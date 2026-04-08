@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-lexer"
+description = "Lexer for the Phoenix programming language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+serde = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+serde_json = { workspace = true }

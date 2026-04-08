@@ -1,0 +1,9 @@
+---
+source: crates/phoenix-parser/src/parser.rs
+assertion_line: 2242
+expression: messages
+---
+[
+    "expected identifier",
+    "expected ')'",
+]

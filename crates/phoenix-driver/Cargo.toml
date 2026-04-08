@@ -1,0 +1,20 @@
+[package]
+name = "phoenix-driver"
+description = "CLI driver for the Phoenix programming language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "phoenix"
+path = "src/main.rs"
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-lexer = { path = "../phoenix-lexer" }
+phoenix-parser = { path = "../phoenix-parser" }
+phoenix-sema = { path = "../phoenix-sema" }
+phoenix-interp = { path = "../phoenix-interp" }
+clap = { workspace = true }
+serde_json = { workspace = true }

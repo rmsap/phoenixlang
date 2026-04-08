@@ -1,0 +1,72 @@
+// Test all new features
+
+struct Point {
+  Int x
+  Int y
+}
+
+impl Point {
+  function display(self) -> String {
+    return "(" + toString(self.x) + ", " + toString(self.y) + ")"
+  }
+}
+
+enum Shape {
+  Circle(Float)
+  Rect(Float, Float)
+}
+
+function describe(s: Shape) -> String {
+  return match s {
+    Circle(r) -> "Circle with radius " + toString(r)
+    Rect(w, h) -> "Rect " + toString(w) + "x" + toString(h)
+  }
+}
+
+function main() {
+  // While loop
+  let mut sum: Int = 0
+  let mut i: Int = 1
+  while i <= 10 {
+    sum = sum + i
+    i = i + 1
+  }
+  print(sum)
+
+  // For loop
+  let mut total: Int = 0
+  for j in 0..5 {
+    total = total + j
+  }
+  print(total)
+
+  // Else if
+  let x: Int = 42
+  if x < 0 {
+    print("negative")
+  } else if x == 0 {
+    print("zero")
+  } else if x < 100 {
+    print("small")
+  } else {
+    print("large")
+  }
+
+  // Struct
+  let p: Point = Point(3, 4)
+  print(p.x)
+  print(p.display())
+
+  // Enum + match
+  let s1: Shape = Circle(3.14)
+  let s2: Shape = Rect(5.0, 10.0)
+  print(describe(s1))
+  print(describe(s2))
+
+  // Match with wildcard
+  let s3: Shape = Circle(1.0)
+  match s3 {
+    Rect(_, _) -> print("rect")
+    _ -> print("not a rect")
+  }
+}

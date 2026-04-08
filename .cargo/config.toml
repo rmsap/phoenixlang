@@ -1,0 +1,4 @@
+[env]
+# Increase test thread stack size to 16 MiB (default is ~8 MiB on most platforms).
+# Needed because the interpreter's recursive eval creates deep Rust stack frames.
+RUST_MIN_STACK = "16777216"

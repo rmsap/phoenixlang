@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-sema"
+description = "Semantic analysis (name resolution and type checking) for the Phoenix programming language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-parser = { path = "../phoenix-parser" }
+
+[dev-dependencies]
+phoenix-lexer = { path = "../phoenix-lexer" }
+insta = { workspace = true }

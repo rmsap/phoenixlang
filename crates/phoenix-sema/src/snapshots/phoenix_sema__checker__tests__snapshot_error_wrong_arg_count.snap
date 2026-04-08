@@ -1,0 +1,8 @@
+---
+source: crates/phoenix-sema/src/checker.rs
+assertion_line: 4567
+expression: messages
+---
+[
+    "function `add` missing argument(s): b",
+]

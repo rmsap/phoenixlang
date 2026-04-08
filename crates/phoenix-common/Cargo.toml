@@ -1,0 +1,10 @@
+[package]
+name = "phoenix-common"
+description = "Shared types (spans, diagnostics, source map) for the Phoenix compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }

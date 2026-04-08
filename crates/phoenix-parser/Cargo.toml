@@ -1,0 +1,16 @@
+[package]
+name = "phoenix-parser"
+description = "Recursive-descent parser and AST for the Phoenix programming language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-lexer = { path = "../phoenix-lexer" }
+serde = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+serde_json = { workspace = true }
