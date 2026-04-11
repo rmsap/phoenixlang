@@ -48,6 +48,31 @@
             {
               "name": "constant.character.escape.phoenix",
               "match": "\\\\[\\\\\"nrt0]"
+            },
+            {
+              "name": "constant.character.escape.phoenix",
+              "match": "\\{\\{|\\}\\}"
+            },
+            {
+              "name": "meta.interpolation.phoenix",
+              "begin": "\\{",
+              "beginCaptures": {
+                "0": { "name": "punctuation.section.interpolation.begin.phoenix" }
+              },
+              "end": "\\}",
+              "endCaptures": {
+                "0": { "name": "punctuation.section.interpolation.end.phoenix" }
+              },
+              "patterns": [
+                { "include": "#comments" },
+                { "include": "#numbers" },
+                { "include": "#constants" },
+                { "include": "#functions" },
+                { "include": "#keywords" },
+                { "include": "#types" },
+                { "include": "#operators" },
+                { "include": "#identifiers" }
+              ]
             }
           ]
         }

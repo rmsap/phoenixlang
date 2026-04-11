@@ -1,42 +1,40 @@
-// Test all new features
+// Showcase of Phoenix language features
 
 struct Point {
   Int x
   Int y
-}
 
-impl Point {
   function display(self) -> String {
-    return "(" + toString(self.x) + ", " + toString(self.y) + ")"
+    "({self.x}, {self.y})"
   }
 }
 
 enum Shape {
   Circle(Float)
   Rect(Float, Float)
-}
 
-function describe(s: Shape) -> String {
-  return match s {
-    Circle(r) -> "Circle with radius " + toString(r)
-    Rect(w, h) -> "Rect " + toString(w) + "x" + toString(h)
+  function describe(self) -> String {
+    match self {
+      Circle(r) -> "Circle with radius {r}"
+      Rect(w, h) -> "Rect {w}x{h}"
+    }
   }
 }
 
 function main() {
-  // While loop
+  // While loop with compound assignment
   let mut sum: Int = 0
   let mut i: Int = 1
   while i <= 10 {
-    sum = sum + i
-    i = i + 1
+    sum += i
+    i += 1
   }
   print(sum)
 
-  // For loop
+  // For loop with compound assignment
   let mut total: Int = 0
   for j in 0..5 {
-    total = total + j
+    total += j
   }
   print(total)
 
@@ -60,8 +58,8 @@ function main() {
   // Enum + match
   let s1: Shape = Circle(3.14)
   let s2: Shape = Rect(5.0, 10.0)
-  print(describe(s1))
-  print(describe(s2))
+  print(s1.describe())
+  print(s2.describe())
 
   // Match with wildcard
   let s3: Shape = Circle(1.0)

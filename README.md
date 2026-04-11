@@ -26,7 +26,7 @@ Phoenix is in **active development**. The current implementation is a **tree-wal
 - **`Option<T>`** and **`Result<T, E>`** (built-in) with `unwrap()`, `unwrapOr()`, `isSome()`/`isOk()`, and **combinators** (`map`, `andThen`, `orElse`, `filter`, `okOr`, `mapErr`, `unwrapOrElse`)
 - **`?` operator** for concise error propagation on `Result` and `Option` values
 - **Traits** with `trait` declarations, `impl Trait for Type`, and trait bounds on generics (`<T: Display>`)
-- **String interpolation** — `"hello {name}, you are {age} years old"`
+- **String interpolation** — `"hello {name}, you are {age} years old"` (non-string values are automatically converted)
 - **String methods** — `length`, `contains`, `startsWith`, `endsWith`, `trim`, `split`, `replace`, `substring`, `indexOf`, `toLowerCase`, `toUpperCase`, plus **ordering comparisons**
 - **Type aliases** — `type UserId = Int`, `type StringResult<T> = Result<T, String>`
 - **Implicit return** — last expression in a function/closure/match-arm/if-else block is the return value
