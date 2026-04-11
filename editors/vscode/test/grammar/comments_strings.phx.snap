@@ -1,0 +1,49 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>// This is a line comment
+#^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>// <- comment.line.double-slash.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>/* Block comment */
+#^^ source.phoenix comment.block.phoenix
+#  ^^^^^^^^^^^^^^^ source.phoenix comment.block.phoenix
+#                 ^^ source.phoenix comment.block.phoenix
+>// <- comment.block.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>/** Doc comment */
+#^^^ source.phoenix comment.block.documentation.phoenix
+#   ^^^^^^^^^^^^^ source.phoenix comment.block.documentation.phoenix
+#                ^^ source.phoenix comment.block.documentation.phoenix
+>// <- comment.block.documentation.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>"hello world"
+#^ source.phoenix string.quoted.double.phoenix
+# ^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#            ^ source.phoenix string.quoted.double.phoenix
+>// <- string.quoted.double.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>"escape: \n \t \\ \""
+#^ source.phoenix string.quoted.double.phoenix
+# ^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#         ^^ source.phoenix string.quoted.double.phoenix constant.character.escape.phoenix
+#           ^ source.phoenix string.quoted.double.phoenix
+#            ^^ source.phoenix string.quoted.double.phoenix constant.character.escape.phoenix
+#              ^ source.phoenix string.quoted.double.phoenix
+#               ^^ source.phoenix string.quoted.double.phoenix constant.character.escape.phoenix
+#                 ^ source.phoenix string.quoted.double.phoenix
+#                  ^^ source.phoenix string.quoted.double.phoenix constant.character.escape.phoenix
+#                    ^ source.phoenix string.quoted.double.phoenix
+>//       ^^ constant.character.escape.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//          ^^ constant.character.escape.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//             ^^ constant.character.escape.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                ^^ constant.character.escape.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>

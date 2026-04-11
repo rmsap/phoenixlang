@@ -1,6 +1,6 @@
 # Phoenix Gen: Typed API Code Generation
 
-**Status: Proposal**
+**Status: Substantially Complete** — Gen Phases 1–3 and 5 are fully complete. Gen Phase 4 has Python and Go targets (Rust target deferred as low-value). The `phoenix-lsp` language server provides hover, autocomplete, go-to-definition, find references, and rename. The VS Code extension uses the LSP for full IDE support. `phoenix gen --watch` re-generates on `.phx` file changes. `phoenix gen` produces typed `types.ts` (with validation functions from `where` constraints), `client.ts`, `handlers.ts`, and `server.ts` (Express router with automatic validation) from `.phx` schema files. `phoenix gen --target openapi` produces an OpenAPI 3.1 JSON specification with JSON Schema validation keywords. A VS Code extension provides syntax highlighting and inline diagnostics. Additional language targets (Go, Rust, Python) are next.
 
 Phoenix Gen is a **standalone code generation tool** that uses Phoenix syntax to define API schemas and generates idiomatic client SDKs, server handler interfaces, validation logic, and OpenAPI specs for existing languages. It is a parallel workstream to the main language roadmap — buildable now with the existing parser and type checker — designed to bring Phoenix's type safety story to developers before the full compiler exists.
 
@@ -185,24 +185,21 @@ export const api = {
 
 And the Python backend gets:
 ```python
-# backend/api/handlers.py
-from dataclasses import dataclass
-from typing import Optional
+# backend/api/models.py
+from pydantic import BaseModel
 
-@dataclass
-class User:
+class User(BaseModel):
     id: int
     name: str
     email: str
     age: int
 
-@dataclass
-class CreateUserBody:
+class CreateUserBody(BaseModel):
     name: str
     email: str
     age: int
 
-# Handler interface — developer implements these
+# backend/api/handlers.py — developer implements these
 class Handlers:
     async def create_user(self, body: CreateUserBody) -> User: ...
     async def get_user(self, id: int) -> User: ...
@@ -243,9 +240,9 @@ One of the strongest differentiators over existing schema tools is generating va
 ```phoenix
 struct User {
   Int id
-  String name where self.length > 0 and self.length <= 100
-  String email where self.contains("@") and self.length > 3
-  Int age where self >= 0 and self <= 150
+  String name where self.length > 0 && self.length <= 100
+  String email where self.contains("@") && self.length > 3
+  Int age where self >= 0 && self <= 150
 }
 
 endpoint createUser: POST "/api/users" {
@@ -259,14 +256,14 @@ The `where` constraints on `User` fields are inherited by derived types. When th
 ```typescript
 export function validateCreateUserBody(input: unknown): CreateUserBody {
   if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');
-  const { name, email, age } = input as Record<string, unknown>;
-  if (typeof name !== 'string') throw new ValidationError('name: expected string');
-  if (!(name.length > 0 && name.length <= 100)) throw new ValidationError('name: length must be 1-100');
-  if (typeof email !== 'string') throw new ValidationError('email: expected string');
-  if (!(email.includes('@') && email.length > 3)) throw new ValidationError('email: invalid format');
-  if (typeof age !== 'number') throw new ValidationError('age: expected number');
-  if (!(age >= 0 && age <= 150)) throw new ValidationError('age: must be 0-150');
-  return { name, email, age };
+  const obj = input as Record<string, unknown>;
+  if (typeof obj.name !== 'string') throw new ValidationError('name: expected string');
+  if (!((obj.name.length > 0) && (obj.name.length <= 100))) throw new ValidationError('name: constraint violated');
+  if (typeof obj.email !== 'string') throw new ValidationError('email: expected string');
+  if (!((obj.email.includes("@")) && (obj.email.length > 3))) throw new ValidationError('email: constraint violated');
+  if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
+  if (!((obj.age >= 0) && (obj.age <= 150))) throw new ValidationError('age: constraint violated');
+  return obj as CreateUserBody;
 }
 ```
 
@@ -528,43 +525,44 @@ Regenerating without schema changes must produce **byte-identical output**. The 
 
 ### Gen Phase 1: Foundation
 
-- Add `endpoint` as a new AST node in the parser
-- Add `schema` declarations for database table definitions (optional, for forward compatibility)
-- Add `where` constraints on struct fields (limited predicate syntax)
-- Type-check endpoint definitions: validate that request/response types exist, path parameters match request fields, error variants are defined
-- Add `phoenix gen` subcommand to the CLI
+- ~~Add `endpoint` as a new AST node in the parser~~ ✅ Complete
+- ~~Add `schema` declarations for database table definitions (parse-only, forward compatibility with Phase 4)~~ ✅ Complete
+- ~~Add `where` constraints on struct fields (limited predicate syntax — numeric bounds, string length, `contains`)~~ ✅ Complete
+- ~~Type-check endpoint definitions: validate that request/response types exist, path parameters match request fields, error variants are defined~~ ✅ Complete
+- ~~Add `phoenix gen` subcommand to the CLI~~ ✅ Complete
 
 ### Gen Phase 2: TypeScript target and editor support
 
 TypeScript first — largest potential user base, most frustration with existing tools. Editor support ships alongside the first target, not after — developers will not write `.phx` files in a plain text editor.
 
-- Generate TypeScript interfaces from Phoenix structs and enums
-- Generate typed client SDK (fetch-based, framework-agnostic)
-- Generate server handler interfaces (Express and Fastify adapters)
-- Generate validation functions from `where` constraints
-- Generate router wiring that connects handlers to endpoints with automatic deserialization
-- VS Code extension with syntax highlighting and basic diagnostics (see [Required tooling](#required-tooling) below)
+- ~~Generate TypeScript interfaces from Phoenix structs and enums~~ ✅ Complete
+- ~~Generate typed client SDK (fetch-based, framework-agnostic) with query parameters, typed error handling (`ApiError`), and `URLSearchParams` construction~~ ✅ Complete
+- ~~Generate server handler interfaces (`handlers.ts` with typed `Handlers` interface)~~ ✅ Complete
+- ~~Generate error types (string unions and const status code maps) in `types.ts`~~ ✅ Complete
+- ~~Generate Express-compatible router wiring (`server.ts` with `createRouter`) that parses path/query/body params, applies defaults, and maps errors to status codes~~ ✅ Complete
+- ~~Generate validation functions from `where` constraints (`validateXxxBody()` in `types.ts`, called from `server.ts` with 400 error mapping)~~ ✅ Complete
+- ~~VS Code extension with syntax highlighting (TextMate grammar) and basic diagnostics (`phoenix check` on save)~~ ✅ Complete
 
-### Gen Phase 3: OpenAPI target
+### Gen Phase 3: OpenAPI target ✅ Complete
 
 Free interop with the entire API tooling ecosystem.
 
-- Generate OpenAPI 3.1 specs from endpoint declarations
-- Map Phoenix types to JSON Schema
-- Map `where` constraints to JSON Schema validation keywords (`minimum`, `maximum`, `pattern`, `minLength`, etc.)
-- Map error variants to HTTP status codes
+- ~~Generate OpenAPI 3.1 specs from endpoint declarations (`phoenix gen --target openapi`)~~ ✅ Complete
+- ~~Map Phoenix types to JSON Schema (structs → objects, enums → string enums or oneOf tagged unions)~~ ✅ Complete
+- ~~Map `where` constraints to JSON Schema validation keywords (`minimum`, `maximum`, `minLength`, `maxLength`, `exclusiveMinimum`, `exclusiveMaximum`)~~ ✅ Complete
+- ~~Map error variants to HTTP response status codes~~ ✅ Complete
 
 ### Gen Phase 4: Additional targets
 
-- Go: structs, handler interfaces (net/http and Echo/Gin adapters), client
+- ~~Go: structs with JSON tags (`types.go`), `net/http` router (`server.go`), Handlers interface (`handlers.go`), typed HTTP client (`client.go`)~~ ✅ Complete
 - Rust: types, handler traits (Axum/Actix adapters), client
-- Python: Pydantic models, FastAPI handler stubs, client
+- ~~Python: Pydantic models (`models.py`), FastAPI router (`server.py`), handler Protocol (`handlers.py`), typed httpx client (`client.py`) with `where` constraint validation via Pydantic `Field()`~~ ✅ Complete
 
 ### Gen Phase 5: Watch mode and integration
 
-- `phoenix gen --watch` re-generates on `.phx` file changes
-- Integration testing: generated client and server can communicate correctly
-- LSP enhancements: autocomplete for endpoint fields, go-to-definition for type references
+- ~~`phoenix gen --watch` re-generates on `.phx` file changes~~ ✅ Complete
+- ~~Integration testing: syntax validation of generated code (Python `ast.parse`, Go `gofmt`, OpenAPI JSON validation)~~ ✅ Complete
+- ~~LSP server (`phoenix-lsp` binary) with hover, autocomplete, go-to-definition, find references, and rename~~ ✅ Complete
 
 ## Required tooling
 
@@ -604,32 +602,57 @@ The existing Phoenix error infrastructure supports span-annotated diagnostics. T
 
 ### Configuration file
 
-A `phoenix.toml` in the project root configures Gen behavior. Multiple targets can be configured simultaneously — a single `phoenix gen` command generates everything:
+A `phoenix.toml` in the project root (or any ancestor directory) configures Gen defaults. Place it alongside your schema file so that `phoenix gen` works with no arguments.
+
+#### Single target
 
 ```toml
 [gen]
-schema = "api/schema.phx"         # or a glob: "api/**/*.phx"
-
-# TypeScript client for the frontend
-[gen.typescript]
-mode = "client"                   # "client", "server", or "both" (default)
-out_dir = "frontend/src/generated"
-client_framework = "fetch"        # "fetch" (default), "axios"
-validation = true                 # generate validation functions from `where` constraints
-
-# Python server for the backend
-[gen.python]
-mode = "server"
-out_dir = "backend/generated"
-server_framework = "fastapi"      # "fastapi", "flask"
-
-# OpenAPI spec for documentation and external tooling
-[gen.openapi]
-output = "api.yaml"               # or "api.json"
-version = "3.1"
+schema = "api/schema.phx"
+target = "typescript"
+out_dir = "./generated"
+mode = "both"                 # "client", "server", or "both"
 ```
 
-With this config, running `phoenix gen` with no flags generates the TypeScript client, the Python server handlers, and the OpenAPI spec in one pass.
+#### Multiple targets
+
+Use `[gen.targets.<name>]` sub-tables to generate code for several languages in one `phoenix gen` invocation:
+
+```toml
+[gen]
+schema = "api/schema.phx"
+
+[gen.targets.typescript]
+out_dir = "frontend/src/generated"
+mode = "client"
+
+[gen.targets.python]
+out_dir = "backend/generated"
+mode = "server"
+
+[gen.targets.openapi]
+out_dir = "docs"
+```
+
+Running `phoenix gen` with this config generates the TypeScript client, the Python server, and the OpenAPI spec — all from the same schema.
+
+Each target inherits the top-level `mode` unless overridden. If a target omits `out_dir`, it defaults to `{top-level out_dir}/{target_name}`.
+
+#### CLI overrides
+
+CLI flags always override config values:
+
+- `--target <name>` selects a single target, ignoring the rest
+- `--client` / `--server` overrides the `mode` for all targets
+- `--out <dir>` overrides the output directory
+
+```bash
+# Config defines multiple targets, but only generate python
+phoenix gen --target python
+
+# Config says mode = "both", but override to client-only
+phoenix gen --client
+```
 
 This is a config file parser, not a package manager — no dependency resolution, no registry, no lockfile. It tells `phoenix gen` where to find schema files and how to generate output.
 
@@ -651,12 +674,12 @@ Binary artifacts are hosted as GitHub Release assets and built automatically by 
 **GitHub Releases with install script:**
 - GitHub Actions builds platform-specific binaries on each tagged release: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`
 - Binaries are uploaded as GitHub Release assets (free for public repos)
-- A shell installer script (hosted in the repo, e.g. `curl -fsSL https://raw.githubusercontent.com/rsaperstein/phoenixlang/main/install.sh | sh`) detects the platform and downloads the correct binary
+- A shell installer script (hosted in the repo, e.g. `curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sh`) detects the platform and downloads the correct binary
 - One-line install command in the README — lowest friction for first-time users
 
 **Homebrew tap:**
 - Create a `homebrew-phoenix` repo with a formula that points to the GitHub Release binaries
-- Users install with `brew tap rsaperstein/phoenix && brew install phoenix`
+- Users install with `brew tap rmsap/phoenix && brew install phoenix`
 - The formula is a single Ruby file updated on each release (can be automated via CI)
 - No approval process — taps are self-published
 

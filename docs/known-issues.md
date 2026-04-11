@@ -54,13 +54,11 @@ For a web-focused language, explicit resource cleanup with `defer conn.close()` 
 
 ## Bugs
 
-### SourceId hardcoded to 0 in string interpolation sub-parser
+### SourceId hardcoded to 0 in string interpolation sub-parser — Resolved
 
 **File:** `phoenix-parser/src/expr.rs`
 
-When parsing interpolation expressions, the sub-parser uses `SourceId(0)` instead of the actual source file ID.
-
-**Fix:** Thread `SourceId` through the `Parser` struct. Fix when multi-file compilation is added (Phase 2 or 3). Single-file mode is unaffected.
+The `Parser` struct now carries a `source_id` field derived from the first token's span. The interpolation sub-parser uses `self.source_id` instead of extracting it from individual tokens. Multi-file compilation will work correctly when added in Phase 2.
 
 ### Silent zero substitution on out-of-range integer/float literals
 
@@ -79,9 +77,16 @@ When an integer or float literal is out of range, the parser emits a diagnostic 
 Key offenders:
 - `interpreter.rs`: `self.env.snapshot()` deep-clones the entire scope stack for every closure creation
 - `check_expr.rs` / `check_types.rs`: many clone calls on type information that could use references (split from the original `checker.rs`)
-- `parser.rs`: `advance()` clones every token — this is the hottest path in parsing
 
 **Recommendation:** Address before compilation (Phase 2). Consider `Rc<str>` for token text, reference-based type checking, and `Cow`-style closure environments.
+
+Note: `parser.rs` `advance()` no longer clones every token — it returns `&'src Token` references. `peek()`, `peek_at()`, and `expect()` also return references. This eliminates per-token cloning on the hottest parsing path.
+
+### `checker.rs` test module extracted — Resolved
+
+**File:** `phoenix-sema/src/checker.rs`
+
+The ~3,000-line test module has been extracted to `checker_tests.rs`, reducing `checker.rs` from 3,997 lines to 950 lines.
 
 ### `parse_prefix` exceeds 190 lines — Resolved
 
@@ -119,12 +124,12 @@ All testing gaps below have been addressed. Tests are integrated into the existi
 ### Missing negative tests — Scheduled
 
 - Multiple trait bounds (`T: Foo + Bar`) — 1 test in `traits.rs`, parse error "expected '>'" confirmed
-- Compound assignment operators (`+=`, `-=`, `*=`, `/=`) — 4 tests in `basic.rs`, parse error "expected expression" confirmed
+- Compound assignment operators (`+=`, `-=`, `*=`, `/=`, `%=`) — now supported; desugared to `x = x op expr` in the parser
 
 ### Snapshot tests for error messages — Scheduled
 
 `insta` snapshot tests now active in both parser and checker:
-- Parser: 5 snapshot tests in `phoenix-parser/src/parser.rs` (missing function name, missing closing brace, missing paren, unexpected token, compound assignment)
+- Parser: 4 snapshot tests in `phoenix-parser/src/parser.rs` (missing function name, missing closing brace, missing paren, unexpected token)
 - Checker: 5 snapshot tests in `phoenix-sema/src/checker.rs` (type mismatch, undefined variable, immutable assignment, wrong arg count, trait not implemented)
 - Snapshots stored in `crates/phoenix-parser/src/snapshots/` and `crates/phoenix-sema/src/snapshots/`
 

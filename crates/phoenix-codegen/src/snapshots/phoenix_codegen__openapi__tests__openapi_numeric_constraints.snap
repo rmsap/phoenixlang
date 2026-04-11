@@ -1,0 +1,33 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: spec
+---
+{
+  "components": {
+    "schemas": {
+      "Product": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "price": {
+            "maximum": 10000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "price",
+          "name"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {}
+}

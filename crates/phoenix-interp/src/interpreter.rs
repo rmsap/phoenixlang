@@ -1,7 +1,12 @@
 use crate::env::Environment;
 use crate::value::Value;
 use phoenix_common::span::Span;
-use phoenix_parser::ast::*;
+use phoenix_parser::ast::{
+    BinaryExpr, BinaryOp, Block, CallExpr, CaptureInfo, Declaration, ElseBranch, Expr, ForSource,
+    ForStmt, FunctionDecl, IfStmt, LiteralKind, MatchBody, MatchExpr, MethodCallExpr, Param,
+    Pattern, Program, Statement, StringSegment, StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp,
+    WhileStmt,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -230,7 +235,9 @@ impl Interpreter {
         match result {
             Ok(StmtResult::Return(value)) => Ok(value),
             Ok(_) => Ok(Value::Void),
-            Err(mut e) if e.try_return_value.is_some() => Ok(e.try_return_value.take().unwrap()),
+            Err(mut e) if e.try_return_value.is_some() => {
+                Ok(e.try_return_value.take().expect("guarded by is_some()"))
+            }
             Err(e) => Err(e),
         }
     }
@@ -296,7 +303,10 @@ impl Interpreter {
                 Declaration::Impl(imp) => {
                     self.register_methods(&imp.type_name, &imp.methods);
                 }
-                Declaration::Trait(_) | Declaration::TypeAlias(_) => {} // Compile-time only
+                Declaration::Trait(_)
+                | Declaration::TypeAlias(_)
+                | Declaration::Endpoint(_)
+                | Declaration::Schema(_) => {} // Compile-time only
             }
         }
 
@@ -992,10 +1002,10 @@ impl Interpreter {
                     let right = self.eval_expr(&binary.right)?;
                     match right {
                         Value::Bool(b) => Ok(Value::Bool(b)),
-                        _ => error("`and` requires Bool operands"),
+                        _ => error("`&&` requires Bool operands"),
                     }
                 }
-                _ => error("`and` requires Bool operands"),
+                _ => error("`&&` requires Bool operands"),
             };
         }
         if binary.op == BinaryOp::Or {
@@ -1006,10 +1016,10 @@ impl Interpreter {
                     let right = self.eval_expr(&binary.right)?;
                     match right {
                         Value::Bool(b) => Ok(Value::Bool(b)),
-                        _ => error("`or` requires Bool operands"),
+                        _ => error("`||` requires Bool operands"),
                     }
                 }
-                _ => error("`or` requires Bool operands"),
+                _ => error("`||` requires Bool operands"),
             };
         }
 
@@ -1061,7 +1071,7 @@ impl Interpreter {
             },
             UnaryOp::Not => match operand {
                 Value::Bool(b) => Ok(Value::Bool(!b)),
-                _ => error(format!("cannot apply `not` to {}", operand.type_name())),
+                _ => error(format!("cannot apply `!` to {}", operand.type_name())),
             },
         }
     }

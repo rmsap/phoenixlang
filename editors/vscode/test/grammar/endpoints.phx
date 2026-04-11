@@ -1,0 +1,44 @@
+// SYNTAX TEST "source.phoenix"
+
+endpoint createUser: POST "/api/users" {
+// <- keyword.other.endpoint.phoenix
+//       ^^^^^^^^^^ entity.name.function.phoenix
+//                   ^^^^ keyword.other.http-method.phoenix
+//                        ^^^^^^^^^^^^^ string.quoted.double.phoenix
+  query {
+//^^^^^ keyword.other.endpoint.phoenix
+    Int page = 1
+//  ^^^ support.type.primitive.phoenix
+//             ^ constant.numeric.integer.phoenix
+    Option<String> search
+//  ^^^^^^ support.type.generic.phoenix
+  }
+  body User omit { id } partial
+//^^^^ keyword.other.endpoint.phoenix
+//          ^^^^ keyword.other.endpoint.phoenix
+//                       ^^^^^^^ keyword.other.endpoint.phoenix
+  response User
+//^^^^^^^^ keyword.other.endpoint.phoenix
+  error {
+//^^^^^ keyword.other.endpoint.phoenix
+    NotFound(404)
+//           ^^^ constant.numeric.integer.phoenix
+  }
+}
+
+endpoint getUser: GET "/api/users/{id}" {
+//                ^^^ keyword.other.http-method.phoenix
+  response User
+}
+
+endpoint updateUser: PUT "/api/users/{id}" {
+//                   ^^^ keyword.other.http-method.phoenix
+}
+
+endpoint patchUser: PATCH "/api/users/{id}" {
+//                  ^^^^^ keyword.other.http-method.phoenix
+}
+
+endpoint deleteUser: DELETE "/api/users/{id}" {
+//                   ^^^^^^ keyword.other.http-method.phoenix
+}

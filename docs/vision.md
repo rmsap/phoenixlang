@@ -91,10 +91,10 @@ Phoenix supports **refinement types** — types with compile-time constraints on
 type PositiveInt = Int where self > 0
 
 // A type for valid email addresses
-type Email = String where self.contains("@") and self.length > 3
+type Email = String where self.contains("@") && self.length > 3
 
 // A bounded range
-type Percent = Float where self >= 0.0 and self <= 100.0
+type Percent = Float where self >= 0.0 && self <= 100.0
 
 // Non-empty collections
 type NonEmptyList<T> = List<T> where self.length > 0

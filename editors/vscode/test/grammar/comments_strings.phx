@@ -1,0 +1,19 @@
+// SYNTAX TEST "source.phoenix"
+
+// This is a line comment
+// <- comment.line.double-slash.phoenix
+
+/* Block comment */
+// <- comment.block.phoenix
+
+/** Doc comment */
+// <- comment.block.documentation.phoenix
+
+"hello world"
+// <- string.quoted.double.phoenix
+
+"escape: \n \t \\ \""
+//       ^^ constant.character.escape.phoenix
+//          ^^ constant.character.escape.phoenix
+//             ^^ constant.character.escape.phoenix
+//                ^^ constant.character.escape.phoenix

@@ -1,0 +1,8 @@
+struct User {
+    Int id
+    String name
+}
+
+endpoint getUser: GET "/api/users/{id}" {
+    response NonexistentType
+}

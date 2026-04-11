@@ -1,0 +1,10 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: "serde_json::to_string_pretty(&combined).unwrap()"
+---
+{
+  "bool": true,
+  "float": 3.125,
+  "int": 42,
+  "string": "hello"
+}

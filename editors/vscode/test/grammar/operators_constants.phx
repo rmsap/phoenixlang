@@ -1,0 +1,48 @@
+// SYNTAX TEST "source.phoenix"
+
+let a: Bool = true and false or not true
+//            ^^^^ constant.language.boolean.phoenix
+//                 ^^^ keyword.operator.logical.phoenix
+//                     ^^^^^ constant.language.boolean.phoenix
+//                           ^^ keyword.operator.logical.phoenix
+//                              ^^^ keyword.operator.logical.phoenix
+//                                  ^^^^ constant.language.boolean.phoenix
+
+let b: Int = 1 + 2 - 3 * 4 / 5 % 6
+//             ^ keyword.operator.arithmetic.phoenix
+//                ^ keyword.operator.arithmetic.phoenix
+//                    ^ keyword.operator.arithmetic.phoenix
+//                        ^ keyword.operator.arithmetic.phoenix
+//                            ^ keyword.operator.arithmetic.phoenix
+
+let c: Bool = x == y
+//              ^^ keyword.operator.comparison.phoenix
+let d: Bool = x != y
+//              ^^ keyword.operator.comparison.phoenix
+let e: Bool = x <= y
+//              ^^ keyword.operator.comparison.phoenix
+let f: Bool = x >= y
+//              ^^ keyword.operator.comparison.phoenix
+
+let ok: Result<Int, String> = Ok(42)
+//      ^^^^^^ support.type.generic.phoenix
+//                            ^^ support.constant.phoenix
+let err: Result<Int, String> = Err("fail")
+//                              ^^^ support.constant.phoenix
+let some: Option<Int> = Some(1)
+//        ^^^^^^ support.type.generic.phoenix
+//                      ^^^^ support.constant.phoenix
+let none: Option<Int> = None
+//                      ^^^^ constant.language.phoenix
+
+data |> parse() |> validate()
+//   ^^ keyword.operator.pipe.phoenix
+//               ^^ keyword.operator.pipe.phoenix
+
+let val: Int = result?
+//                   ^ keyword.operator.try.phoenix
+
+let list: List<Int> = [1, 2, 3]
+//        ^^^^ support.type.generic.phoenix
+let map: Map<String, Int> = {}
+//       ^^^ support.type.generic.phoenix

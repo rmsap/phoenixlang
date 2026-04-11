@@ -1,0 +1,11 @@
+// SYNTAX TEST "source.phoenix"
+
+schema db {
+// <- keyword.other.endpoint.phoenix
+  table users from User {
+//                  ^^^^ entity.name.type.phoenix
+    primary key id
+    unique email
+    index age
+  }
+}

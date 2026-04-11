@@ -1,18 +1,21 @@
 use crate::types::Type;
+use phoenix_common::span::Span;
 use std::collections::HashMap;
 
 /// Information about a variable binding in a lexical scope.
 ///
-/// Each variable tracked by the scope stack carries its resolved [`Type`]
-/// and a flag indicating whether the binding was declared as mutable
-/// (`mut`).  Phoenix uses garbage collection for memory management, so no
-/// ownership or move tracking is needed at the semantic analysis level.
+/// Each variable tracked by the scope stack carries its resolved [`Type`],
+/// a flag indicating whether the binding was declared as mutable (`mut`),
+/// and the source location where it was defined.
 #[derive(Debug, Clone)]
 pub struct VarInfo {
     /// The resolved type of the variable.
     pub ty: Type,
     /// Whether the variable was declared with the `mut` qualifier.
     pub is_mut: bool,
+    /// Source span where this variable was defined (the `let` statement or
+    /// function parameter).
+    pub definition_span: Span,
 }
 
 /// A lexical scope containing variable bindings.
@@ -95,7 +98,11 @@ mod tests {
 
     /// Helper to create a simple `VarInfo`.
     fn var(ty: Type, is_mut: bool) -> VarInfo {
-        VarInfo { ty, is_mut }
+        VarInfo {
+            ty,
+            is_mut,
+            definition_span: Span::BUILTIN,
+        }
     }
 
     #[test]

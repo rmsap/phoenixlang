@@ -1,0 +1,87 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>struct User {
+#^^^^^^ source.phoenix storage.type.phoenix
+#      ^ source.phoenix
+#       ^^^^ source.phoenix entity.name.type.phoenix
+#           ^^^ source.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//     ^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  String name where self.length > 0 and self.length <= 100
+#^^ source.phoenix
+#  ^^^^^^ source.phoenix support.type.primitive.phoenix
+#        ^ source.phoenix
+#         ^^^^ source.phoenix variable.other.phoenix
+#             ^ source.phoenix
+#              ^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#                   ^ source.phoenix
+#                    ^^^^ source.phoenix variable.language.self.phoenix
+#                        ^ source.phoenix
+#                         ^^^^^^ source.phoenix variable.other.phoenix
+#                               ^ source.phoenix
+#                                ^ source.phoenix keyword.operator.comparison.phoenix
+#                                 ^ source.phoenix
+#                                  ^ source.phoenix constant.numeric.integer.phoenix
+#                                   ^ source.phoenix
+#                                    ^^^ source.phoenix keyword.operator.logical.phoenix
+#                                       ^ source.phoenix
+#                                        ^^^^ source.phoenix variable.language.self.phoenix
+#                                            ^ source.phoenix
+#                                             ^^^^^^ source.phoenix variable.other.phoenix
+#                                                   ^ source.phoenix
+#                                                    ^^ source.phoenix keyword.operator.comparison.phoenix
+#                                                      ^ source.phoenix
+#                                                       ^^^ source.phoenix constant.numeric.integer.phoenix
+>//^^^^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//            ^^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                  ^^^^ variable.language.self.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                                ^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                                  ^^^ keyword.operator.logical.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                                                  ^^ keyword.operator.comparison.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                                                     ^^^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  Int age where self >= 0 and self <= 150
+#^^ source.phoenix
+#  ^^^ source.phoenix support.type.primitive.phoenix
+#     ^ source.phoenix
+#      ^^^ source.phoenix variable.other.phoenix
+#         ^ source.phoenix
+#          ^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#               ^ source.phoenix
+#                ^^^^ source.phoenix variable.language.self.phoenix
+#                    ^ source.phoenix
+#                     ^^ source.phoenix keyword.operator.comparison.phoenix
+#                       ^ source.phoenix
+#                        ^ source.phoenix constant.numeric.integer.phoenix
+#                         ^ source.phoenix
+#                          ^^^ source.phoenix keyword.operator.logical.phoenix
+#                             ^ source.phoenix
+#                              ^^^^ source.phoenix variable.language.self.phoenix
+#                                  ^ source.phoenix
+#                                   ^^ source.phoenix keyword.operator.comparison.phoenix
+#                                     ^ source.phoenix
+#                                      ^^^ source.phoenix constant.numeric.integer.phoenix
+>//^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//        ^^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//              ^^^^ variable.language.self.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                   ^^ keyword.operator.comparison.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                      ^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                        ^^^ keyword.operator.logical.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>

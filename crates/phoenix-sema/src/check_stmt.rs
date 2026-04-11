@@ -1,7 +1,10 @@
 use crate::checker::Checker;
 use crate::scope::VarInfo;
 use crate::types::Type;
-use phoenix_parser::ast::*;
+use phoenix_parser::ast::{
+    ElseBranch, ForSource, ForStmt, IfStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget,
+    WhileStmt,
+};
 
 impl Checker {
     /// Dispatches type-checking for a single statement.
@@ -79,6 +82,7 @@ impl Checker {
                     VarInfo {
                         ty: var_type,
                         is_mut: var.is_mut,
+                        definition_span: var.span,
                     },
                 ) {
                     self.error(
@@ -108,14 +112,13 @@ impl Checker {
 
                     // For each field name in the destructuring, verify it exists and bind it
                     for field_name in field_names {
-                        if let Some((_fname, ftype)) =
-                            info.fields.iter().find(|(n, _)| n == field_name)
-                        {
+                        if let Some(field) = info.fields.iter().find(|f| &f.name == field_name) {
                             if !self.scopes.define(
                                 field_name.clone(),
                                 VarInfo {
-                                    ty: ftype.clone(),
+                                    ty: field.ty.clone(),
                                     is_mut: var.is_mut,
+                                    definition_span: var.span,
                                 },
                             ) {
                                 self.error(
@@ -278,6 +281,7 @@ impl Checker {
             VarInfo {
                 ty: var_type,
                 is_mut: false,
+                definition_span: f.span,
             },
         );
         self.check_block(&f.body);

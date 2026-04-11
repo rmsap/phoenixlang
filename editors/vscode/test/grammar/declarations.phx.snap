@@ -1,0 +1,166 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>function add(a: Int, b: Int) -> Int {
+#^^^^^^^^ source.phoenix storage.type.phoenix
+#        ^ source.phoenix
+#         ^^^ source.phoenix entity.name.function.phoenix
+#            ^ source.phoenix
+#             ^ source.phoenix variable.other.phoenix
+#              ^^ source.phoenix
+#                ^^^ source.phoenix support.type.primitive.phoenix
+#                   ^^ source.phoenix
+#                     ^ source.phoenix variable.other.phoenix
+#                      ^^ source.phoenix
+#                        ^^^ source.phoenix support.type.primitive.phoenix
+#                           ^^ source.phoenix
+#                             ^^ source.phoenix keyword.operator.arrow.phoenix
+#                               ^ source.phoenix
+#                                ^^^ source.phoenix support.type.primitive.phoenix
+#                                   ^^^ source.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//       ^^^ entity.name.function.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//              ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                      ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                           ^^ keyword.operator.arrow.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                              ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  a + b
+#^^ source.phoenix
+#  ^ source.phoenix variable.other.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix keyword.operator.arithmetic.phoenix
+#     ^ source.phoenix
+#      ^ source.phoenix variable.other.phoenix
+>//  ^ keyword.operator.arithmetic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>struct User {
+#^^^^^^ source.phoenix storage.type.phoenix
+#      ^ source.phoenix
+#       ^^^^ source.phoenix entity.name.type.phoenix
+#           ^^^ source.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//     ^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  Int id
+#^^ source.phoenix
+#  ^^^ source.phoenix support.type.primitive.phoenix
+#     ^ source.phoenix
+#      ^^ source.phoenix variable.other.phoenix
+>//^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  String name
+#^^ source.phoenix
+#  ^^^^^^ source.phoenix support.type.primitive.phoenix
+#        ^ source.phoenix
+#         ^^^^ source.phoenix variable.other.phoenix
+>//^^^^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  Option<String> bio
+#^^ source.phoenix
+#  ^^^^^^ source.phoenix support.type.generic.phoenix
+#        ^ source.phoenix keyword.operator.comparison.phoenix
+#         ^^^^^^ source.phoenix support.type.primitive.phoenix
+#               ^ source.phoenix keyword.operator.comparison.phoenix
+#                ^ source.phoenix
+#                 ^^^ source.phoenix variable.other.phoenix
+>//^^^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>enum Shape {
+#^^^^ source.phoenix storage.type.phoenix
+#    ^ source.phoenix
+#     ^^^^^ source.phoenix entity.name.type.phoenix
+#          ^^^ source.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//   ^^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  Circle(Float)
+#^^ source.phoenix
+#  ^^^^^^ source.phoenix entity.name.type.phoenix
+#        ^ source.phoenix
+#         ^^^^^ source.phoenix support.type.primitive.phoenix
+#              ^^ source.phoenix
+>//       ^^^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  Rect(Float, Float)
+#^^ source.phoenix
+#  ^^^^ source.phoenix entity.name.type.phoenix
+#      ^ source.phoenix
+#       ^^^^^ source.phoenix support.type.primitive.phoenix
+#            ^^ source.phoenix
+#              ^^^^^ source.phoenix support.type.primitive.phoenix
+#                   ^^ source.phoenix
+>}
+#^^ source.phoenix
+>
+>trait Display {
+#^^^^^ source.phoenix storage.type.phoenix
+#     ^ source.phoenix
+#      ^^^^^^^ source.phoenix entity.name.type.phoenix
+#             ^^^ source.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//    ^^^^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  function toString(self) -> String
+#^^ source.phoenix
+#  ^^^^^^^^ source.phoenix storage.type.phoenix
+#          ^ source.phoenix
+#           ^^^^^^^^ source.phoenix entity.name.function.phoenix
+#                   ^ source.phoenix
+#                    ^^^^ source.phoenix variable.language.self.phoenix
+#                        ^^ source.phoenix
+#                          ^^ source.phoenix keyword.operator.arrow.phoenix
+#                            ^ source.phoenix
+#                             ^^^^^^ source.phoenix support.type.primitive.phoenix
+>//         ^^^^^^^^ entity.name.function.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                  ^^^^ variable.language.self.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                        ^^ keyword.operator.arrow.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                           ^^^^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>impl User {
+#^^^^ source.phoenix storage.type.phoenix
+#    ^ source.phoenix
+#     ^^^^ source.phoenix entity.name.type.phoenix
+#         ^^^ source.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//   ^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>type UserId = Int
+#^^^^ source.phoenix storage.type.phoenix
+#    ^ source.phoenix
+#     ^^^^^^ source.phoenix entity.name.type.phoenix
+#           ^ source.phoenix
+#            ^ source.phoenix keyword.operator.assignment.phoenix
+#             ^ source.phoenix
+#              ^^^ source.phoenix support.type.primitive.phoenix
+>// <- storage.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//   ^^^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//            ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>

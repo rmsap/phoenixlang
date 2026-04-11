@@ -1,0 +1,165 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>endpoint createUser: POST "/api/users" {
+#^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#        ^ source.phoenix
+#         ^^^^^^^^^^ source.phoenix entity.name.function.phoenix
+#                   ^^ source.phoenix
+#                     ^^^^ source.phoenix keyword.other.http-method.phoenix
+#                         ^ source.phoenix
+#                          ^ source.phoenix string.quoted.double.phoenix
+#                           ^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                     ^ source.phoenix string.quoted.double.phoenix
+#                                      ^^^ source.phoenix
+>// <- keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//       ^^^^^^^^^^ entity.name.function.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                   ^^^^ keyword.other.http-method.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                        ^^^^^^^^^^^^^ string.quoted.double.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  query {
+#^^ source.phoenix
+#  ^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#       ^^^ source.phoenix
+>//^^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>    Int page = 1
+#^^^^ source.phoenix
+#    ^^^ source.phoenix support.type.primitive.phoenix
+#       ^ source.phoenix
+#        ^^^^ source.phoenix variable.other.phoenix
+#            ^ source.phoenix
+#             ^ source.phoenix keyword.operator.assignment.phoenix
+#              ^ source.phoenix
+#               ^ source.phoenix constant.numeric.integer.phoenix
+>//  ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//             ^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>    Option<String> search
+#^^^^ source.phoenix
+#    ^^^^^^ source.phoenix support.type.generic.phoenix
+#          ^ source.phoenix keyword.operator.comparison.phoenix
+#           ^^^^^^ source.phoenix support.type.primitive.phoenix
+#                 ^ source.phoenix keyword.operator.comparison.phoenix
+#                  ^ source.phoenix
+#                   ^^^^^^ source.phoenix variable.other.phoenix
+>//  ^^^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  }
+#^^^^ source.phoenix
+>  body User omit { id } partial
+#^^ source.phoenix
+#  ^^^^ source.phoenix keyword.other.endpoint.phoenix
+#      ^ source.phoenix
+#       ^^^^ source.phoenix entity.name.type.phoenix
+#           ^ source.phoenix
+#            ^^^^ source.phoenix keyword.other.endpoint.phoenix
+#                ^^^ source.phoenix
+#                   ^^ source.phoenix variable.other.phoenix
+#                     ^^^ source.phoenix
+#                        ^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+>//^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//          ^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                       ^^^^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  response User
+#^^ source.phoenix
+#  ^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#          ^ source.phoenix
+#           ^^^^ source.phoenix entity.name.type.phoenix
+>//^^^^^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  error {
+#^^ source.phoenix
+#  ^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#       ^^^ source.phoenix
+>//^^^^^ keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>    NotFound(404)
+#^^^^ source.phoenix
+#    ^^^^^^^^ source.phoenix entity.name.type.phoenix
+#            ^ source.phoenix
+#             ^^^ source.phoenix constant.numeric.integer.phoenix
+#                ^^ source.phoenix
+>//           ^^^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  }
+#^^^^ source.phoenix
+>}
+#^^ source.phoenix
+>
+>endpoint getUser: GET "/api/users/{id}" {
+#^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#        ^ source.phoenix
+#         ^^^^^^^ source.phoenix entity.name.function.phoenix
+#                ^^ source.phoenix
+#                  ^^^ source.phoenix keyword.other.http-method.phoenix
+#                     ^ source.phoenix
+#                      ^ source.phoenix string.quoted.double.phoenix
+#                       ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                      ^ source.phoenix string.quoted.double.phoenix
+#                                       ^^^ source.phoenix
+>//                ^^^ keyword.other.http-method.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  response User
+#^^ source.phoenix
+#  ^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#          ^ source.phoenix
+#           ^^^^ source.phoenix entity.name.type.phoenix
+>}
+#^^ source.phoenix
+>
+>endpoint updateUser: PUT "/api/users/{id}" {
+#^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#        ^ source.phoenix
+#         ^^^^^^^^^^ source.phoenix entity.name.function.phoenix
+#                   ^^ source.phoenix
+#                     ^^^ source.phoenix keyword.other.http-method.phoenix
+#                        ^ source.phoenix
+#                         ^ source.phoenix string.quoted.double.phoenix
+#                          ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                         ^ source.phoenix string.quoted.double.phoenix
+#                                          ^^^ source.phoenix
+>//                   ^^^ keyword.other.http-method.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>endpoint patchUser: PATCH "/api/users/{id}" {
+#^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#        ^ source.phoenix
+#         ^^^^^^^^^ source.phoenix entity.name.function.phoenix
+#                  ^^ source.phoenix
+#                    ^^^^^ source.phoenix keyword.other.http-method.phoenix
+#                         ^ source.phoenix
+#                          ^ source.phoenix string.quoted.double.phoenix
+#                           ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                          ^ source.phoenix string.quoted.double.phoenix
+#                                           ^^^ source.phoenix
+>//                  ^^^^^ keyword.other.http-method.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>endpoint deleteUser: DELETE "/api/users/{id}" {
+#^^^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#        ^ source.phoenix
+#         ^^^^^^^^^^ source.phoenix entity.name.function.phoenix
+#                   ^^ source.phoenix
+#                     ^^^^^^ source.phoenix keyword.other.http-method.phoenix
+#                           ^ source.phoenix
+#                            ^ source.phoenix string.quoted.double.phoenix
+#                             ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                            ^ source.phoenix string.quoted.double.phoenix
+#                                             ^^^ source.phoenix
+>//                   ^^^^^^ keyword.other.http-method.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>

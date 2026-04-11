@@ -1,0 +1,51 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: "serde_json::to_string_pretty(&schema).unwrap()"
+---
+{
+  "discriminator": {
+    "propertyName": "tag"
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "tag": {
+          "const": "Circle",
+          "type": "string"
+        },
+        "value": {}
+      },
+      "required": [
+        "tag",
+        "value"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "tag": {
+          "const": "Square",
+          "type": "string"
+        },
+        "value": {}
+      },
+      "required": [
+        "tag",
+        "value"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "tag": {
+          "const": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tag"
+      ],
+      "type": "object"
+    }
+  ]
+}

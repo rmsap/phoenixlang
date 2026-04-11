@@ -1,5 +1,11 @@
-use crate::ast::*;
+use crate::ast::{
+    Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
+    FieldDecl, FunctionDecl, HttpMethod, ImplBlock, InlineTraitImpl, NamedType, Param, Program,
+    QueryParam, SchemaDecl, SchemaTable, StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl,
+    TypeExpr, TypeModifier,
+};
 use phoenix_common::diagnostics::Diagnostic;
+use phoenix_common::span::SourceId;
 use phoenix_lexer::token::{Token, TokenKind};
 
 /// Returns a human-readable name for a [`TokenKind`], suitable for use in
@@ -30,6 +36,22 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Continue => "'continue'",
         TokenKind::Trait => "'trait'",
         TokenKind::Type => "'type'",
+        TokenKind::Endpoint => "'endpoint'",
+        TokenKind::Body => "'body'",
+        TokenKind::Response => "'response'",
+        TokenKind::ErrorKw => "'error'",
+        TokenKind::Omit => "'omit'",
+        TokenKind::Pick => "'pick'",
+        TokenKind::Partial => "'partial'",
+        TokenKind::Query => "'query'",
+        TokenKind::Where => "'where'",
+        TokenKind::Schema => "'schema'",
+        TokenKind::Get => "'GET'",
+        TokenKind::Post => "'POST'",
+        TokenKind::Put => "'PUT'",
+        TokenKind::Patch => "'PATCH'",
+        TokenKind::Delete => "'DELETE'",
+        TokenKind::DocComment => "doc comment",
         TokenKind::IntType => "Int",
         TokenKind::FloatType => "Float",
         TokenKind::StringType => "String",
@@ -47,9 +69,9 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Gt => "'>'",
         TokenKind::LtEq => "'<='",
         TokenKind::GtEq => "'>='",
-        TokenKind::And => "'and'",
-        TokenKind::Or => "'or'",
-        TokenKind::Not => "'not'",
+        TokenKind::And => "'&&'",
+        TokenKind::Or => "'||'",
+        TokenKind::Not => "'!'",
         TokenKind::Arrow => "'->'",
         TokenKind::LParen => "'('",
         TokenKind::RParen => "')'",
@@ -63,6 +85,11 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::DotDot => "'..'",
         TokenKind::Question => "'?'",
         TokenKind::Pipe => "'|>'",
+        TokenKind::PlusEq => "'+='",
+        TokenKind::MinusEq => "'-='",
+        TokenKind::StarEq => "'*='",
+        TokenKind::SlashEq => "'/='",
+        TokenKind::PercentEq => "'%='",
         TokenKind::Newline => "newline",
         TokenKind::Eof => "end of file",
         TokenKind::Error => "error token",
@@ -78,7 +105,13 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
 pub struct Parser<'src> {
     tokens: &'src [Token],
     pub(crate) pos: usize,
+    /// Parse errors collected during parsing for multi-error reporting.
     pub diagnostics: Vec<Diagnostic>,
+    /// The source file ID for the tokens being parsed.
+    ///
+    /// Derived from the first token's span. Used by the string interpolation
+    /// sub-parser so it doesn't need to extract the ID from individual tokens.
+    pub source_id: SourceId,
 }
 
 impl<'src> Parser<'src> {
@@ -87,10 +120,15 @@ impl<'src> Parser<'src> {
     /// The token slice must end with a [`TokenKind::Eof`] token (the lexer
     /// guarantees this).
     pub fn new(tokens: &'src [Token]) -> Self {
+        let source_id = tokens
+            .first()
+            .map(|t| t.span.source_id)
+            .unwrap_or(SourceId(0));
         Self {
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            source_id,
         }
     }
 
@@ -123,19 +161,48 @@ impl<'src> Parser<'src> {
         }
     }
 
-    /// Parses a top-level declaration (function, struct, enum, impl, trait, or type alias).
+    /// Parses a top-level declaration, optionally preceded by a doc comment.
     fn parse_declaration(&mut self) -> Option<Declaration> {
+        // Consume a doc comment if present — it attaches to the next declaration.
+        let doc_comment = self.try_consume_doc_comment();
+
         match self.peek().kind {
             TokenKind::Function => self.parse_function_decl().map(Declaration::Function),
-            TokenKind::Struct => self.parse_struct_decl().map(Declaration::Struct),
-            TokenKind::Enum => self.parse_enum_decl().map(Declaration::Enum),
+            TokenKind::Struct => self.parse_struct_decl(doc_comment).map(Declaration::Struct),
+            TokenKind::Enum => self.parse_enum_decl(doc_comment).map(Declaration::Enum),
             TokenKind::Impl => self.parse_impl_block().map(Declaration::Impl),
             TokenKind::Trait => self.parse_trait_decl().map(Declaration::Trait),
             TokenKind::Type => self.parse_type_alias_decl().map(Declaration::TypeAlias),
+            TokenKind::Endpoint => self
+                .parse_endpoint_decl(doc_comment)
+                .map(Declaration::Endpoint),
+            TokenKind::Schema => self.parse_schema_decl().map(Declaration::Schema),
             _ => {
-                self.error_at_current("expected a declaration (e.g. `function`, `struct`, `enum`, `impl`, `trait`, `type`)");
+                self.error_at_current("expected a declaration (e.g. `function`, `struct`, `enum`, `impl`, `trait`, `type`, `endpoint`, `schema`)");
                 None
             }
+        }
+    }
+
+    /// Consumes a [`TokenKind::DocComment`] token if one is present at the
+    /// current position, and returns its trimmed text content.
+    ///
+    /// Doc comments (`/** ... */`) may precede `struct`, `enum`, and `endpoint`
+    /// declarations. This method is called by [`parse_declaration`](Self::parse_declaration)
+    /// before dispatching to the specific declaration parser, so that the
+    /// doc comment text can be threaded through as a parameter.
+    ///
+    /// Any newlines following the doc comment are also consumed so that the
+    /// next token seen by the caller is the declaration keyword.
+    ///
+    /// Returns `None` if the current token is not a doc comment.
+    fn try_consume_doc_comment(&mut self) -> Option<String> {
+        if self.peek().kind == TokenKind::DocComment {
+            let tok = self.advance();
+            self.skip_newlines();
+            Some(tok.text.clone())
+        } else {
+            None
         }
     }
 
@@ -164,6 +231,7 @@ impl<'src> Parser<'src> {
 
         Some(FunctionDecl {
             name,
+            name_span: name_token.span,
             type_params,
             type_param_bounds,
             params,
@@ -334,7 +402,11 @@ impl<'src> Parser<'src> {
 
     /// Returns a reference to the current token without advancing.
     /// Returns the `Eof` token if the position is past the end.
-    pub(crate) fn peek(&self) -> &Token {
+    ///
+    /// The returned reference has the `'src` lifetime of the token slice,
+    /// so it does not keep `&self` borrowed — callers can hold the reference
+    /// while calling `&mut self` methods.
+    pub(crate) fn peek(&self) -> &'src Token {
         self.tokens
             .get(self.pos)
             .unwrap_or_else(|| self.tokens.last().expect("token stream must end with Eof"))
@@ -343,25 +415,28 @@ impl<'src> Parser<'src> {
     /// Returns a reference to the token `offset` positions ahead of the current
     /// position without consuming any tokens. Returns the `Eof` token if the
     /// offset is past the end of the token stream.
-    pub(crate) fn peek_at(&self, offset: usize) -> &Token {
+    pub(crate) fn peek_at(&self, offset: usize) -> &'src Token {
         self.tokens
             .get(self.pos + offset)
             .unwrap_or_else(|| self.tokens.last().expect("token stream must end with Eof"))
     }
 
-    /// Consumes the current token and returns a clone of it.
+    /// Consumes the current token and returns a reference to it.
     /// Does not advance past `Eof`.
-    pub(crate) fn advance(&mut self) -> Token {
-        let token = self.peek().clone();
+    pub(crate) fn advance(&mut self) -> &'src Token {
+        let token = self
+            .tokens
+            .get(self.pos)
+            .unwrap_or_else(|| self.tokens.last().expect("token stream must end with Eof"));
         if token.kind != TokenKind::Eof {
             self.pos += 1;
         }
         token
     }
 
-    /// Consumes the current token if it matches `kind`, returning it.
+    /// Consumes the current token if it matches `kind`, returning a reference.
     /// Records a diagnostic and returns `None` on mismatch.
-    pub(crate) fn expect(&mut self, kind: TokenKind) -> Option<Token> {
+    pub(crate) fn expect(&mut self, kind: TokenKind) -> Option<&'src Token> {
         if self.peek().kind == kind {
             Some(self.advance())
         } else {
@@ -396,7 +471,13 @@ impl<'src> Parser<'src> {
     }
 
     /// Parses a struct declaration: `struct Name { fields, methods, impl blocks }`.
-    pub(crate) fn parse_struct_decl(&mut self) -> Option<StructDecl> {
+    ///
+    /// The optional `doc_comment` parameter carries the text of a preceding
+    /// `/** ... */` doc comment, if one was consumed by
+    /// [`try_consume_doc_comment`](Self::try_consume_doc_comment). It is
+    /// stored on the resulting [`StructDecl`] for use by code generators and
+    /// documentation tools.
+    pub(crate) fn parse_struct_decl(&mut self, doc_comment: Option<String>) -> Option<StructDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Struct)?;
         let name_token = self.expect(TokenKind::Ident)?;
@@ -423,15 +504,28 @@ impl<'src> Parser<'src> {
                     self.synchronize_stmt();
                 }
             } else {
-                // Field
+                // Field: [doc_comment] Type name [where <constraint-expr>]
+                let field_doc = self.try_consume_doc_comment();
                 let fstart = self.peek().span;
                 if let Some(type_expr) = self.parse_type_expr()
                     && let Some(name_tok) = self.expect(TokenKind::Ident)
                 {
-                    let span = fstart.merge(name_tok.span);
+                    let constraint = if self.peek().kind == TokenKind::Where {
+                        self.advance(); // consume 'where'
+                        self.parse_expr()
+                    } else {
+                        None
+                    };
+                    let end_span = constraint
+                        .as_ref()
+                        .map(|e| e.span())
+                        .unwrap_or(name_tok.span);
+                    let span = fstart.merge(end_span);
                     fields.push(FieldDecl {
                         type_annotation: type_expr,
                         name: name_tok.text.clone(),
+                        constraint,
+                        doc_comment: field_doc,
                         span,
                     });
                 }
@@ -442,16 +536,24 @@ impl<'src> Parser<'src> {
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(StructDecl {
             name: name_token.text.clone(),
+            name_span: name_token.span,
             type_params,
             fields,
             methods,
             trait_impls,
+            doc_comment,
             span: start.merge(end),
         })
     }
 
     /// Parses an enum declaration: `enum Name { Variant, Variant(Type), methods, impl blocks }`.
-    pub(crate) fn parse_enum_decl(&mut self) -> Option<EnumDecl> {
+    ///
+    /// The optional `doc_comment` parameter carries the text of a preceding
+    /// `/** ... */` doc comment, if one was consumed by
+    /// [`try_consume_doc_comment`](Self::try_consume_doc_comment). It is
+    /// stored on the resulting [`EnumDecl`] for use by code generators and
+    /// documentation tools.
+    pub(crate) fn parse_enum_decl(&mut self, doc_comment: Option<String>) -> Option<EnumDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Enum)?;
         let name_token = self.expect(TokenKind::Ident)?;
@@ -502,10 +604,12 @@ impl<'src> Parser<'src> {
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(EnumDecl {
             name: name_token.text.clone(),
+            name_span: name_token.span,
             type_params,
             variants,
             methods,
             trait_impls,
+            doc_comment,
             span: start.merge(end),
         })
     }
@@ -611,6 +715,7 @@ impl<'src> Parser<'src> {
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(TraitDecl {
             name: name_token.text.clone(),
+            name_span: name_token.span,
             type_params,
             methods,
             span: start.merge(end),
@@ -670,8 +775,439 @@ impl<'src> Parser<'src> {
         self.eat(TokenKind::Newline);
         Some(TypeAliasDecl {
             name: name_token.text.clone(),
+            name_span: name_token.span,
             type_params,
             target,
+            span: start.merge(end),
+        })
+    }
+
+    // ── Endpoint parsing ─────────────────────────────────────────────
+
+    /// Parses an endpoint declaration.
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// endpoint <name>: <METHOD> "<path>" {
+    ///     [body <TypeExpr> [omit|pick|partial { ... }]*]
+    ///     [response <TypeExpr>]
+    ///     [query { <Type> <name> [= <default>], ... }]
+    ///     [error { <Name>(<code>), ... }]
+    /// }
+    /// ```
+    ///
+    /// The inner sections (`body`, `response`, `query`, `error`) are all
+    /// optional and may appear in any order.  Duplicate sections produce a
+    /// diagnostic.  This method delegates to
+    /// [`parse_body_type`](Self::parse_body_type),
+    /// [`parse_query_block`](Self::parse_query_block), and
+    /// [`parse_error_block`](Self::parse_error_block) for the respective
+    /// sections.
+    ///
+    /// The `doc_comment` parameter carries an optional preceding `/** ... */`
+    /// comment, stored on the resulting [`EndpointDecl`].
+    ///
+    /// Returns `None` if a required token is missing (e.g. the HTTP method or
+    /// the path string literal), after recording a diagnostic.
+    fn parse_endpoint_decl(&mut self, doc_comment: Option<String>) -> Option<EndpointDecl> {
+        let start = self.peek().span;
+        self.expect(TokenKind::Endpoint)?;
+        let name_token = self.expect(TokenKind::Ident)?;
+        self.expect(TokenKind::Colon)?;
+
+        // Parse HTTP method
+        let method = match self.peek().kind {
+            TokenKind::Get => {
+                self.advance();
+                HttpMethod::Get
+            }
+            TokenKind::Post => {
+                self.advance();
+                HttpMethod::Post
+            }
+            TokenKind::Put => {
+                self.advance();
+                HttpMethod::Put
+            }
+            TokenKind::Patch => {
+                self.advance();
+                HttpMethod::Patch
+            }
+            TokenKind::Delete => {
+                self.advance();
+                HttpMethod::Delete
+            }
+            _ => {
+                self.error_at_current("expected HTTP method (GET, POST, PUT, PATCH, DELETE)");
+                return None;
+            }
+        };
+
+        // Parse URL path
+        let path_token = self.expect(TokenKind::StringLiteral)?;
+        // Strip surrounding quotes from the string literal
+        let path = path_token.text.trim_matches('"').to_string();
+
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let mut query_params = Vec::new();
+        let mut body = None;
+        let mut response = None;
+        let mut errors = Vec::new();
+        let mut has_query = false;
+        let mut has_body = false;
+        let mut has_response = false;
+        let mut has_error = false;
+
+        // Parse inner sections
+        loop {
+            match self.peek().kind {
+                TokenKind::RBrace | TokenKind::Eof => break,
+                TokenKind::Query => {
+                    if has_query {
+                        self.error_at_current("duplicate `query` section in endpoint");
+                    }
+                    has_query = true;
+                    query_params = self.parse_query_block();
+                }
+                TokenKind::Body => {
+                    if has_body {
+                        self.error_at_current("duplicate `body` section in endpoint");
+                    }
+                    has_body = true;
+                    body = self.parse_body_type();
+                }
+                TokenKind::Response => {
+                    if has_response {
+                        self.error_at_current("duplicate `response` section in endpoint");
+                    }
+                    has_response = true;
+                    self.advance();
+                    self.skip_newlines();
+                    response = self.parse_type_expr();
+                }
+                TokenKind::ErrorKw => {
+                    if has_error {
+                        self.error_at_current("duplicate `error` section in endpoint");
+                    }
+                    has_error = true;
+                    errors = self.parse_error_block();
+                }
+                _ => {
+                    self.error_at_current("expected `query`, `body`, `response`, `error`, or `}`");
+                    self.advance();
+                }
+            }
+            self.skip_newlines();
+        }
+
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Some(EndpointDecl {
+            name: name_token.text.clone(),
+            name_span: name_token.span,
+            method,
+            path,
+            query_params,
+            body,
+            response,
+            errors,
+            doc_comment,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parses the `body` section of an endpoint, producing a [`DerivedType`].
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// body <BaseType> [omit { field, ... }] [pick { field, ... }] [partial [{ field, ... }]]
+    /// ```
+    ///
+    /// The base type is parsed via [`parse_type_expr`](Self::parse_type_expr),
+    /// followed by zero or more chained type modifiers (`omit`, `pick`,
+    /// `partial`). Modifiers are applied left-to-right and may be combined
+    /// freely (e.g. `User omit { id } partial`).
+    ///
+    /// Returns `None` if the `body` keyword or base type is missing.
+    fn parse_body_type(&mut self) -> Option<DerivedType> {
+        let start = self.peek().span;
+        self.expect(TokenKind::Body)?;
+        self.skip_newlines();
+        let base_type = self.parse_type_expr()?;
+        let mut modifiers = Vec::new();
+
+        // Parse chained modifiers: omit, pick, partial
+        loop {
+            match self.peek().kind {
+                TokenKind::Omit => {
+                    let mstart = self.peek().span;
+                    self.advance();
+                    let fields = self.parse_field_list()?;
+                    let mend = self.peek().span;
+                    modifiers.push(TypeModifier::Omit {
+                        fields,
+                        span: mstart.merge(mend),
+                    });
+                }
+                TokenKind::Pick => {
+                    let mstart = self.peek().span;
+                    self.advance();
+                    let fields = self.parse_field_list()?;
+                    let mend = self.peek().span;
+                    modifiers.push(TypeModifier::Pick {
+                        fields,
+                        span: mstart.merge(mend),
+                    });
+                }
+                TokenKind::Partial => {
+                    let mstart = self.peek().span;
+                    self.advance();
+                    // Optional field list for selective partial
+                    let fields = if self.peek().kind == TokenKind::LBrace {
+                        Some(self.parse_field_list()?)
+                    } else {
+                        None
+                    };
+                    let mend = self.peek().span;
+                    modifiers.push(TypeModifier::Partial {
+                        fields,
+                        span: mstart.merge(mend),
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        let end = modifiers
+            .last()
+            .map(|m| match m {
+                TypeModifier::Omit { span, .. }
+                | TypeModifier::Pick { span, .. }
+                | TypeModifier::Partial { span, .. } => *span,
+            })
+            .unwrap_or(match &base_type {
+                TypeExpr::Named(n) => n.span,
+                TypeExpr::Function(f) => f.span,
+                TypeExpr::Generic(g) => g.span,
+            });
+
+        Some(DerivedType {
+            base_type,
+            modifiers,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parses a brace-delimited, comma-or-newline-separated list of field names.
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// { field1, field2, field3 }
+    /// ```
+    ///
+    /// Used by the `omit`, `pick`, and `partial` type modifier parsers to
+    /// collect the set of field names the modifier applies to.
+    ///
+    /// Returns `None` if the opening `{` or closing `}` is missing.
+    fn parse_field_list(&mut self) -> Option<Vec<String>> {
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+        let mut fields = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            let tok = self.expect(TokenKind::Ident)?;
+            fields.push(tok.text.clone());
+            self.eat(TokenKind::Comma);
+            self.skip_newlines();
+        }
+        self.expect(TokenKind::RBrace)?;
+        Some(fields)
+    }
+
+    /// Parses an `error` block inside an endpoint declaration.
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// error {
+    ///     NotFound(404)
+    ///     Conflict(409)
+    /// }
+    /// ```
+    ///
+    /// Each variant is an identifier followed by a parenthesised integer
+    /// literal representing the HTTP status code. Variants are separated by
+    /// newlines.
+    ///
+    /// Returns an empty vector if the `error` keyword or opening `{` is
+    /// missing (a diagnostic is recorded in that case).
+    fn parse_error_block(&mut self) -> Vec<EndpointErrorVariant> {
+        let mut errors = Vec::new();
+        if self.expect(TokenKind::ErrorKw).is_none() {
+            return errors;
+        }
+        if self.expect(TokenKind::LBrace).is_none() {
+            return errors;
+        }
+        self.skip_newlines();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            let estart = self.peek().span;
+            if let Some(name_tok) = self.expect(TokenKind::Ident)
+                && self.expect(TokenKind::LParen).is_some()
+                && let Some(code_tok) = self.expect(TokenKind::IntLiteral)
+            {
+                let code = code_tok.text.parse::<i64>().unwrap_or(0);
+                let eend = self
+                    .expect(TokenKind::RParen)
+                    .map(|t| t.span)
+                    .unwrap_or(code_tok.span);
+                errors.push(EndpointErrorVariant {
+                    name: name_tok.text.clone(),
+                    status_code: code,
+                    span: estart.merge(eend),
+                });
+            }
+            self.skip_newlines();
+        }
+        let _ = self.expect(TokenKind::RBrace);
+        errors
+    }
+
+    /// Parses a `query` block inside an endpoint declaration.
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// query {
+    ///     Int page = 1
+    ///     Option<String> search
+    /// }
+    /// ```
+    ///
+    /// Each query parameter consists of a type expression, a name, and an
+    /// optional default value (`= <expr>`). Parameters are separated by
+    /// newlines.
+    ///
+    /// Returns an empty vector if the `query` keyword or opening `{` is
+    /// missing (a diagnostic is recorded in that case).
+    fn parse_query_block(&mut self) -> Vec<QueryParam> {
+        let mut params = Vec::new();
+        if self.expect(TokenKind::Query).is_none() {
+            return params;
+        }
+        if self.expect(TokenKind::LBrace).is_none() {
+            return params;
+        }
+        self.skip_newlines();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            let pstart = self.peek().span;
+            if let Some(type_expr) = self.parse_type_expr()
+                && let Some(name_tok) = self.expect(TokenKind::Ident)
+            {
+                let default_value = if self.eat(TokenKind::Eq) {
+                    self.parse_expr()
+                } else {
+                    None
+                };
+                let pend = default_value
+                    .as_ref()
+                    .map(|e| e.span())
+                    .unwrap_or(name_tok.span);
+                params.push(QueryParam {
+                    type_annotation: type_expr,
+                    name: name_tok.text.clone(),
+                    default_value,
+                    span: pstart.merge(pend),
+                });
+            }
+            self.skip_newlines();
+        }
+        let _ = self.expect(TokenKind::RBrace);
+        params
+    }
+
+    // ── Schema declaration parsing ────────────────────────────────
+
+    /// Parses a `schema` declaration: `schema name { table ... }`.
+    ///
+    /// The schema body contains table declarations. Table constraint bodies
+    /// are parsed as opaque token sequences for forward compatibility with
+    /// Phase 4.
+    fn parse_schema_decl(&mut self) -> Option<SchemaDecl> {
+        let start = self.peek().span;
+        self.expect(TokenKind::Schema)?;
+
+        let name_tok = self.expect(TokenKind::Ident)?;
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let mut tables = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            if self.peek().kind == TokenKind::Ident && self.peek().text == "table" {
+                if let Some(table) = self.parse_schema_table() {
+                    tables.push(table);
+                }
+            } else {
+                self.advance(); // skip unrecognized tokens
+            }
+            self.skip_newlines();
+        }
+
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Some(SchemaDecl {
+            name: name_tok.text.clone(),
+            tables,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parses a single `table` declaration within a schema block.
+    ///
+    /// Syntax: `table name [from TypeName] { ... }`.
+    /// The body is consumed as raw token lines for forward compatibility.
+    fn parse_schema_table(&mut self) -> Option<SchemaTable> {
+        let start = self.peek().span;
+        self.advance(); // consume "table" ident
+
+        let name_tok = self.expect(TokenKind::Ident)?;
+
+        // Optional `from TypeName`
+        let source_type = if self.peek().kind == TokenKind::Ident && self.peek().text == "from" {
+            self.advance(); // consume "from"
+            Some(self.expect(TokenKind::Ident)?.text.clone())
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        // Consume body as raw token lines (opaque for forward compatibility)
+        let mut body_tokens: Vec<Vec<String>> = Vec::new();
+        let mut current_line: Vec<String> = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            if self.peek().kind == TokenKind::Newline {
+                if !current_line.is_empty() {
+                    body_tokens.push(std::mem::take(&mut current_line));
+                }
+                self.advance();
+            } else {
+                current_line.push(self.peek().text.clone());
+                self.advance();
+            }
+        }
+        if !current_line.is_empty() {
+            body_tokens.push(current_line);
+        }
+
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Some(SchemaTable {
+            name: name_tok.text.clone(),
+            source_type,
+            body_tokens,
             span: start.merge(end),
         })
     }
@@ -688,7 +1224,9 @@ impl<'src> Parser<'src> {
                 | TokenKind::Enum
                 | TokenKind::Impl
                 | TokenKind::Trait
-                | TokenKind::Type => break,
+                | TokenKind::Type
+                | TokenKind::Endpoint
+                | TokenKind::Schema => break,
                 _ => {
                     self.advance();
                 }
@@ -762,6 +1300,7 @@ pub fn parse(tokens: &[Token]) -> (Program, Vec<Diagnostic>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::*;
     use phoenix_common::span::SourceId;
     use phoenix_lexer::lexer::tokenize;
 
@@ -788,7 +1327,8 @@ mod tests {
 
     #[test]
     fn parse_function_with_return_type() {
-        let (program, diagnostics) = parse_source("function add(a: Int, b: Int) -> Int { return a }");
+        let (program, diagnostics) =
+            parse_source("function add(a: Int, b: Int) -> Int { return a }");
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
             Declaration::Function(f) => {
@@ -1015,7 +1555,7 @@ mod tests {
 
     #[test]
     fn parse_unary_not() {
-        let (program, diagnostics) = parse_source("function main() { let b: Bool = not true }");
+        let (program, diagnostics) = parse_source("function main() { let b: Bool = !true }");
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
             Declaration::Function(f) => match &f.body.statements[0] {
@@ -2250,9 +2790,1035 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_error_compound_assignment() {
-        let (_, diags) = parse_source("function main() { let mut x: Int = 1\n x += 2 }");
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        insta::assert_debug_snapshot!(messages);
+    fn parse_compound_assignment() {
+        let (program, diagnostics) =
+            parse_source("function main() { let mut x: Int = 1\n x += 2 }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        // x += 2 desugars to x = x + 2, which is an Assignment expression
+        match &program.declarations[0] {
+            Declaration::Function(f) => match &f.body.statements[1] {
+                Statement::Expression(es) => match &es.expr {
+                    Expr::Assignment(a) => {
+                        assert_eq!(a.name, "x");
+                        match &a.value {
+                            Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Add),
+                            other => panic!("expected Binary, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Assignment, got {:?}", other),
+                },
+                other => panic!("expected Expression, got {:?}", other),
+            },
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    // ── Endpoint parsing tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_endpoint_get_response_only() {
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "getUser");
+                assert_eq!(ep.method, HttpMethod::Get);
+                assert_eq!(ep.path, "/api/users/{id}");
+                assert!(ep.body.is_none());
+                assert!(ep.query_params.is_empty());
+                assert!(ep.errors.is_empty());
+                assert!(ep.doc_comment.is_none());
+                match &ep.response {
+                    Some(TypeExpr::Named(n)) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User) response, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_post_body_and_response() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            body User
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "createUser");
+                assert_eq!(ep.method, HttpMethod::Post);
+                assert_eq!(ep.path, "/api/users");
+                let body = ep.body.as_ref().expect("should have body");
+                match &body.base_type {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User) body base type, got {:?}", other),
+                }
+                assert!(body.modifiers.is_empty());
+                match &ep.response {
+                    Some(TypeExpr::Named(n)) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User) response, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_body_omit() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            body User omit { id }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                let body = ep.body.as_ref().expect("should have body");
+                match &body.base_type {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User) body base type, got {:?}", other),
+                }
+                assert_eq!(body.modifiers.len(), 1);
+                match &body.modifiers[0] {
+                    TypeModifier::Omit { fields, .. } => {
+                        assert_eq!(fields, &["id"]);
+                    }
+                    other => panic!("expected Omit modifier, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_body_pick() {
+        let source = r#"endpoint updateName: PUT "/api/users/{id}" {
+            body User pick { name, email }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.method, HttpMethod::Put);
+                let body = ep.body.as_ref().expect("should have body");
+                assert_eq!(body.modifiers.len(), 1);
+                match &body.modifiers[0] {
+                    TypeModifier::Pick { fields, .. } => {
+                        assert_eq!(fields, &["name", "email"]);
+                    }
+                    other => panic!("expected Pick modifier, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_body_partial_bare() {
+        let source = r#"endpoint patchUser: PATCH "/api/users/{id}" {
+            body User partial
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.method, HttpMethod::Patch);
+                let body = ep.body.as_ref().expect("should have body");
+                assert_eq!(body.modifiers.len(), 1);
+                match &body.modifiers[0] {
+                    TypeModifier::Partial { fields, .. } => {
+                        assert!(fields.is_none(), "bare partial should have no field list");
+                    }
+                    other => panic!("expected Partial modifier, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_body_chained_omit_partial() {
+        let source = r#"endpoint patchUser: PATCH "/api/users/{id}" {
+            body User omit { id } partial
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                let body = ep.body.as_ref().expect("should have body");
+                assert_eq!(body.modifiers.len(), 2);
+                match &body.modifiers[0] {
+                    TypeModifier::Omit { fields, .. } => {
+                        assert_eq!(fields, &["id"]);
+                    }
+                    other => panic!("expected Omit modifier first, got {:?}", other),
+                }
+                match &body.modifiers[1] {
+                    TypeModifier::Partial { fields, .. } => {
+                        assert!(fields.is_none(), "bare partial should have no field list");
+                    }
+                    other => panic!("expected Partial modifier second, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_query_params() {
+        let source = r#"endpoint listUsers: GET "/api/users" {
+            query {
+                Int page = 1
+                String search
+            }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.query_params.len(), 2);
+                assert_eq!(ep.query_params[0].name, "page");
+                match &ep.query_params[0].type_annotation {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "Int"),
+                    other => panic!("expected Named(Int), got {:?}", other),
+                }
+                match &ep.query_params[0].default_value {
+                    Some(Expr::Literal(Literal {
+                        kind: LiteralKind::Int(1),
+                        ..
+                    })) => {}
+                    other => panic!("expected default value Int(1), got {:?}", other),
+                }
+                assert_eq!(ep.query_params[1].name, "search");
+                match &ep.query_params[1].type_annotation {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "String"),
+                    other => panic!("expected Named(String), got {:?}", other),
+                }
+                assert!(
+                    ep.query_params[1].default_value.is_none(),
+                    "search should have no default"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_error_block() {
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User
+            error {
+                NotFound(404)
+                Forbidden(403)
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.errors.len(), 2);
+                assert_eq!(ep.errors[0].name, "NotFound");
+                assert_eq!(ep.errors[0].status_code, 404);
+                assert_eq!(ep.errors[1].name, "Forbidden");
+                assert_eq!(ep.errors[1].status_code, 403);
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_with_doc_comment() {
+        let source = r#"/** Fetches a single user by ID. */
+        endpoint getUser: GET "/api/users/{id}" {
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "getUser");
+                assert!(
+                    ep.doc_comment.is_some(),
+                    "endpoint should have a doc comment"
+                );
+                let doc = ep.doc_comment.as_ref().unwrap();
+                assert!(
+                    doc.contains("Fetches a single user by ID"),
+                    "doc comment should contain expected text, got: {:?}",
+                    doc
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_full() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            query {
+                Bool verbose = false
+            }
+            body User omit { id }
+            response User
+            error {
+                Conflict(409)
+                BadRequest(400)
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "createUser");
+                assert_eq!(ep.method, HttpMethod::Post);
+                assert_eq!(ep.path, "/api/users");
+                // query
+                assert_eq!(ep.query_params.len(), 1);
+                assert_eq!(ep.query_params[0].name, "verbose");
+                // body
+                let body = ep.body.as_ref().expect("should have body");
+                match &body.base_type {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User) body, got {:?}", other),
+                }
+                assert_eq!(body.modifiers.len(), 1);
+                match &body.modifiers[0] {
+                    TypeModifier::Omit { fields, .. } => assert_eq!(fields, &["id"]),
+                    other => panic!("expected Omit modifier, got {:?}", other),
+                }
+                // response
+                match &ep.response {
+                    Some(TypeExpr::Named(n)) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User) response, got {:?}", other),
+                }
+                // errors
+                assert_eq!(ep.errors.len(), 2);
+                assert_eq!(ep.errors[0].name, "Conflict");
+                assert_eq!(ep.errors[0].status_code, 409);
+                assert_eq!(ep.errors[1].name, "BadRequest");
+                assert_eq!(ep.errors[1].status_code, 400);
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    // ── Endpoint error cases ─────────────────────────────────────────
+
+    #[test]
+    fn parse_endpoint_missing_http_method() {
+        let source = r#"endpoint foo: "/path" { response User }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "should produce a diagnostic for missing HTTP method"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_missing_path() {
+        let source = r#"endpoint foo: GET { response User }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "should produce a diagnostic for missing path string"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_body_on_get() {
+        // Body on a GET endpoint should parse successfully — validation is in the
+        // type checker, not the parser.
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            body User
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.method, HttpMethod::Get);
+                assert!(ep.body.is_some(), "body should be parsed even on GET");
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    // ── Doc comment attachment tests ─────────────────────────────────
+
+    #[test]
+    fn parse_doc_comment_on_struct() {
+        let source = "/** A 2D point. */\nstruct Point { Int x\n Int y }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.name, "Point");
+                assert!(s.doc_comment.is_some(), "struct should have a doc comment");
+                let doc = s.doc_comment.as_ref().unwrap();
+                assert!(
+                    doc.contains("A 2D point"),
+                    "doc comment should contain expected text, got: {:?}",
+                    doc
+                );
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_doc_comment_on_enum() {
+        let source = "/** Primary colors. */\nenum Color { Red\n Green\n Blue }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Enum(e) => {
+                assert_eq!(e.name, "Color");
+                assert!(e.doc_comment.is_some(), "enum should have a doc comment");
+                let doc = e.doc_comment.as_ref().unwrap();
+                assert!(
+                    doc.contains("Primary colors"),
+                    "doc comment should contain expected text, got: {:?}",
+                    doc
+                );
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_delete_method() {
+        let source = r#"endpoint deleteUser: DELETE "/api/users/{id}" {
+            response Void
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.method, HttpMethod::Delete);
+                assert_eq!(ep.path, "/api/users/{id}");
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// A minimal endpoint with no body, response, query, or errors parses successfully.
+    #[test]
+    fn parse_endpoint_minimal_empty_body() {
+        let source = r#"endpoint healthCheck: GET "/api/health" { }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "healthCheck");
+                assert_eq!(ep.method, HttpMethod::Get);
+                assert!(ep.body.is_none());
+                assert!(ep.response.is_none());
+                assert!(ep.query_params.is_empty());
+                assert!(ep.errors.is_empty());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// Body with `pick` followed by `partial` chains correctly.
+    #[test]
+    fn parse_endpoint_body_pick_then_partial() {
+        let source = r#"
+struct User { Int id  String name  String email  Int age }
+endpoint updateEmail: PATCH "/api/users/{id}" {
+    body User pick { name, email } partial { email }
+    response User
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[1] {
+            Declaration::Endpoint(ep) => {
+                let body = ep.body.as_ref().unwrap();
+                assert_eq!(body.modifiers.len(), 2);
+                assert!(
+                    matches!(&body.modifiers[0], TypeModifier::Pick { fields, .. } if fields.len() == 2)
+                );
+                assert!(
+                    matches!(&body.modifiers[1], TypeModifier::Partial { fields: Some(f), .. } if f.len() == 1)
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// Body with selective partial (field list) parses field names correctly.
+    #[test]
+    fn parse_endpoint_selective_partial() {
+        let source = r#"
+struct User { Int id  String name  String email  Int age }
+endpoint patchUser: PATCH "/api/users/{id}" {
+    body User omit { id } partial { email, age }
+    response User
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[1] {
+            Declaration::Endpoint(ep) => {
+                let body = ep.body.as_ref().unwrap();
+                assert_eq!(body.modifiers.len(), 2);
+                match &body.modifiers[1] {
+                    TypeModifier::Partial {
+                        fields: Some(names),
+                        ..
+                    } => {
+                        assert_eq!(names, &vec!["email".to_string(), "age".to_string()]);
+                    }
+                    other => panic!("expected selective Partial, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// Path with multiple parameters parses correctly.
+    #[test]
+    fn parse_endpoint_multiple_path_params() {
+        let source = r#"
+struct Comment { Int id  String text }
+endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId}" {
+    response Comment
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[1] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(
+                    ep.path,
+                    "/api/users/{userId}/posts/{postId}/comments/{commentId}"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// Endpoint with only query params (no body, no response) parses.
+    #[test]
+    fn parse_endpoint_query_only() {
+        let source = r#"endpoint search: GET "/api/search" {
+    query {
+        String term
+        Int page = 1
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.query_params.len(), 2);
+                assert!(ep.body.is_none());
+                assert!(ep.response.is_none());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// Endpoint with only errors (no body, no response) parses.
+    #[test]
+    fn parse_endpoint_errors_only() {
+        let source = r#"endpoint deleteUser: DELETE "/api/users/{id}" {
+    error {
+        NotFound(404)
+        Forbidden(403)
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.errors.len(), 2);
+                assert!(ep.body.is_none());
+                assert!(ep.response.is_none());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// All five HTTP methods parse correctly.
+    #[test]
+    fn parse_endpoint_all_http_methods() {
+        for (method_str, expected) in [
+            ("GET", HttpMethod::Get),
+            ("POST", HttpMethod::Post),
+            ("PUT", HttpMethod::Put),
+            ("PATCH", HttpMethod::Patch),
+            ("DELETE", HttpMethod::Delete),
+        ] {
+            let source = format!(r#"endpoint test: {method_str} "/api/test" {{ }}"#);
+            let (program, diagnostics) = parse_source(&source);
+            assert!(
+                diagnostics.is_empty(),
+                "errors for {method_str}: {:?}",
+                diagnostics
+            );
+            match &program.declarations[0] {
+                Declaration::Endpoint(ep) => assert_eq!(ep.method, expected),
+                other => panic!("expected Endpoint, got {:?}", other),
+            }
+        }
+    }
+
+    /// Query param with Option type parses correctly.
+    #[test]
+    fn parse_endpoint_query_option_type() {
+        let source = r#"endpoint list: GET "/api/items" {
+    query {
+        Option<String> search
+        Int limit = 10
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.query_params.len(), 2);
+                assert_eq!(ep.query_params[0].name, "search");
+                assert!(ep.query_params[0].default_value.is_none());
+                assert_eq!(ep.query_params[1].name, "limit");
+                assert!(ep.query_params[1].default_value.is_some());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    // ── Where constraint tests ──────────────────────────────────────
+
+    /// A struct field with a `where` constraint parses correctly.
+    #[test]
+    fn parse_field_with_where_constraint() {
+        let source = r#"struct User {
+    Int age where self >= 0 and self <= 150
+    String name
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert!(
+                    s.fields[0].constraint.is_some(),
+                    "age should have constraint"
+                );
+                assert!(
+                    s.fields[1].constraint.is_none(),
+                    "name should have no constraint"
+                );
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    /// String field with `self.length` and `self.contains` constraints.
+    #[test]
+    fn parse_field_with_string_constraint() {
+        let source = r#"struct User {
+    String email where self.contains("@") and self.length > 3
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert!(s.fields[0].constraint.is_some());
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    /// Multiple fields, some with constraints and some without.
+    #[test]
+    fn parse_struct_mixed_constraints() {
+        let source = r#"struct User {
+    Int id
+    String name where self.length > 0 and self.length <= 100
+    String email where self.contains("@")
+    Int age where self >= 0
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert!(s.fields[0].constraint.is_none());
+                assert!(s.fields[1].constraint.is_some());
+                assert!(s.fields[2].constraint.is_some());
+                assert!(s.fields[3].constraint.is_some());
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    /// Single constraint (no `and`).
+    #[test]
+    fn parse_field_single_constraint() {
+        let source = "struct Item { Int price where self > 0 }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert!(s.fields[0].constraint.is_some());
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    /// `or` constraint parses.
+    #[test]
+    fn parse_field_or_constraint() {
+        let source = "struct Range { Int x where self < 0 || self > 100 }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => assert!(s.fields[0].constraint.is_some()),
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    /// Float field with constraint.
+    #[test]
+    fn parse_field_float_constraint() {
+        let source = "struct Item { Float price where self > 0.0 && self < 1000.0 }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => assert!(s.fields[0].constraint.is_some()),
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    // ── Schema declaration tests ────────────────────────────────────
+
+    /// A simple schema with one table parses.
+    #[test]
+    fn parse_schema_basic() {
+        let source = r#"
+struct User { Int id  String name }
+schema db {
+    table users from User {
+        primary key id
+        unique email
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[1] {
+            Declaration::Schema(s) => {
+                assert_eq!(s.name, "db");
+                assert_eq!(s.tables.len(), 1);
+                assert_eq!(s.tables[0].name, "users");
+                assert_eq!(s.tables[0].source_type, Some("User".to_string()));
+                assert!(!s.tables[0].body_tokens.is_empty());
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    /// Schema with multiple tables parses.
+    #[test]
+    fn parse_schema_multiple_tables() {
+        let source = r#"
+schema db {
+    table users from User {
+        primary key id
+    }
+    table posts from Post {
+        primary key id
+        foreign key authorId references users(id)
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Schema(s) => {
+                assert_eq!(s.tables.len(), 2);
+                assert_eq!(s.tables[0].name, "users");
+                assert_eq!(s.tables[1].name, "posts");
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    /// Schema with standalone table (no `from` clause) parses.
+    #[test]
+    fn parse_schema_standalone_table() {
+        let source = r#"
+schema db {
+    table sessions {
+        String token primary key
+        Int userId
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Schema(s) => {
+                assert_eq!(s.tables[0].name, "sessions");
+                assert!(s.tables[0].source_type.is_none());
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    /// Empty schema parses.
+    #[test]
+    fn parse_schema_empty() {
+        let source = "schema db { }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Schema(s) => {
+                assert_eq!(s.name, "db");
+                assert!(s.tables.is_empty());
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    /// Schema coexists with structs and endpoints without parse errors.
+    #[test]
+    fn parse_schema_alongside_other_declarations() {
+        let source = r#"
+struct User { Int id  String name }
+endpoint getUser: GET "/api/users/{id}" {
+    response User
+}
+schema db {
+    table users from User {
+        primary key id
+    }
+}
+"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 3);
+        assert!(matches!(&program.declarations[0], Declaration::Struct(_)));
+        assert!(matches!(&program.declarations[1], Declaration::Endpoint(_)));
+        assert!(matches!(&program.declarations[2], Declaration::Schema(_)));
+    }
+
+    /// Table with empty body parses.
+    #[test]
+    fn parse_schema_table_empty_body() {
+        let source = r#"
+schema db {
+    table users from User { }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Schema(s) => {
+                assert_eq!(s.tables[0].name, "users");
+                assert_eq!(s.tables[0].source_type, Some("User".to_string()));
+                assert!(s.tables[0].body_tokens.is_empty());
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    /// Body tokens are correctly captured as separate token strings per line.
+    #[test]
+    fn parse_schema_body_tokens_content() {
+        let source = r#"
+schema db {
+    table users from User {
+        primary key id
+        unique email
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Schema(s) => {
+                let tokens = &s.tables[0].body_tokens;
+                assert_eq!(tokens.len(), 2, "should have 2 constraint lines");
+                assert_eq!(tokens[0], vec!["primary", "key", "id"]);
+                assert_eq!(tokens[1], vec!["unique", "email"]);
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    /// Complex constraint syntax (foreign key with cascade) is captured.
+    #[test]
+    fn parse_schema_complex_constraints() {
+        let source = r#"
+schema db {
+    table posts from Post {
+        primary key id
+        foreign key authorId references users(id) on delete cascade
+    }
+}"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Schema(s) => {
+                let tokens = &s.tables[0].body_tokens;
+                assert_eq!(tokens.len(), 2);
+                // First line: primary key id
+                assert_eq!(tokens[0], vec!["primary", "key", "id"]);
+                // Second line: foreign key authorId references users(id) on delete cascade
+                assert!(
+                    tokens[1].len() >= 5,
+                    "complex constraint should have multiple tokens"
+                );
+                assert_eq!(tokens[1][0], "foreign");
+            }
+            other => panic!("expected Schema, got {:?}", other),
+        }
+    }
+
+    // ── Duplicate section tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_endpoint_duplicate_body() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            body User
+            body User
+            response User
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate `body`")),
+            "should report duplicate body: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_duplicate_response() {
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User
+            response User
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate `response`")),
+            "should report duplicate response: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_duplicate_query() {
+        let source = r#"endpoint listUsers: GET "/api/users" {
+            query { Int page = 1 }
+            query { Int limit = 20 }
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate `query`")),
+            "should report duplicate query: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_duplicate_error() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            body User
+            error { BadRequest(400) }
+            error { Conflict(409) }
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate `error`")),
+            "should report duplicate error: {:?}",
+            diagnostics
+        );
+    }
+
+    // ── Field doc comment tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_struct_field_doc_comment() {
+        let source = r#"struct User {
+            /** The user's full name */
+            String name
+            Int age
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.fields.len(), 2);
+                assert_eq!(
+                    s.fields[0].doc_comment.as_deref(),
+                    Some("The user's full name")
+                );
+                assert!(s.fields[1].doc_comment.is_none());
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_struct_multiple_field_doc_comments() {
+        let source = r#"struct User {
+            /** Unique identifier */
+            Int id
+            /** Display name */
+            String name
+            Int age
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.fields.len(), 3);
+                assert_eq!(
+                    s.fields[0].doc_comment.as_deref(),
+                    Some("Unique identifier")
+                );
+                assert_eq!(s.fields[1].doc_comment.as_deref(), Some("Display name"));
+                assert!(s.fields[2].doc_comment.is_none());
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    // ── Multiline field list in omit/pick ─────────────────────────────
+
+    #[test]
+    fn parse_endpoint_multiline_omit() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            body User omit {
+                id,
+                createdAt,
+            }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                let body = ep.body.as_ref().expect("should have body");
+                match &body.modifiers[0] {
+                    TypeModifier::Omit { fields, .. } => {
+                        assert_eq!(fields, &["id", "createdAt"]);
+                    }
+                    other => panic!("expected Omit, got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
     }
 }

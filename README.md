@@ -1,6 +1,6 @@
 # Phoenix
 
-[![CI](https://github.com/rsaperstein/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rsaperstein/phoenixlang/actions/workflows/ci.yml)
+[![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Phoenix** is a strict, statically typed programming language designed for web development. It combines functional and object-oriented programming in a clean, familiar syntax with a focus on safe concurrency, async-first design, and developer productivity.
@@ -11,9 +11,9 @@ When searching online, use **phoenixlang** to distinguish this project from the 
 
 ## Current Status
 
-Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,082 tests** across the following features:
+Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,617 tests** across **8 crates** with the following features:
 
-- Variables (`let` and `let mut`) with explicit types or type inference
+- Variables (`let` and `let mut`) with explicit types or type inference, **compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`)
 - Functions with typed parameters, return types, **named/default parameters**
 - `if`/`else if`/`else`, `while` loops, `for` loops (range-based and **collection-based**), `break`/`continue`
 - **Loop `else` clauses** — `for/while ... {} else {}` (else runs when loop completes without `break`)
@@ -35,6 +35,8 @@ Phoenix is in **active development**. The current implementation is a **tree-wal
 - **Recursive types** — self-referential enums (linked lists, trees)
 - `//` line comments and `/* */` block comments (nestable)
 - Built-in `print()` and `toString()`
+- **Endpoint declarations** for API schema definition ([Phoenix Gen](docs/phoenix-gen.md))
+- **`where` constraints** on struct fields for validation (`String name where self.length > 0`, `Int age where self >= 0`)
 - **CI pipeline** with `cargo fmt`, `clippy`, and `cargo test`
 
 **Next up:** [Phase 2 — Compilation](docs/roadmap.md) (IR design, Cranelift native compilation, WebAssembly target).
@@ -43,15 +45,23 @@ Phoenix is in **active development**. The current implementation is a **tree-wal
 
 ## Getting Started
 
-### Prerequisites
-
-- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
-
-### Build
+### Quick install
 
 ```bash
-git clone https://github.com/rsaperstein/phoenix.git
-cd phoenix
+curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sh
+```
+
+This installs `phoenix` and `phoenix-lsp` to `/usr/local/bin`. Set `PHOENIX_INSTALL_DIR` to change the location.
+
+Or download binaries directly from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases).
+
+### Build from source
+
+Requires [Rust](https://www.rust-lang.org/tools/install) (stable toolchain).
+
+```bash
+git clone https://github.com/rmsap/phoenixlang.git
+cd phoenixlang
 cargo build --release
 ```
 
@@ -61,9 +71,6 @@ Phoenix source files use the `.phx` extension.
 
 ```bash
 # Run a Phoenix program
-cargo run -- run path/to/file.phx
-
-# Or use the built binary directly
 ./target/release/phoenix run path/to/file.phx
 ```
 
@@ -74,6 +81,14 @@ phoenix lex file.phx     # Tokenize and print the token stream
 phoenix parse file.phx    # Parse and dump the AST as JSON
 phoenix check file.phx    # Type-check without running
 phoenix run file.phx      # Execute the program
+phoenix gen file.phx                      # Generate TypeScript (types, client, handlers, server)
+phoenix gen file.phx --target python      # Generate Python (Pydantic, FastAPI, httpx)
+phoenix gen file.phx --target go          # Generate Go (structs, net/http, client)
+phoenix gen file.phx --target openapi     # Generate OpenAPI 3.1 JSON spec
+phoenix gen file.phx --client             # Generate only types + client SDK
+phoenix gen file.phx --server             # Generate only types + handlers + router
+phoenix gen file.phx --watch              # Watch for changes and re-generate
+phoenix gen                               # Use settings from phoenix.toml
 ```
 
 ---
@@ -101,7 +116,7 @@ let pi: Float = 3.14159
 let name = "Phoenix"        // String
 let count = 10              // Int
 let mut sum = 0             // Int, mutable
-sum = sum + 1
+sum += 1
 
 // Functions with typed parameters and return type
 function add(a: Int, b: Int) -> Int {
@@ -128,7 +143,7 @@ function fizzbuzz(n: Int) -> String {
 function sumTo(n: Int) -> Int {
   let mut total: Int = 0
   for i in 0..n {
-    total = total + i
+    total += i
   }
   total
 }
@@ -268,6 +283,22 @@ See **[Language Vision](docs/vision.md)** for detailed designs and code examples
 
 ---
 
+## Editor Support
+
+A **VS Code extension** is included in `editors/vscode/` with full **Language Server Protocol** support via the `phoenix-lsp` binary:
+
+- **Syntax highlighting** for `.phx` files (keywords, types, strings, numbers, comments, operators, endpoint declarations, `where` constraints)
+- **Inline diagnostics** — errors and warnings as editor squiggles
+- **Hover** — shows resolved type at cursor
+- **Autocomplete** — struct/enum/function names, keywords
+- **Go-to-definition** — jump to declarations from references
+- **Find references** — locate all uses of a symbol
+- **Rename** — rename a symbol across all references
+
+To use: build `phoenix-lsp` with `cargo build -p phoenix-lsp`, then open `editors/vscode/` in VS Code, run `npm install && npm run compile`, and press **F5** to launch the Extension Development Host.
+
+---
+
 ## Project Structure
 
 Phoenix is implemented in Rust as a Cargo workspace:
@@ -279,6 +310,8 @@ Phoenix is implemented in Rust as a Cargo workspace:
 | `phoenix-parser` | Recursive-descent parser and AST |
 | `phoenix-sema` | Semantic analysis (name resolution and type checking) |
 | `phoenix-interp` | Tree-walk interpreter |
+| `phoenix-codegen` | Code generation backends (TypeScript, Python, Go, OpenAPI) |
+| `phoenix-lsp` | Language Server Protocol server |
 | `phoenix-driver` | CLI binary |
 
 ---

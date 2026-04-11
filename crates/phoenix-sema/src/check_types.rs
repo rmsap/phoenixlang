@@ -1,6 +1,6 @@
 use crate::checker::Checker;
 use crate::types::Type;
-use phoenix_parser::ast::*;
+use phoenix_parser::ast::TypeExpr;
 use std::collections::HashMap;
 
 impl Checker {

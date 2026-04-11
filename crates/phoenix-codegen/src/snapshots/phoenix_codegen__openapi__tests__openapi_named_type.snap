@@ -1,0 +1,7 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: "serde_json::to_string_pretty(&schema).unwrap()"
+---
+{
+  "$ref": "#/components/schemas/User"
+}

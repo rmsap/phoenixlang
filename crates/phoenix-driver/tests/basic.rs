@@ -257,7 +257,7 @@ function main() {
 
 #[test]
 fn short_circuit_and_does_not_evaluate_right() {
-    // The right operand of `and` should NOT be evaluated when left is false.
+    // The right operand of `&&` should NOT be evaluated when left is false.
     // If it were evaluated, the division by zero would cause a runtime error.
     run_expect(
         r#"
@@ -266,7 +266,7 @@ function crashes() -> Bool {
   return true
 }
 function main() {
-  let result: Bool = false and crashes()
+  let result: Bool = false && crashes()
   print(result)
 }
 "#,
@@ -276,7 +276,7 @@ function main() {
 
 #[test]
 fn short_circuit_or_does_not_evaluate_right() {
-    // The right operand of `or` should NOT be evaluated when left is true.
+    // The right operand of `||` should NOT be evaluated when left is true.
     run_expect(
         r#"
 function crashes() -> Bool {
@@ -284,7 +284,7 @@ function crashes() -> Bool {
   return false
 }
 function main() {
-  let result: Bool = true or crashes()
+  let result: Bool = true || crashes()
   print(result)
 }
 "#,
@@ -297,7 +297,7 @@ fn short_circuit_and_evaluates_right_when_needed() {
     run_expect(
         r#"
 function main() {
-  let result: Bool = true and false
+  let result: Bool = true && false
   print(result)
 }
 "#,
@@ -310,7 +310,7 @@ fn short_circuit_or_evaluates_right_when_needed() {
     run_expect(
         r#"
 function main() {
-  let result: Bool = false or true
+  let result: Bool = false || true
   print(result)
 }
 "#,
@@ -426,7 +426,7 @@ fn short_circuit_and_does_not_evaluate_rhs() {
     run_expect(
         r#"
 function main() {
-    let x: Bool = false and true
+    let x: Bool = false && true
     print(x)
 }
 "#,
@@ -439,7 +439,7 @@ fn short_circuit_or_does_not_evaluate_rhs() {
     run_expect(
         r#"
 function main() {
-    let x: Bool = true or false
+    let x: Bool = true || false
     print(x)
 }
 "#,
@@ -563,9 +563,9 @@ fn unary_not_operator() {
         r#"
 function main() {
     let a: Bool = true
-    let b: Bool = not a
+    let b: Bool = !a
     print(b)
-    print(not false)
+    print(!false)
 }
 "#,
         &["false", "true"],
@@ -1049,10 +1049,10 @@ fn cannot_not_int() {
     expect_type_error(
         r#"
 function main() {
-    let x: Bool = not 42
+    let x: Bool = !42
 }
 "#,
-        "cannot apply `not`",
+        "cannot apply `!`",
     );
 }
 
@@ -1061,7 +1061,7 @@ fn and_requires_bool_operands() {
     expect_type_error(
         r#"
 function main() {
-    let x: Bool = 1 and 2
+    let x: Bool = 1 && 2
 }
 "#,
         "must be Bool",
@@ -1073,7 +1073,7 @@ fn or_requires_bool_operands() {
     expect_type_error(
         r#"
 function main() {
-    let x: Bool = 1 or 2
+    let x: Bool = 1 || 2
 }
 "#,
         "must be Bool",
@@ -1153,7 +1153,7 @@ fn while_loop_with_break_return_value() {
 function findFirstDivisible(target: Int) -> Int {
     let mut i: Int = 1
     while i < 100 {
-        if target % i == 0 and i > 1 {
+        if target % i == 0 && i > 1 {
             return i
         }
         i = i + 1
@@ -1900,57 +1900,91 @@ function main() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Negative test: compound assignment operators (not supported)
+// Compound assignment operators (+=, -=, *=, /=, %=)
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn compound_plus_equals_parse_error() {
-    expect_parse_error(
+fn compound_plus_equals() {
+    run_expect(
         r#"
 function main() {
   let mut x: Int = 1
   x += 2
+  print(x)
 }
 "#,
-        "expected expression",
+        &["3"],
     );
 }
 
 #[test]
-fn compound_minus_equals_parse_error() {
-    expect_parse_error(
+fn compound_minus_equals() {
+    run_expect(
         r#"
 function main() {
-  let mut x: Int = 1
-  x -= 1
+  let mut x: Int = 10
+  x -= 3
+  print(x)
 }
 "#,
-        "expected expression",
+        &["7"],
     );
 }
 
 #[test]
-fn compound_star_equals_parse_error() {
-    expect_parse_error(
+fn compound_star_equals() {
+    run_expect(
         r#"
 function main() {
-  let mut x: Int = 2
-  x *= 3
+  let mut x: Int = 4
+  x *= 5
+  print(x)
 }
 "#,
-        "expected expression",
+        &["20"],
     );
 }
 
 #[test]
-fn compound_slash_equals_parse_error() {
-    expect_parse_error(
+fn compound_slash_equals() {
+    run_expect(
         r#"
 function main() {
   let mut x: Int = 10
   x /= 2
+  print(x)
 }
 "#,
-        "expected expression",
+        &["5"],
+    );
+}
+
+#[test]
+fn compound_percent_equals() {
+    run_expect(
+        r#"
+function main() {
+  let mut x: Int = 10
+  x %= 3
+  print(x)
+}
+"#,
+        &["1"],
+    );
+}
+
+#[test]
+fn compound_assignment_in_loop() {
+    run_expect(
+        r#"
+function main() {
+  let mut sum: Int = 0
+  for i in 0..5 {
+    sum += i
+  }
+  print(sum)
+}
+"#,
+        &["10"],
     );
 }

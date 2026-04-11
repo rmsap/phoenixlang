@@ -1,0 +1,51 @@
+// SYNTAX TEST "source.phoenix"
+
+function add(a: Int, b: Int) -> Int {
+// <- storage.type.phoenix
+//       ^^^ entity.name.function.phoenix
+//              ^^^ support.type.primitive.phoenix
+//                      ^^^ support.type.primitive.phoenix
+//                           ^^ keyword.operator.arrow.phoenix
+//                              ^^^ support.type.primitive.phoenix
+  a + b
+//  ^ keyword.operator.arithmetic.phoenix
+}
+
+struct User {
+// <- storage.type.phoenix
+//     ^^^^ entity.name.type.phoenix
+  Int id
+//^^^ support.type.primitive.phoenix
+  String name
+//^^^^^^ support.type.primitive.phoenix
+  Option<String> bio
+//^^^^^^ support.type.generic.phoenix
+}
+
+enum Shape {
+// <- storage.type.phoenix
+//   ^^^^^ entity.name.type.phoenix
+  Circle(Float)
+//       ^^^^^ support.type.primitive.phoenix
+  Rect(Float, Float)
+}
+
+trait Display {
+// <- storage.type.phoenix
+//    ^^^^^^^ entity.name.type.phoenix
+  function toString(self) -> String
+//         ^^^^^^^^ entity.name.function.phoenix
+//                  ^^^^ variable.language.self.phoenix
+//                        ^^ keyword.operator.arrow.phoenix
+//                           ^^^^^^ support.type.primitive.phoenix
+}
+
+impl User {
+// <- storage.type.phoenix
+//   ^^^^ entity.name.type.phoenix
+}
+
+type UserId = Int
+// <- storage.type.phoenix
+//   ^^^^^^ entity.name.type.phoenix
+//            ^^^ support.type.primitive.phoenix

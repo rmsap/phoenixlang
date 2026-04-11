@@ -3,9 +3,13 @@
 //! Provides [`span::Span`] for source locations, [`diagnostics::Diagnostic`]
 //! for error/warning messages, and [`source::SourceMap`] for managing loaded
 //! source files.
+#![warn(missing_docs)]
 
+/// Error and warning diagnostics produced by the compiler pipeline.
 pub mod diagnostics;
+/// Source file registry for multi-file compilation.
 pub mod source;
+/// Byte-offset spans and source file identifiers.
 pub mod span;
 
 pub use diagnostics::Diagnostic;

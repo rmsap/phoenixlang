@@ -1,0 +1,122 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let x: Int = 42
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^ source.phoenix support.type.primitive.phoenix
+#          ^ source.phoenix
+#           ^ source.phoenix keyword.operator.assignment.phoenix
+#            ^ source.phoenix
+#             ^^ source.phoenix constant.numeric.integer.phoenix
+>// <- keyword.declaration.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//     ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//           ^^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let mut y: Float = 3.14
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^ source.phoenix keyword.declaration.phoenix
+#       ^ source.phoenix
+#        ^ source.phoenix variable.other.phoenix
+#         ^^ source.phoenix
+#           ^^^^^ source.phoenix support.type.primitive.phoenix
+#                ^ source.phoenix
+#                 ^ source.phoenix keyword.operator.assignment.phoenix
+#                  ^ source.phoenix
+#                   ^^^^ source.phoenix constant.numeric.float.phoenix
+>// <- keyword.declaration.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//  ^^^ keyword.declaration.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//         ^^^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//               ^^^^ constant.numeric.float.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>if true {
+#^^ source.phoenix keyword.control.phoenix
+#  ^ source.phoenix
+#   ^^^^ source.phoenix constant.language.boolean.phoenix
+#       ^^^ source.phoenix
+>// <- keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>// ^^^^ constant.language.boolean.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>} else {
+#^^ source.phoenix
+#  ^^^^ source.phoenix keyword.control.phoenix
+#      ^^^ source.phoenix
+>// ^^^^ keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>while false {
+#^^^^^ source.phoenix keyword.control.phoenix
+#     ^ source.phoenix
+#      ^^^^^ source.phoenix constant.language.boolean.phoenix
+#           ^^^ source.phoenix
+>// <- keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//    ^^^^^ constant.language.boolean.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  break
+#^^ source.phoenix
+#  ^^^^^ source.phoenix keyword.control.phoenix
+>//^^^^^ keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  continue
+#^^ source.phoenix
+#  ^^^^^^^^ source.phoenix keyword.control.phoenix
+>//^^^^^^^^ keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>for i in 0..10 {
+#^^^ source.phoenix keyword.control.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^ source.phoenix
+#      ^^ source.phoenix keyword.control.phoenix
+#        ^ source.phoenix
+#         ^ source.phoenix constant.numeric.integer.phoenix
+#          ^^ source.phoenix keyword.operator.range.phoenix
+#            ^^ source.phoenix constant.numeric.integer.phoenix
+#              ^^^ source.phoenix
+>// <- keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//    ^^ keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//       ^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//        ^^ keyword.operator.range.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//          ^^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>
+>return x
+#^^^^^^ source.phoenix keyword.control.phoenix
+#      ^ source.phoenix
+#       ^ source.phoenix variable.other.phoenix
+>// <- keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>match x {
+#^^^^^ source.phoenix keyword.control.phoenix
+#     ^ source.phoenix
+#      ^ source.phoenix variable.other.phoenix
+#       ^^^ source.phoenix
+>// <- keyword.control.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>}
+#^^ source.phoenix
+>

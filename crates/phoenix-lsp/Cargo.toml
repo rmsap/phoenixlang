@@ -1,0 +1,19 @@
+[package]
+name = "phoenix-lsp"
+description = "Language Server Protocol server for Phoenix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "phoenix-lsp"
+path = "src/main.rs"
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-lexer = { path = "../phoenix-lexer" }
+phoenix-parser = { path = "../phoenix-parser" }
+phoenix-sema = { path = "../phoenix-sema" }
+tower-lsp = { workspace = true }
+tokio = { workspace = true }

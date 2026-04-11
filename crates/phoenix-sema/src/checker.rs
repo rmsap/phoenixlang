@@ -2,7 +2,10 @@ use crate::scope::{ScopeStack, VarInfo};
 use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::Span;
-use phoenix_parser::ast::*;
+use phoenix_parser::ast::{
+    Block, CaptureInfo, Declaration, ElseBranch, FunctionDecl, IfStmt, ImplBlock, InlineTraitImpl,
+    MethodCallExpr, Program, Statement,
+};
 use std::collections::{HashMap, HashSet};
 
 /// The result of semantic analysis, containing diagnostics and resolved
@@ -29,63 +32,241 @@ pub struct CheckResult {
     pub trait_impls: HashSet<(String, String)>,
     /// Registered type aliases (alias_name → info).
     pub type_aliases: HashMap<String, TypeAliasInfo>,
+    /// Resolved endpoint declarations with all types checked.
+    pub endpoints: Vec<EndpointInfo>,
     /// Resolved type for each expression, keyed by the expression's source
     /// span. Populated during the checking pass so that downstream passes
     /// (IR lowering, codegen) can look up the type of any expression without
     /// re-running type inference.
     pub expr_types: HashMap<Span, Type>,
+    /// Symbol references: maps each use-site span to the symbol it refers to.
+    /// Used by the LSP for go-to-definition, find-references, and rename.
+    pub symbol_references: HashMap<Span, SymbolRef>,
+}
+
+/// A reference from a use-site to a symbol definition.
+///
+/// Stored in [`CheckResult::symbol_references`] for each identifier,
+/// field access, or type reference that resolves to a known declaration.
+#[derive(Debug, Clone)]
+pub struct SymbolRef {
+    /// What kind of symbol is being referenced.
+    pub kind: SymbolKind,
+    /// The name of the referenced symbol.
+    pub name: String,
+}
+
+/// The kind of symbol a reference points to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolKind {
+    /// A function declared with `function`.
+    Function,
+    /// A struct declared with `struct`.
+    Struct,
+    /// An enum declared with `enum`.
+    Enum,
+    /// A local variable or parameter.
+    Variable,
+    /// A field on a struct (`struct_name.field_name`).
+    Field {
+        /// The struct type that owns this field.
+        struct_name: String,
+    },
+    /// A method on a type.
+    Method {
+        /// The type that owns this method.
+        type_name: String,
+    },
+    /// An enum variant (e.g., `Some`, `None`, `Ok`, `Err`).
+    EnumVariant {
+        /// The enum type that owns this variant.
+        enum_name: String,
+    },
 }
 
 /// Information about a registered function signature, captured during the
 /// first pass so that call sites can be type-checked in the second pass.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
+    /// Source span of the function name identifier (for go-to-definition).
+    pub definition_span: Span,
+    /// Generic type parameters declared on this function.
     pub type_params: Vec<String>,
     /// Trait bounds for type parameters (e.g. `[("T", ["Display"])]`).
     pub type_param_bounds: Vec<(String, Vec<String>)>,
+    /// The resolved types of the function parameters (excludes `self`).
     pub params: Vec<Type>,
     /// Parameter names, parallel to `params` (excludes `self`).
     pub param_names: Vec<String>,
     /// Indices of parameters that have default values (relative to the
     /// `params`/`param_names` vectors, i.e. excluding `self`).
     pub default_param_indices: Vec<usize>,
+    /// The resolved return type.
     pub return_type: Type,
 }
 
 /// Information about a registered trait.
 #[derive(Debug, Clone)]
 pub struct TraitInfo {
+    /// Source span of the trait name identifier (for go-to-definition).
+    pub definition_span: Span,
+    /// Generic type parameters declared on this trait.
     pub type_params: Vec<String>,
+    /// The method signatures required by this trait.
     pub methods: Vec<TraitMethodInfo>,
 }
 
 /// Information about a method signature in a trait.
 #[derive(Debug, Clone)]
 pub struct TraitMethodInfo {
+    /// The method name.
     pub name: String,
+    /// The resolved parameter types (excludes `self`).
     pub params: Vec<Type>,
+    /// The resolved return type.
     pub return_type: Type,
+}
+
+/// A single resolved field in a struct definition, including any constraint.
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    /// The field name.
+    pub name: String,
+    /// The resolved type.
+    pub ty: Type,
+    /// Optional constraint expression (from `where` clause on the field).
+    pub constraint: Option<phoenix_parser::ast::Expr>,
+    /// Source span of the field declaration.
+    pub definition_span: Span,
 }
 
 /// Information about a registered struct definition (fields and generic params).
 #[derive(Debug, Clone)]
 pub struct StructInfo {
+    /// Source span of the struct name identifier (for go-to-definition).
+    pub definition_span: Span,
+    /// Generic type parameters declared on this struct.
     pub type_params: Vec<String>,
-    pub fields: Vec<(String, Type)>,
+    /// The resolved field definitions.
+    pub fields: Vec<FieldInfo>,
 }
 
 /// Information about a registered enum definition (variants and generic params).
 #[derive(Debug, Clone)]
 pub struct EnumInfo {
+    /// Source span of the enum name identifier (for go-to-definition).
+    pub definition_span: Span,
+    /// Generic type parameters declared on this enum.
     pub type_params: Vec<String>,
+    /// The enum variants as `(name, field_types)` pairs.
     pub variants: Vec<(String, Vec<Type>)>,
 }
 
 /// Information about a method registered on a type (parameter types exclude `self`).
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
-    pub params: Vec<Type>, // excludes self
+    /// Source span of the method name identifier (for go-to-definition).
+    pub definition_span: Span,
+    /// Parameter types for the method, excluding the implicit `self` receiver.
+    pub params: Vec<Type>,
+    /// The method's return type.
     pub return_type: Type,
+}
+
+/// A resolved field in a derived endpoint body type.
+///
+/// Each `DerivedField` represents a single field after all `omit`/`pick`/`partial`
+/// modifiers have been applied to the base struct. Fields removed by `omit` or
+/// not included by `pick` are absent entirely; fields made optional by `partial`
+/// have `optional` set to `true`.
+#[derive(Debug, Clone)]
+pub struct DerivedField {
+    /// The field name.
+    pub name: String,
+    /// The resolved type of the field.
+    pub ty: Type,
+    /// Whether this field is optional (from a `partial` modifier).
+    pub optional: bool,
+    /// Constraint inherited from the base struct field's `where` clause.
+    pub constraint: Option<phoenix_parser::ast::Expr>,
+}
+
+/// A resolved derived type for an endpoint body, with all modifiers applied.
+///
+/// Produced by [`Checker::check_endpoint`] after validating and applying
+/// the `omit`/`pick`/`partial` modifier chain to the base struct's fields.
+/// Downstream code generators use this to emit the exact field set for
+/// request body types without re-evaluating the modifier chain.
+#[derive(Debug, Clone)]
+pub struct ResolvedDerivedType {
+    /// The base struct type name.
+    pub base_type: String,
+    /// The fields after applying omit/pick/partial modifiers.
+    pub fields: Vec<DerivedField>,
+}
+
+/// A literal default value for a query parameter, extracted from the AST.
+///
+/// Stored in a language-agnostic form so that code generators for different
+/// target languages can each emit the correct literal syntax.
+#[derive(Debug, Clone)]
+pub enum DefaultValue {
+    /// An integer default, e.g. `1`.
+    Int(i64),
+    /// A floating-point default, e.g. `3.14`.
+    Float(f64),
+    /// A string default, e.g. `"hello"`.
+    String(String),
+    /// A boolean default: `true` or `false`.
+    Bool(bool),
+}
+
+/// Information about a resolved query parameter in an endpoint.
+///
+/// Captures the parameter name, its resolved type, and whether a default
+/// value was provided. Code generators use this to determine which query
+/// parameters are required vs. optional in generated client signatures,
+/// and to apply default values in server router wiring.
+#[derive(Debug, Clone)]
+pub struct QueryParamInfo {
+    /// The parameter name.
+    pub name: String,
+    /// The resolved type.
+    pub ty: Type,
+    /// Whether the parameter has a default value.
+    pub has_default: bool,
+    /// The literal default value, if provided. Used by server-side code
+    /// generators to apply defaults when query parameters are omitted.
+    pub default_value: Option<DefaultValue>,
+}
+
+/// Resolved information about an endpoint declaration, produced during
+/// semantic analysis.
+///
+/// Contains everything a code generator needs to emit typed client methods,
+/// server handler stubs, and OpenAPI-style documentation for a single HTTP
+/// endpoint: the HTTP method, URL pattern (with extracted path parameters),
+/// query parameters, resolved body and response types, and error variants.
+#[derive(Debug, Clone)]
+pub struct EndpointInfo {
+    /// The endpoint name (e.g., "createUser").
+    pub name: String,
+    /// The HTTP method.
+    pub method: phoenix_parser::ast::HttpMethod,
+    /// The URL path pattern (e.g., "/api/users/{id}").
+    pub path: String,
+    /// Path parameters extracted from `{param}` segments in the URL.
+    pub path_params: Vec<String>,
+    /// Resolved query parameters.
+    pub query_params: Vec<QueryParamInfo>,
+    /// The resolved body type with modifiers applied, if present.
+    pub body: Option<ResolvedDerivedType>,
+    /// The resolved response type, if declared.
+    pub response: Option<Type>,
+    /// Error variants: (name, status_code).
+    pub errors: Vec<(String, i64)>,
+    /// Doc comment attached to this endpoint.
+    pub doc_comment: Option<String>,
 }
 
 /// Information about a registered type alias.
@@ -94,6 +275,8 @@ pub struct MethodInfo {
 /// checker can expand aliases when they appear in type positions.
 #[derive(Debug, Clone)]
 pub struct TypeAliasInfo {
+    /// Source span of the alias name identifier (for go-to-definition).
+    pub definition_span: Span,
     /// Generic type parameters declared on the alias (e.g. `["T"]` for
     /// `type StringResult<T> = Result<T, String>`). Empty for non-generic aliases.
     pub type_params: Vec<String>,
@@ -114,6 +297,8 @@ pub struct Checker {
     pub(crate) trait_impls: HashSet<(String, String)>,
     /// Registered type aliases (`type Name = TypeExpr`).
     pub(crate) type_aliases: HashMap<String, TypeAliasInfo>,
+    /// Resolved endpoint declarations.
+    pub(crate) endpoints: Vec<EndpointInfo>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     /// Captured variables for each lambda, keyed by the lambda's source span.
     pub(crate) lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
@@ -126,6 +311,8 @@ pub struct Checker {
     pub(crate) current_type_param_bounds: Vec<(String, Vec<String>)>,
     /// Resolved type for each expression, keyed by source span.
     pub(crate) expr_types: HashMap<Span, Type>,
+    /// Symbol references collected during checking.
+    pub(crate) symbol_references: HashMap<Span, SymbolRef>,
 }
 
 impl Default for Checker {
@@ -146,6 +333,7 @@ impl Checker {
             traits: HashMap::new(),
             trait_impls: HashSet::new(),
             type_aliases: HashMap::new(),
+            endpoints: Vec::new(),
             diagnostics: Vec::new(),
             lambda_captures: HashMap::new(),
             current_return_type: None,
@@ -153,6 +341,7 @@ impl Checker {
             current_type_params: Vec::new(),
             current_type_param_bounds: Vec::new(),
             expr_types: HashMap::new(),
+            symbol_references: HashMap::new(),
         }
     }
 
@@ -193,6 +382,7 @@ impl Checker {
                     self.structs.insert(
                         s.name.clone(),
                         StructInfo {
+                            definition_span: s.name_span,
                             type_params: s.type_params.clone(),
                             fields: Vec::new(),
                         },
@@ -202,6 +392,7 @@ impl Checker {
                     self.enums.insert(
                         e.name.clone(),
                         EnumInfo {
+                            definition_span: e.name_span,
                             type_params: e.type_params.clone(),
                             variants: Vec::new(),
                         },
@@ -221,6 +412,8 @@ impl Checker {
                 Declaration::Impl(imp) => self.register_impl(imp),
                 Declaration::Trait(t) => self.register_trait(t),
                 Declaration::TypeAlias(ta) => self.register_type_alias(ta),
+                Declaration::Endpoint(ep) => self.check_endpoint(ep),
+                Declaration::Schema(_) => {} // Parse-only, no type checking
             }
         }
 
@@ -235,7 +428,10 @@ impl Checker {
                 Declaration::Enum(e) => {
                     self.check_inline_methods(&e.name, &e.methods, &e.trait_impls, e.span);
                 }
-                Declaration::Trait(_) | Declaration::TypeAlias(_) => {}
+                Declaration::Trait(_)
+                | Declaration::TypeAlias(_)
+                | Declaration::Endpoint(_)
+                | Declaration::Schema(_) => {} // Parse-only, no checking
             }
         }
     }
@@ -275,8 +471,14 @@ impl Checker {
                         );
                     }
                 }
-                this.scopes
-                    .define(param.name.clone(), VarInfo { ty, is_mut: false });
+                this.scopes.define(
+                    param.name.clone(),
+                    VarInfo {
+                        ty,
+                        is_mut: false,
+                        definition_span: param.span,
+                    },
+                );
             }
 
             this.check_block(&func.body);
@@ -379,6 +581,7 @@ impl Checker {
                     VarInfo {
                         ty: self_type,
                         is_mut: false,
+                        definition_span: func.span,
                     },
                 );
 
@@ -387,8 +590,14 @@ impl Checker {
                         continue;
                     }
                     let ty = this.resolve_type_expr(&param.type_annotation);
-                    this.scopes
-                        .define(param.name.clone(), VarInfo { ty, is_mut: false });
+                    this.scopes.define(
+                        param.name.clone(),
+                        VarInfo {
+                            ty,
+                            is_mut: false,
+                            definition_span: param.span,
+                        },
+                    );
                 }
 
                 this.check_block(&func.body);
@@ -663,6 +872,16 @@ impl Checker {
     pub(crate) fn error(&mut self, message: String, span: Span) {
         self.diagnostics.push(Diagnostic::error(message, span));
     }
+
+    /// Records a symbol reference at the given use-site span.
+    ///
+    /// This is called during type checking whenever an identifier, field access,
+    /// or type name resolves to a known declaration. The LSP uses this data for
+    /// go-to-definition, find-references, and rename.
+    pub(crate) fn record_reference(&mut self, use_span: Span, kind: SymbolKind, name: String) {
+        self.symbol_references
+            .insert(use_span, SymbolRef { kind, name });
+    }
 }
 
 /// Type-checks a Phoenix program and returns diagnostics and resolved type
@@ -724,2070 +943,8 @@ pub fn check(program: &Program) -> CheckResult {
         traits: checker.traits,
         trait_impls: checker.trait_impls,
         type_aliases: checker.type_aliases,
+        endpoints: checker.endpoints,
         expr_types: checker.expr_types,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use phoenix_common::span::SourceId;
-    use phoenix_lexer::lexer::tokenize;
-    use phoenix_parser::parser;
-
-    fn check_source(source: &str) -> Vec<Diagnostic> {
-        let tokens = tokenize(source, SourceId(0));
-        let (program, parse_errors) = parser::parse(&tokens);
-        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
-        check(&program).diagnostics
-    }
-
-    fn assert_no_errors(source: &str) {
-        let errors = check_source(source);
-        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
-    }
-
-    fn assert_has_error(source: &str, expected_msg: &str) {
-        let errors = check_source(source);
-        assert!(
-            errors.iter().any(|e| e.message.contains(expected_msg)),
-            "expected error containing '{}', got: {:?}",
-            expected_msg,
-            errors
-        );
-    }
-
-    #[test]
-    fn valid_simple_program() {
-        assert_no_errors("function main() { let x: Int = 42\n print(x) }");
-    }
-
-    #[test]
-    fn valid_function_call() {
-        assert_no_errors(
-            "function add(a: Int, b: Int) -> Int { return a + b }\nfunction main() { let result: Int = add(1, 2)\n print(result) }",
-        );
-    }
-
-    #[test]
-    fn type_mismatch_var_decl() {
-        assert_has_error(
-            "function main() { let x: Int = \"hello\" }",
-            "type mismatch",
-        );
-    }
-
-    #[test]
-    fn undefined_variable() {
-        assert_has_error("function main() { print(x) }", "undefined variable `x`");
-    }
-
-    #[test]
-    fn duplicate_variable() {
-        assert_has_error(
-            "function main() { let x: Int = 1\n let x: Int = 2 }",
-            "already defined",
-        );
-    }
-
-    #[test]
-    fn assignment_to_immutable() {
-        assert_has_error(
-            "function main() { let x: Int = 1\n x = 2 }",
-            "cannot assign to immutable",
-        );
-    }
-
-    #[test]
-    fn assignment_to_mutable() {
-        assert_no_errors("function main() { let mut x: Int = 1\n x = 2 }");
-    }
-
-    #[test]
-    fn return_type_mismatch() {
-        assert_has_error(
-            "function foo() -> Int { return \"hello\" }",
-            "return type mismatch",
-        );
-    }
-
-    #[test]
-    fn if_condition_not_bool() {
-        assert_has_error(
-            "function main() { if 42 { print(1) } }",
-            "if condition must be Bool",
-        );
-    }
-
-    #[test]
-    fn wrong_argument_count() {
-        assert_has_error(
-            "function foo(a: Int) -> Int { return a }\nfunction main() { foo(1, 2) }",
-            "takes 1 argument",
-        );
-    }
-
-    #[test]
-    fn wrong_argument_type() {
-        assert_has_error(
-            "function foo(a: Int) -> Int { return a }\nfunction main() { foo(\"hello\") }",
-            "expected `Int` but got `String`",
-        );
-    }
-
-    #[test]
-    fn while_loop_valid() {
-        assert_no_errors("function main() { let mut x: Int = 0\n while x < 10 { x = x + 1 } }");
-    }
-
-    #[test]
-    fn while_condition_not_bool() {
-        assert_has_error(
-            "function main() { while 42 { print(1) } }",
-            "while condition must be Bool",
-        );
-    }
-
-    #[test]
-    fn for_loop_valid() {
-        assert_no_errors("function main() { for i in 0..10 { print(i) } }");
-    }
-
-    #[test]
-    fn struct_valid() {
-        assert_no_errors(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.x) }",
-        );
-    }
-
-    #[test]
-    fn struct_wrong_field_count() {
-        assert_has_error(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1) }",
-            "has 2 field(s), got 1",
-        );
-    }
-
-    #[test]
-    fn enum_and_match() {
-        assert_no_errors(
-            "enum Color {\n  Red\n  Green\n  Blue\n}\nfunction main() {\n  let c: Color = Red\n  match c {\n    Red -> print(\"red\")\n    Green -> print(\"green\")\n    Blue -> print(\"blue\")\n  }\n}",
-        );
-    }
-
-    #[test]
-    fn for_loop_non_int_range() {
-        assert_has_error(
-            "function main() { for i: Float in 0..10 { print(i) } }",
-            "for loop variable must be Int",
-        );
-    }
-
-    #[test]
-    fn while_loop_with_return() {
-        assert_no_errors(
-            "function foo() -> Int { let mut x: Int = 0\n while x < 10 { x = x + 1\n return x } return 0 }",
-        );
-    }
-
-    #[test]
-    fn struct_field_access_valid() {
-        assert_no_errors(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.x) }",
-        );
-    }
-
-    #[test]
-    fn struct_field_access_invalid() {
-        assert_has_error(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.z) }",
-            "has no field `z`",
-        );
-    }
-
-    #[test]
-    fn struct_field_type_check() {
-        assert_no_errors(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n let val: Int = p.x }",
-        );
-    }
-
-    #[test]
-    fn method_call_valid() {
-        assert_no_errors(
-            "struct Counter {\n  Int value\n}\nimpl Counter {\n  function get(self) -> Int { return self.value }\n}\nfunction main() { let c: Counter = Counter(0)\n let v: Int = c.get() }",
-        );
-    }
-
-    #[test]
-    fn method_call_undefined() {
-        assert_has_error(
-            "struct Counter {\n  Int value\n}\nfunction main() { let c: Counter = Counter(0)\n c.reset() }",
-            "no method `reset`",
-        );
-    }
-
-    #[test]
-    fn method_wrong_args() {
-        assert_has_error(
-            "struct Counter {\n  Int value\n}\nimpl Counter {\n  function add(self, n: Int) -> Int { return self.value + n }\n}\nfunction main() { let c: Counter = Counter(0)\n c.add(1, 2) }",
-            "takes 1 argument",
-        );
-    }
-
-    #[test]
-    fn enum_variant_with_wrong_field_count() {
-        assert_has_error(
-            "enum Shape {\n  Circle(Float)\n  Square(Float)\n}\nfunction main() { let s: Shape = Circle(1.0, 2.0) }",
-            "takes 1 field(s), got 2",
-        );
-    }
-
-    #[test]
-    fn enum_variant_with_wrong_field_type() {
-        assert_has_error(
-            "enum Shape {\n  Circle(Float)\n  Square(Float)\n}\nfunction main() { let s: Shape = Circle(\"hello\") }",
-            "expected `Float` but got `String`",
-        );
-    }
-
-    #[test]
-    fn match_on_enum_with_bindings() {
-        assert_no_errors(
-            "enum Shape {\n  Circle(Float)\n  Square(Float)\n}\nfunction main() {\n  let s: Shape = Circle(3.14)\n  match s {\n    Circle(r) -> print(r)\n    Square(side) -> print(side)\n  }\n}",
-        );
-    }
-
-    #[test]
-    fn impl_on_enum_valid() {
-        assert_no_errors(
-            "enum Color {\n  Red\n  Green\n  Blue\n}\nimpl Color {\n  function describe(self) -> String { return \"a color\" }\n}\nfunction main() {\n  let c: Color = Red\n  let desc: String = c.describe()\n}",
-        );
-    }
-
-    #[test]
-    fn else_if_chain_type_check() {
-        assert_has_error(
-            "function main() { let x: Int = 1\n if x == 1 { print(1) } else if 42 { print(2) } }",
-            "if condition must be Bool",
-        );
-    }
-
-    #[test]
-    fn break_inside_while_valid() {
-        assert_no_errors("function main() { while true { break } }");
-    }
-
-    #[test]
-    fn continue_inside_for_valid() {
-        assert_no_errors("function main() { for i in 0..10 { continue } }");
-    }
-
-    #[test]
-    fn break_outside_loop_error() {
-        assert_has_error("function main() { break }", "`break` outside of loop");
-    }
-
-    #[test]
-    fn continue_outside_loop_error() {
-        assert_has_error("function main() { continue }", "`continue` outside of loop");
-    }
-
-    #[test]
-    fn break_in_nested_if_inside_loop() {
-        assert_no_errors(
-            "function main() { let mut x: Int = 0\n while true { x = x + 1\n if x == 5 { break } } }",
-        );
-    }
-
-    #[test]
-    fn struct_type_as_param() {
-        assert_no_errors(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction show(p: Point) { print(p.x) }\nfunction main() { let p: Point = Point(1, 2)\n show(p) }",
-        );
-    }
-
-    /// A variable with a function type assigned a compatible lambda passes type checking.
-    #[test]
-    fn lambda_type_check_valid() {
-        assert_no_errors(
-            "function main() {\n  let double: (Int) -> Int = function(x: Int) -> Int { return x * 2 }\n  print(double(5))\n}",
-        );
-    }
-
-    /// Assigning a lambda with mismatched parameter types to a function-typed variable
-    /// produces a type mismatch error.
-    #[test]
-    fn lambda_type_mismatch() {
-        assert_has_error(
-            "function main() {\n  let f: (Int) -> Int = function(x: String) -> Int { return 0 }\n}",
-            "type mismatch",
-        );
-    }
-
-    /// Calling a variable that holds a function value type-checks correctly,
-    /// verifying argument types and returning the correct result type.
-    #[test]
-    fn call_function_variable() {
-        assert_no_errors(
-            "function main() {\n  let add: (Int, Int) -> Int = function(a: Int, b: Int) -> Int { return a + b }\n  let result: Int = add(1, 2)\n}",
-        );
-    }
-
-    /// A function that takes another function as a parameter type-checks
-    /// when the argument is a compatible lambda.
-    #[test]
-    fn higher_order_function() {
-        assert_no_errors(
-            "function apply(f: (Int) -> Int, x: Int) -> Int {\n  return f(x)\n}\nfunction main() {\n  let double: (Int) -> Int = function(x: Int) -> Int { return x * 2 }\n  let result: Int = apply(double, 5)\n}",
-        );
-    }
-
-    /// A lambda that references a variable from an outer scope type-checks
-    /// successfully (the outer variable is visible inside the lambda body).
-    #[test]
-    fn closure_captures_outer_variable() {
-        assert_no_errors(
-            "function main() {\n  let offset: Int = 10\n  let addOffset: (Int) -> Int = function(x: Int) -> Int { return x + offset }\n  let result: Int = addOffset(5)\n}",
-        );
-    }
-
-    /// A generic identity function infers T from its argument and type-checks.
-    #[test]
-    fn generic_function_identity() {
-        assert_no_errors(
-            "function identity<T>(x: T) -> T { return x }\nfunction main() { let result: Int = identity(42) }",
-        );
-    }
-
-    /// A generic struct with two type parameters type-checks when constructed
-    /// with matching concrete types.
-    #[test]
-    fn generic_struct_valid() {
-        assert_no_errors(
-            "struct Pair<A, B> {\n  A first\n  B second\n}\nfunction main() { let p: Pair<Int, String> = Pair(1, \"hi\") }",
-        );
-    }
-
-    /// A generic enum with a value-carrying variant type-checks correctly.
-    #[test]
-    fn generic_enum_option() {
-        assert_no_errors(
-            "enum Option<T> {\n  Some(T)\n  None\n}\nfunction main() { let x: Option<Int> = Some(42) }",
-        );
-    }
-
-    /// The `None` variant of a generic enum is compatible with any concrete
-    /// instantiation because its type arguments remain as type variables.
-    #[test]
-    fn generic_enum_none_compatible() {
-        assert_no_errors(
-            "enum Option<T> {\n  Some(T)\n  None\n}\nfunction main() { let x: Option<Int> = None }",
-        );
-    }
-
-    /// Assigning the result of a generic function to the wrong concrete type
-    /// produces a type mismatch error (T is inferred as Int, not String).
-    #[test]
-    fn generic_function_type_mismatch() {
-        assert_has_error(
-            "function identity<T>(x: T) -> T { return x }\nfunction main() { let s: String = identity(42) }",
-            "type mismatch",
-        );
-    }
-
-    #[test]
-    fn list_literal_valid() {
-        assert_no_errors("function main() { let nums: List<Int> = [1, 2, 3] }");
-    }
-
-    #[test]
-    fn list_literal_empty() {
-        assert_no_errors("function main() { let nums: List<Int> = [] }");
-    }
-
-    #[test]
-    fn list_element_type_mismatch() {
-        assert_has_error(
-            "function main() { let nums: List<Int> = [1, \"hello\", 3] }",
-            "list element type mismatch",
-        );
-    }
-
-    #[test]
-    fn list_length_method() {
-        assert_no_errors(
-            "function main() { let nums: List<Int> = [1, 2, 3]\n let len: Int = nums.length() }",
-        );
-    }
-
-    #[test]
-    fn list_get_method() {
-        assert_no_errors(
-            "function main() { let nums: List<Int> = [1, 2, 3]\n let first: Int = nums.get(0) }",
-        );
-    }
-
-    #[test]
-    fn list_get_wrong_arg_type() {
-        assert_has_error(
-            "function main() { let nums: List<Int> = [1, 2, 3]\n let first: Int = nums.get(\"zero\") }",
-            "expected Int but got String",
-        );
-    }
-
-    #[test]
-    fn list_push_method() {
-        assert_no_errors(
-            "function main() { let nums: List<Int> = [1, 2]\n let nums2: List<Int> = nums.push(3) }",
-        );
-    }
-
-    #[test]
-    fn list_push_wrong_type() {
-        assert_has_error(
-            "function main() { let nums: List<Int> = [1, 2]\n let nums2: List<Int> = nums.push(\"hello\") }",
-            "expected Int but got String",
-        );
-    }
-
-    #[test]
-    fn list_unknown_method() {
-        assert_has_error(
-            "function main() { let nums: List<Int> = [1]\n nums.foo() }",
-            "no method `foo` on type `List`",
-        );
-    }
-
-    #[test]
-    fn list_type_annotation() {
-        assert_no_errors("function main() { let names: List<String> = [\"alice\", \"bob\"] }");
-    }
-
-    #[test]
-    fn list_var_decl_type_mismatch() {
-        assert_has_error(
-            "function main() { let nums: List<Int> = [\"hello\"] }",
-            "type mismatch",
-        );
-    }
-
-    // --- Built-in Option and Result type tests ---
-
-    /// `Option<Int> x = Some(42)` passes type checking using the built-in Option enum.
-    #[test]
-    fn option_some_valid() {
-        assert_no_errors("function main() { let x: Option<Int> = Some(42) }");
-    }
-
-    /// `Option<Int> x = None` passes because None is compatible with any Option instantiation.
-    #[test]
-    fn option_none_valid() {
-        assert_no_errors("function main() { let x: Option<Int> = None }");
-    }
-
-    /// `Option<String> x = Some(42)` produces a type mismatch (Int vs String).
-    #[test]
-    fn option_type_mismatch() {
-        assert_has_error(
-            "function main() { let x: Option<String> = Some(42) }",
-            "type mismatch",
-        );
-    }
-
-    /// The return type of `unwrap()` on `Option<Int>` is `Int`.
-    #[test]
-    fn option_unwrap_type() {
-        assert_no_errors(
-            "function main() { let x: Option<Int> = Some(42)\n let v: Int = x.unwrap() }",
-        );
-    }
-
-    /// `Result<Int, String> x = Ok(42)` passes type checking using the built-in Result enum.
-    #[test]
-    fn result_ok_valid() {
-        assert_no_errors(r#"function main() { let x: Result<Int, String> = Ok(42) }"#);
-    }
-
-    /// `Result<Int, String> x = Err("oops")` passes type checking.
-    #[test]
-    fn result_err_valid() {
-        assert_no_errors(r#"function main() { let x: Result<Int, String> = Err("oops") }"#);
-    }
-
-    /// `isOk()` on a Result returns Bool.
-    #[test]
-    fn result_is_ok_returns_bool() {
-        assert_no_errors(
-            r#"function main() { let r: Result<Int, String> = Ok(1)
-let b: Bool = r.isOk() }"#,
-        );
-    }
-
-    /// Providing the wrong number of type arguments to a generic struct
-    /// produces a type mismatch error (Pair needs 2, but only 1 is given).
-    #[test]
-    fn generic_wrong_type_arg_count() {
-        assert_has_error(
-            "struct Pair<A, B> {\n  A first\n  B second\n}\nfunction main() { let p: Pair<Int> = Pair(1, \"hi\") }",
-            "type mismatch",
-        );
-    }
-
-    /// A generic higher-order function `unwrapOr` that takes an `Option<T>`
-    /// and a default `T` value type-checks correctly.
-    #[test]
-    fn generic_unwrap_or() {
-        assert_no_errors(
-            "enum Option<T> {\n  Some(T)\n  None\n}\nfunction unwrapOr<T>(opt: Option<T>, defaultVal: T) -> T {\n  return match opt {\n    Some(v) -> v\n    None -> defaultVal\n  }\n}\nfunction main() {\n  let x: Option<Int> = Some(42)\n  let result: Int = unwrapOr(x, 0)\n}",
-        );
-    }
-
-    /// Calling a closure with the wrong number of arguments produces an error.
-    #[test]
-    fn closure_wrong_arg_count() {
-        assert_has_error(
-            "function main() {\n  let f: (Int) -> Int = function(x: Int) -> Int { return x * 2 }\n  f(1, 2)\n}",
-            "takes 1 argument(s), got 2",
-        );
-    }
-
-    /// A lambda whose body returns the wrong type produces a return type mismatch error.
-    #[test]
-    fn closure_return_type_mismatch() {
-        assert_has_error(
-            "function main() {\n  let f: (Int) -> Int = function(x: Int) -> Int { return \"hello\" }\n}",
-            "return type mismatch",
-        );
-    }
-
-    /// `Option<List<Int>>` with a nested generic type passes type checking.
-    #[test]
-    fn generic_nested_type() {
-        assert_no_errors("function main() { let x: Option<List<Int>> = Some([1, 2, 3]) }");
-    }
-
-    /// Passing a function with the wrong type signature to a higher-order
-    /// function produces a type mismatch error.
-    #[test]
-    fn function_type_param_mismatch() {
-        assert_has_error(
-            "function apply(f: (Int) -> Int, x: Int) -> Int {\n  return f(x)\n}\nfunction main() {\n  let g: (String) -> String = function(s: String) -> String { return s }\n  apply(g, 5)\n}",
-            "expected `(Int) -> Int` but got `(String) -> String`",
-        );
-    }
-
-    /// A lambda that returns another lambda type-checks correctly with
-    /// nested function types.
-    #[test]
-    fn nested_closures_valid() {
-        assert_no_errors(
-            "function main() {\n  let makeAdder: (Int) -> (Int) -> Int = function(n: Int) -> (Int) -> Int {\n    return function(x: Int) -> Int { return x + n }\n  }\n  let add5: (Int) -> Int = makeAdder(5)\n  let result: Int = add5(10)\n}",
-        );
-    }
-
-    /// A full trait decl + impl + method call passes type checking.
-    #[test]
-    fn trait_impl_valid() {
-        assert_no_errors(
-            r#"
-trait Display {
-  function toString(self) -> String
-}
-struct Point {
-  Int x
-  Int y
-
-  impl Display {
-    function toString(self) -> String { return "Point" }
-  }
-}
-function main() {
-  let p: Point = Point(1, 2)
-  let s: String = p.toString()
-}
-"#,
-        );
-    }
-
-    /// An impl that is missing a required trait method produces an error.
-    #[test]
-    fn trait_impl_missing_method() {
-        assert_has_error(
-            r#"
-trait Display {
-  function toString(self) -> String
-}
-struct Point {
-  Int x
-  Int y
-
-  impl Display {
-  }
-}
-function main() { }
-"#,
-            "missing method `toString`",
-        );
-    }
-
-    /// A generic function with a trait bound, called with a type that implements
-    /// the trait, passes type checking.
-    #[test]
-    fn trait_bound_satisfied() {
-        assert_no_errors(
-            r#"
-trait Display {
-  function toString(self) -> String
-}
-struct Point {
-  Int x
-  Int y
-
-  impl Display {
-    function toString(self) -> String { return "Point" }
-  }
-}
-function show<T: Display>(item: T) -> String {
-  return item.toString()
-}
-function main() {
-  let p: Point = Point(1, 2)
-  let s: String = show(p)
-}
-"#,
-        );
-    }
-
-    /// A generic function with a trait bound, called with a type that does NOT
-    /// implement the trait, produces an error.
-    #[test]
-    fn trait_bound_not_satisfied() {
-        assert_has_error(
-            r#"
-trait Display {
-  function toString(self) -> String
-}
-struct Point {
-  Int x
-  Int y
-}
-function show<T: Display>(item: T) -> String {
-  return item.toString()
-}
-function main() {
-  let p: Point = Point(1, 2)
-  let s: String = show(p)
-}
-"#,
-            "does not implement trait `Display`",
-        );
-    }
-
-    /// `impl FakeTrait for X` where FakeTrait is not defined produces an error.
-    #[test]
-    fn unknown_trait_in_impl() {
-        assert_has_error(
-            r#"
-struct Point {
-  Int x
-  Int y
-
-  impl FakeTrait {
-    function foo(self) -> Int { return 0 }
-  }
-}
-function main() { }
-"#,
-            "unknown trait `FakeTrait`",
-        );
-    }
-
-    /// A trait with two methods, both implemented, passes type checking.
-    #[test]
-    fn trait_multiple_methods_valid() {
-        assert_no_errors(
-            r#"
-trait Shape {
-  function area(self) -> Float
-  function name(self) -> String
-}
-struct Circle {
-  Float radius
-
-  impl Shape {
-    function area(self) -> Float { return 3.14 }
-    function name(self) -> String { return "Circle" }
-  }
-}
-function main() {
-  let c: Circle = Circle(1.0)
-  let a: Float = c.area()
-  let n: String = c.name()
-}
-"#,
-        );
-    }
-
-    /// A trait with two methods where impl only provides one should error.
-    #[test]
-    fn trait_partial_impl() {
-        assert_has_error(
-            r#"
-trait Shape {
-  function area(self) -> Float
-  function name(self) -> String
-}
-struct Circle {
-  Float radius
-
-  impl Shape {
-    function area(self) -> Float { return 3.14 }
-  }
-}
-function main() { }
-"#,
-            "missing method `name`",
-        );
-    }
-
-    // --- Type inference tests ---
-
-    /// Type inference works for literals.
-    #[test]
-    fn type_inference_literal() {
-        assert_no_errors("function main() { let x = 42\n print(x) }");
-    }
-
-    /// Type inference works for struct constructors.
-    #[test]
-    fn type_inference_struct() {
-        assert_no_errors(
-            r#"
-struct Point { Int x  Int y }
-function main() {
-  let p = Point(1, 2)
-  print(p.x)
-}
-"#,
-        );
-    }
-
-    /// Type inference rejects Void initializer.
-    #[test]
-    fn type_inference_rejects_void() {
-        assert_has_error(
-            "function foo() { }\nfunction main() { let x = foo() }",
-            "cannot infer type for `x`: initializer has type Void",
-        );
-    }
-
-    /// Type inference rejects ambiguous generic types (e.g. `None`).
-    #[test]
-    fn type_inference_rejects_ambiguous_generic() {
-        assert_has_error(
-            "function main() { let x = None }",
-            "cannot infer type for `x`: initializer has ambiguous type",
-        );
-    }
-
-    /// Explicit annotation with `None` is fine — the annotation resolves the type.
-    #[test]
-    fn type_annotation_resolves_none() {
-        assert_no_errors("function main() { let x: Option<Int> = None }");
-    }
-
-    /// Type inference works for mutable variables.
-    #[test]
-    fn type_inference_mut() {
-        assert_no_errors(
-            r#"
-function main() {
-  let mut x = 42
-  x = x + 1
-  print(x)
-}
-"#,
-        );
-    }
-
-    /// Type inference works for string values with mutability.
-    #[test]
-    fn type_inference_mut_string() {
-        assert_no_errors(
-            r#"
-function main() {
-  let mut s = "hello"
-  s = "world"
-  print(s)
-}
-"#,
-        );
-    }
-
-    /// Type inference catches type mismatches on reassignment.
-    #[test]
-    fn type_inference_mut_mismatch() {
-        assert_has_error(
-            r#"
-function main() {
-  let mut x = 42
-  x = "hello"
-}
-"#,
-            "type mismatch",
-        );
-    }
-
-    /// For-loop with inferred type (no annotation) works.
-    #[test]
-    fn for_loop_inferred_type() {
-        assert_no_errors("function main() { for i in 0..10 { print(i) } }");
-    }
-
-    /// For-loop with explicit Int type annotation works.
-    #[test]
-    fn for_loop_explicit_int_type() {
-        assert_no_errors("function main() { for i: Int in 0..10 { print(i) } }");
-    }
-
-    // --- GC memory model tests ---
-    // Phoenix uses garbage collection.  All values — including structs, enums,
-    // lists, and closures — can be freely shared and reused after assignment or
-    // being passed to functions.
-
-    /// A struct assigned to another variable remains usable.
-    #[test]
-    fn struct_reusable_after_assignment() {
-        assert_no_errors(
-            r#"
-struct Point {
-  Int x
-  Int y
-}
-function main() {
-  let p: Point = Point(1, 2)
-  let q: Point = p
-  print(p.x)
-  print(q.x)
-}
-"#,
-        );
-    }
-
-    /// A list assigned to another variable remains usable.
-    #[test]
-    fn list_reusable_after_assignment() {
-        assert_no_errors(
-            r#"
-function main() {
-  let a: List<Int> = [1, 2, 3]
-  let b: List<Int> = a
-  print(a.length())
-  print(b.length())
-}
-"#,
-        );
-    }
-
-    /// An enum (Option) assigned to another variable remains usable.
-    #[test]
-    fn enum_reusable_after_assignment() {
-        assert_no_errors(
-            r#"
-function main() {
-  let a: Option<Int> = Some(42)
-  let b: Option<Int> = a
-  print(a.isSome())
-}
-"#,
-        );
-    }
-
-    /// A struct passed to a function can still be used by the caller.
-    #[test]
-    fn function_arg_does_not_consume() {
-        assert_no_errors(
-            r#"
-struct Point {
-  Int x
-  Int y
-}
-function take(p: Point) { print(p.x) }
-function main() {
-  let p: Point = Point(1, 2)
-  take(p)
-  print(p.x)
-}
-"#,
-        );
-    }
-
-    /// A struct referenced inside a closure can still be used outside.
-    #[test]
-    fn closure_capture_does_not_consume() {
-        assert_no_errors(
-            r#"
-struct Point {
-  Int x
-  Int y
-}
-function main() {
-  let p: Point = Point(1, 2)
-  let q: Point = p
-  let f: (Int) -> Int = function(x: Int) -> Int { return p.x }
-  print(p.x)
-}
-"#,
-        );
-    }
-
-    /// The same variable can be passed as multiple arguments to a function.
-    #[test]
-    fn same_var_passed_twice() {
-        assert_no_errors(
-            r#"
-struct Point {
-  Int x
-  Int y
-}
-function both(a: Point, b: Point) { print(a.x) }
-function main() {
-  let p: Point = Point(1, 2)
-  both(p, p)
-}
-"#,
-        );
-    }
-
-    /// A variable used inside an if branch can still be used after the branch.
-    #[test]
-    fn use_after_assign_in_if_branch() {
-        assert_no_errors(
-            r#"
-struct Data { Int value }
-function take(d: Data) { print(d.value) }
-function main() {
-  let d: Data = Data(42)
-  if true {
-    take(d)
-  }
-  print(d.value)
-}
-"#,
-        );
-    }
-
-    // --- Match exhaustiveness tests ---
-
-    /// A match on an enum missing a variant (without wildcard) should error.
-    #[test]
-    fn match_non_exhaustive_error() {
-        assert_has_error(
-            r#"
-enum Color {
-  Red
-  Green
-  Blue
-}
-function main() {
-  let c: Color = Red
-  match c {
-    Red -> print("red")
-    Green -> print("green")
-  }
-}
-"#,
-            "non-exhaustive match",
-        );
-    }
-
-    /// A match with a wildcard is always exhaustive.
-    #[test]
-    fn match_exhaustive_with_wildcard() {
-        assert_no_errors(
-            r#"
-enum Color {
-  Red
-  Green
-  Blue
-}
-function main() {
-  let c: Color = Red
-  match c {
-    Red -> print("red")
-    _ -> print("other")
-  }
-}
-"#,
-        );
-    }
-
-    /// A match with a binding catch-all is always exhaustive.
-    #[test]
-    fn match_exhaustive_with_binding() {
-        assert_no_errors(
-            r#"
-enum Color {
-  Red
-  Green
-  Blue
-}
-function main() {
-  let c: Color = Red
-  match c {
-    Red -> print("red")
-    other -> print("other")
-  }
-}
-"#,
-        );
-    }
-
-    /// A match covering all enum variants is exhaustive.
-    #[test]
-    fn match_exhaustive_all_variants() {
-        assert_no_errors(
-            r#"
-enum Color {
-  Red
-  Green
-  Blue
-}
-function main() {
-  let c: Color = Red
-  match c {
-    Red -> print("red")
-    Green -> print("green")
-    Blue -> print("blue")
-  }
-}
-"#,
-        );
-    }
-
-    // --- Comparison operator error type tests ---
-
-    /// Comparing incompatible types returns an error (not Bool).
-    #[test]
-    fn comparison_incompatible_types_error() {
-        assert_has_error(
-            "function main() { let b: Bool = 42 < \"hello\" }",
-            "cannot compare",
-        );
-    }
-
-    /// Equality between incompatible types returns an error.
-    #[test]
-    fn equality_incompatible_types_error() {
-        assert_has_error(
-            "function main() { let b: Bool = 42 == \"hello\" }",
-            "cannot compare",
-        );
-    }
-
-    // --- Additional missing tests ---
-
-    /// Duplicate function definition produces an error.
-    #[test]
-    fn duplicate_function_error() {
-        assert_has_error(
-            "function foo() { }\nfunction foo() { }\nfunction main() { }",
-            "already defined",
-        );
-    }
-
-    /// A match block body with a return statement has the correct type.
-    #[test]
-    fn match_block_body_with_return() {
-        assert_no_errors(
-            r#"
-enum Shape {
-  Circle(Float)
-  Rect(Float, Float)
-}
-impl Shape {
-  function describe(self) -> String {
-    return match self {
-      Circle(_) -> "circle"
-      Rect(w, h) -> {
-        if w == h { return "square" }
-        return "rectangle"
-      }
-    }
-  }
-}
-function main() {
-  let s: Shape = Rect(3.0, 3.0)
-  let desc: String = s.describe()
-}
-"#,
-        );
-    }
-
-    /// Empty match on an enum without arms should error for exhaustiveness.
-    #[test]
-    fn match_empty_arms_error() {
-        assert_has_error(
-            r#"
-enum Color {
-  Red
-  Green
-}
-function main() {
-  let c: Color = Red
-  match c {
-  }
-}
-"#,
-            "non-exhaustive match",
-        );
-    }
-
-    /// A generic function with a closure parameter infers type arguments correctly.
-    #[test]
-    fn generic_function_with_closure() {
-        assert_no_errors(
-            r#"
-function map<T, U>(value: T, f: (T) -> U) -> U {
-  return f(value)
-}
-function main() {
-  let result: String = map(42, function(n: Int) -> String { return toString(n) })
-}
-"#,
-        );
-    }
-
-    /// Multiple errors are accumulated and all reported.
-    #[test]
-    fn multiple_errors_accumulated() {
-        let errors = check_source(
-            r#"
-function main() {
-  let x: Int = "hello"
-  let y: Bool = 42
-  let z: Float = true
-}
-"#,
-        );
-        assert!(
-            errors.len() >= 3,
-            "expected at least 3 errors, got: {:?}",
-            errors
-        );
-    }
-
-    /// Match on Option missing Some variant (without wildcard) errors.
-    #[test]
-    fn match_option_non_exhaustive() {
-        assert_has_error(
-            r#"
-function main() {
-  let x: Option<Int> = Some(42)
-  match x {
-    Some(v) -> print(v)
-  }
-}
-"#,
-            "non-exhaustive match",
-        );
-    }
-
-    /// A deeply nested generic type passes type checking.
-    #[test]
-    fn deeply_nested_generic_type() {
-        assert_no_errors(
-            r#"
-function main() {
-  let items: List<Option<Int>> = [Some(1), None, Some(3)]
-  let opt: Option<List<Int>> = Some([1, 2, 3])
-}
-"#,
-        );
-    }
-
-    /// Closures at 3 levels of nesting type-check correctly.
-    #[test]
-    fn triple_nested_closures() {
-        assert_no_errors(
-            r#"
-function main() {
-  let a: Int = 1
-  let f: (Int) -> (Int) -> (Int) -> Int = function(b: Int) -> (Int) -> (Int) -> Int {
-    return function(c: Int) -> (Int) -> Int {
-      return function(d: Int) -> Int {
-        return a + b + c + d
-      }
-    }
-  }
-  let g: (Int) -> (Int) -> Int = f(2)
-  let h: (Int) -> Int = g(3)
-  let result: Int = h(4)
-}
-"#,
-        );
-    }
-
-    /// Using the for-loop variable after the loop is fine (it's scoped).
-    #[test]
-    fn for_loop_variable_scoped() {
-        assert_has_error(
-            "function main() { for i in 0..10 { print(i) }\n print(i) }",
-            "undefined variable `i`",
-        );
-    }
-
-    /// Calling a method on a void expression errors.
-    #[test]
-    fn method_on_void_error() {
-        assert_has_error(
-            "function foo() { }\nfunction main() { foo().bar() }",
-            "cannot call method on Void",
-        );
-    }
-
-    // --- Phase 1.8 feature tests ---
-
-    /// Field assignment to an immutable variable is an error.
-    #[test]
-    fn field_assignment_immutable_error() {
-        assert_has_error(
-            r#"
-struct Point { Int x  Int y }
-function main() {
-  let p: Point = Point(1, 2)
-  p.x = 10
-}
-"#,
-            "immutable",
-        );
-    }
-
-    /// Field assignment with wrong type is an error.
-    #[test]
-    fn field_assignment_wrong_type_error() {
-        assert_has_error(
-            r#"
-struct Point { Int x  Int y }
-function main() {
-  let mut p: Point = Point(1, 2)
-  p.x = "hello"
-}
-"#,
-            "type mismatch",
-        );
-    }
-
-    /// The `?` operator on a non-Result/non-Option type is an error.
-    #[test]
-    fn try_operator_on_non_result_error() {
-        assert_has_error(
-            r#"
-function foo() -> Result<Int, String> {
-  let x: Int = 42
-  let y: Int = x?
-  return Ok(y)
-}
-function main() { }
-"#,
-            "?",
-        );
-    }
-
-    /// The `?` operator in a function not returning Result/Option is an error.
-    #[test]
-    fn try_operator_wrong_return_type_error() {
-        assert_has_error(
-            r#"
-function helper() -> Result<Int, String> { return Ok(1) }
-function main() {
-  let x: Int = helper()?
-}
-"#,
-            "?",
-        );
-    }
-
-    /// Type aliases resolve correctly so `type Id = Int; Id x = 42` passes.
-    #[test]
-    fn type_alias_resolves() {
-        assert_no_errors(
-            r#"
-type Id = Int
-function main() {
-  let x: Id = 42
-}
-"#,
-        );
-    }
-
-    /// String interpolation type-checks to String.
-    #[test]
-    fn string_interpolation_type_checks() {
-        assert_no_errors(
-            r#"
-function main() {
-  let name: String = "world"
-  let greeting: String = "hello {name}"
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn lambda_implicit_return_type_mismatch() {
-        assert_has_error(
-            "function main() {\n  let f: (Int) -> String = function(x: Int) -> String { x }\n}",
-            "lambda return type mismatch",
-        );
-    }
-
-    #[test]
-    fn generic_type_alias_missing_args() {
-        assert_has_error(
-            "type StringResult<T> = Result<T, String>\nfunction main() {\n  let x: StringResult = Ok(42)\n}",
-            "generic type alias `StringResult` requires type arguments",
-        );
-    }
-
-    #[test]
-    fn field_assignment_type_mismatch() {
-        assert_has_error(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() {\n  let mut p: Point = Point(1, 2)\n  p.x = \"hello\"\n}",
-            "type mismatch",
-        );
-    }
-
-    // ── Low-priority edge case tests ───────────────────────────────
-
-    #[test]
-    fn circular_type_alias_produces_error() {
-        // type A refers to B which doesn't exist yet at registration time
-        assert_has_error(
-            "type A = B\ntype B = A\nfunction main() { let x: A = 42 }",
-            "unknown type `B`",
-        );
-    }
-
-    #[test]
-    fn trait_bound_only_valid_on_type_params() {
-        // Trait bounds on concrete (non-generic) parameter types should still work
-        // when the type actually implements the trait
-        assert_no_errors(
-            r#"
-trait Display {
-  function toString(self) -> String
-}
-struct Point {
-  Int x
-  Int y
-
-  impl Display {
-    function toString(self) -> String { return "point" }
-  }
-}
-function show<T: Display>(item: T) -> String {
-  return item.toString()
-}
-function main() {
-  let p: Point = Point(1, 2)
-  print(show(p))
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn method_arg_type_compat_with_generics_regression() {
-        // Regression test: method argument checking should use types_compatible()
-        // not strict equality, so type variables work correctly
-        assert_no_errors(
-            r#"
-function main() {
-  let x: Option<Int> = Some(42)
-  let val: Int = x.unwrapOr(0)
-  print(val)
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn empty_match_exhaustiveness_error() {
-        assert_has_error(
-            "enum Color {\n  Red\n  Green\n}\nfunction main() {\n  let c: Color = Red\n  match c { }\n}",
-            "non-exhaustive match",
-        );
-    }
-
-    #[test]
-    fn unknown_escape_sequence_passthrough() {
-        // Unknown escape sequences like \x should pass through as literal characters
-        assert_no_errors(
-            r#"function main() { let s: String = "hello\x41"
-  print(s) }"#,
-        );
-    }
-
-    #[test]
-    fn and_or_with_error_operand_no_cascade() {
-        // When one operand has a prior error, And/Or should not report
-        // an additional "must be Bool" error about the error type
-        let errors = check_source("function main() { let b: Bool = undefinedVar and true }");
-        // Should have "undefined variable" but NOT "must be Bool"
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("undefined variable"))
-        );
-        assert!(!errors.iter().any(|e| e.message.contains("must be Bool")));
-    }
-
-    #[test]
-    fn trait_impl_wrong_param_count() {
-        assert_has_error(
-            r#"
-trait Greet {
-  function hello(self) -> String
-}
-struct Person {
-  String name
-
-  impl Greet {
-    function hello(self, extra: Int) -> String { return "hi" }
-  }
-}
-"#,
-            "parameter(s) but trait",
-        );
-    }
-
-    #[test]
-    fn trait_impl_wrong_return_type() {
-        assert_has_error(
-            r#"
-trait Greet {
-  function hello(self) -> String
-}
-struct Person {
-  String name
-
-  impl Greet {
-    function hello(self) -> Int { return 42 }
-  }
-}
-"#,
-            "returns `Int` but trait",
-        );
-    }
-
-    #[test]
-    fn trait_impl_wrong_parameter_type() {
-        assert_has_error(
-            r#"
-trait Adder {
-  function add(self, x: Int) -> Int
-}
-struct Foo {
-  Int val
-
-  impl Adder {
-    function add(self, x: String) -> Int { return 42 }
-  }
-}
-"#,
-            "parameter `x` has type `String` but trait `Adder` expects `Int`",
-        );
-    }
-
-    #[test]
-    fn named_arguments_duplicate() {
-        assert_has_error(
-            r#"
-function foo(a: Int, b: Int) -> Int { return a + b }
-function main() { print(foo(a: 1, a: 2)) }
-"#,
-            "duplicate",
-        );
-    }
-
-    #[test]
-    fn named_arguments_unknown_parameter() {
-        let diags = check_source(
-            r#"
-function foo(a: Int) -> Int { return a }
-function main() { print(foo(z: 1)) }
-"#,
-        );
-        let has_relevant_error = diags.iter().any(|d| {
-            let msg = d.message.to_lowercase();
-            msg.contains("unknown") || msg.contains("no parameter")
-        });
-        assert!(
-            has_relevant_error,
-            "expected error about unknown/no parameter, got: {:?}",
-            diags
-        );
-    }
-
-    #[test]
-    fn default_parameters_valid() {
-        assert_no_errors(
-            r#"
-function greet(name: String, prefix: String = "Hello") -> String {
-  return prefix + " " + name
-}
-function main() { print(greet("Alice")) }
-"#,
-        );
-    }
-
-    #[test]
-    fn struct_destructuring_valid() {
-        assert_no_errors(
-            r#"
-struct Point {
-  Int x
-  Int y
-}
-function main() {
-  let p: Point = Point(3, 4)
-  let Point { x, y } = p
-  print(x)
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn struct_destructuring_unknown_field() {
-        let diags = check_source(
-            r#"
-struct Point {
-  Int x
-  Int y
-}
-function main() {
-  let p: Point = Point(3, 4)
-  let Point { x, z } = p
-}
-"#,
-        );
-        let has_relevant_error = diags.iter().any(|d| {
-            let msg = d.message.to_lowercase();
-            msg.contains("z")
-                && (msg.contains("not found")
-                    || msg.contains("no field")
-                    || msg.contains("unknown"))
-        });
-        assert!(
-            has_relevant_error,
-            "expected error about unknown field `z`, got: {:?}",
-            diags
-        );
-    }
-
-    #[test]
-    fn closure_captures_outer_mutable_variable() {
-        assert_no_errors(
-            r#"
-function main() {
-  let mut count: Int = 0
-  let inc: () -> Void = function() { count = count + 1 }
-  inc()
-  print(count)
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn generic_function_conflicting_types() {
-        assert_has_error(
-            r#"
-function same<T>(a: T, b: T) -> T { return a }
-function main() { same(1, "hello") }
-"#,
-            "expected `Int` but got `String`",
-        );
-    }
-
-    #[test]
-    fn match_on_int_literal_patterns() {
-        assert_no_errors(
-            r#"
-function main() {
-  let x: Int = 42
-  match x {
-    1 -> print("one")
-    _ -> print("other")
-  }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn trait_impl_correct_parameter_types() {
-        assert_no_errors(
-            r#"
-trait Converter {
-  function convert(self, x: Int) -> String
-}
-struct MyConv {
-  impl Converter {
-    function convert(self, x: Int) -> String { return toString(x) }
-  }
-}
-function main() { }
-"#,
-        );
-    }
-
-    // ── Bug fix: match arm type mismatch with break/continue/return ──
-
-    /// A match arm with `break` should not cause a type mismatch error when
-    /// another arm evaluates to a non-Void type.
-    #[test]
-    fn match_arm_break_error() {
-        assert_has_error(
-            r#"
-enum Action { Go  Stop }
-function main() {
-  let actions: List<Action> = [Go, Stop]
-  let mut count: Int = 0
-  for a in actions {
-    match a {
-      Go -> { count = count + 1 }
-      Stop -> { break }
-    }
-  }
-}
-"#,
-            "`break` is not allowed inside match arms",
-        );
-    }
-
-    #[test]
-    fn match_arm_continue_error() {
-        assert_has_error(
-            r#"
-function main() {
-  let mut sum: Int = 0
-  for i in 0..10 {
-    match i % 2 {
-      0 -> { sum = sum + i }
-      _ -> { continue }
-    }
-  }
-}
-"#,
-            "`continue` is not allowed inside match arms",
-        );
-    }
-
-    /// `break` in a match arm outside of any loop still produces the match-arm error,
-    /// not the "break outside of loop" error.
-    #[test]
-    fn match_arm_break_outside_loop_error() {
-        assert_has_error(
-            r#"
-function main() {
-  let x: Int = 1
-  match x {
-    1 -> { break }
-    _ -> {}
-  }
-}
-"#,
-            "`break` is not allowed inside match arms",
-        );
-    }
-
-    /// `continue` in a match arm outside of any loop still produces the match-arm error.
-    #[test]
-    fn match_arm_continue_outside_loop_error() {
-        assert_has_error(
-            r#"
-function main() {
-  let x: Int = 1
-  match x {
-    1 -> { continue }
-    _ -> {}
-  }
-}
-"#,
-            "`continue` is not allowed inside match arms",
-        );
-    }
-
-    /// `return` in a match arm is still allowed (it exits the enclosing function).
-    #[test]
-    fn match_arm_return_still_allowed() {
-        assert_no_errors(
-            r#"
-function foo(x: Int) -> Int {
-  match x {
-    1 -> { return 42 }
-    _ -> { return 0 }
-  }
-  return -1
-}
-function main() { print(foo(1)) }
-"#,
-        );
-    }
-
-    /// A match arm with `return` should not cause a type mismatch error.
-    #[test]
-    fn match_arm_return_no_type_mismatch() {
-        assert_no_errors(
-            r#"
-function find(nums: List<Int>) -> Int {
-  for n in nums {
-    match n % 2 {
-      0 -> { return n }
-      _ -> { let x: Int = 0 }
-    }
-  }
-  return -1
-}
-function main() { print(find([1, 3, 4])) }
-"#,
-        );
-    }
-
-    // ── 1.13.1: CheckResult exposes type registries ─────────────────
-
-    fn check_full(source: &str) -> CheckResult {
-        let tokens = tokenize(source, SourceId(0));
-        let (program, parse_errors) = parser::parse(&tokens);
-        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
-        let result = check(&program);
-        assert!(
-            result.diagnostics.is_empty(),
-            "type errors: {:?}",
-            result.diagnostics
-        );
-        result
-    }
-
-    #[test]
-    fn check_result_contains_functions() {
-        let result = check_full(
-            r#"
-function add(a: Int, b: Int) -> Int { return a + b }
-function greet(name: String) -> String { return name }
-function main() { }
-"#,
-        );
-        assert!(result.functions.contains_key("add"));
-        assert!(result.functions.contains_key("greet"));
-        assert!(result.functions.contains_key("main"));
-        let add_info = &result.functions["add"];
-        assert_eq!(add_info.params.len(), 2);
-        assert_eq!(add_info.params[0], Type::Int);
-        assert_eq!(add_info.params[1], Type::Int);
-        assert_eq!(add_info.return_type, Type::Int);
-        let greet_info = &result.functions["greet"];
-        assert_eq!(greet_info.params, vec![Type::String]);
-        assert_eq!(greet_info.return_type, Type::String);
-    }
-
-    #[test]
-    fn check_result_contains_structs() {
-        let result = check_full(
-            r#"
-struct Point { Int x  Int y }
-struct Named { String name }
-function main() { }
-"#,
-        );
-        assert!(result.structs.contains_key("Point"));
-        let point = &result.structs["Point"];
-        assert_eq!(point.fields.len(), 2);
-        assert_eq!(point.fields[0], ("x".to_string(), Type::Int));
-        assert_eq!(point.fields[1], ("y".to_string(), Type::Int));
-        assert!(point.type_params.is_empty());
-
-        assert!(result.structs.contains_key("Named"));
-        assert_eq!(result.structs["Named"].fields[0].1, Type::String);
-    }
-
-    #[test]
-    fn check_result_contains_generic_struct() {
-        let result = check_full(
-            r#"
-struct Wrapper<T> { T value }
-function main() { }
-"#,
-        );
-        let wrapper = &result.structs["Wrapper"];
-        assert_eq!(wrapper.type_params, vec!["T".to_string()]);
-        assert_eq!(wrapper.fields.len(), 1);
-    }
-
-    #[test]
-    fn check_result_contains_enums() {
-        let result = check_full(
-            r#"
-enum Color { Red  Green  Blue }
-enum Shape { Circle(Float)  Rect(Float, Float) }
-function main() { }
-"#,
-        );
-        assert!(result.enums.contains_key("Color"));
-        let color = &result.enums["Color"];
-        assert_eq!(color.variants.len(), 3);
-        assert_eq!(color.variants[0].0, "Red");
-        assert!(color.variants[0].1.is_empty()); // unit variant
-
-        assert!(result.enums.contains_key("Shape"));
-        let shape = &result.enums["Shape"];
-        assert_eq!(shape.variants.len(), 2);
-        assert_eq!(shape.variants[0].0, "Circle");
-        assert_eq!(shape.variants[0].1.len(), 1); // one Float field
-        assert_eq!(shape.variants[1].0, "Rect");
-        assert_eq!(shape.variants[1].1.len(), 2); // two Float fields
-    }
-
-    #[test]
-    fn check_result_contains_builtin_enums() {
-        let result = check_full("function main() { }");
-        // Option and Result are pre-registered builtins
-        assert!(result.enums.contains_key("Option"));
-        assert!(result.enums.contains_key("Result"));
-        let option = &result.enums["Option"];
-        assert_eq!(option.type_params, vec!["T".to_string()]);
-        assert_eq!(option.variants.len(), 2); // Some, None
-    }
-
-    #[test]
-    fn check_result_contains_methods() {
-        let result = check_full(
-            r#"
-struct Counter { Int val }
-impl Counter {
-    function get(self) -> Int { return self.val }
-    function inc(self) -> Counter { return Counter(self.val + 1) }
-}
-function main() { }
-"#,
-        );
-        assert!(result.methods.contains_key("Counter"));
-        let counter_methods = &result.methods["Counter"];
-        assert!(counter_methods.contains_key("get"));
-        assert!(counter_methods.contains_key("inc"));
-        assert_eq!(counter_methods["get"].return_type, Type::Int);
-        assert!(counter_methods["get"].params.is_empty()); // excludes self
-    }
-
-    #[test]
-    fn check_result_contains_traits_and_impls() {
-        let result = check_full(
-            r#"
-trait Display {
-    function toString(self) -> String
-}
-struct Point {
-    Int x
-    Int y
-
-    impl Display {
-        function toString(self) -> String { return "point" }
-    }
-}
-function main() { }
-"#,
-        );
-        assert!(result.traits.contains_key("Display"));
-        let display = &result.traits["Display"];
-        assert_eq!(display.methods.len(), 1);
-        assert_eq!(display.methods[0].name, "toString");
-        assert_eq!(display.methods[0].return_type, Type::String);
-
-        assert!(
-            result
-                .trait_impls
-                .contains(&("Point".to_string(), "Display".to_string()))
-        );
-    }
-
-    #[test]
-    fn check_result_contains_type_aliases() {
-        let result = check_full(
-            r#"
-type UserId = Int
-type StringResult<T> = Result<T, String>
-function main() { }
-"#,
-        );
-        assert!(result.type_aliases.contains_key("UserId"));
-        assert_eq!(result.type_aliases["UserId"].target, Type::Int);
-        assert!(result.type_aliases["UserId"].type_params.is_empty());
-
-        assert!(result.type_aliases.contains_key("StringResult"));
-        assert_eq!(
-            result.type_aliases["StringResult"].type_params,
-            vec!["T".to_string()]
-        );
-    }
-
-    #[test]
-    fn check_result_function_with_defaults() {
-        let result = check_full(
-            r#"
-function greet(name: String, greeting: String = "Hello") -> String {
-    return greeting + " " + name
-}
-function main() { }
-"#,
-        );
-        let info = &result.functions["greet"];
-        assert_eq!(info.params.len(), 2);
-        assert_eq!(info.param_names, vec!["name", "greeting"]);
-        assert_eq!(info.default_param_indices, vec![1]);
-    }
-
-    // ── 1.13.2: Expression-level type annotations ───────────────────
-
-    #[test]
-    fn expr_types_populated_for_literals() {
-        let result = check_full(
-            r#"
-function main() {
-    let x: Int = 42
-    let y: Float = 3.14
-    let s: String = "hello"
-    let b: Bool = true
-}
-"#,
-        );
-        // expr_types should be non-empty — every expression gets recorded
-        assert!(
-            !result.expr_types.is_empty(),
-            "expr_types should be populated"
-        );
-        // Check that all basic types appear in the values
-        let types: Vec<&Type> = result.expr_types.values().collect();
-        assert!(types.contains(&&Type::Int));
-        assert!(types.contains(&&Type::Float));
-        assert!(types.contains(&&Type::String));
-        assert!(types.contains(&&Type::Bool));
-    }
-
-    #[test]
-    fn expr_types_populated_for_binary_ops() {
-        let result = check_full(
-            r#"
-function main() {
-    let x: Int = 1 + 2
-    let y: Bool = 1 < 2
-    let z: Float = 1.0 + 2.0
-}
-"#,
-        );
-        let types: Vec<&Type> = result.expr_types.values().collect();
-        assert!(types.contains(&&Type::Int));
-        assert!(types.contains(&&Type::Bool));
-        assert!(types.contains(&&Type::Float));
-    }
-
-    #[test]
-    fn expr_types_populated_for_function_calls() {
-        let result = check_full(
-            r#"
-function add(a: Int, b: Int) -> Int { return a + b }
-function main() {
-    let x: Int = add(1, 2)
-}
-"#,
-        );
-        // The call expression `add(1, 2)` should be recorded as Type::Int
-        let has_int_call = result.expr_types.values().any(|t| *t == Type::Int);
-        assert!(has_int_call, "call to add() should produce Type::Int");
-    }
-
-    #[test]
-    fn expr_types_populated_for_method_calls() {
-        let result = check_full(
-            r#"
-struct Counter { Int val }
-impl Counter {
-    function get(self) -> Int { return self.val }
-}
-function main() {
-    let c: Counter = Counter(5)
-    let v: Int = c.get()
-}
-"#,
-        );
-        let has_int = result.expr_types.values().any(|t| *t == Type::Int);
-        assert!(has_int, "method call should produce Type::Int");
-    }
-
-    #[test]
-    fn expr_types_populated_for_string_interpolation() {
-        let result = check_full(
-            r#"
-function main() {
-    let name: String = "world"
-    let msg: String = "hello {name}"
-}
-"#,
-        );
-        let string_count = result
-            .expr_types
-            .values()
-            .filter(|t| **t == Type::String)
-            .count();
-        // At least: the "world" literal, the "hello {name}" interpolation, and the `name` ident
-        assert!(
-            string_count >= 3,
-            "should have at least 3 String-typed expressions, got {}",
-            string_count
-        );
-    }
-
-    // ── Snapshot tests for error messages ──────────────────────────────
-
-    #[test]
-    fn snapshot_error_type_mismatch() {
-        let diags = check_source(r#"function main() { let x: Int = "hello" }"#);
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        insta::assert_debug_snapshot!(messages);
-    }
-
-    #[test]
-    fn snapshot_error_undefined_variable() {
-        let diags = check_source("function main() { print(x) }");
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        insta::assert_debug_snapshot!(messages);
-    }
-
-    #[test]
-    fn snapshot_error_immutable_assignment() {
-        let diags = check_source("function main() { let x: Int = 1\n x = 2 }");
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        insta::assert_debug_snapshot!(messages);
-    }
-
-    #[test]
-    fn snapshot_error_wrong_arg_count() {
-        let diags = check_source(
-            "function add(a: Int, b: Int) -> Int { return a + b }\nfunction main() { add(1) }",
-        );
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        insta::assert_debug_snapshot!(messages);
-    }
-
-    #[test]
-    fn snapshot_error_trait_not_implemented() {
-        let diags = check_source(
-            "trait Display {\n  function toString(self) -> String\n}\nstruct Point { Int x  Int y }\nfunction show<T: Display>(item: T) -> String { return item.toString() }\nfunction main() { show(Point(1, 2)) }",
-        );
-        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-        insta::assert_debug_snapshot!(messages);
+        symbol_references: checker.symbol_references,
     }
 }

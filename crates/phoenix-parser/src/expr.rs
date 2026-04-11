@@ -1,4 +1,9 @@
-use crate::ast::*;
+use crate::ast::{
+    AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Expr, FieldAccessExpr, FieldAssignmentExpr,
+    IdentExpr, LambdaExpr, ListLiteralExpr, Literal, LiteralKind, MapLiteralExpr, MatchArm,
+    MatchBody, MatchExpr, MethodCallExpr, Pattern, StringInterpolationExpr, StringSegment,
+    StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp, VariantPattern,
+};
 use crate::parser::Parser;
 use phoenix_common::span::SourceId;
 use phoenix_lexer::token::TokenKind;
@@ -207,7 +212,7 @@ impl<'src> Parser<'src> {
     /// unescaping and numeric overflow diagnostics. Does NOT handle string
     /// interpolation — the caller must check for that when needed.
     fn parse_literal(&mut self) -> Option<Literal> {
-        let token = self.peek().clone();
+        let token = self.peek();
         match token.kind {
             TokenKind::IntLiteral => {
                 self.advance();
@@ -324,6 +329,58 @@ impl<'src> Parser<'src> {
                 }
             }
 
+            // Compound assignment: x += expr  desugars to  x = x + expr
+            let compound_op = match op_kind {
+                TokenKind::PlusEq => Some(BinaryOp::Add),
+                TokenKind::MinusEq => Some(BinaryOp::Sub),
+                TokenKind::StarEq => Some(BinaryOp::Mul),
+                TokenKind::SlashEq => Some(BinaryOp::Div),
+                TokenKind::PercentEq => Some(BinaryOp::Mod),
+                _ => None,
+            };
+            if let Some(bin_op) = compound_op {
+                if let Expr::Ident(ref ident) = lhs {
+                    let name = ident.name.clone();
+                    let start = ident.span;
+                    self.advance();
+                    let rhs = self.parse_expr()?;
+                    let rhs_span = rhs.span();
+                    let value = Expr::Binary(Box::new(BinaryExpr {
+                        left: lhs,
+                        op: bin_op,
+                        right: rhs,
+                        span: start.merge(rhs_span),
+                    }));
+                    let span = start.merge(rhs_span);
+                    return Some(Expr::Assignment(Box::new(AssignmentExpr {
+                        name,
+                        value,
+                        span,
+                    })));
+                }
+                if let Expr::FieldAccess(ref fa) = lhs {
+                    let object = fa.object.clone();
+                    let field = fa.field.clone();
+                    let start = fa.span;
+                    self.advance();
+                    let rhs = self.parse_expr()?;
+                    let rhs_span = rhs.span();
+                    let value = Expr::Binary(Box::new(BinaryExpr {
+                        left: lhs,
+                        op: bin_op,
+                        right: rhs,
+                        span: start.merge(rhs_span),
+                    }));
+                    let span = start.merge(rhs_span);
+                    return Some(Expr::FieldAssignment(Box::new(FieldAssignmentExpr {
+                        object,
+                        field,
+                        value,
+                        span,
+                    })));
+                }
+            }
+
             // Postfix `?` (try/propagation operator)
             if op_kind == TokenKind::Question {
                 let end = self.advance().span;
@@ -420,7 +477,7 @@ impl<'src> Parser<'src> {
     /// Parses a prefix expression (literals, identifiers, unary ops, parenthesized
     /// expressions, list literals, struct/enum constructors, match, and lambdas).
     fn parse_prefix(&mut self) -> Option<Expr> {
-        let token = self.peek().clone();
+        let token = self.peek();
 
         match token.kind {
             TokenKind::Minus | TokenKind::Not => {
@@ -457,7 +514,7 @@ impl<'src> Parser<'src> {
                 };
                 if contains_interpolation(raw) {
                     self.advance();
-                    let segments = parse_interpolation_segments(raw, self, token.span.source_id);
+                    let segments = parse_interpolation_segments(raw, self, self.source_id);
                     return Some(Expr::StringInterpolation(StringInterpolationExpr {
                         segments,
                         span: token.span,
@@ -535,7 +592,7 @@ impl<'src> Parser<'src> {
     /// and a parenthesised argument list. If both are absent, the identifier is
     /// returned as a plain `Ident` expression.
     fn parse_ident_or_constructor(&mut self) -> Option<Expr> {
-        let token = self.peek().clone();
+        let token = self.peek();
         self.advance();
         let name = token.text.clone();
 
@@ -701,7 +758,7 @@ impl<'src> Parser<'src> {
 
     /// Parses a match pattern: wildcard (`_`), variant destructuring, literal, or binding.
     fn parse_pattern(&mut self) -> Option<Pattern> {
-        let token = self.peek().clone();
+        let token = self.peek();
         match token.kind {
             // Wildcard _
             TokenKind::Ident if token.text == "_" => {
@@ -715,7 +772,7 @@ impl<'src> Parser<'src> {
             // Negative numeric literal patterns: -42, -3.14
             TokenKind::Minus => {
                 let start = self.advance().span; // consume '-'
-                let next = self.peek().clone();
+                let next = self.peek();
                 match next.kind {
                     TokenKind::IntLiteral => {
                         self.advance();
@@ -781,7 +838,7 @@ impl<'src> Parser<'src> {
     /// x            // variable binding (lowercase)
     /// ```
     fn parse_variant_pattern(&mut self) -> Option<Pattern> {
-        let token = self.peek().clone();
+        let token = self.peek();
         self.advance();
         let name = token.text.clone();
 

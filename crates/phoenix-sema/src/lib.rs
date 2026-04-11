@@ -4,21 +4,30 @@
 //! entry point is [`checker::check`], which returns a list of diagnostics
 //! for any semantic errors found (undefined variables, type mismatches,
 //! mutability violations, etc.).
+#![warn(missing_docs)]
 
 mod check_builtins_list;
 mod check_builtins_map;
 mod check_builtins_option;
 mod check_builtins_result;
 mod check_builtins_string;
+mod check_endpoint;
 mod check_expr;
+mod check_expr_call;
 mod check_register;
 mod check_stmt;
 mod check_types;
+/// The semantic checker: two-pass name resolution and type checking.
 pub mod checker;
+#[cfg(test)]
+mod checker_tests;
+/// Lexical scope stack for variable name resolution.
 pub mod scope;
+/// The Phoenix type system representation.
 pub mod types;
 
 pub use checker::{
-    CheckResult, EnumInfo, FunctionInfo, MethodInfo, StructInfo, TraitInfo, TraitMethodInfo,
-    TypeAliasInfo, check,
+    CheckResult, DefaultValue, DerivedField, EndpointInfo, EnumInfo, FieldInfo, FunctionInfo,
+    MethodInfo, QueryParamInfo, ResolvedDerivedType, StructInfo, SymbolKind, SymbolRef, TraitInfo,
+    TraitMethodInfo, TypeAliasInfo, check,
 };

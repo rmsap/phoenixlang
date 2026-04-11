@@ -38,8 +38,11 @@ pub enum Value {
     /// `Rc<RefCell<Value>>` cell, so mutations inside the closure are
     /// visible in the enclosing scope and vice versa.
     Closure {
+        /// Parameter names declared in the closure signature.
         params: Vec<String>,
+        /// The AST block that forms the closure body.
         body: phoenix_parser::ast::Block,
+        /// Variables captured from the enclosing scope (by shared reference).
         captures: HashMap<String, Rc<RefCell<Value>>>,
     },
 }

@@ -6,11 +6,18 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/rsaperstein/phoenix"
+repository = "https://github.com/rmsap/phoenixlang"
 
 [workspace.dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# File watching
+notify = "6.1"
+
+# LSP server
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["io-std", "macros", "rt"] }
 
 # Testing
 insta = { version = "1", features = ["glob"] }
@@ -18,3 +25,6 @@ insta = { version = "1", features = ["glob"] }
 # Serialization (AST dumps, debugging)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Configuration
+toml = "0.8"

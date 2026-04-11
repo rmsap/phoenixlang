@@ -16,5 +16,9 @@ phoenix-lexer = { path = "../phoenix-lexer" }
 phoenix-parser = { path = "../phoenix-parser" }
 phoenix-sema = { path = "../phoenix-sema" }
 phoenix-interp = { path = "../phoenix-interp" }
+phoenix-codegen = { path = "../phoenix-codegen" }
 clap = { workspace = true }
+notify = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }

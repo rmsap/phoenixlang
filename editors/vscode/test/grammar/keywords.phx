@@ -1,0 +1,43 @@
+// SYNTAX TEST "source.phoenix"
+
+let x: Int = 42
+// <- keyword.declaration.phoenix
+//     ^^^ support.type.primitive.phoenix
+//           ^^ constant.numeric.integer.phoenix
+
+let mut y: Float = 3.14
+// <- keyword.declaration.phoenix
+//  ^^^ keyword.declaration.phoenix
+//         ^^^^^ support.type.primitive.phoenix
+//               ^^^^ constant.numeric.float.phoenix
+
+if true {
+// <- keyword.control.phoenix
+// ^^^^ constant.language.boolean.phoenix
+} else {
+// ^^^^ keyword.control.phoenix
+}
+
+while false {
+// <- keyword.control.phoenix
+//    ^^^^^ constant.language.boolean.phoenix
+  break
+//^^^^^ keyword.control.phoenix
+  continue
+//^^^^^^^^ keyword.control.phoenix
+}
+
+for i in 0..10 {
+// <- keyword.control.phoenix
+//    ^^ keyword.control.phoenix
+//       ^ constant.numeric.integer.phoenix
+//        ^^ keyword.operator.range.phoenix
+//          ^^ constant.numeric.integer.phoenix
+}
+
+return x
+// <- keyword.control.phoenix
+
+match x {
+// <- keyword.control.phoenix
+}

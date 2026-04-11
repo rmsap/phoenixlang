@@ -57,6 +57,63 @@ pub enum TokenKind {
     /// The `type` keyword, introducing a type alias declaration.
     Type,
 
+    // ── Gen keywords ────────────────────────────────────────
+    /// The `endpoint` keyword, introducing an endpoint declaration.
+    ///
+    /// Syntax: `endpoint name: METHOD "path" { ... }`.
+    Endpoint,
+    /// The `body` keyword, declaring the request body type inside an endpoint.
+    ///
+    /// Appears as `body TypeExpr [modifiers]` within an endpoint block.
+    Body,
+    /// The `response` keyword, declaring the response type inside an endpoint.
+    ///
+    /// Appears as `response TypeExpr` within an endpoint block.
+    Response,
+    /// The `error` keyword, introducing an error-variant block inside an endpoint.
+    ///
+    /// Named `ErrorKw` to avoid collision with the [`Error`](TokenKind::Error) variant
+    /// used for malformed tokens. Appears as `error { Variant(code), ... }`.
+    ErrorKw,
+    /// The `omit` keyword, a type derivation operator that excludes listed fields.
+    ///
+    /// Used in endpoint body declarations: `User omit { id, created_at }`.
+    Omit,
+    /// The `pick` keyword, a type derivation operator that includes only listed fields.
+    ///
+    /// Used in endpoint body declarations: `User pick { name, email }`.
+    Pick,
+    /// The `partial` keyword, a type derivation operator that makes fields optional.
+    ///
+    /// Can apply to all fields (`partial`) or a subset (`partial { name, email }`).
+    Partial,
+    /// The `query` keyword, introducing a query-parameter block inside an endpoint.
+    ///
+    /// Appears as `query { Type name [= default], ... }`.
+    Query,
+    /// The `where` keyword, introducing a constraint clause on a struct field.
+    ///
+    /// Appears as `Type name where <expr>` inside a struct body. The constraint
+    /// expression must evaluate to `Bool` and uses `self` to refer to the field value.
+    Where,
+    /// The `schema` keyword, introducing a database schema declaration.
+    ///
+    /// Appears as `schema name { table ... }`. Parsed for forward compatibility
+    /// with Phase 4 (typed database queries and migrations).
+    Schema,
+
+    // ── HTTP methods ────────────────────────────────────────
+    /// The `GET` HTTP method keyword (case-sensitive).
+    Get,
+    /// The `POST` HTTP method keyword (case-sensitive).
+    Post,
+    /// The `PUT` HTTP method keyword (case-sensitive).
+    Put,
+    /// The `PATCH` HTTP method keyword (case-sensitive).
+    Patch,
+    /// The `DELETE` HTTP method keyword (case-sensitive).
+    Delete,
+
     // ── Type keywords ────────────────────────────────────────
     /// The `Int` type name.
     IntType,
@@ -94,11 +151,11 @@ pub enum TokenKind {
     LtEq,
     /// `>=`
     GtEq,
-    /// The `and` keyword operator.
+    /// `&&` (logical and)
     And,
-    /// The `or` keyword operator.
+    /// `||` (logical or)
     Or,
-    /// The `not` keyword operator, or `!` when followed by `=`.
+    /// `!` (logical not)
     Not,
     /// `->` (return-type arrow)
     Arrow,
@@ -108,6 +165,16 @@ pub enum TokenKind {
     Question,
     /// `|>` (pipe operator)
     Pipe,
+    /// `+=` (compound addition assignment)
+    PlusEq,
+    /// `-=` (compound subtraction assignment)
+    MinusEq,
+    /// `*=` (compound multiplication assignment)
+    StarEq,
+    /// `/=` (compound division assignment)
+    SlashEq,
+    /// `%=` (compound modulo assignment)
+    PercentEq,
 
     // ── Delimiters ───────────────────────────────────────────
     /// `(`
@@ -130,6 +197,9 @@ pub enum TokenKind {
     RBracket,
 
     // ── Special ──────────────────────────────────────────────
+    /// A doc comment `/** ... */`. The token text contains the inner content
+    /// (stripped of the `/**` and `*/` delimiters).
+    DocComment,
     /// A user-defined identifier (variable name, function name, etc.).
     Ident,
     /// A significant newline that acts as a statement terminator.

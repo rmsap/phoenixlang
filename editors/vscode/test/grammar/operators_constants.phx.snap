@@ -1,0 +1,289 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let a: Bool = true and false or not true
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^^ source.phoenix support.type.primitive.phoenix
+#           ^ source.phoenix
+#            ^ source.phoenix keyword.operator.assignment.phoenix
+#             ^ source.phoenix
+#              ^^^^ source.phoenix constant.language.boolean.phoenix
+#                  ^ source.phoenix
+#                   ^^^ source.phoenix keyword.operator.logical.phoenix
+#                      ^ source.phoenix
+#                       ^^^^^ source.phoenix constant.language.boolean.phoenix
+#                            ^ source.phoenix
+#                             ^^ source.phoenix keyword.operator.logical.phoenix
+#                               ^ source.phoenix
+#                                ^^^ source.phoenix keyword.operator.logical.phoenix
+#                                   ^ source.phoenix
+#                                    ^^^^ source.phoenix constant.language.boolean.phoenix
+>//            ^^^^ constant.language.boolean.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                 ^^^ keyword.operator.logical.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                     ^^^^^ constant.language.boolean.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                           ^^ keyword.operator.logical.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                              ^^^ keyword.operator.logical.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                                  ^^^^ constant.language.boolean.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let b: Int = 1 + 2 - 3 * 4 / 5 % 6
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^ source.phoenix support.type.primitive.phoenix
+#          ^ source.phoenix
+#           ^ source.phoenix keyword.operator.assignment.phoenix
+#            ^ source.phoenix
+#             ^ source.phoenix constant.numeric.integer.phoenix
+#              ^ source.phoenix
+#               ^ source.phoenix keyword.operator.arithmetic.phoenix
+#                ^ source.phoenix
+#                 ^ source.phoenix constant.numeric.integer.phoenix
+#                  ^ source.phoenix
+#                   ^ source.phoenix keyword.operator.arithmetic.phoenix
+#                    ^ source.phoenix
+#                     ^ source.phoenix constant.numeric.integer.phoenix
+#                      ^ source.phoenix
+#                       ^ source.phoenix keyword.operator.arithmetic.phoenix
+#                        ^ source.phoenix
+#                         ^ source.phoenix constant.numeric.integer.phoenix
+#                          ^ source.phoenix
+#                           ^ source.phoenix keyword.operator.arithmetic.phoenix
+#                            ^ source.phoenix
+#                             ^ source.phoenix constant.numeric.integer.phoenix
+#                              ^ source.phoenix
+#                               ^ source.phoenix keyword.operator.arithmetic.phoenix
+#                                ^ source.phoenix
+#                                 ^ source.phoenix constant.numeric.integer.phoenix
+>//             ^ keyword.operator.arithmetic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                ^ keyword.operator.arithmetic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                    ^ keyword.operator.arithmetic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                        ^ keyword.operator.arithmetic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                            ^ keyword.operator.arithmetic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let c: Bool = x == y
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^^ source.phoenix support.type.primitive.phoenix
+#           ^ source.phoenix
+#            ^ source.phoenix keyword.operator.assignment.phoenix
+#             ^ source.phoenix
+#              ^ source.phoenix variable.other.phoenix
+#               ^ source.phoenix
+#                ^^ source.phoenix keyword.operator.comparison.phoenix
+#                  ^ source.phoenix
+#                   ^ source.phoenix variable.other.phoenix
+>//              ^^ keyword.operator.comparison.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let d: Bool = x != y
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^^ source.phoenix support.type.primitive.phoenix
+#           ^ source.phoenix
+#            ^ source.phoenix keyword.operator.assignment.phoenix
+#             ^ source.phoenix
+#              ^ source.phoenix variable.other.phoenix
+#               ^ source.phoenix
+#                ^^ source.phoenix keyword.operator.comparison.phoenix
+#                  ^ source.phoenix
+#                   ^ source.phoenix variable.other.phoenix
+>//              ^^ keyword.operator.comparison.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let e: Bool = x <= y
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^^ source.phoenix support.type.primitive.phoenix
+#           ^ source.phoenix
+#            ^ source.phoenix keyword.operator.assignment.phoenix
+#             ^ source.phoenix
+#              ^ source.phoenix variable.other.phoenix
+#               ^ source.phoenix
+#                ^^ source.phoenix keyword.operator.comparison.phoenix
+#                  ^ source.phoenix
+#                   ^ source.phoenix variable.other.phoenix
+>//              ^^ keyword.operator.comparison.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let f: Bool = x >= y
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^^ source.phoenix support.type.primitive.phoenix
+#           ^ source.phoenix
+#            ^ source.phoenix keyword.operator.assignment.phoenix
+#             ^ source.phoenix
+#              ^ source.phoenix variable.other.phoenix
+#               ^ source.phoenix
+#                ^^ source.phoenix keyword.operator.comparison.phoenix
+#                  ^ source.phoenix
+#                   ^ source.phoenix variable.other.phoenix
+>//              ^^ keyword.operator.comparison.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let ok: Result<Int, String> = Ok(42)
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^ source.phoenix variable.other.phoenix
+#      ^^ source.phoenix
+#        ^^^^^^ source.phoenix support.type.generic.phoenix
+#              ^ source.phoenix keyword.operator.comparison.phoenix
+#               ^^^ source.phoenix support.type.primitive.phoenix
+#                  ^^ source.phoenix
+#                    ^^^^^^ source.phoenix support.type.primitive.phoenix
+#                          ^ source.phoenix keyword.operator.comparison.phoenix
+#                           ^ source.phoenix
+#                            ^ source.phoenix keyword.operator.assignment.phoenix
+#                             ^ source.phoenix
+#                              ^^ source.phoenix support.constant.phoenix
+#                                ^ source.phoenix
+#                                 ^^ source.phoenix constant.numeric.integer.phoenix
+#                                   ^^ source.phoenix
+>//      ^^^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                            ^^ support.constant.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let err: Result<Int, String> = Err("fail")
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^ source.phoenix variable.other.phoenix
+#       ^^ source.phoenix
+#         ^^^^^^ source.phoenix support.type.generic.phoenix
+#               ^ source.phoenix keyword.operator.comparison.phoenix
+#                ^^^ source.phoenix support.type.primitive.phoenix
+#                   ^^ source.phoenix
+#                     ^^^^^^ source.phoenix support.type.primitive.phoenix
+#                           ^ source.phoenix keyword.operator.comparison.phoenix
+#                            ^ source.phoenix
+#                             ^ source.phoenix keyword.operator.assignment.phoenix
+#                              ^ source.phoenix
+#                               ^^^ source.phoenix support.constant.phoenix
+#                                  ^ source.phoenix
+#                                   ^ source.phoenix string.quoted.double.phoenix
+#                                    ^^^^ source.phoenix string.quoted.double.phoenix
+#                                        ^ source.phoenix string.quoted.double.phoenix
+#                                         ^^ source.phoenix
+>//                              ^^^ support.constant.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let some: Option<Int> = Some(1)
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^^ source.phoenix variable.other.phoenix
+#        ^^ source.phoenix
+#          ^^^^^^ source.phoenix support.type.generic.phoenix
+#                ^ source.phoenix keyword.operator.comparison.phoenix
+#                 ^^^ source.phoenix support.type.primitive.phoenix
+#                    ^ source.phoenix keyword.operator.comparison.phoenix
+#                     ^ source.phoenix
+#                      ^ source.phoenix keyword.operator.assignment.phoenix
+#                       ^ source.phoenix
+#                        ^^^^ source.phoenix support.constant.phoenix
+#                            ^ source.phoenix
+#                             ^ source.phoenix constant.numeric.integer.phoenix
+#                              ^^ source.phoenix
+>//        ^^^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//                      ^^^^ support.constant.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let none: Option<Int> = None
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^^ source.phoenix variable.other.phoenix
+#        ^^ source.phoenix
+#          ^^^^^^ source.phoenix support.type.generic.phoenix
+#                ^ source.phoenix keyword.operator.comparison.phoenix
+#                 ^^^ source.phoenix support.type.primitive.phoenix
+#                    ^ source.phoenix keyword.operator.comparison.phoenix
+#                     ^ source.phoenix
+#                      ^ source.phoenix keyword.operator.assignment.phoenix
+#                       ^ source.phoenix
+#                        ^^^^ source.phoenix constant.language.phoenix
+>//                      ^^^^ constant.language.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>data |> parse() |> validate()
+#^^^^ source.phoenix variable.other.phoenix
+#    ^ source.phoenix
+#     ^^ source.phoenix keyword.operator.pipe.phoenix
+#       ^ source.phoenix
+#        ^^^^^ source.phoenix entity.name.function.phoenix
+#             ^^^ source.phoenix
+#                ^^ source.phoenix keyword.operator.pipe.phoenix
+#                  ^ source.phoenix
+#                   ^^^^^^^^ source.phoenix entity.name.function.phoenix
+#                           ^^^ source.phoenix
+>//   ^^ keyword.operator.pipe.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//               ^^ keyword.operator.pipe.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let val: Int = result?
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^ source.phoenix variable.other.phoenix
+#       ^^ source.phoenix
+#         ^^^ source.phoenix support.type.primitive.phoenix
+#            ^ source.phoenix
+#             ^ source.phoenix keyword.operator.assignment.phoenix
+#              ^ source.phoenix
+#               ^^^^^^ source.phoenix variable.other.phoenix
+#                     ^ source.phoenix keyword.operator.try.phoenix
+>//                   ^ keyword.operator.try.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>let list: List<Int> = [1, 2, 3]
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^^ source.phoenix variable.other.phoenix
+#        ^^ source.phoenix
+#          ^^^^ source.phoenix support.type.generic.phoenix
+#              ^ source.phoenix keyword.operator.comparison.phoenix
+#               ^^^ source.phoenix support.type.primitive.phoenix
+#                  ^ source.phoenix keyword.operator.comparison.phoenix
+#                   ^ source.phoenix
+#                    ^ source.phoenix keyword.operator.assignment.phoenix
+#                     ^^ source.phoenix
+#                       ^ source.phoenix constant.numeric.integer.phoenix
+#                        ^^ source.phoenix
+#                          ^ source.phoenix constant.numeric.integer.phoenix
+#                           ^^ source.phoenix
+#                             ^ source.phoenix constant.numeric.integer.phoenix
+#                              ^^ source.phoenix
+>//        ^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>let map: Map<String, Int> = {}
+#^^^ source.phoenix keyword.declaration.phoenix
+#   ^ source.phoenix
+#    ^^^ source.phoenix variable.other.phoenix
+#       ^^ source.phoenix
+#         ^^^ source.phoenix support.type.generic.phoenix
+#            ^ source.phoenix keyword.operator.comparison.phoenix
+#             ^^^^^^ source.phoenix support.type.primitive.phoenix
+#                   ^^ source.phoenix
+#                     ^^^ source.phoenix support.type.primitive.phoenix
+#                        ^ source.phoenix keyword.operator.comparison.phoenix
+#                         ^ source.phoenix
+#                          ^ source.phoenix keyword.operator.assignment.phoenix
+#                           ^^^^ source.phoenix
+>//       ^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>

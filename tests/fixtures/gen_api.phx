@@ -1,0 +1,129 @@
+// Phoenix Gen — a realistic REST API for a blog platform
+
+// ── Domain types ──────────────────────────────────────────────
+
+struct Author {
+    Int id
+    String name where self.length > 0 && self.length <= 100
+    String email where self.contains("@") && self.length > 3
+    Option<String> avatarUrl
+}
+
+enum PostStatus { Draft  Published  Archived }
+
+struct Post {
+    Int id
+    String title where self.length > 0 && self.length <= 200
+    String body where self.length > 0
+    Author author
+    PostStatus status
+    List<String> tags
+}
+
+struct Comment {
+    Int id
+    Int postId
+    String text where self.length > 0 && self.length <= 2000
+    String authorName where self.length > 0
+    Option<Int> parentId
+}
+
+// ── Endpoints ─────────────────────────────────────────────────
+
+/** List published posts with pagination and optional tag filter */
+endpoint listPosts: GET "/api/posts" {
+    query {
+        Int page = 1
+        Int limit = 20
+        Option<String> tag
+        Option<String> search
+    }
+    response List<Post>
+}
+
+/** Get a single post by ID */
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post
+    error { NotFound(404) }
+}
+
+/** Create a new post (omit server-generated fields) */
+endpoint createPost: POST "/api/posts" {
+    body Post omit { id, author } partial { tags }
+    response Post
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}
+
+/** Full update — replace all mutable fields */
+endpoint updatePost: PUT "/api/posts/{id}" {
+    body Post omit { id, author }
+    response Post
+    error {
+        NotFound(404)
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}
+
+/** Partial update — every field is optional */
+endpoint patchPost: PATCH "/api/posts/{id}" {
+    body Post omit { id, author } partial
+    response Post
+    error {
+        NotFound(404)
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}
+
+/** Delete a post */
+endpoint deletePost: DELETE "/api/posts/{id}" {
+    error {
+        NotFound(404)
+        Unauthorized(401)
+    }
+}
+
+// ── Comments (nested under posts) ─────────────────────────────
+
+/** List comments for a post */
+endpoint listComments: GET "/api/posts/{postId}/comments" {
+    query {
+        Int page = 1
+        Int limit = 50
+    }
+    response List<Comment>
+    error { NotFound(404) }
+}
+
+/** Add a comment to a post */
+endpoint createComment: POST "/api/posts/{postId}/comments" {
+    body Comment omit { id, postId, parentId }
+    response Comment
+    error {
+        NotFound(404)
+        ValidationError(400)
+    }
+}
+
+// ── Author management (pick for a lightweight profile) ────────
+
+/** Get the public profile for an author */
+endpoint getAuthorProfile: GET "/api/authors/{id}" {
+    response Author
+    error { NotFound(404) }
+}
+
+/** Update author profile — only name and avatar are editable */
+endpoint updateAuthorProfile: PATCH "/api/authors/{id}" {
+    body Author pick { name, avatarUrl } partial { avatarUrl }
+    response Author
+    error {
+        NotFound(404)
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}

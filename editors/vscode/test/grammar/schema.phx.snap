@@ -1,0 +1,44 @@
+>// SYNTAX TEST "source.phoenix"
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>
+>schema db {
+#^^^^^^ source.phoenix keyword.other.endpoint.phoenix
+#      ^ source.phoenix
+#       ^^ source.phoenix variable.other.phoenix
+#         ^^^ source.phoenix
+>// <- keyword.other.endpoint.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  table users from User {
+#^^ source.phoenix
+#  ^^^^^ source.phoenix variable.other.phoenix
+#       ^ source.phoenix
+#        ^^^^^ source.phoenix variable.other.phoenix
+#             ^ source.phoenix
+#              ^^^^ source.phoenix variable.other.phoenix
+#                  ^ source.phoenix
+#                   ^^^^ source.phoenix entity.name.type.phoenix
+#                       ^^^ source.phoenix
+>//                  ^^^^ entity.name.type.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>    primary key id
+#^^^^ source.phoenix
+#    ^^^^^^^ source.phoenix variable.other.phoenix
+#           ^ source.phoenix
+#            ^^^ source.phoenix variable.other.phoenix
+#               ^ source.phoenix
+#                ^^ source.phoenix variable.other.phoenix
+>    unique email
+#^^^^ source.phoenix
+#    ^^^^^^ source.phoenix variable.other.phoenix
+#          ^ source.phoenix
+#           ^^^^^ source.phoenix variable.other.phoenix
+>    index age
+#^^^^ source.phoenix
+#    ^^^^^ source.phoenix variable.other.phoenix
+#         ^ source.phoenix
+#          ^^^ source.phoenix variable.other.phoenix
+>  }
+#^^^^ source.phoenix
+>}
+#^^ source.phoenix
+>

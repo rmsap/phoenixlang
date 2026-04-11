@@ -2,7 +2,7 @@
 
 This document outlines the path from the current tree-walk interpreter to a production-ready full-stack web language.
 
-**Current state (updated 2026-04-08):** A working tree-walk interpreter with 1,082 tests across ~15,500 LOC (6 crates). Phase 1 is fully complete. All tests pass, clippy is clean, formatting is clean, CI is green. **Next up: Phase 2 (Compilation).**
+**Current state (updated 2026-04-10):** A working tree-walk interpreter with 1,617 tests across ~42,000 LOC (8 crates). Phoenix Gen Phases 1–3 and 5 fully complete with TypeScript, Python, Go, and OpenAPI code generation, VS Code extension with full LSP (hover, autocomplete, go-to-definition, find-references, rename), watch mode, and `where` constraint validation. Phase 1 is fully complete. `#![warn(missing_docs)]` enforced on all crates. All tests pass, clippy is clean, formatting is clean, CI is green. **Next up: Phase 2 (Compilation).**
 
 ---
 

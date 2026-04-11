@@ -274,7 +274,7 @@ These features can be implemented in the tree-walk interpreter before compilatio
 function parsePort(s: String) -> Option<Int> {
   // Chain operations: parse, then validate range
   parseInt(s)
-    .filter(function(p: Int) -> Bool { return p > 0 and p < 65536 })
+    .filter(function(p: Int) -> Bool { return p > 0 && p < 65536 })
 }
 
 function findUser(id: Int) -> Result<User, HttpError> {

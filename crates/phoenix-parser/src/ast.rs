@@ -31,6 +31,10 @@ pub enum Declaration {
     Trait(TraitDecl),
     /// A type alias declaration: `type Name = TypeExpr` or `type Name<T> = TypeExpr`.
     TypeAlias(TypeAliasDecl),
+    /// An endpoint declaration: `endpoint name: METHOD "path" { ... }`.
+    Endpoint(EndpointDecl),
+    /// A database schema declaration: `schema name { table ... }`.
+    Schema(SchemaDecl),
 }
 
 /// A function declaration, including its name, parameters, optional return
@@ -49,6 +53,8 @@ pub enum Declaration {
 pub struct FunctionDecl {
     /// The function name.
     pub name: String,
+    /// Source span covering just the function name identifier.
+    pub name_span: Span,
     /// Generic type parameters (e.g. `["T", "U"]` for `function map<T, U>(...)`).
     pub type_params: Vec<String>,
     /// Trait bounds for type parameters (e.g. `T -> [Display]` for `<T: Display>`).
@@ -260,11 +266,22 @@ pub struct WhileStmt {
 #[derive(Debug, Clone, Serialize)]
 pub enum ForSource {
     /// Range-based: `for i in 0..10`
-    Range { start: Expr, end: Expr },
+    Range {
+        /// The start of the range (inclusive).
+        start: Expr,
+        /// The end of the range (exclusive).
+        end: Expr,
+    },
     /// Collection-based: `for item in expr`
     Iterable(Expr),
 }
 
+/// A `for` loop over a range or collection.
+///
+/// ```text
+/// for i in 0..10 { print(i) }
+/// for item in list { print(item) }
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct ForStmt {
     /// The loop variable name.
@@ -298,6 +315,8 @@ pub struct ForStmt {
 pub struct StructDecl {
     /// The struct name.
     pub name: String,
+    /// Source span covering just the struct name identifier.
+    pub name_span: Span,
     /// Generic type parameters (e.g. `["A", "B"]` for `struct Pair<A, B>`).
     pub type_params: Vec<String>,
     /// The fields declared in this struct.
@@ -306,6 +325,8 @@ pub struct StructDecl {
     pub methods: Vec<FunctionDecl>,
     /// Inline trait implementations defined inside the struct body.
     pub trait_impls: Vec<InlineTraitImpl>,
+    /// Doc comment attached to this struct, if any.
+    pub doc_comment: Option<String>,
     /// Source span covering the entire struct declaration.
     pub span: Span,
 }
@@ -314,6 +335,7 @@ pub struct StructDecl {
 ///
 /// ```text
 /// Int x
+/// String name where self.length > 0 and self.length <= 100
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldDecl {
@@ -321,6 +343,11 @@ pub struct FieldDecl {
     pub type_annotation: TypeExpr,
     /// The field name.
     pub name: String,
+    /// Optional constraint expression introduced by `where`. The expression
+    /// must evaluate to `Bool` and uses `self` to refer to the field value.
+    pub constraint: Option<Expr>,
+    /// Doc comment attached to this field, if any.
+    pub doc_comment: Option<String>,
     /// Source span covering the field declaration.
     pub span: Span,
 }
@@ -344,6 +371,8 @@ pub struct FieldDecl {
 pub struct EnumDecl {
     /// The enum name.
     pub name: String,
+    /// Source span covering just the enum name identifier.
+    pub name_span: Span,
     /// Generic type parameters (e.g. `["T"]` for `enum Option<T>`).
     pub type_params: Vec<String>,
     /// The variants of this enum.
@@ -352,6 +381,8 @@ pub struct EnumDecl {
     pub methods: Vec<FunctionDecl>,
     /// Inline trait implementations defined inside the enum body.
     pub trait_impls: Vec<InlineTraitImpl>,
+    /// Doc comment attached to this enum, if any.
+    pub doc_comment: Option<String>,
     /// Source span covering the entire enum declaration.
     pub span: Span,
 }
@@ -424,6 +455,8 @@ pub struct ImplBlock {
 pub struct TraitDecl {
     /// The trait name.
     pub name: String,
+    /// Source span covering just the trait name identifier.
+    pub name_span: Span,
     /// Generic type parameters for the trait.
     pub type_params: Vec<String>,
     /// The method signatures declared in this trait.
@@ -463,11 +496,262 @@ pub struct TraitMethodSig {
 pub struct TypeAliasDecl {
     /// The alias name.
     pub name: String,
+    /// Source span covering just the alias name identifier.
+    pub name_span: Span,
     /// Generic type parameters (e.g. `["T"]` for `type StringResult<T> = ...`).
     pub type_params: Vec<String>,
     /// The type expression that this alias expands to.
     pub target: TypeExpr,
     /// Source span covering the entire type alias declaration.
+    pub span: Span,
+}
+
+/// An HTTP method for an endpoint declaration.
+///
+/// Each variant maps directly to the corresponding uppercase keyword token
+/// produced by the lexer (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`).
+///
+/// ```text
+/// endpoint getUser: GET "/api/users/{id}" { ... }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum HttpMethod {
+    /// The `GET` HTTP method — used for read-only retrieval.
+    Get,
+    /// The `POST` HTTP method — used for creating resources.
+    Post,
+    /// The `PUT` HTTP method — used for full replacement of a resource.
+    Put,
+    /// The `PATCH` HTTP method — used for partial updates to a resource.
+    Patch,
+    /// The `DELETE` HTTP method — used for removing a resource.
+    Delete,
+}
+
+impl HttpMethod {
+    /// Returns the uppercase string representation (e.g. `"GET"`, `"POST"`).
+    pub fn as_upper_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    /// Returns the lowercase string representation (e.g. `"get"`, `"post"`).
+    pub fn as_lower_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Post => "post",
+            Self::Put => "put",
+            Self::Patch => "patch",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// A type derivation modifier applied to a base type in endpoint body declarations.
+///
+/// Modifiers chain left-to-right: `User omit { id } partial` means
+/// "start with User, remove the `id` field, then make all remaining fields optional."
+///
+/// These modifiers are inspired by TypeScript's utility types (`Omit`, `Pick`,
+/// `Partial`) and allow endpoint declarations to re-use existing struct
+/// definitions without repeating field lists.
+#[derive(Debug, Clone, Serialize)]
+pub enum TypeModifier {
+    /// `omit { field1, field2 }` -- exclude the listed fields from the base type.
+    Omit {
+        /// The field names to exclude.
+        fields: Vec<String>,
+        /// Source span covering the `omit { ... }` expression.
+        span: Span,
+    },
+    /// `pick { field1, field2 }` -- include only the listed fields from the base type.
+    Pick {
+        /// The field names to include.
+        fields: Vec<String>,
+        /// Source span covering the `pick { ... }` expression.
+        span: Span,
+    },
+    /// `partial` -- make fields optional.
+    ///
+    /// If `fields` is `None`, **all** fields become optional.
+    /// If `fields` is `Some(vec)`, only the listed fields become optional.
+    Partial {
+        /// The field names to make optional, or `None` for all fields.
+        fields: Option<Vec<String>>,
+        /// Source span covering the `partial` or `partial { ... }` expression.
+        span: Span,
+    },
+}
+
+/// A derived type reference: a base type with zero or more chained modifiers.
+///
+/// Derived types appear in endpoint `body` declarations and allow re-using an
+/// existing struct definition with field-level transformations.
+///
+/// ```text
+/// User omit { id } partial          // all User fields except id, all optional
+/// User pick { name, email }          // only name and email from User
+/// User partial { email }             // User with email made optional
+/// ```
+///
+/// When `modifiers` is empty the derived type is equivalent to a plain type
+/// reference.
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivedType {
+    /// The base struct type that modifiers are applied to (e.g. `User`).
+    pub base_type: TypeExpr,
+    /// Chained type modifiers (`omit`, `pick`, `partial`), applied left-to-right.
+    /// May be empty when the body type is used without derivation.
+    pub modifiers: Vec<TypeModifier>,
+    /// Source span covering the entire derived type expression, from the base
+    /// type name through the last modifier.
+    pub span: Span,
+}
+
+/// An error variant in an endpoint `error` block.
+///
+/// Each variant pairs a descriptive name with an HTTP status code. These are
+/// used by code generators to produce typed error responses.
+///
+/// ```text
+/// error {
+///     NotFound(404)
+///     Conflict(409)
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointErrorVariant {
+    /// The error variant name (e.g. `"NotFound"`, `"Conflict"`).
+    pub name: String,
+    /// The HTTP status code associated with this error (e.g. `404`, `409`).
+    pub status_code: i64,
+    /// Source span covering the entire `Name(code)` variant.
+    pub span: Span,
+}
+
+/// A query parameter declared in an endpoint `query` block.
+///
+/// Query parameters define the typed query-string inputs for an endpoint.
+/// Each parameter has a type, a name, and an optional default value.
+///
+/// ```text
+/// query {
+///     Int page = 1
+///     Option<String> search
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryParam {
+    /// The declared type of the query parameter (e.g. `Int`, `Option<String>`).
+    pub type_annotation: TypeExpr,
+    /// The parameter name as it appears in the query string (e.g. `"page"`).
+    pub name: String,
+    /// An optional default value expression, used when the parameter is omitted
+    /// from the request.
+    pub default_value: Option<Expr>,
+    /// Source span covering the entire parameter declaration.
+    pub span: Span,
+}
+
+/// An endpoint declaration describing a single HTTP API endpoint.
+///
+/// Endpoint declarations are a Phoenix Gen feature that enables code generation
+/// of typed API clients and server stubs. Each endpoint specifies an HTTP
+/// method, a URL path, and optional sections for query parameters, request
+/// body, response type, and error variants.
+///
+/// ```text
+/// /** Creates a new user account. */
+/// endpoint createUser: POST "/api/users" {
+///     body User omit { id }
+///     response User
+///     query {
+///         Bool notify = true
+///     }
+///     error {
+///         Conflict(409)
+///     }
+/// }
+/// ```
+///
+/// All inner sections (`body`, `response`, `query`, `error`) are optional and
+/// may appear in any order within the endpoint block.
+#[derive(Debug, Clone, Serialize)]
+pub struct EndpointDecl {
+    /// The endpoint name, used as an identifier in generated code
+    /// (e.g. `"createUser"`).
+    pub name: String,
+    /// Source span covering just the endpoint name identifier.
+    pub name_span: Span,
+    /// The HTTP method for this endpoint (e.g. `POST`).
+    pub method: HttpMethod,
+    /// The URL path pattern, potentially containing path parameters
+    /// (e.g. `"/api/users/{id}"`).
+    pub path: String,
+    /// Query parameters declared in an optional `query { ... }` block.
+    /// Empty if no query block is present.
+    pub query_params: Vec<QueryParam>,
+    /// The request body type with optional derivation modifiers, parsed from
+    /// the `body` section. `None` if the endpoint has no body (e.g. `GET`).
+    pub body: Option<DerivedType>,
+    /// The response type, parsed from the `response` section.
+    /// `None` if the endpoint does not declare a response type.
+    pub response: Option<TypeExpr>,
+    /// Error variants with HTTP status codes, parsed from the `error { ... }`
+    /// block. Empty if no error block is present.
+    pub errors: Vec<EndpointErrorVariant>,
+    /// An optional doc comment (`/** ... */`) attached to this endpoint.
+    /// Carries the trimmed inner text for use by code generators.
+    pub doc_comment: Option<String>,
+    /// Source span covering the entire endpoint declaration, from the
+    /// `endpoint` keyword through the closing `}`.
+    pub span: Span,
+}
+
+// ── Schema declarations (forward compatibility for Phase 4) ─────────
+
+/// A database schema declaration containing table definitions.
+///
+/// Parsed for forward compatibility with Phase 4 (typed database queries
+/// and migrations). Not type-checked or code-generated in the current phase.
+///
+/// ```text
+/// schema db {
+///     table users from User {
+///         primary key id
+///         unique email
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaDecl {
+    /// The schema name (e.g., `"db"`).
+    pub name: String,
+    /// The table declarations within this schema.
+    pub tables: Vec<SchemaTable>,
+    /// Source span covering the entire schema declaration.
+    pub span: Span,
+}
+
+/// A table declaration within a schema block.
+///
+/// May reference a Phoenix struct via `from TypeName` or declare columns
+/// inline. Constraints (primary key, unique, index, foreign key, exclude)
+/// are stored as opaque token sequences for forward compatibility.
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaTable {
+    /// The table name (e.g., `"users"`).
+    pub name: String,
+    /// Optional struct name from `from TypeName` clause.
+    pub source_type: Option<String>,
+    /// Raw constraint/column lines stored as token text sequences.
+    pub body_tokens: Vec<Vec<String>>,
+    /// Source span covering this table declaration.
     pub span: Span,
 }
 
@@ -624,8 +908,8 @@ impl std::fmt::Display for BinaryOp {
             BinaryOp::Gt => write!(f, ">"),
             BinaryOp::LtEq => write!(f, "<="),
             BinaryOp::GtEq => write!(f, ">="),
-            BinaryOp::And => write!(f, "and"),
-            BinaryOp::Or => write!(f, "or"),
+            BinaryOp::And => write!(f, "&&"),
+            BinaryOp::Or => write!(f, "||"),
         }
     }
 }
@@ -653,7 +937,7 @@ pub struct BinaryExpr {
 pub enum UnaryOp {
     /// Arithmetic negation (`-`).
     Neg,
-    /// Logical negation (`not`).
+    /// Logical negation (`!`).
     Not,
 }
 
@@ -661,7 +945,7 @@ pub enum UnaryOp {
 ///
 /// ```text
 /// -x
-/// not flag
+/// !flag
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct UnaryExpr {

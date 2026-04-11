@@ -5,7 +5,9 @@
 //! the lambda's own parameters).  Used by both the semantic checker
 //! (for capture annotation) and the interpreter (for runtime capture).
 
-use crate::ast::*;
+use crate::ast::{
+    Block, ElseBranch, Expr, IfStmt, MatchBody, Pattern, Statement, StringSegment, VarDeclTarget,
+};
 use std::collections::HashSet;
 
 /// Collects free variable names in `body` that are not in `params` or
@@ -187,6 +189,7 @@ fn walk_expr(expr: &Expr, free: &mut HashSet<String>, local: &mut HashSet<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::*;
     use crate::parser;
     use phoenix_common::span::SourceId;
     use phoenix_lexer::lexer::tokenize;

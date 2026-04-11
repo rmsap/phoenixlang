@@ -9,7 +9,10 @@ use crate::checker::{
 };
 use crate::types::Type;
 use phoenix_common::span::Span;
-use phoenix_parser::ast::*;
+use phoenix_parser::ast::{
+    EnumDecl, FunctionDecl, ImplBlock, InlineTraitImpl, Param, StructDecl, TraitDecl,
+    TypeAliasDecl, TypeExpr,
+};
 use std::collections::HashMap;
 
 impl Checker {
@@ -20,6 +23,7 @@ impl Checker {
         self.enums.insert(
             "Option".to_string(),
             EnumInfo {
+                definition_span: Span::BUILTIN,
                 type_params: vec!["T".to_string()],
                 variants: vec![
                     ("Some".to_string(), vec![Type::TypeVar("T".to_string())]),
@@ -32,6 +36,7 @@ impl Checker {
         self.enums.insert(
             "Result".to_string(),
             EnumInfo {
+                definition_span: Span::BUILTIN,
                 type_params: vec!["T".to_string(), "E".to_string()],
                 variants: vec![
                     ("Ok".to_string(), vec![Type::TypeVar("T".to_string())]),
@@ -47,6 +52,7 @@ impl Checker {
                 (
                     "isSome".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![],
                         return_type: Type::Bool,
                     },
@@ -54,6 +60,7 @@ impl Checker {
                 (
                     "isNone".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![],
                         return_type: Type::Bool,
                     },
@@ -61,6 +68,7 @@ impl Checker {
                 (
                     "unwrap".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![],
                         return_type: Type::TypeVar("T".to_string()),
                     },
@@ -68,6 +76,7 @@ impl Checker {
                 (
                     "unwrapOr".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![Type::TypeVar("T".to_string())],
                         return_type: Type::TypeVar("T".to_string()),
                     },
@@ -82,6 +91,7 @@ impl Checker {
                 (
                     "isOk".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![],
                         return_type: Type::Bool,
                     },
@@ -89,6 +99,7 @@ impl Checker {
                 (
                     "isErr".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![],
                         return_type: Type::Bool,
                     },
@@ -96,6 +107,7 @@ impl Checker {
                 (
                     "unwrap".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![],
                         return_type: Type::TypeVar("T".to_string()),
                     },
@@ -103,6 +115,7 @@ impl Checker {
                 (
                     "unwrapOr".to_string(),
                     MethodInfo {
+                        definition_span: Span::BUILTIN,
                         params: vec![Type::TypeVar("T".to_string())],
                         return_type: Type::TypeVar("T".to_string()),
                     },
@@ -147,9 +160,15 @@ impl Checker {
                 func.span,
             );
         } else {
+            self.record_reference(
+                func.name_span,
+                crate::checker::SymbolKind::Function,
+                func.name.clone(),
+            );
             self.functions.insert(
                 func.name.clone(),
                 FunctionInfo {
+                    definition_span: func.name_span,
                     type_params: func.type_params.clone(),
                     type_param_bounds: func.type_param_bounds.clone(),
                     params,
@@ -165,15 +184,58 @@ impl Checker {
     /// them in the struct table for use during constructor and field-access
     /// checking.  Also registers any inline methods and trait implementations.
     pub(crate) fn register_struct(&mut self, s: &StructDecl) {
-        let fields: Vec<(String, Type)> = self.with_type_params(&s.type_params, None, |this| {
-            s.fields
-                .iter()
-                .map(|f| (f.name.clone(), this.resolve_type_expr(&f.type_annotation)))
-                .collect()
-        });
+        let fields: Vec<crate::checker::FieldInfo> =
+            self.with_type_params(&s.type_params, None, |this| {
+                s.fields
+                    .iter()
+                    .map(|f| {
+                        let ty = this.resolve_type_expr(&f.type_annotation);
+
+                        // Validate constraint expression if present: bind `self` to
+                        // the field type, type-check the expression, verify it is Bool.
+                        if let Some(ref constraint) = f.constraint {
+                            this.scopes.push();
+                            this.scopes.define(
+                                "self".to_string(),
+                                crate::scope::VarInfo {
+                                    ty: ty.clone(),
+                                    is_mut: false,
+                                    definition_span: f.span,
+                                },
+                            );
+                            let constraint_ty = this.check_expr(constraint);
+                            this.scopes.pop();
+                            if constraint_ty != crate::types::Type::Bool
+                                && !constraint_ty.is_error()
+                            {
+                                this.error(
+                                    format!(
+                                        "constraint on field `{}` must evaluate to Bool, got `{}`",
+                                        f.name, constraint_ty
+                                    ),
+                                    f.span,
+                                );
+                            }
+                        }
+
+                        crate::checker::FieldInfo {
+                            name: f.name.clone(),
+                            ty,
+                            constraint: f.constraint.clone(),
+                            definition_span: f.span,
+                        }
+                    })
+                    .collect()
+            });
+        self.record_reference(
+            s.name_span,
+            crate::checker::SymbolKind::Struct,
+            s.name.clone(),
+        );
         self.structs.insert(
             s.name.clone(),
             StructInfo {
+                definition_span: s.name_span,
                 type_params: s.type_params.clone(),
                 fields,
             },
@@ -198,9 +260,15 @@ impl Checker {
                     })
                     .collect()
             });
+        self.record_reference(
+            e.name_span,
+            crate::checker::SymbolKind::Enum,
+            e.name.clone(),
+        );
         self.enums.insert(
             e.name.clone(),
             EnumInfo {
+                definition_span: e.name_span,
                 type_params: e.type_params.clone(),
                 variants,
             },
@@ -237,6 +305,7 @@ impl Checker {
         self.traits.insert(
             t.name.clone(),
             TraitInfo {
+                definition_span: t.name_span,
                 type_params: t.type_params.clone(),
                 methods,
             },
@@ -276,6 +345,7 @@ impl Checker {
         self.type_aliases.insert(
             ta.name.clone(),
             TypeAliasInfo {
+                definition_span: ta.name_span,
                 type_params: ta.type_params.clone(),
                 target,
             },
@@ -362,6 +432,7 @@ impl Checker {
             methods_to_add.push((
                 func.name.clone(),
                 MethodInfo {
+                    definition_span: func.name_span,
                     params,
                     return_type,
                 },

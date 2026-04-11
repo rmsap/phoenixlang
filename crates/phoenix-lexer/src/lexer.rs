@@ -46,6 +46,18 @@ impl<'src> Lexer<'src> {
         self.bytes.get(self.pos + 1).copied()
     }
 
+    /// Returns the byte at an arbitrary absolute position in the source
+    /// without advancing the lexer cursor.
+    ///
+    /// Unlike [`peek`](Self::peek) and [`peek_next`](Self::peek_next), which
+    /// look at offsets relative to the current position, `peek_at` takes an
+    /// absolute byte index. This is used when the lexer needs to look further
+    /// ahead than `pos + 1` -- for example, when distinguishing a doc comment
+    /// (`/**`) from a plain block comment (`/*`).
+    fn peek_at(&self, pos: usize) -> Option<u8> {
+        self.bytes.get(pos).copied()
+    }
+
     fn advance(&mut self) -> u8 {
         let b = self.bytes[self.pos];
         self.pos += 1;
@@ -92,6 +104,64 @@ impl<'src> Lexer<'src> {
                 break;
             }
             self.advance();
+        }
+    }
+
+    /// Lexes a doc comment (`/** ... */`).
+    ///
+    /// This method is called after the `/**` prefix has already been consumed
+    /// (the lexer cursor is positioned just past the second `*`). It scans
+    /// forward until the closing `*/` delimiter is found or EOF is reached.
+    ///
+    /// The returned [`TokenKind::DocComment`] token carries the **inner content**
+    /// with the following transformations applied:
+    ///
+    /// 1. The `/**` and `*/` delimiters are stripped.
+    /// 2. Each line is trimmed of leading/trailing whitespace.
+    /// 3. A leading `* ` or `*` prefix is removed from each line, supporting
+    ///    the common multi-line doc comment style:
+    ///    ```text
+    ///    /**
+    ///     * First line.
+    ///     * Second line.
+    ///     */
+    ///    ```
+    /// 4. The final assembled string is trimmed of leading and trailing
+    ///    whitespace so that blank lines from the delimiters are removed.
+    ///
+    /// If EOF is reached before `*/`, an [`TokenKind::Error`] token is produced
+    /// instead.
+    fn lex_doc_comment(&mut self, start: usize) -> Token {
+        let content_start = self.pos;
+        loop {
+            match self.peek() {
+                Some(b'*') if self.peek_next() == Some(b'/') => {
+                    let content_end = self.pos;
+                    self.advance(); // consume *
+                    self.advance(); // consume /
+                    let raw = &self.source[content_start..content_end];
+                    // Trim leading/trailing whitespace and strip leading ` * ` from each line
+                    let text = raw
+                        .lines()
+                        .map(|line| {
+                            let trimmed = line.trim();
+                            trimmed
+                                .strip_prefix("* ")
+                                .unwrap_or(trimmed.strip_prefix('*').unwrap_or(trimmed))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_string();
+                    return Token::new(TokenKind::DocComment, text, self.span(start));
+                }
+                Some(_) => {
+                    self.advance();
+                }
+                None => {
+                    return Token::new(TokenKind::Error, self.text(start), self.span(start));
+                }
+            }
         }
     }
 
@@ -151,6 +221,11 @@ impl<'src> Lexer<'src> {
                 | TokenKind::DotDot
                 | TokenKind::Pipe
                 | TokenKind::Question
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
         )
     }
 
@@ -251,14 +326,26 @@ impl<'src> Lexer<'src> {
             "continue" => TokenKind::Continue,
             "trait" => TokenKind::Trait,
             "type" => TokenKind::Type,
+            "endpoint" => TokenKind::Endpoint,
+            "body" => TokenKind::Body,
+            "response" => TokenKind::Response,
+            "error" => TokenKind::ErrorKw,
+            "omit" => TokenKind::Omit,
+            "pick" => TokenKind::Pick,
+            "partial" => TokenKind::Partial,
+            "query" => TokenKind::Query,
+            "where" => TokenKind::Where,
+            "schema" => TokenKind::Schema,
+            "GET" => TokenKind::Get,
+            "POST" => TokenKind::Post,
+            "PUT" => TokenKind::Put,
+            "PATCH" => TokenKind::Patch,
+            "DELETE" => TokenKind::Delete,
             "Int" => TokenKind::IntType,
             "Float" => TokenKind::FloatType,
             "String" => TokenKind::StringType,
             "Bool" => TokenKind::BoolType,
             "Void" => TokenKind::Void,
-            "and" => TokenKind::And,
-            "or" => TokenKind::Or,
-            "not" => TokenKind::Not,
             _ => TokenKind::Ident,
         };
 
@@ -267,8 +354,8 @@ impl<'src> Lexer<'src> {
 
     /// Lexes a potentially multi-character operator token.
     ///
-    /// Handles `->`, `==`, `!=`, `<=`, `>=`, `|>`, and their single-character
-    /// counterparts (`-`, `=`, `!`, `<`, `>`, `?`).
+    /// Handles `->`, `==`, `!=`, `<=`, `>=`, `|>`, `&&`, `||`, and their
+    /// single-character counterparts (`-`, `=`, `!`, `<`, `>`, `?`).
     fn lex_operator(&mut self) -> Token {
         let s = self.pos;
         let b = self.advance();
@@ -277,6 +364,9 @@ impl<'src> Lexer<'src> {
                 if self.peek() == Some(b'>') {
                     self.advance();
                     Token::new(TokenKind::Arrow, "->", self.span(s))
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    Token::new(TokenKind::MinusEq, "-=", self.span(s))
                 } else {
                     Token::new(TokenKind::Minus, "-", self.span(s))
                 }
@@ -294,9 +384,7 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     Token::new(TokenKind::NotEq, "!=", self.span(s))
                 } else {
-                    // Standalone `!` is not a valid operator — Phoenix uses
-                    // the `not` keyword for boolean negation.
-                    Token::new(TokenKind::Error, "!", self.span(s))
+                    Token::new(TokenKind::Not, "!", self.span(s))
                 }
             }
             b'<' => {
@@ -320,6 +408,17 @@ impl<'src> Lexer<'src> {
                 if self.peek() == Some(b'>') {
                     self.advance();
                     Token::new(TokenKind::Pipe, "|>", self.span(s))
+                } else if self.peek() == Some(b'|') {
+                    self.advance();
+                    Token::new(TokenKind::Or, "||", self.span(s))
+                } else {
+                    Token::new(TokenKind::Error, self.text(s), self.span(s))
+                }
+            }
+            b'&' => {
+                if self.peek() == Some(b'&') {
+                    self.advance();
+                    Token::new(TokenKind::And, "&&", self.span(s))
                 } else {
                     Token::new(TokenKind::Error, self.text(s), self.span(s))
                 }
@@ -340,11 +439,19 @@ impl<'src> Lexer<'src> {
                 self.skip_line_comment();
                 continue;
             }
-            // Handle block comments
+            // Handle block comments and doc comments
             if self.peek() == Some(b'/') && self.peek_next() == Some(b'*') {
                 let start = self.pos;
+                // Check for doc comment: /** but not /***
+                let is_doc = self.peek_at(start + 2) == Some(b'*')
+                    && self.peek_at(start + 3) != Some(b'*')
+                    && self.peek_at(start + 3) != Some(b'/');
                 self.advance(); // consume /
                 self.advance(); // consume *
+                if is_doc {
+                    self.advance(); // consume second *
+                    return self.lex_doc_comment(start);
+                }
                 if self.skip_block_comment() {
                     continue;
                 } else {
@@ -395,24 +502,44 @@ impl<'src> Lexer<'src> {
                 b'+' => {
                     let s = self.pos;
                     self.advance();
-                    Token::new(TokenKind::Plus, "+", self.span(s))
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        Token::new(TokenKind::PlusEq, "+=", self.span(s))
+                    } else {
+                        Token::new(TokenKind::Plus, "+", self.span(s))
+                    }
                 }
                 b'*' => {
                     let s = self.pos;
                     self.advance();
-                    Token::new(TokenKind::Star, "*", self.span(s))
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        Token::new(TokenKind::StarEq, "*=", self.span(s))
+                    } else {
+                        Token::new(TokenKind::Star, "*", self.span(s))
+                    }
                 }
                 // Note: `//` and `/*` comments are handled before this match
                 // statement, so reaching here means this `/` is a division operator.
                 b'/' => {
                     let s = self.pos;
                     self.advance();
-                    Token::new(TokenKind::Slash, "/", self.span(s))
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        Token::new(TokenKind::SlashEq, "/=", self.span(s))
+                    } else {
+                        Token::new(TokenKind::Slash, "/", self.span(s))
+                    }
                 }
                 b'%' => {
                     let s = self.pos;
                     self.advance();
-                    Token::new(TokenKind::Percent, "%", self.span(s))
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        Token::new(TokenKind::PercentEq, "%=", self.span(s))
+                    } else {
+                        Token::new(TokenKind::Percent, "%", self.span(s))
+                    }
                 }
                 b',' => {
                     let s = self.pos;
@@ -471,7 +598,7 @@ impl<'src> Lexer<'src> {
                     Token::new(TokenKind::RBracket, "]", self.span(s))
                 }
 
-                b'-' | b'=' | b'!' | b'<' | b'>' | b'?' | b'|' => self.lex_operator(),
+                b'-' | b'=' | b'!' | b'<' | b'>' | b'?' | b'|' | b'&' => self.lex_operator(),
 
                 _ => {
                     let s = self.pos;
@@ -498,7 +625,7 @@ impl Iterator for Lexer<'_> {
         if token.kind == TokenKind::Eof {
             return None;
         }
-        if token.kind != TokenKind::Newline {
+        if token.kind != TokenKind::Newline && token.kind != TokenKind::DocComment {
             self.last_token_kind = Some(token.kind);
         }
         Some(token)
@@ -583,7 +710,7 @@ mod tests {
     #[test]
     fn comparison_operators() {
         assert_eq!(
-            token_kinds("x < 10 and y >= 5"),
+            token_kinds("x < 10 && y >= 5"),
             vec![Ident, Lt, IntLiteral, And, Ident, GtEq, IntLiteral, Eof]
         );
     }
@@ -648,7 +775,7 @@ mod tests {
     #[test]
     fn logical_operators() {
         assert_eq!(
-            token_kinds("not x and y or z"),
+            token_kinds("!x && y || z"),
             vec![Not, Ident, And, Ident, Or, Ident, Eof]
         );
     }
@@ -1070,17 +1197,147 @@ mod tests {
         assert_eq!(kinds, vec![Ident, Newline, Ident, Eof]);
     }
 
-    /// Standalone `!` is an error token — Phoenix uses `not` for negation.
+    /// Standalone `!` is the logical not operator.
     #[test]
-    fn bang_is_error_token() {
+    fn bang_is_not_token() {
         let kinds = token_kinds("!x");
-        assert_eq!(kinds, vec![Error, Ident, Eof]);
+        assert_eq!(kinds, vec![Not, Ident, Eof]);
     }
 
-    /// `!=` is still valid (not affected by `!` being an error).
+    /// `!=` is still valid (not-equal operator).
     #[test]
     fn bang_equals_still_valid() {
         let kinds = token_kinds("a != b");
         assert_eq!(kinds, vec![Ident, NotEq, Ident, Eof]);
+    }
+
+    // ── Endpoint / gen keyword tokenisation tests ─────────────────────
+
+    #[test]
+    fn endpoint_keyword() {
+        assert_eq!(token_kinds("endpoint"), vec![Endpoint, Eof]);
+    }
+
+    #[test]
+    fn http_method_keywords() {
+        assert_eq!(token_kinds("GET"), vec![Get, Eof]);
+        assert_eq!(token_kinds("POST"), vec![Post, Eof]);
+        assert_eq!(token_kinds("PUT"), vec![Put, Eof]);
+        assert_eq!(token_kinds("PATCH"), vec![Patch, Eof]);
+        assert_eq!(token_kinds("DELETE"), vec![Delete, Eof]);
+    }
+
+    #[test]
+    fn gen_section_keywords() {
+        assert_eq!(token_kinds("body"), vec![Body, Eof]);
+        assert_eq!(token_kinds("response"), vec![Response, Eof]);
+        assert_eq!(token_kinds("error"), vec![ErrorKw, Eof]);
+        assert_eq!(token_kinds("omit"), vec![Omit, Eof]);
+        assert_eq!(token_kinds("pick"), vec![Pick, Eof]);
+        assert_eq!(token_kinds("partial"), vec![Partial, Eof]);
+        assert_eq!(token_kinds("query"), vec![Query, Eof]);
+    }
+
+    #[test]
+    fn doc_comment_token() {
+        let tokens = tokenize("/** hello */", SourceId(0));
+        assert_eq!(tokens[0].kind, DocComment);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[1].kind, Eof);
+    }
+
+    #[test]
+    fn doc_comment_multiline_content() {
+        let tokens = tokenize("/** line one\n * line two */", SourceId(0));
+        assert_eq!(tokens[0].kind, DocComment);
+        let text = &tokens[0].text;
+        assert!(
+            text.contains("line one"),
+            "doc comment text should contain 'line one', got: {:?}",
+            text
+        );
+        assert!(
+            text.contains("line two"),
+            "doc comment text should contain 'line two', got: {:?}",
+            text
+        );
+    }
+
+    /// An unterminated doc comment produces an Error token.
+    #[test]
+    fn doc_comment_unterminated() {
+        let tokens = tokenize("/** no closing", SourceId(0));
+        assert_eq!(tokens[0].kind, Error);
+    }
+
+    /// `/***/` is treated as a regular block comment (not a doc comment)
+    /// because the third `*` is immediately followed by `/`.
+    #[test]
+    fn triple_star_slash_is_block_comment() {
+        let tokens = tokenize("/***/ let x = 1", SourceId(0));
+        // Block comment is skipped; first real token is `let`
+        assert_eq!(tokens[0].kind, Let);
+    }
+
+    /// Lowercase HTTP method names are identifiers, not keywords.
+    #[test]
+    fn http_methods_are_case_sensitive() {
+        assert_eq!(token_kinds("get"), vec![Ident, Eof]);
+        assert_eq!(token_kinds("post"), vec![Ident, Eof]);
+        assert_eq!(token_kinds("delete"), vec![Ident, Eof]);
+    }
+
+    /// A doc comment preceding a struct is followed directly by the struct
+    /// keyword (no newline token, because DocComment does not update
+    /// `last_token_kind` and thus does not trigger newline emission).
+    #[test]
+    fn doc_comment_before_struct() {
+        let kinds = token_kinds("/** A user */\nstruct User { }");
+        assert_eq!(kinds[0], DocComment);
+        assert_eq!(kinds[1], Struct);
+    }
+
+    /// An empty doc comment `/** */` produces a DocComment token with empty text.
+    #[test]
+    fn doc_comment_empty() {
+        let tokens = tokenize("/** */", SourceId(0));
+        assert_eq!(tokens[0].kind, DocComment);
+        assert_eq!(tokens[0].text, "");
+    }
+
+    /// `where` is a keyword.
+    #[test]
+    fn where_keyword() {
+        assert_eq!(token_kinds("where"), vec![Where, Eof]);
+    }
+
+    /// `where_clause` is an identifier, not the `where` keyword.
+    #[test]
+    fn where_prefix_is_ident() {
+        assert_eq!(token_kinds("where_clause"), vec![Ident, Eof]);
+    }
+
+    /// `WHERE` (uppercase) is an identifier, not the `where` keyword.
+    #[test]
+    fn where_case_sensitive() {
+        assert_eq!(token_kinds("WHERE"), vec![Ident, Eof]);
+    }
+
+    /// `schema` is a keyword.
+    #[test]
+    fn schema_keyword() {
+        assert_eq!(token_kinds("schema"), vec![Schema, Eof]);
+    }
+
+    /// `Schema` (capitalized) is an identifier, not the `schema` keyword.
+    #[test]
+    fn schema_case_sensitive() {
+        assert_eq!(token_kinds("Schema"), vec![Ident, Eof]);
+    }
+
+    /// `table` is NOT a keyword — it's an identifier parsed contextually.
+    #[test]
+    fn table_is_ident() {
+        assert_eq!(token_kinds("table"), vec![Ident, Eof]);
     }
 }

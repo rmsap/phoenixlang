@@ -1,0 +1,18 @@
+[package]
+name = "phoenix-codegen"
+description = "Code generation backends for Phoenix Gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-parser = { path = "../phoenix-parser" }
+phoenix-sema = { path = "../phoenix-sema" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+phoenix-lexer = { path = "../phoenix-lexer" }
+insta = { workspace = true }
+serde_json = { workspace = true }

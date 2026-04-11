@@ -1,0 +1,8 @@
+---
+source: crates/phoenix-sema/src/checker_tests.rs
+assertion_line: 2038
+expression: messages
+---
+[
+    "undefined variable `x`",
+]

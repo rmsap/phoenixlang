@@ -25,6 +25,13 @@ pub struct Span {
 }
 
 impl Span {
+    /// A sentinel span representing a built-in symbol with no source location.
+    pub const BUILTIN: Span = Span {
+        source_id: SourceId(0),
+        start: 0,
+        end: 0,
+    };
+
     /// Creates a new span in the given source file covering bytes `[start, end)`.
     ///
     /// # Panics

@@ -1,4 +1,7 @@
-use crate::ast::*;
+use crate::ast::{
+    ElseBranch, ExprStmt, ForSource, ForStmt, IfStmt, ReturnStmt, Statement, VarDecl,
+    VarDeclTarget, WhileStmt,
+};
 use crate::parser::Parser;
 use phoenix_lexer::token::TokenKind;
 

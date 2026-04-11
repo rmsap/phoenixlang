@@ -1,0 +1,18 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: "serde_json::to_string_pretty(&combined).unwrap()"
+---
+{
+  "bool": {
+    "type": "boolean"
+  },
+  "float": {
+    "type": "number"
+  },
+  "int": {
+    "type": "integer"
+  },
+  "string": {
+    "type": "string"
+  }
+}

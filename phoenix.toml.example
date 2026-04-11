@@ -1,0 +1,31 @@
+# Phoenix project configuration.
+#
+# Copy this file to phoenix.toml in your project root to configure
+# `phoenix gen` defaults. Run `phoenix gen` with no arguments to
+# generate code using these settings.
+
+[gen]
+# Path to your .phx schema file.
+schema = "api/schema.phx"
+
+# ── Single target ──────────────────────────────────────────────
+# Uncomment these for simple single-target generation:
+#
+# target = "typescript"       # typescript, python, go, openapi
+# out_dir = "./generated"
+# mode = "both"               # "client", "server", or "both"
+
+# ── Multiple targets ───────────────────────────────────────────
+# Use [gen.targets.<name>] sections to generate code for several
+# languages in one `phoenix gen` invocation.
+
+[gen.targets.typescript]
+out_dir = "frontend/src/generated"
+mode = "client"                     # types + client SDK only
+
+[gen.targets.python]
+out_dir = "backend/generated"
+mode = "server"                     # types + handlers + router only
+
+[gen.targets.openapi]
+out_dir = "docs"
