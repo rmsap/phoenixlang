@@ -10,17 +10,28 @@ export interface User {
   age: number;
 }
 
-export type UpdateUserBody = {
-  name?: string;
-  age?: number;
-};
-
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ValidationError";
   }
 }
+
+export function validateUser(input: unknown): User {
+  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');
+  const obj = input as Record<string, unknown>;
+  if (typeof obj.id !== 'number') throw new ValidationError('id: expected number');
+  if (typeof obj.name !== 'string') throw new ValidationError('name: expected string');
+  if (!((obj.name.length > 0))) throw new ValidationError('name: constraint violated');
+  if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
+  if (!((obj.age >= 0))) throw new ValidationError('age: constraint violated');
+  return obj as User;
+}
+
+export type UpdateUserBody = {
+  name?: string;
+  age?: number;
+};
 
 export function validateUpdateUserBody(input: unknown): UpdateUserBody {
   if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');

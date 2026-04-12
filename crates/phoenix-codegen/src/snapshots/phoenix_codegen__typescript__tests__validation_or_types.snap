@@ -9,16 +9,25 @@ export interface Range {
   x: number;
 }
 
-export type CreateBody = {
-  x: number;
-};
-
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ValidationError";
   }
 }
+
+export function validateRange(input: unknown): Range {
+  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');
+  const obj = input as Record<string, unknown>;
+  if (typeof obj.id !== 'number') throw new ValidationError('id: expected number');
+  if (typeof obj.x !== 'number') throw new ValidationError('x: expected number');
+  if (!(((obj.x < 0) || (obj.x > 100)))) throw new ValidationError('x: constraint violated');
+  return obj as Range;
+}
+
+export type CreateBody = {
+  x: number;
+};
 
 export function validateCreateBody(input: unknown): CreateBody {
   if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');

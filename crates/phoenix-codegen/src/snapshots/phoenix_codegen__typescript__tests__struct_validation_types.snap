@@ -27,18 +27,3 @@ export function validateUser(input: unknown): User {
   if (!(((obj.age >= 0) && (obj.age <= 150)))) throw new ValidationError('age: constraint violated');
   return obj as User;
 }
-
-export type CreateUserBody = {
-  name: string;
-  age: number;
-};
-
-export function validateCreateUserBody(input: unknown): CreateUserBody {
-  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');
-  const obj = input as Record<string, unknown>;
-  if (typeof obj.name !== 'string') throw new ValidationError('name: expected string');
-  if (!(((obj.name.length > 0) && (obj.name.length <= 100)))) throw new ValidationError('name: constraint violated');
-  if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
-  if (!(((obj.age >= 0) && (obj.age <= 150)))) throw new ValidationError('age: constraint violated');
-  return obj as CreateUserBody;
-}
