@@ -2,7 +2,7 @@
   "name": "phoenix-lang",
   "displayName": "Phoenix Lang",
   "description": "Syntax highlighting and language server for the Phoenix programming language",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "rmsap",
   "repository": {
     "type": "git",
