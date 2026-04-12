@@ -154,24 +154,23 @@ fn run() {
                     .unwrap_or_else(|| "./generated".to_string());
                 let mode = cli_mode.unwrap_or_else(|| parse_mode(config.codegen.mode.as_deref()));
                 if watch {
-                    cmd_gen_watch(&file, &cli_target, &out, mode);
+                    cmd_gen_watch(&file, &[(&cli_target, out.as_str(), mode)]);
                 } else {
                     cmd_gen(&file, &cli_target, &out, mode);
                 }
             } else if let Some(resolved) = config.codegen.resolve_targets() {
                 // Config provides target(s) — run them all
                 if watch {
-                    // Watch mode: use the first target (watch only supports one)
-                    let first = &resolved[0];
-                    let out = out.as_deref().unwrap_or(&first.out_dir);
-                    let mode = cli_mode.unwrap_or_else(|| parse_mode(first.mode.as_deref()));
-                    if resolved.len() > 1 {
-                        eprintln!(
-                            "warning: --watch only supports one target, using '{}'",
-                            first.target
-                        );
-                    }
-                    cmd_gen_watch(&file, &first.target, out, mode);
+                    let targets: Vec<(&str, &str, GenMode)> = resolved
+                        .iter()
+                        .map(|rt| {
+                            let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
+                            let mode =
+                                cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
+                            (rt.target.as_str(), out_dir, mode)
+                        })
+                        .collect();
+                    cmd_gen_watch(&file, &targets);
                 } else {
                     for rt in &resolved {
                         let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
@@ -184,7 +183,7 @@ fn run() {
                 let out = out.unwrap_or_else(|| "./generated".to_string());
                 let mode = cli_mode.unwrap_or(GenMode::Both);
                 if watch {
-                    cmd_gen_watch(&file, "typescript", &out, mode);
+                    cmd_gen_watch(&file, &[("typescript", out.as_str(), mode)]);
                 } else {
                     cmd_gen(&file, "typescript", &out, mode);
                 }
@@ -537,24 +536,26 @@ fn write_file(out_dir: &str, name: &str, content: &str) -> Result<(), String> {
 ///
 /// Performs an initial generation, then enters a loop that watches the
 /// directory containing the schema file. On each change to a `.phx` file,
-/// re-runs the full pipeline. Errors are printed to stderr but do not
-/// terminate the watch loop.
+/// re-runs the full pipeline for all targets. Errors are printed to stderr
+/// but do not terminate the watch loop.
 ///
 /// Events are debounced with a 100 ms delay so that multiple rapid file-system
 /// events from a single save are coalesced into one regeneration pass.
-fn cmd_gen_watch(path: &str, target: &str, out_dir: &str, mode: GenMode) {
+fn cmd_gen_watch(path: &str, targets: &[(&str, &str, GenMode)]) {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     use std::path::Path;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    // Validate target before starting watch
-    if !matches!(target, "typescript" | "python" | "go" | "openapi") {
-        eprintln!(
-            "error: unsupported target '{}' (supported: typescript, python, go, openapi)",
-            target
-        );
-        process::exit(1);
+    // Validate all targets before starting watch
+    for (target, _, _) in targets {
+        if !matches!(*target, "typescript" | "python" | "go" | "openapi") {
+            eprintln!(
+                "error: unsupported target '{}' (supported: typescript, python, go, openapi)",
+                target
+            );
+            process::exit(1);
+        }
     }
 
     let watch_dir = Path::new(path)
@@ -563,15 +564,24 @@ fn cmd_gen_watch(path: &str, target: &str, out_dir: &str, mode: GenMode) {
         .to_path_buf();
 
     // Initial generation
+    let target_list: Vec<&str> = targets.iter().map(|(t, _, _)| *t).collect();
     eprintln!(
-        "[phoenix gen] target={}, out={}, watching {}",
-        target,
-        out_dir,
+        "[phoenix gen] targets={}, watching {}",
+        target_list.join(", "),
         watch_dir.display()
     );
-    match generate_once(path, target, out_dir, mode) {
-        Ok(()) => eprintln!("[phoenix gen] initial generation complete"),
-        Err(e) => eprintln!("[phoenix gen] initial generation failed: {}", e),
+    let mut had_error = false;
+    for (target, out_dir, mode) in targets {
+        match generate_once(path, target, out_dir, *mode) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("[phoenix gen] initial generation failed ({}): {}", target, e);
+                had_error = true;
+            }
+        }
+    }
+    if !had_error {
+        eprintln!("[phoenix gen] initial generation complete");
     }
 
     // Set up file watcher
@@ -622,9 +632,18 @@ fn cmd_gen_watch(path: &str, target: &str, out_dir: &str, mode: GenMode) {
         {
             last_relevant_event = None;
             eprintln!("[phoenix gen] change detected, regenerating...");
-            match generate_once(path, target, out_dir, mode) {
-                Ok(()) => eprintln!("[phoenix gen] regeneration complete"),
-                Err(e) => eprintln!("[phoenix gen] regeneration failed: {}", e),
+            let mut had_error = false;
+            for (target, out_dir, mode) in targets {
+                match generate_once(path, target, out_dir, *mode) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("[phoenix gen] regeneration failed ({}): {}", target, e);
+                        had_error = true;
+                    }
+                }
+            }
+            if !had_error {
+                eprintln!("[phoenix gen] regeneration complete");
             }
         }
 
