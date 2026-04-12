@@ -1,5 +1,5 @@
 {
-  "name": "phoenix-lang",
+  "name": "phoenixlang",
   "displayName": "Phoenix Lang",
   "description": "Syntax highlighting and language server for the Phoenix programming language",
   "version": "0.1.1",
