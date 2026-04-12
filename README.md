@@ -11,7 +11,7 @@ When searching online, use **phoenixlang** to distinguish this project from the 
 
 ## Current Status
 
-Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,617 tests** across **8 crates** with the following features:
+Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,619 tests** across **8 crates** with the following features:
 
 - Variables (`let` and `let mut`) with explicit types or type inference, **compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`)
 - Functions with typed parameters, return types, **named/default parameters**
@@ -48,10 +48,14 @@ Phoenix is in **active development**. The current implementation is a **tree-wal
 ### Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sudo sh
 ```
 
-This installs `phoenix` and `phoenix-lsp` to `/usr/local/bin`. Set `PHOENIX_INSTALL_DIR` to change the location.
+This installs `phoenix` and `phoenix-lsp` to `/usr/local/bin`. To install without `sudo`, set a user-local directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | PHOENIX_INSTALL_DIR=~/.local/bin sh
+```
 
 Or download binaries directly from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases).
 

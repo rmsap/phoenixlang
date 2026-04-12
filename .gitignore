@@ -3,3 +3,4 @@
 *.pdb
 node_modules/
 out/
+generated/

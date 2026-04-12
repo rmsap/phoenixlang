@@ -85,6 +85,20 @@ enum Commands {
 }
 
 fn main() {
+    // Spawn the real work on a thread with a 16 MiB stack to handle deep
+    // recursion in the parser and interpreter.  The default 8 MiB stack is
+    // not enough for complex programs when RUST_MIN_STACK is not set
+    // (e.g. binaries installed via the install script).
+    let builder = std::thread::Builder::new().stack_size(16 * 1024 * 1024);
+    let handler = builder
+        .spawn(run)
+        .expect("failed to spawn main thread");
+    if let Err(e) = handler.join() {
+        std::panic::resume_unwind(e);
+    }
+}
+
+fn run() {
     let cli = Cli::parse();
 
     match cli.command {

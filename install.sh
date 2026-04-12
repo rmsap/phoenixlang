@@ -2,7 +2,7 @@
 # Phoenix installer — detects platform and downloads the latest release.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sudo sh
 
 set -e
 

@@ -445,6 +445,33 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Consumes the current token if it is an identifier or a contextual keyword
+    /// that can be used as a name (e.g. struct field names, variable names).
+    ///
+    /// Gen keywords like `body`, `response`, `query`, `error`, `omit`, `pick`,
+    /// `partial`, `where`, and `schema` are only special inside endpoint blocks.
+    /// Everywhere else they should be usable as ordinary identifiers.
+    pub(crate) fn expect_ident_or_contextual(&mut self) -> Option<&'src Token> {
+        if matches!(
+            self.peek().kind,
+            TokenKind::Ident
+                | TokenKind::Body
+                | TokenKind::Response
+                | TokenKind::Query
+                | TokenKind::ErrorKw
+                | TokenKind::Omit
+                | TokenKind::Pick
+                | TokenKind::Partial
+                | TokenKind::Where
+                | TokenKind::Schema
+        ) {
+            Some(self.advance())
+        } else {
+            self.error_at_current(&format!("expected {}", token_kind_display(&TokenKind::Ident)));
+            None
+        }
+    }
+
     /// Consumes the current token if it matches `kind`, returning `true`.
     /// Does nothing and returns `false` on mismatch.
     pub(crate) fn eat(&mut self, kind: TokenKind) -> bool {
@@ -508,7 +535,7 @@ impl<'src> Parser<'src> {
                 let field_doc = self.try_consume_doc_comment();
                 let fstart = self.peek().span;
                 if let Some(type_expr) = self.parse_type_expr()
-                    && let Some(name_tok) = self.expect(TokenKind::Ident)
+                    && let Some(name_tok) = self.expect_ident_or_contextual()
                 {
                     let constraint = if self.peek().kind == TokenKind::Where {
                         self.advance(); // consume 'where'
