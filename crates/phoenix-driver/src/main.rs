@@ -90,9 +90,7 @@ fn main() {
     // not enough for complex programs when RUST_MIN_STACK is not set
     // (e.g. binaries installed via the install script).
     let builder = std::thread::Builder::new().stack_size(16 * 1024 * 1024);
-    let handler = builder
-        .spawn(run)
-        .expect("failed to spawn main thread");
+    let handler = builder.spawn(run).expect("failed to spawn main thread");
     if let Err(e) = handler.join() {
         std::panic::resume_unwind(e);
     }

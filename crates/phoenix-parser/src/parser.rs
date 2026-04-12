@@ -467,7 +467,10 @@ impl<'src> Parser<'src> {
         ) {
             Some(self.advance())
         } else {
-            self.error_at_current(&format!("expected {}", token_kind_display(&TokenKind::Ident)));
+            self.error_at_current(&format!(
+                "expected {}",
+                token_kind_display(&TokenKind::Ident)
+            ));
             None
         }
     }
