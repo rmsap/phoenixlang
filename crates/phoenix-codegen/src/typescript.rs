@@ -259,7 +259,7 @@ impl<'a> TsGenerator<'a> {
         }
 
         self.types_out
-            .push_str(&format!("  return obj as {};\n", s.name));
+            .push_str(&format!("  return obj as unknown as {};\n", s.name));
         self.types_out.push_str("}\n\n");
     }
 
@@ -435,7 +435,7 @@ impl<'a> TsGenerator<'a> {
         }
 
         self.types_out
-            .push_str(&format!("  return obj as {};\n", type_name));
+            .push_str(&format!("  return obj as unknown as {};\n", type_name));
         self.types_out.push_str("}\n\n");
     }
 

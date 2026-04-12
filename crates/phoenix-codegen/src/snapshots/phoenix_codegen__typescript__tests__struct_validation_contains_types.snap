@@ -22,5 +22,5 @@ export function validateUser(input: unknown): User {
   if (typeof obj.id !== 'number') throw new ValidationError('id: expected number');
   if (typeof obj.email !== 'string') throw new ValidationError('email: expected string');
   if (!((obj.email.includes("@") && (obj.email.length > 3)))) throw new ValidationError('email: constraint violated');
-  return obj as User;
+  return obj as unknown as User;
 }

@@ -1,25 +1,71 @@
 # Phoenix Gen: Typed API Code Generation
 
-**Status: Substantially Complete** — Gen Phases 1–3 and 5 are fully complete. Gen Phase 4 has Python and Go targets (Rust target deferred as low-value). The `phoenix-lsp` language server provides hover, autocomplete, go-to-definition, find references, and rename. The VS Code extension uses the LSP for full IDE support. `phoenix gen --watch` re-generates on `.phx` file changes. `phoenix gen` produces typed `types.ts` (with validation functions from `where` constraints), `client.ts`, `handlers.ts`, and `server.ts` (Express router with automatic validation) from `.phx` schema files. `phoenix gen --target openapi` produces an OpenAPI 3.1 JSON specification with JSON Schema validation keywords. A VS Code extension provides syntax highlighting and inline diagnostics. Additional language targets (Go, Rust, Python) are next.
+Phoenix Gen generates idiomatic client SDKs, server handler interfaces, validation logic, and OpenAPI specs from `.phx` schema files. Write your API schema once, generate typed code for TypeScript, Python, Go, and OpenAPI.
 
-Phoenix Gen is a **standalone code generation tool** that uses Phoenix syntax to define API schemas and generates idiomatic client SDKs, server handler interfaces, validation logic, and OpenAPI specs for existing languages. It is a parallel workstream to the main language roadmap — buildable now with the existing parser and type checker — designed to bring Phoenix's type safety story to developers before the full compiler exists.
+## Quick Start
 
-## Motivation
+### 1. Install Phoenix
 
-Phoenix's most differentiating features — typed endpoints, built-in serialization, refinement types — are planned for Phases 4-5 of the language roadmap, which depend on compilation (Phase 2) and the async runtime. That means the features most likely to drive adoption are years away from being usable.
+```bash
+curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sudo sh
+```
 
-Phoenix Gen inverts this by extracting the **schema and code generation** aspects of typed endpoints into a standalone tool that works today. Developers write `.phx` schema files, run `phoenix gen`, and get typed code in their existing language. This:
+Or download binaries from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases).
 
-- **Proves the value proposition now.** Developers experience Phoenix's type safety without adopting a new language.
-- **Builds a user base.** Every developer using `phoenix gen` learns Phoenix syntax and joins the ecosystem.
-- **Validates the design.** Real-world usage of `endpoint` and `schema` declarations shapes the full language design with feedback instead of speculation.
-- **Creates a migration path.** When the full language ships, `.phx` schema files become importable modules with zero rewrite.
+### 2. Write a schema
 
-## How it works
+```phoenix
+struct User {
+  Int id
+  String name
+  String email
+  Int age
+}
 
-### 1. Define schemas in Phoenix syntax
+endpoint listUsers: GET "/api/users" {
+  query {
+    Int page = 1
+    Int limit = 20
+    Option<String> search
+  }
+  response List<User>
+}
 
-Schema files use a subset of existing Phoenix syntax (structs, enums, type aliases) plus new `endpoint` and `schema` declarations:
+endpoint createUser: POST "/api/users" {
+  body User omit { id }
+  response User
+  error {
+    ValidationError(400)
+    Conflict(409)
+  }
+}
+
+endpoint getUser: GET "/api/users/{id}" {
+  response User
+  error { NotFound(404) }
+}
+```
+
+### 3. Generate code
+
+```bash
+phoenix gen schema.phx                        # TypeScript (default)
+phoenix gen schema.phx --target python        # Python (Pydantic + FastAPI)
+phoenix gen schema.phx --target go            # Go (net/http)
+phoenix gen schema.phx --target openapi       # OpenAPI 3.1 JSON spec
+phoenix gen schema.phx --client               # Types + client SDK only
+phoenix gen schema.phx --server               # Types + handlers + router only
+phoenix gen schema.phx --watch                # Re-generate on file changes
+phoenix gen                                   # Use settings from phoenix.toml
+```
+
+---
+
+## Schema Syntax
+
+Schema files use Phoenix syntax: structs, enums, type aliases, and `endpoint` declarations.
+
+### Structs and enums
 
 ```phoenix
 /** A registered user */
@@ -30,282 +76,19 @@ struct User {
   Int age
 }
 
-/** List all users, optionally filtered by search query */
-endpoint listUsers: GET "/api/users" {
-  query {
-    Int page = 1              // default value
-    Int limit = 20
-    Option<String> search     // optional, can be omitted
-  }
-  response List<User>
-}
-
-/** Create a new user */
-endpoint createUser: POST "/api/users" {
-  body User omit { id }       // all User fields except id
-  response User
-  error {
-    ValidationError(400)
-    Conflict(409)
-  }
-}
-
-/** Update an existing user — all fields optional */
-endpoint updateUser: PUT "/api/users/{id}" {
-  body User omit { id } partial         // name, email, age — all optional
-  response User
-  error { NotFound(404) }
-}
-
-/** Get a user by ID */
-endpoint getUser: GET "/api/users/{id}" {
-  // path params are inferred from the URL pattern
-  response User
-  error { NotFound(404) }
-}
+enum Role { Admin, Editor, Viewer }
 ```
 
-### 2. Generate code for target languages
+### Endpoints
 
-```bash
-# Generate TypeScript client and server
-phoenix gen --target typescript --out ./generated
-
-# Generate only a client SDK (no server handlers)
-phoenix gen --target typescript --client --out ./frontend/src/generated
-
-# Generate only server handlers (no client SDK)
-phoenix gen --target python --server --out ./backend/generated
-
-# Generate OpenAPI 3.1 spec
-phoenix gen --target openapi --out ./api.yaml
-```
-
-The `--client` and `--server` flags generate only the relevant half. This is how you support **different languages for frontend and backend** — the schema is the shared contract, and each side gets code in its own language (see [Cross-language usage](#cross-language-usage) below).
-
-### 3. Use the generated code in existing projects
-
-**TypeScript client** (generated):
-```typescript
-// generated/client.ts
-
-/** A registered user */
-export interface User {
-  id: number;
-  name: string;
-  email: string;
-  age: number;
-}
-
-// Derived types — generated from `omit`, `pick`, and `partial` operators
-export type CreateUserBody = Omit<User, "id">;
-export type UpdateUserBody = Partial<Omit<User, "id">>;
-
-export const api = {
-  /** List all users, optionally filtered by search query */
-  async listUsers(opts?: { page?: number; limit?: number; search?: string }): Promise<User[]> { ... },
-  /** Create a new user */
-  async createUser(body: CreateUserBody): Promise<User> { ... },
-  /** Update an existing user */
-  async updateUser(id: number, body: UpdateUserBody): Promise<User> { ... },
-  /** Get a user by ID */
-  async getUser(id: number): Promise<User> { ... },
-}
-```
-
-**TypeScript server handlers** (generated interface, developer implements):
-```typescript
-// generated/handlers.ts
-export interface Handlers {
-  listUsers(query: { page: number; limit: number; search?: string }): Promise<User[]>;
-  createUser(body: CreateUserBody): Promise<User>;
-  updateUser(id: number, body: UpdateUserBody): Promise<User>;
-  getUser(id: number): Promise<User>;
-}
-
-// generated/server.ts — Express/Fastify/Hono router wiring
-export function createRouter(handlers: Handlers): Router { ... }
-```
-
-**OpenAPI spec** (generated):
-```yaml
-# api.yaml — usable with Postman, API gateways, documentation tools
-openapi: "3.1.0"
-paths:
-  /api/users:
-    get:
-      operationId: listUsers
-      description: "List all users, optionally filtered by search query"
-      parameters:
-        - name: page
-          in: query
-          schema: { type: integer, default: 1 }
-        - name: limit
-          in: query
-          schema: { type: integer, default: 20 }
-        - name: search
-          in: query
-          required: false
-          schema: { type: string }
-      responses:
-        '200':
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/User'
-    post:
-      operationId: createUser
-      # ...
-```
-
-### Cross-language usage
-
-A single `.phx` schema can generate client code in one language and server code in another. This is a key differentiator over tools like tRPC, which lock both sides into TypeScript.
-
-**Example: TypeScript frontend + Python backend**
-
-```bash
-# Frontend team generates a typed fetch client
-phoenix gen --target typescript --client --out ./frontend/src/api
-
-# Backend team generates FastAPI handler stubs
-phoenix gen --target python --server --out ./backend/api
-```
-
-From the same schema, the TypeScript frontend gets:
-```typescript
-// frontend/src/api/client.ts
-export const api = {
-  async createUser(body: CreateUserBody): Promise<User> { ... },
-  async getUser(id: number): Promise<User> { ... },
-}
-```
-
-And the Python backend gets:
-```python
-# backend/api/models.py
-from pydantic import BaseModel
-
-class User(BaseModel):
-    id: int
-    name: str
-    email: str
-    age: int
-
-class CreateUserBody(BaseModel):
-    name: str
-    email: str
-    age: int
-
-# backend/api/handlers.py — developer implements these
-class Handlers:
-    async def create_user(self, body: CreateUserBody) -> User: ...
-    async def get_user(self, id: int) -> User: ...
-```
-
-Both sides are derived from the same `.phx` file. If a field is added, renamed, or removed in the schema, both the client and server code are regenerated — the contract cannot drift out of sync.
-
-**Other cross-language combinations work the same way:**
-- TypeScript frontend + Go backend
-- TypeScript frontend + Rust backend
-- React Native client + Python backend
-- Multiple clients (web, mobile, CLI) from one schema
-
-The `phoenix.toml` config supports multiple targets simultaneously, so a single `phoenix gen` command can generate everything at once.
-
-## Leverages existing Phoenix infrastructure
-
-Phoenix Gen is not a separate project — it extends the existing codebase:
-
-| Existing component | How Phoenix Gen uses it |
-|--------------------|------------------------|
-| Phoenix parser | Parses structs, enums, type aliases, generics in `.phx` files |
-| Phoenix type checker | Validates that endpoint request/response types exist and are consistent |
-| AST representation | Code generators traverse the same AST the interpreter/compiler uses |
-
-The new components are:
-
-| New component | Purpose |
-|---------------|---------|
-| `endpoint` / `schema` AST nodes | Extend the parser with API-specific declarations |
-| Code generation backends | Emit idiomatic code for each target language |
-| CLI `gen` subcommand | Orchestrate parsing, checking, and code generation |
-
-## Validation from type constraints
-
-One of the strongest differentiators over existing schema tools is generating validation logic from type constraints. This is a limited form of refinement types (Phase 5.2) that can be implemented without a full constraint solver:
-
-```phoenix
-struct User {
-  Int id
-  String name where self.length > 0 && self.length <= 100
-  String email where self.contains("@") && self.length > 3
-  Int age where self >= 0 && self <= 150
-}
-
-endpoint createUser: POST "/api/users" {
-  body User omit { id }       // constraints on name, email, age are inherited
-  response User
-}
-```
-
-The `where` constraints on `User` fields are inherited by derived types. When the code generator emits a validation function for the `createUser` body, it includes the constraints for the fields that are present:
-
-```typescript
-export function validateCreateUserBody(input: unknown): CreateUserBody {
-  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');
-  const obj = input as Record<string, unknown>;
-  if (typeof obj.name !== 'string') throw new ValidationError('name: expected string');
-  if (!((obj.name.length > 0) && (obj.name.length <= 100))) throw new ValidationError('name: constraint violated');
-  if (typeof obj.email !== 'string') throw new ValidationError('email: expected string');
-  if (!((obj.email.includes("@")) && (obj.email.length > 3))) throw new ValidationError('email: constraint violated');
-  if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
-  if (!((obj.age >= 0) && (obj.age <= 150))) throw new ValidationError('age: constraint violated');
-  return obj as CreateUserBody;
-}
-```
-
-This eliminates an entire category of hand-written boilerplate that every web project requires.
-
-## Competitive landscape
-
-| Tool | Strengths | Gap Phoenix Gen fills |
-|------|-----------|----------------------|
-| OpenAPI / Swagger | Universal ecosystem support | Verbose YAML, poor authoring experience, mediocre code generators |
-| Protobuf / gRPC | Excellent multi-language codegen, dominant in microservices | Designed for RPC, not REST/HTTP APIs with path params and JSON |
-| TypeSpec (Microsoft) | Clean DSL, generates OpenAPI | No validation/refinement types, no direct client SDK generation |
-| tRPC | Best-in-class DX for TypeScript full-stack | TypeScript-only — locks both client and server to one language |
-| Smithy (AWS) | Powerful service modeling | Complex, AWS-centric, steep learning curve |
-| GraphQL | Strong type system, introspection | Different paradigm (query language), N+1 problems, complexity for simple APIs |
-
-Phoenix Gen's position: **a clean, expressive schema language with type constraints that generates idiomatic code and OpenAPI specs, without locking you into any particular backend or frontend language.**
-
-## Design decisions
-
-### Naming conventions
-
-Phoenix uses `camelCase` for fields and endpoints. Generated code is automatically converted to the target language's conventions:
-
-| Phoenix (source) | TypeScript | Go | Rust | Python |
-|---|---|---|---|---|
-| `listUsers` (endpoint) | `listUsers` | `ListUsers` | `list_users` | `list_users` |
-| `createdAt` (field) | `createdAt` | `CreatedAt` | `created_at` | `created_at` |
-| `User` (type) | `User` | `User` | `User` | `User` |
-
-**JSON wire format uses camelCase.** This is the overwhelming convention for web APIs and what JavaScript developers expect. Phoenix source code already uses `camelCase`, so field names map directly to JSON keys with no conversion needed. Generated server code for other languages (Go, Rust, Python) handles the mapping between Phoenix's `camelCase` field names and the target language's conventions automatically.
-
-### Endpoint structure: path params, query params, and body
-
-Endpoints use distinct sections that map directly to HTTP semantics:
+Endpoints map directly to HTTP semantics with distinct sections for path params, query params, body, response, and errors:
 
 ```phoenix
 endpoint updateUser: PUT "/api/users/{id}" {
   query {
     Bool notify = false           // query string: ?notify=true
   }
-  body User omit { id } partial    // derived type — all User fields except id, all optional
+  body User omit { id } partial   // all User fields except id, all optional
   response User
   error {
     NotFound(404)
@@ -314,18 +97,52 @@ endpoint updateUser: PUT "/api/users/{id}" {
 }
 ```
 
-- **Path params** are inferred from the URL pattern. `{id}` means the endpoint expects an `Int id` parameter — no separate declaration needed. The type is inferred from the matching struct field or defaults to `String`.
-- **`query { }`** defines URL query parameters. Supports default values (`Int page = 1`) and optional params (`Option<String> search`). Only valid on any HTTP method, but most common on GET.
-- **`body TypeName`** defines the JSON request body. Supports `omit` and `pick` modifiers (see [Type derivation](#type-derivation-omit-and-pick) below). Only valid on POST, PUT, and PATCH — the type checker rejects `body` on GET and DELETE endpoints.
+- **Path params** are inferred from the URL pattern. `{id}` expects an `Int id` parameter — no separate declaration needed. The type is inferred from the matching struct field or defaults to `String`.
+- **`query { }`** defines URL query parameters. Supports default values (`Int page = 1`) and optional params (`Option<String> search`).
+- **`body TypeName`** defines the JSON request body. Supports `omit`, `pick`, and `partial` modifiers (see [Type derivation](#type-derivation-omit-pick-and-partial)). Only valid on POST, PUT, and PATCH — the type checker rejects `body` on GET and DELETE.
 - **`response TypeName`** defines the JSON response body.
+- **`error { }`** defines error variants with explicit HTTP status codes.
 
-This separation matters for code generation: query params become URL-encoded query strings, body becomes JSON serialization, path params become URL template substitution. Collapsing them into a single `request` block would lose this information.
+### Doc comments
 
-### Type derivation: `omit` and `pick`
+`/** */` comments attach to the next declaration and flow through to generated code as JSDoc, Go doc comments, Python docstrings, and OpenAPI `description` fields:
 
-API endpoints almost never accept the exact same shape as the full domain type. A `createUser` endpoint shouldn't accept `id` (the server generates it). An `updateUser` endpoint might only allow changing certain fields. Without type derivation, you'd define a separate struct for every request body — duplicating fields, drifting out of sync, and adding boilerplate.
+```phoenix
+/** A registered user in the system */
+struct User {
+  /** Full display name */
+  String name
+  /** Primary email address */
+  String email
+  Int age
+}
 
-`omit`, `pick`, and `partial` are compile-time type operators that derive a new anonymous type from an existing struct. They chain left to right like a pipeline:
+/** Retrieve a single user by their unique ID */
+endpoint getUser: GET "/api/users/{id}" {
+  response User
+  error { NotFound(404) }
+}
+```
+
+### Multiple schema files
+
+All `.phx` files matched by the config glob are parsed and merged into a flat namespace. A type defined in any file is available in all files. Name conflicts are a compile error.
+
+```
+api/
+  types.phx         // User, Post, Comment structs
+  enums.phx         // Role, Status enums
+  users.phx         // user endpoints
+  posts.phx         // post endpoints
+```
+
+No import syntax needed between schema files.
+
+---
+
+## Type Derivation: `omit`, `pick`, and `partial`
+
+API endpoints almost never accept the exact same shape as the full domain type. `omit`, `pick`, and `partial` are compile-time type operators that derive new types from existing structs, so you don't need to define a separate struct for every request body.
 
 ```phoenix
 struct User {
@@ -366,11 +183,11 @@ endpoint updateEmail: PATCH "/api/users/{id}/email" {
 
 - **`omit { field1, field2 }`** — all fields from the base type *except* the listed ones
 - **`pick { field1, field2 }`** — *only* the listed fields from the base type
-- **`partial`** — bare `partial` makes *all* fields optional (`Option<T>`). Typically used for update endpoints where only changed fields are sent.
-- **`partial { field1, field2 }`** — with a field list, makes only the *listed* fields optional. Unlisted fields remain required. This allows a mix of required and optional fields in a single derived type.
+- **`partial`** — makes *all* fields optional. Typically used for update endpoints where only changed fields are sent.
+- **`partial { field1, field2 }`** — makes only the *listed* fields optional. Unlisted fields remain required.
 - Operators chain left to right: `User omit { id } partial { age }` means "start with User, remove id, make age optional"
-- The type checker validates that all named fields exist on the base type — `User omit { nonexistent }` is a compile error, as is `partial { nonexistent }`
-- `where` constraints on the base type's fields are inherited by the derived type — an optional field that *is* present still validates its constraint
+- The type checker validates that all named fields exist on the base type — `User omit { nonexistent }` is a compile error
+- `where` constraints on the base type's fields are inherited by the derived type
 
 **Generated TypeScript:**
 
@@ -389,222 +206,175 @@ export type PatchUserBody = {
 };
 ```
 
-This keeps the `User` struct as the single source of truth. Endpoints declare how they relate to it, and the type checker ensures everything stays in sync.
+---
 
-### Error variants and HTTP status codes
+## Validation from `where` Constraints
 
-Error variants carry explicit status codes — no convention-based guessing:
-
-```phoenix
-error {
-  NotFound(404)
-  Unauthorized(401)
-  ValidationError(400)
-  Conflict(409)
-  RateLimited(429)
-}
-```
-
-This reuses the existing enum variant-with-payload syntax. The generated code maps each variant to the corresponding HTTP status:
-
-```typescript
-// Generated error handling in server router
-if (error instanceof NotFoundError) {
-  res.status(404).json({ error: "NotFound" });
-} else if (error instanceof ValidationError) {
-  res.status(400).json({ error: "ValidationError" });
-}
-```
-
-On the client side, the SDK maps response status codes back to typed error variants, so the caller can match on them.
-
-### Optional fields
-
-`Option<T>` in Phoenix maps to nullable/optional fields in generated code:
-
-| Phoenix | TypeScript | Go | JSON | OpenAPI |
-|---|---|---|---|---|
-| `String name` | `name: string` | `Name string` | required, must be present | in `required` array |
-| `Option<String> name` | `name?: string` | `Name *string` | absent or `null` → `None` | not in `required` |
-
-Both absent and `null` in JSON map to `None`. This matches how most real APIs behave — clients that omit a field and clients that send `null` both mean "no value."
-
-In generated validation: required fields throw if missing, optional fields skip validation when absent and validate the inner type when present.
-
-### Multiple schema files
-
-All `.phx` files matched by the config glob are parsed and merged into a **flat namespace**. A type defined in any file is available in all files. Name conflicts are a compile error.
-
-```
-api/
-  types.phx         // User, Post, Comment structs
-  enums.phx         // Role, Status enums
-  users.phx         // user endpoints
-  posts.phx         // post endpoints
-```
-
-No import syntax needed between schema files. This is simple and works for what schema files actually are — a flat collection of type and endpoint definitions. The full Phoenix language has a proper module system (Phase 2.6); Gen doesn't need that complexity. If a project outgrows a flat namespace, they're likely ready for the full language.
-
-### Doc comments
-
-`/** */` is a doc comment that attaches to the next declaration. Doc comments flow through to generated code as JSDoc, Go doc comments, Python docstrings, and OpenAPI `description` fields:
+`where` constraints on struct fields generate validation logic automatically. This eliminates hand-written validation boilerplate:
 
 ```phoenix
-/** A registered user in the system */
 struct User {
-  /** Full display name */
-  String name
-  /** Primary email address */
-  String email
-  Int age
+  Int id
+  String name where self.length > 0 && self.length <= 100
+  String email where self.contains("@") && self.length > 3
+  Int age where self >= 0 && self <= 150
 }
 
-/** Retrieve a single user by their unique ID */
-endpoint getUser: GET "/api/users/{id}" {
+endpoint createUser: POST "/api/users" {
+  body User omit { id }       // constraints on name, email, age are inherited
   response User
-  error { NotFound(404) }
 }
 ```
 
-Generates:
+Constraints are inherited by derived types. The generated server code validates incoming requests and returns 400 errors on constraint violations:
 
 ```typescript
-/** A registered user in the system */
+export function validateCreateUserBody(input: unknown): CreateUserBody {
+  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');
+  const obj = input as Record<string, unknown>;
+  if (typeof obj.name !== 'string') throw new ValidationError('name: expected string');
+  if (!((obj.name.length > 0) && (obj.name.length <= 100))) throw new ValidationError('name: constraint violated');
+  if (typeof obj.email !== 'string') throw new ValidationError('email: expected string');
+  if (!((obj.email.includes("@")) && (obj.email.length > 3))) throw new ValidationError('email: constraint violated');
+  if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
+  if (!((obj.age >= 0) && (obj.age <= 150))) throw new ValidationError('age: constraint violated');
+  return obj as CreateUserBody;
+}
+```
+
+For OpenAPI, `where` constraints map to JSON Schema validation keywords (`minimum`, `maximum`, `minLength`, `maxLength`, `exclusiveMinimum`, `exclusiveMaximum`).
+
+---
+
+## Generated Output
+
+### TypeScript
+
+```bash
+phoenix gen schema.phx --target typescript --out ./generated
+```
+
+**Types and client:**
+```typescript
+// generated/client.ts
+
+/** A registered user */
 export interface User {
-  /** Full display name */
+  id: number;
   name: string;
-  /** Primary email address */
   email: string;
   age: number;
 }
-```
 
-In OpenAPI, doc comments populate the `description` field on operations, parameters, and schema properties.
+export type CreateUserBody = Omit<User, "id">;
 
-### Enum mapping
-
-**Simple enums** (no payloads) map to string values:
-
-```phoenix
-enum Role { Admin, Editor, Viewer }
-```
-
-| Target | Output |
-|---|---|
-| TypeScript | `type Role = "Admin" \| "Editor" \| "Viewer"` |
-| Go | `type Role string` + `const RoleAdmin Role = "Admin"` ... |
-| JSON | `"Admin"`, `"Editor"`, `"Viewer"` |
-| OpenAPI | `{ type: "string", enum: ["Admin", "Editor", "Viewer"] }` |
-
-**Enums with payloads** (ADTs) map to tagged unions. The tag field is `tag` (avoids collision with `type`, which is common in domain models):
-
-```phoenix
-enum Shape {
-  Circle(Float)
-  Rect(Float, Float)
+export const api = {
+  /** List all users, optionally filtered by search query */
+  async listUsers(opts?: { page?: number; limit?: number; search?: string }): Promise<User[]> { ... },
+  /** Create a new user */
+  async createUser(body: CreateUserBody): Promise<User> { ... },
+  /** Get a user by ID */
+  async getUser(id: number): Promise<User> { ... },
 }
 ```
 
+**Server handlers:**
 ```typescript
-type Shape =
-  | { tag: "Circle"; value: number }
-  | { tag: "Rect"; value: [number, number] }
+// generated/handlers.ts
+export interface Handlers {
+  listUsers(query: { page: number; limit: number; search?: string }): Promise<User[]>;
+  createUser(body: CreateUserBody): Promise<User>;
+  getUser(id: number): Promise<User>;
+}
+
+// generated/server.ts — Express router wiring
+export function createRouter(handlers: Handlers): Router { ... }
 ```
 
-In JSON: `{ "tag": "Circle", "value": 3.14 }`. In OpenAPI: `discriminator` with `propertyName: "tag"`.
+### Python
 
-### Authentication — deferred
+```bash
+phoenix gen schema.phx --target python --out ./generated
+```
 
-Auth is not modeled in Gen schemas. Every framework handles auth differently (Express middleware, Fastify decorators, Go handler wrapping), and trying to model it in the schema would produce a leaky abstraction. The generated handler interface receives the full request context — the user wires auth in their own framework's way. This can be revisited if a clean, framework-agnostic pattern emerges from real-world usage.
+```python
+# generated/models.py
+from pydantic import BaseModel
 
-### Generated code stability
+class User(BaseModel):
+    id: int
+    name: str
+    email: str
+    age: int
 
-Regenerating without schema changes must produce **byte-identical output**. The generator uses declaration order (not alphabetical sorting), consistent formatting, and no timestamps or generated-at comments. Adding one field to a struct should produce a minimal diff in the generated output — only the lines related to that field change.
+class CreateUserBody(BaseModel):
+    name: str
+    email: str
+    age: int
 
-## Implementation phases
+# generated/handlers.py — developer implements these
+class Handlers:
+    async def list_users(self, page: int, limit: int, search: str | None) -> list[User]: ...
+    async def create_user(self, body: CreateUserBody) -> User: ...
+    async def get_user(self, id: int) -> User: ...
+```
 
-### Gen Phase 1: Foundation
+### Go
 
-- ~~Add `endpoint` as a new AST node in the parser~~ ✅ Complete
-- ~~Add `schema` declarations for database table definitions (parse-only, forward compatibility with Phase 4)~~ ✅ Complete
-- ~~Add `where` constraints on struct fields (limited predicate syntax — numeric bounds, string length, `contains`)~~ ✅ Complete
-- ~~Type-check endpoint definitions: validate that request/response types exist, path parameters match request fields, error variants are defined~~ ✅ Complete
-- ~~Add `phoenix gen` subcommand to the CLI~~ ✅ Complete
+```bash
+phoenix gen schema.phx --target go --out ./generated
+```
 
-### Gen Phase 2: TypeScript target and editor support
+```go
+// generated/types.go
+type User struct {
+    ID    int    `json:"id"`
+    Name  string `json:"name"`
+    Email string `json:"email"`
+    Age   int    `json:"age"`
+}
 
-TypeScript first — largest potential user base, most frustration with existing tools. Editor support ships alongside the first target, not after — developers will not write `.phx` files in a plain text editor.
+// generated/handlers.go — developer implements this interface
+type Handlers interface {
+    ListUsers(query ListUsersQuery) ([]User, error)
+    CreateUser(body CreateUserBody) (*User, error)
+    GetUser(id int) (*User, error)
+}
+```
 
-- ~~Generate TypeScript interfaces from Phoenix structs and enums~~ ✅ Complete
-- ~~Generate typed client SDK (fetch-based, framework-agnostic) with query parameters, typed error handling (`ApiError`), and `URLSearchParams` construction~~ ✅ Complete
-- ~~Generate server handler interfaces (`handlers.ts` with typed `Handlers` interface)~~ ✅ Complete
-- ~~Generate error types (string unions and const status code maps) in `types.ts`~~ ✅ Complete
-- ~~Generate Express-compatible router wiring (`server.ts` with `createRouter`) that parses path/query/body params, applies defaults, and maps errors to status codes~~ ✅ Complete
-- ~~Generate validation functions from `where` constraints (`validateXxxBody()` in `types.ts`, called from `server.ts` with 400 error mapping)~~ ✅ Complete
-- ~~VS Code extension with syntax highlighting (TextMate grammar) and basic diagnostics (`phoenix check` on save)~~ ✅ Complete
+### OpenAPI
 
-### Gen Phase 3: OpenAPI target ✅ Complete
+```bash
+phoenix gen schema.phx --target openapi --out ./api.json
+```
 
-Free interop with the entire API tooling ecosystem.
+Generates an OpenAPI 3.1 spec with paths, schemas, parameters, error responses, and JSON Schema validation keywords from `where` constraints. Usable with Swagger UI, Postman, API gateways, and documentation tools.
 
-- ~~Generate OpenAPI 3.1 specs from endpoint declarations (`phoenix gen --target openapi`)~~ ✅ Complete
-- ~~Map Phoenix types to JSON Schema (structs → objects, enums → string enums or oneOf tagged unions)~~ ✅ Complete
-- ~~Map `where` constraints to JSON Schema validation keywords (`minimum`, `maximum`, `minLength`, `maxLength`, `exclusiveMinimum`, `exclusiveMaximum`)~~ ✅ Complete
-- ~~Map error variants to HTTP response status codes~~ ✅ Complete
+---
 
-### Gen Phase 4: Additional targets
+## Cross-Language Usage
 
-- ~~Go: structs with JSON tags (`types.go`), `net/http` router (`server.go`), Handlers interface (`handlers.go`), typed HTTP client (`client.go`)~~ ✅ Complete
-- Rust: types, handler traits (Axum/Actix adapters), client
-- ~~Python: Pydantic models (`models.py`), FastAPI router (`server.py`), handler Protocol (`handlers.py`), typed httpx client (`client.py`) with `where` constraint validation via Pydantic `Field()`~~ ✅ Complete
+A single `.phx` schema can generate client code in one language and server code in another. The schema is the shared contract.
 
-### Gen Phase 5: Watch mode and integration
+```bash
+# TypeScript frontend
+phoenix gen schema.phx --target typescript --client --out ./frontend/src/api
 
-- ~~`phoenix gen --watch` re-generates on `.phx` file changes~~ ✅ Complete
-- ~~Integration testing: syntax validation of generated code (Python `ast.parse`, Go `gofmt`, OpenAPI JSON validation)~~ ✅ Complete
-- ~~LSP server (`phoenix-lsp` binary) with hover, autocomplete, go-to-definition, find references, and rename~~ ✅ Complete
+# Python backend
+phoenix gen schema.phx --target python --server --out ./backend/api
+```
 
-## Required tooling
+Both sides are derived from the same `.phx` file. If a field is added, renamed, or removed in the schema, both the client and server code are regenerated — the contract cannot drift out of sync.
 
-Phoenix Gen does not need the full tooling suite planned in Phase 3 of the language roadmap. But it does need a targeted subset — without editor support, the authoring experience is worse than OpenAPI YAML, which already has schema validation in every editor.
+Other combinations work the same way: TypeScript + Go, React Native + Python, multiple clients from one schema, etc.
 
-### VS Code extension (ships with Gen Phase 2)
+---
 
-The extension ships alongside the first code generation target. It is not optional — developers evaluate tools by opening a file in their editor. No highlighting, no adoption.
+## Configuration
 
-**TextMate grammar for syntax highlighting:**
-- Keywords: `struct`, `enum`, `endpoint`, `schema`, `where`, `function`, `let`, type names
-- Literals: strings, numbers, booleans
-- Comments: `//` and `/* */`
-- This is a single `.tmLanguage.json` file — a few days of work, not weeks
-- Provides immediate visual feedback that `.phx` files are a real, supported format
+A `phoenix.toml` in your project configures Gen defaults so `phoenix gen` works with no arguments.
 
-**Basic diagnostics (via the existing type checker):**
-- Run the Phoenix parser and type checker on save
-- Report errors inline: undefined types, invalid endpoint definitions, malformed `where` constraints
-- This does not require a full LSP server — a simple "run checker, parse JSON errors, show squiggles" extension is sufficient for launch
-- The existing Phoenix type checker already produces span-annotated errors, so the infrastructure exists
-
-**What can wait:**
-- Full LSP with autocomplete, go-to-definition, find references — valuable, but not a launch blocker. Add incrementally in Gen Phase 5.
-- Hover for type info — useful for complex generic types, not critical for schema files which are typically simple structs and endpoints.
-- Extensions for other editors (JetBrains, Neovim, etc.) — VS Code first, expand based on demand.
-
-### Error message quality
-
-Schema files are typically short, so when something goes wrong, the error message is the entire debugging experience. Every diagnostic should include:
-
-- **What** went wrong: `unknown type "Usr" in endpoint response`
-- **Where**: file path, line number, and column span pointing at the offending token
-- **Suggestion**: `did you mean "User"?` (fuzzy matching against known types)
-
-The existing Phoenix error infrastructure supports span-annotated diagnostics. The work here is ensuring new AST nodes (`endpoint`, `schema`, `where`) produce equally good errors, and adding "did you mean" suggestions for common mistakes in schema files.
-
-### Configuration file
-
-A `phoenix.toml` in the project root (or any ancestor directory) configures Gen defaults. Place it alongside your schema file so that `phoenix gen` works with no arguments.
-
-#### Single target
+### Single target
 
 ```toml
 [gen]
@@ -614,9 +384,7 @@ out_dir = "./generated"
 mode = "both"                 # "client", "server", or "both"
 ```
 
-#### Multiple targets
-
-Use `[gen.targets.<name>]` sub-tables to generate code for several languages in one `phoenix gen` invocation:
+### Multiple targets
 
 ```toml
 [gen]
@@ -634,17 +402,11 @@ mode = "server"
 out_dir = "docs"
 ```
 
-Running `phoenix gen` with this config generates the TypeScript client, the Python server, and the OpenAPI spec — all from the same schema.
+Running `phoenix gen` with this config generates all targets from the same schema.
 
-Each target inherits the top-level `mode` unless overridden. If a target omits `out_dir`, it defaults to `{top-level out_dir}/{target_name}`.
-
-#### CLI overrides
+### CLI overrides
 
 CLI flags always override config values:
-
-- `--target <name>` selects a single target, ignoring the rest
-- `--client` / `--server` overrides the `mode` for all targets
-- `--out <dir>` overrides the output directory
 
 ```bash
 # Config defines multiple targets, but only generate python
@@ -652,78 +414,131 @@ phoenix gen --target python
 
 # Config says mode = "both", but override to client-only
 phoenix gen --client
+
+# Override output directory
+phoenix gen --out ./custom-dir
 ```
 
-This is a config file parser, not a package manager — no dependency resolution, no registry, no lockfile. It tells `phoenix gen` where to find schema files and how to generate output.
+---
 
-### What Gen does NOT need from Phase 3
+## Reference
 
-| Phase 3 item | Why Gen doesn't need it |
-|--------------|------------------------|
-| 3.1 Package manager | Schema files are standalone — no cross-package imports, no dependency resolution |
-| 3.3 Formatter | Schema files are short and simple; manual formatting is fine. A formatter can come later. |
-| 3.4 Test framework | Gen produces code for other languages — those languages have their own test frameworks |
-| 3.2 Full LSP | A full LSP with autocomplete, references, and rename is valuable but not required at launch. Basic diagnostics via the type checker are sufficient. |
+### Naming conventions
 
-## Distribution and release plan
+Phoenix uses `camelCase` for fields and endpoints. Generated code is automatically converted to the target language's conventions:
 
-Binary artifacts are hosted as GitHub Release assets and built automatically by GitHub Actions on each tagged release.
+| Phoenix (source) | TypeScript | Go | Python |
+|---|---|---|---|
+| `listUsers` (endpoint) | `listUsers` | `ListUsers` | `list_users` |
+| `createdAt` (field) | `createdAt` | `CreatedAt` | `created_at` |
+| `User` (type) | `User` | `User` | `User` |
 
-### Day one: GitHub Releases + install script + Homebrew tap
+JSON wire format uses camelCase. Generated server code for Go and Python handles the mapping automatically.
 
-**GitHub Releases with install script:**
-- GitHub Actions builds platform-specific binaries on each tagged release: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `win32-x64`
-- Binaries are uploaded as GitHub Release assets (free for public repos)
-- A shell installer script (hosted in the repo, e.g. `curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sh`) detects the platform and downloads the correct binary
-- One-line install command in the README — lowest friction for first-time users
+### Enum mapping
 
-**Homebrew tap:**
-- Create a `homebrew-phoenix` repo with a formula that points to the GitHub Release binaries
-- Users install with `brew tap rmsap/phoenix && brew install phoenix`
-- The formula is a single Ruby file updated on each release (can be automated via CI)
-- No approval process — taps are self-published
+**Simple enums** (no payloads) map to string values:
 
-### With TypeScript target (Gen Phase 2): npm
+```phoenix
+enum Role { Admin, Editor, Viewer }
+```
 
-Publishing to npm makes sense when the TypeScript target ships — developers generating TypeScript are already in the npm ecosystem.
+| Target | Output |
+|---|---|
+| TypeScript | `type Role = "Admin" \| "Editor" \| "Viewer"` |
+| Go | `type Role string` + `const RoleAdmin Role = "Admin"` ... |
+| JSON | `"Admin"`, `"Editor"`, `"Viewer"` |
+| OpenAPI | `{ type: "string", enum: ["Admin", "Editor", "Viewer"] }` |
 
-- Create an npmjs.com account (free for public packages)
-- Publish platform-specific binary packages: `@phoenixlang/cli-darwin-arm64`, `@phoenixlang/cli-linux-x64`, etc.
-- Publish a base package (`phoenixlang`) that detects the platform and pulls in the correct binary via `optionalDependencies`
-- Developers can then run `npx phoenixlang gen` or `npm install -g phoenixlang`
-- This is the same pattern used by esbuild, Turbo, and Biome for distributing Rust/Go binaries via npm
+**Enums with payloads** (ADTs) map to tagged unions with `tag` as the discriminator:
 
-### With traction: Homebrew core + crates.io
+```phoenix
+enum Shape {
+  Circle(Float)
+  Rect(Float, Float)
+}
+```
 
-**Homebrew core** (official `brew install phoenix` without a tap):
-- Submit a PR to the [homebrew-core](https://github.com/Homebrew/homebrew-core) repo
-- Must meet their criteria: notable project (some GitHub stars and usage), stable tagged releases, passing CI
-- Reviewed by Homebrew maintainers — pursue once Phoenix Gen has real users, not on day one
+```typescript
+type Shape =
+  | { tag: "Circle"; value: number }
+  | { tag: "Rect"; value: [number, number] }
+```
 
-**crates.io** (`cargo install phoenix-cli`):
-- Free, zero setup — `cargo publish` uploads to the Rust package registry
-- Compiles from source, so it requires users to have the Rust toolchain installed
-- Good as an additional option for Rust developers, not a primary distribution method
+### Optional fields
 
-### Release automation
+| Phoenix | TypeScript | Go | JSON | OpenAPI |
+|---|---|---|---|---|
+| `String name` | `name: string` | `Name string` | required | in `required` array |
+| `Option<String> name` | `name?: string` | `Name *string` | absent or `null` | not in `required` |
 
-All of the above should be automated in a single GitHub Actions workflow triggered by a version tag:
+Both absent and `null` in JSON map to `None`.
 
-1. `git tag v0.1.0 && git push --tags`
-2. CI builds binaries for all platforms
-3. CI creates a GitHub Release with the binaries attached
-4. CI publishes to npm (platform packages + base package)
-5. CI updates the Homebrew tap formula with new URLs and SHA256 checksums
+### Error variants
 
-Once set up, releasing a new version is a single `git tag` command.
+Error variants carry explicit HTTP status codes:
 
-## Relationship to the full language
+```phoenix
+error {
+  NotFound(404)
+  Unauthorized(401)
+  ValidationError(400)
+  Conflict(409)
+  RateLimited(429)
+}
+```
 
-Phoenix Gen is a **stepping stone**, not a fork. The relationship is:
+Generated server code maps each variant to the corresponding HTTP status. Generated client code maps response status codes back to typed error variants.
 
-1. **Schema files are valid Phoenix code.** When the full compiler (Phase 2) ships, `.phx` schema files become importable modules. No rewrite needed.
-2. **`endpoint` and `schema` parsing built for Gen feeds directly into the compiler.** The parser extensions are shared.
-3. **Validation from `where` constraints is a subset of refinement types (Phase 5.2).** Real-world usage in Gen informs the design of the full refinement type system.
-4. **Users who adopt Phoenix Gen become the first users of the full language.** They already know the syntax, have `.phx` files in their projects, and have a reason to care about the compiler shipping.
+### Authentication
 
-The long-term trajectory: Phoenix Gen starts as a code generation tool for other languages, and gradually becomes less necessary as the full Phoenix language can handle both client and server natively. But even then, OpenAPI generation and multi-language client SDK generation remain valuable — not every consumer of a Phoenix API will be written in Phoenix.
+Auth is not modeled in Gen schemas. The generated handler interface receives the full request context — wire auth in your framework's own way (Express middleware, FastAPI dependencies, Go middleware, etc.).
+
+### Generated code stability
+
+Regenerating without schema changes produces byte-identical output. The generator uses declaration order, consistent formatting, and no timestamps. Adding one field produces a minimal diff — only lines related to that field change.
+
+---
+
+## Background
+
+### Motivation
+
+Phoenix's most differentiating features — typed endpoints, built-in serialization, refinement types — are planned for later phases of the language roadmap, which depend on compilation and the async runtime. Phoenix Gen inverts this by extracting the schema and code generation aspects into a standalone tool that works today:
+
+- **Proves the value proposition now.** Developers experience Phoenix's type safety without adopting a new language.
+- **Builds a user base.** Every developer using `phoenix gen` learns Phoenix syntax and joins the ecosystem.
+- **Validates the design.** Real-world usage of `endpoint` and `schema` declarations shapes the full language design with feedback instead of speculation.
+- **Creates a migration path.** When the full language ships, `.phx` schema files become importable modules with zero rewrite.
+
+### Competitive landscape
+
+| Tool | Strengths | Gap Phoenix Gen fills |
+|------|-----------|----------------------|
+| OpenAPI / Swagger | Universal ecosystem support | Verbose YAML, poor authoring experience, mediocre code generators |
+| Protobuf / gRPC | Excellent multi-language codegen | Designed for RPC, not REST/HTTP APIs with path params and JSON |
+| TypeSpec (Microsoft) | Clean DSL, generates OpenAPI | No validation/refinement types, no direct client SDK generation |
+| tRPC | Best-in-class DX for TypeScript full-stack | TypeScript-only — locks both client and server to one language |
+| Smithy (AWS) | Powerful service modeling | Complex, AWS-centric, steep learning curve |
+| GraphQL | Strong type system, introspection | Different paradigm, N+1 problems, complexity for simple APIs |
+
+### Implementation status
+
+| Phase | Status |
+|-------|--------|
+| Gen Phase 1: Foundation (parser, type checker, CLI) | Complete |
+| Gen Phase 2: TypeScript target + VS Code extension | Complete |
+| Gen Phase 3: OpenAPI target | Complete |
+| Gen Phase 4: Python and Go targets | Complete (Rust deferred) |
+| Gen Phase 5: Watch mode, integration testing, LSP | Complete |
+
+### Relationship to the full language
+
+Phoenix Gen is a stepping stone, not a fork:
+
+1. Schema files are valid Phoenix code — when the full compiler ships, `.phx` schema files become importable modules.
+2. Parser extensions built for Gen feed directly into the compiler.
+3. `where` constraints are a subset of refinement types — real-world Gen usage informs the full design.
+4. Users who adopt Phoenix Gen become the first users of the full language.
+
+The long-term trajectory: Gen starts as a code generation tool for other languages, and gradually becomes less necessary as the full Phoenix language handles both client and server natively. But OpenAPI generation and multi-language client SDK generation remain valuable even then.

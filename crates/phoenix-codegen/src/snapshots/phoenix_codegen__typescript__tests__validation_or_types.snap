@@ -22,7 +22,7 @@ export function validateRange(input: unknown): Range {
   if (typeof obj.id !== 'number') throw new ValidationError('id: expected number');
   if (typeof obj.x !== 'number') throw new ValidationError('x: expected number');
   if (!(((obj.x < 0) || (obj.x > 100)))) throw new ValidationError('x: constraint violated');
-  return obj as Range;
+  return obj as unknown as Range;
 }
 
 export type CreateBody = {
@@ -34,5 +34,5 @@ export function validateCreateBody(input: unknown): CreateBody {
   const obj = input as Record<string, unknown>;
   if (typeof obj.x !== 'number') throw new ValidationError('x: expected number');
   if (!(((obj.x < 0) || (obj.x > 100)))) throw new ValidationError('x: constraint violated');
-  return obj as CreateBody;
+  return obj as unknown as CreateBody;
 }

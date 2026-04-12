@@ -25,7 +25,7 @@ export function validateUser(input: unknown): User {
   if (!((obj.name.length > 0))) throw new ValidationError('name: constraint violated');
   if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
   if (!((obj.age >= 0))) throw new ValidationError('age: constraint violated');
-  return obj as User;
+  return obj as unknown as User;
 }
 
 export type UpdateUserBody = {
@@ -40,5 +40,5 @@ export function validateUpdateUserBody(input: unknown): UpdateUserBody {
   if (obj.name !== undefined && !((obj.name.length > 0))) throw new ValidationError('name: constraint violated');
   if (obj.age !== undefined && typeof obj.age !== 'number') throw new ValidationError('age: expected number');
   if (obj.age !== undefined && !((obj.age >= 0))) throw new ValidationError('age: constraint violated');
-  return obj as UpdateUserBody;
+  return obj as unknown as UpdateUserBody;
 }

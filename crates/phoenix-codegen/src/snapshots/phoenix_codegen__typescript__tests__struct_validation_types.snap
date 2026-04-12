@@ -25,5 +25,5 @@ export function validateUser(input: unknown): User {
   if (!(((obj.name.length > 0) && (obj.name.length <= 100)))) throw new ValidationError('name: constraint violated');
   if (typeof obj.age !== 'number') throw new ValidationError('age: expected number');
   if (!(((obj.age >= 0) && (obj.age <= 150)))) throw new ValidationError('age: constraint violated');
-  return obj as User;
+  return obj as unknown as User;
 }
