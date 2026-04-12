@@ -1,8 +1,8 @@
 {
   "name": "phoenixlang",
   "displayName": "Phoenix Language",
-  "description": "Syntax highlighting and language server for the Phoenix programming language",
-  "version": "0.1.1",
+  "description": "Syntax highlighting and language support for the Phoenix programming language. Automatically downloads the Phoenix language server for hover, autocomplete, go-to-definition, and more.",
+  "version": "0.1.2",
   "publisher": "rmsap",
   "repository": {
     "type": "git",
@@ -45,7 +45,7 @@
         "phoenix.lspPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the phoenix-lsp language server binary. Leave empty to use the bundled binary."
+          "description": "Path to the phoenix-lsp language server binary. Leave empty to download automatically."
         }
       }
     }
