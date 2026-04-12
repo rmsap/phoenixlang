@@ -165,8 +165,7 @@ fn run() {
                         .iter()
                         .map(|rt| {
                             let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
-                            let mode =
-                                cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
+                            let mode = cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
                             (rt.target.as_str(), out_dir, mode)
                         })
                         .collect();
@@ -575,7 +574,10 @@ fn cmd_gen_watch(path: &str, targets: &[(&str, &str, GenMode)]) {
         match generate_once(path, target, out_dir, *mode) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("[phoenix gen] initial generation failed ({}): {}", target, e);
+                eprintln!(
+                    "[phoenix gen] initial generation failed ({}): {}",
+                    target, e
+                );
                 had_error = true;
             }
         }
