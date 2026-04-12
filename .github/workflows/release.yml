@@ -19,15 +19,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            vscode-target: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            vscode-target: linux-arm64
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            vscode-target: darwin-x64
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            vscode-target: darwin-arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+            vscode-target: win32-x64
 
     runs-on: ${{ matrix.os }}
 
@@ -42,7 +50,15 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - name: Build release binaries
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (Unix)
@@ -62,11 +78,17 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/phoenix-lsp.exe dist/
           Compress-Archive -Path dist/* -DestinationPath phoenix-${{ github.ref_name }}-${{ matrix.target }}.zip
 
-      - name: Upload artifact
+      - name: Upload release artifact
         uses: actions/upload-artifact@v5
         with:
           name: phoenix-${{ matrix.target }}
           path: phoenix-${{ github.ref_name }}-${{ matrix.target }}.*
+
+      - name: Upload LSP binary for VS Code extension
+        uses: actions/upload-artifact@v5
+        with:
+          name: lsp-${{ matrix.vscode-target }}
+          path: target/${{ matrix.target }}/release/phoenix-lsp${{ matrix.os == 'windows-latest' && '.exe' || '' }}
 
   release:
     needs: build
@@ -78,6 +100,7 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           path: artifacts
+          pattern: phoenix-*
           merge-multiple: true
 
       - name: Create GitHub Release
@@ -85,3 +108,49 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+
+  vscode:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - vscode-target: linux-x64
+          - vscode-target: linux-arm64
+          - vscode-target: darwin-x64
+          - vscode-target: darwin-arm64
+          - vscode-target: win32-x64
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download LSP binary
+        uses: actions/download-artifact@v5
+        with:
+          name: lsp-${{ matrix.vscode-target }}
+          path: editors/vscode/server
+
+      - name: Mark LSP binary as executable
+        if: matrix.vscode-target != 'win32-x64'
+        run: chmod +x editors/vscode/server/phoenix-lsp
+
+      - name: Install dependencies and compile
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm run compile
+
+      - name: Package extension
+        working-directory: editors/vscode
+        run: npx @vscode/vsce package --target ${{ matrix.vscode-target }}
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: vsix-${{ matrix.vscode-target }}
+          path: editors/vscode/*.vsix
+
