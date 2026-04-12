@@ -814,11 +814,11 @@ fn constraint_validate_checks_type() {
 #[test]
 fn constraint_validate_checks_constraint() {
     let files = generate_constrained();
-    // name: self.length > 0 and self.length <= 100
+    // name: self.length > 0 && self.length <= 100
     assert!(files.types.contains("obj.name.length"));
     // email: self.contains("@")
     assert!(files.types.contains("obj.email.includes"));
-    // age: self >= 0 and self <= 150
+    // age: self >= 0 && self <= 150
     assert!(files.types.contains("obj.age >= 0"));
     assert!(files.types.contains("obj.age <= 150"));
 }

@@ -335,7 +335,7 @@ pub struct StructDecl {
 ///
 /// ```text
 /// Int x
-/// String name where self.length > 0 and self.length <= 100
+/// String name where self.length > 0 && self.length <= 100
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldDecl {

@@ -1580,8 +1580,8 @@ endpoint healthCheck: GET "/api/health" {
             r#"
 struct User {
     Int id
-    String name where self.length > 0 and self.length <= 100
-    Int age where self >= 0 and self <= 150
+    String name where self.length > 0 && self.length <= 100
+    Int age where self >= 0 && self <= 150
 }
 endpoint createUser: POST "/api/users" {
     body User omit { id }
@@ -1599,7 +1599,7 @@ endpoint createUser: POST "/api/users" {
             r#"
 struct User {
     Int id
-    String email where self.contains("@") and self.length > 3
+    String email where self.contains("@") && self.length > 3
 }
 endpoint createUser: POST "/api/users" {
     body User omit { id }
@@ -1652,7 +1652,7 @@ endpoint createUser: POST "/api/users" {
     fn validation_or_constraint() {
         let files = generate_from_source(
             r#"
-struct Range { Int id  Int x where self < 0 or self > 100 }
+struct Range { Int id  Int x where self < 0 || self > 100 }
 endpoint create: POST "/api/ranges" {
     body Range omit { id }
     response Range

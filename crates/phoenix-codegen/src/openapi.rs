@@ -616,7 +616,7 @@ endpoint createUser: POST "/api/users" {
         let spec = generate_from_source(
             r#"
 struct Product {
-    Int price where self >= 0 and self <= 10000
+    Int price where self >= 0 && self <= 10000
     String name
 }
 "#,
@@ -629,7 +629,7 @@ struct Product {
         let spec = generate_from_source(
             r#"
 struct Profile {
-    String username where self.length >= 3 and self.length <= 50
+    String username where self.length >= 3 && self.length <= 50
     String bio
 }
 "#,

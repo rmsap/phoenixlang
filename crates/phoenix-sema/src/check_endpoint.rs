@@ -858,9 +858,9 @@ mod tests {
             r#"
             struct User {
                 Int id
-                String name where self.length > 0 and self.length <= 100
+                String name where self.length > 0 && self.length <= 100
                 String email
-                Int age where self >= 0 and self <= 150
+                Int age where self >= 0 && self <= 150
                 Option<String> bio
             }
 

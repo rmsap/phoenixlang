@@ -3401,7 +3401,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_field_with_where_constraint() {
         let source = r#"struct User {
-    Int age where self >= 0 and self <= 150
+    Int age where self >= 0 && self <= 150
     String name
 }"#;
         let (program, diagnostics) = parse_source(source);
@@ -3425,7 +3425,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_field_with_string_constraint() {
         let source = r#"struct User {
-    String email where self.contains("@") and self.length > 3
+    String email where self.contains("@") && self.length > 3
 }"#;
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -3442,7 +3442,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     fn parse_struct_mixed_constraints() {
         let source = r#"struct User {
     Int id
-    String name where self.length > 0 and self.length <= 100
+    String name where self.length > 0 && self.length <= 100
     String email where self.contains("@")
     Int age where self >= 0
 }"#;

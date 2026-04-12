@@ -2527,8 +2527,8 @@ fn constraint_valid_numeric_and_string() {
     assert_no_errors(
         r#"
 struct User {
-Int age where self >= 0 and self <= 150
-String name where self.length > 0 and self.length <= 100
+Int age where self >= 0 && self <= 150
+String name where self.length > 0 && self.length <= 100
 }
 "#,
     );
@@ -2540,7 +2540,7 @@ fn constraint_valid_string_contains() {
     assert_no_errors(
         r#"
 struct User {
-String email where self.contains("@") and self.length > 3
+String email where self.contains("@") && self.length > 3
 }
 "#,
     );
@@ -2630,7 +2630,7 @@ function main() { }
 fn constraint_valid_or() {
     assert_no_errors(
         r#"
-struct Range { Int x where self < 0 or self > 100 }
+struct Range { Int x where self < 0 || self > 100 }
 "#,
     );
 }
@@ -2640,7 +2640,7 @@ struct Range { Int x where self < 0 or self > 100 }
 fn constraint_valid_float() {
     assert_no_errors(
         r#"
-struct Item { Float price where self > 0.0 and self < 1000.0 }
+struct Item { Float price where self > 0.0 && self < 1000.0 }
 "#,
     );
 }

@@ -853,8 +853,8 @@ struct User {
             r#"
 struct User {
     Int id
-    String name where self.length > 0 and self.length <= 100
-    Int age where self >= 0 and self <= 150
+    String name where self.length > 0 && self.length <= 100
+    Int age where self >= 0 && self <= 150
 }
 "#,
         );
@@ -1020,7 +1020,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
     fn float_constraints() {
         let files = generate_from_source(
             r#"
-struct Measurement { Float value where self >= 0.0 and self <= 100.5 }
+struct Measurement { Float value where self >= 0.0 && self <= 100.5 }
 "#,
         );
         insta::assert_snapshot!("py_float_constraints", files.models);
