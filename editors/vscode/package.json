@@ -1,6 +1,6 @@
 {
   "name": "phoenix-lang",
-  "displayName": "Phoenix",
+  "displayName": "Phoenix Lang",
   "description": "Syntax highlighting and language server for the Phoenix programming language",
   "version": "0.1.0",
   "publisher": "rmsap",
