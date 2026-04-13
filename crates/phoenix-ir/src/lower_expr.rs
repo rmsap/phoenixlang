@@ -83,6 +83,14 @@ impl<'a> LoweringContext<'a> {
                 VarBinding::Direct(val, _) => val,
                 VarBinding::Mutable(slot, ty) => self.emit(Op::Load(slot), ty, Some(ident.span)),
             }
+        } else if ident.name == "None" {
+            // Built-in Option::None — emit as a zero-field struct so that
+            // EnumDiscriminant and format() work uniformly with Some().
+            self.emit(
+                Op::StructAlloc("None".to_string(), Vec::new()),
+                IrType::StructRef("None".to_string()),
+                Some(ident.span),
+            )
         } else {
             // Unknown variable — emit a placeholder constant.
             // This shouldn't happen if sema passed, but be defensive.

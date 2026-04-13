@@ -17,6 +17,7 @@ phoenix-parser = { path = "../phoenix-parser" }
 phoenix-sema = { path = "../phoenix-sema" }
 phoenix-interp = { path = "../phoenix-interp" }
 phoenix-ir = { path = "../phoenix-ir" }
+phoenix-ir-interp = { path = "../phoenix-ir-interp" }
 phoenix-codegen = { path = "../phoenix-codegen" }
 clap = { workspace = true }
 notify = { workspace = true }

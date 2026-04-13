@@ -6,7 +6,7 @@ Move from interpretation to native code generation. This is what makes Phoenix a
 
 ## 2.1 Intermediate Representation (IR)
 
-**Status: In progress.** The `phoenix-ir` crate implements an SSA-style IR with basic blocks, typed instructions, and explicit control flow. The lowering pass converts the type-checked AST into IR for all major language features (arithmetic, control flow, structs, enums, match, closures, method calls, collections, try operator, string interpolation). Use `phoenix ir <file.phx>` to inspect the output. Next steps: IR interpreter for round-trip verification, then Cranelift integration.
+**Status: In progress.** The `phoenix-ir` crate implements an SSA-style IR with basic blocks, typed instructions, and explicit control flow. The lowering pass converts the type-checked AST into IR for all major language features (arithmetic, control flow, structs, enums, match, closures, method calls, collections, try operator, string interpolation). Use `phoenix ir <file.phx>` to inspect the output. The `phoenix-ir-interp` crate provides an IR interpreter for round-trip verification — use `phoenix run-ir <file.phx>` to execute via the IR and compare output with `phoenix run`. Round-trip tests cover all lowered features including the try operator; see `crates/phoenix-ir-interp/tests/` for the full suite. Next step: Cranelift integration.
 
 - Lower the type-checked AST to a flat, SSA-style IR
 - Basic blocks, typed instructions, explicit control flow

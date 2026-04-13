@@ -92,6 +92,11 @@ impl IrFunction {
         }
     }
 
+    /// Returns the number of [`ValueId`]s allocated in this function.
+    pub fn value_count(&self) -> u32 {
+        self.next_value_id
+    }
+
     /// Allocates a fresh [`ValueId`].
     pub fn fresh_value(&mut self) -> ValueId {
         let id = ValueId(self.next_value_id);

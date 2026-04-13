@@ -765,6 +765,7 @@ dependencies = [
  "phoenix-common",
  "phoenix-interp",
  "phoenix-ir",
+ "phoenix-ir-interp",
  "phoenix-lexer",
  "phoenix-parser",
  "phoenix-sema",
@@ -789,6 +790,19 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "phoenix-common",
+ "phoenix-lexer",
+ "phoenix-parser",
+ "phoenix-sema",
+]
+
+[[package]]
+name = "phoenix-ir-interp"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "phoenix-common",
+ "phoenix-interp",
+ "phoenix-ir",
  "phoenix-lexer",
  "phoenix-parser",
  "phoenix-sema",

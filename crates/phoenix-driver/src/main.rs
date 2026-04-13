@@ -14,6 +14,7 @@
 //! | `run`   | Execute a Phoenix program via the tree-walk interpreter |
 //! | `gen`   | Generate typed code or OpenAPI specs from a Phoenix schema file (supports `--watch`) |
 //! | `ir`    | Dump the SSA-style IR for a Phoenix source file |
+//! | `run-ir` | Run a Phoenix program via the IR interpreter |
 #![warn(missing_docs)]
 
 mod config;
@@ -67,6 +68,11 @@ enum Commands {
         /// Path to the source file
         file: String,
     },
+    /// Run a Phoenix program via the IR interpreter
+    RunIr {
+        /// Path to the source file
+        file: String,
+    },
     /// Generate typed code from a Phoenix schema file
     Gen {
         /// Path to the .phx schema file (or set gen.schema in phoenix.toml)
@@ -111,6 +117,7 @@ fn run() {
         Commands::Check { file } => cmd_check(&file),
         Commands::Ir { file } => cmd_ir(&file),
         Commands::Run { file } => cmd_run(&file),
+        Commands::RunIr { file } => cmd_run_ir(&file),
         Commands::Gen {
             file,
             target,
@@ -321,6 +328,25 @@ fn cmd_ir(path: &str) {
 fn cmd_run(path: &str) {
     let (program, check_result) = parse_and_check(path);
     if let Err(err) = interpreter::run(&program, check_result.lambda_captures) {
+        eprintln!("runtime error: {}", err);
+        process::exit(1);
+    }
+}
+
+/// Run a Phoenix program via the IR interpreter.
+fn cmd_run_ir(path: &str) {
+    let (program, check_result) = parse_and_check(path);
+    let ir_module = phoenix_ir::lower(&program, &check_result);
+
+    let errors = phoenix_ir::verify::verify(&ir_module);
+    if !errors.is_empty() {
+        for err in &errors {
+            eprintln!("IR verification error in {}: {}", err.function, err.message);
+        }
+        process::exit(1);
+    }
+
+    if let Err(err) = phoenix_ir_interp::run(&ir_module) {
         eprintln!("runtime error: {}", err);
         process::exit(1);
     }
