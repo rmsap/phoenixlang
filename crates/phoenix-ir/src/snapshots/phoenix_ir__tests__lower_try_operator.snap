@@ -1,0 +1,29 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @fallible() -> enum.Result {
+  bb0:
+    v0 = const_i64 42
+    v1 = struct_alloc @Ok(v0)
+    return v1
+}
+
+func @main() -> enum.Result {
+  bb0:
+    v0 = call f0()
+    v1 = enum_discriminant v0
+    v2 = const_i64 0
+    v3 = ieq v1, v2
+    branch v3, bb1, bb2
+  bb1:
+    v4 = enum_get_field v0, 0
+    jump bb3
+  bb2:
+    return v0
+  bb3:
+    v5 = const_i64 1
+    v6 = iadd v4, v5
+    v7 = struct_alloc @Ok(v6)
+    return v7
+}

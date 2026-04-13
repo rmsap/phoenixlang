@@ -1,0 +1,17 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @double(x: i64) -> i64 {
+  bb0(v0: i64):
+    v1 = const_i64 2
+    v2 = imul v0, v1
+    return v2
+}
+
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 21
+    v1 = call f0(v0)
+    return v1
+}

@@ -1,0 +1,9 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> f64 {
+  bb0:
+    v0 = const_f64 3.14
+    return v0
+}

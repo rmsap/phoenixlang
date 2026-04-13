@@ -1,0 +1,8 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> void {
+  bb0:
+    return
+}

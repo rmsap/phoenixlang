@@ -1,0 +1,15 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> bool {
+  bb0:
+    v0 = const_bool false
+    v1 = const_bool true
+    v2 = const_bool true
+    branch v0, bb2(v2), bb1
+  bb1:
+    jump bb2(v1)
+  bb2(v3: bool):
+    return v3
+}

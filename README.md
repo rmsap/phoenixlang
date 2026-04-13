@@ -11,7 +11,7 @@ When searching online, use **phoenixlang** to distinguish this project from the 
 
 ## Current Status
 
-Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,619 tests** across **8 crates** with the following features:
+Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,600+ tests** across **9 crates** with the following features:
 
 - Variables (`let` and `let mut`) with explicit types or type inference, **compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`)
 - Functions with typed parameters, return types, **named/default parameters**
@@ -39,7 +39,7 @@ Phoenix is in **active development**. The current implementation is a **tree-wal
 - **`where` constraints** on struct fields for validation (`String name where self.length > 0`, `Int age where self >= 0`)
 - **CI pipeline** with `cargo fmt`, `clippy`, and `cargo test`
 
-**Next up:** [Phase 2 — Compilation](docs/roadmap.md) (IR design, Cranelift native compilation, WebAssembly target).
+**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering started, Cranelift native compilation next, then WebAssembly target).
 
 ---
 
@@ -84,6 +84,7 @@ Phoenix source files use the `.phx` extension.
 phoenix lex file.phx     # Tokenize and print the token stream
 phoenix parse file.phx    # Parse and dump the AST as JSON
 phoenix check file.phx    # Type-check without running
+phoenix ir file.phx       # Dump the SSA-style intermediate representation
 phoenix run file.phx      # Execute the program
 phoenix gen file.phx                      # Generate TypeScript (types, client, handlers, server)
 phoenix gen file.phx --target python      # Generate Python (Pydantic, FastAPI, httpx)
@@ -314,6 +315,7 @@ Phoenix is implemented in Rust as a Cargo workspace:
 | `phoenix-parser` | Recursive-descent parser and AST |
 | `phoenix-sema` | Semantic analysis (name resolution and type checking) |
 | `phoenix-interp` | Tree-walk interpreter |
+| `phoenix-ir` | SSA-style intermediate representation and AST-to-IR lowering |
 | `phoenix-codegen` | Code generation backends (TypeScript, Python, Go, OpenAPI) |
 | `phoenix-lsp` | Language Server Protocol server |
 | `phoenix-driver` | CLI binary |

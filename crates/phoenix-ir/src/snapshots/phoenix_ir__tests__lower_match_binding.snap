@@ -1,0 +1,24 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 42
+    v2 = const_i64 1
+    v3 = ieq v0, v2
+    branch v3, bb2, bb4
+  bb1(v1: i64):
+    return v1
+  bb2:
+    v4 = const_i64 100
+    jump bb1(v4)
+  bb3:
+    v5 = const_i64 1
+    v6 = iadd v0, v5
+    jump bb1(v6)
+  bb4:
+    jump bb3
+  bb5:
+    unreachable
+}

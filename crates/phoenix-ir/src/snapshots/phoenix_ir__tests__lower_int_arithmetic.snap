@@ -1,0 +1,11 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 10
+    v1 = const_i64 20
+    v2 = iadd v0, v1
+    return v2
+}

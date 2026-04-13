@@ -1,0 +1,25 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @square(x: i64) -> i64 {
+  bb0(v0: i64):
+    v1 = imul v0, v0
+    return v1
+}
+
+func @sumOfSquares(a: i64, b: i64) -> i64 {
+  bb0(v0: i64, v1: i64):
+    v2 = call f0(v0)
+    v3 = call f0(v1)
+    v4 = iadd v2, v3
+    return v4
+}
+
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 3
+    v1 = const_i64 4
+    v2 = call f1(v0, v1)
+    return v2
+}

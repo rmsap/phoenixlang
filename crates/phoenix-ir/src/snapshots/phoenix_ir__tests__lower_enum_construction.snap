@@ -1,0 +1,9 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> enum.Color {
+  bb0:
+    v0 = enum_alloc @Color:0
+    return v0
+}

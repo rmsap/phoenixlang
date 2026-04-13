@@ -1,0 +1,10 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> bool {
+  bb0:
+    v0 = const_bool true
+    v1 = bool_not v0
+    return v1
+}

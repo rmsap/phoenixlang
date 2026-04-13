@@ -13,6 +13,7 @@
 //! | `check` | Type-check a source file and report errors |
 //! | `run`   | Execute a Phoenix program via the tree-walk interpreter |
 //! | `gen`   | Generate typed code or OpenAPI specs from a Phoenix schema file (supports `--watch`) |
+//! | `ir`    | Dump the SSA-style IR for a Phoenix source file |
 #![warn(missing_docs)]
 
 mod config;
@@ -61,6 +62,11 @@ enum Commands {
         /// Path to the source file
         file: String,
     },
+    /// Dump the SSA-style intermediate representation
+    Ir {
+        /// Path to the source file
+        file: String,
+    },
     /// Generate typed code from a Phoenix schema file
     Gen {
         /// Path to the .phx schema file (or set gen.schema in phoenix.toml)
@@ -103,6 +109,7 @@ fn run() {
         Commands::Lex { file } => cmd_lex(&file),
         Commands::Parse { file } => cmd_parse(&file),
         Commands::Check { file } => cmd_check(&file),
+        Commands::Ir { file } => cmd_ir(&file),
         Commands::Run { file } => cmd_run(&file),
         Commands::Gen {
             file,
@@ -292,6 +299,23 @@ fn parse_and_check(path: &str) -> (phoenix_parser::ast::Program, phoenix_sema::C
 fn cmd_check(path: &str) {
     parse_and_check(path);
     println!("No errors found.");
+}
+
+/// Lower a Phoenix source file to IR and print the textual representation.
+fn cmd_ir(path: &str) {
+    let (program, check_result) = parse_and_check(path);
+    let ir_module = phoenix_ir::lower(&program, &check_result);
+
+    // Run the IR verifier to catch structural errors.
+    let errors = phoenix_ir::verify::verify(&ir_module);
+    if !errors.is_empty() {
+        for err in &errors {
+            eprintln!("IR verification error in {}: {}", err.function, err.message);
+        }
+        process::exit(1);
+    }
+
+    print!("{}", ir_module);
 }
 
 fn cmd_run(path: &str) {

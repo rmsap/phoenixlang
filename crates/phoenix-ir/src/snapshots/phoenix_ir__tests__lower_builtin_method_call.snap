@@ -1,0 +1,10 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> i64 {
+  bb0:
+    v0 = const_string "hello"
+    v1 = builtin_call @String.length(v0)
+    return v1
+}

@@ -1,0 +1,16 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> void {
+  bb0:
+    v0 = const_i64 1
+    v1 = const_i64 2
+    v2 = struct_alloc @Point(v0, v1)
+    v3 = alloca struct.Point
+    store v3, v2
+    v4 = load v3
+    v5 = const_i64 42
+    struct_set_field v4, 0, v5
+    return
+}

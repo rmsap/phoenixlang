@@ -1,0 +1,31 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> void {
+  bb0:
+    v0 = const_i64 5
+    v1 = const_i64 10
+    v2 = igt v0, v1
+    branch v2, bb1, bb3
+  bb1:
+    v3 = const_string "big"
+    builtin_call @print(v3)
+    jump bb2
+  bb2:
+    return
+  bb3:
+    v4 = const_i64 0
+    v5 = igt v0, v4
+    branch v5, bb4, bb6
+  bb4:
+    v6 = const_string "medium"
+    builtin_call @print(v6)
+    jump bb5
+  bb5:
+    jump bb2
+  bb6:
+    v7 = const_string "small"
+    builtin_call @print(v7)
+    jump bb5
+}

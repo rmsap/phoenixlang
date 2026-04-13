@@ -1,0 +1,20 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @Pair.sum(self: struct.Pair) -> i64 {
+  bb0(v0: struct.Pair):
+    v1 = struct_get_field v0, 0
+    v2 = struct_get_field v0, 1
+    v3 = iadd v1, v2
+    return v3
+}
+
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 3
+    v1 = const_i64 7
+    v2 = struct_alloc @Pair(v0, v1)
+    v3 = call f0(v2)
+    return v3
+}

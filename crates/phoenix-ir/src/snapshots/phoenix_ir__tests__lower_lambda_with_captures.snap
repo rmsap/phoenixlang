@@ -1,0 +1,16 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> string {
+  bb0:
+    v0 = const_string "hello"
+    v1 = closure_alloc f1(v0)
+    v2 = call_indirect v1()
+    return v2
+}
+
+func @__closure_0(__cap_greeting: string) -> string {
+  bb0(v0: string):
+    return v0
+}

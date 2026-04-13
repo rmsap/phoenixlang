@@ -1,0 +1,11 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> bool {
+  bb0:
+    v0 = const_string "abc"
+    v1 = const_string "def"
+    v2 = string_eq v0, v1
+    return v2
+}

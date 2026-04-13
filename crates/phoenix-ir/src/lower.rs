@@ -1,0 +1,302 @@
+//! AST-to-IR lowering pass.
+//!
+//! The main entry point is [`lower`], which takes a parsed AST and a
+//! [`CheckResult`] from semantic analysis and produces an [`IrModule`].
+//!
+//! The lowering is structured as two passes:
+//! - **Pass 1 (registration):** Walk all declarations to register struct/enum
+//!   layouts, create function stubs, and populate the module's name-to-ID
+//!   lookup tables.
+//! - **Pass 2 (lowering):** Lower each function body into basic blocks with
+//!   SSA instructions and explicit control flow.
+
+use crate::block::BlockId;
+use crate::instruction::{FuncId, Op, ValueId};
+use crate::module::{IrFunction, IrModule};
+use crate::terminator::Terminator;
+use crate::types::IrType;
+use phoenix_common::span::Span;
+use phoenix_parser::ast::Program;
+use phoenix_sema::checker::CheckResult;
+use phoenix_sema::types::Type;
+use std::collections::HashMap;
+
+/// Lower a type-checked Phoenix program into an IR module.
+///
+/// Takes the parsed AST and the [`CheckResult`] from semantic analysis,
+/// and produces a fully-formed [`IrModule`] with all functions, methods,
+/// struct/enum layouts, and dispatch tables populated.
+pub fn lower(program: &Program, check_result: &CheckResult) -> IrModule {
+    let mut ctx = LoweringContext::new(check_result);
+    ctx.lower_program(program);
+    ctx.module
+}
+
+/// Convert a source-level [`Type`] to an IR-level [`IrType`].
+pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
+    match ty {
+        Type::Int => IrType::I64,
+        Type::Float => IrType::F64,
+        Type::Bool => IrType::Bool,
+        Type::String => IrType::StringRef,
+        Type::Void => IrType::Void,
+        Type::Named(name) => {
+            if check_result.structs.contains_key(name) {
+                IrType::StructRef(name.clone())
+            } else if check_result.enums.contains_key(name) {
+                IrType::EnumRef(name.clone())
+            } else {
+                // Unknown named type — treat as opaque struct reference.
+                // This can happen with type aliases or forward declarations
+                // that sema resolved but aren't in the struct/enum registries.
+                debug_assert!(false, "unknown named type in IR lowering: {name}");
+                IrType::StructRef(name.clone())
+            }
+        }
+        Type::Function(params, ret) => IrType::ClosureRef {
+            param_types: params.iter().map(|p| lower_type(p, check_result)).collect(),
+            return_type: Box::new(lower_type(ret, check_result)),
+        },
+        Type::TypeVar(_) => {
+            // Generic type variable — use opaque struct ref for now.
+            // Monomorphization will specialize this later.
+            IrType::StructRef("__generic".to_string())
+        }
+        Type::Generic(name, args) => match name.as_str() {
+            "List" => {
+                let elem = args
+                    .first()
+                    .map(|t| lower_type(t, check_result))
+                    .unwrap_or(IrType::Void);
+                IrType::ListRef(Box::new(elem))
+            }
+            "Map" => {
+                let key = args
+                    .first()
+                    .map(|t| lower_type(t, check_result))
+                    .unwrap_or(IrType::Void);
+                let val = args
+                    .get(1)
+                    .map(|t| lower_type(t, check_result))
+                    .unwrap_or(IrType::Void);
+                IrType::MapRef(Box::new(key), Box::new(val))
+            }
+            "Option" | "Result" => {
+                // Option and Result are enums at the IR level
+                IrType::EnumRef(name.clone())
+            }
+            other => {
+                // Generic struct or enum
+                if check_result.structs.contains_key(other) {
+                    IrType::StructRef(other.to_string())
+                } else {
+                    IrType::EnumRef(other.to_string())
+                }
+            }
+        },
+        Type::Error => {
+            // Should never reach IR lowering — type errors should be caught
+            // by sema.  Use Void as a safe fallback.
+            IrType::Void
+        }
+    }
+}
+
+/// How a variable is bound in the IR.
+#[derive(Debug, Clone)]
+pub(crate) enum VarBinding {
+    /// An immutable SSA value — the `ValueId` *is* the variable.
+    Direct(ValueId, IrType),
+    /// A mutable variable stored in an `Alloca` slot — accesses go through
+    /// `Load`/`Store`.  The [`IrType`] is the type of the stored value.
+    Mutable(ValueId, IrType),
+}
+
+impl VarBinding {
+    /// Returns the IR type of the bound variable.
+    #[allow(dead_code)]
+    pub(crate) fn ir_type(&self) -> &IrType {
+        match self {
+            VarBinding::Direct(_, ty) | VarBinding::Mutable(_, ty) => ty,
+        }
+    }
+}
+
+/// Information about the current loop, used for `break`/`continue` lowering.
+#[derive(Debug, Clone)]
+pub(crate) struct LoopContext {
+    /// Block to jump to for `continue` (loop header or latch).
+    pub(crate) continue_target: BlockId,
+    /// Block to jump to for `break` (skips else block if present).
+    pub(crate) break_target: BlockId,
+}
+
+/// Mutable context carried through the lowering pass.
+pub(crate) struct LoweringContext<'a> {
+    /// The sema [`CheckResult`] for type and signature lookups.
+    pub(crate) check: &'a CheckResult,
+    /// The module being built.
+    pub(crate) module: IrModule,
+
+    // --- Per-function state (reset when entering a new function) ---
+    /// The function currently being lowered.
+    pub(crate) current_func_id: Option<FuncId>,
+    /// The block currently being appended to.
+    pub(crate) current_block: Option<BlockId>,
+    /// Variable name → binding, using a scope stack for lexical scoping.
+    pub(crate) var_scopes: Vec<HashMap<String, VarBinding>>,
+    /// Loop context stack for `break`/`continue` targeting.
+    pub(crate) loop_stack: Vec<LoopContext>,
+    /// Counter for generating unique closure function names.
+    pub(crate) closure_counter: u32,
+}
+
+impl<'a> LoweringContext<'a> {
+    /// Creates a new lowering context.
+    fn new(check: &'a CheckResult) -> Self {
+        Self {
+            check,
+            module: IrModule::new(),
+            current_func_id: None,
+            current_block: None,
+            var_scopes: Vec::new(),
+            loop_stack: Vec::new(),
+            closure_counter: 0,
+        }
+    }
+
+    /// Orchestrates the full lowering of a program.
+    fn lower_program(&mut self, program: &Program) {
+        // Pass 1: Register all declarations (layouts, function stubs, indices).
+        self.register_declarations(program);
+
+        // Pass 2: Lower all function bodies.
+        self.lower_function_bodies(program);
+    }
+
+    // --- Scope management ---
+
+    /// Pushes a new variable scope.
+    pub(crate) fn push_scope(&mut self) {
+        self.var_scopes.push(HashMap::new());
+    }
+
+    /// Pops the innermost variable scope.
+    pub(crate) fn pop_scope(&mut self) {
+        self.var_scopes.pop();
+    }
+
+    /// Defines a variable in the current scope.
+    pub(crate) fn define_var(&mut self, name: String, binding: VarBinding) {
+        if let Some(scope) = self.var_scopes.last_mut() {
+            scope.insert(name, binding);
+        }
+    }
+
+    /// Looks up a variable by name, searching from innermost to outermost scope.
+    pub(crate) fn lookup_var(&self, name: &str) -> Option<&VarBinding> {
+        for scope in self.var_scopes.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                return Some(binding);
+            }
+        }
+        None
+    }
+
+    // --- Loop context ---
+
+    /// Pushes a loop context for `break`/`continue` lowering.
+    pub(crate) fn push_loop(&mut self, ctx: LoopContext) {
+        self.loop_stack.push(ctx);
+    }
+
+    /// Pops the innermost loop context.
+    pub(crate) fn pop_loop(&mut self) {
+        self.loop_stack.pop();
+    }
+
+    /// Returns the innermost loop context.
+    pub(crate) fn current_loop(&self) -> Option<&LoopContext> {
+        self.loop_stack.last()
+    }
+
+    // --- IR construction helpers ---
+
+    /// Returns a mutable reference to the current function being lowered.
+    pub(crate) fn current_func_mut(&mut self) -> &mut IrFunction {
+        let func_id = self.current_func_id.expect("no current function");
+        &mut self.module.functions[func_id.0 as usize]
+    }
+
+    /// Returns the current function ID.
+    #[allow(dead_code)]
+    pub(crate) fn current_func_id(&self) -> FuncId {
+        self.current_func_id.expect("no current function")
+    }
+
+    /// Returns the current block ID.
+    pub(crate) fn current_block(&self) -> BlockId {
+        self.current_block.expect("no current block")
+    }
+
+    /// Creates a new basic block in the current function and returns its ID.
+    pub(crate) fn create_block(&mut self) -> BlockId {
+        self.current_func_mut().create_block()
+    }
+
+    /// Switches the insertion point to the specified block.
+    pub(crate) fn switch_to_block(&mut self, block: BlockId) {
+        self.current_block = Some(block);
+    }
+
+    /// Emits an instruction into the current block and returns its result
+    /// [`ValueId`].  For void-typed operations, [`VOID_SENTINEL`] is
+    /// returned — callers must not use it as an operand (the verifier
+    /// checks this).
+    pub(crate) fn emit(&mut self, op: Op, result_type: IrType, span: Option<Span>) -> ValueId {
+        let block = self.current_block();
+        if result_type == IrType::Void {
+            self.current_func_mut().emit(block, op, IrType::Void, span);
+            crate::instruction::VOID_SENTINEL
+        } else {
+            self.current_func_mut()
+                .emit_value(block, op, result_type, span)
+        }
+    }
+
+    /// Emits a void instruction into the current block (no result value).
+    pub(crate) fn emit_void(&mut self, op: Op, span: Option<Span>) {
+        let block = self.current_block();
+        self.current_func_mut().emit(block, op, IrType::Void, span);
+    }
+
+    /// Sets the terminator for the current block.
+    pub(crate) fn terminate(&mut self, term: Terminator) {
+        let block = self.current_block();
+        self.current_func_mut().set_terminator(block, term);
+    }
+
+    /// Adds a block parameter to the specified block and returns its [`ValueId`].
+    pub(crate) fn add_block_param(&mut self, block: BlockId, ty: IrType) -> ValueId {
+        self.current_func_mut().add_block_param(block, ty)
+    }
+
+    /// Looks up the IR type of a source expression by its span.
+    pub(crate) fn expr_type(&self, span: &Span) -> IrType {
+        if let Some(ty) = self.check.expr_types.get(span) {
+            lower_type(ty, self.check)
+        } else {
+            IrType::Void
+        }
+    }
+
+    /// Looks up the source-level type of an expression by its span.
+    pub(crate) fn source_type(&self, span: &Span) -> Option<&Type> {
+        self.check.expr_types.get(span)
+    }
+
+    /// Converts a source-level [`Type`] to an [`IrType`].
+    pub(crate) fn lower_type(&self, ty: &Type) -> IrType {
+        lower_type(ty, self.check)
+    }
+}

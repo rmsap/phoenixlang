@@ -1,0 +1,16 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 5
+    v1 = alloca i64
+    store v1, v0
+    v2 = load v1
+    v3 = const_i64 3
+    v4 = iadd v2, v3
+    store v1, v4
+    v5 = load v1
+    return v5
+}

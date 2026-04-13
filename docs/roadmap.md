@@ -2,7 +2,7 @@
 
 This document outlines the path from the current tree-walk interpreter to a production-ready full-stack web language.
 
-**Current state (updated 2026-04-10):** A working tree-walk interpreter with 1,617 tests across ~42,000 LOC (8 crates). Phoenix Gen Phases 1–3 and 5 fully complete with TypeScript, Python, Go, and OpenAPI code generation, VS Code extension with full LSP (hover, autocomplete, go-to-definition, find-references, rename), watch mode, and `where` constraint validation. Phase 1 is fully complete. `#![warn(missing_docs)]` enforced on all crates. All tests pass, clippy is clean, formatting is clean, CI is green. **Next up: Phase 2 (Compilation).**
+**Current state (updated 2026-04-13):** A working tree-walk interpreter with 1,600+ tests across 45,000+ LOC (9 crates). Phoenix Gen Phases 1–3 and 5 fully complete with TypeScript, Python, Go, and OpenAPI code generation, VS Code extension with full LSP (hover, autocomplete, go-to-definition, find-references, rename), watch mode, and `where` constraint validation. Phase 1 is fully complete. Phase 2.1 (IR) is in progress — the `phoenix-ir` crate implements SSA-style IR lowering from the typed AST. `#![warn(missing_docs)]` enforced on all crates. All tests pass, clippy is clean, formatting is clean, CI is green. **Next up: Phase 2 (Compilation) — continuing with IR interpreter, then Cranelift integration.**
 
 ---
 
@@ -11,7 +11,7 @@ This document outlines the path from the current tree-walk interpreter to a prod
 | Phase | Name | Status | Description |
 |-------|------|--------|-------------|
 | [1](phases/phase-1.md) | Core Language | ✅ Complete | Variables, functions, control flow, structs, enums, generics, traits, closures, collections, error handling, and all ergonomic features |
-| [2](phases/phase-2.md) | Compilation | Next | IR design, Cranelift native compilation, runtime library (GC), WebAssembly target, JS interop, module system and visibility |
+| [2](phases/phase-2.md) | Compilation | In Progress | IR design (started), Cranelift native compilation, runtime library (GC), WebAssembly target, JS interop, module system and visibility |
 | [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, test framework, error message quality |
 | [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access, logging |
 | [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability |

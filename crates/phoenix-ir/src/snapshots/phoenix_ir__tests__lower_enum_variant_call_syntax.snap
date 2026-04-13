@@ -1,0 +1,10 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> enum.Shape {
+  bb0:
+    v0 = const_f64 3.14
+    v1 = enum_alloc @Shape:0(v0)
+    return v1
+}

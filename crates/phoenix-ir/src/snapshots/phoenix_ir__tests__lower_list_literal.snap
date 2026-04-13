@@ -1,0 +1,12 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> list<i64> {
+  bb0:
+    v0 = const_i64 1
+    v1 = const_i64 2
+    v2 = const_i64 3
+    v3 = list_alloc(v0, v1, v2)
+    return v3
+}

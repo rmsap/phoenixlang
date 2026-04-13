@@ -1,0 +1,11 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> string {
+  bb0:
+    v0 = const_string "hello"
+    v1 = const_string " world"
+    v2 = string_concat v0, v1
+    return v2
+}

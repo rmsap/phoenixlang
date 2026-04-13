@@ -1,0 +1,13 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> map<string, i64> {
+  bb0:
+    v0 = const_string "a"
+    v1 = const_i64 1
+    v2 = const_string "b"
+    v3 = const_i64 2
+    v4 = map_alloc [v0: v1, v2: v3]
+    return v4
+}

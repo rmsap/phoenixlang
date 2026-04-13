@@ -1,0 +1,11 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> bool {
+  bb0:
+    v0 = const_f64 1
+    v1 = const_f64 2
+    v2 = flt v0, v1
+    return v2
+}
