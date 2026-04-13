@@ -289,7 +289,7 @@ See **[Language Vision](docs/vision.md)** for detailed designs and code examples
 
 ## Editor Support
 
-A **VS Code extension** is included in `editors/vscode/` with full **Language Server Protocol** support via the `phoenix-lsp` binary:
+A **[VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang)** is available with full **Language Server Protocol** support via the `phoenix-lsp` binary:
 
 - **Syntax highlighting** for `.phx` files (keywords, types, strings, numbers, comments, operators, endpoint declarations, `where` constraints)
 - **Inline diagnostics** — errors and warnings as editor squiggles

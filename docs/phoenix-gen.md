@@ -12,6 +12,8 @@ curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh |
 
 Or download binaries from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases).
 
+**Editor support:** Install the [Phoenix VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang) for syntax highlighting and inline diagnostics while editing `.phx` files. See [Editor Support](../README.md#editor-support) for full details.
+
 ### 2. Write a schema
 
 ```phoenix
