@@ -263,7 +263,7 @@ fn translate_op(
 
         // Function calls
         Op::Call(..) | Op::CallIndirect(..) | Op::BuiltinCall(..) => {
-            calls::translate_call(builder, ctx, ir_module, op, result_type, state)
+            calls::translate_call(builder, ctx, ir_module, op, state)
         }
 
         // Mutable variables

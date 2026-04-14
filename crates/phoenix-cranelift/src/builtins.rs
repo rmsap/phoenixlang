@@ -44,6 +44,26 @@ pub struct RuntimeFunctions {
     pub str_ge: FuncId,
     /// `phx_alloc(size) -> ptr`.
     pub alloc: FuncId,
+    /// `phx_str_length(ptr, len) -> i64`.
+    pub str_length: FuncId,
+    /// `phx_str_contains(p1, l1, p2, l2) -> i8`.
+    pub str_contains: FuncId,
+    /// `phx_str_starts_with(p1, l1, p2, l2) -> i8`.
+    pub str_starts_with: FuncId,
+    /// `phx_str_ends_with(p1, l1, p2, l2) -> i8`.
+    pub str_ends_with: FuncId,
+    /// `phx_str_trim(ptr, len) -> (ptr, len)`.
+    pub str_trim: FuncId,
+    /// `phx_str_to_lower(ptr, len) -> (ptr, len)`.
+    pub str_to_lower: FuncId,
+    /// `phx_str_to_upper(ptr, len) -> (ptr, len)`.
+    pub str_to_upper: FuncId,
+    /// `phx_str_index_of(p1, l1, p2, l2) -> i64`.
+    pub str_index_of: FuncId,
+    /// `phx_str_replace(p1, l1, p2, l2, p3, l3) -> (ptr, len)`.
+    pub str_replace: FuncId,
+    /// `phx_str_substring(ptr, len, start, end) -> (ptr, len)`.
+    pub str_substring: FuncId,
 }
 
 impl RuntimeFunctions {
@@ -72,6 +92,36 @@ impl RuntimeFunctions {
             str_le: declare_str_cmp(module, "phx_str_le", call_conv)?,
             str_ge: declare_str_cmp(module, "phx_str_ge", call_conv)?,
             alloc: declare_func(module, "phx_alloc", &[I64], &[I64], call_conv)?,
+            str_length: declare_func(module, "phx_str_length", &[I64, I64], &[I64], call_conv)?,
+            // contains/startsWith/endsWith share the same signature as str_cmp.
+            str_contains: declare_str_cmp(module, "phx_str_contains", call_conv)?,
+            str_starts_with: declare_str_cmp(module, "phx_str_starts_with", call_conv)?,
+            str_ends_with: declare_str_cmp(module, "phx_str_ends_with", call_conv)?,
+            // trim/toLowerCase/toUpperCase: (ptr, len) -> (ptr, len).
+            str_trim: declare_str_transform(module, "phx_str_trim", call_conv)?,
+            str_to_lower: declare_str_transform(module, "phx_str_to_lower", call_conv)?,
+            str_to_upper: declare_str_transform(module, "phx_str_to_upper", call_conv)?,
+            str_index_of: declare_func(
+                module,
+                "phx_str_index_of",
+                &[I64, I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            str_replace: declare_func(
+                module,
+                "phx_str_replace",
+                &[I64, I64, I64, I64, I64, I64],
+                &[I64, I64],
+                call_conv,
+            )?,
+            str_substring: declare_func(
+                module,
+                "phx_str_substring",
+                &[I64, I64, I64, I64],
+                &[I64, I64],
+                call_conv,
+            )?,
         })
     }
 }
@@ -94,11 +144,20 @@ fn declare_func(
     Ok(module.declare_function(name, Linkage::Import, &sig)?)
 }
 
-/// Declare a string comparison runtime function (`(ptr, len, ptr, len) -> i8`).
+/// Declare a string comparison/predicate function: `(ptr, len, ptr, len) -> i8`.
 fn declare_str_cmp(
     module: &mut impl Module,
     name: &str,
     call_conv: CallConv,
 ) -> Result<FuncId, CompileError> {
     declare_func(module, name, &[I64, I64, I64, I64], &[I8], call_conv)
+}
+
+/// Declare a unary string transform: `(ptr, len) -> (ptr, len)`.
+fn declare_str_transform(
+    module: &mut impl Module,
+    name: &str,
+    call_conv: CallConv,
+) -> Result<FuncId, CompileError> {
+    declare_func(module, name, &[I64, I64], &[I64, I64], call_conv)
 }

@@ -72,3 +72,61 @@ fn closure_with_unknown_capture_type_returns_error() {
         "error should mention unknown capture type, got: {err_msg}"
     );
 }
+
+/// A `BuiltinCall("String.split", ...)` must produce a compile error because
+/// `split` returns a `List<String>` and List support is not yet implemented.
+///
+/// Construct a minimal IR module where `main` calls `String.split` on a
+/// string literal.  The Cranelift backend should return an error rather
+/// than panicking.
+#[test]
+fn unsupported_string_method_returns_error() {
+    let mut module = IrModule::new();
+
+    let main_fid = FuncId(0);
+    let mut main_fn = IrFunction::new(
+        main_fid,
+        "main".to_string(),
+        vec![],
+        vec![],
+        IrType::Void,
+        None,
+    );
+    let bb0 = main_fn.create_block();
+
+    // Emit a string constant (the receiver).
+    let s = main_fn.emit_value(
+        bb0,
+        Op::ConstString("hello world".to_string()),
+        IrType::StringRef,
+        None,
+    );
+    // Emit a string constant (the delimiter argument).
+    let delim = main_fn.emit_value(
+        bb0,
+        Op::ConstString(" ".to_string()),
+        IrType::StringRef,
+        None,
+    );
+    // Emit the unsupported builtin call.
+    main_fn.block_mut(bb0).instructions.push(Instruction {
+        result: Some(ValueId(100)),
+        result_type: IrType::Void, // placeholder — compilation should fail before using this
+        op: Op::BuiltinCall("String.split".to_string(), vec![s, delim]),
+        span: None,
+    });
+    main_fn.set_terminator(bb0, Terminator::Return(None));
+    module.functions.push(main_fn);
+    module.function_index.insert("main".to_string(), main_fid);
+
+    let result = phoenix_cranelift::compile(&module);
+    assert!(
+        result.is_err(),
+        "compile should fail for unsupported string method 'split'"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not yet supported"),
+        "error should mention unsupported method, got: {err_msg}"
+    );
+}

@@ -75,7 +75,6 @@ pub(super) fn translate_call(
     ctx: &mut CompileContext,
     ir_module: &IrModule,
     op: &Op,
-    result_type: &IrType,
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     match op {
@@ -138,9 +137,7 @@ pub(super) fn translate_call(
             let call = builder.ins().call_indirect(sig_ref, func_ptr, &cl_args);
             Ok(builder.inst_results(call).to_vec())
         }
-        Op::BuiltinCall(name, args) => {
-            translate_builtin(builder, ctx, name, args, result_type, state)
-        }
+        Op::BuiltinCall(name, args) => translate_builtin(builder, ctx, name, args, state),
         _ => unreachable!(),
     }
 }
@@ -151,7 +148,6 @@ fn translate_builtin(
     ctx: &mut CompileContext,
     name: &str,
     args: &[ValueId],
-    result_type: &IrType,
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     match name {
@@ -232,13 +228,91 @@ fn translate_builtin(
                 ))),
             }
         }
-        _ => {
-            // Method calls (e.g. "String.length") — stub for now.
-            let _ = result_type;
-            Err(CompileError::new(format!(
-                "builtin '{name}' not yet supported in compiled mode"
-            )))
+        // String methods are dispatched by a dedicated function.
+        _ if name.starts_with("String.") => translate_string_method(
+            builder,
+            ctx,
+            name.strip_prefix("String.").unwrap(),
+            args,
+            state,
+        ),
+        _ => Err(CompileError::new(format!(
+            "builtin '{name}' not yet supported in compiled mode"
+        ))),
+    }
+}
+
+/// Translate a `String.*` builtin method call.
+///
+/// Each method receives the string as `args[0]` (a fat `(ptr, len)` pair)
+/// plus any additional arguments.  Methods are grouped by calling pattern
+/// to reduce repetition.
+fn translate_string_method(
+    builder: &mut FunctionBuilder,
+    ctx: &mut CompileContext,
+    method: &str,
+    args: &[ValueId],
+    state: &FuncState,
+) -> Result<Vec<Value>, CompileError> {
+    let recv = get_val(state, args[0])?;
+
+    match method {
+        // Receiver-only methods: (ptr, len) -> result.
+        "length" | "trim" | "toLowerCase" | "toUpperCase" => {
+            let func = match method {
+                "length" => ctx.runtime.str_length,
+                "trim" => ctx.runtime.str_trim,
+                "toLowerCase" => ctx.runtime.str_to_lower,
+                "toUpperCase" => ctx.runtime.str_to_upper,
+                _ => unreachable!(),
+            };
+            Ok(call_runtime(builder, ctx, func, &[recv[0], recv[1]]))
         }
+        // Receiver + one string argument: (p1, l1, p2, l2) -> result.
+        "contains" | "startsWith" | "endsWith" | "indexOf" => {
+            let arg = get_val(state, args[1])?;
+            let func = match method {
+                "contains" => ctx.runtime.str_contains,
+                "startsWith" => ctx.runtime.str_starts_with,
+                "endsWith" => ctx.runtime.str_ends_with,
+                "indexOf" => ctx.runtime.str_index_of,
+                _ => unreachable!(),
+            };
+            Ok(call_runtime(
+                builder,
+                ctx,
+                func,
+                &[recv[0], recv[1], arg[0], arg[1]],
+            ))
+        }
+        // replace(old, new): two string arguments.
+        "replace" => {
+            let from = get_val(state, args[1])?;
+            let to = get_val(state, args[2])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.str_replace,
+                &[recv[0], recv[1], from[0], from[1], to[0], to[1]],
+            ))
+        }
+        // substring(start, end): two scalar arguments.
+        "substring" => {
+            let start = get_val1(state, args[1])?;
+            let end = get_val1(state, args[2])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.str_substring,
+                &[recv[0], recv[1], start, end],
+            ))
+        }
+        // `split` returns a List<String>, which requires List support in the
+        // compiled backend (not yet implemented).  Other unknown methods also
+        // fall through here.
+        _ => Err(CompileError::new(format!(
+            "string method '{method}' not yet supported in compiled mode"
+        ))),
     }
 }
 

@@ -39,7 +39,7 @@ Phoenix is in **active development**, written in **Rust** with **1,700+ tests** 
 - **`where` constraints** on struct fields for validation (`String name where self.length > 0`, `Int age where self >= 0`)
 - **CI pipeline** with `cargo fmt`, `clippy`, and `cargo test`
 
-**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering complete, Cranelift native compilation working for value types, strings, structs, enums, closures, and function calls; Lists/Maps and builtin methods not yet supported in compiled mode — use `phoenix run` for full coverage; WebAssembly target next).
+**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering complete, Cranelift native compilation working for value types, strings, structs, enums, closures, function calls, and string methods (all except `split`, which returns a `List` and depends on List support); Lists/Maps not yet supported in compiled mode — use `phoenix run` for full coverage; WebAssembly target next).
 
 ---
 

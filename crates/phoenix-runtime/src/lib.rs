@@ -10,6 +10,8 @@
 //! long-running processes.
 #![warn(missing_docs)]
 
+mod string_methods;
+
 use std::io::Write;
 use std::process;
 use std::slice;
@@ -90,7 +92,7 @@ fn format_panic_message(bytes: &[u8]) -> String {
 ///
 /// # Safety
 ///
-/// Both `(p1, l1)` and `(p2, l2)` must be valid byte slices.
+/// Both `(p1, l1)` and `(p2, l2)` must be valid UTF-8 byte slices.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_concat(
     p1: *const u8,
@@ -215,7 +217,7 @@ fn format_f64(val: f64) -> String {
 /// The string's backing memory is deliberately not freed — a GC will
 /// reclaim it in Phase 2.3.  Until then, every call to this function
 /// leaks `s.len()` bytes.
-fn leak_string(s: String) -> PhxFatPtr {
+pub(crate) fn leak_string(s: String) -> PhxFatPtr {
     let len = s.len();
     let ptr = s.as_ptr();
     std::mem::forget(s);
