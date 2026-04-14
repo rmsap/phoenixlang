@@ -348,3 +348,106 @@ The result: a Phoenix web server has production-grade observability **out of the
 
 - **Complexity:** High — requires trace context propagation through the async runtime, span recording with low overhead, OpenTelemetry export, metrics aggregation, and configuration. The structured concurrency model makes context propagation straightforward (it follows the task tree), but the export and configuration layers are substantial.
 - **Depends on:** Async runtime (4.3), Structured concurrency (4.3), HTTP (4.4), Database access (4.7)
+
+## 5.8 Frontend Framework
+
+Phoenix's vision is "one language from client to database." The reactive primitives in 5.3 (signals, derived, effects) and the typed endpoints in 5.4 provide the foundation. This section defines the full frontend framework that ties them together into a production-ready UI development experience.
+
+### Delivery strategy: JS interop first, native framework second
+
+The framework is delivered in two stages:
+
+1. **Stage 1 (JS interop bridge):** Ship after Phase 2.5 (JS interop). Developers use Phoenix for typed API calls, business logic, and state management while rendering with React, Svelte, or Vue via `extern js`. This makes Phoenix immediately usable for frontend work without waiting for a custom framework to mature.
+
+2. **Stage 2 (native components):** Ship as part of Phase 5. Phoenix provides its own component model compiled directly to WASM. Components use the signal runtime (5.3) for fine-grained reactivity and manipulate the DOM through targeted mutations — no virtual DOM, no JavaScript runtime overhead. JS interop (2.5) remains available as a fallback for npm libraries that the native framework doesn't cover.
+
+### Component model
+
+Components are declared with the `component` keyword. They contain reactive state (signals), lifecycle logic (effects), and a `render()` method that returns `Html`.
+
+```phoenix
+component TodoApp {
+  let items = signal(List<String>([]))
+  let input = signal("")
+
+  let count = derived(function() -> Int {
+    items.get().length()
+  })
+
+  function addItem() {
+    if input.get().length() > 0 {
+      items.set(items.get().push(input.get()))
+      input.set("")
+    }
+  }
+
+  function render() -> Html {
+    <div>
+      <h1>"Todos ({count.get()})"</h1>
+      <input value={input.get()} onInput={function(e: Event) { input.set(e.value) }} />
+      <button onClick={function() { addItem() }}>"Add"</button>
+      <ul>
+        {items.get().map(function(item: String) -> Html {
+          <li>{item}</li>
+        })}
+      </ul>
+    </div>
+  }
+}
+```
+
+### Routing
+
+Client-side routing maps URL paths to components. The router integrates with typed endpoints (5.4) so that route parameters are type-checked.
+
+```phoenix
+router frontend {
+  "/"                -> HomePage
+  "/users/{id: Int}" -> UserProfile
+  "/settings"        -> Settings
+}
+
+component UserProfile {
+  // `id` is extracted from the URL and type-checked at compile time
+  let id: Int = route.param("id")
+  let user = signal(None: Option<User>)
+
+  effect(async function() {
+    let result = await getUser.call(id)  // typed endpoint call
+    match result {
+      Ok(u) -> user.set(Some(u))
+      Err(_) -> ()
+    }
+  })
+
+  function render() -> Html {
+    match user.get() {
+      Some(u) -> <div><h1>{u.name}</h1><p>{u.email}</p></div>
+      None -> <p>"Loading..."</p>
+    }
+  }
+}
+```
+
+### Scope
+
+The full frontend framework includes:
+
+- **Component declarations** with signal-based state, derived values, effects, and `render()`
+- **JSX-like templates** parsed by the Phoenix compiler — `<div>`, `<p>`, `{expression}` — compiled to direct DOM manipulation calls
+- **Client-side routing** with typed path parameters, integrated with the backend router and typed endpoints
+- **CSS scoping** — component styles are automatically scoped to prevent leakage (similar to Svelte's approach)
+- **SSR (server-side rendering)** — components can render to HTML strings on the backend for initial page load, then hydrate on the client
+- **JS interop escape hatch** — `extern js` remains available for npm packages, third-party component libraries, and browser APIs not yet covered by the Phoenix standard library
+
+### Why a native framework instead of just wrapping React
+
+| Approach | Type safety | Performance | DX | Ecosystem |
+|----------|------------|-------------|-----|-----------|
+| React via JS interop | Partial — types stop at the WASM↔JS boundary | WASM↔JS marshalling overhead on every render | Two languages, two mental models | Full npm |
+| Phoenix native framework | End-to-end — compiler checks from DB query to DOM node | Direct WASM→DOM, no JS runtime | One language everywhere | Growing; JS interop as fallback |
+
+The core value proposition of Phoenix is compile-time safety across the entire stack. If the frontend layer is React, that chain is broken at the JS boundary. The native framework is what makes "one language from client to database" real rather than aspirational.
+
+- **Complexity:** Very high — requires a JSX-like template parser, a WASM DOM binding layer, a component lifecycle model, a client-side router, CSS scoping, and SSR with hydration. Each of these is a significant subsystem. However, the signal runtime (5.3) and typed endpoints (5.4) handle the hardest conceptual pieces (reactivity and type-safe client-server communication); the framework is primarily the glue that connects them to the DOM.
+- **Depends on:** WASM target (2.4), JS interop (2.5), First-class reactivity (5.3), Typed endpoints (5.4), Module system (2.6), Built-in serialization (5.1)

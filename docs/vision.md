@@ -136,6 +136,68 @@ component Counter {
 - **No hidden magic**: reads are `signal.get()`, writes are `signal.set(value)` — no assignment operator overloading
 - **Works with WASM**: reactive components compile to WebAssembly for high-performance frontend rendering
 
+## Frontend Strategy
+
+Phoenix aims to be a **single-language full-stack** web language where compile-time type safety flows from database to DOM. That vision requires a frontend framework — but building one from scratch before the compiler is mature would be premature. The strategy is **JS interop first, native framework second**.
+
+### Stage 1: JavaScript Interop (Phase 2.5)
+
+Phoenix compiles to WebAssembly and calls into the JavaScript ecosystem via `extern js` declarations and npm imports. Developers use **existing frameworks** (React, Svelte, Vue) for the UI layer and write business logic, state management, and backend code in Phoenix. This delivers immediate value: Phoenix's type safety for data and API calls, the JS ecosystem for UI.
+
+```phoenix
+// Use React from Phoenix via JS interop
+extern js {
+  function createElement(tag: String, props: Map<String, String>) -> JsValue
+  function render(element: JsValue, root: JsValue)
+}
+
+import js "react" { function useState(init: Int) -> (Int, (Int) -> Void) }
+
+// Phoenix logic, rendered by React
+async function loadUser(id: Int) -> Result<User, ApiError> {
+  await getUser.call(id)  // typed endpoint — compiler checks both sides
+}
+```
+
+### Stage 2: Phoenix-Native Components (Phase 5.3 + 5.8)
+
+Once WASM compilation, the module system, and the signal runtime are stable, Phoenix ships its own **component model** with fine-grained reactivity — no virtual DOM, no JavaScript runtime overhead. Components compile directly to WASM and manipulate the DOM through targeted mutations.
+
+```phoenix
+component UserProfile {
+  let user = signal(None: Option<User>)
+  let loading = signal(true)
+
+  effect(async function() {
+    let result = await getUser.call(currentUserId())
+    match result {
+      Ok(u) -> user.set(Some(u))
+      Err(_) -> ()
+    }
+    loading.set(false)
+  })
+
+  function render() -> Html {
+    if loading.get() {
+      return <p>"Loading..."</p>
+    }
+    match user.get() {
+      Some(u) -> <div>
+        <h1>{u.name}</h1>
+        <p>{u.email}</p>
+      </div>
+      None -> <p>"User not found"</p>
+    }
+  }
+}
+```
+
+### Why both stages
+
+- **Stage 1 makes Phoenix usable for frontend today** — developers don't wait years for a framework to mature. They write Phoenix where it's strongest (typed APIs, business logic, backend) and use proven UI tools for the rest.
+- **Stage 2 delivers the differentiating promise** — one language, one type system, compile-time safety from database query to DOM node. No marshalling, no FFI overhead, no contract drift between "the Phoenix part" and "the React part."
+- **Stage 1 is the fallback for Stage 2** — JS interop remains available after the native framework ships. Developers can use React component libraries, charting packages, or any npm module alongside Phoenix components. The native framework doesn't have to cover every use case on day one.
+
 ## Typed Endpoints
 
 Phoenix treats **API endpoints as a language-level concept**. You define an endpoint once — the compiler generates the server handler, the client call function, and all serialization code. The types are checked at compile time across both sides, so the client and server can never drift out of sync.

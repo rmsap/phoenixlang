@@ -14,7 +14,7 @@ This document outlines the path from the current implementation to a production-
 | [2](phases/phase-2.md) | Compilation | In Progress | IR (complete), Cranelift native compilation (in progress), runtime library (GC), WebAssembly target, JS interop, module system and visibility |
 | [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, test framework, error message quality |
 | [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access, logging |
-| [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability |
+| [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability, frontend framework |
 | [6](phases/phase-6.md) | Ecosystem & Adoption | Planned | Documentation site, package registry, starter templates, community, 1.0 release |
 
 See also: [Known Issues & Design Decisions](known-issues.md) | [Phoenix Gen](phoenix-gen.md) (parallel track)
@@ -52,7 +52,7 @@ CI pipeline, type registries exposed, and expression types annotated.
 
 **M5 — "Differentiated"** (Phase 5)
 
-> Built-in serialization, refinement types, reactivity, typed endpoints, auto-generated API docs (OpenAPI from typed endpoints), and built-in observability (automatic tracing from structured concurrency). Phoenix does something no other language does.
+> Built-in serialization, refinement types, reactivity, typed endpoints, auto-generated API docs (OpenAPI from typed endpoints), built-in observability (automatic tracing from structured concurrency), and a native frontend framework (components, routing, SSR). Phoenix does something no other language does.
 
 **M6 — "Ecosystem"** (Phase 6)
 
@@ -95,5 +95,6 @@ CI pipeline, type registries exposed, and expression types annotated.
 | 57 | Auto-generated API documentation (OpenAPI) | Typed endpoints, serialization | Small | |
 | 58 | Built-in observability (structured tracing, metrics) | Async runtime, structured concurrency, HTTP | High | |
 | 59 | Compile-time evaluation (`comptime`) | Compilation | Very High | |
-| 60 | Documentation site | All of the above | Medium | |
-| 61 | Package registry | Package manager | Medium | |
+| 60 | Frontend framework (native components, routing, SSR) | WASM, JS interop, reactivity, typed endpoints | Very High | |
+| 61 | Documentation site | All of the above | Medium | |
+| 62 | Package registry | Package manager | Medium | |
