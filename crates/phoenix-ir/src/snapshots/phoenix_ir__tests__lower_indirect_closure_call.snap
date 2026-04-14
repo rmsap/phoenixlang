@@ -16,8 +16,8 @@ func @main() -> i64 {
     return v2
 }
 
-func @__closure_0(n: void) -> i64 {
-  bb0(v0: void):
+func @__closure_0(n: i64) -> i64 {
+  bb0(v0: i64):
     v1 = const_i64 2
     v2 = imul v0, v1
     return v2

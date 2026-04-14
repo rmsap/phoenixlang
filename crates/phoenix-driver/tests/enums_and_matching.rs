@@ -232,8 +232,6 @@ function main() {
     );
 }
 
-// ── Second audit regression tests ───────────────────────────────────────
-
 #[test]
 fn enum_variant_equality_same_type() {
     // Enum variants of the same type with same data should be equal
@@ -1153,8 +1151,6 @@ function main() {
         &["other"],
     );
 }
-
-// --- Match arm implicit vs explicit return regression tests ---
 
 /// A match arm block with an unexecuted `return` and an implicit return
 /// value must use the implicit value as the match result, NOT propagate

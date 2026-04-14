@@ -765,8 +765,6 @@ function main() {
     );
 }
 
-// ── Bug fix: escaped braces in non-interpolated strings ────────────
-
 /// Escaped braces `{{` and `}}` in a string without interpolation should
 /// produce literal `{` and `}` characters.
 #[test]
@@ -822,8 +820,6 @@ function main() {
         &["value: 42 and {literal}"],
     );
 }
-
-// --- index_of character index regression tests ---
 
 /// `index_of` must return a character index, not a byte offset.
 /// For ASCII strings both are the same, but for multi-byte UTF-8 they differ.

@@ -941,11 +941,7 @@ function main() {
     );
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// Audit-discovered bugs — regression tests
-// ══════════════════════════════════════════════════════════════════════
-
-/// Bug 1: `?` operator must reject non-Result/Option return types even
+/// `?` operator must reject non-Result/Option return types even
 /// when the return type contains type variables (e.g. `List<T>`).
 #[test]
 fn try_operator_rejects_list_return_type() {

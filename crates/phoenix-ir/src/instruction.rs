@@ -163,7 +163,8 @@ pub enum Op {
     /// Extract the discriminant (variant index) from an enum value.
     EnumDiscriminant(ValueId),
     /// Extract a field from an enum variant (after confirming the variant).
-    EnumGetField(ValueId, u32),
+    /// `EnumGetField(enum_value, variant_index, field_index)`.
+    EnumGetField(ValueId, u32, u32),
 
     // --- Collection operations ---
     /// Allocate a list on the GC heap from initial elements.

@@ -119,7 +119,7 @@ impl<'a> LoweringContext<'a> {
                         for (j, binding_name) in vp.bindings.iter().enumerate() {
                             let field_type = field_types.get(j).cloned().unwrap_or(IrType::Void);
                             let field_val = self.emit(
-                                Op::EnumGetField(subject, j as u32),
+                                Op::EnumGetField(subject, var_idx as u32, j as u32),
                                 field_type.clone(),
                                 ctx.span,
                             );

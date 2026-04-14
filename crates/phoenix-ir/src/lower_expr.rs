@@ -526,8 +526,23 @@ impl<'a> LoweringContext<'a> {
             .collect();
 
         // Add the actual lambda parameters.
-        for p in &lambda.params {
-            let ty = self.expr_type(&p.span);
+        // Extract user param types from the ClosureRef type if available,
+        // falling back to expr_type lookup for each parameter.
+        let user_param_types: Vec<IrType> = match &result_type {
+            IrType::ClosureRef {
+                param_types: pt, ..
+            } => pt.clone(),
+            _ => lambda
+                .params
+                .iter()
+                .map(|p| self.expr_type(&p.span))
+                .collect(),
+        };
+        for (i, p) in lambda.params.iter().enumerate() {
+            let ty = user_param_types
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.expr_type(&p.span));
             param_types.push(ty);
             param_names.push(p.name.clone());
         }
@@ -701,7 +716,11 @@ impl<'a> LoweringContext<'a> {
 
         // Unwrap path: extract the inner value.
         self.switch_to_block(unwrap_block);
-        let unwrapped = self.emit(Op::EnumGetField(operand, 0), unwrap_type, span);
+        let unwrapped = self.emit(
+            Op::EnumGetField(operand, ok_index as u32, 0),
+            unwrap_type,
+            span,
+        );
 
         // Early return path: return the error/none value.
         let continue_block = self.create_block();

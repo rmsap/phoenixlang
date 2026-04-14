@@ -1,12 +1,12 @@
 # Phase 2: Compilation
 
-**Status: In progress (2.1 started)**
+**Status: In progress (2.2 started)**
 
 Move from interpretation to native code generation. This is what makes Phoenix a real language rather than a scripting tool.
 
 ## 2.1 Intermediate Representation (IR)
 
-**Status: In progress.** The `phoenix-ir` crate implements an SSA-style IR with basic blocks, typed instructions, and explicit control flow. The lowering pass converts the type-checked AST into IR for all major language features (arithmetic, control flow, structs, enums, match, closures, method calls, collections, try operator, string interpolation). Use `phoenix ir <file.phx>` to inspect the output. The `phoenix-ir-interp` crate provides an IR interpreter for round-trip verification — use `phoenix run-ir <file.phx>` to execute via the IR and compare output with `phoenix run`. Round-trip tests cover all lowered features including the try operator; see `crates/phoenix-ir-interp/tests/` for the full suite. Next step: Cranelift integration.
+**Status: Complete.** The `phoenix-ir` crate implements an SSA-style IR with basic blocks, typed instructions, and explicit control flow. The lowering pass converts the type-checked AST into IR for all major language features (arithmetic, control flow, structs, enums, match, closures, method calls, collections, try operator, string interpolation). Use `phoenix ir <file.phx>` to inspect the output. The `phoenix-ir-interp` crate provides an IR interpreter for round-trip verification — use `phoenix run-ir <file.phx>` to execute via the IR and compare output with `phoenix run`. Round-trip tests cover all lowered features including the try operator; see `crates/phoenix-ir-interp/tests/` for the full suite.
 
 - Lower the type-checked AST to a flat, SSA-style IR
 - Basic blocks, typed instructions, explicit control flow
@@ -15,19 +15,24 @@ Move from interpretation to native code generation. This is what makes Phoenix a
 
 ## 2.2 Native Compilation (Cranelift)
 
+**Status: In progress.** The `phoenix-cranelift` crate translates Phoenix IR to Cranelift IR and produces native executables via `cranelift-object` + system linker. The `phoenix-runtime` crate provides a small static library linked into every compiled binary (print, toString, string comparison and concatenation, heap allocation, panic handler). Use `phoenix build <file.phx>` to compile. Value types (Int, Float, Bool), strings, structs (including String fields), enums (including String variant fields), pattern matching, closures (including String captures), and direct/indirect function calls all work. Lists, Maps, and most builtin methods are not yet supported in compiled mode — use `phoenix run-ir` for full feature coverage. All memory is currently leaked (no GC); compiled binaries are not suitable for long-running processes. Next step: builtin method support, then collections.
+
 - Translate Phoenix IR to Cranelift IR
 - Produce native executables via `cranelift-object` + system linker
 - Start with debug builds only (no optimization)
 - Keep the interpreter available as a fast-feedback mode (`phoenix run` = interpret, `phoenix build` = compile)
 - **Why Cranelift over LLVM:** pure Rust dependency, fast compile times, built-in WASM support. Add LLVM as an optional optimizing backend later.
 
-## 2.3 Runtime Library
+## 2.3 Runtime Library (expand)
 
-- A small Rust library linked into every compiled Phoenix binary
+A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix-runtime/) crate (static library linked into compiled binaries). It currently provides `print` (all value types + strings), `toString`, string comparison and concatenation, heap allocation (`phx_alloc` via `malloc`, no GC), and panic/abort. This section covers extending it into a full runtime.
+
 - Garbage collector (tracing GC or reference-counted — TBD during compiler development)
-- String implementation (UTF-8, immutable by default)
-- Panic/abort handler
-- Built-in function implementations (`print`, `toString`)
+- String implementation (UTF-8, immutable by default) — basic ops already in `phoenix-runtime`
+- Panic/abort handler — already in `phoenix-runtime`
+- Built-in function implementations (`print`, `toString`) — already in `phoenix-runtime`
+- Collection runtime support (List, Map data structures with dynamic resizing)
+- Builtin method implementations (String.*, List.*, Map.*, Option.*, Result.*)
 
 ## 2.4 WebAssembly Target
 

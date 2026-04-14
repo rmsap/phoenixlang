@@ -158,7 +158,9 @@ impl fmt::Display for Op {
                 Ok(())
             }
             Op::EnumDiscriminant(v) => write!(f, "enum_discriminant {v}"),
-            Op::EnumGetField(v, idx) => write!(f, "enum_get_field {v}, {idx}"),
+            Op::EnumGetField(v, variant, idx) => {
+                write!(f, "enum_get_field {v}, variant={variant}, {idx}")
+            }
 
             // Collection ops
             Op::ListAlloc(elems) => {

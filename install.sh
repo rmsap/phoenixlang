@@ -46,10 +46,23 @@ cp "$TMP/phoenix" "$INSTALL_DIR/phoenix"
 cp "$TMP/phoenix-lsp" "$INSTALL_DIR/phoenix-lsp"
 chmod +x "$INSTALL_DIR/phoenix" "$INSTALL_DIR/phoenix-lsp"
 
+# Install runtime library (needed by `phoenix build`)
+LIB_DIR="$(dirname "$INSTALL_DIR")/lib"
+mkdir -p "$LIB_DIR"
+if [ -f "$TMP/lib/libphoenix_runtime.a" ]; then
+    cp "$TMP/lib/libphoenix_runtime.a" "$LIB_DIR/libphoenix_runtime.a"
+    RUNTIME_INSTALLED=true
+fi
+
 # Clean up
 rm -rf "$TMP"
 
 echo "Installed phoenix and phoenix-lsp to $INSTALL_DIR"
+if [ "$RUNTIME_INSTALLED" = true ]; then
+    echo "Installed libphoenix_runtime.a to $LIB_DIR"
+else
+    echo "Warning: libphoenix_runtime.a not found in release archive (phoenix build will not work)"
+fi
 echo ""
 echo "Make sure $INSTALL_DIR is in your PATH, then run:"
 echo "  phoenix --version"

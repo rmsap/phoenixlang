@@ -59,9 +59,10 @@ jobs:
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          mkdir -p dist
+          mkdir -p dist dist/lib
           cp target/${{ matrix.target }}/release/phoenix dist/
           cp target/${{ matrix.target }}/release/phoenix-lsp dist/
+          cp target/${{ matrix.target }}/release/libphoenix_runtime.a dist/lib/
           tar czf phoenix-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
 
       - name: Package (Windows)
@@ -69,8 +70,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
+          New-Item -ItemType Directory -Force -Path dist/lib
           Copy-Item target/${{ matrix.target }}/release/phoenix.exe dist/
           Copy-Item target/${{ matrix.target }}/release/phoenix-lsp.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/phoenix_runtime.lib dist/lib/
           Compress-Archive -Path dist/* -DestinationPath phoenix-${{ github.ref_name }}-${{ matrix.target }}.zip
 
       - name: Upload artifact

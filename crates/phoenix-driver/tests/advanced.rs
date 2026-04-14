@@ -99,8 +99,6 @@ function main() {
     );
 }
 
-// ── Tier A: Bug fix tests ────────────────────────────────────────────────
-
 #[test]
 fn substring_negative_start_index() {
     expect_runtime_error(

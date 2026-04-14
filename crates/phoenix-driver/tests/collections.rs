@@ -1173,7 +1173,7 @@ function main() {
     );
 }
 
-/// Bug 4: `take()` should error on negative argument (not silently clamp).
+/// `take()` should error on negative argument (not silently clamp).
 #[test]
 fn list_take_negative_error() {
     expect_runtime_error(
@@ -1187,7 +1187,7 @@ function main() {
     );
 }
 
-/// Bug 4: `drop()` should error on negative argument (not silently clamp).
+/// `drop()` should error on negative argument (not silently clamp).
 #[test]
 fn list_drop_negative_error() {
     expect_runtime_error(

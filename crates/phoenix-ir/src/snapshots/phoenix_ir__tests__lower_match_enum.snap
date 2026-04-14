@@ -13,11 +13,11 @@ func @main() -> f64 {
   bb1(v2: f64):
     return v2
   bb2:
-    v6 = enum_get_field v1, 0
+    v6 = enum_get_field v1, variant=0, 0
     jump bb1(v6)
   bb3:
-    v9 = enum_get_field v1, 0
-    v10 = enum_get_field v1, 1
+    v9 = enum_get_field v1, variant=1, 0
+    v10 = enum_get_field v1, variant=1, 1
     v11 = fadd v9, v10
     jump bb1(v11)
   bb4:

@@ -120,8 +120,6 @@ function main() {
     );
 }
 
-// --- Bug fix integration tests ---
-
 /// Float division by zero returns a clean runtime error.
 #[test]
 fn float_division_by_zero() {
@@ -252,8 +250,6 @@ function main() {
     );
     assert!(result.unwrap_err().to_string().contains("integer overflow"));
 }
-
-// ── Audit bug fix regression tests ──────────────────────────────────────
 
 #[test]
 fn short_circuit_and_does_not_evaluate_right() {

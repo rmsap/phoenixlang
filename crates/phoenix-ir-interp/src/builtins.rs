@@ -711,8 +711,6 @@ mod tests {
         }
     }
 
-    // ── BUG-2 regression: non-Bool callback returns must error ──────
-
     #[test]
     fn expect_bool_rejects_non_bool() {
         let result = expect_bool(&IrValue::Int(42), "filter");
@@ -744,8 +742,6 @@ mod tests {
         assert!(!expect_bool(&IrValue::Bool(false), "all").unwrap());
         let _ = interp; // suppress unused warning
     }
-
-    // ── BUG-3 regression: print/toString arity validation ───────────
 
     #[test]
     fn print_rejects_zero_args() {

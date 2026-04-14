@@ -16,7 +16,7 @@
 //!                                       ↓
 //!                                   IrModule
 //!                                       ↓
-//!                              Cranelift / WASM backend (future)
+//!                              Cranelift backend (phoenix-cranelift) / WASM (future)
 //! ```
 #![warn(missing_docs)]
 

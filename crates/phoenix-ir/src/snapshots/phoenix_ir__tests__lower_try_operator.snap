@@ -17,7 +17,7 @@ func @main() -> enum.Result {
     v3 = ieq v1, v2
     branch v3, bb1, bb2
   bb1:
-    v4 = enum_get_field v0, 0
+    v4 = enum_get_field v0, variant=0, 0
     jump bb3
   bb2:
     return v0

@@ -1368,7 +1368,7 @@ function main() {
 
 #[test]
 fn method_arg_type_compat_with_generics_regression() {
-    // Regression test: method argument checking should use types_compatible()
+    // Method argument checking should use types_compatible()
     // not strict equality, so type variables work correctly
     assert_no_errors(
         r#"

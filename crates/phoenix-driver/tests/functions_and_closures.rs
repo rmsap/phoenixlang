@@ -1296,11 +1296,7 @@ function main() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Bug regression tests
-// ---------------------------------------------------------------------------
-
-/// Regression: free-variable analysis must capture variables used as named args.
+/// Free-variable analysis must capture variables used as named args.
 #[test]
 fn free_vars_captures_named_args() {
     run_expect(

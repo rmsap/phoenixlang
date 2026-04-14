@@ -19,6 +19,7 @@ phoenix-interp = { path = "../phoenix-interp" }
 phoenix-ir = { path = "../phoenix-ir" }
 phoenix-ir-interp = { path = "../phoenix-ir-interp" }
 phoenix-codegen = { path = "../phoenix-codegen" }
+phoenix-cranelift = { path = "../phoenix-cranelift" }
 clap = { workspace = true }
 notify = { workspace = true }
 serde = { workspace = true }

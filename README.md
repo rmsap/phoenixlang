@@ -11,7 +11,7 @@ When searching online, use **phoenixlang** to distinguish this project from the 
 
 ## Current Status
 
-Phoenix is in **active development**. The current implementation is a **tree-walk interpreter** written in **Rust** with **1,600+ tests** across **9 crates** with the following features:
+Phoenix is in **active development**, written in **Rust** with **1,700+ tests** across **12 crates**. Phoenix programs can be executed via a tree-walk interpreter (`phoenix run`) or compiled to native binaries via Cranelift (`phoenix build`). Current language features:
 
 - Variables (`let` and `let mut`) with explicit types or type inference, **compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`)
 - Functions with typed parameters, return types, **named/default parameters**
@@ -39,7 +39,7 @@ Phoenix is in **active development**. The current implementation is a **tree-wal
 - **`where` constraints** on struct fields for validation (`String name where self.length > 0`, `Int age where self >= 0`)
 - **CI pipeline** with `cargo fmt`, `clippy`, and `cargo test`
 
-**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering started, Cranelift native compilation next, then WebAssembly target).
+**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering complete, Cranelift native compilation working for value types, strings, structs, enums, closures, and function calls; Lists/Maps and builtin methods not yet supported in compiled mode — use `phoenix run` for full coverage; WebAssembly target next).
 
 ---
 
@@ -85,7 +85,11 @@ phoenix lex file.phx     # Tokenize and print the token stream
 phoenix parse file.phx    # Parse and dump the AST as JSON
 phoenix check file.phx    # Type-check without running
 phoenix ir file.phx       # Dump the SSA-style intermediate representation
-phoenix run file.phx      # Execute the program
+phoenix run file.phx      # Execute via the tree-walk interpreter
+phoenix run-ir file.phx   # Execute via the IR interpreter (round-trip verification)
+phoenix build file.phx    # Compile to a native executable via Cranelift
+phoenix build file.phx -o out  # Compile with a custom output name
+# Note: `phoenix build` requires a C compiler (gcc or clang) for linking.
 phoenix gen file.phx                      # Generate TypeScript (types, client, handlers, server)
 phoenix gen file.phx --target python      # Generate Python (Pydantic, FastAPI, httpx)
 phoenix gen file.phx --target go          # Generate Go (structs, net/http, client)
@@ -316,6 +320,9 @@ Phoenix is implemented in Rust as a Cargo workspace:
 | `phoenix-sema` | Semantic analysis (name resolution and type checking) |
 | `phoenix-interp` | Tree-walk interpreter |
 | `phoenix-ir` | SSA-style intermediate representation and AST-to-IR lowering |
+| `phoenix-ir-interp` | IR interpreter for round-trip verification |
+| `phoenix-cranelift` | Cranelift-based native code generation |
+| `phoenix-runtime` | Runtime library linked into compiled Phoenix binaries |
 | `phoenix-codegen` | Code generation backends (TypeScript, Python, Go, OpenAPI) |
 | `phoenix-lsp` | Language Server Protocol server |
 | `phoenix-driver` | CLI binary |

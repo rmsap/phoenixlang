@@ -1712,8 +1712,6 @@ mod tests {
         ).unwrap();
     }
 
-    // --- Bug fix validation tests ---
-
     /// Float division by zero returns a runtime error.
     #[test]
     fn run_float_division_by_zero() {

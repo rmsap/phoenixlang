@@ -342,11 +342,22 @@ impl<'m> IrInterpreter<'m> {
                     _ => error(format!("EnumDiscriminant on non-enum value: {val}")),
                 }
             }
-            Op::EnumGetField(vid, idx) => {
+            Op::EnumGetField(vid, variant_idx, idx) => {
                 let val = frame.get(*vid)?;
                 match val {
                     IrValue::EnumVariant(data) => {
                         let data = data.borrow();
+                        // Validate that the IR's variant_idx matches the
+                        // runtime discriminant.  A mismatch indicates a bug
+                        // in the IR lowering (e.g. extracting a field from
+                        // the wrong variant).
+                        debug_assert_eq!(
+                            data.discriminant, *variant_idx,
+                            "EnumGetField variant_idx ({}) does not match runtime \
+                             discriminant ({}) — IR lowering may have emitted the \
+                             wrong variant index",
+                            variant_idx, data.discriminant,
+                        );
                         data.fields
                             .get(*idx as usize)
                             .cloned()

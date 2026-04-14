@@ -613,8 +613,6 @@ fn lower_string_concat() {
     insta::assert_snapshot!(ir);
 }
 
-// ── Lambda with captures (BUG-1 regression) ─────────────────────────
-
 #[test]
 fn lower_lambda_with_captures() {
     let ir = lower_to_string(
@@ -631,8 +629,6 @@ fn lower_lambda_with_captures() {
     );
     insta::assert_snapshot!(ir);
 }
-
-// ── Match with string literal (BUG-2 regression) ────────────────────
 
 #[test]
 fn lower_match_string_literal() {

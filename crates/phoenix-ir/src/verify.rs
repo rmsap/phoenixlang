@@ -243,7 +243,7 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
 
         // Enum ops.
         Op::EnumAlloc(_, _, vals) => vals.clone(),
-        Op::EnumGetField(v, _) => vec![*v],
+        Op::EnumGetField(v, _, _) => vec![*v],
 
         // Collection ops.
         Op::ListAlloc(vals) => vals.clone(),

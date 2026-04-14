@@ -1,22 +1,24 @@
 //! The Phoenix CLI driver.
 //!
-//! This binary wires together the lexer, parser, semantic checker, and
-//! tree-walk interpreter to provide a unified command-line interface for
-//! working with Phoenix source files.
+//! This binary wires together the lexer, parser, semantic checker,
+//! interpreter, IR pipeline, and Cranelift backend to provide a unified
+//! command-line interface for working with Phoenix source files.
 //!
 //! # Subcommands
 //!
 //! | Command | Description |
 //! |---------|-------------|
-//! | `lex`   | Tokenize a source file and print the token stream |
-//! | `parse` | Parse a source file and dump the AST as JSON |
-//! | `check` | Type-check a source file and report errors |
-//! | `run`   | Execute a Phoenix program via the tree-walk interpreter |
-//! | `gen`   | Generate typed code or OpenAPI specs from a Phoenix schema file (supports `--watch`) |
-//! | `ir`    | Dump the SSA-style IR for a Phoenix source file |
+//! | `lex`    | Tokenize a source file and print the token stream |
+//! | `parse`  | Parse a source file and dump the AST as JSON |
+//! | `check`  | Type-check a source file and report errors |
+//! | `run`    | Execute a Phoenix program via the tree-walk interpreter |
+//! | `build`  | Compile a Phoenix program to a native executable via Cranelift |
+//! | `gen`    | Generate typed code or OpenAPI specs from a Phoenix schema file (supports `--watch`) |
+//! | `ir`     | Dump the SSA-style IR for a Phoenix source file |
 //! | `run-ir` | Run a Phoenix program via the IR interpreter |
 #![warn(missing_docs)]
 
+mod build;
 mod config;
 
 use clap::{Parser, Subcommand};
@@ -73,6 +75,14 @@ enum Commands {
         /// Path to the source file
         file: String,
     },
+    /// Compile a Phoenix program to a native executable
+    Build {
+        /// Path to the source file
+        file: String,
+        /// Output executable path (default: input filename without extension)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
     /// Generate typed code from a Phoenix schema file
     Gen {
         /// Path to the .phx schema file (or set gen.schema in phoenix.toml)
@@ -118,6 +128,7 @@ fn run() {
         Commands::Ir { file } => cmd_ir(&file),
         Commands::Run { file } => cmd_run(&file),
         Commands::RunIr { file } => cmd_run_ir(&file),
+        Commands::Build { file, output } => build::cmd_build(&file, output.as_deref()),
         Commands::Gen {
             file,
             target,
@@ -284,7 +295,9 @@ fn cmd_parse(path: &str) {
 
 /// Parses and type-checks a source file, exiting on errors.
 /// Returns the program AST and the semantic check result.
-fn parse_and_check(path: &str) -> (phoenix_parser::ast::Program, phoenix_sema::CheckResult) {
+pub(crate) fn parse_and_check(
+    path: &str,
+) -> (phoenix_parser::ast::Program, phoenix_sema::CheckResult) {
     let (source_map, source_id, contents) = read_source(path);
     let tokens = tokenize(&contents, source_id);
     let (program, parse_errors) = parser::parse(&tokens);

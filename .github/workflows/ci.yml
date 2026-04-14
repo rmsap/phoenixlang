@@ -18,6 +18,10 @@ jobs:
       - run: cargo test -p phoenix-parser
       - run: cargo test -p phoenix-sema
       - run: cargo test -p phoenix-interp
+      - run: cargo test -p phoenix-ir
+      - run: cargo test -p phoenix-ir-interp
       - run: cargo test -p phoenix-codegen
       - run: cargo test -p phoenix-lsp
       - run: cargo test -p phoenix-driver
+      - run: cargo test -p phoenix-runtime
+      - run: cargo test -p phoenix-cranelift
