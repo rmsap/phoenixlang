@@ -21,21 +21,21 @@ func @main() -> void {
     v8 = load v1
     v9 = const_i64 5
     v10 = ieq v8, v9
-    branch v10, bb4, bb5
+    branch v10, bb5, bb4
   bb3:
     return
   bb4:
-    jump bb3
-  bb5:
     v11 = load v1
     v12 = const_i64 3
     v13 = ieq v11, v12
-    branch v13, bb6, bb7
+    branch v13, bb7, bb6
+  bb5:
+    jump bb3
   bb6:
-    jump bb1
-  bb7:
     v14 = load v1
     v15 = builtin_call @toString(v14)
     builtin_call @print(v15)
+    jump bb1
+  bb7:
     jump bb1
 }

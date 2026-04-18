@@ -6,12 +6,12 @@ func @abs(x: i64) -> i64 {
   bb0(v0: i64):
     v1 = const_i64 0
     v2 = ilt v0, v1
-    branch v2, bb1, bb2
+    branch v2, bb2, bb1
   bb1:
+    return v0
+  bb2:
     v3 = ineg v0
     return v3
-  bb2:
-    return v0
 }
 
 func @main() -> i64 {

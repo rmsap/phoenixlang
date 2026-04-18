@@ -1,6 +1,5 @@
 use crate::ast::{
-    ElseBranch, ExprStmt, ForSource, ForStmt, IfStmt, ReturnStmt, Statement, VarDecl,
-    VarDeclTarget, WhileStmt,
+    ExprStmt, ForSource, ForStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget, WhileStmt,
 };
 use crate::parser::Parser;
 use phoenix_lexer::token::TokenKind;
@@ -14,7 +13,6 @@ impl<'src> Parser<'src> {
         match self.peek().kind {
             TokenKind::Let => self.parse_var_decl().map(Statement::VarDecl),
             TokenKind::Return => self.parse_return_stmt().map(Statement::Return),
-            TokenKind::If => self.parse_if_stmt().map(Statement::If),
             TokenKind::While => self.parse_while_stmt().map(Statement::While),
             TokenKind::For => self.parse_for_stmt().map(Statement::For),
             // `break` — immediately exits the innermost enclosing loop.
@@ -126,39 +124,6 @@ impl<'src> Parser<'src> {
         };
         self.eat(TokenKind::Newline);
         Some(ReturnStmt { value, span })
-    }
-
-    /// Parses `if`/`else if`/`else` chains.
-    fn parse_if_stmt(&mut self) -> Option<IfStmt> {
-        let start = self.peek().span;
-        self.expect(TokenKind::If)?;
-
-        let condition = self.parse_expr()?;
-        let then_block = self.parse_block()?;
-
-        let else_branch = if self.eat(TokenKind::Else) {
-            if self.peek().kind == TokenKind::If {
-                // else if — parse recursively
-                Some(ElseBranch::ElseIf(Box::new(self.parse_if_stmt()?)))
-            } else {
-                Some(ElseBranch::Block(self.parse_block()?))
-            }
-        } else {
-            None
-        };
-
-        let end = match &else_branch {
-            Some(ElseBranch::Block(b)) => b.span,
-            Some(ElseBranch::ElseIf(elif)) => elif.span,
-            None => then_block.span,
-        };
-
-        Some(IfStmt {
-            condition,
-            then_block,
-            else_branch,
-            span: start.merge(end),
-        })
     }
 
     /// Parses `while condition { body } [else { else_body }]`.

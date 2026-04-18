@@ -1,0 +1,31 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @fib(n: i64) -> i64 {
+  bb0(v0: i64):
+    v2 = const_i64 1
+    v3 = ile v0, v2
+    branch v3, bb2, bb3
+  bb1(v1: i64):
+    return v1
+  bb2:
+    jump bb1(v0)
+  bb3:
+    v4 = const_i64 1
+    v5 = isub v0, v4
+    v6 = call f0(v5)
+    v7 = const_i64 2
+    v8 = isub v0, v7
+    v9 = call f0(v8)
+    v10 = iadd v6, v9
+    jump bb1(v10)
+}
+
+func @main() -> void {
+  bb0:
+    v0 = const_i64 10
+    v1 = call f0(v0)
+    builtin_call @print(v1)
+    return
+}

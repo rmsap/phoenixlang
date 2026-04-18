@@ -1,0 +1,25 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> i64 {
+  bb0:
+    v1 = const_bool false
+    branch v1, bb2, bb3
+  bb1(v0: i64):
+    return v0
+  bb2:
+    v2 = const_i64 1
+    jump bb1(v2)
+  bb3:
+    v4 = const_bool true
+    branch v4, bb5, bb6
+  bb4(v3: i64):
+    jump bb1(v3)
+  bb5:
+    v5 = const_i64 2
+    jump bb4(v5)
+  bb6:
+    v6 = const_i64 3
+    jump bb4(v6)
+}

@@ -1,8 +1,9 @@
 use crate::ast::{
-    AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Expr, FieldAccessExpr, FieldAssignmentExpr,
-    IdentExpr, LambdaExpr, ListLiteralExpr, Literal, LiteralKind, MapLiteralExpr, MatchArm,
-    MatchBody, MatchExpr, MethodCallExpr, Pattern, StringInterpolationExpr, StringSegment,
-    StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp, VariantPattern,
+    AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, ElseBranch, Expr, FieldAccessExpr,
+    FieldAssignmentExpr, IdentExpr, IfExpr, LambdaExpr, ListLiteralExpr, Literal, LiteralKind,
+    MapLiteralExpr, MatchArm, MatchBody, MatchExpr, MethodCallExpr, Pattern,
+    StringInterpolationExpr, StringSegment, StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp,
+    VariantPattern,
 };
 use crate::parser::Parser;
 use phoenix_common::span::SourceId;
@@ -530,6 +531,9 @@ impl<'src> Parser<'src> {
             // Match expression
             TokenKind::Match => self.parse_match_expr(),
 
+            // If expression
+            TokenKind::If => self.parse_if_expr().map(|i| Expr::If(Box::new(i))),
+
             // Lambda expression: function(params) -> ReturnType { body }
             TokenKind::Function => self.parse_lambda_expr(),
 
@@ -700,6 +704,43 @@ impl<'src> Parser<'src> {
             named_args,
             span,
         })))
+    }
+
+    /// Parses an `if cond { then } [else { else_block } | else if ...]` expression.
+    ///
+    /// `if` is a first-class expression: its value is the value of the taken
+    /// branch. When used as a statement, the outer `Statement::Expression`
+    /// wrapper discards the value.
+    pub(crate) fn parse_if_expr(&mut self) -> Option<IfExpr> {
+        let start = self.peek().span;
+        self.expect(TokenKind::If)?;
+
+        let condition = self.parse_expr()?;
+        let then_block = self.parse_block()?;
+
+        let else_branch = if self.eat(TokenKind::Else) {
+            if self.peek().kind == TokenKind::If {
+                // else if — parse recursively
+                Some(ElseBranch::ElseIf(Box::new(self.parse_if_expr()?)))
+            } else {
+                Some(ElseBranch::Block(self.parse_block()?))
+            }
+        } else {
+            None
+        };
+
+        let end = match &else_branch {
+            Some(ElseBranch::Block(b)) => b.span,
+            Some(ElseBranch::ElseIf(elif)) => elif.span,
+            None => then_block.span,
+        };
+
+        Some(IfExpr {
+            condition,
+            then_block,
+            else_branch,
+            span: start.merge(end),
+        })
     }
 
     /// Parses a `match subject { arm1, arm2, ... }` expression.

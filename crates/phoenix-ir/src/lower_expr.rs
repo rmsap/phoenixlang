@@ -3,16 +3,17 @@
 //! Flattens nested Phoenix expressions into sequences of IR instructions,
 //! each producing an SSA [`ValueId`].
 
-use crate::instruction::{Op, ValueId};
+use crate::instruction::{Op, VOID_SENTINEL, ValueId};
 use crate::lower::{LoweringContext, VarBinding};
 use crate::module::IrFunction;
 use crate::terminator::Terminator;
 use crate::types::IrType;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
-    AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Expr, FieldAccessExpr, FieldAssignmentExpr,
-    LambdaExpr, ListLiteralExpr, LiteralKind, MapLiteralExpr, MethodCallExpr,
-    StringInterpolationExpr, StringSegment, StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp,
+    AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, ElseBranch, Expr, FieldAccessExpr,
+    FieldAssignmentExpr, IfExpr, LambdaExpr, ListLiteralExpr, LiteralKind, MapLiteralExpr,
+    MethodCallExpr, StringInterpolationExpr, StringSegment, StructLiteralExpr, TryExpr, UnaryExpr,
+    UnaryOp,
 };
 use phoenix_sema::types::Type;
 
@@ -31,12 +32,120 @@ impl<'a> LoweringContext<'a> {
             Expr::MethodCall(mc) => self.lower_method_call(mc),
             Expr::StructLiteral(sl) => self.lower_struct_literal(sl),
             Expr::Match(m) => self.lower_match(m),
+            Expr::If(if_expr) => self.lower_if(if_expr),
             Expr::Lambda(lambda) => self.lower_lambda(lambda),
             Expr::ListLiteral(list) => self.lower_list_literal(list),
             Expr::MapLiteral(map) => self.lower_map_literal(map),
             Expr::StringInterpolation(si) => self.lower_string_interpolation(si),
             Expr::Try(try_expr) => self.lower_try(try_expr),
         }
+    }
+
+    /// Lower an `if`/`else if`/`else` expression into IR control flow.
+    ///
+    /// Mirrors [`Self::lower_match`]: creates a merge block with an optional
+    /// parameter for the result value, branches on the condition, lowers each
+    /// branch as a value-producing block, and threads the branch value through
+    /// to the merge block via `Jump { args: [val] }`.
+    ///
+    /// `else if` chains recurse: the nested `if` produces its own merge block
+    /// and `ValueId`, which the outer `if` then forwards to its own merge.
+    /// `if` without `else` has type `Void`; the false branch goes directly to
+    /// the merge block.
+    pub(crate) fn lower_if(&mut self, if_expr: &IfExpr) -> ValueId {
+        let span = Some(if_expr.span);
+        let result_type = self.expr_type(&if_expr.span);
+
+        let merge_block = self.create_block();
+        let result_param = if result_type != IrType::Void {
+            Some(self.add_block_param(merge_block, result_type.clone()))
+        } else {
+            None
+        };
+
+        let cond = self.lower_expr(&if_expr.condition);
+        let then_block = self.create_block();
+        let else_block = if if_expr.else_branch.is_some() {
+            self.create_block()
+        } else {
+            merge_block
+        };
+
+        self.terminate(Terminator::Branch {
+            condition: cond,
+            true_block: then_block,
+            true_args: Vec::new(),
+            false_block: else_block,
+            false_args: Vec::new(),
+        });
+
+        // Then branch: lower, thread value to merge.
+        self.switch_to_block(then_block);
+        let then_val = self.lower_block_implicit(&if_expr.then_block);
+        let then_reaches_merge = self.jump_to_merge(merge_block, result_param, then_val, span);
+
+        // Else branch: lower, thread value to merge.  Tracks whether any
+        // branch actually jumped to the merge block so we can terminate an
+        // unreachable merge with `Unreachable` instead of letting an upstream
+        // `Return` pick up a VOID_SENTINEL operand.
+        let else_reaches_merge = match &if_expr.else_branch {
+            Some(ElseBranch::Block(block)) => {
+                self.switch_to_block(else_block);
+                let else_val = self.lower_block_implicit(block);
+                self.jump_to_merge(merge_block, result_param, else_val, span)
+            }
+            Some(ElseBranch::ElseIf(nested)) => {
+                self.switch_to_block(else_block);
+                let nested_val = self.lower_if(nested);
+                self.jump_to_merge(merge_block, result_param, Some(nested_val), span)
+            }
+            // No `else`: the false-branch target IS the merge block, so the
+            // Branch terminator itself reaches merge.
+            None => true,
+        };
+
+        self.switch_to_block(merge_block);
+
+        // If every branch diverged (e.g., `if c { return a } else { return b }`),
+        // the merge block has no predecessors.  Terminate it as unreachable so
+        // the function-level terminator logic doesn't try to emit a return
+        // using a stale result_param or VOID_SENTINEL.
+        if !then_reaches_merge && !else_reaches_merge {
+            self.terminate(Terminator::Unreachable);
+        }
+
+        // For Void if-expressions, return a sentinel rather than emitting a
+        // dead `const_bool` into the merge block.  Callers of a Void if never
+        // use the resulting ValueId.
+        result_param.unwrap_or(VOID_SENTINEL)
+    }
+
+    /// Emits a `Jump` from the current block to `merge_block`, passing the
+    /// branch's value as a block argument when the merge block takes a result
+    /// parameter.  Returns `true` if the jump was emitted (merge is reachable
+    /// from this branch), `false` if the current block was already terminated
+    /// (e.g. the branch ended in `return`).
+    fn jump_to_merge(
+        &mut self,
+        merge_block: crate::block::BlockId,
+        result_param: Option<ValueId>,
+        branch_val: Option<ValueId>,
+        span: Option<Span>,
+    ) -> bool {
+        if !self.block_needs_terminator() {
+            return false;
+        }
+        let args = if result_param.is_some() {
+            let val = branch_val.unwrap_or_else(|| self.void_placeholder(span));
+            vec![val]
+        } else {
+            Vec::new()
+        };
+        self.terminate(Terminator::Jump {
+            target: merge_block,
+            args,
+        });
+        true
     }
 
     /// Lower a literal expression.

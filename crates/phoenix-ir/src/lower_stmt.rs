@@ -9,8 +9,7 @@ use crate::lower::{LoweringContext, VarBinding};
 use crate::terminator::Terminator;
 use crate::types::IrType;
 use phoenix_parser::ast::{
-    Block, Declaration, ElseBranch, ForSource, ForStmt, IfStmt, Program, Statement, VarDecl,
-    VarDeclTarget, WhileStmt,
+    Block, Declaration, ForSource, ForStmt, Program, Statement, VarDecl, VarDeclTarget, WhileStmt,
 };
 
 impl<'a> LoweringContext<'a> {
@@ -198,9 +197,6 @@ impl<'a> LoweringContext<'a> {
                     self.terminate(Terminator::Return(None));
                 }
             }
-            Statement::If(if_stmt) => {
-                self.lower_if_stmt(if_stmt);
-            }
             Statement::While(w) => {
                 self.lower_while_stmt(w);
             }
@@ -267,66 +263,6 @@ impl<'a> LoweringContext<'a> {
                 }
             }
         }
-    }
-
-    /// Lower an if/else if/else chain.
-    fn lower_if_stmt(&mut self, if_stmt: &IfStmt) {
-        let cond = self.lower_expr(&if_stmt.condition);
-
-        let then_block = self.create_block();
-        let merge_block = self.create_block();
-
-        let else_block = if if_stmt.else_branch.is_some() {
-            self.create_block()
-        } else {
-            merge_block
-        };
-
-        self.terminate(Terminator::Branch {
-            condition: cond,
-            true_block: then_block,
-            true_args: Vec::new(),
-            false_block: else_block,
-            false_args: Vec::new(),
-        });
-
-        // Lower the then branch.
-        self.switch_to_block(then_block);
-        self.lower_block(&if_stmt.then_block);
-        // Jump to merge if no terminator yet.
-        if self.block_needs_terminator() {
-            self.terminate(Terminator::Jump {
-                target: merge_block,
-                args: Vec::new(),
-            });
-        }
-
-        // Lower the else branch.
-        if let Some(else_branch) = &if_stmt.else_branch {
-            self.switch_to_block(else_block);
-            match else_branch {
-                ElseBranch::Block(block) => {
-                    self.lower_block(block);
-                    if self.block_needs_terminator() {
-                        self.terminate(Terminator::Jump {
-                            target: merge_block,
-                            args: Vec::new(),
-                        });
-                    }
-                }
-                ElseBranch::ElseIf(nested_if) => {
-                    self.lower_if_stmt(nested_if);
-                    if self.block_needs_terminator() {
-                        self.terminate(Terminator::Jump {
-                            target: merge_block,
-                            args: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        self.switch_to_block(merge_block);
     }
 
     /// Lower a while loop into header/body/exit blocks.

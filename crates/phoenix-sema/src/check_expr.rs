@@ -2,9 +2,10 @@ use crate::checker::Checker;
 use crate::scope::VarInfo;
 use crate::types::Type;
 use phoenix_parser::ast::{
-    AssignmentExpr, BinaryExpr, BinaryOp, CaptureInfo, Expr, FieldAccessExpr, FieldAssignmentExpr,
-    IdentExpr, LambdaExpr, ListLiteralExpr, LiteralKind, MapLiteralExpr, MatchBody, MatchExpr,
-    Pattern, Statement, StringInterpolationExpr, StringSegment, TryExpr, UnaryExpr, UnaryOp,
+    AssignmentExpr, BinaryExpr, BinaryOp, CaptureInfo, ElseBranch, Expr, FieldAccessExpr,
+    FieldAssignmentExpr, IdentExpr, IfExpr, LambdaExpr, ListLiteralExpr, LiteralKind,
+    MapLiteralExpr, MatchBody, MatchExpr, Pattern, Statement, StringInterpolationExpr,
+    StringSegment, TryExpr, UnaryExpr, UnaryOp,
 };
 
 impl Checker {
@@ -41,6 +42,7 @@ impl Checker {
             Expr::MethodCall(mc) => self.check_method_call(mc),
             Expr::StructLiteral(sl) => self.check_struct_literal(sl),
             Expr::Match(m) => self.check_match(m),
+            Expr::If(if_expr) => self.check_if_expr(if_expr),
             Expr::ListLiteral(list) => self.check_list_literal(list),
             Expr::MapLiteral(map) => self.check_map_literal(map),
             Expr::Try(try_expr) => self.check_try(try_expr),
@@ -503,6 +505,78 @@ impl Checker {
         self.check_match_exhaustiveness(m, &base_name);
 
         result_type.unwrap_or(Type::Void)
+    }
+
+    /// Type-checks an `if`/`else if`/`else` expression.
+    ///
+    /// Mirrors [`Self::check_match`]: validates the condition is `Bool`, checks
+    /// each branch in a fresh scope, and unifies the branch types.  A branch
+    /// whose block diverges (ends in `return`/`break`/`continue`) does not
+    /// contribute to unification.  If the `else` branch is missing, the
+    /// expression has type `Void` (branches are still checked for diagnostics).
+    fn check_if_expr(&mut self, if_expr: &IfExpr) -> Type {
+        let cond_type = self.check_expr(&if_expr.condition);
+        if !cond_type.is_error() && cond_type != Type::Bool {
+            self.error(
+                format!("if condition must be Bool, got {}", cond_type),
+                if_expr.condition.span(),
+            );
+        }
+
+        // Check the then-branch and record its type unless it diverges.
+        self.scopes.push();
+        let then_type = self.check_block_type(&if_expr.then_block);
+        self.scopes.pop();
+        let then_diverges = Self::block_diverges(&if_expr.then_block);
+
+        // No else branch → Void (but we already checked the then block for diagnostics).
+        let Some(else_branch) = &if_expr.else_branch else {
+            return Type::Void;
+        };
+
+        let (else_type, else_diverges) = match else_branch {
+            ElseBranch::Block(block) => {
+                self.scopes.push();
+                let ty = self.check_block_type(block);
+                self.scopes.pop();
+                (ty, Self::block_diverges(block))
+            }
+            ElseBranch::ElseIf(nested) => {
+                let ty = self.check_if_expr(nested);
+                (ty, Self::if_expr_diverges(nested))
+            }
+        };
+
+        // Unify non-diverging branch types.
+        let ty = match (then_diverges, else_diverges) {
+            (true, true) => Type::Void,
+            (true, false) => else_type,
+            (false, true) => then_type,
+            (false, false) => {
+                if then_type.is_error() || else_type.is_error() {
+                    Type::Error
+                } else if self.types_compatible(&then_type, &else_type) {
+                    then_type
+                } else if self.types_compatible(&else_type, &then_type) {
+                    else_type
+                } else {
+                    self.error(
+                        format!(
+                            "if/else branches have incompatible types: {} and {}",
+                            then_type, else_type
+                        ),
+                        if_expr.span,
+                    );
+                    Type::Error
+                }
+            }
+        };
+
+        // Record the type so IR lowering can look it up by span.  Needed in
+        // particular for nested `else if` chains, which recurse through
+        // `check_if_expr` directly without passing through `check_expr`.
+        self.expr_types.insert(if_expr.span, ty.clone());
+        ty
     }
 
     /// Warns if a match on an enum type does not cover all variants and has no

@@ -2,8 +2,7 @@ use crate::checker::Checker;
 use crate::scope::VarInfo;
 use crate::types::Type;
 use phoenix_parser::ast::{
-    ElseBranch, ForSource, ForStmt, IfStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget,
-    WhileStmt,
+    ForSource, ForStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget, WhileStmt,
 };
 
 impl Checker {
@@ -15,7 +14,6 @@ impl Checker {
                 self.check_expr(&expr_stmt.expr);
             }
             Statement::Return(ret) => self.check_return(ret),
-            Statement::If(if_stmt) => self.check_if(if_stmt),
             Statement::While(w) => self.check_while(w),
             Statement::For(f) => self.check_for(f),
             // `break` is only valid inside a loop body. The checker tracks
@@ -169,35 +167,6 @@ impl Checker {
                         format!("expected return value of type {}", expected),
                         ret.span,
                     );
-                }
-            }
-        }
-    }
-
-    /// Type-checks an `if` statement, ensuring the condition is `Bool` and
-    /// recursively checking then/else branches.
-    fn check_if(&mut self, if_stmt: &IfStmt) {
-        let cond_type = self.check_expr(&if_stmt.condition);
-        if !cond_type.is_error() && cond_type != Type::Bool {
-            self.error(
-                format!("if condition must be Bool, got {}", cond_type),
-                if_stmt.condition.span(),
-            );
-        }
-
-        self.scopes.push();
-        self.check_block(&if_stmt.then_block);
-        self.scopes.pop();
-
-        if let Some(ref else_branch) = if_stmt.else_branch {
-            match else_branch {
-                ElseBranch::Block(block) => {
-                    self.scopes.push();
-                    self.check_block(block);
-                    self.scopes.pop();
-                }
-                ElseBranch::ElseIf(elif) => {
-                    self.check_if(elif);
                 }
             }
         }

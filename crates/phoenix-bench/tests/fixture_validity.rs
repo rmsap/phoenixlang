@@ -139,7 +139,6 @@ fn empty_fixture_ir_interp() {
 }
 
 #[test]
-#[ignore = "IR interpreter does not yet support recursion — needed for fib()"]
 fn small_fixture_ir_interp() {
     let output = run_ir("small", SMALL);
     assert_eq!(output, vec!["55"]);
@@ -152,7 +151,6 @@ fn medium_fixture_ir_interp() {
 }
 
 #[test]
-#[ignore = "IR interpreter does not yet support recursion — needed for factorial()"]
 fn medium_large_fixture_ir_interp() {
     let output = run_ir("medium_large", MEDIUM_LARGE);
     assert_eq!(output, vec!["(3, 7)", "25", "120", "[4, 8, 12, 16, 20]"]);

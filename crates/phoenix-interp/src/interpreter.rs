@@ -3,7 +3,7 @@ use crate::value::Value;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     BinaryExpr, BinaryOp, Block, CallExpr, CaptureInfo, Declaration, ElseBranch, Expr, ForSource,
-    ForStmt, FunctionDecl, IfStmt, LiteralKind, MatchBody, MatchExpr, MethodCallExpr, Param,
+    ForStmt, FunctionDecl, IfExpr, LiteralKind, MatchBody, MatchExpr, MethodCallExpr, Param,
     Pattern, Program, Statement, StringSegment, StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp,
     WhileStmt,
 };
@@ -480,20 +480,13 @@ impl Interpreter {
             let is_last = implicit_return && i == last_idx && !block.statements.is_empty();
             // If this is the last statement and it's a bare expression,
             // evaluate it and return its value (implicit return).
-            if is_last {
-                if let Statement::Expression(expr_stmt) = stmt {
-                    let value = self.eval_expr(&expr_stmt.expr)?;
-                    if !matches!(value, Value::Void) {
-                        self.last_return_was_explicit = false;
-                        return Ok(StmtResult::Return(value));
-                    }
-                    return Ok(StmtResult::Continue);
+            if is_last && let Statement::Expression(expr_stmt) = stmt {
+                let value = self.eval_expr(&expr_stmt.expr)?;
+                if !matches!(value, Value::Void) {
+                    self.last_return_was_explicit = false;
+                    return Ok(StmtResult::Return(value));
                 }
-                // If the last statement is an if/else, propagate implicit
-                // return into each branch so the branch value is returned.
-                if let Statement::If(if_stmt) = stmt {
-                    return self.exec_if_inner(if_stmt, true);
-                }
+                return Ok(StmtResult::Continue);
             }
             let result = self.exec_statement(stmt)?;
             // Check for pending control flow from expressions (e.g. break inside match)
@@ -556,7 +549,6 @@ impl Interpreter {
                 self.last_return_was_explicit = true;
                 Ok(StmtResult::Return(value))
             }
-            Statement::If(if_stmt) => self.exec_if_inner(if_stmt, false),
             Statement::While(w) => self.exec_while(w),
             Statement::For(f) => self.exec_for(f),
             Statement::Break(_) => Ok(StmtResult::Break),
@@ -564,8 +556,6 @@ impl Interpreter {
         }
     }
 
-    /// Executes an `if`/`else if`/`else` chain. When `implicit_return` is true,
-    /// the last expression in each branch becomes the return value.
     /// Evaluates a slice of expressions into a `Vec<Value>`.
     fn eval_args(&mut self, args: &[Expr]) -> Result<Vec<Value>> {
         args.iter().map(|a| self.eval_expr(a)).collect()
@@ -598,25 +588,63 @@ impl Interpreter {
         Ok(StmtResult::Continue)
     }
 
-    fn exec_if_inner(&mut self, if_stmt: &IfStmt, implicit_return: bool) -> Result<StmtResult> {
-        let condition = self.eval_expr(&if_stmt.condition)?;
+    /// Evaluates an `if`/`else if`/`else` expression, returning the [`Value`]
+    /// of the taken branch.
+    ///
+    /// When the condition is false and no `else` branch is present, returns
+    /// [`Value::Void`] — preserving statement-like behavior when wrapped in
+    /// [`Statement::Expression`].
+    ///
+    /// Explicit `return` inside a branch propagates out via the `try_return_value`
+    /// error channel, just like [`Self::eval_match`].
+    fn eval_if(&mut self, if_expr: &IfExpr) -> Result<Value> {
+        let condition = self.eval_expr(&if_expr.condition)?;
         if condition.is_truthy() {
             self.env.push_scope();
-            let result = self.exec_block_inner(&if_stmt.then_block, implicit_return)?;
+            let result = self.eval_branch_block(&if_expr.then_block);
             self.env.pop_scope();
-            Ok(result)
-        } else if let Some(ref else_branch) = if_stmt.else_branch {
+            result
+        } else if let Some(ref else_branch) = if_expr.else_branch {
             match else_branch {
                 ElseBranch::Block(block) => {
                     self.env.push_scope();
-                    let result = self.exec_block_inner(block, implicit_return)?;
+                    let result = self.eval_branch_block(block);
                     self.env.pop_scope();
-                    Ok(result)
+                    result
                 }
-                ElseBranch::ElseIf(elif) => self.exec_if_inner(elif, implicit_return),
+                ElseBranch::ElseIf(elif) => self.eval_if(elif),
             }
         } else {
-            Ok(StmtResult::Continue)
+            Ok(Value::Void)
+        }
+    }
+
+    /// Evaluates a block as a value-producing expression (for `if`-branch bodies).
+    ///
+    /// Propagates explicit `return` via `try_return_value`; maps loop-control
+    /// flow to `pending_control_flow` mirroring the pattern used in match-arm
+    /// block evaluation.
+    fn eval_branch_block(&mut self, block: &Block) -> Result<Value> {
+        match self.exec_block_implicit(block)? {
+            StmtResult::Return(v) => {
+                if self.last_return_was_explicit {
+                    Err(RuntimeError {
+                        message: String::new(),
+                        try_return_value: Some(v),
+                    })
+                } else {
+                    Ok(v)
+                }
+            }
+            StmtResult::Break => {
+                self.pending_control_flow = Some(PendingControlFlow::Break);
+                Ok(Value::Void)
+            }
+            StmtResult::LoopContinue => {
+                self.pending_control_flow = Some(PendingControlFlow::LoopContinue);
+                Ok(Value::Void)
+            }
+            StmtResult::Continue => Ok(Value::Void),
         }
     }
 
@@ -742,6 +770,7 @@ impl Interpreter {
             Expr::MethodCall(mc) => self.eval_method_call(mc),
             Expr::StructLiteral(sl) => self.eval_struct_or_variant(sl),
             Expr::Match(m) => self.eval_match(m),
+            Expr::If(if_expr) => self.eval_if(if_expr),
 
             Expr::ListLiteral(list) => {
                 let elements: Vec<Value> = list
@@ -2290,6 +2319,85 @@ function main() {
 }"#,
         );
         assert_eq!(output, vec!["3"]);
+    }
+
+    // ─── If as a first-class expression ──────────────────────────────────
+    // Value semantics of `if` expressions: let initializers,
+    // arithmetic operands, else-if chains,
+    // and the no-else Void case.
+
+    #[test]
+    fn run_if_expr_value_true_branch() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let x: Int = if true { 10 } else { 20 }
+  print(x)
+}"#,
+        );
+        assert_eq!(output, vec!["10"]);
+    }
+
+    #[test]
+    fn run_if_expr_value_false_branch() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let x: Int = if false { 10 } else { 20 }
+  print(x)
+}"#,
+        );
+        assert_eq!(output, vec!["20"]);
+    }
+
+    #[test]
+    fn run_if_expr_in_arithmetic() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let y: Int = 1 + if true { 2 } else { 3 }
+  print(y)
+}"#,
+        );
+        assert_eq!(output, vec!["3"]);
+    }
+
+    #[test]
+    fn run_if_expr_else_if_chain_picks_middle() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let x: Int = if false { 1 } else if true { 2 } else { 3 }
+  print(x)
+}"#,
+        );
+        assert_eq!(output, vec!["2"]);
+    }
+
+    #[test]
+    fn run_if_expr_no_else_is_void_statement() {
+        // `if` without else in statement position: value is discarded,
+        // subsequent statements still execute.
+        let output = run_capturing_source(
+            r#"
+function main() {
+  if false { print("hidden") }
+  print("visible")
+}"#,
+        );
+        assert_eq!(output, vec!["visible"]);
+    }
+
+    #[test]
+    fn run_if_expr_tail_recursive_fib() {
+        let output = run_capturing_source(
+            r#"
+function fib(n: Int) -> Int {
+  if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
+}
+function main() { print(fib(10)) }"#,
+        );
+        assert_eq!(output, vec!["55"]);
     }
 
     /// Nested field assignment through 3 levels of structs.

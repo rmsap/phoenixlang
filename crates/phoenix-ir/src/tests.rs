@@ -1033,3 +1033,68 @@ function main() -> Int {
     );
     insta::assert_snapshot!(ir);
 }
+
+// ── If as a first-class expression ───────────────────────────────────────
+// These tests cover value-producing `if` lowering: merge-block parameter for
+// non-Void results, branch values threaded via `Jump { args }`, else-if
+// chains that produce nested merge blocks, and the Void statement-position
+// case that must still lower cleanly.
+
+#[test]
+fn lower_if_expr_threads_value_fib() {
+    // Recursive `fib` with `if` in tail position.
+    // The IR must return a well-typed I64.
+    let ir = lower_to_string(
+        "function fib(n: Int) -> Int {
+            if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
+        }
+        function main() { print(fib(10)) }",
+    );
+    insta::assert_snapshot!(ir);
+}
+
+#[test]
+fn lower_if_expr_as_var_init() {
+    let ir = lower_to_string(
+        "function main() -> Int {
+            let x: Int = if true { 10 } else { 20 }
+            x
+        }",
+    );
+    insta::assert_snapshot!(ir);
+}
+
+#[test]
+fn lower_if_expr_else_if_chain_value() {
+    // `else if` recursion: each nested `if` should produce its own merge
+    // block whose ValueId is threaded to the outer merge.
+    let ir = lower_to_string(
+        "function main() -> Int {
+            if false { 1 } else if true { 2 } else { 3 }
+        }",
+    );
+    insta::assert_snapshot!(ir);
+}
+
+#[test]
+fn lower_if_expr_in_arithmetic() {
+    let ir = lower_to_string(
+        "function main() -> Int {
+            1 + if true { 2 } else { 3 }
+        }",
+    );
+    insta::assert_snapshot!(ir);
+}
+
+#[test]
+fn lower_if_expr_all_branches_return() {
+    // When every branch diverges (explicit `return`), the merge block has
+    // no live predecessors.  The IR must still be well-formed.
+    let ir = lower_to_string(
+        "function classify(n: Int) -> String {
+            if n < 0 { return \"neg\" } else { return \"non-neg\" }
+        }
+        function main() { print(classify(-1)) }",
+    );
+    insta::assert_snapshot!(ir);
+}

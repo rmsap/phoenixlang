@@ -3,8 +3,8 @@ use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
-    Block, CaptureInfo, Declaration, ElseBranch, FunctionDecl, IfStmt, ImplBlock, InlineTraitImpl,
-    MethodCallExpr, Program, Statement,
+    Block, CaptureInfo, Declaration, ElseBranch, Expr, FunctionDecl, IfExpr, ImplBlock,
+    InlineTraitImpl, MethodCallExpr, Program, Statement,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -498,7 +498,29 @@ impl Checker {
         }
         match func.body.statements.last() {
             Some(Statement::Expression(expr_stmt)) => {
+                // Tail `if` expression: three outcomes depending on branch shape.
+                //   1. All branches diverge (e.g. each ends in `return`)  → OK.
+                //   2. Implicit type is Void (e.g. missing `else`)        → "does not return" error.
+                //   3. Otherwise → standard implicit-return type check.
+                if let Expr::If(if_expr) = &expr_stmt.expr
+                    && Self::if_expr_diverges(if_expr)
+                {
+                    return;
+                }
+                let is_tail_if = matches!(&expr_stmt.expr, Expr::If(_));
                 let implicit_type = self.infer_expr_type(&expr_stmt.expr);
+                if is_tail_if && implicit_type == Type::Void {
+                    if !func.body.statements.iter().any(Self::contains_return) {
+                        self.error(
+                            format!(
+                                "function `{}` has return type `{}` but body does not return a value",
+                                func.name, return_type
+                            ),
+                            func.span,
+                        );
+                    }
+                    return;
+                }
                 if !implicit_type.is_error() && !self.types_compatible(return_type, &implicit_type)
                 {
                     self.error(
@@ -507,31 +529,6 @@ impl Checker {
                             return_type, implicit_type
                         ),
                         expr_stmt.span,
-                    );
-                }
-            }
-            Some(Statement::If(if_stmt)) => {
-                let implicit_type = self.infer_if_implicit_type(if_stmt);
-                if implicit_type != Type::Void
-                    && !implicit_type.is_error()
-                    && !self.types_compatible(return_type, &implicit_type)
-                {
-                    self.error(
-                        format!(
-                            "implicit return type mismatch: expected {} but got {}",
-                            return_type, implicit_type
-                        ),
-                        if_stmt.span,
-                    );
-                } else if implicit_type == Type::Void
-                    && !func.body.statements.iter().any(Self::contains_return)
-                {
-                    self.error(
-                        format!(
-                            "function `{}` has return type `{}` but body does not return a value",
-                            func.name, return_type
-                        ),
-                        func.span,
                     );
                 }
             }
@@ -645,61 +642,35 @@ impl Checker {
     // Expression checking methods are in check_expr.rs.
     // Type resolution and unification methods are in check_types.rs.
 
-    /// Infers the implicit return type of an `if`/`else` chain.
+    /// Returns `true` if a block's last statement diverges (cannot produce
+    /// a value).  Diverging blocks are compatible with any expected type in
+    /// match arm / if-branch type checking.
     ///
-    /// Returns the common type of the last expression in every branch when all
-    /// branches (including `else`) end with a bare expression. Returns
-    /// [`Type::Void`] when the chain is missing an `else` branch or any branch
-    /// does not end with an expression.
-    fn infer_if_implicit_type(&mut self, if_stmt: &IfStmt) -> Type {
-        let then_type = self.infer_block_implicit_type(&if_stmt.then_block);
-        if then_type == Type::Void {
-            return Type::Void;
-        }
-        let else_type = match &if_stmt.else_branch {
-            Some(ElseBranch::Block(b)) => self.infer_block_implicit_type(b),
-            Some(ElseBranch::ElseIf(elif)) => self.infer_if_implicit_type(elif),
-            None => return Type::Void, // no else → cannot guarantee a value
-        };
-        if else_type == Type::Void {
-            return Type::Void;
-        }
-        // Both branches produce a value — check they're compatible.
-        if self.types_compatible(&then_type, &else_type) {
-            then_type
-        } else if self.types_compatible(&else_type, &then_type) {
-            else_type
-        } else {
-            self.error(
-                format!(
-                    "if/else branches have incompatible types: {} and {}",
-                    then_type, else_type
-                ),
-                if_stmt.span,
-            );
-            Type::Error
-        }
-    }
-
-    /// Returns the implicit return type of a block — the type of its last
-    /// statement when that statement is a bare expression or an if/else chain
-    /// whose branches all produce values. Returns [`Type::Void`] otherwise.
-    fn infer_block_implicit_type(&mut self, block: &Block) -> Type {
-        match block.statements.last() {
-            Some(Statement::Expression(expr_stmt)) => self.infer_expr_type(&expr_stmt.expr),
-            Some(Statement::If(if_stmt)) => self.infer_if_implicit_type(if_stmt),
-            _ => Type::Void,
-        }
-    }
-
-    /// Returns `true` if a block's last statement is a control-flow statement
-    /// that diverges (break, continue, or return).  Diverging blocks are
-    /// compatible with any expected type in match arm type checking.
+    /// Diverges when the last statement is `break`, `continue`, `return`,
+    /// or an `if`-expression whose every branch diverges.
     pub(crate) fn block_diverges(block: &Block) -> bool {
-        matches!(
-            block.statements.last(),
-            Some(Statement::Break(_) | Statement::Continue(_) | Statement::Return(_))
-        )
+        match block.statements.last() {
+            Some(Statement::Break(_) | Statement::Continue(_) | Statement::Return(_)) => true,
+            Some(Statement::Expression(expr_stmt)) => match &expr_stmt.expr {
+                Expr::If(if_expr) => Self::if_expr_diverges(if_expr),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if every branch of an `if`/`else if`/`else` chain
+    /// diverges.  Used for tail-position `if` expressions like
+    /// `if c { return a } else { return b }`.
+    pub(crate) fn if_expr_diverges(if_expr: &IfExpr) -> bool {
+        if !Self::block_diverges(&if_expr.then_block) {
+            return false;
+        }
+        match &if_expr.else_branch {
+            Some(ElseBranch::Block(b)) => Self::block_diverges(b),
+            Some(ElseBranch::ElseIf(nested)) => Self::if_expr_diverges(nested),
+            None => false, // missing else → non-diverging (value is Void)
+        }
     }
 
     /// Returns `true` if a statement contains (or is) an explicit `return`.
@@ -710,17 +681,40 @@ impl Checker {
     fn contains_return(stmt: &Statement) -> bool {
         match stmt {
             Statement::Return(_) => true,
-            Statement::If(if_stmt) => Self::if_contains_return(if_stmt),
-            Statement::While(w) => w.body.statements.iter().any(Self::contains_return),
-            Statement::For(f) => f.body.statements.iter().any(Self::contains_return),
+            Statement::Expression(es) => Self::expr_contains_return(&es.expr),
+            Statement::VarDecl(vd) => Self::expr_contains_return(&vd.initializer),
+            Statement::While(w) => {
+                Self::expr_contains_return(&w.condition)
+                    || w.body.statements.iter().any(Self::contains_return)
+                    || w.else_block
+                        .as_ref()
+                        .is_some_and(|b| b.statements.iter().any(Self::contains_return))
+            }
+            Statement::For(f) => {
+                f.body.statements.iter().any(Self::contains_return)
+                    || f.else_block
+                        .as_ref()
+                        .is_some_and(|b| b.statements.iter().any(Self::contains_return))
+            }
+            Statement::Break(_) | Statement::Continue(_) => false,
+        }
+    }
+
+    /// Returns `true` if an expression contains an explicit `return`.
+    ///
+    /// Only constructs that can embed statements (currently `if` expressions)
+    /// need to recurse; other expressions cannot contain a `return` statement.
+    fn expr_contains_return(expr: &Expr) -> bool {
+        match expr {
+            Expr::If(if_expr) => Self::if_expr_contains_return(if_expr),
             _ => false,
         }
     }
 
-    /// Recursive helper for [`Self::contains_return`] -- checks an `if`/`else`
-    /// chain for at least one explicit `return` statement.
-    fn if_contains_return(if_stmt: &IfStmt) -> bool {
-        if if_stmt
+    /// Returns `true` if any branch of an `if`/`else if`/`else` chain
+    /// contains an explicit `return`.
+    fn if_expr_contains_return(if_expr: &IfExpr) -> bool {
+        if if_expr
             .then_block
             .statements
             .iter()
@@ -728,9 +722,9 @@ impl Checker {
         {
             return true;
         }
-        match &if_stmt.else_branch {
+        match &if_expr.else_branch {
             Some(ElseBranch::Block(b)) => b.statements.iter().any(Self::contains_return),
-            Some(ElseBranch::ElseIf(nested)) => Self::if_contains_return(nested),
+            Some(ElseBranch::ElseIf(nested)) => Self::if_expr_contains_return(nested),
             None => false,
         }
     }

@@ -3020,6 +3020,71 @@ query { String sort = "name" }
     );
 }
 
+// ── If as a first-class expression ───────────────────────────────
+
+#[test]
+fn if_expr_unifies_branch_types() {
+    assert_no_errors("function main() { let x: Int = if true { 1 } else { 2 }\n print(x) }");
+}
+
+#[test]
+fn if_expr_without_else_is_void() {
+    // `let x: Int = ...` with a Void initializer should surface as a type
+    // mismatch on the variable declaration.
+    assert_has_error(
+        "function main() { let x: Int = if true { 1 } }",
+        "type mismatch",
+    );
+}
+
+#[test]
+fn if_expr_incompatible_branches() {
+    assert_has_error(
+        "function main() { let x: Int = if true { 1 } else { \"two\" } }",
+        "incompatible types",
+    );
+}
+
+#[test]
+fn if_expr_diverging_branch_ok() {
+    // Then-branch diverges (return); else contributes Int; overall type is Int.
+    assert_no_errors(
+        r#"
+function f(n: Int) -> Int {
+    let v: Int = if n < 0 { return 0 } else { n }
+    v
+}
+function main() { print(f(5)) }
+"#,
+    );
+}
+
+#[test]
+fn if_expr_else_if_chain_unifies() {
+    assert_no_errors(
+        r#"
+function main() {
+    let x: Int = if false { 1 } else if true { 2 } else { 3 }
+    print(x)
+}
+"#,
+    );
+}
+
+#[test]
+fn if_expr_tail_with_all_returns_ok() {
+    // `if` whose every branch ends in `return` satisfies the function's
+    // non-Void return type — no "implicit return type mismatch" error.
+    assert_no_errors(
+        r#"
+function classify(n: Int) -> String {
+    if n < 0 { return "neg" } else { return "non-neg" }
+}
+function main() { print(classify(-1)) }
+"#,
+    );
+}
+
 // ── Definition name_span is precise ──────────────────────────────
 
 /// Function definition_span covers only the name, not the full declaration.

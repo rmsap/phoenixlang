@@ -1414,10 +1414,13 @@ mod tests {
             Declaration::Function(f) => {
                 assert_eq!(f.body.statements.len(), 1);
                 match &f.body.statements[0] {
-                    Statement::If(if_stmt) => {
-                        assert!(if_stmt.else_branch.is_some());
-                    }
-                    other => panic!("expected If, got {:?}", other),
+                    Statement::Expression(e) => match &e.expr {
+                        Expr::If(if_expr) => {
+                            assert!(if_expr.else_branch.is_some());
+                        }
+                        other => panic!("expected Expr::If, got {:?}", other),
+                    },
+                    other => panic!("expected Expression, got {:?}", other),
                 }
             }
             _ => panic!("expected Function"),
@@ -1525,11 +1528,14 @@ mod tests {
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
             Declaration::Function(f) => match &f.body.statements[0] {
-                Statement::If(if_stmt) => {
-                    assert!(if_stmt.else_branch.is_none(), "should have no else block");
-                    assert_eq!(if_stmt.then_block.statements.len(), 1);
-                }
-                other => panic!("expected If, got {:?}", other),
+                Statement::Expression(e) => match &e.expr {
+                    Expr::If(if_expr) => {
+                        assert!(if_expr.else_branch.is_none(), "should have no else block");
+                        assert_eq!(if_expr.then_block.statements.len(), 1);
+                    }
+                    other => panic!("expected Expr::If, got {:?}", other),
+                },
+                other => panic!("expected Expression, got {:?}", other),
             },
             _ => panic!("expected Function"),
         }
@@ -1543,16 +1549,22 @@ mod tests {
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
             Declaration::Function(f) => match &f.body.statements[0] {
-                Statement::If(outer) => {
-                    assert_eq!(outer.then_block.statements.len(), 1);
-                    match &outer.then_block.statements[0] {
-                        Statement::If(inner) => {
-                            assert_eq!(inner.then_block.statements.len(), 1);
+                Statement::Expression(e) => match &e.expr {
+                    Expr::If(outer) => {
+                        assert_eq!(outer.then_block.statements.len(), 1);
+                        match &outer.then_block.statements[0] {
+                            Statement::Expression(inner_e) => match &inner_e.expr {
+                                Expr::If(inner) => {
+                                    assert_eq!(inner.then_block.statements.len(), 1);
+                                }
+                                other => panic!("expected inner Expr::If, got {:?}", other),
+                            },
+                            other => panic!("expected inner Expression, got {:?}", other),
                         }
-                        other => panic!("expected inner If, got {:?}", other),
                     }
-                }
-                other => panic!("expected If, got {:?}", other),
+                    other => panic!("expected Expr::If, got {:?}", other),
+                },
+                other => panic!("expected Expression, got {:?}", other),
             },
             _ => panic!("expected Function"),
         }
@@ -1870,37 +1882,154 @@ mod tests {
             Declaration::Function(f) => {
                 assert_eq!(f.body.statements.len(), 1);
                 match &f.body.statements[0] {
-                    Statement::If(if_stmt) => {
-                        // First condition: x == 1
-                        match &if_stmt.condition {
-                            Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Eq),
-                            other => panic!("expected Binary Eq, got {:?}", other),
-                        }
-                        // else branch should be ElseIf
-                        match &if_stmt.else_branch {
-                            Some(ElseBranch::ElseIf(elif)) => {
-                                // Second condition: x == 2
-                                match &elif.condition {
-                                    Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Eq),
-                                    other => {
-                                        panic!("expected Binary Eq in else-if, got {:?}", other)
+                    Statement::Expression(e) => match &e.expr {
+                        Expr::If(if_expr) => {
+                            // First condition: x == 1
+                            match &if_expr.condition {
+                                Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Eq),
+                                other => panic!("expected Binary Eq, got {:?}", other),
+                            }
+                            // else branch should be ElseIf
+                            match &if_expr.else_branch {
+                                Some(ElseBranch::ElseIf(elif)) => {
+                                    // Second condition: x == 2
+                                    match &elif.condition {
+                                        Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Eq),
+                                        other => {
+                                            panic!("expected Binary Eq in else-if, got {:?}", other)
+                                        }
+                                    }
+                                    // The else-if should have a plain else block
+                                    match &elif.else_branch {
+                                        Some(ElseBranch::Block(_)) => {}
+                                        other => panic!(
+                                            "expected ElseBranch::Block for final else, got {:?}",
+                                            other
+                                        ),
                                     }
                                 }
-                                // The else-if should have a plain else block
-                                match &elif.else_branch {
-                                    Some(ElseBranch::Block(_)) => {}
-                                    other => panic!(
-                                        "expected ElseBranch::Block for final else, got {:?}",
-                                        other
-                                    ),
-                                }
+                                other => panic!("expected ElseBranch::ElseIf, got {:?}", other),
                             }
-                            other => panic!("expected ElseBranch::ElseIf, got {:?}", other),
                         }
-                    }
-                    other => panic!("expected If, got {:?}", other),
+                        other => panic!("expected Expr::If, got {:?}", other),
+                    },
+                    other => panic!("expected Expression, got {:?}", other),
                 }
             }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    // ─── If as a first-class expression ──────────────────────────────────
+
+    #[test]
+    fn parse_if_expr_as_var_decl_init() {
+        let source = "function main() { let x: Int = if true { 1 } else { 2 } }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => match &f.body.statements[0] {
+                Statement::VarDecl(v) => match &v.initializer {
+                    Expr::If(if_expr) => {
+                        assert!(if_expr.else_branch.is_some());
+                    }
+                    other => panic!("expected Expr::If initializer, got {:?}", other),
+                },
+                other => panic!("expected VarDecl, got {:?}", other),
+            },
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn parse_if_expr_in_arithmetic() {
+        let source = "function main() { let x: Int = 1 + if true { 2 } else { 3 } }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => match &f.body.statements[0] {
+                Statement::VarDecl(v) => match &v.initializer {
+                    Expr::Binary(b) => {
+                        assert_eq!(b.op, BinaryOp::Add);
+                        match &b.right {
+                            Expr::If(_) => {}
+                            other => panic!("expected Expr::If on rhs, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Binary, got {:?}", other),
+                },
+                other => panic!("expected VarDecl, got {:?}", other),
+            },
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn parse_if_expr_as_call_arg() {
+        let source = "function main() { print(if true { 1 } else { 2 }) }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => match &f.body.statements[0] {
+                Statement::Expression(e) => match &e.expr {
+                    Expr::Call(c) => {
+                        assert_eq!(c.args.len(), 1);
+                        match &c.args[0] {
+                            Expr::If(_) => {}
+                            other => panic!("expected Expr::If arg, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Call, got {:?}", other),
+                },
+                other => panic!("expected Expression, got {:?}", other),
+            },
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn parse_if_expr_as_function_tail() {
+        // `if` in tail position yielding a value.
+        let source =
+            "function fib(n: Int) -> Int { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(f.body.statements.len(), 1);
+                match &f.body.statements[0] {
+                    Statement::Expression(e) => match &e.expr {
+                        Expr::If(if_expr) => {
+                            assert!(if_expr.else_branch.is_some());
+                        }
+                        other => panic!("expected Expr::If, got {:?}", other),
+                    },
+                    other => panic!("expected Expression, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Function"),
+        }
+    }
+
+    #[test]
+    fn parse_if_expr_else_if_chain_as_init() {
+        let source =
+            "function main() { let x: Int = if false { 1 } else if true { 2 } else { 3 } }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => match &f.body.statements[0] {
+                Statement::VarDecl(v) => match &v.initializer {
+                    Expr::If(outer) => match &outer.else_branch {
+                        Some(ElseBranch::ElseIf(elif)) => {
+                            assert!(matches!(&elif.else_branch, Some(ElseBranch::Block(_))));
+                        }
+                        other => panic!("expected ElseBranch::ElseIf, got {:?}", other),
+                    },
+                    other => panic!("expected Expr::If, got {:?}", other),
+                },
+                other => panic!("expected VarDecl, got {:?}", other),
+            },
             _ => panic!("expected Function"),
         }
     }

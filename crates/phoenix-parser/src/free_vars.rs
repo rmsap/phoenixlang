@@ -6,7 +6,7 @@
 //! (for capture annotation) and the interpreter (for runtime capture).
 
 use crate::ast::{
-    Block, ElseBranch, Expr, IfStmt, MatchBody, Pattern, Statement, StringSegment, VarDeclTarget,
+    Block, ElseBranch, Expr, IfExpr, MatchBody, Pattern, Statement, StringSegment, VarDeclTarget,
 };
 use std::collections::HashSet;
 
@@ -48,7 +48,6 @@ fn walk_stmt(stmt: &Statement, free: &mut HashSet<String>, local: &mut HashSet<S
                 walk_expr(val, free, local);
             }
         }
-        Statement::If(if_stmt) => walk_if(if_stmt, free, local),
         Statement::While(w) => {
             walk_expr(&w.condition, free, local);
             walk_block(&w.body, free, local);
@@ -78,10 +77,10 @@ fn walk_stmt(stmt: &Statement, free: &mut HashSet<String>, local: &mut HashSet<S
     }
 }
 
-fn walk_if(if_stmt: &IfStmt, free: &mut HashSet<String>, local: &mut HashSet<String>) {
-    walk_expr(&if_stmt.condition, free, local);
-    walk_block(&if_stmt.then_block, free, local);
-    if let Some(branch) = &if_stmt.else_branch {
+fn walk_if(if_expr: &IfExpr, free: &mut HashSet<String>, local: &mut HashSet<String>) {
+    walk_expr(&if_expr.condition, free, local);
+    walk_block(&if_expr.then_block, free, local);
+    if let Some(branch) = &if_expr.else_branch {
         match branch {
             ElseBranch::Block(b) => walk_block(b, free, local),
             ElseBranch::ElseIf(nested) => walk_if(nested, free, local),
@@ -183,6 +182,7 @@ fn walk_expr(expr: &Expr, free: &mut HashSet<String>, local: &mut HashSet<String
             }
         }
         Expr::Try(t) => walk_expr(&t.operand, free, local),
+        Expr::If(if_expr) => walk_if(if_expr, free, local),
     }
 }
 

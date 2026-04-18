@@ -112,8 +112,6 @@ pub enum Statement {
     Expression(ExprStmt),
     /// A `return` statement.
     Return(ReturnStmt),
-    /// An `if` / `else if` / `else` statement.
-    If(IfStmt),
     /// A `while` loop.
     While(WhileStmt),
     /// A `for` loop over a range.
@@ -201,12 +199,16 @@ pub struct ReturnStmt {
     pub span: Span,
 }
 
-/// An `if`/`else if`/`else` statement.
+/// An `if`/`else if`/`else` expression.
 ///
-/// Chained `else if` branches are represented recursively via
-/// [`ElseBranch::ElseIf`].
+/// `if` is a first-class expression in Phoenix: its value is the value of
+/// the branch taken. When used as a statement (bare `if` with no consumer),
+/// wrap it in [`Statement::Expression`] via [`Expr::If`]. Chained `else if`
+/// branches are represented recursively via [`ElseBranch::ElseIf`].
 ///
 /// ```text
+/// let x = if cond { 1 } else { 2 }
+///
 /// if x > 0 {
 ///     print("positive")
 /// } else if x == 0 {
@@ -216,24 +218,24 @@ pub struct ReturnStmt {
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize)]
-pub struct IfStmt {
+pub struct IfExpr {
     /// The boolean condition guarding the `then` block.
     pub condition: Expr,
     /// The block executed when `condition` is true.
     pub then_block: Block,
     /// An optional `else` or `else if` branch.
     pub else_branch: Option<ElseBranch>,
-    /// Source span covering the entire `if` statement.
+    /// Source span covering the entire `if` expression.
     pub span: Span,
 }
 
-/// The else branch of an `if` statement.
+/// The else branch of an `if` expression.
 #[derive(Debug, Clone, Serialize)]
 pub enum ElseBranch {
     /// A plain `else { ... }` block.
     Block(Block),
-    /// An `else if ...` chain, represented as a nested [`IfStmt`].
-    ElseIf(Box<IfStmt>),
+    /// An `else if ...` chain, represented as a nested [`IfExpr`].
+    ElseIf(Box<IfExpr>),
 }
 
 /// A `while` loop that runs its body as long as the condition is true.
@@ -783,6 +785,8 @@ pub enum Expr {
     StructLiteral(Box<StructLiteralExpr>),
     /// A `match` expression.
     Match(Box<MatchExpr>),
+    /// An `if`/`else if`/`else` expression.
+    If(Box<IfExpr>),
     /// A lambda (anonymous function) expression.
     ///
     /// ```text
@@ -821,6 +825,7 @@ impl Expr {
             Expr::MethodCall(m) => m.span,
             Expr::StructLiteral(s) => s.span,
             Expr::Match(m) => m.span,
+            Expr::If(i) => i.span,
             Expr::Lambda(l) => l.span,
             Expr::ListLiteral(l) => l.span,
             Expr::MapLiteral(m) => m.span,
