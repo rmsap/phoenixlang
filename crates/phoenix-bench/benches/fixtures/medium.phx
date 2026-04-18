@@ -1,0 +1,27 @@
+// Benchmark fixture: medium
+// Exercises: structs, enums, pattern matching (match), field access,
+//            function calls, float arithmetic, let bindings.
+// Expected output:
+//   3
+//   78.53975
+
+struct Point {
+    Int x
+    Int y
+}
+enum Shape {
+    Circle(Float)
+    Rect(Float, Float)
+}
+function area(s: Shape) -> Float {
+    match s {
+        Circle(r) -> 3.14159 * r * r
+        Rect(w, h) -> w * h
+    }
+}
+function main() {
+    let p: Point = Point(1, 2)
+    print(p.x + p.y)
+    let s: Shape = Circle(5.0)
+    print(area(s))
+}

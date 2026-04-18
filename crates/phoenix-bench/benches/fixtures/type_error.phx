@@ -1,0 +1,8 @@
+// Benchmark fixture: type_error
+// Syntactically valid but contains a type mismatch — used to test that
+// the pipeline correctly reports semantic errors.  This fixture should
+// parse cleanly but fail during type checking.
+
+function main() {
+    let x: Int = "not an int"
+}

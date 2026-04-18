@@ -1,0 +1,5 @@
+// Benchmark fixture: empty
+// Minimal valid program — exercises only the main-function scaffolding.
+// Expected output: (none)
+
+function main() {}

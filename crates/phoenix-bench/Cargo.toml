@@ -1,0 +1,24 @@
+[package]
+name = "phoenix-bench"
+description = "Benchmarks for the Phoenix compiler pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-lexer = { path = "../phoenix-lexer" }
+phoenix-parser = { path = "../phoenix-parser" }
+phoenix-sema = { path = "../phoenix-sema" }
+phoenix-interp = { path = "../phoenix-interp" }
+phoenix-ir = { path = "../phoenix-ir" }
+phoenix-ir-interp = { path = "../phoenix-ir-interp" }
+phoenix-cranelift = { path = "../phoenix-cranelift" }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false

@@ -330,6 +330,7 @@ Phoenix is implemented in Rust as a Cargo workspace:
 | `phoenix-codegen` | Code generation backends (TypeScript, Python, Go, OpenAPI) |
 | `phoenix-lsp` | Language Server Protocol server |
 | `phoenix-driver` | CLI binary |
+| `phoenix-bench` | Benchmarks for the compiler pipeline (Criterion) |
 
 ---
 

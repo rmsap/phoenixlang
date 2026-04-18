@@ -1,0 +1,8 @@
+// Benchmark fixture: small
+// Exercises: recursion, if/else expressions, arithmetic, function calls.
+// Expected output: 55
+
+function fib(n: Int) -> Int {
+    if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
+}
+function main() { print(fib(10)) }

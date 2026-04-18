@@ -1,0 +1,7 @@
+// Benchmark fixture: parse_error
+// Deliberately invalid syntax — used to test that the pipeline correctly
+// reports parse errors.  This fixture should NEVER pass the parse stage.
+
+function main( {
+    let x: Int = 42
+}
