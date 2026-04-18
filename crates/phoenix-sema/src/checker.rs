@@ -563,7 +563,7 @@ impl Checker {
                     .as_ref()
                     .map(|t| this.resolve_type_expr(t))
                     .unwrap_or(Type::Void);
-                this.current_return_type = Some(return_type);
+                this.current_return_type = Some(return_type.clone());
                 this.scopes.push();
 
                 // Build proper self type with TypeVar args for generic types
@@ -601,6 +601,7 @@ impl Checker {
                 }
 
                 this.check_block(&func.body);
+                this.validate_implicit_return(func, &return_type);
                 this.scopes.pop();
                 this.current_return_type = None;
             });

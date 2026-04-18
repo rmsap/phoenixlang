@@ -15,7 +15,19 @@ Move from interpretation to native code generation. This is what makes Phoenix a
 
 ## 2.2 Native Compilation (Cranelift)
 
-**Status: In progress.** The `phoenix-cranelift` crate translates Phoenix IR to Cranelift IR and produces native executables via `cranelift-object` + system linker. The `phoenix-runtime` crate provides a small static library linked into every compiled binary (print, toString, string comparison and concatenation, heap allocation, panic handler). Use `phoenix build <file.phx>` to compile. Value types (Int, Float, Bool), strings, structs (including String fields), enums (including String variant fields), pattern matching, closures (including String captures), and direct/indirect function calls all work. Lists, Maps, and most builtin methods are not yet supported in compiled mode — use `phoenix run-ir` for full feature coverage. All memory is currently leaked (no GC); compiled binaries are not suitable for long-running processes. Next step: builtin method support, then collections.
+**Status: In progress.** The `phoenix-cranelift` crate translates Phoenix IR to Cranelift IR and produces native executables via `cranelift-object` + system linker. The `phoenix-runtime` crate provides a small static library linked into every compiled binary. Use `phoenix build <file.phx>` to compile. Supported features:
+
+- Value types (Int, Float, Bool), strings, structs (including String fields)
+- Enums (including String variant fields), pattern matching
+- `for x in list` iteration over `List<T>` collections
+- Closures (including String captures), direct and indirect function calls
+- All string methods (including `split`)
+- `List<T>` with all functional methods (map, filter, reduce, find, any, all, flatMap, sortBy, first, last, contains, take, drop). Note: `sortBy` uses O(n^2) insertion sort — acceptable for small lists, merge sort planned.
+- `Map<K, V>` with all methods (get, set, contains, remove, keys, values, length)
+- `Option<T>` with combinators (unwrap, unwrapOr, isSome, isNone, map, andThen, orElse, filter, okOr, unwrapOrElse). See [known issues](../../docs/known-issues.md) for `okOr` limitation.
+- `Result<T, E>` with combinators (unwrap, unwrapOr, isOk, isErr, map, andThen, orElse, mapErr, unwrapOrElse)
+
+All memory is currently leaked (no GC); compiled binaries are not suitable for long-running processes. Next step: garbage collection, then WebAssembly target.
 
 - Translate Phoenix IR to Cranelift IR
 - Produce native executables via `cranelift-object` + system linker
@@ -25,14 +37,14 @@ Move from interpretation to native code generation. This is what makes Phoenix a
 
 ## 2.3 Runtime Library (expand)
 
-A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix-runtime/) crate (static library linked into compiled binaries). It currently provides `print` (all value types + strings), `toString`, string comparison and concatenation, heap allocation (`phx_alloc` via `malloc`, no GC), and panic/abort. This section covers extending it into a full runtime.
+A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix-runtime/) crate (static library linked into compiled binaries). It currently provides `print` (all value types + strings), `toString`, string comparison and concatenation, all string methods, heap allocation (`phx_alloc` via `malloc`, no GC), panic/abort, `List<T>` data structures (alloc, get, push, contains, take, drop), `String.split` (returns `List<String>`), and `Map<K, V>` data structures (alloc, get, set, remove, contains, keys, values). This section covers extending it into a full runtime.
 
 - Garbage collector (tracing GC or reference-counted — TBD during compiler development)
 - String implementation (UTF-8, immutable by default) — basic ops already in `phoenix-runtime`
 - Panic/abort handler — already in `phoenix-runtime`
 - Built-in function implementations (`print`, `toString`) — already in `phoenix-runtime`
-- Collection runtime support (List, Map data structures with dynamic resizing)
-- Builtin method implementations (String.*, List.*, Map.*, Option.*, Result.*)
+- Collection runtime support (List, Map data structures with dynamic resizing) — **basic implementation complete** (`list_methods.rs`, `map_methods.rs`); map lookup is currently O(n) linear scan — hash-based implementation planned
+- Builtin method implementations (String.*, List.*, Map.*, Option.*, Result.*) — **complete** in compiled mode; closure-based list methods (map, filter, reduce, etc.) are compiled inline as Cranelift loops (`list_methods_closure.rs` for single-loop methods — map, filter, find, any, all, reduce; `list_methods_complex.rs` for nested-loop methods — flatMap, sortBy)
 
 ## 2.4 WebAssembly Target
 

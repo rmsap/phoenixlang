@@ -84,17 +84,18 @@ impl<'a> LoweringContext<'a> {
                 VarBinding::Mutable(slot, ty) => self.emit(Op::Load(slot), ty, Some(ident.span)),
             }
         } else if ident.name == "None" {
-            // Built-in Option::None — emit as a zero-field struct so that
-            // EnumDiscriminant and format() work uniformly with Some().
+            // Built-in Option::None — emit as enum variant (discriminant 1).
             self.emit(
-                Op::StructAlloc("None".to_string(), Vec::new()),
-                IrType::StructRef("None".to_string()),
+                Op::EnumAlloc(crate::types::OPTION_ENUM.to_string(), 1, Vec::new()),
+                IrType::EnumRef(crate::types::OPTION_ENUM.to_string()),
                 Some(ident.span),
             )
         } else {
-            // Unknown variable — emit a placeholder constant.
-            // This shouldn't happen if sema passed, but be defensive.
-            self.emit(Op::ConstI64(0), IrType::I64, Some(ident.span))
+            // Unknown variable — sema should have caught this.
+            unreachable!(
+                "unknown identifier `{}` at {:?} — sema should have rejected this",
+                ident.name, ident.span
+            )
         }
     }
 
@@ -113,13 +114,7 @@ impl<'a> LoweringContext<'a> {
         let rhs = self.lower_expr(&binary.right);
 
         // Determine the operand type from the left operand's sema type.
-        let left_type = self
-            .source_type(&binary.left.span())
-            .cloned()
-            .unwrap_or_else(|| {
-                debug_assert!(false, "missing sema type for binary left operand");
-                Type::Int
-            });
+        let left_type = self.require_source_type(&binary.left.span());
 
         let op = match (&left_type, binary.op) {
             // Int arithmetic
@@ -255,13 +250,7 @@ impl<'a> LoweringContext<'a> {
 
         match unary.op {
             UnaryOp::Neg => {
-                let operand_type = self
-                    .source_type(&unary.operand.span())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        debug_assert!(false, "missing sema type for unary operand");
-                        Type::Int
-                    });
+                let operand_type = self.require_source_type(&unary.operand.span());
                 match operand_type {
                     Type::Float => self.emit(Op::FNeg(operand), IrType::F64, span),
                     _ => self.emit(Op::INeg(operand), IrType::I64, span),
@@ -275,24 +264,30 @@ impl<'a> LoweringContext<'a> {
     fn lower_call(&mut self, call: &CallExpr) -> ValueId {
         let span = Some(call.span);
 
-        // Lower arguments.
-        let args: Vec<ValueId> = call.args.iter().map(|a| self.lower_expr(a)).collect();
-        // TODO: handle named arguments by reordering based on function signature
+        // Lower positional arguments.
+        let positional: Vec<ValueId> = call.args.iter().map(|a| self.lower_expr(a)).collect();
+        // Lower named arguments (values only — placement is deferred until we
+        // know the callee's parameter names).
+        let named: Vec<(String, ValueId)> = call
+            .named_args
+            .iter()
+            .map(|(name, expr)| (name.clone(), self.lower_expr(expr)))
+            .collect();
 
         // Determine the callee.
         if let Expr::Ident(ident) = &call.callee {
-            // Check for built-in functions.
+            // Check for built-in functions (no named-arg support).
             match ident.name.as_str() {
                 "print" => {
                     return self.emit(
-                        Op::BuiltinCall("print".to_string(), args),
+                        Op::BuiltinCall("print".to_string(), positional),
                         IrType::Void,
                         span,
                     );
                 }
                 "toString" => {
                     return self.emit(
-                        Op::BuiltinCall("toString".to_string(), args),
+                        Op::BuiltinCall("toString".to_string(), positional),
                         IrType::StringRef,
                         span,
                     );
@@ -303,6 +298,7 @@ impl<'a> LoweringContext<'a> {
             // Check for a known function.
             if let Some(&func_id) = self.module.function_index.get(&ident.name) {
                 let result_type = self.expr_type(&call.span);
+                let args = self.merge_call_args(func_id, &positional, &named);
                 return self.emit(Op::Call(func_id, args), result_type, span);
             }
 
@@ -317,7 +313,7 @@ impl<'a> LoweringContext<'a> {
             {
                 let result_type = IrType::EnumRef(enum_name.clone());
                 return self.emit(
-                    Op::EnumAlloc(enum_name.clone(), idx as u32, args),
+                    Op::EnumAlloc(enum_name.clone(), idx as u32, positional),
                     result_type,
                     span,
                 );
@@ -326,14 +322,68 @@ impl<'a> LoweringContext<'a> {
             // Check for a struct constructor (e.g. `Point(1, 2)` parsed as a call).
             if self.module.struct_layouts.contains_key(&ident.name) {
                 let result_type = IrType::StructRef(ident.name.clone());
-                return self.emit(Op::StructAlloc(ident.name.clone(), args), result_type, span);
+                return self.emit(
+                    Op::StructAlloc(ident.name.clone(), positional),
+                    result_type,
+                    span,
+                );
             }
         }
 
         // Indirect call through a closure value.
         let callee_val = self.lower_expr(&call.callee);
         let result_type = self.expr_type(&call.span);
-        self.emit(Op::CallIndirect(callee_val, args), result_type, span)
+        self.emit(Op::CallIndirect(callee_val, positional), result_type, span)
+    }
+
+    /// Merge positional and named arguments into a single argument list
+    /// ordered by the callee's parameter names.
+    ///
+    /// Positional args fill slots `0..n`, then named args are placed into
+    /// their corresponding parameter slots by name.  If a named arg
+    /// targets a slot already filled by a positional arg, the named arg
+    /// wins (sema should prevent this overlap).
+    ///
+    /// All parameter slots must be filled after merging — unfilled slots
+    /// indicate a sema bug (no default parameter values exist in the IR).
+    fn merge_call_args(
+        &self,
+        func_id: crate::instruction::FuncId,
+        positional: &[ValueId],
+        named: &[(String, ValueId)],
+    ) -> Vec<ValueId> {
+        if named.is_empty() {
+            return positional.to_vec();
+        }
+        let param_names = &self.module.functions[func_id.0 as usize].param_names;
+        let total = param_names.len();
+        let mut slots: Vec<Option<ValueId>> = vec![None; total];
+
+        // Fill positional args.
+        for (i, val) in positional.iter().enumerate() {
+            if i < total {
+                slots[i] = Some(*val);
+            }
+        }
+
+        // Fill named args by matching parameter names.
+        for (name, val) in named {
+            if let Some(idx) = param_names.iter().position(|p| p == name) {
+                slots[idx] = Some(*val);
+            }
+        }
+
+        // Collect — flatten drops None, which means unfilled slots are
+        // silently skipped.  The debug_assert catches this in test builds.
+        let result: Vec<ValueId> = slots.into_iter().flatten().collect();
+        debug_assert_eq!(
+            result.len(),
+            total,
+            "merge_call_args: {} of {} slots filled — sema should ensure all params are covered",
+            result.len(),
+            total
+        );
+        result
     }
 
     /// Lower a variable assignment.
@@ -358,10 +408,7 @@ impl<'a> LoweringContext<'a> {
         let obj_type = self
             .source_type(&fa.object.span())
             .cloned()
-            .unwrap_or_else(|| {
-                debug_assert!(false, "missing sema type for field assignment object");
-                Type::Void
-            });
+            .unwrap_or_else(|| unreachable!("missing sema type for field assignment object"));
         if let Type::Named(ref struct_name) = obj_type
             && let Some(layout) = self.module.struct_layouts.get(struct_name).cloned()
             && let Some(idx) = layout.iter().position(|(name, _)| *name == fa.field)
@@ -380,10 +427,7 @@ impl<'a> LoweringContext<'a> {
         let obj_type = self
             .source_type(&fa.object.span())
             .cloned()
-            .unwrap_or_else(|| {
-                debug_assert!(false, "missing sema type for field access object");
-                Type::Void
-            });
+            .unwrap_or_else(|| unreachable!("missing sema type for field access object"));
 
         if let Type::Named(ref struct_name) = obj_type
             && let Some(layout) = self.module.struct_layouts.get(struct_name).cloned()
@@ -393,15 +437,11 @@ impl<'a> LoweringContext<'a> {
             return self.emit(Op::StructGetField(obj, idx as u32), field_type, span);
         }
 
-        // Fallback: struct layout lookup failed — the object may be a
-        // generic type or type alias that sema resolved differently.
-        debug_assert!(
-            false,
+        // Struct layout lookup failed — sema should have caught this.
+        unreachable!(
             "field access on unknown struct layout: field `{}` on type {:?}",
             fa.field, obj_type
-        );
-        let result_type = self.expr_type(&fa.span);
-        self.emit(Op::StructGetField(obj, 0), result_type, span)
+        )
     }
 
     /// Lower a method call.
@@ -413,10 +453,7 @@ impl<'a> LoweringContext<'a> {
         let obj_type = self
             .source_type(&mc.object.span())
             .cloned()
-            .unwrap_or_else(|| {
-                debug_assert!(false, "missing sema type for method call object");
-                Type::Void
-            });
+            .unwrap_or_else(|| unreachable!("missing sema type for method call object"));
 
         // Determine the type name for method lookup.
         let type_name = match &obj_type {
@@ -677,27 +714,27 @@ impl<'a> LoweringContext<'a> {
         let disc = self.emit(Op::EnumDiscriminant(operand), IrType::I64, span);
 
         // Determine if this is Result or Option from the sema type.
-        let operand_type = self
-            .source_type(&try_expr.operand.span())
-            .cloned()
-            .unwrap_or(Type::Void);
+        let operand_type = self.require_source_type(&try_expr.operand.span());
 
         let (ok_index, unwrap_type) = match &operand_type {
-            Type::Generic(name, args) if name == "Result" => {
+            Type::Generic(name, args) if name == crate::types::RESULT_ENUM => {
                 let inner = args
                     .first()
                     .map(|t| self.lower_type(t))
                     .unwrap_or(IrType::Void);
                 (0i64, inner) // Ok is variant 0
             }
-            Type::Generic(name, args) if name == "Option" => {
+            Type::Generic(name, args) if name == crate::types::OPTION_ENUM => {
                 let inner = args
                     .first()
                     .map(|t| self.lower_type(t))
                     .unwrap_or(IrType::Void);
                 (0i64, inner) // Some is variant 0
             }
-            _ => (0, IrType::Void),
+            _ => unreachable!(
+                "? operator applied to non-Result/Option type {:?} — sema should reject this",
+                operand_type
+            ),
         };
 
         let ok_const = self.emit(Op::ConstI64(ok_index), IrType::I64, span);
@@ -718,7 +755,7 @@ impl<'a> LoweringContext<'a> {
         self.switch_to_block(unwrap_block);
         let unwrapped = self.emit(
             Op::EnumGetField(operand, ok_index as u32, 0),
-            unwrap_type,
+            unwrap_type.clone(),
             span,
         );
 
@@ -726,14 +763,17 @@ impl<'a> LoweringContext<'a> {
         let continue_block = self.create_block();
         self.terminate(Terminator::Jump {
             target: continue_block,
-            args: Vec::new(),
+            args: vec![unwrapped],
         });
 
         self.switch_to_block(early_return_block);
         self.terminate(Terminator::Return(Some(operand)));
 
+        // Merge: receive the unwrapped value via block parameter so that
+        // the definition properly dominates all uses in continue_block.
+        let result = self.add_block_param(continue_block, unwrap_type);
         self.switch_to_block(continue_block);
-        unwrapped
+        result
     }
 
     /// Emit an equality comparison appropriate for the given source type.

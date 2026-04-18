@@ -6,6 +6,16 @@
 
 use std::fmt;
 
+/// Sentinel name used in [`IrType::StructRef`] to represent an unresolved
+/// generic type parameter.  The concrete type is determined at each use site
+/// via type inference or monomorphization.
+pub const GENERIC_PLACEHOLDER: &str = "__generic";
+
+/// The name of the built-in `Option` enum in the IR.
+pub const OPTION_ENUM: &str = "Option";
+/// The name of the built-in `Result` enum in the IR.
+pub const RESULT_ENUM: &str = "Result";
+
 /// A type in the IR.
 ///
 /// Value types (`I64`, `F64`, `Bool`) are passed by copy and live in
@@ -56,6 +66,12 @@ impl IrType {
     /// Returns `true` if this is a reference type (GC-managed heap pointer).
     pub fn is_ref_type(&self) -> bool {
         !self.is_value_type()
+    }
+
+    /// Returns `true` if this type is the [`GENERIC_PLACEHOLDER`] sentinel,
+    /// representing an unresolved generic type parameter.
+    pub fn is_generic_placeholder(&self) -> bool {
+        matches!(self, IrType::StructRef(n) if n == GENERIC_PLACEHOLDER)
     }
 }
 

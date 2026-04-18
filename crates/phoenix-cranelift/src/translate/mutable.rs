@@ -27,7 +27,7 @@ pub(super) fn translate_mutable(
 ) -> Result<Vec<Value>, CompileError> {
     match op {
         Op::Alloca(ty) => {
-            let slot_size = (slots_for_type(ty) * 8) as u32;
+            let slot_size = (slots_for_type(ty) * super::layout::SLOT_SIZE) as u32;
             let data = StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 0);
             let slot = builder.create_sized_stack_slot(data);
             let addr = builder.ins().stack_addr(POINTER_TYPE, slot, 0);
@@ -41,7 +41,12 @@ pub(super) fn translate_mutable(
                 match &ty {
                     IrType::StringRef => {
                         let ptr_val = builder.ins().load(POINTER_TYPE, MemFlags::new(), addr, 0);
-                        let len_val = builder.ins().load(cl::I64, MemFlags::new(), addr, 8);
+                        let len_val = builder.ins().load(
+                            cl::I64,
+                            MemFlags::new(),
+                            addr,
+                            super::layout::SLOT_SIZE as i32,
+                        );
                         Ok(vec![ptr_val, len_val])
                     }
                     _ => {
@@ -64,7 +69,12 @@ pub(super) fn translate_mutable(
                 match &ty {
                     IrType::StringRef => {
                         builder.ins().store(MemFlags::new(), vals[0], addr, 0);
-                        builder.ins().store(MemFlags::new(), vals[1], addr, 8);
+                        builder.ins().store(
+                            MemFlags::new(),
+                            vals[1],
+                            addr,
+                            super::layout::SLOT_SIZE as i32,
+                        );
                     }
                     _ => {
                         builder.ins().store(MemFlags::new(), vals[0], addr, 0);

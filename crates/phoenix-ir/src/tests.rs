@@ -1,6 +1,7 @@
 //! Integration tests for IR lowering.
 
 use crate::lower;
+use crate::types::{OPTION_ENUM, RESULT_ENUM};
 use crate::verify;
 use phoenix_common::span::SourceId;
 use phoenix_lexer::lexer::tokenize;
@@ -841,5 +842,194 @@ fn lower_variable_shadowing() {
     );
     // The outer `x` should survive the inner scope — the implicit return
     // should use the outer x (v0), not the shadowed x.
+    insta::assert_snapshot!(ir);
+}
+
+/// Option and Result enum layouts are registered even in minimal programs.
+#[test]
+fn builtin_enum_layouts_always_registered() {
+    let module = lower_source(
+        r#"
+function main() {
+    print(42)
+}
+"#,
+    );
+    // Option and Result layouts should be registered as built-in enums.
+    assert!(
+        module.enum_layouts.contains_key(OPTION_ENUM),
+        "Option layout should be registered"
+    );
+    assert!(
+        module.enum_layouts.contains_key(RESULT_ENUM),
+        "Result layout should be registered"
+    );
+    // Option has two variants: Some and None.
+    let option_layout = &module.enum_layouts[OPTION_ENUM];
+    assert_eq!(option_layout.len(), 2, "Option should have 2 variants");
+    assert_eq!(option_layout[0].0, "Some");
+    assert_eq!(option_layout[1].0, "None");
+    // Result has two variants: Ok and Err.
+    let result_layout = &module.enum_layouts[RESULT_ENUM];
+    assert_eq!(result_layout.len(), 2, "Result should have 2 variants");
+    assert_eq!(result_layout[0].0, "Ok");
+    assert_eq!(result_layout[1].0, "Err");
+}
+
+/// Option and Result use EnumAlloc (not StructAlloc) in IR output.
+#[test]
+fn option_result_use_enum_alloc_in_ir() {
+    let ir = lower_to_string(
+        r#"
+function main() {
+    let x: Option<Int> = Some(42)
+    let y: Result<Int, String> = Ok(1)
+}
+"#,
+    );
+    // Should use enum_alloc, not struct_alloc, for Option/Result.
+    assert!(
+        ir.contains("enum_alloc @Option"),
+        "Some should lower to enum_alloc @Option, got:\n{ir}"
+    );
+    assert!(
+        ir.contains("enum_alloc @Result"),
+        "Ok should lower to enum_alloc @Result, got:\n{ir}"
+    );
+    assert!(
+        !ir.contains("struct_alloc @Some"),
+        "Some should NOT use struct_alloc, got:\n{ir}"
+    );
+    assert!(
+        !ir.contains("struct_alloc @Ok"),
+        "Ok should NOT use struct_alloc, got:\n{ir}"
+    );
+}
+
+/// Bare `None` must lower to `enum_alloc @Option:1()`,
+/// not `struct_alloc @None`.
+#[test]
+fn bare_none_uses_enum_alloc() {
+    let ir = lower_to_string(
+        r#"
+function main() {
+    let x: Option<Int> = None
+    print(toString(x))
+}
+"#,
+    );
+    assert!(
+        ir.contains("enum_alloc @Option:1"),
+        "bare None should lower to enum_alloc @Option:1, got:\n{ir}"
+    );
+    assert!(
+        !ir.contains("struct_alloc @None"),
+        "bare None should NOT use struct_alloc, got:\n{ir}"
+    );
+}
+
+/// Verify `Err("msg")` produces `enum_alloc @Result:1(...)`.
+#[test]
+fn err_constructor_uses_enum_alloc() {
+    let ir = lower_to_string(
+        r#"
+function main() {
+    let x: Result<Int, String> = Err("bad")
+    print(toString(x))
+}
+"#,
+    );
+    assert!(
+        ir.contains("enum_alloc @Result:1("),
+        "Err should lower to enum_alloc @Result:1(...), got:\n{ir}"
+    );
+    assert!(
+        !ir.contains("struct_alloc @Err"),
+        "Err should NOT use struct_alloc, got:\n{ir}"
+    );
+}
+
+/// Match on Option<Int> with Some(x) and None arms produces
+/// `enum_discriminant` and `enum_get_field` instructions.
+#[test]
+fn match_on_option() {
+    let ir = lower_to_string(
+        r#"
+function main() -> Int {
+    let x: Option<Int> = Some(42)
+    match x {
+        Some(v) -> v
+        None -> 0
+    }
+}
+"#,
+    );
+    assert!(
+        ir.contains("enum_discriminant"),
+        "match on Option should use enum_discriminant, got:\n{ir}"
+    );
+    assert!(
+        ir.contains("enum_get_field"),
+        "match on Option should use enum_get_field for Some binding, got:\n{ir}"
+    );
+}
+
+/// Match on Result<Int, String> with Ok(x) and Err(e) arms produces
+/// `enum_discriminant` and `enum_get_field` instructions.
+#[test]
+fn match_on_result() {
+    let ir = lower_to_string(
+        r#"
+function main() -> Int {
+    let x: Result<Int, String> = Ok(42)
+    match x {
+        Ok(v) -> v
+        Err(e) -> 0
+    }
+}
+"#,
+    );
+    assert!(
+        ir.contains("enum_discriminant"),
+        "match on Result should use enum_discriminant, got:\n{ir}"
+    );
+    assert!(
+        ir.contains("enum_get_field"),
+        "match on Result should use enum_get_field for Ok/Err bindings, got:\n{ir}"
+    );
+}
+
+/// Try operator on Option — the `?` desugaring should check for None and
+/// return early, extracting the Some payload on the happy path.
+#[test]
+fn lower_try_operator_option() {
+    let ir = lower_to_string(
+        "function maybe() -> Option<Int> { Some(10) }
+         function main() -> Option<Int> {
+             let val: Int = maybe()?
+             Some(val + 1)
+         }",
+    );
+    assert!(
+        ir.contains("enum_discriminant"),
+        "try on Option should check discriminant, got:\n{ir}"
+    );
+}
+
+/// Snapshot test for match on Result — verifies the Err binding resolves
+/// to the correct type (`string`, not `struct.__generic`).
+#[test]
+fn match_on_result_snapshot() {
+    let ir = lower_to_string(
+        r#"
+function main() -> Int {
+    let x: Result<Int, String> = Ok(42)
+    match x {
+        Ok(v) -> v
+        Err(e) -> 0
+    }
+}
+"#,
+    );
     insta::assert_snapshot!(ir);
 }

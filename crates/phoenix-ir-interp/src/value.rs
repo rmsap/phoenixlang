@@ -2,6 +2,7 @@
 
 use phoenix_ir::instruction::FuncId;
 use phoenix_ir::module::IrModule;
+use phoenix_ir::types::{OPTION_ENUM, RESULT_ENUM};
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -73,16 +74,6 @@ impl IrValue {
             IrValue::Void => "void".to_string(),
             IrValue::Struct(data) => {
                 let data = data.borrow();
-                // Built-in variant structs (Some, None, Ok, Err) are formatted
-                // like enum variants: Name or Name(val1, val2).
-                if is_variant_struct(&data.name) {
-                    if data.fields.is_empty() {
-                        return data.name.clone();
-                    }
-                    let field_strs: Vec<String> =
-                        data.fields.iter().map(|v| v.format(module)).collect();
-                    return format!("{}({})", data.name, field_strs.join(", "));
-                }
                 // Regular structs: Name(field1: val1, field2: val2).
                 let field_strs: Vec<String> =
                     if let Some(layout) = module.struct_layouts.get(&data.name) {
@@ -152,6 +143,11 @@ impl IrValue {
 }
 
 impl PartialEq for IrValue {
+    /// Compare two values for equality.
+    ///
+    /// Float comparison uses IEEE 754 semantics: `NaN != NaN`. This means
+    /// `list.contains(NaN)` will never find a NaN element. This is by design
+    /// and matches the compiled code path.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (IrValue::Int(a), IrValue::Int(b)) => a == b,
@@ -233,48 +229,40 @@ impl fmt::Display for IrValue {
     }
 }
 
-/// Names of built-in variant structs that should be formatted like enum variants
-/// (without field names) rather than regular structs.
-const VARIANT_STRUCT_NAMES: &[&str] = &["Some", "None", "Ok", "Err"];
-
-/// Returns true if this struct name represents a built-in variant.
-pub fn is_variant_struct(name: &str) -> bool {
-    VARIANT_STRUCT_NAMES.contains(&name)
-}
-
 /// Construct an `Option::Some` IR value.
 ///
-/// The IR lowering represents `Some(x)` as `StructAlloc("Some", [x])`.
+/// The IR lowering represents `Some(x)` as `EnumAlloc(@Option, discriminant 0, [x])`.
 pub fn some_val(val: IrValue) -> IrValue {
-    IrValue::Struct(Rc::new(RefCell::new(StructData {
-        name: "Some".to_string(),
+    IrValue::EnumVariant(Rc::new(RefCell::new(EnumData {
+        enum_name: OPTION_ENUM.to_string(),
+        discriminant: 0,
         fields: vec![val],
     })))
 }
 
 /// Construct an `Option::None` IR value.
-///
-/// Both IR lowering and builtins represent `None` uniformly as
-/// `StructAlloc("None", [])`.
 pub fn none_val() -> IrValue {
-    IrValue::Struct(Rc::new(RefCell::new(StructData {
-        name: "None".to_string(),
+    IrValue::EnumVariant(Rc::new(RefCell::new(EnumData {
+        enum_name: OPTION_ENUM.to_string(),
+        discriminant: 1,
         fields: vec![],
     })))
 }
 
 /// Construct a `Result::Ok` IR value.
 pub fn ok_val(val: IrValue) -> IrValue {
-    IrValue::Struct(Rc::new(RefCell::new(StructData {
-        name: "Ok".to_string(),
+    IrValue::EnumVariant(Rc::new(RefCell::new(EnumData {
+        enum_name: RESULT_ENUM.to_string(),
+        discriminant: 0,
         fields: vec![val],
     })))
 }
 
 /// Construct a `Result::Err` IR value.
 pub fn err_val(val: IrValue) -> IrValue {
-    IrValue::Struct(Rc::new(RefCell::new(StructData {
-        name: "Err".to_string(),
+    IrValue::EnumVariant(Rc::new(RefCell::new(EnumData {
+        enum_name: RESULT_ENUM.to_string(),
+        discriminant: 1,
         fields: vec![val],
     })))
 }

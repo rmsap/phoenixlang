@@ -64,6 +64,40 @@ pub struct RuntimeFunctions {
     pub str_replace: FuncId,
     /// `phx_str_substring(ptr, len, start, end) -> (ptr, len)`.
     pub str_substring: FuncId,
+    /// `phx_str_split(ptr, len, sep_ptr, sep_len) -> list_ptr`.
+    pub str_split: FuncId,
+    // ── List runtime functions ──────────────────────────────────────
+    /// `phx_list_alloc(elem_size, count) -> list_ptr`.
+    pub list_alloc: FuncId,
+    /// `phx_list_length(list_ptr) -> i64`.
+    pub list_length: FuncId,
+    /// `phx_list_get_raw(list_ptr, index) -> elem_ptr`.
+    pub list_get_raw: FuncId,
+    /// `phx_list_push_raw(list_ptr, elem_ptr, elem_size) -> new_list_ptr`.
+    pub list_push_raw: FuncId,
+    /// `phx_list_contains(list_ptr, elem_ptr, elem_size, is_float) -> i8`.
+    pub list_contains: FuncId,
+    /// `phx_list_take(list_ptr, n) -> new_list_ptr`.
+    pub list_take: FuncId,
+    /// `phx_list_drop(list_ptr, n) -> new_list_ptr`.
+    pub list_drop: FuncId,
+    // ── Map runtime functions ───────────────────────────────────────
+    /// `phx_map_alloc(key_size, val_size, count) -> map_ptr`.
+    pub map_alloc: FuncId,
+    /// `phx_map_length(map_ptr) -> i64`.
+    pub map_length: FuncId,
+    /// `phx_map_get_raw(map_ptr, key_ptr, key_size) -> val_ptr_or_null`.
+    pub map_get_raw: FuncId,
+    /// `phx_map_set_raw(map_ptr, key_ptr, val_ptr, key_size, val_size) -> new_map_ptr`.
+    pub map_set_raw: FuncId,
+    /// `phx_map_remove_raw(map_ptr, key_ptr, key_size) -> new_map_ptr`.
+    pub map_remove_raw: FuncId,
+    /// `phx_map_contains(map_ptr, key_ptr, key_size) -> i8`.
+    pub map_contains: FuncId,
+    /// `phx_map_keys(map_ptr) -> list_ptr`.
+    pub map_keys: FuncId,
+    /// `phx_map_values(map_ptr) -> list_ptr`.
+    pub map_values: FuncId,
 }
 
 impl RuntimeFunctions {
@@ -122,6 +156,66 @@ impl RuntimeFunctions {
                 &[I64, I64],
                 call_conv,
             )?,
+            str_split: declare_func(
+                module,
+                "phx_str_split",
+                &[I64, I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            // List functions.
+            list_alloc: declare_func(module, "phx_list_alloc", &[I64, I64], &[I64], call_conv)?,
+            list_length: declare_func(module, "phx_list_length", &[I64], &[I64], call_conv)?,
+            list_get_raw: declare_func(module, "phx_list_get_raw", &[I64, I64], &[I64], call_conv)?,
+            list_push_raw: declare_func(
+                module,
+                "phx_list_push_raw",
+                &[I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            list_contains: declare_func(
+                module,
+                "phx_list_contains",
+                &[I64, I64, I64, I8],
+                &[I8],
+                call_conv,
+            )?,
+            list_take: declare_func(module, "phx_list_take", &[I64, I64], &[I64], call_conv)?,
+            list_drop: declare_func(module, "phx_list_drop", &[I64, I64], &[I64], call_conv)?,
+            // Map functions.
+            map_alloc: declare_func(module, "phx_map_alloc", &[I64, I64, I64], &[I64], call_conv)?,
+            map_length: declare_func(module, "phx_map_length", &[I64], &[I64], call_conv)?,
+            map_get_raw: declare_func(
+                module,
+                "phx_map_get_raw",
+                &[I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            map_set_raw: declare_func(
+                module,
+                "phx_map_set_raw",
+                &[I64, I64, I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            map_remove_raw: declare_func(
+                module,
+                "phx_map_remove_raw",
+                &[I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            map_contains: declare_func(
+                module,
+                "phx_map_contains",
+                &[I64, I64, I64],
+                &[I8],
+                call_conv,
+            )?,
+            map_keys: declare_func(module, "phx_map_keys", &[I64], &[I64], call_conv)?,
+            map_values: declare_func(module, "phx_map_values", &[I64], &[I64], call_conv)?,
         })
     }
 }

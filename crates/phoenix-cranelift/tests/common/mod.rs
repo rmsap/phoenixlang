@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,39 +18,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// return the captured stdout lines.
 pub fn compile_and_run(source: &str) -> Vec<String> {
     let obj_bytes = compile_to_obj(source);
-
-    // Write object to a temp file with a unique name.
-    let dir = std::env::temp_dir().join("phoenix_cranelift_tests");
-    std::fs::create_dir_all(&dir).unwrap();
-    let id = std::process::id();
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let obj_path = dir.join(format!("test_{id}_{n}.o"));
-    let exe_path = dir.join(format!("test_{id}_{n}"));
-
-    std::fs::write(&obj_path, &obj_bytes).unwrap();
-
-    // Find the runtime library.
-    let runtime_dir = phoenix_cranelift::find_runtime_lib().expect(
-        "could not find runtime lib — build it first with `cargo build -p phoenix-runtime`",
-    );
-
-    // Link.
-    let mut cmd = Command::new("cc");
-    cmd.arg("-o")
-        .arg(exe_path.to_str().unwrap())
-        .arg(obj_path.to_str().unwrap())
-        .arg(format!("-L{runtime_dir}"))
-        .arg("-lphoenix_runtime");
-
-    // Platform-specific system libraries.
-    if cfg!(target_os = "linux") {
-        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
-    } else if cfg!(target_os = "macos") {
-        cmd.arg("-lpthread").arg("-lm");
-    }
-
-    let status = cmd.status().expect("could not run linker 'cc'");
-    assert!(status.success(), "linking failed: {status}");
+    let (obj_path, exe_path) = link_binary(&obj_bytes, "test");
 
     // Run.
     let output = Command::new(exe_path.to_str().unwrap())
@@ -119,4 +88,59 @@ pub fn roundtrip(source: &str) {
 pub fn runtime_dir() -> String {
     phoenix_cranelift::find_runtime_lib()
         .expect("could not find runtime lib — build it first with `cargo build -p phoenix-runtime`")
+}
+
+/// Compile object bytes to a linked executable and return (obj_path, exe_path).
+///
+/// Shared by [`compile_and_run`] and [`expect_panic`] to avoid duplicating
+/// the linking logic (temp file creation, linker flags, platform libs).
+fn link_binary(obj_bytes: &[u8], prefix: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join("phoenix_cranelift_tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = std::process::id();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let obj_path = dir.join(format!("{prefix}_{id}_{n}.o"));
+    let exe_path = dir.join(format!("{prefix}_{id}_{n}"));
+    std::fs::write(&obj_path, obj_bytes).unwrap();
+
+    let rt_dir = runtime_dir();
+    let mut cmd = Command::new("cc");
+    cmd.arg("-o")
+        .arg(exe_path.to_str().unwrap())
+        .arg(obj_path.to_str().unwrap())
+        .arg(format!("-L{rt_dir}"))
+        .arg("-lphoenix_runtime");
+
+    // Platform-specific system libraries.
+    if cfg!(target_os = "linux") {
+        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+    } else if cfg!(target_os = "macos") {
+        cmd.arg("-lpthread").arg("-lm");
+    }
+
+    let status = cmd.status().expect("could not run linker 'cc'");
+    assert!(status.success(), "linking failed: {status}");
+    (obj_path, exe_path)
+}
+
+/// Compile a Phoenix program, link it, run it, and assert it panics with
+/// the expected message on stderr.
+pub fn expect_panic(source: &str, expected_stderr: &str) {
+    let obj_bytes = compile_to_obj(source);
+    let (obj_path, exe_path) = link_binary(&obj_bytes, "test_panic");
+
+    let output = Command::new(exe_path.to_str().unwrap())
+        .output()
+        .expect("could not run compiled binary");
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit, but binary succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_stderr),
+        "expected stderr to contain {expected_stderr:?}, got: {stderr}"
+    );
+    let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&exe_path);
 }

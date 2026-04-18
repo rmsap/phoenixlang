@@ -1,4 +1,8 @@
-//! Translation of closure allocation, function calls, and builtin calls.
+//! Translation of closure allocation, function calls, and builtin call dispatch.
+//!
+//! Core call mechanics live here (direct calls, indirect calls, closure
+//! allocation).  Builtin method calls are dispatched to domain-specific
+//! modules: `list_methods`, `map_methods`, `option_methods`, `result_methods`.
 
 use cranelift_codegen::ir::types as cl;
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
@@ -8,11 +12,11 @@ use cranelift_module::Module;
 use crate::context::CompileContext;
 use crate::error::CompileError;
 use crate::types::POINTER_TYPE;
-use phoenix_ir::instruction::{FuncId as PhxFuncId, Op, ValueId};
+use phoenix_ir::instruction::{Op, ValueId};
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::{call_runtime, load_fat_value, slots_for_type, store_fat_value};
+use super::helpers::{call_runtime, slots_for_type, store_fat_value};
 use super::{FuncState, get_val, get_val1};
 
 /// Translate a `ClosureAlloc` operation.
@@ -41,7 +45,7 @@ pub(super) fn translate_closure_alloc(
         .into_iter()
         .sum();
     let num_slots = 1 + capture_slots;
-    let size = (num_slots * 8) as i64;
+    let size = (num_slots * super::layout::SLOT_SIZE) as i64;
     let alloc_ref = ctx
         .module
         .declare_func_in_func(ctx.runtime.alloc, builder.func);
@@ -63,7 +67,7 @@ pub(super) fn translate_closure_alloc(
             state.type_map.get(cap).cloned().ok_or_else(|| {
                 CompileError::new(format!("unknown type for closure capture {cap}"))
             })?;
-        store_fat_value(builder, cap_vals, &ty, ptr, slot);
+        store_fat_value(builder, &cap_vals, &ty, ptr, slot);
         slot += slots_for_type(&ty);
     }
     Ok(vec![ptr])
@@ -75,6 +79,7 @@ pub(super) fn translate_call(
     ctx: &mut CompileContext,
     ir_module: &IrModule,
     op: &Op,
+    result_type: &IrType,
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     match op {
@@ -89,152 +94,81 @@ pub(super) fn translate_call(
             Ok(builder.inst_results(call).to_vec())
         }
         Op::CallIndirect(closure, args) => {
-            let closure_ptr = get_val1(state, *closure)?;
-            let func_ptr = builder
-                .ins()
-                .load(POINTER_TYPE, MemFlags::new(), closure_ptr, 0);
-            let closure_type = state
-                .type_map
-                .get(closure)
-                .ok_or_else(|| CompileError::new("unknown type for indirect call target"))?;
-            let (user_param_types, return_type) = match closure_type {
-                IrType::ClosureRef {
-                    param_types,
-                    return_type,
-                } => (param_types, return_type),
-                _ => return Err(CompileError::new("CallIndirect on non-closure type")),
-            };
-
-            // Try to look up the exact closure function via the ClosureAlloc
-            // that produced this value, falling back to a module-wide scan.
-            let capture_param_types = if let Some(target_fid) = state.closure_func_map.get(closure)
-            {
-                find_capture_types_by_func_id(ir_module, *target_fid, user_param_types.len())
-            } else {
-                find_closure_capture_types(ir_module, user_param_types, return_type)?
-            };
-
-            // Load captures from the closure object (slots 1..N).
-            let mut cl_args = Vec::new();
-            let mut slot = 1usize;
-            for cap_ty in &capture_param_types {
-                let vals = load_fat_value(builder, cap_ty, closure_ptr, slot)?;
-                cl_args.extend(vals);
-                slot += slots_for_type(cap_ty);
-            }
-
-            // Append user args.
+            // Collect user arguments as Cranelift values.
+            let mut user_args = Vec::new();
             for arg in args {
-                cl_args.extend(get_val(state, *arg)?);
+                user_args.extend(get_val(state, *arg)?);
             }
-
-            // Build full signature: capture params + user params.
-            let mut full_param_types = capture_param_types;
-            full_param_types.extend(user_param_types.iter().cloned());
-            let sig = crate::abi::build_signature(&full_param_types, return_type, ctx.call_conv);
-            let sig_ref = builder.import_signature(sig);
-
-            let call = builder.ins().call_indirect(sig_ref, func_ptr, &cl_args);
-            Ok(builder.inst_results(call).to_vec())
+            // Delegate to the shared closure-calling helper.
+            super::closure_call::call_closure(builder, ctx, ir_module, *closure, &user_args, state)
         }
-        Op::BuiltinCall(name, args) => translate_builtin(builder, ctx, name, args, state),
+        Op::BuiltinCall(name, args) => {
+            translate_builtin(builder, ctx, ir_module, name, args, state, result_type)
+        }
         _ => unreachable!(),
     }
 }
 
 /// Translate a builtin call (print, toString, method calls).
+///
+/// Dispatches to domain-specific modules for collection and monad methods.
 fn translate_builtin(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
+    ir_module: &IrModule,
     name: &str,
     args: &[ValueId],
     state: &FuncState,
+    result_type: &IrType,
 ) -> Result<Vec<Value>, CompileError> {
     match name {
-        "print" => {
-            let arg = args[0];
-            let arg_type = state
-                .type_map
-                .get(&arg)
-                .ok_or_else(|| CompileError::new("unknown type for print argument"))?;
-            match arg_type {
-                IrType::I64 => {
-                    call_runtime(
-                        builder,
-                        ctx,
-                        ctx.runtime.print_i64,
-                        &[get_val1(state, arg)?],
-                    );
-                }
-                IrType::F64 => {
-                    call_runtime(
-                        builder,
-                        ctx,
-                        ctx.runtime.print_f64,
-                        &[get_val1(state, arg)?],
-                    );
-                }
-                IrType::Bool => {
-                    call_runtime(
-                        builder,
-                        ctx,
-                        ctx.runtime.print_bool,
-                        &[get_val1(state, arg)?],
-                    );
-                }
-                IrType::StringRef => {
-                    let vals = get_val(state, arg)?;
-                    call_runtime(builder, ctx, ctx.runtime.print_str, &[vals[0], vals[1]]);
-                }
-                _ => {
-                    return Err(CompileError::new(format!(
-                        "print not yet supported for type {arg_type} in compiled mode"
-                    )));
-                }
-            }
-            Ok(vec![])
-        }
-        "toString" => {
-            let arg = args[0];
-            let arg_type = state
-                .type_map
-                .get(&arg)
-                .ok_or_else(|| CompileError::new("unknown type for toString argument"))?;
-            match arg_type {
-                IrType::I64 => Ok(call_runtime(
-                    builder,
-                    ctx,
-                    ctx.runtime.i64_to_str,
-                    &[get_val1(state, arg)?],
-                )),
-                IrType::F64 => Ok(call_runtime(
-                    builder,
-                    ctx,
-                    ctx.runtime.f64_to_str,
-                    &[get_val1(state, arg)?],
-                )),
-                IrType::Bool => Ok(call_runtime(
-                    builder,
-                    ctx,
-                    ctx.runtime.bool_to_str,
-                    &[get_val1(state, arg)?],
-                )),
-                IrType::StringRef => {
-                    // toString on a string is identity.
-                    get_val(state, arg)
-                }
-                _ => Err(CompileError::new(format!(
-                    "toString not yet supported for type {arg_type} in compiled mode"
-                ))),
-            }
-        }
-        // String methods are dispatched by a dedicated function.
+        "print" => translate_print(builder, ctx, args, state),
+        "toString" => translate_to_string(builder, ctx, args, state),
+        // String methods.
         _ if name.starts_with("String.") => translate_string_method(
             builder,
             ctx,
             name.strip_prefix("String.").unwrap(),
             args,
             state,
+        ),
+        // List methods.
+        _ if name.starts_with("List.") => super::list_methods::translate_list_method(
+            builder,
+            ctx,
+            ir_module,
+            name.strip_prefix("List.").unwrap(),
+            args,
+            state,
+        ),
+        // Map methods.
+        _ if name.starts_with("Map.") => super::map_methods::translate_map_method(
+            builder,
+            ctx,
+            ir_module,
+            name.strip_prefix("Map.").unwrap(),
+            args,
+            state,
+        ),
+        // Option methods.
+        _ if name.starts_with("Option.") => super::option_methods::translate_option_method(
+            builder,
+            ctx,
+            ir_module,
+            name.strip_prefix("Option.").unwrap(),
+            args,
+            state,
+            result_type,
+        ),
+        // Result methods.
+        _ if name.starts_with("Result.") => super::result_methods::translate_result_method(
+            builder,
+            ctx,
+            ir_module,
+            name.strip_prefix("Result.").unwrap(),
+            args,
+            state,
+            result_type,
         ),
         _ => Err(CompileError::new(format!(
             "builtin '{name}' not yet supported in compiled mode"
@@ -244,9 +178,7 @@ fn translate_builtin(
 
 /// Translate a `String.*` builtin method call.
 ///
-/// Each method receives the string as `args[0]` (a fat `(ptr, len)` pair)
-/// plus any additional arguments.  Methods are grouped by calling pattern
-/// to reduce repetition.
+/// String values are represented as fat `(ptr, len)` pairs in Cranelift.
 fn translate_string_method(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
@@ -257,7 +189,6 @@ fn translate_string_method(
     let recv = get_val(state, args[0])?;
 
     match method {
-        // Receiver-only methods: (ptr, len) -> result.
         "length" | "trim" | "toLowerCase" | "toUpperCase" => {
             let func = match method {
                 "length" => ctx.runtime.str_length,
@@ -268,7 +199,6 @@ fn translate_string_method(
             };
             Ok(call_runtime(builder, ctx, func, &[recv[0], recv[1]]))
         }
-        // Receiver + one string argument: (p1, l1, p2, l2) -> result.
         "contains" | "startsWith" | "endsWith" | "indexOf" => {
             let arg = get_val(state, args[1])?;
             let func = match method {
@@ -285,7 +215,6 @@ fn translate_string_method(
                 &[recv[0], recv[1], arg[0], arg[1]],
             ))
         }
-        // replace(old, new): two string arguments.
         "replace" => {
             let from = get_val(state, args[1])?;
             let to = get_val(state, args[2])?;
@@ -296,7 +225,6 @@ fn translate_string_method(
                 &[recv[0], recv[1], from[0], from[1], to[0], to[1]],
             ))
         }
-        // substring(start, end): two scalar arguments.
         "substring" => {
             let start = get_val1(state, args[1])?;
             let end = get_val1(state, args[2])?;
@@ -307,79 +235,105 @@ fn translate_string_method(
                 &[recv[0], recv[1], start, end],
             ))
         }
-        // `split` returns a List<String>, which requires List support in the
-        // compiled backend (not yet implemented).  Other unknown methods also
-        // fall through here.
+        "split" => {
+            let sep = get_val(state, args[1])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.str_split,
+                &[recv[0], recv[1], sep[0], sep[1]],
+            ))
+        }
         _ => Err(CompileError::new(format!(
             "string method '{method}' not yet supported in compiled mode"
         ))),
     }
 }
 
-/// Find the capture parameter types for a closure function by its `FuncId`.
-///
-/// The closure function's parameters are `[captures..., user_params...]`.
-/// Given the number of user parameters, the capture types are the prefix.
-fn find_capture_types_by_func_id(
-    ir_module: &IrModule,
-    func_id: PhxFuncId,
-    user_param_count: usize,
-) -> Vec<IrType> {
-    for func in &ir_module.functions {
-        if func.id == func_id {
-            if func.param_types.len() >= user_param_count {
-                let capture_count = func.param_types.len() - user_param_count;
-                return func.param_types[..capture_count].to_vec();
-            }
-            break;
+/// Translate a `print(value)` builtin call.
+fn translate_print(
+    builder: &mut FunctionBuilder,
+    ctx: &mut CompileContext,
+    args: &[ValueId],
+    state: &FuncState,
+) -> Result<Vec<Value>, CompileError> {
+    let arg = args[0];
+    let arg_type = state
+        .type_map
+        .get(&arg)
+        .ok_or_else(|| CompileError::new("unknown type for print argument"))?;
+    match arg_type {
+        IrType::I64 => {
+            call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.print_i64,
+                &[get_val1(state, arg)?],
+            );
+        }
+        IrType::F64 => {
+            call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.print_f64,
+                &[get_val1(state, arg)?],
+            );
+        }
+        IrType::Bool => {
+            call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.print_bool,
+                &[get_val1(state, arg)?],
+            );
+        }
+        IrType::StringRef => {
+            let vals = get_val(state, arg)?;
+            call_runtime(builder, ctx, ctx.runtime.print_str, &[vals[0], vals[1]]);
+        }
+        _ => {
+            return Err(CompileError::new(format!(
+                "print not yet supported for type {arg_type} in compiled mode"
+            )));
         }
     }
-    Vec::new()
+    Ok(vec![])
 }
 
-/// Find the capture parameter types for a closure by scanning IR functions
-/// for matching user parameter types and return type.
-///
-/// This is a fallback heuristic used when the closure value comes through
-/// a block parameter (phi) and the exact `FuncId` is not known.  Returns
-/// an error if multiple closures match with different capture layouts.
-fn find_closure_capture_types(
-    ir_module: &IrModule,
-    user_param_types: &[IrType],
-    return_type: &IrType,
-) -> Result<Vec<IrType>, CompileError> {
-    let mut candidates: Vec<Vec<IrType>> = Vec::new();
-    for func in &ir_module.functions {
-        if !func.name.starts_with("__closure_") {
-            continue;
-        }
-        if func.return_type != *return_type {
-            continue;
-        }
-        if func.param_types.len() < user_param_types.len() {
-            continue;
-        }
-        let capture_count = func.param_types.len() - user_param_types.len();
-        let suffix = &func.param_types[capture_count..];
-        if suffix == user_param_types {
-            candidates.push(func.param_types[..capture_count].to_vec());
-        }
-    }
-
-    if candidates.is_empty() {
-        // No captures found — the closure has no captured variables.
-        return Ok(Vec::new());
-    }
-
-    // Check that all matching closures agree on capture types.
-    let first = &candidates[0];
-    if candidates.iter().all(|c| c == first) {
-        Ok(candidates.into_iter().next().unwrap())
-    } else {
-        Err(CompileError::new(
-            "ambiguous indirect call: multiple closures with the same user signature \
-             but different captures. This pattern requires ClosureAlloc tracking \
-             (pass closures directly, not through block parameters).",
-        ))
+/// Translate a `toString(value)` builtin call.
+fn translate_to_string(
+    builder: &mut FunctionBuilder,
+    ctx: &mut CompileContext,
+    args: &[ValueId],
+    state: &FuncState,
+) -> Result<Vec<Value>, CompileError> {
+    let arg = args[0];
+    let arg_type = state
+        .type_map
+        .get(&arg)
+        .ok_or_else(|| CompileError::new("unknown type for toString argument"))?;
+    match arg_type {
+        IrType::I64 => Ok(call_runtime(
+            builder,
+            ctx,
+            ctx.runtime.i64_to_str,
+            &[get_val1(state, arg)?],
+        )),
+        IrType::F64 => Ok(call_runtime(
+            builder,
+            ctx,
+            ctx.runtime.f64_to_str,
+            &[get_val1(state, arg)?],
+        )),
+        IrType::Bool => Ok(call_runtime(
+            builder,
+            ctx,
+            ctx.runtime.bool_to_str,
+            &[get_val1(state, arg)?],
+        )),
+        IrType::StringRef => get_val(state, arg),
+        _ => Err(CompileError::new(format!(
+            "toString not yet supported for type {arg_type} in compiled mode"
+        ))),
     }
 }

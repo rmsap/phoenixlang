@@ -1,0 +1,28 @@
+---
+source: crates/phoenix-ir/src/tests.rs
+expression: ir
+---
+func @main() -> i64 {
+  bb0:
+    v0 = const_i64 42
+    v1 = enum_alloc @Result:0(v0)
+    v3 = enum_discriminant v1
+    v4 = const_i64 0
+    v5 = ieq v3, v4
+    branch v5, bb2, bb4
+  bb1(v2: i64):
+    return v2
+  bb2:
+    v6 = enum_get_field v1, variant=0, 0
+    jump bb1(v6)
+  bb3:
+    v9 = enum_get_field v1, variant=1, 0
+    v10 = const_i64 0
+    jump bb1(v10)
+  bb4:
+    v7 = const_i64 1
+    v8 = ieq v3, v7
+    branch v8, bb3, bb5
+  bb5:
+    unreachable
+}

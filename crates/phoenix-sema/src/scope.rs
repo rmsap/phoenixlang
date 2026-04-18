@@ -60,6 +60,10 @@ impl ScopeStack {
 
     /// Pops the innermost scope, discarding all variable bindings it contains.
     pub fn pop(&mut self) {
+        debug_assert!(
+            self.scopes.len() > 1,
+            "scope underflow: attempted to pop the global scope"
+        );
         self.scopes.pop();
     }
 

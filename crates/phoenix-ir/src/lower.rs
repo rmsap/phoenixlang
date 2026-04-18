@@ -47,10 +47,10 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
                 IrType::EnumRef(name.clone())
             } else {
                 // Unknown named type — treat as opaque struct reference.
-                // This can happen with type aliases or forward declarations
-                // that sema resolved but aren't in the struct/enum registries.
-                debug_assert!(false, "unknown named type in IR lowering: {name}");
-                IrType::StructRef(name.clone())
+                // This should not happen: sema resolves all named types.
+                // Panic to catch bugs early rather than silently emitting
+                // a StructRef that may cause downstream miscompilation.
+                unreachable!("unknown named type in IR lowering: {name}")
             }
         }
         Type::Function(params, ret) => IrType::ClosureRef {
@@ -60,7 +60,7 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
         Type::TypeVar(_) => {
             // Generic type variable — use opaque struct ref for now.
             // Monomorphization will specialize this later.
-            IrType::StructRef("__generic".to_string())
+            IrType::StructRef(crate::types::GENERIC_PLACEHOLDER.to_string())
         }
         Type::Generic(name, args) => match name.as_str() {
             "List" => {
@@ -81,7 +81,7 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
                     .unwrap_or(IrType::Void);
                 IrType::MapRef(Box::new(key), Box::new(val))
             }
-            "Option" | "Result" => {
+            crate::types::OPTION_ENUM | crate::types::RESULT_ENUM => {
                 // Option and Result are enums at the IR level
                 IrType::EnumRef(name.clone())
             }
@@ -95,9 +95,10 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
             }
         },
         Type::Error => {
-            // Should never reach IR lowering — type errors should be caught
-            // by sema.  Use Void as a safe fallback.
-            IrType::Void
+            // Should never reach IR lowering — type errors must be caught
+            // by sema.  Panic here to catch bugs early rather than silently
+            // producing Void, which could cause subtle downstream issues.
+            unreachable!("Type::Error reached IR lowering — sema should have caught this")
         }
     }
 }
@@ -110,16 +111,6 @@ pub(crate) enum VarBinding {
     /// A mutable variable stored in an `Alloca` slot — accesses go through
     /// `Load`/`Store`.  The [`IrType`] is the type of the stored value.
     Mutable(ValueId, IrType),
-}
-
-impl VarBinding {
-    /// Returns the IR type of the bound variable.
-    #[allow(dead_code)]
-    pub(crate) fn ir_type(&self) -> &IrType {
-        match self {
-            VarBinding::Direct(_, ty) | VarBinding::Mutable(_, ty) => ty,
-        }
-    }
 }
 
 /// Information about the current loop, used for `break`/`continue` lowering.
@@ -167,11 +158,50 @@ impl<'a> LoweringContext<'a> {
 
     /// Orchestrates the full lowering of a program.
     fn lower_program(&mut self, program: &Program) {
+        // Register built-in Option/Result enum layouts so their constructors
+        // use EnumAlloc (with a discriminant) instead of StructAlloc.
+        self.register_builtin_enum_layouts();
+
         // Pass 1: Register all declarations (layouts, function stubs, indices).
         self.register_declarations(program);
 
         // Pass 2: Lower all function bodies.
         self.lower_function_bodies(program);
+    }
+
+    /// Register enum layouts for built-in Option and Result types.
+    ///
+    /// Option has `Some(T)` and `None`; Result has `Ok(T)` and `Err(E)`.
+    /// Since these are generic, the field types use a placeholder
+    /// (`StructRef(GENERIC_PLACEHOLDER)`).  The concrete types are determined at
+    /// each use site via type inference.
+    fn register_builtin_enum_layouts(&mut self) {
+        for name in &[crate::types::OPTION_ENUM, crate::types::RESULT_ENUM] {
+            if let Some(info) = self.check.enums.get(*name) {
+                let variants: Vec<(String, Vec<IrType>)> = info
+                    .variants
+                    .iter()
+                    .map(|(vname, fields)| {
+                        let ir_fields: Vec<IrType> =
+                            fields.iter().map(|t| lower_type(t, self.check)).collect();
+                        (vname.clone(), ir_fields)
+                    })
+                    .collect();
+                self.module.enum_layouts.insert(name.to_string(), variants);
+                // Store type parameter names for generic substitution in
+                // match lowering (see resolve_field_type).
+                if !info.type_params.is_empty() {
+                    self.module
+                        .enum_type_params
+                        .insert(name.to_string(), info.type_params.clone());
+                }
+            } else {
+                unreachable!(
+                    "builtin enum '{name}' not found in sema — \
+                     sema should always register Option and Result"
+                );
+            }
+        }
     }
 
     // --- Scope management ---
@@ -295,8 +325,27 @@ impl<'a> LoweringContext<'a> {
         self.check.expr_types.get(span)
     }
 
+    /// Like [`source_type`](Self::source_type) but panics if the type is
+    /// missing.  Use this only where sema guarantees a type annotation exists.
+    pub(crate) fn require_source_type(&self, span: &Span) -> Type {
+        self.check.expr_types.get(span).cloned().unwrap_or_else(|| {
+            unreachable!(
+                "missing sema type at {span:?} — sema should always type-annotate expressions"
+            )
+        })
+    }
+
     /// Converts a source-level [`Type`] to an [`IrType`].
     pub(crate) fn lower_type(&self, ty: &Type) -> IrType {
         lower_type(ty, self.check)
+    }
+
+    /// Emit a dummy value for void-typed expressions that must still return a
+    /// [`ValueId`] (e.g., match arms whose result is discarded).
+    ///
+    /// The value is never used at runtime — it exists only to satisfy the SSA
+    /// builder's requirement that every expression produces a value.
+    pub(crate) fn void_placeholder(&mut self, span: Option<Span>) -> ValueId {
+        self.emit(Op::ConstBool(false), IrType::Bool, span)
     }
 }

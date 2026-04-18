@@ -1,9 +1,11 @@
 //! String method runtime functions for compiled Phoenix programs.
 //!
 //! Each function implements a Phoenix `String` builtin method
-//! (e.g. `length`, `contains`, `trim`).  The `split` method is not
-//! included because it returns a `List<String>`, which requires
-//! List support in the compiled backend (not yet implemented).
+//! (e.g. `length`, `contains`, `trim`).
+//!
+//! **Note:** The `split` method is implemented in [`crate::list_methods`]
+//! as `phx_str_split` because it returns a `List<String>` and depends on
+//! the list allocation infrastructure.
 //!
 //! All functions that return strings operate on **Unicode scalar values**
 //! (Rust `char`), not grapheme clusters.  For example, `length` returns

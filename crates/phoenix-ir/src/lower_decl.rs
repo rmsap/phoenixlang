@@ -88,6 +88,11 @@ impl<'a> LoweringContext<'a> {
                 )
                 .collect();
             self.module.enum_layouts.insert(e.name.clone(), variants);
+            if !info.type_params.is_empty() {
+                self.module
+                    .enum_type_params
+                    .insert(e.name.clone(), info.type_params.clone());
+            }
         }
     }
 

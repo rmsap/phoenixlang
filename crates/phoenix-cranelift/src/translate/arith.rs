@@ -72,17 +72,93 @@ pub(super) fn translate_int_arith(
             let va = get_val1(state, *a)?;
             let vb = get_val1(state, *b)?;
             emit_div_zero_check(builder, ctx, vb)?;
-            Ok(vec![builder.ins().sdiv(va, vb)])
+            // Guard against i64::MIN / -1 which traps on x86 (SIGFPE).
+            // When both conditions hold, return i64::MIN (wrapping behavior).
+            let result = emit_safe_sdiv(builder, va, vb);
+            Ok(vec![result])
         }
         Op::IMod(a, b) => {
             let va = get_val1(state, *a)?;
             let vb = get_val1(state, *b)?;
             emit_div_zero_check(builder, ctx, vb)?;
-            Ok(vec![builder.ins().srem(va, vb)])
+            // Guard against i64::MIN % -1 which also traps on x86.
+            // When both conditions hold, return 0 (correct wrapping result).
+            let result = emit_safe_srem(builder, va, vb);
+            Ok(vec![result])
         }
         Op::INeg(a) => Ok(vec![builder.ins().ineg(get_val1(state, *a)?)]),
         _ => unreachable!(),
     }
+}
+
+/// Emit a branch-merge that checks `b == -1` and takes an overflow path
+/// or normal path.  `overflow_val_fn` produces the value for the overflow
+/// path, `normal_val_fn` produces the value for the normal path.
+fn emit_safe_int_op(
+    builder: &mut FunctionBuilder,
+    a: Value,
+    b: Value,
+    overflow_val_fn: impl FnOnce(&mut FunctionBuilder, Value) -> Value,
+    normal_val_fn: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
+) -> Value {
+    let neg_one = builder.ins().iconst(cl::I64, -1);
+    let is_neg_one = builder.ins().icmp(IntCC::Equal, b, neg_one);
+
+    let overflow_block = builder.create_block();
+    let normal_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, cl::I64);
+
+    builder
+        .ins()
+        .brif(is_neg_one, overflow_block, &[], normal_block, &[]);
+
+    // Overflow path.
+    builder.seal_block(overflow_block);
+    builder.switch_to_block(overflow_block);
+    let overflow_val = overflow_val_fn(builder, a);
+    builder.ins().jump(merge_block, &[overflow_val]);
+
+    // Normal path.
+    builder.seal_block(normal_block);
+    builder.switch_to_block(normal_block);
+    let normal_val = normal_val_fn(builder, a, b);
+    builder.ins().jump(merge_block, &[normal_val]);
+
+    builder.seal_block(merge_block);
+    builder.switch_to_block(merge_block);
+    builder.block_params(merge_block)[0]
+}
+
+/// Emit a safe signed division that handles i64::MIN / -1.
+///
+/// On x86, `sdiv` traps (SIGFPE) when dividing i64::MIN by -1 because
+/// the result overflows.  We emit a branch: if b == -1, use `ineg(a)`
+/// instead of `sdiv`.  `ineg` wraps correctly for i64::MIN (producing
+/// i64::MIN) and gives the same result as division by -1 for all other
+/// values.
+fn emit_safe_sdiv(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value {
+    emit_safe_int_op(
+        builder,
+        a,
+        b,
+        |builder, a| builder.ins().ineg(a),
+        |builder, a, b| builder.ins().sdiv(a, b),
+    )
+}
+
+/// Emit a safe signed remainder that handles i64::MIN % -1.
+///
+/// On x86, `srem` traps (SIGFPE) for the same reason as sdiv.
+/// i64::MIN % -1 == 0 (the remainder is always 0 when dividing by -1).
+fn emit_safe_srem(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value {
+    emit_safe_int_op(
+        builder,
+        a,
+        b,
+        |builder, _a| builder.ins().iconst(cl::I64, 0),
+        |builder, a, b| builder.ins().srem(a, b),
+    )
 }
 
 /// Translate a floating-point arithmetic operation.

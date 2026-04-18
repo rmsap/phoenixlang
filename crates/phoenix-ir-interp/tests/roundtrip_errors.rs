@@ -10,11 +10,14 @@ fn error_division_by_zero_int() {
     assert!(result.unwrap_err().message.contains("division by zero"));
 }
 
+/// Float division by zero produces IEEE 754 infinity, matching the compiler.
 #[test]
-fn error_division_by_zero_float() {
+fn float_division_by_zero_produces_inf() {
     let result = ir_run_result("function main() { print(1.0 / 0.0) }");
-    assert!(result.is_err());
-    assert!(result.unwrap_err().message.contains("division by zero"));
+    assert!(
+        result.is_ok(),
+        "float div by zero should succeed with IEEE 754 semantics"
+    );
 }
 
 #[test]
@@ -24,11 +27,14 @@ fn error_modulo_by_zero_int() {
     assert!(result.unwrap_err().message.contains("modulo by zero"));
 }
 
+/// Float modulo by zero produces IEEE 754 NaN, matching the compiler.
 #[test]
-fn error_modulo_by_zero_float() {
+fn float_modulo_by_zero_produces_nan() {
     let result = ir_run_result("function main() { print(1.0 % 0.0) }");
-    assert!(result.is_err());
-    assert!(result.unwrap_err().message.contains("modulo by zero"));
+    assert!(
+        result.is_ok(),
+        "float mod by zero should succeed with IEEE 754 semantics"
+    );
 }
 
 #[test]

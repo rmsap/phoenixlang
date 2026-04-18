@@ -5,7 +5,7 @@ expression: ir
 func @fallible() -> enum.Result {
   bb0:
     v0 = const_i64 42
-    v1 = struct_alloc @Ok(v0)
+    v1 = enum_alloc @Result:0(v0)
     return v1
 }
 
@@ -18,12 +18,12 @@ func @main() -> enum.Result {
     branch v3, bb1, bb2
   bb1:
     v4 = enum_get_field v0, variant=0, 0
-    jump bb3
+    jump bb3(v4)
   bb2:
     return v0
-  bb3:
-    v5 = const_i64 1
-    v6 = iadd v4, v5
-    v7 = struct_alloc @Ok(v6)
-    return v7
+  bb3(v5: i64):
+    v6 = const_i64 1
+    v7 = iadd v5, v6
+    v8 = enum_alloc @Result:0(v7)
+    return v8
 }

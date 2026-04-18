@@ -4,6 +4,41 @@ Issues identified during audits that require design decisions or architectural c
 
 ---
 
+## Memory Management
+
+### All compiled programs leak memory (no GC)
+
+Compiled Phoenix binaries (`phoenix build`) allocate heap memory via `malloc` but never free it. There is no garbage collector, reference counting, or manual deallocation. This means every string, list, map, closure, struct, and enum variant allocated during execution is leaked.
+
+Compiled binaries are **not suitable for long-running processes** (servers, daemons). Short-lived CLI programs are fine in practice since the OS reclaims all memory on exit.
+
+**Planned fix:** Garbage collector (tracing GC or reference-counted) in Phase 2.3 — see [phase-2.md](phases/phase-2.md#23-runtime-library-expand).
+
+---
+
+## Runtime Behavior
+
+### `List.get` panics on out-of-bounds
+
+`List.get(index)` terminates the process (panic/exit) when the index is out of bounds, rather than returning `Option<T>`. This is inconsistent with `Map.get(key)`, which returns `Option<V>` for missing keys.
+
+**Workaround:** Check `list.length()` before calling `get`, or use `first`/`last` which return `Option<T>`.
+
+### `Map<Float, V>` uses byte-wise key comparison
+
+`Map<Float, V>` compares keys using byte-wise equality, not IEEE 754 floating-point equality. This means `-0.0` and `0.0` are treated as different keys, and `NaN` equals itself (unlike IEEE 754 where `NaN != NaN`). This is deliberate — byte-wise comparison provides consistent, deterministic behavior for map lookups.
+
+### `substring` clamps out-of-range indices silently
+
+`substring(start, end)` silently clamps out-of-range indices instead of returning an error:
+- Negative `start` is clamped to `0`
+- `end` beyond the string length is clamped to the string length
+- `start > end` produces an empty string
+
+This matches the behavior of JavaScript's `String.prototype.substring()` but may surprise users expecting strict bounds checking.
+
+---
+
 ## Architecture
 
 ### `break`/`continue` in match arms inside loops — Resolved
@@ -67,6 +102,55 @@ The `Parser` struct now carries a `source_id` field derived from the first token
 When an integer or float literal is out of range, the parser emits a diagnostic but substitutes `0` (or `0.0`) into the AST.
 
 **Recommendation:** Acceptable for now. Consider adding an `ErrorLiteral` AST variant if this causes real-world confusion.
+
+### `Option.okOr()` fails to compile when payload type cannot be inferred
+
+The `okOr` combinator on `Option<T>` values produces a compile error when the Cranelift backend cannot infer the payload type `T`. This happens when the `Option` value comes from a function parameter or cross-function return (where generic type arguments are not propagated through the IR's `EnumRef` type). Previously this silently fell back to `IrType::I64` (1 slot), which corrupted multi-slot types like `String` (pointer + length = 2 slots). The fix surfaces a clear compile error instead of silently miscompiling.
+
+**Workaround:** Use pattern matching instead of `okOr` when the Option comes from a function parameter.
+**Root cause:** `IrType::EnumRef("Option")` does not carry generic type arguments.
+**Tracked in:** Cranelift `option_methods.rs` `option_payload_type` function.
+
+### Closure capture type ambiguity with indirect calls
+
+When a closure is passed through a block parameter (phi node), the compiler
+falls back to a heuristic scan of IR functions to find capture types.  If two
+closures share the same user-param types, return type, and capture types, they
+are silently conflated.  Different capture layouts are caught (compile error),
+but identical-layout mismatches are invisible.
+
+**Workaround:** Pass closures directly to methods rather than through conditional block parameters.
+**Root cause:** The IR's closure representation does not carry capture metadata alongside the function pointer.
+**Tracked in:** Cranelift `ir_analysis.rs` `find_closure_capture_types`.
+
+### `Result.ok()` and `Result.err()` not supported in compiled mode
+
+The `Result.ok()` (returns `Option<T>`) and `Result.err()` (returns `Option<E>`)
+methods work in the IR interpreter but are not yet implemented in the Cranelift
+backend.  Calling them produces a "not yet supported in compiled mode" error.
+
+**Workaround:** Use pattern matching to convert a Result to an Option manually.
+**Tracked in:** Cranelift `result_methods.rs` dispatch table.
+
+### O(n) map key lookup
+
+`Map<K, V>` key lookup, insertion, removal, and contains operations use a
+linear scan over a flat array.  Building an n-entry map is O(n²).
+
+**Planned fix:** Hash-based implementation.
+**Tracked in:** `phoenix-runtime/src/map_methods.rs` module header.
+
+### O(n²) `List.sortBy` insertion sort
+
+`List.sortBy` uses O(n²) insertion sort in both backends.  In the interpreter,
+the comparator closure requires `&mut self` on the interpreter, preventing use
+of `slice::sort_by`.  In the Cranelift compiler, the comparator closure must be
+called through block-based control flow, and inline insertion sort maps
+naturally to nested loops.  Both backends use the same algorithm for
+consistency.  Acceptable for small lists but a performance hazard for large ones.
+
+**Planned fix:** Merge sort implementation.
+**Tracked in:** `list_methods_complex.rs` `translate_list_sortby` doc comment.
 
 ---
 

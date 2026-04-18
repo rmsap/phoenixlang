@@ -1,7 +1,7 @@
 //! Integration tests: basic compilation and execution of Phoenix programs.
 
 mod common;
-use common::roundtrip;
+use common::{compile_and_run, roundtrip};
 
 #[test]
 fn hello_world() {
@@ -340,6 +340,176 @@ function main() {
     print(flag)
     flag = false
     print(flag)
+}
+"#,
+    );
+}
+
+/// Negating i64::MIN should wrap (not panic).
+#[test]
+fn integer_overflow_negate_min() {
+    roundtrip(
+        r#"
+function main() {
+    let min = -9223372036854775807 - 1
+    let neg = 0 - min
+    print(neg)
+}
+"#,
+    );
+}
+
+/// i64::MIN / -1 should wrap to i64::MIN (not panic).
+#[test]
+fn integer_overflow_div_min_by_neg1() {
+    roundtrip(
+        r#"
+function main() {
+    let min = -9223372036854775807 - 1
+    let result = min / -1
+    print(result)
+}
+"#,
+    );
+}
+
+/// Assert that i64::MIN / -1 produces i64::MIN (wrapping behavior).
+#[test]
+fn integer_overflow_div_min_by_neg1_value() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let min = -9223372036854775807 - 1
+    let result = min / -1
+    print(result)
+}
+"#,
+    );
+    assert_eq!(out, vec!["-9223372036854775808"]);
+}
+
+/// Assert that -i64::MIN wraps to i64::MIN.
+#[test]
+fn integer_overflow_negate_min_value() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let min = -9223372036854775807 - 1
+    let neg = 0 - min
+    print(neg)
+}
+"#,
+    );
+    assert_eq!(out, vec!["-9223372036854775808"]);
+}
+
+/// 1.0 / 0.0 should produce "inf", not panic.
+#[test]
+fn float_div_by_zero_produces_inf() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let x: Float = 1.0
+    let y: Float = 0.0
+    print(x / y)
+}
+"#,
+    );
+    assert_eq!(out, vec!["inf"]);
+}
+
+/// 1.0 % 0.0 should produce "NaN", not panic.
+#[test]
+fn float_mod_by_zero_produces_nan() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let x: Float = 1.0
+    let y: Float = 0.0
+    print(x % y)
+}
+"#,
+    );
+    assert_eq!(out, vec!["NaN"]);
+}
+
+/// i64::MIN % -1 should produce 0 (safe modulo handling).
+#[test]
+fn integer_overflow_mod_min_by_neg1() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let x: Int = -9223372036854775807 - 1
+    let result = x % -1
+    print(result)
+}
+"#,
+    );
+    assert_eq!(out, vec!["0"]);
+}
+
+/// Two chained `?` operators in the same function body.
+#[test]
+fn try_operator_chained_two_steps() {
+    let out = compile_and_run(
+        r#"
+function step1() -> Result<Int, String> { Ok(10) }
+function step2(x: Int) -> Result<Int, String> { Ok(x + 1) }
+function combined() -> Result<Int, String> {
+    let a = step1()?
+    let b = step2(a)?
+    Ok(b)
+}
+function main() {
+    match combined() {
+        Ok(v) -> { print(v) }
+        Err(e) -> { print(e) }
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["11"]);
+}
+
+/// Chained `?` operators where the second step fails.
+#[test]
+fn try_operator_chained_second_fails() {
+    let out = compile_and_run(
+        r#"
+function step1() -> Result<Int, String> { Ok(10) }
+function step2(x: Int) -> Result<Int, String> { Err("step2 failed") }
+function combined() -> Result<Int, String> {
+    let a = step1()?
+    let b = step2(a)?
+    Ok(b)
+}
+function main() {
+    match combined() {
+        Ok(v) -> { print(v) }
+        Err(e) -> { print(e) }
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["step2 failed"]);
+}
+
+/// User-defined generic enums are not yet supported in Cranelift codegen.
+#[test]
+#[ignore = "requires user-defined generic enum codegen not yet implemented"]
+fn user_defined_generic_enum() {
+    let _out = compile_and_run(
+        r#"
+enum Either<L, R> {
+    Left(L)
+    Right(R)
+}
+function main() {
+    let x: Either<Int, String> = Left(42)
+    match x {
+        Left(v) -> print(v)
+        Right(s) -> print(s)
+    }
 }
 "#,
     );

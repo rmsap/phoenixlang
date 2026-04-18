@@ -3,13 +3,29 @@
 //! This module orchestrates the translation of each Phoenix IR function
 //! into Cranelift IR, dispatching individual operations to domain-specific
 //! submodules for readability and separation of concerns.
-
+//!
+//! Most translation functions take `(&mut FunctionBuilder, &mut CompileContext,
+//! &IrModule, &FuncState)` as their first parameters.  A context struct was
+//! considered but the two `&mut` borrows (`builder` + `ctx`) make bundling
+//! awkward without adding `RefCell`-style indirection.
 mod arith;
 mod calls;
+mod closure_call;
 mod control;
 mod data;
+mod enum_combinators;
+mod enum_helpers;
+mod enum_type_inference;
 mod helpers;
+mod ir_analysis;
+mod layout;
+mod list_methods;
+mod list_methods_closure;
+mod list_methods_complex;
+mod map_methods;
 mod mutable;
+mod option_methods;
+mod result_methods;
 
 use std::collections::HashMap;
 
@@ -41,6 +57,10 @@ pub(crate) struct FuncState {
     /// Tracks which `ClosureAlloc` produced each `ValueId`, so `CallIndirect`
     /// can look up the target function directly instead of using a heuristic.
     pub closure_func_map: HashMap<ValueId, PhxFuncId>,
+    /// Records the concrete payload field types from `EnumAlloc` instructions.
+    /// Used by `option_payload_type` to infer the `T` in `Option<T>` for
+    /// methods like `okOr` where the result type doesn't directly reveal `T`.
+    pub enum_payload_types: HashMap<ValueId, Vec<IrType>>,
     /// Mapping from Phoenix `BlockId` to Cranelift block.
     pub block_map: HashMap<PhxBlockId, ir::Block>,
 }
@@ -80,6 +100,7 @@ fn translate_function(
         alloca_map: HashMap::new(),
         type_map: HashMap::new(),
         closure_func_map: HashMap::new(),
+        enum_payload_types: HashMap::new(),
         block_map: HashMap::new(),
     };
 
@@ -139,8 +160,30 @@ fn translate_function(
                 if let Op::ClosureAlloc(target_fid, _) = &inst.op {
                     state.closure_func_map.insert(vid, *target_fid);
                 }
+                // Record concrete payload types from EnumAlloc for later inference.
+                if let Op::EnumAlloc(_name, _idx, fields) = &inst.op
+                    && !fields.is_empty()
+                {
+                    // Use the actual type of each field, falling back to I64
+                    // if the type is not yet known (e.g., for forward
+                    // references).  Using `map` instead of `filter_map`
+                    // preserves the field count so downstream consumers
+                    // get the correct payload arity.
+                    let field_types: Vec<IrType> = fields
+                        .iter()
+                        .map(|fid| state.type_map.get(fid).cloned().unwrap_or(IrType::I64))
+                        .collect();
+                    state.enum_payload_types.insert(vid, field_types);
+                }
             }
         }
+
+        // Propagate enum_payload_types through block-parameter forwarding.
+        // When a Jump/Branch passes a value that has known payload types to
+        // a target block, the block parameter's ValueId should inherit the
+        // payload type info so downstream code can infer enum inner types
+        // even when the value flows through phi nodes.
+        propagate_enum_payload_types(&block.terminator, func, &mut state);
 
         // Translate terminator.
         control::translate_terminator(&mut builder, &block.terminator, &state, func)?;
@@ -161,6 +204,48 @@ fn translate_function(
     cl_ctx.clear();
 
     Ok(())
+}
+
+/// Propagate `enum_payload_types` from jump/branch arguments to the target
+/// block's parameter ValueIds.  This ensures that when an `EnumAlloc` value
+/// flows through a phi node (e.g., `if/else` producing `Some(x)` vs `None`),
+/// the block parameter inherits the payload type info so downstream methods
+/// like `option_payload_type` can find it.
+fn propagate_enum_payload_types(
+    term: &phoenix_ir::terminator::Terminator,
+    func: &IrFunction,
+    state: &mut FuncState,
+) {
+    let targets: Vec<(&PhxBlockId, &[ValueId])> = match term {
+        phoenix_ir::terminator::Terminator::Jump { target, args } => {
+            vec![(target, args)]
+        }
+        phoenix_ir::terminator::Terminator::Branch {
+            true_block,
+            true_args,
+            false_block,
+            false_args,
+            ..
+        } => {
+            vec![(true_block, true_args), (false_block, false_args)]
+        }
+        _ => return,
+    };
+
+    for (target_block, args) in targets {
+        // Find the corresponding block in the IR to get its parameter ValueIds.
+        let Some(block) = func.blocks.iter().find(|b| b.id == *target_block) else {
+            continue;
+        };
+        for (arg_vid, (param_vid, _param_ty)) in args.iter().zip(block.params.iter()) {
+            if let Some(payload) = state.enum_payload_types.get(arg_vid).cloned() {
+                state
+                    .enum_payload_types
+                    .entry(*param_vid)
+                    .or_insert(payload);
+            }
+        }
+    }
 }
 
 // ── Value helpers ──────────────────────────────────────────────────
@@ -253,17 +338,18 @@ fn translate_op(
             data::translate_enum(builder, ctx, ir_module, op, result_type, state)
         }
 
-        // Collection operations (stub)
-        Op::ListAlloc(_) | Op::MapAlloc(_) => Err(CompileError::new(
-            "List/Map types are not yet supported in compiled mode. Use `phoenix run-ir`.",
-        )),
+        // Collection operations
+        Op::ListAlloc(_) => {
+            list_methods::translate_list_alloc(builder, ctx, op, result_type, state)
+        }
+        Op::MapAlloc(_) => map_methods::translate_map_alloc(builder, ctx, op, result_type, state),
 
         // Closure operations
         Op::ClosureAlloc(..) => calls::translate_closure_alloc(builder, ctx, op, state),
 
         // Function calls
         Op::Call(..) | Op::CallIndirect(..) | Op::BuiltinCall(..) => {
-            calls::translate_call(builder, ctx, ir_module, op, state)
+            calls::translate_call(builder, ctx, ir_module, op, result_type, state)
         }
 
         // Mutable variables

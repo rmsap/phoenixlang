@@ -21,10 +21,29 @@ use super::FuncState;
 ///
 /// `StringRef` is a fat pointer (ptr + len) and takes 2 slots.
 /// All other types occupy 1 slot.
+///
+/// # Important
+///
+/// The runtime's `phx_list_contains` and `phx_map_*` functions use
+/// `elem_size == STRING_FAT_POINTER_SIZE` (16) as a heuristic for "this is
+/// a string fat pointer" and compare by content rather than by raw bytes.
+/// If a future IR type also requires 2 slots, both this function and the
+/// runtime's `elements_equal` / `STRING_FAT_POINTER_SIZE` must be updated.
 pub(crate) fn slots_for_type(ty: &IrType) -> usize {
     match ty {
         IrType::StringRef => 2,
-        _ => 1,
+        // All known single-slot types are listed explicitly so that adding
+        // a new IrType variant forces a compiler error here, preventing
+        // silent miscompilation if the new type needs 2+ slots.
+        IrType::I64
+        | IrType::F64
+        | IrType::Bool
+        | IrType::Void
+        | IrType::StructRef(_)
+        | IrType::EnumRef(_)
+        | IrType::ListRef(_)
+        | IrType::MapRef(_, _)
+        | IrType::ClosureRef { .. } => 1,
     }
 }
 
@@ -34,24 +53,33 @@ pub(crate) fn slots_for_type(ty: &IrType) -> usize {
 /// For all other types, stores a single value.
 pub(crate) fn store_fat_value(
     builder: &mut FunctionBuilder,
-    vals: Vec<Value>,
+    vals: &[Value],
     ty: &IrType,
     base_ptr: Value,
     slot: usize,
 ) {
     match ty {
         IrType::StringRef => {
-            builder
-                .ins()
-                .store(MemFlags::new(), vals[0], base_ptr, (slot * 8) as i32);
-            builder
-                .ins()
-                .store(MemFlags::new(), vals[1], base_ptr, ((slot + 1) * 8) as i32);
+            builder.ins().store(
+                MemFlags::new(),
+                vals[0],
+                base_ptr,
+                (slot * super::layout::SLOT_SIZE) as i32,
+            );
+            builder.ins().store(
+                MemFlags::new(),
+                vals[1],
+                base_ptr,
+                ((slot + 1) * super::layout::SLOT_SIZE) as i32,
+            );
         }
         _ => {
-            builder
-                .ins()
-                .store(MemFlags::new(), vals[0], base_ptr, (slot * 8) as i32);
+            builder.ins().store(
+                MemFlags::new(),
+                vals[0],
+                base_ptr,
+                (slot * super::layout::SLOT_SIZE) as i32,
+            );
         }
     }
 }
@@ -68,21 +96,28 @@ pub(crate) fn load_fat_value(
 ) -> Result<Vec<Value>, CompileError> {
     match ty {
         IrType::StringRef => {
-            let ptr_val =
-                builder
-                    .ins()
-                    .load(POINTER_TYPE, MemFlags::new(), base_ptr, (slot * 8) as i32);
-            let len_val =
-                builder
-                    .ins()
-                    .load(cl::I64, MemFlags::new(), base_ptr, ((slot + 1) * 8) as i32);
+            let ptr_val = builder.ins().load(
+                POINTER_TYPE,
+                MemFlags::new(),
+                base_ptr,
+                (slot * super::layout::SLOT_SIZE) as i32,
+            );
+            let len_val = builder.ins().load(
+                cl::I64,
+                MemFlags::new(),
+                base_ptr,
+                ((slot + 1) * super::layout::SLOT_SIZE) as i32,
+            );
             Ok(vec![ptr_val, len_val])
         }
         _ => {
             let cl_ty = ir_type_to_cl_single(ty)?;
-            let val = builder
-                .ins()
-                .load(cl_ty, MemFlags::new(), base_ptr, (slot * 8) as i32);
+            let val = builder.ins().load(
+                cl_ty,
+                MemFlags::new(),
+                base_ptr,
+                (slot * super::layout::SLOT_SIZE) as i32,
+            );
             Ok(vec![val])
         }
     }

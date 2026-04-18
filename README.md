@@ -11,19 +11,20 @@ When searching online, use **phoenixlang** to distinguish this project from the 
 
 ## Current Status
 
-Phoenix is in **active development**, written in **Rust** with **1,700+ tests** across **12 crates**. Phoenix programs can be executed via a tree-walk interpreter (`phoenix run`) or compiled to native binaries via Cranelift (`phoenix build`). Current language features:
+Phoenix is in **active development**, written in **Rust** with **2,000+ tests** across **12 crates**. Phoenix programs can be executed via a tree-walk interpreter (`phoenix run`) or compiled to native binaries via Cranelift (`phoenix build`). Current language features:
 
 - Variables (`let` and `let mut`) with explicit types or type inference, **compound assignment** (`+=`, `-=`, `*=`, `/=`, `%=`)
 - Functions with typed parameters, return types, **named/default parameters**
-- `if`/`else if`/`else`, `while` loops, `for` loops (range-based and **collection-based**), `break`/`continue`
+- `if`/`else if`/`else`, `while` loops, `for` loops (range-based and **`for x in list`** over `List<T>` collections), `break`/`continue`
 - **Loop `else` clauses** — `for/while ... {} else {}` (else runs when loop completes without `break`)
 - Structs with fields, methods (`impl` blocks and **inline methods**), field access, and **field assignment**
 - Enums/ADTs with `match` (variant destructuring, wildcards, literals), **inline methods and trait impls**
 - **Generics** on functions, structs, and enums (`<T, U>` syntax with type inference)
 - **Closures** and first-class functions (by-reference capture, higher-order functions)
-- **`List<T>`** with `[1, 2, 3]` literals and **functional methods** (`map`, `filter`, `reduce`, `find`, `any`, `all`, `flatMap`, `sortBy`, `first`, `last`, `contains`, `take`, `drop`)
-- **`Map<K, V>`** with `{"key": value}` literals, `get()`, `set()`, `contains()`, `remove()`, `keys()`, `values()`
-- **`Option<T>`** and **`Result<T, E>`** (built-in) with `unwrap()`, `unwrapOr()`, `isSome()`/`isOk()`, and **combinators** (`map`, `andThen`, `orElse`, `filter`, `okOr`, `mapErr`, `unwrapOrElse`)
+- **`List<T>`** with `[1, 2, 3]` literals, `length()`, `get()`, `push()`, and **functional methods** (`map`, `filter`, `reduce`, `find`, `any`, `all`, `flatMap`, `sortBy`, `first`, `last`, `contains`, `take`, `drop`)
+- **`Map<K, V>`** with `{"key": value}` literals, `get()`, `set()`, `contains()`, `remove()`, `keys()`, `values()`, `length()`
+- **`Option<T>`** (built-in) with `unwrap()`, `unwrapOr()`, `isSome()`, `isNone()`, and **combinators** (`map`, `andThen`, `orElse`, `filter`, `okOr`, `unwrapOrElse`)
+- **`Result<T, E>`** (built-in) with `unwrap()`, `unwrapOr()`, `isOk()`, `isErr()`, and **combinators** (`map`, `andThen`, `orElse`, `mapErr`, `unwrapOrElse`)
 - **`?` operator** for concise error propagation on `Result` and `Option` values
 - **Traits** with `trait` declarations, `impl Trait for Type`, and trait bounds on generics (`<T: Display>`)
 - **String interpolation** — `"hello {name}, you are {age} years old"` (non-string values are automatically converted)
@@ -39,7 +40,7 @@ Phoenix is in **active development**, written in **Rust** with **1,700+ tests** 
 - **`where` constraints** on struct fields for validation (`String name where self.length > 0`, `Int age where self >= 0`)
 - **CI pipeline** with `cargo fmt`, `clippy`, and `cargo test`
 
-**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering complete, Cranelift native compilation working for value types, strings, structs, enums, closures, function calls, and string methods (all except `split`, which returns a `List` and depends on List support); Lists/Maps not yet supported in compiled mode — use `phoenix run` for full coverage; WebAssembly target next).
+**In progress:** [Phase 2 — Compilation](docs/roadmap.md) (IR lowering complete, Cranelift native compilation working for value types, strings, structs, enums, closures, function calls, string methods including `split`, **`List<T>`** with all functional methods (map, filter, reduce, find, any, all, flatMap, sortBy, first, last, contains, take, drop), **`Map<K, V>`** with all methods, and **`Option<T>`/`Result<T, E>`** with all combinators including `isSome`/`isNone`/`isOk`/`isErr`; garbage collection, then WebAssembly target).
 
 ---
 
@@ -272,7 +273,10 @@ let doubled: List<Int> = nums.map(function(n: Int) -> Int { n * 2 })
 
 // Map literals
 let scores: Map<String, Int> = {"alice": 95, "bob": 87}
-print(scores.get("alice"))  // 95
+match scores.get("alice") {
+    Some(s) -> print(s)      // 95
+    None -> print("not found")
+}
 ```
 
 ### Pipes

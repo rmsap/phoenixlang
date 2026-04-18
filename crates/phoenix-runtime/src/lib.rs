@@ -10,7 +10,25 @@
 //! long-running processes.
 #![warn(missing_docs)]
 
+mod list_methods;
+mod map_methods;
 mod string_methods;
+
+/// Return the list header size in bytes.
+///
+/// Exposed so the compiler crate can assert at test time that its
+/// `LIST_HEADER` constant matches the runtime's layout.
+pub fn list_header_size() -> usize {
+    list_methods::HEADER_SIZE
+}
+
+/// Return the map header size in bytes.
+///
+/// Exposed so the compiler crate can assert at test time that its
+/// `MAP_HEADER` constant matches the runtime's layout.
+pub fn map_header_size() -> usize {
+    map_methods::HEADER_SIZE
+}
 
 use std::io::Write;
 use std::process;
@@ -102,6 +120,19 @@ pub unsafe extern "C" fn phx_str_concat(
 ) -> PhxFatPtr {
     let s1 = unsafe { slice::from_raw_parts(p1, l1) };
     let s2 = unsafe { slice::from_raw_parts(p2, l2) };
+    if l1 + l2 == 0 {
+        // Return a valid (non-dangling) empty string pointer.
+        // Vec::with_capacity(0) doesn't allocate, so as_ptr() would dangle.
+        //
+        // NOTE: This returns a pointer into the binary's .rodata section.
+        // When a GC is added (Phase 2.3), this pointer must NOT be freed
+        // or reallocated. The GC will need to distinguish static pointers
+        // from heap pointers (e.g., via a heap range check or tag bit).
+        return PhxFatPtr {
+            ptr: b"".as_ptr(),
+            len: 0,
+        };
+    }
     let mut buf = Vec::with_capacity(l1 + l2);
     buf.extend_from_slice(s1);
     buf.extend_from_slice(s2);
@@ -176,6 +207,10 @@ pub extern "C" fn phx_alloc(size: usize) -> *mut u8 {
         eprintln!("runtime error: out of memory");
         process::exit(1);
     }
+    debug_assert!(
+        (ptr as usize).is_multiple_of(8),
+        "phx_alloc returned unaligned pointer"
+    );
     ptr
 }
 
@@ -205,7 +240,7 @@ pub struct PhxFatPtr {
 /// Rust's default `f64` formatting (e.g. `3.14` → `"3.14"`,
 /// `f64::NAN` → `"NaN"`).
 fn format_f64(val: f64) -> String {
-    if val.fract() == 0.0 && val.is_finite() && val >= i64::MIN as f64 && val <= i64::MAX as f64 {
+    if val.fract() == 0.0 && val.is_finite() && val >= i64::MIN as f64 && val < i64::MAX as f64 {
         (val as i64).to_string()
     } else {
         val.to_string()
@@ -276,6 +311,17 @@ mod tests {
         let b = b"";
         let result = unsafe { phx_str_concat(a.as_ptr(), a.len(), b.as_ptr(), b.len()) };
         assert_eq!(result.len, 0);
+    }
+
+    /// Concatenating two empty strings must return a
+    /// valid (non-null) pointer, not a dangling or null one.
+    #[test]
+    fn str_concat_both_empty_returns_valid_ptr() {
+        let a = b"";
+        let b_str = b"";
+        let result = unsafe { phx_str_concat(a.as_ptr(), a.len(), b_str.as_ptr(), b_str.len()) };
+        assert_eq!(result.len, 0);
+        assert!(!result.ptr.is_null(), "empty concat should not return null");
     }
 
     // ── toString functions ─────────────────────────────────────────
@@ -469,6 +515,42 @@ mod tests {
         // Should use float formatting, not i64 cast.
         let s_str = std::str::from_utf8(s).unwrap();
         assert!(s_str.contains("e") || s_str.contains("10000000000000000000"));
+    }
+
+    /// `i64::MAX as f64` rounds up to 2^63 which
+    /// overflows when cast back to i64.  `format_f64` must use float
+    /// formatting for this value, not integer formatting.
+    #[test]
+    fn f64_to_str_i64_max_boundary() {
+        // i64::MAX as f64 rounds up to 9223372036854775808.0 (2^63),
+        // which is i64::MAX + 1.  Casting this to i64 is UB / overflow.
+        let val = i64::MAX as f64;
+        let result = format_f64(val);
+        // Must use float formatting (contains 'e' or the full digit string),
+        // NOT integer formatting (which would require a val-as-i64 cast).
+        let parsed: f64 = result.parse().expect("must be a valid float string");
+        assert_eq!(parsed, val);
+        // Verify we didn't take the integer path by checking the string
+        // is NOT what (val as i64).to_string() would produce (which wraps
+        // to i64::MIN = -9223372036854775808).
+        assert!(
+            !result.starts_with('-'),
+            "format_f64({val}) = \"{result}\" — should not be negative"
+        );
+    }
+
+    /// Values just below i64::MAX should still use integer
+    /// formatting (the fix must not break the normal path).
+    #[test]
+    fn f64_to_str_just_below_i64_max() {
+        // The largest f64 that is strictly less than i64::MAX as f64.
+        // This is 9223372036854774784.0, which fits in i64.
+        let val = 9223372036854774784.0_f64;
+        assert!(val < i64::MAX as f64);
+        let result = format_f64(val);
+        // Should use integer formatting.
+        let expected = (val as i64).to_string();
+        assert_eq!(result, expected);
     }
 
     // ── Allocation ─────────────────────────────────────────────────

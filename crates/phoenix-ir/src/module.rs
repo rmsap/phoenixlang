@@ -20,6 +20,11 @@ pub struct IrModule {
     /// Enum layout info: name → variant list, each variant has
     /// `(variant_name, field_types)`.
     pub enum_layouts: HashMap<String, Vec<(String, Vec<IrType>)>>,
+    /// Enum type parameter names: name → ordered list of type param names.
+    /// Used for generic substitution during match lowering — maps each
+    /// `__generic` placeholder back to its source type parameter by index.
+    /// Example: `"Result" → ["T", "E"]`.
+    pub enum_type_params: HashMap<String, Vec<String>>,
     /// Function name → [`FuncId`] mapping for call resolution.
     pub function_index: HashMap<String, FuncId>,
     /// Method dispatch table: `(type_name, method_name)` → [`FuncId`].
@@ -33,6 +38,7 @@ impl IrModule {
             functions: Vec::new(),
             struct_layouts: HashMap::new(),
             enum_layouts: HashMap::new(),
+            enum_type_params: HashMap::new(),
             function_index: HashMap::new(),
             method_index: HashMap::new(),
         }

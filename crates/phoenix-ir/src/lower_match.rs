@@ -1,7 +1,13 @@
 //! Match expression lowering.
 //!
 //! Lowers Phoenix `match` expressions into IR control flow.  Enum matches
-//! use discriminant-based branching; non-enum matches chain equality tests.
+//! use discriminant-based branching (one block per variant); non-enum
+//! matches chain equality tests.
+//!
+//! Generic type substitution: for generic enums like `Option<Int>` or
+//! `Result<Int, String>`, the enum layout uses `__generic` placeholders.
+//! [`resolve_field_type`] substitutes these with concrete type arguments
+//! at the match site.
 
 use crate::block::BlockId;
 use crate::instruction::{Op, ValueId};
@@ -14,8 +20,12 @@ use phoenix_sema::types::Type;
 
 /// Shared context for match arm lowering (avoids passing many parameters).
 struct MatchCtx {
+    /// Block where all match arms jump after executing their body.
     merge_block: BlockId,
+    /// Block parameter on `merge_block` that receives the match result
+    /// value.  `None` if the match result is `Void`.
     result_param: Option<ValueId>,
+    /// Source span of the `match` expression (for diagnostics).
     span: Option<Span>,
 }
 
@@ -66,7 +76,7 @@ impl<'a> LoweringContext<'a> {
         }
 
         self.switch_to_block(merge_block);
-        result_param.unwrap_or_else(|| self.emit(Op::ConstBool(false), IrType::Bool, span))
+        result_param.unwrap_or_else(|| self.void_placeholder(span))
     }
 
     /// Lower enum match arms using discriminant-based branching.
@@ -116,8 +126,54 @@ impl<'a> LoweringContext<'a> {
 
                         self.switch_to_block(arm_block);
                         self.push_scope();
+                        let type_args = match subject_type {
+                            Type::Generic(_, args) => args.clone(),
+                            _ => Vec::new(),
+                        };
+                        // Count generic placeholders in all prior variants so we
+                        // know where this variant's generics start in `type_args`.
+                        //
+                        // LIMITATION: this assumes a 1:1 correspondence between
+                        // generic placeholders across the enum layout and the
+                        // `type_args` list.  This works for Option<T> and
+                        // Result<T, E> (each variant has at most one generic), but
+                        // would produce wrong results for user-defined enums where
+                        // the same type parameter appears in multiple variants
+                        // (e.g., `enum Foo<T, U> { Baz(T), Bar(Int, T, U) }`).
+                        // A proper fix requires storing type parameter index
+                        // metadata in the enum layout (see A5).
+                        let generic_offset: usize = variants
+                            .iter()
+                            .take(var_idx)
+                            .map(|(_, fs)| fs.iter().filter(|t| t.is_generic_placeholder()).count())
+                            .sum();
+                        // Guard: if the computed offset would exceed type_args,
+                        // the heuristic is wrong for this enum (e.g., a
+                        // user-defined generic enum where the same type param
+                        // appears in multiple variants).  Skip generic
+                        // substitution rather than using the wrong concrete type.
+                        // A proper fix requires storing type parameter index
+                        // metadata in the enum layout (see architecture item A5).
+                        let total_generics_in_variant = field_types
+                            .iter()
+                            .filter(|t| t.is_generic_placeholder())
+                            .count();
+                        let safe_type_args = if generic_offset + total_generics_in_variant
+                            > type_args.len()
+                            && !type_args.is_empty()
+                        {
+                            &[] as &[Type]
+                        } else {
+                            &type_args
+                        };
                         for (j, binding_name) in vp.bindings.iter().enumerate() {
-                            let field_type = field_types.get(j).cloned().unwrap_or(IrType::Void);
+                            let field_type = resolve_field_type(
+                                field_types,
+                                j,
+                                generic_offset,
+                                safe_type_args,
+                                self.check,
+                            );
                             let field_val = self.emit(
                                 Op::EnumGetField(subject, var_idx as u32, j as u32),
                                 field_type.clone(),
@@ -133,17 +189,11 @@ impl<'a> LoweringContext<'a> {
                         // rejected this, but be defensive: jump past the arm
                         // and push a scope so the pop in lower_arm_body stays
                         // balanced.
-                        debug_assert!(
-                            false,
-                            "unknown enum variant `{}` in match lowering",
+                        unreachable!(
+                            "unknown enum variant `{}` in match lowering — \
+                             sema should have rejected this",
                             vp.variant
                         );
-                        self.terminate(Terminator::Jump {
-                            target: next_block,
-                            args: Vec::new(),
-                        });
-                        self.switch_to_block(arm_block);
-                        self.push_scope();
                     }
                 }
                 phoenix_parser::ast::Pattern::Wildcard(_) => {
@@ -249,13 +299,13 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
-    /// Lower a match arm body and jump to the merge block.
+    /// Lower a match arm body, pop scope, and jump to the merge block.
     fn lower_arm_body(&mut self, body: &MatchBody, ctx: &MatchCtx) {
         let arm_val = match body {
             MatchBody::Expr(expr) => self.lower_expr(expr),
             MatchBody::Block(block) => self
                 .lower_block_implicit(block)
-                .unwrap_or_else(|| self.emit(Op::ConstBool(false), IrType::Bool, ctx.span)),
+                .unwrap_or_else(|| self.void_placeholder(ctx.span)),
         };
         self.pop_scope();
 
@@ -271,4 +321,49 @@ impl<'a> LoweringContext<'a> {
             });
         }
     }
+}
+
+/// Resolve the concrete type for a variant field, substituting generic
+/// placeholders with type arguments from the match subject.
+///
+/// `field_types` is the variant's field type list from the enum layout.
+/// `field_idx` is the index of the current field within this variant.
+/// `generic_offset` is the number of generic placeholders in all prior variants.
+/// `type_args` is the concrete type arguments from the subject type
+/// (e.g., `[Int]` for `Option<Int>`).
+///
+/// ## Worked example: `Result<Int, String>`
+///
+/// Layout: `[("Ok", [__generic]), ("Err", [__generic])]`
+/// Type args: `[Int, String]`
+///
+/// For the `Ok` variant (index 0):
+///   - `generic_offset` = 0 (no prior variants)
+///   - field 0 is `__generic`, `prior_generics` = 0
+///   - `arg_idx` = 0 + 0 = 0 → resolves to `Int`
+///
+/// For the `Err` variant (index 1):
+///   - `generic_offset` = 1 (Ok has 1 generic placeholder)
+///   - field 0 is `__generic`, `prior_generics` = 0
+///   - `arg_idx` = 1 + 0 = 1 → resolves to `String`
+fn resolve_field_type(
+    field_types: &[IrType],
+    field_idx: usize,
+    generic_offset: usize,
+    type_args: &[Type],
+    check: &phoenix_sema::checker::CheckResult,
+) -> IrType {
+    let mut field_type = field_types.get(field_idx).cloned().unwrap_or(IrType::Void);
+    if field_type.is_generic_placeholder() {
+        let prior_generics = field_types
+            .iter()
+            .take(field_idx)
+            .filter(|t| t.is_generic_placeholder())
+            .count();
+        let arg_idx = generic_offset + prior_generics;
+        if let Some(concrete) = type_args.get(arg_idx) {
+            field_type = crate::lower::lower_type(concrete, check);
+        }
+    }
+    field_type
 }

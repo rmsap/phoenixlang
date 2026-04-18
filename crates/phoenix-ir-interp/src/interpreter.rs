@@ -13,7 +13,7 @@ use std::io::Write;
 use std::rc::Rc;
 
 /// Maximum call depth before reporting a stack overflow.
-const MAX_CALL_DEPTH: usize = 50;
+const MAX_CALL_DEPTH: usize = 256;
 
 /// A call frame on the interpreter stack.
 struct CallFrame {
@@ -324,21 +324,6 @@ impl<'m> IrInterpreter<'m> {
                     IrValue::EnumVariant(data) => {
                         Ok(IrValue::Int(data.borrow().discriminant as i64))
                     }
-                    // Built-in Option/Result variants are lowered as StructAlloc.
-                    // Map variant names to discriminants matching sema registration:
-                    // Some=0, None=1; Ok=0, Err=1.
-                    IrValue::Struct(data) => {
-                        let disc = match data.borrow().name.as_str() {
-                            "Some" | "Ok" => 0i64,
-                            "None" | "Err" => 1i64,
-                            name => {
-                                return error(format!(
-                                    "EnumDiscriminant on non-variant struct: {name}"
-                                ));
-                            }
-                        };
-                        Ok(IrValue::Int(disc))
-                    }
                     _ => error(format!("EnumDiscriminant on non-enum value: {val}")),
                 }
             }
@@ -351,31 +336,19 @@ impl<'m> IrInterpreter<'m> {
                         // runtime discriminant.  A mismatch indicates a bug
                         // in the IR lowering (e.g. extracting a field from
                         // the wrong variant).
-                        debug_assert_eq!(
-                            data.discriminant, *variant_idx,
-                            "EnumGetField variant_idx ({}) does not match runtime \
-                             discriminant ({}) — IR lowering may have emitted the \
-                             wrong variant index",
-                            variant_idx, data.discriminant,
-                        );
+                        if data.discriminant != *variant_idx {
+                            return error(format!(
+                                "EnumGetField variant_idx ({}) does not match runtime \
+                                 discriminant ({}) — IR lowering may have emitted the \
+                                 wrong variant index",
+                                variant_idx, data.discriminant,
+                            ));
+                        }
                         data.fields
                             .get(*idx as usize)
                             .cloned()
                             .ok_or_else(|| IrRuntimeError {
                                 message: format!("enum field index {} out of bounds", idx),
-                            })
-                    }
-                    // Built-in variants represented as structs.
-                    IrValue::Struct(data) => {
-                        let data = data.borrow();
-                        data.fields
-                            .get(*idx as usize)
-                            .cloned()
-                            .ok_or_else(|| IrRuntimeError {
-                                message: format!(
-                                    "variant struct field index {} out of bounds",
-                                    idx
-                                ),
                             })
                     }
                     _ => error(format!("EnumGetField on non-enum value: {val}")),
@@ -421,7 +394,7 @@ impl<'m> IrInterpreter<'m> {
                     .iter()
                     .map(|vid| frame.get(*vid).cloned())
                     .collect::<Result<_>>()?;
-                self.call_closure(callee, user_args)
+                self.call_closure(&callee, user_args)
             }
             Op::BuiltinCall(name, arg_vids) => {
                 let args: Vec<IrValue> = arg_vids
@@ -480,18 +453,18 @@ impl<'m> IrInterpreter<'m> {
                 if b == 0 {
                     return error("division by zero");
                 }
-                Ok(IrValue::Int(a / b))
+                Ok(IrValue::Int(a.wrapping_div(b)))
             }
             Op::IMod(a, b) => {
                 let (a, b) = (self.get_int(frame, *a)?, self.get_int(frame, *b)?);
                 if b == 0 {
                     return error("modulo by zero");
                 }
-                Ok(IrValue::Int(a % b))
+                Ok(IrValue::Int(a.wrapping_rem(b)))
             }
             Op::INeg(a) => {
                 let a = self.get_int(frame, *a)?;
-                Ok(IrValue::Int(-a))
+                Ok(IrValue::Int(a.wrapping_neg()))
             }
             Op::FAdd(a, b) => {
                 let (a, b) = (self.get_float(frame, *a)?, self.get_float(frame, *b)?);
@@ -507,16 +480,13 @@ impl<'m> IrInterpreter<'m> {
             }
             Op::FDiv(a, b) => {
                 let (a, b) = (self.get_float(frame, *a)?, self.get_float(frame, *b)?);
-                if b == 0.0 {
-                    return error("division by zero");
-                }
+                // No zero check: IEEE 754 produces inf/NaN, matching Cranelift's
+                // `fdiv` instruction (the compiler does not guard float division).
                 Ok(IrValue::Float(a / b))
             }
             Op::FMod(a, b) => {
                 let (a, b) = (self.get_float(frame, *a)?, self.get_float(frame, *b)?);
-                if b == 0.0 {
-                    return error("modulo by zero");
-                }
+                // No zero check: matches compiler semantics (IEEE 754 NaN).
                 Ok(IrValue::Float(a % b))
             }
             Op::FNeg(a) => {
@@ -670,15 +640,18 @@ impl<'m> IrInterpreter<'m> {
     }
 
     /// Call a closure value with arguments.
+    ///
+    /// Takes the closure by reference to avoid cloning the entire `IrValue`
+    /// on each call in a loop.  The captures are cloned internally.
     pub(crate) fn call_closure(
         &mut self,
-        closure: IrValue,
+        closure: &IrValue,
         user_args: Vec<IrValue>,
     ) -> Result<IrValue> {
         if let IrValue::Closure(func_id, captures) = closure {
-            let mut all_args = captures;
+            let mut all_args = captures.clone();
             all_args.extend(user_args);
-            self.call_function(func_id, all_args)
+            self.call_function(*func_id, all_args)
         } else {
             error(format!("expected closure, got {closure}"))
         }

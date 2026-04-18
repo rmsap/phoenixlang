@@ -2,11 +2,11 @@
 //!
 //! Each test compiles a Phoenix program via Cranelift and verifies
 //! the output matches the IR interpreter (see [`common::roundtrip`]).
-//! The `split` method is not tested here because it returns a
-//! `List<String>`, which is not yet supported in compiled mode.
+//! The `split` method is tested in `compile_lists.rs` alongside other
+//! list operations.
 
 mod common;
-use common::roundtrip;
+use common::{compile_and_run, roundtrip};
 
 // ── length ──────────────────────────────────────────────────────────
 
@@ -352,6 +352,22 @@ function main() {
     );
 }
 
+/// Substring with negative indices and out-of-bounds
+/// should clamp rather than panic.
+#[test]
+fn string_substring_clamping() {
+    roundtrip(
+        r#"
+function main() {
+    let s = "hello"
+    print(s.substring(-1, 3))
+    print(s.substring(2, 100))
+    print(s.substring(3, 1))
+}
+"#,
+    );
+}
+
 // ── chained methods ─────────────────────────────────────────────────
 
 #[test]
@@ -540,6 +556,20 @@ function main() {
     );
 }
 
+/// Searching for a non-empty needle in an empty string should return -1.
+#[test]
+fn string_index_of_empty_haystack_returns_neg1() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let s: String = ""
+    print(s.indexOf("a"))
+}
+"#,
+    );
+    assert_eq!(out, vec!["-1"]);
+}
+
 #[test]
 fn string_starts_with_empty_prefix() {
     roundtrip(
@@ -628,18 +658,6 @@ fn string_contains_identity() {
 function main() {
     let s: String = "hello"
     print(s.contains("hello"))
-}
-"#,
-    );
-}
-
-#[test]
-fn string_index_of_empty_haystack_nonempty_needle() {
-    roundtrip(
-        r#"
-function main() {
-    let s: String = ""
-    print(s.indexOf("a"))
 }
 "#,
     );

@@ -7,6 +7,13 @@
 //! - No instruction or terminator operand references [`VOID_SENTINEL`].
 //! - Every [`ValueId`] used as an operand is defined in the same function.
 //!
+//! **Not yet checked:** SSA dominance — the verifier does not verify that
+//! each use of a `ValueId` is dominated by its definition.  A full
+//! dominator-tree check would catch violations like using a value defined
+//! in a non-dominating predecessor.  This is a known gap; until it is
+//! implemented, take care to pass values through block parameters when
+//! crossing block boundaries (see `lower_try` for the canonical pattern).
+//!
 //! Run the verifier after every lowering pass in debug builds to catch
 //! bugs early.
 
