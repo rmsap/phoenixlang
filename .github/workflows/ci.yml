@@ -24,4 +24,5 @@ jobs:
       - run: cargo test -p phoenix-lsp
       - run: cargo test -p phoenix-driver
       - run: cargo test -p phoenix-runtime
+      - run: cargo build -p phoenix-runtime
       - run: cargo test -p phoenix-cranelift
