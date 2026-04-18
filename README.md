@@ -341,6 +341,7 @@ Phoenix is in early development and contributions are welcome. If you're interes
 2. Look at [known issues](docs/known-issues.md) for things that need fixing
 3. Open an issue to discuss before starting large changes
 4. All PRs should pass `cargo fmt`, `cargo clippy`, and `cargo test`
+5. Git hooks (pre-commit: fmt + clippy; pre-push: tests) install automatically via [cargo-husky](https://github.com/rhysd/cargo-husky) the first time you run `cargo test`
 
 ---
 

@@ -1,0 +1,13 @@
+#!/bin/sh
+# This hook was set by cargo-husky v1: https://github.com/rhysd/cargo-husky#readme
+
+set -e
+
+# phoenix-cranelift tests require libphoenix_runtime.a, which `cargo test`
+# does not build (staticlib crate-type is skipped for test harnesses).
+echo "[pre-push] cargo build -p phoenix-runtime"
+cargo build -p phoenix-runtime
+
+# Build and test one crate at a time to keep memory usage low.
+echo "[pre-push] cargo test --workspace (sequential)"
+cargo test --workspace --jobs 1 -- --test-threads=1
