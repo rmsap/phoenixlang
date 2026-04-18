@@ -308,3 +308,7 @@ async function main() {
   await server.serve(app)
 }
 ```
+
+---
+
+> *Phoenix: named for the bird that rises from its own ashes — a language that reimagines web development to be safe, expressive, and productive, letting developers write full-stack code in a single language with compile-time safety from client to database.*

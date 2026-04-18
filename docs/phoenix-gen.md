@@ -1,20 +1,34 @@
 # Phoenix Gen: Typed API Code Generation
 
-Phoenix Gen generates idiomatic client SDKs, server handler interfaces, validation logic, and OpenAPI specs from `.phx` schema files. Write your API schema once, generate typed code for TypeScript, Python, Go, and OpenAPI.
+**One schema file → typed clients and typed servers in four languages.** Phoenix Gen fills the gap between OpenAPI (verbose, weak authoring DX) and tRPC (TypeScript-only): a compact, typed Phoenix schema syntax with validation and refinement types built in, generating idiomatic code for TypeScript, Python, Go, and OpenAPI 3.1.
+
+## Why Phoenix Gen
+
+- **vs OpenAPI / Swagger** — same universal output (OpenAPI 3.1 is a target), but authored in compact Phoenix syntax instead of verbose YAML
+- **vs tRPC** — full-stack type safety across language boundaries, not just TypeScript
+- **vs Protobuf / gRPC** — designed for REST / JSON with path params, not RPC
+- **vs TypeSpec** — `where` constraints compile to real runtime validators, not just OpenAPI annotations
+
+## Contents
+
+- [Quick Start](#quick-start)
+- [Comparison to other tools](#comparison-to-other-tools)
+- [Schema Syntax](#schema-syntax)
+- [Type Derivation: `omit`, `pick`, and `partial`](#type-derivation-omit-pick-and-partial)
+- [Validation from `where` Constraints](#validation-from-where-constraints)
+- [Generated Output](#generated-output)
+- [Cross-Language Usage](#cross-language-usage)
+- [Configuration](#configuration)
+- [Reference](#reference)
+- [Background](#background)
+
+---
 
 ## Quick Start
 
-### 1. Install Phoenix
+Install Phoenix — see the [main README](../README.md#quick-start) for full install options, and the [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang) for syntax highlighting and inline diagnostics while editing `.phx` files.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sudo sh
-```
-
-Or download binaries from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases).
-
-**Editor support:** Install the [Phoenix VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang) for syntax highlighting and inline diagnostics while editing `.phx` files. See [Editor Support](../README.md#editor-support) for full details.
-
-### 2. Write a schema
+### 1. Write a schema
 
 ```phoenix
 struct User {
@@ -48,7 +62,7 @@ endpoint getUser: GET "/api/users/{id}" {
 }
 ```
 
-### 3. Generate code
+### 2. Generate code
 
 ```bash
 phoenix gen schema.phx                        # TypeScript (default)
@@ -60,6 +74,54 @@ phoenix gen schema.phx --server               # Types + handlers + router only
 phoenix gen schema.phx --watch                # Re-generate on file changes
 phoenix gen                                   # Use settings from phoenix.toml
 ```
+
+### 3. What you get
+
+TypeScript output (client side) for the schema above:
+
+```typescript
+// generated/client.ts
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  age: number;
+}
+
+export type CreateUserBody = Omit<User, "id">;
+
+export const api = {
+  async listUsers(opts?: { page?: number; limit?: number; search?: string }): Promise<User[]> { /* ... */ },
+  async createUser(body: CreateUserBody): Promise<User> { /* ... */ },
+  async getUser(id: number): Promise<User> { /* ... */ },
+};
+```
+
+And the server-side handler interface the developer implements:
+
+```typescript
+// generated/handlers.ts
+export interface Handlers {
+  listUsers(query: { page: number; limit: number; search?: string }): Promise<User[]>;
+  createUser(body: CreateUserBody): Promise<User>;
+  getUser(id: number): Promise<User>;
+}
+```
+
+Phoenix Gen emits the router, request validation, and error-to-HTTP mapping; the developer just implements `Handlers`. See [Generated Output](#generated-output) for Python, Go, and OpenAPI samples.
+
+---
+
+## Comparison to other tools
+
+| Tool | Strengths | Gap Phoenix Gen fills |
+|------|-----------|----------------------|
+| OpenAPI / Swagger | Universal ecosystem support | Verbose YAML, poor authoring experience, mediocre code generators |
+| Protobuf / gRPC | Excellent multi-language codegen | Designed for RPC, not REST/HTTP APIs with path params and JSON |
+| TypeSpec (Microsoft) | Clean DSL, generates OpenAPI | No validation/refinement types, no direct client SDK generation |
+| tRPC | Best-in-class DX for TypeScript full-stack | TypeScript-only — locks both client and server to one language |
+| Smithy (AWS) | Powerful service modeling | Complex, AWS-centric, steep learning curve |
+| GraphQL | Strong type system, introspection | Different paradigm, N+1 problems, complexity for simple APIs |
 
 ---
 
@@ -356,19 +418,33 @@ Generates an OpenAPI 3.1 spec with paths, schemas, parameters, error responses, 
 
 ## Cross-Language Usage
 
-A single `.phx` schema can generate client code in one language and server code in another. The schema is the shared contract.
+A single `.phx` schema can generate client code in one language and server code in another. The schema is the shared contract — when a field is added, renamed, or removed, both sides regenerate and any mismatch is caught at compile time before any runtime traffic.
+
+### Example: TypeScript frontend + Go backend
 
 ```bash
-# TypeScript frontend
-phoenix gen schema.phx --target typescript --client --out ./frontend/src/api
+# TypeScript frontend (React app)
+phoenix gen schema.phx --target typescript --client --out ./web/src/api
 
-# Python backend
-phoenix gen schema.phx --target python --server --out ./backend/api
+# Go backend (net/http server)
+phoenix gen schema.phx --target go --server --out ./server/api
 ```
 
-Both sides are derived from the same `.phx` file. If a field is added, renamed, or removed in the schema, both the client and server code are regenerated — the contract cannot drift out of sync.
+Now rename a field — say `age` becomes `birthYear` in `schema.phx`. Re-run both commands:
 
-Other combinations work the same way: TypeScript + Go, React Native + Python, multiple clients from one schema, etc.
+- The TypeScript frontend fails to compile until any UI code referencing `user.age` is updated to `user.birthYear`.
+- The Go `Handlers` interface now requires a `BirthYear int` field; the backend won't build until the implementation catches up.
+
+The contract **cannot drift out of sync** — inconsistencies surface at compile time on both sides, not at runtime after a user-facing error.
+
+### Other combinations
+
+- TypeScript client + Python FastAPI server
+- React Native client + Go backend
+- Multiple clients (e.g., web + mobile) from a single schema
+- One server + an OpenAPI spec for third-party consumers
+
+Phoenix Gen treats every target as a peer: all four produce equally idiomatic output, and any combination of client/server languages works.
 
 ---
 
@@ -512,27 +588,6 @@ Phoenix's most differentiating features — typed endpoints, built-in serializat
 - **Builds a user base.** Every developer using `phoenix gen` learns Phoenix syntax and joins the ecosystem.
 - **Validates the design.** Real-world usage of `endpoint` and `schema` declarations shapes the full language design with feedback instead of speculation.
 - **Creates a migration path.** When the full language ships, `.phx` schema files become importable modules with zero rewrite.
-
-### Competitive landscape
-
-| Tool | Strengths | Gap Phoenix Gen fills |
-|------|-----------|----------------------|
-| OpenAPI / Swagger | Universal ecosystem support | Verbose YAML, poor authoring experience, mediocre code generators |
-| Protobuf / gRPC | Excellent multi-language codegen | Designed for RPC, not REST/HTTP APIs with path params and JSON |
-| TypeSpec (Microsoft) | Clean DSL, generates OpenAPI | No validation/refinement types, no direct client SDK generation |
-| tRPC | Best-in-class DX for TypeScript full-stack | TypeScript-only — locks both client and server to one language |
-| Smithy (AWS) | Powerful service modeling | Complex, AWS-centric, steep learning curve |
-| GraphQL | Strong type system, introspection | Different paradigm, N+1 problems, complexity for simple APIs |
-
-### Implementation status
-
-| Phase | Status |
-|-------|--------|
-| Gen Phase 1: Foundation (parser, type checker, CLI) | Complete |
-| Gen Phase 2: TypeScript target + VS Code extension | Complete |
-| Gen Phase 3: OpenAPI target | Complete |
-| Gen Phase 4: Python and Go targets | Complete (Rust deferred) |
-| Gen Phase 5: Watch mode, integration testing, LSP | Complete |
 
 ### Relationship to the full language
 
