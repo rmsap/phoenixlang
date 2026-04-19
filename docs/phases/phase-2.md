@@ -35,16 +35,40 @@ All memory is currently leaked (no GC); compiled binaries are not suitable for l
 - Keep the interpreter available as a fast-feedback mode (`phoenix run` = interpret, `phoenix build` = compile)
 - **Why Cranelift over LLVM:** pure Rust dependency, fast compile times, built-in WASM support. Add LLVM as an optional optimizing backend later.
 
-## 2.3 Runtime Library (expand)
+### Design decisions locked in this phase
+
+These decisions pin the ABI / calling convention and must land before 2.2 wraps — retrofitting after user code ships is strictly worse. See [design-decisions.md](../design-decisions.md):
+
+- **[Generic function monomorphization](../design-decisions.md#generic-function-monomorphization-strategy)** — user generics get one specialized copy per concrete instantiation.
+- **[Dynamic dispatch via `dyn Trait`](../design-decisions.md#dynamic-dispatch-via-dyn-trait)** — vtable ABI `(data_ptr, vtable_ptr)`; static dispatch stays the default.
+- **[Centralized `Layout` trait](../design-decisions.md#centralized-layout-for-reference-types)** — single source of truth for reference-type slot count, alignment, load/store codegen.
+- **[Numeric error semantics](../design-decisions.md#numeric-error-semantics-division-overflow-integer-edge-cases)** — Int operators panic on overflow / divide-by-zero / `i64::MIN` negation (ratifies current behavior); Float follows IEEE 754. Stdlib `Int.checked*` family lands in Phase 4.1.
+
+### Bugs to be closed in this phase
+
+See [known-issues.md](../known-issues.md) for the full entries. Three Cranelift-specific bugs should close out by the end of 2.2:
+
+- **[`Option.okOr` payload inference](../known-issues.md#optionokor-fails-to-compile-when-payload-type-cannot-be-inferred)** — likely absorbed by monomorphization (see decision above); verify after that lands.
+- **[Closure capture type ambiguity with indirect calls](../known-issues.md#closure-capture-type-ambiguity-with-indirect-calls)** — IR closure representation needs capture metadata. Check whether to stage this fix alongside the Phase 2.6 `Value::Closure` refactor.
+- **[`Result.ok()` / `Result.err()` not in Cranelift](../known-issues.md#resultok-and-resulterr-not-supported-in-compiled-mode)** — straightforward dispatch-table addition.
+
+## 2.3 Runtime and Memory Management
 
 A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix-runtime/) crate (static library linked into compiled binaries). It currently provides `print` (all value types + strings), `toString`, string comparison and concatenation, all string methods, heap allocation (`phx_alloc` via `malloc`, no GC), panic/abort, `List<T>` data structures (alloc, get, push, contains, take, drop), `String.split` (returns `List<String>`), and `Map<K, V>` data structures (alloc, get, set, remove, contains, keys, values). This section covers extending it into a full runtime.
 
-- Garbage collector (tracing GC or reference-counted — TBD during compiler development)
+- Garbage collector — **tracing GC, mark-and-sweep baseline** (decided 2026-04-19; see [GC strategy](../design-decisions.md#gc-strategy)). Leave room to evolve to generational later without ABI changes. Implied commitment: `defer` / `using` / `with` syntax becomes required since tracing GC has no deterministic-destruction story for resource cleanup (see [`defer` for resource cleanup](../design-decisions.md#defer-for-resource-cleanup), still open on syntax).
 - String implementation (UTF-8, immutable by default) — basic ops already in `phoenix-runtime`
 - Panic/abort handler — already in `phoenix-runtime`
 - Built-in function implementations (`print`, `toString`) — already in `phoenix-runtime`
 - Collection runtime support (List, Map data structures with dynamic resizing) — **basic implementation complete** (`list_methods.rs`, `map_methods.rs`); map lookup is currently O(n) linear scan — hash-based implementation planned
 - Builtin method implementations (String.*, List.*, Map.*, Option.*, Result.*) — **complete** in compiled mode; closure-based list methods (map, filter, reduce, etc.) are compiled inline as Cranelift loops (`list_methods_closure.rs` for single-loop methods — map, filter, find, any, all, reduce; `list_methods_complex.rs` for nested-loop methods — flatMap, sortBy)
+
+### Bugs to be closed in this phase
+
+See [known-issues.md](../known-issues.md):
+
+- **[O(n) map key lookup](../known-issues.md#on-map-key-lookup)** — replace the flat-array linear scan with a hash-based implementation.
+- **[O(n²) `List.sortBy` insertion sort](../known-issues.md#on²-listsortby-insertion-sort)** — replace with merge sort. Both backends currently share the O(n²) algorithm; the fix lands in the runtime and the Cranelift inline codegen together.
 
 ## 2.4 WebAssembly Target
 
@@ -52,6 +76,7 @@ A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix
 - Slim runtime for the browser
 - Bridge to browser APIs via imports (DOM manipulation, fetch, etc.)
 - Shared types between backend and frontend targets
+- **Target the WASM GC proposal** (standardized, shipping in all major browsers). The [tracing GC decision](../design-decisions.md#gc-strategy) was made in part to align with WASM GC — Phoenix's object model maps onto WASM GC's struct/reference types cleanly, so the browser VM does the collection and binaries stay small. Linear-memory WASM remains a fallback option for runtimes without WASM GC support.
 
 ## 2.5 JavaScript Interop
 
@@ -157,6 +182,13 @@ function hash(input: String) -> String {
 - **Why before packages:** The package manager (3.1) needs modules to exist. You cannot have cross-package imports without intra-project imports. Module resolution is also needed by the LSP (3.2) for go-to-definition and auto-imports.
 - **Complexity:** High — requires a module resolver (file system → module tree), import resolution, visibility checking across module boundaries, and changes to name resolution in the semantic checker. The two-pass registration design already handles forward references within a file; extending it to cross-file references adds significant complexity.
 - **Depends on:** Semantic analysis (Phase 1, complete)
+
+### Refactors bundled into this phase
+
+Two codebase-hygiene refactors land alongside the module-system work — both paid for by the module-system scope (multi-file diagnostics, evolving parser AST) and both must be complete before Phase 3.2 (LSP). See [design-decisions.md](../design-decisions.md):
+
+- **[Diagnostic builder pattern](../design-decisions.md#diagnostic-builder-pattern)** — replace inline `self.error(msg, span)` with a fluent `Diagnostic::error(span, msg).with_note(...).with_suggestion(...).emit()` API. Module-system diagnostics are a natural first consumer (multi-span "symbol X is private, defined here: [other file]" errors). Hard deadline: before Phase 3.2.
+- **[Interpreter-parser coupling via `Value::Closure`](../design-decisions.md#interpreter-parser-coupling-via-valueclosure)** — switch closures to store IR blocks instead of parser AST blocks, so the interpreter consumes IR like the Cranelift backend does. IR stabilizes during Phase 2.2; doing this in 2.6 targets a settled IR.
 
 ## 2.7 Benchmark Suite
 

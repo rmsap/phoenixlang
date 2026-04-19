@@ -265,7 +265,7 @@ See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Langua
 Phoenix is in early development and contributions are welcome.
 
 1. Check the [roadmap](docs/roadmap.md) for current priorities
-2. Look at [known issues](docs/known-issues.md) for things that need fixing
+2. Look at [known issues](docs/known-issues.md) for things that need fixing, or [design decisions](docs/design-decisions.md) for open questions about the language
 3. Open an issue to discuss before starting large changes
 4. All PRs should pass `cargo fmt`, `cargo clippy`, and `cargo test` — git hooks (pre-commit: fmt + clippy; pre-push: tests) install automatically via [cargo-husky](https://github.com/rhysd/cargo-husky) on first `cargo test`
 

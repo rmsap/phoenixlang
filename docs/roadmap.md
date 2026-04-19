@@ -17,7 +17,7 @@ This document outlines the path from the current implementation to a production-
 | [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability, frontend framework |
 | [6](phases/phase-6.md) | Ecosystem & Adoption | Planned | Documentation site, package registry, starter templates, community, 1.0 release |
 
-See also: [Known Issues & Design Decisions](known-issues.md) | [Phoenix Gen](phoenix-gen.md) (parallel track)
+See also: [Known Issues](known-issues.md) | [Design Decisions](design-decisions.md) | [Phoenix Gen](phoenix-gen.md) (parallel track)
 
 ---
 

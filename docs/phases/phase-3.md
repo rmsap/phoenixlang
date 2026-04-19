@@ -19,6 +19,7 @@ Developers will not adopt a language without good tooling. This must come before
 - Auto-completion for fields, methods, and function parameters
 - VS Code extension as the first-class IDE integration
 - **Why critical:** developers evaluate a language by opening a file in their editor. If there's no autocomplete or inline errors, the language feels broken.
+- **Prerequisite:** the [diagnostic builder](../design-decisions.md#diagnostic-builder-pattern) (landing in Phase 2.6) must be in place before LSP work begins. LSP clients render rich diagnostics — secondary spans, notes, quick-fix suggestions — and those map onto the builder's fields. Shipping LSP against a thin diagnostic API means retrofitting both LSP and every error site once the builder lands.
 
 ## 3.3 Formatter
 
@@ -267,3 +268,4 @@ This is deferred until refinement types exist, but the `@test` annotation and as
 - Every error should say what went wrong, where, and suggest a fix
 - Use source-annotated diagnostics (like Rust's or Elm's error messages)
 - This is not a feature — it is a continuous effort that should improve with every release
+- **Foundation:** the [diagnostic builder](../design-decisions.md#diagnostic-builder-pattern) (Phase 2.6) is the construction API this phase builds on; notes, secondary spans, and suggestions are already wired through by the time 3.5 begins. This phase is about *populating* those fields with high-quality messages, not about infrastructure.

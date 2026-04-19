@@ -10,6 +10,7 @@ A batteries-included stdlib for web development. This is what makes Phoenix prac
 - `String` methods (split, trim, contains, replace, startsWith, etc.)
 - Math functions (abs, min, max, floor, ceil, sqrt, pow)
 - Type conversion (Int to Float, etc.)
+- **Numeric recovery methods** (per the [numeric error semantics decision](../design-decisions.md#numeric-error-semantics-division-overflow-integer-edge-cases)): `Int.checkedDiv`, `Int.checkedAdd`, `Int.checkedSub`, `Int.checkedMul`, `Int.checkedRem`, `Int.checkedNeg` — each returning `Option<Int>` for validation paths. Float predicates: `Float.isFinite()`, `Float.isNaN()`, `Float.isInfinite()` — IEEE 754 is the recovery story for floats, not checked arithmetic.
 
 ### Tuple types
 
@@ -284,6 +285,13 @@ match config {
 ## 4.3 Async Runtime and Structured Concurrency
 
 Phoenix uses **structured concurrency** — every spawned task has a parent scope, and the parent cannot complete until all its children have finished or been cancelled. This prevents orphaned tasks, leaked resources, and fire-and-forget concurrency bugs.
+
+**Open design decisions for this phase** (see [design-decisions.md](../design-decisions.md)):
+
+- **[`mut` aliasing / shared mutable captures](../design-decisions.md#mut-gives-no-aliasing-guarantees-closures-share-mutable-captures-freely)** — today closures can share mutable captures freely. Benign under single-threaded execution; the shape of a data race once tasks run concurrently. Decide task-boundary constraint model (forbid shared mutable captures? require `Atomic` / `Mutex` at task-crossing? channel-only?) before `spawn` / task APIs get designed here — retrofitting `Send`-equivalent bounds after task APIs exist creates permanent coloring problems.
+- **[`defer` for resource cleanup](../design-decisions.md#defer-for-resource-cleanup)** — forced by the tracing GC decision (no `Drop`-style deterministic destruction). The "do we need it" question is answered yes; syntax (`defer`, `using`, `with`) still open. Resolve before async resource-management patterns solidify.
+
+**GC context:** the [tracing GC decision](../design-decisions.md#gc-strategy) was made partly with this phase in mind — tracing GCs compose cleanly with concurrent collection, whereas RC would need atomic refcount ops (10–100× slower under contention).
 
 ### Core primitives
 
