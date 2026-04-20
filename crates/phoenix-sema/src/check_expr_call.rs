@@ -1,7 +1,14 @@
+use crate::check_types::UnifyError;
 use crate::checker::{Checker, FunctionInfo};
 use crate::types::Type;
+use phoenix_common::span::Span;
 use phoenix_parser::ast::{CallExpr, Expr, MethodCallExpr, StructLiteralExpr};
 use std::collections::{HashMap, HashSet};
+
+/// Output of [`Checker::infer_and_check_call_generics`]:
+/// `(bindings, arg_types, errors)`.
+/// See that method's docstring for field semantics.
+type CallGenericsInference = (HashMap<String, Type>, Vec<Type>, Vec<(usize, UnifyError)>);
 
 impl Checker {
     /// Type-checks a method call (`obj.method(args)`), dispatching to built-in
@@ -75,8 +82,30 @@ impl Checker {
         if let Some(type_methods) = self.methods.get(&type_name).cloned()
             && let Some(method_info) = type_methods.get(&mc.method)
         {
-            self.check_method_args(mc, &method_info.params, &bindings);
-            return Self::substitute(&method_info.return_type, &bindings);
+            // Merge parent-type bindings (from the receiver) with bindings
+            // inferred for the method's own type parameters (from the
+            // argument types), then record the method's concrete type
+            // args for IR monomorphization.
+            let mut all_bindings = bindings.clone();
+            if !method_info.type_params.is_empty() {
+                // Pre-check arg types so inference has something to unify.
+                let arg_types: Vec<Type> = mc.args.iter().map(|a| self.check_expr(a)).collect();
+                let (method_bindings, errors) =
+                    self.infer_type_args(&method_info.params, &arg_types);
+                for (k, v) in method_bindings.iter() {
+                    all_bindings.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                self.record_inferred_type_args(
+                    &format!("{}.{}", type_name, mc.method),
+                    &method_info.type_params,
+                    &all_bindings,
+                    &errors,
+                    &arg_types,
+                    mc.span,
+                );
+            }
+            self.check_method_args(mc, &method_info.params, &all_bindings);
+            return Self::substitute(&method_info.return_type, &all_bindings);
         }
         // Check trait bounds for type variables
         if let Some(ty) = self.resolve_trait_bound_method(&obj_type, mc) {
@@ -180,7 +209,7 @@ impl Checker {
                 }
                 let field_types: Vec<Type> =
                     struct_info.fields.iter().map(|f| f.ty.clone()).collect();
-                let bindings = self.infer_type_args(&field_types, &arg_types);
+                let (bindings, _) = self.infer_type_args(&field_types, &arg_types);
                 for (i, arg) in sl.args.iter().enumerate() {
                     let expected = Self::substitute(&struct_info.fields[i].ty, &bindings);
                     if !arg_types[i].is_error()
@@ -262,7 +291,7 @@ impl Checker {
                 for arg in &sl.args {
                     arg_types.push(self.check_expr(arg));
                 }
-                let bindings = self.infer_type_args(&variant_types, &arg_types);
+                let (bindings, _) = self.infer_type_args(&variant_types, &arg_types);
                 for (i, arg) in sl.args.iter().enumerate() {
                     let expected = Self::substitute(&variant_types[i], &bindings);
                     if !arg_types[i].is_error()
@@ -453,8 +482,16 @@ impl Checker {
 
         // Now type-check all provided arguments
         if !func_info.type_params.is_empty() {
-            let bindings =
+            let (bindings, arg_types, errors) =
                 self.infer_and_check_call_generics(func_name, func_info, call, positional_count);
+            self.record_inferred_type_args(
+                func_name,
+                &func_info.type_params,
+                &bindings,
+                &errors,
+                &arg_types,
+                call.span,
+            );
             return Self::substitute(&func_info.return_type, &bindings);
         }
 
@@ -538,15 +575,26 @@ impl Checker {
 
     /// For a generic function call, builds the full argument type array,
     /// infers type variable bindings, type-checks each argument against its
-    /// substituted parameter type, and validates trait bounds. Returns the
-    /// inferred type bindings map.
+    /// substituted parameter type, and validates trait bounds.
+    ///
+    /// Returns `(bindings, arg_types, errors)`:
+    /// - `bindings` maps declared type parameters to their inferred concrete
+    ///   types. May be incomplete if no argument constrains a parameter.
+    /// - `arg_types` is the fully resolved `Vec<Type>` in declared parameter
+    ///   order (defaults fill in uncovered positions). Used downstream by
+    ///   [`record_inferred_type_args`](Self::record_inferred_type_args) to
+    ///   suppress unresolved-param diagnostics when a cascade is already in
+    ///   flight from `Type::Error` arguments.
+    /// - `errors` are the binding-level failures ([`UnifyError::Conflict`]
+    ///   and [`UnifyError::OccursCheck`]) discovered by
+    ///   [`infer_type_args`](Self::infer_type_args).
     fn infer_and_check_call_generics(
         &mut self,
         func_name: &str,
         func_info: &FunctionInfo,
         call: &CallExpr,
         positional_count: usize,
-    ) -> HashMap<String, Type> {
+    ) -> CallGenericsInference {
         let total_params = func_info.params.len();
 
         // Build the full arg_types array in param order
@@ -572,7 +620,7 @@ impl Checker {
                 *at = func_info.params[i].clone();
             }
         }
-        let bindings = self.infer_type_args(&func_info.params, &arg_types);
+        let (bindings, errors) = self.infer_type_args(&func_info.params, &arg_types);
 
         // Type-check provided args against substituted param types
         for (i, arg) in call.args.iter().enumerate() {
@@ -634,7 +682,114 @@ impl Checker {
             }
         }
 
-        bindings
+        (bindings, arg_types, errors)
+    }
+
+    /// Finalize a generic call: emit diagnostics for any unification errors
+    /// and for unresolved type parameters, then (if everything resolved
+    /// cleanly) record the concrete type arguments in
+    /// [`call_type_args`](Checker::call_type_args) keyed by `call_span` for
+    /// IR monomorphization to consume.
+    ///
+    /// The contract is:
+    /// - Conflicts and occurs-check failures always produce a diagnostic.
+    /// - Unresolved type parameters produce a diagnostic **unless** some
+    ///   argument already has `Type::Error` (suppresses cascades from
+    ///   undefined identifiers and similar upstream errors).
+    /// - Nothing is inserted into `call_type_args` if any diagnostic fires
+    ///   or if any resolved type is `Type::Error`. Downstream IR lowering
+    ///   relies on this invariant: entries always have fully-resolved
+    ///   concrete types.
+    pub(crate) fn record_inferred_type_args(
+        &mut self,
+        callee_name: &str,
+        type_params: &[String],
+        bindings: &HashMap<String, Type>,
+        errors: &[(usize, UnifyError)],
+        arg_types: &[Type],
+        call_span: Span,
+    ) {
+        // Surface binding-level failures first.
+        let mut had_hard_error = false;
+        for (i, err) in errors {
+            had_hard_error = true;
+            match err {
+                UnifyError::Conflict {
+                    param,
+                    existing,
+                    incoming,
+                } => {
+                    self.error(
+                        format!(
+                            "argument {} of `{}`: conflicting bindings for type parameter `{}` (was `{}`, now `{}`)",
+                            i + 1,
+                            callee_name,
+                            param,
+                            existing,
+                            incoming
+                        ),
+                        call_span,
+                    );
+                }
+                UnifyError::OccursCheck { param, incoming } => {
+                    self.error(
+                        format!(
+                            "argument {} of `{}`: cannot bind type parameter `{}` to `{}` (recursive type)",
+                            i + 1,
+                            callee_name,
+                            param,
+                            incoming
+                        ),
+                        call_span,
+                    );
+                }
+                UnifyError::Mismatch => {}
+            }
+        }
+
+        // Surface unresolved type parameters — but only if no argument is
+        // already `Type::Error`, to avoid cascading diagnostics from
+        // upstream failures (undefined identifiers, type errors in args).
+        let has_error_arg = arg_types.iter().any(Type::is_error);
+        let unresolved: Vec<&str> = type_params
+            .iter()
+            .filter(|tp| !bindings.contains_key(tp.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unresolved.is_empty() && !has_error_arg {
+            let names = unresolved
+                .iter()
+                .map(|n| format!("`{}`", n))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (param_word, them) = if unresolved.len() == 1 {
+                ("type parameter", "it")
+            } else {
+                ("type parameters", "them")
+            };
+            self.error(
+                format!(
+                    "cannot infer {} {} for call to `{}`; no argument constrains {}",
+                    param_word, names, callee_name, them
+                ),
+                call_span,
+            );
+            return;
+        }
+
+        if had_hard_error {
+            return;
+        }
+
+        let ordered: Option<Vec<Type>> = type_params
+            .iter()
+            .map(|tp| bindings.get(tp).cloned())
+            .collect();
+        if let Some(ordered) = ordered
+            && !ordered.iter().any(Type::is_error)
+        {
+            self.call_type_args.insert(call_span, ordered);
+        }
     }
 
     /// Checks a call expression against a callee that has a known type.

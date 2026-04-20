@@ -62,16 +62,24 @@ impl CompileContext {
         // Declare runtime functions.
         let runtime = RuntimeFunctions::declare(&mut module, call_conv)?;
 
-        // Declare all Phoenix functions in the Cranelift module.
+        // Declare all concrete Phoenix functions in the Cranelift module.
+        // Generic templates are skipped via `concrete_functions()` — their
+        // param/return types contain `IrType::TypeVar` which has no
+        // Cranelift representation. The monomorphized specializations are
+        // declared alongside.
+        //
+        // Monomorphization produces symbol-safe names (see
+        // `phoenix_ir::monomorphize`'s mangling grammar), so the only
+        // mangling needed here is the `.` → `__` step for method names
+        // (`TypeName.method` → `TypeName__method`).
         let mut func_ids = HashMap::new();
-        for func in &ir_module.functions {
+        for func in ir_module.concrete_functions() {
             let sig = build_signature(&func.param_types, &func.return_type, call_conv);
             let linkage = if func.name == "main" {
                 Linkage::Export
             } else {
                 Linkage::Local
             };
-            // Mangle function names to avoid conflicts with runtime symbols.
             let cl_name = format!("phx_{}", func.name.replace('.', "__"));
             let cl_id = module.declare_function(&cl_name, linkage, &sig)?;
             func_ids.insert(func.id, cl_id);

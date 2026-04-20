@@ -32,6 +32,20 @@ pub struct IrModule {
 }
 
 impl IrModule {
+    /// Iterate over the functions that any backend or verifier should
+    /// consume: all concrete (non-template) functions in insertion order.
+    ///
+    /// Generic templates remain in `self.functions` as inert stubs after
+    /// monomorphization (to preserve the `FuncId`-as-vector-index
+    /// invariant), but they contain `IrType::TypeVar` and have no valid
+    /// lowering. Every consumer that walks functions should go through
+    /// this iterator.
+    pub fn concrete_functions(&self) -> impl Iterator<Item = &IrFunction> {
+        self.functions.iter().filter(|f| !f.is_generic_template)
+    }
+}
+
+impl IrModule {
     /// Creates an empty module.
     pub fn new() -> Self {
         Self {
@@ -73,6 +87,24 @@ pub struct IrFunction {
     next_block_id: u32,
     /// Source span of the original function declaration (for debug info).
     pub span: Option<Span>,
+    /// Declared generic type parameter names in source order (e.g.,
+    /// `["T", "U"]` for `function foo<T, U>`). Empty for non-generic
+    /// functions. Monomorphization uses this to build the substitution map
+    /// from `IrType::TypeVar(name)` to concrete types.
+    pub type_param_names: Vec<String>,
+    /// `true` if this function is a generic template that has not been
+    /// specialized. Templates are kept in the module after monomorphization
+    /// as inert stubs (to preserve `FuncId`-as-vector-index) and are skipped
+    /// by the verifier and by downstream backends.
+    ///
+    /// **Consumers must not iterate `IrModule::functions` directly after
+    /// monomorphization.** Use [`IrModule::concrete_functions`] (which
+    /// filters on this flag) or explicitly check `is_generic_template`
+    /// before touching a function's body — a template may still contain
+    /// `IrType::TypeVar`, which panics
+    /// [`IrType::is_value_type`](crate::types::IrType::is_value_type) and
+    /// friends.
+    pub is_generic_template: bool,
 }
 
 impl IrFunction {
@@ -95,6 +127,8 @@ impl IrFunction {
             next_value_id: 0,
             next_block_id: 0,
             span,
+            type_param_names: Vec::new(),
+            is_generic_template: false,
         }
     }
 

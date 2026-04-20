@@ -41,6 +41,9 @@ mod lower_decl;
 mod lower_expr;
 mod lower_match;
 mod lower_stmt;
+// Monomorphization pass — specializes generic functions at every concrete
+// call site. See the module-level docs in `monomorphize.rs` for the algorithm.
+mod monomorphize;
 
 #[cfg(test)]
 mod tests;

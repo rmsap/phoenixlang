@@ -18,7 +18,7 @@ pub(super) fn find_capture_types_by_func_id(
     func_id: PhxFuncId,
     user_param_count: usize,
 ) -> Result<Vec<IrType>, CompileError> {
-    for func in &ir_module.functions {
+    for func in ir_module.concrete_functions() {
         if func.id == func_id {
             if func.param_types.len() >= user_param_count {
                 let capture_count = func.param_types.len() - user_param_count;
@@ -54,7 +54,7 @@ pub(super) fn find_closure_capture_types(
     return_type: &IrType,
 ) -> Result<Vec<IrType>, CompileError> {
     let mut candidates: Vec<Vec<IrType>> = Vec::new();
-    for func in &ir_module.functions {
+    for func in ir_module.concrete_functions() {
         if !func.name.starts_with("__closure_") {
             continue;
         }

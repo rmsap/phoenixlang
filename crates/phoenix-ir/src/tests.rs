@@ -1098,3 +1098,388 @@ fn lower_if_expr_all_branches_return() {
     );
     insta::assert_snapshot!(ir);
 }
+
+/// An ambiguous/unresolvable generic call site must not
+/// panic in `lower_type` when sema's inference falls back to `Type::Error`.
+/// Lowering should produce a module (possibly with placeholder types)
+/// without unwinding.
+#[test]
+fn unresolvable_generic_call_does_not_panic() {
+    let source = r#"
+function identity<T>(x: T) -> T { x }
+function main() {
+    // No call to `identity` at all — sema has nothing to infer, and the
+    // template stays untouched. Lower should succeed.
+}
+"#;
+    // Compiling an uninstantiated template must not panic.
+    let _ = lower_source(source);
+}
+
+/// Verifier must skip generic templates — their bodies contain
+/// `IrType::TypeVar` which no backend consumes.
+#[test]
+fn verifier_skips_generic_templates() {
+    let module = lower_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function main() { print(identity(1)) }
+"#,
+    );
+
+    // The module contains the template and the specialization.
+    let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"identity"), "expected template");
+    assert!(
+        names.contains(&"identity__i64"),
+        "expected specialization, have: {names:?}"
+    );
+
+    // Verification succeeds without errors despite TypeVars in the
+    // template body.
+    let errs = verify::verify(&module);
+    assert!(
+        errs.is_empty(),
+        "verifier reported errors for template: {errs:?}"
+    );
+}
+
+/// `IrModule::concrete_functions` must filter out generic templates.
+#[test]
+fn concrete_functions_filters_templates() {
+    let module = lower_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function main() { print(identity(1)) }
+"#,
+    );
+    for f in module.concrete_functions() {
+        assert!(
+            !f.is_generic_template,
+            "concrete_functions yielded template `{}`",
+            f.name
+        );
+    }
+}
+
+/// Generic methods on user-defined types are monomorphized just like
+/// generic free functions.
+#[test]
+fn generic_method_specializations_appear_in_module() {
+    let module = lower_source(
+        r#"
+struct Holder {
+    Int tag
+}
+impl Holder {
+    function wrap<U>(self, x: U) -> U { x }
+}
+function main() {
+    let h = Holder(1)
+    print(h.wrap(42))
+    print(h.wrap("hi"))
+}
+"#,
+    );
+
+    // Expect two specializations: at Int and at String.
+    let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.contains("wrap__i64")),
+        "missing Int specialization, have: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("wrap__str")),
+        "missing String specialization, have: {names:?}"
+    );
+}
+
+#[test]
+fn generic_method_call_retargets_to_specialization() {
+    use crate::instruction::Op;
+
+    let module = lower_source(
+        r#"
+struct Holder {
+    Int tag
+}
+impl Holder {
+    function wrap<U>(self, x: U) -> U { x }
+}
+function main() {
+    let h = Holder(1)
+    print(h.wrap(42))
+    print(h.wrap("hi"))
+}
+"#,
+    );
+
+    // Find the template's FuncId — any specialization targeting this id
+    // would be a regression.
+    let template_id = module
+        .functions
+        .iter()
+        .find(|f| f.name == "Holder.wrap" && f.is_generic_template)
+        .expect("expected a template function for Holder.wrap")
+        .id;
+
+    let main = module
+        .functions
+        .iter()
+        .find(|f| f.name == "main")
+        .expect("main function");
+    for block in &main.blocks {
+        for instr in &block.instructions {
+            if let Op::Call(callee, type_args, _) = &instr.op {
+                assert_ne!(
+                    *callee, template_id,
+                    "main still calls the Holder.wrap template directly — \
+                     sema did not record call_type_args or monomorphize \
+                     did not rewrite the call"
+                );
+                assert!(
+                    type_args.is_empty(),
+                    "main's Op::Call still carries non-empty type_args \
+                     post-monomorphization: {type_args:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A generic call at a reference type (List, Map, closure, enum) must
+/// mangle to a symbol-safe name. This pins the exact mangled names so a
+/// regression that silently produces different-but-still-safe symbols is
+/// still caught.
+#[test]
+fn mangled_names_are_exact_and_symbol_safe() {
+    let module = lower_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function sizeOf<K, V>(m: Map<K, V>) -> Int { m.length() }
+function hasValue<T>(o: Option<T>) -> Bool { o.isSome() }
+function main() {
+    let xs: List<Int> = [1, 2]
+    let ys = identity(xs)
+    let m: Map<String, Int> = {"a": 1}
+    let s = sizeOf(m)
+    let some: Option<Int> = Some(1)
+    let h = hasValue(some)
+    print(ys.length())
+    print(s)
+    print(h)
+}
+"#,
+    );
+    let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    // Pin exact mangled names so a silent mangling regression is caught.
+    // Note: `hasValue` is inferred as `T := Int` from `Option<Int>`, so the
+    // specialization is `hasValue__i64` — not `hasValue__e_Option`.
+    for expected in ["identity__L_i64_E", "sizeOf__str__i64", "hasValue__i64"] {
+        assert!(
+            names.iter().any(|n| n == &expected),
+            "expected mangled name `{expected}`, have: {names:?}"
+        );
+    }
+    // All function names must be symbol-safe `[A-Za-z0-9_.]` (the dot is
+    // for method names like `Holder.wrap`; Cranelift's symbol emitter
+    // rewrites `.` to `__`).
+    for n in &names {
+        assert!(
+            n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.'),
+            "function name `{n}` is not symbol-safe"
+        );
+    }
+}
+
+/// Two distinct type arguments must mangle to distinct names. Regression
+/// guard for any future simplification of `mangle_type` that collapses
+/// structurally-different types into the same encoding.
+#[test]
+fn mangling_is_injective_for_distinct_type_args() {
+    use crate::monomorphize::mangle_type;
+    use crate::types::IrType;
+
+    let cases: Vec<IrType> = vec![
+        IrType::I64,
+        IrType::F64,
+        IrType::Bool,
+        IrType::Void,
+        IrType::StringRef,
+        IrType::StructRef("Point".into()),
+        IrType::EnumRef("Point".into()), // distinct encoding from StructRef of same name
+        IrType::ListRef(Box::new(IrType::I64)),
+        IrType::ListRef(Box::new(IrType::StringRef)),
+        IrType::MapRef(Box::new(IrType::StringRef), Box::new(IrType::I64)),
+        IrType::MapRef(Box::new(IrType::I64), Box::new(IrType::StringRef)),
+        IrType::ClosureRef {
+            param_types: vec![IrType::I64],
+            return_type: Box::new(IrType::I64),
+        },
+        IrType::ClosureRef {
+            param_types: vec![IrType::I64, IrType::I64],
+            return_type: Box::new(IrType::I64),
+        },
+    ];
+    let mut seen = std::collections::HashMap::new();
+    for ty in &cases {
+        let mangled = mangle_type(ty);
+        if let Some(prev) = seen.insert(mangled.clone(), ty.clone()) {
+            panic!("mangling collision: `{mangled}` produced by both `{prev:?}` and `{ty:?}`");
+        }
+    }
+}
+
+/// Before monomorphization runs, a generic call site's IR instruction
+/// should carry the concrete type arguments in `Op::Call`'s middle slot.
+/// We can't observe that from the final `lower()` output (which runs
+/// monomorphize internally), so instead we assert the post-mono invariant:
+/// every remaining `Op::Call` in concrete functions has empty `type_args`.
+/// This is the contract Cranelift and the interpreter rely on.
+#[test]
+fn post_monomorphization_no_call_carries_type_args() {
+    use crate::instruction::Op;
+
+    let module = lower_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function outer<T>(x: T) -> T { identity(x) }
+function main() {
+    print(outer(1))
+    print(outer("hi"))
+}
+"#,
+    );
+    for func in module.concrete_functions() {
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if let Op::Call(_, targs, _) = &instr.op {
+                    assert!(
+                        targs.is_empty(),
+                        "concrete function `{}` has Op::Call with non-empty type_args: {targs:?}",
+                        func.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Pass D end-to-end: an orphan `IrType::TypeVar` in a non-template
+/// function (arising from sema inference that never saw a constraint —
+/// typically an empty list literal whose element type is unresolved)
+/// must be erased to `StructRef(GENERIC_PLACEHOLDER)` so the Cranelift
+/// backend's use-site inference can handle it instead of panicking in
+/// `is_value_type()`.
+#[test]
+fn orphan_typevar_is_erased_to_generic_placeholder_post_mono() {
+    use crate::types::{GENERIC_PLACEHOLDER, IrType};
+
+    let module = lower_source(
+        r#"
+function main() {
+    let xs: List<Int> = []
+    print(xs.length())
+}
+"#,
+    );
+
+    // Walk every concrete function and assert no IrType::TypeVar remains.
+    // Any List<TypeVar(...)> result type introduced by the `[]` literal
+    // before sema binding must have been erased to
+    // List<StructRef("__generic")>.
+    fn walk(t: &IrType, saw_placeholder: &mut bool) {
+        match t {
+            IrType::TypeVar(name) => panic!("residual TypeVar({name}) survived Pass D"),
+            IrType::StructRef(n) if n == GENERIC_PLACEHOLDER => *saw_placeholder = true,
+            IrType::ListRef(inner) => walk(inner, saw_placeholder),
+            IrType::MapRef(k, v) => {
+                walk(k, saw_placeholder);
+                walk(v, saw_placeholder);
+            }
+            IrType::ClosureRef {
+                param_types,
+                return_type,
+            } => {
+                for p in param_types {
+                    walk(p, saw_placeholder);
+                }
+                walk(return_type, saw_placeholder);
+            }
+            _ => {}
+        }
+    }
+
+    for func in module.concrete_functions() {
+        for pt in &func.param_types {
+            walk(pt, &mut false);
+        }
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                walk(&instr.result_type, &mut false);
+            }
+            for (_, bp_ty) in &block.params {
+                walk(bp_ty, &mut false);
+            }
+        }
+    }
+    // The walker above panics on residual TypeVar; reaching here means
+    // every TypeVar was erased. We don't require a placeholder to appear
+    // in this particular program (sema may have bound `[]` to
+    // `List<Int>` from the annotation), but the *absence* of TypeVar is
+    // the key invariant.
+}
+
+/// A source-level self-recursive generic (`fn f<T>(...) { ... f(...) ... }`)
+/// must produce a single specialization per concrete type arg, with the
+/// recursive call targeting that same specialization (not the template).
+#[test]
+fn self_recursive_generic_lowers_and_specializes() {
+    use crate::instruction::Op;
+
+    let module = lower_source(
+        r#"
+function countDown<T>(x: T, n: Int) -> T {
+    if n <= 0 { x } else { countDown(x, n - 1) }
+}
+function main() {
+    print(countDown(42, 3))
+    print(countDown("done", 2))
+}
+"#,
+    );
+    let spec_ids: Vec<_> = module
+        .concrete_functions()
+        .filter(|f| f.name.starts_with("countDown__"))
+        .map(|f| (f.name.clone(), f.id))
+        .collect();
+    assert_eq!(
+        spec_ids.len(),
+        2,
+        "expected two specializations, got {spec_ids:?}"
+    );
+
+    for (name, spec_id) in &spec_ids {
+        let func = module
+            .functions
+            .iter()
+            .find(|f| f.id == *spec_id)
+            .unwrap_or_else(|| panic!("specialization `{name}` not found"));
+        let mut saw_self_call = false;
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                if let Op::Call(callee, _, _) = &instr.op
+                    && *callee == *spec_id
+                {
+                    saw_self_call = true;
+                }
+            }
+        }
+        assert!(
+            saw_self_call,
+            "specialization `{name}` did not target itself recursively — \
+             the internal call was not rewritten"
+        );
+    }
+}

@@ -167,6 +167,20 @@ User-defined generic functions currently lower to a `GENERIC_PLACEHOLDER` sentin
 **Decision:** Monomorphization. The compiler collects each concrete instantiation of a generic function and emits one specialized copy per instantiation. No runtime indirection; zero-cost generics in the Rust / C++ template sense.
 **Decided:** 2026-04-19
 **Target phase:** Phase 2.2 (Cranelift native compilation, in flight)
+**Implemented:** 2026-04-20. `monomorphize` pass in `crates/phoenix-ir/src/monomorphize.rs` runs post-lowering inside `lower()`. Sema records per-call-site concrete type-arg bindings in `CheckResult.call_type_args` (keyed by span); IR lowering propagates them by embedding the type args directly into the middle slot of `Op::Call(FuncId, Vec<IrType>, Vec<ValueId>)`, so every `Op::Call` is self-describing and no side table is required. The BFS pass walks each non-template caller in deterministic `(FuncId, block, instr)` order, specializes each `(template, targs)` pair, substitutes `IrType::TypeVar(name)` with the concrete type, rewrites `Op::Call` destinations to their specialized FuncIds, and clears the embedded `type_args` vectors. Specialized function names use a symbol-safe grammar (see "Mangling grammar" below); templates remain in `module.functions` as inert stubs (`is_generic_template = true`) to preserve the `FuncId`-as-vector-index invariant, and every downstream pass that walks functions should iterate via `IrModule::concrete_functions()`. Orphan `IrType::TypeVar` (from unresolved sema inference, e.g. empty list literals) is erased to `StructRef(GENERIC_PLACEHOLDER)` post-pass for the built-in-generic inference strategies in the Cranelift backend to handle at use sites. MVP scope covers multiple type params, recursion, generic-to-generic calls, and generic methods on user-defined types (method's own type parameters); parent-type-parameter substitution in methods on generic structs, trait-bounded method-call specialization, generic closures, and cross-module instantiation are deferred.
+
+**Mangling grammar.** Specialized function names are built from the original name plus one `__{mangled_type}` segment per type argument, where each mangled type matches `[A-Za-z0-9_]`:
+
+| Source type | Mangled form |
+|---|---|
+| `Int` / `Float` / `Bool` / `Void` / `String` | `i64` / `f64` / `bool` / `void` / `str` |
+| `StructRef(name)` | `s_{name}` |
+| `EnumRef(name)` | `e_{name}` |
+| `List<T>` | `L_{mangle(T)}_E` |
+| `Map<K, V>` | `M_{mangle(K)}_{mangle(V)}_E` |
+| `(P1, …, Pn) -> R` | `C{n}_{mangle(P1)}_…_{mangle(Pn)}_{mangle(R)}_E` |
+
+The `__` segment separator cannot appear in a Phoenix identifier, so specialized names are collision-free with user-defined function names. The Cranelift context prepends `phx_` to the final mangled name and replaces `.` with `__` for method symbols (e.g. `TypeName__method`). No further symbol sanitization is required.
 **Rationale:** Phoenix is positioned as a compiled language with native performance, and the stdlib generics are already hand-monomorphized in the Cranelift backend. Any other strategy creates a two-tier world where stdlib is fast and user generics are slow. Monomorphization also stacks cleanly with a future vtable ABI for `dyn Trait`. The compile-time fan-out cost is real but mitigable (shared specialization where layouts match, incremental caching of instantiations) and only bites meaningfully once the stdlib grows in Phase 4.
 
 **Alternatives considered:**

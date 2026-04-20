@@ -3,6 +3,44 @@ use crate::types::Type;
 use phoenix_parser::ast::TypeExpr;
 use std::collections::HashMap;
 
+/// Failure modes surfaced by [`Checker::unify`] during generic call
+/// inference. Each variant is turned into a user-facing diagnostic by the
+/// caller; see [`Checker::infer_type_args`] for which variants propagate.
+#[derive(Debug, Clone)]
+pub(crate) enum UnifyError {
+    /// A type variable was bound to two incompatible concrete types across
+    /// different argument positions (e.g., `identity(1, "s")` against
+    /// `identity<T>(a: T, b: T)` — `T` seen as both `Int` and `String`).
+    Conflict {
+        /// The name of the type parameter that received conflicting bindings.
+        param: String,
+        /// The binding established by an earlier argument position.
+        existing: Type,
+        /// The incoming binding from the current argument position.
+        incoming: Type,
+    },
+    /// A type variable would be bound to a type that mentions itself
+    /// (e.g., `T := List<T>`), which would make substitution diverge.
+    ///
+    /// Reserved for future use: Phoenix does not currently alpha-rename
+    /// type parameters, so a scope-oblivious occurs-check would
+    /// false-positive on template-body shadowing (`function outer<T> {
+    /// inner(x) }` binding `inner.T := outer.T`). This variant is not
+    /// emitted by the current inference; it is kept so callers can be
+    /// written forward-compatibly.
+    #[allow(dead_code)]
+    OccursCheck {
+        /// The name of the type parameter.
+        param: String,
+        /// The cyclic candidate type the caller tried to bind.
+        incoming: Type,
+    },
+    /// A non-variable mismatch (e.g., pattern `Int` vs concrete `String`).
+    /// Reported by `unify` but not surfaced by `infer_type_args`, since the
+    /// per-argument type check produces a clearer diagnostic at the call site.
+    Mismatch,
+}
+
 impl Checker {
     /// Checks whether two types are compatible, accounting for type variables
     /// in generic contexts.
@@ -180,29 +218,68 @@ impl Checker {
     /// When the pattern contains a [`Type::TypeVar`], it is bound to the
     /// corresponding concrete type (or checked against an existing binding).
     /// Generic and function types are unified structurally by recursing into
-    /// their type arguments.  Returns `true` if unification succeeds.
-    fn unify(pattern: &Type, concrete: &Type, bindings: &mut HashMap<String, Type>) -> bool {
+    /// their type arguments.
+    ///
+    /// Returns `Ok(())` on success. Returns `Err(UnifyError::Conflict { .. })`
+    /// when a type variable already bound to one concrete type is unified
+    /// against a different concrete type (e.g., `T` seen as both `Int` and
+    /// `String` across two argument positions). Returns
+    /// `Err(UnifyError::OccursCheck { .. })` when binding `T` to a type that
+    /// itself mentions `T` (e.g., `T := List<T>`) — this would make
+    /// [`substitute`](Self::substitute) diverge.
+    ///
+    /// A mismatch between non-variable types (e.g., `Int` vs `String`) is
+    /// reported as `Err(UnifyError::Mismatch)` and is surfaced to the user
+    /// by the per-argument type check in
+    /// [`infer_and_check_call_generics`](Checker::infer_and_check_call_generics);
+    /// [`infer_type_args`](Self::infer_type_args) only propagates the first
+    /// two variants, since mismatches already produce a clearer "argument N
+    /// expected X got Y" diagnostic at the call site.
+    fn unify(
+        pattern: &Type,
+        concrete: &Type,
+        bindings: &mut HashMap<String, Type>,
+    ) -> Result<(), UnifyError> {
         match (pattern, concrete) {
             (Type::TypeVar(name), _) => {
                 if let Some(existing) = bindings.get(name) {
-                    existing == concrete
+                    if existing == concrete {
+                        Ok(())
+                    } else {
+                        Err(UnifyError::Conflict {
+                            param: name.clone(),
+                            existing: existing.clone(),
+                            incoming: concrete.clone(),
+                        })
+                    }
                 } else {
+                    // Note: Phoenix does not alpha-rename type parameters,
+                    // so nested generic templates shadow each other's
+                    // binder names (`function outer<T> { inner(x) }` where
+                    // both `outer<T>` and `inner<T>` use the name `T`).
+                    // This means a scope-oblivious occurs-check would
+                    // false-positive on every same-named shadowing, so we
+                    // do not run one here. `UnifyError::OccursCheck` stays
+                    // in the enum for a future alpha-renaming pass but is
+                    // not emitted by the current inference.
                     bindings.insert(name.clone(), concrete.clone());
-                    true
+                    Ok(())
                 }
             }
             (Type::Generic(pn, pa), Type::Generic(cn, ca)) if pn == cn && pa.len() == ca.len() => {
-                pa.iter()
-                    .zip(ca.iter())
-                    .all(|(p, c)| Self::unify(p, c, bindings))
+                for (p, c) in pa.iter().zip(ca.iter()) {
+                    Self::unify(p, c, bindings)?;
+                }
+                Ok(())
             }
             (Type::Function(pp, pr), Type::Function(cp, cr)) if pp.len() == cp.len() => {
-                pp.iter()
-                    .zip(cp.iter())
-                    .all(|(p, c)| Self::unify(p, c, bindings))
-                    && Self::unify(pr, cr, bindings)
+                for (p, c) in pp.iter().zip(cp.iter()) {
+                    Self::unify(p, c, bindings)?;
+                }
+                Self::unify(pr, cr, bindings)
             }
-            _ => pattern == concrete,
+            _ if pattern == concrete => Ok(()),
+            _ => Err(UnifyError::Mismatch),
         }
     }
 
@@ -211,21 +288,35 @@ impl Checker {
     ///
     /// Each [`Type::TypeVar`] inside `param_types` is matched against the
     /// corresponding entry in `arg_types` via [`unify`](Self::unify), building
-    /// a map from type-parameter names to their concrete types.  The resulting
-    /// bindings can then be fed to [`substitute`](Self::substitute) to
-    /// concretize the return type and validate argument compatibility.
+    /// a map from type-parameter names to their concrete types.
+    ///
+    /// Returns the bindings plus a list of `(arg_index, UnifyError)` pairs
+    /// describing any binding-level failures: conflicts (same type variable
+    /// forced to two different types) and occurs-check failures (binding
+    /// `T := f(T)`). Pure type mismatches between non-variable types are
+    /// not returned because the call-site per-argument check produces a
+    /// clearer diagnostic; see [`unify`](Self::unify).
     pub(crate) fn infer_type_args(
         &self,
         param_types: &[Type],
         arg_types: &[Type],
-    ) -> HashMap<String, Type> {
+    ) -> (HashMap<String, Type>, Vec<(usize, UnifyError)>) {
         let mut bindings = HashMap::new();
-        for (param, arg) in param_types.iter().zip(arg_types.iter()) {
-            if !arg.is_error() {
-                Self::unify(param, arg, &mut bindings);
+        let mut errors = Vec::new();
+        for (i, (param, arg)) in param_types.iter().zip(arg_types.iter()).enumerate() {
+            if arg.is_error() {
+                continue;
+            }
+            if let Err(e) = Self::unify(param, arg, &mut bindings) {
+                match e {
+                    UnifyError::Conflict { .. } | UnifyError::OccursCheck { .. } => {
+                        errors.push((i, e));
+                    }
+                    UnifyError::Mismatch => {}
+                }
             }
         }
-        bindings
+        (bindings, errors)
     }
 
     /// Extracts the base type name and type parameter bindings from a [`Type`].

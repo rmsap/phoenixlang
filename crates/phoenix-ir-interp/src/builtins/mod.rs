@@ -96,14 +96,7 @@ mod tests {
     use phoenix_ir::types::OPTION_ENUM;
 
     fn empty_module() -> IrModule {
-        IrModule {
-            functions: vec![],
-            struct_layouts: Default::default(),
-            enum_layouts: Default::default(),
-            enum_type_params: Default::default(),
-            function_index: Default::default(),
-            method_index: Default::default(),
-        }
+        IrModule::new()
     }
 
     #[test]

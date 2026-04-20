@@ -36,13 +36,18 @@ pub struct VerifyError {
 ///
 /// Returns a list of errors found.  An empty list means the module is
 /// well-formed.
+///
+/// Generic templates (functions with `is_generic_template = true`) are
+/// intentionally skipped: their bodies carry `IrType::TypeVar`
+/// annotations that the monomorphization pass consumes to produce
+/// specialized copies, and no downstream backend ever reads them.
+/// Iterating via [`IrModule::concrete_functions`] is the canonical way
+/// to walk verifiable functions.
 pub fn verify(module: &IrModule) -> Vec<VerifyError> {
     let mut errors = Vec::new();
-
-    for func in &module.functions {
+    for func in module.concrete_functions() {
         verify_function(func, &mut errors);
     }
-
     errors
 }
 
@@ -260,7 +265,7 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
         Op::ClosureAlloc(_, vals) => vals.clone(),
 
         // Call ops.
-        Op::Call(_, args) => args.clone(),
+        Op::Call(_, _, args) => args.clone(),
         Op::CallIndirect(callee, args) => {
             let mut ops = vec![*callee];
             ops.extend(args);

@@ -25,7 +25,7 @@ impl fmt::Display for ValueId {
 }
 
 /// A unique identifier for a function within a module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FuncId(pub u32);
 
 impl fmt::Display for FuncId {
@@ -179,7 +179,13 @@ pub enum Op {
 
     // --- Function calls ---
     /// Direct call to a known function.
-    Call(FuncId, Vec<ValueId>),
+    ///
+    /// The middle `Vec<IrType>` carries concrete generic type arguments
+    /// in the callee's declared type-parameter order. It is empty for
+    /// calls to non-generic functions and for calls emitted after the
+    /// monomorphization pass (which rewrites generic calls to point at
+    /// specialized `FuncId`s and clears the type-args).
+    Call(FuncId, Vec<IrType>, Vec<ValueId>),
     /// Indirect call through a closure value.
     CallIndirect(ValueId, Vec<ValueId>),
     /// Call a built-in runtime function by name (e.g. `"print"`, `"String.length"`).

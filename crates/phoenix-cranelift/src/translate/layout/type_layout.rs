@@ -85,6 +85,13 @@ impl TypeLayout {
                 cl_types: CL_POINTER,
                 slots: 1,
             },
+            // TypeVar should be eliminated by monomorphization before any
+            // layout query reaches the backend. Reaching here means a
+            // generic template leaked past monomorphization.
+            IrType::TypeVar(name) => unreachable!(
+                "TypeLayout::of on IrType::TypeVar({name}) — monomorphization \
+                 should have eliminated all type variables before codegen"
+            ),
         }
     }
 

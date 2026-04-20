@@ -12,7 +12,11 @@ use std::fmt;
 
 impl fmt::Display for IrModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, func) in self.functions.iter().enumerate() {
+        // Skip generic template stubs (they contain `IrType::TypeVar` and
+        // render as unspecialized signatures that would confuse snapshot
+        // readers). All downstream consumers use `concrete_functions()` to
+        // iterate post-monomorphization; the textual dump follows suit.
+        for (i, func) in self.concrete_functions().enumerate() {
             if i > 0 {
                 writeln!(f)?;
             }
@@ -192,8 +196,18 @@ impl fmt::Display for Op {
             }
 
             // Call ops
-            Op::Call(func, args) => {
+            Op::Call(func, type_args, args) => {
                 write!(f, "call {func}")?;
+                if !type_args.is_empty() {
+                    write!(f, "<")?;
+                    for (i, t) in type_args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{t}")?;
+                    }
+                    write!(f, ">")?;
+                }
                 write_value_list(f, args)
             }
             Op::CallIndirect(callee, args) => {

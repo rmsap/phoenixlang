@@ -42,6 +42,31 @@ pub struct CheckResult {
     /// Symbol references: maps each use-site span to the symbol it refers to.
     /// Used by the LSP for go-to-definition, find-references, and rename.
     pub symbol_references: HashMap<Span, SymbolRef>,
+    /// Concrete type arguments inferred at each generic function call site,
+    /// keyed by the call expression's source span. Values are ordered by the
+    /// callee's declared type-parameter list (e.g., `function pair<A, B>`
+    /// produces `[type_of_A, type_of_B]`). Non-generic calls are absent.
+    /// Consumed by IR monomorphization.
+    ///
+    /// **Invariants enforced by
+    /// [`Checker::record_inferred_type_args`](crate::checker::Checker::record_inferred_type_args):**
+    /// - No entry contains `Type::Error` or any unresolved `Type::TypeVar`.
+    /// - An entry is present *only* when every declared type parameter of
+    ///   the callee was inferable from the call site. If any parameter is
+    ///   unresolvable, a diagnostic is emitted and no entry is recorded
+    ///   (so IR lowering never sees a partial binding).
+    /// - Covers both free-function generic calls and user-defined method
+    ///   generic calls (keyed by the `MethodCallExpr` span for the latter).
+    ///
+    /// **Known architectural limitation (deferred to Phase 3).** Keying by
+    /// `Span` makes the sema → lowering handoff fragile under any
+    /// transformation that reparents or synthesizes AST nodes (macro
+    /// expansion, cross-file inlining). The intended Phase-3 fix is to
+    /// assign a stable `CallId: u32` at parse time and key this map on
+    /// it. For the single-file, single-pass Phase 2 compiler, spans are
+    /// immutable per `SourceId` and unique per syntactic call expression,
+    /// so the current keying is sound but should not be generalized.
+    pub call_type_args: HashMap<Span, Vec<Type>>,
 }
 
 /// A reference from a use-site to a symbol definition.
@@ -171,6 +196,29 @@ pub struct MethodInfo {
     pub params: Vec<Type>,
     /// The method's return type.
     pub return_type: Type,
+    /// The method's own generic type parameters in source order.
+    ///
+    /// Does **not** include the parent `impl` block's type parameters; those
+    /// are bound by the receiver's type (e.g., calling `p.swap()` on
+    /// `Pair<Int, String>` supplies the `impl<T, U>`-level `T` and `U`
+    /// directly, without re-inference). Only the method's own `<...>`
+    /// binders appear here, and only these are inferred from argument
+    /// types at each call site for IR monomorphization.
+    pub type_params: Vec<String>,
+}
+
+impl MethodInfo {
+    /// Construct a built-in method descriptor with no per-method generic
+    /// parameters. Use [`MethodInfo`]'s struct literal form when a method
+    /// has its own `type_params`.
+    pub fn builtin(params: Vec<Type>, return_type: Type) -> Self {
+        Self {
+            definition_span: Span::BUILTIN,
+            params,
+            return_type,
+            type_params: Vec::new(),
+        }
+    }
 }
 
 /// A resolved field in a derived endpoint body type.
@@ -313,6 +361,9 @@ pub struct Checker {
     pub(crate) expr_types: HashMap<Span, Type>,
     /// Symbol references collected during checking.
     pub(crate) symbol_references: HashMap<Span, SymbolRef>,
+    /// Concrete type arguments inferred at each generic function call site,
+    /// keyed by the call expression's source span.
+    pub(crate) call_type_args: HashMap<Span, Vec<Type>>,
 }
 
 impl Default for Checker {
@@ -342,6 +393,7 @@ impl Checker {
             current_type_param_bounds: Vec::new(),
             expr_types: HashMap::new(),
             symbol_references: HashMap::new(),
+            call_type_args: HashMap::new(),
         }
     }
 
@@ -941,5 +993,6 @@ pub fn check(program: &Program) -> CheckResult {
         endpoints: checker.endpoints,
         expr_types: checker.expr_types,
         symbol_references: checker.symbol_references,
+        call_type_args: checker.call_type_args,
     }
 }

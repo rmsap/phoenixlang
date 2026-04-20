@@ -91,3 +91,29 @@ Note: `parser.rs` `advance()` no longer clones every token — it returns `&'src
 Abbreviated variable names (`vstart`, `vend`, `fstart`) instead of full names. Minor readability issue.
 
 **Recommendation:** Rename during the next parser-touching change.
+
+### `CheckResult.call_type_args` is keyed by `Span`
+
+Sema records per-call-site concrete type arguments into `HashMap<Span, Vec<Type>>` and IR lowering looks them up at the matching call expression. This relies on sema and lowering agreeing on the exact `Span` object, which holds for the current single-file, single-pass pipeline but breaks under any transformation that reparents or synthesizes AST nodes (macros, cross-file inlining).
+
+**File:** `phoenix-sema/src/checker.rs` (`CheckResult.call_type_args`); consumed in `phoenix-ir/src/lower.rs` (`LowerContext::resolve_call_type_args`).
+**Planned fix:** Assign a stable `CallId: u32` to each call expression at parse time and key the map on it. Decouples the sema→lowering handoff from span identity.
+**Target phase:** Phase 3. Not urgent while compilation stays single-file/single-pass. Must land before any change that synthesizes or reparents call-expression AST nodes.
+
+### Occurs-check suppressed pending alpha-renaming of type parameters
+
+`Checker::unify` (`phoenix-sema/src/check_types.rs`) detects and reports *conflicting* bindings (`T := Int` and later `T := String` at a different argument position) but does not run an occurs-check against cyclic bindings such as `T := List<T>`. The check is defined on `UnifyError::OccursCheck` but not emitted: Phoenix does not alpha-rename type parameter binders, so a scope-oblivious occurs-check false-positives on every template-body shadowing (`function outer<T> { inner(x) }` where both `outer<T>` and `inner<T>` use the same name `T`).
+
+Not actively miscompiling today: Phoenix's `substitute` is a single-pass walk, so a cyclic binding produces a weird intermediate type rather than an infinite loop, and the downstream per-argument type check catches the user-visible errors. The concern is diagnostic quality (cyclic bindings are reported as cascade errors rather than a clean "cannot bind `T` to type containing `T`").
+
+**File:** `phoenix-sema/src/check_types.rs` — `UnifyError::OccursCheck` variant kept for future use.
+**Planned fix:** Introduce alpha-renaming (fresh-name each template's type parameter binders during inference) so the occurs-check can distinguish "same name, different binder" from "genuine cycle", then re-enable the check.
+**Target phase:** Phase 3 or deferred until it causes a real diagnostic complaint.
+
+### Generic-template stubs tracked by a `bool` flag
+
+`IrFunction.is_generic_template: bool` marks templates that remain in `module.functions` as inert stubs after monomorphization (to preserve the `FuncId`-as-vector-index invariant). Every downstream consumer must either check the flag or iterate via `IrModule::concrete_functions()` — forgetting does not fail loudly, it just exposes `IrType::TypeVar` to code that panics on it (`IrType::is_value_type`, classification helpers). The audit on 2026-04-20 caught two slips (`IrModule::Display` and `ir_analysis.rs`) that had bypassed the filter.
+
+**File:** `phoenix-ir/src/module.rs` — `IrFunction.is_generic_template`; iteration helper `IrModule::concrete_functions`.
+**Planned fix:** Replace the bool flag with a typed split — a `ConcreteFunctions` newtype iterator, or two separate `functions` / `templates` fields — so the filter is enforceable at the type system level rather than at every call site.
+**Target phase:** Phase 2.6 or Phase 3. Pairs naturally with the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) scheduled for 2.6, since both are IR-shape refactors.

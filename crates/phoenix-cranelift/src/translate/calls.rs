@@ -85,7 +85,15 @@ pub(super) fn translate_call(
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     match op {
-        Op::Call(fid, args) => {
+        Op::Call(fid, type_args, args) => {
+            // This is a compiler-invariant violation, not a debug-only
+            // condition: if it ever fires we would miscompile a generic
+            // call. `assert!` so release builds catch it too.
+            assert!(
+                type_args.is_empty(),
+                "Op::Call reached codegen with non-empty type_args ({type_args:?}) \
+                 — monomorphization should have cleared them"
+            );
             let cl_func_id = ctx.func_ids[fid];
             let func_ref = ctx.module.declare_func_in_func(cl_func_id, builder.func);
             let mut cl_args = Vec::new();

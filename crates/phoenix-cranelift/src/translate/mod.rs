@@ -76,7 +76,10 @@ pub fn translate_module(
     let mut cl_ctx = Context::new();
     let mut fb_ctx = FunctionBuilderContext::new();
 
-    for func in &ir_module.functions {
+    // Generic templates are inert post-monomorphization; their bodies
+    // contain `IrType::TypeVar` which has no Cranelift lowering. Iterating
+    // via `concrete_functions()` filters them out.
+    for func in ir_module.concrete_functions() {
         translate_function(ctx, ir_module, func, &mut cl_ctx, &mut fb_ctx)?;
     }
 

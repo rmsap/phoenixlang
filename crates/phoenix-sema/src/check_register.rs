@@ -51,35 +51,22 @@ impl Checker {
             HashMap::from([
                 (
                     "isSome".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![],
-                        return_type: Type::Bool,
-                    },
+                    MethodInfo::builtin(vec![], Type::Bool),
                 ),
                 (
                     "isNone".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![],
-                        return_type: Type::Bool,
-                    },
+                    MethodInfo::builtin(vec![], Type::Bool),
                 ),
                 (
                     "unwrap".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![],
-                        return_type: Type::TypeVar("T".to_string()),
-                    },
+                    MethodInfo::builtin(vec![], Type::TypeVar("T".to_string())),
                 ),
                 (
                     "unwrapOr".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![Type::TypeVar("T".to_string())],
-                        return_type: Type::TypeVar("T".to_string()),
-                    },
+                    MethodInfo::builtin(
+                        vec![Type::TypeVar("T".to_string())],
+                        Type::TypeVar("T".to_string()),
+                    ),
                 ),
             ]),
         );
@@ -88,37 +75,18 @@ impl Checker {
         self.methods.insert(
             "Result".to_string(),
             HashMap::from([
-                (
-                    "isOk".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![],
-                        return_type: Type::Bool,
-                    },
-                ),
-                (
-                    "isErr".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![],
-                        return_type: Type::Bool,
-                    },
-                ),
+                ("isOk".to_string(), MethodInfo::builtin(vec![], Type::Bool)),
+                ("isErr".to_string(), MethodInfo::builtin(vec![], Type::Bool)),
                 (
                     "unwrap".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![],
-                        return_type: Type::TypeVar("T".to_string()),
-                    },
+                    MethodInfo::builtin(vec![], Type::TypeVar("T".to_string())),
                 ),
                 (
                     "unwrapOr".to_string(),
-                    MethodInfo {
-                        definition_span: Span::BUILTIN,
-                        params: vec![Type::TypeVar("T".to_string())],
-                        return_type: Type::TypeVar("T".to_string()),
-                    },
+                    MethodInfo::builtin(
+                        vec![Type::TypeVar("T".to_string())],
+                        Type::TypeVar("T".to_string()),
+                    ),
                 ),
             ]),
         );
@@ -435,6 +403,7 @@ impl Checker {
                     definition_span: func.name_span,
                     params,
                     return_type,
+                    type_params: func.type_params.clone(),
                 },
             ));
         }

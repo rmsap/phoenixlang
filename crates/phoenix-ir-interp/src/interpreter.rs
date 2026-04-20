@@ -381,7 +381,14 @@ impl<'m> IrInterpreter<'m> {
             }
 
             // --- Function calls ---
-            Op::Call(func_id, arg_vids) => {
+            Op::Call(func_id, type_args, arg_vids) => {
+                // Compiler-invariant violation if non-empty — keep live in
+                // release builds too (not `debug_assert!`).
+                assert!(
+                    type_args.is_empty(),
+                    "Op::Call reached interpreter with non-empty type_args ({type_args:?}) \
+                     — monomorphization should have cleared them"
+                );
                 let args: Vec<IrValue> = arg_vids
                     .iter()
                     .map(|vid| frame.get(*vid).cloned())

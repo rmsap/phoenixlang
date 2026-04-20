@@ -408,7 +408,8 @@ impl<'a> LoweringContext<'a> {
             if let Some(&func_id) = self.module.function_index.get(&ident.name) {
                 let result_type = self.expr_type(&call.span);
                 let args = self.merge_call_args(func_id, &positional, &named);
-                return self.emit(Op::Call(func_id, args), result_type, span);
+                let type_args = self.resolve_call_type_args(call.span);
+                return self.emit(Op::Call(func_id, type_args, args), result_type, span);
             }
 
             // Check for an enum variant constructor (e.g. `Some(42)`).
@@ -581,7 +582,8 @@ impl<'a> LoweringContext<'a> {
             // Pass `self` as the first argument.
             args.insert(0, obj);
             let result_type = self.expr_type(&mc.span);
-            return self.emit(Op::Call(func_id, args), result_type, span);
+            let type_args = self.resolve_call_type_args(mc.span);
+            return self.emit(Op::Call(func_id, type_args, args), result_type, span);
         }
 
         // Built-in method: emit as BuiltinCall.

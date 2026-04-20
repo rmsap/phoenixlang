@@ -103,7 +103,7 @@ impl<'a> LoweringContext<'a> {
         let (param_types, param_names) = self.lower_params(f);
         let return_type = self.resolve_return_type(f);
 
-        let func = IrFunction::new(
+        let mut func = IrFunction::new(
             func_id,
             f.name.clone(),
             param_types,
@@ -111,6 +111,8 @@ impl<'a> LoweringContext<'a> {
             return_type,
             Some(f.span),
         );
+        func.type_param_names = f.type_params.clone();
+        func.is_generic_template = !f.type_params.is_empty();
 
         self.module.functions.push(func);
         self.module.function_index.insert(f.name.clone(), func_id);
@@ -169,7 +171,7 @@ impl<'a> LoweringContext<'a> {
             self.resolve_return_type(method)
         };
 
-        let func = IrFunction::new(
+        let mut func = IrFunction::new(
             func_id,
             mangled_name.clone(),
             param_types,
@@ -177,6 +179,8 @@ impl<'a> LoweringContext<'a> {
             return_type,
             Some(method.span),
         );
+        func.type_param_names = method.type_params.clone();
+        func.is_generic_template = !method.type_params.is_empty();
 
         self.module.functions.push(func);
         self.module

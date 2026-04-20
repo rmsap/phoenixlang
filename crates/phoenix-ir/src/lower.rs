@@ -26,13 +26,40 @@ use std::collections::HashMap;
 /// Takes the parsed AST and the [`CheckResult`] from semantic analysis,
 /// and produces a fully-formed [`IrModule`] with all functions, methods,
 /// struct/enum layouts, and dispatch tables populated.
+///
+/// **Monomorphization is run internally** as the last step, so the returned
+/// module is fully concrete with respect to user-defined generics: no call
+/// site has non-empty `Op::Call` type-args, and every call to a generic
+/// template has been rewritten to target a specialized `FuncId`.
+///
+/// Templates themselves remain in `module.functions` as inert stubs (with
+/// `is_generic_template = true`) to preserve the `FuncId`-as-vector-index
+/// invariant. **Downstream consumers must iterate via
+/// [`IrModule::concrete_functions`](crate::module::IrModule::concrete_functions)**,
+/// not `module.functions` directly, or they will encounter unspecialized
+/// bodies that still contain `IrType::TypeVar`. Do not call
+/// `monomorphize` separately after `lower` — it is not idempotent and
+/// would attempt to re-specialize the already-specialized module.
 pub fn lower(program: &Program, check_result: &CheckResult) -> IrModule {
     let mut ctx = LoweringContext::new(check_result);
     ctx.lower_program(program);
-    ctx.module
+    let mut module = ctx.module;
+    crate::monomorphize::monomorphize(&mut module);
+    module
 }
 
 /// Convert a source-level [`Type`] to an IR-level [`IrType`].
+///
+/// Generic type variables (`Type::TypeVar(name)`) lower to
+/// [`IrType::TypeVar`], preserving the name so the monomorphization pass
+/// can substitute it with a concrete type when specializing a template.
+/// Post-monomorphization, no function body should contain `TypeVar`.
+///
+/// # Panics
+///
+/// Panics on `Type::Error` or on a `Type::Named` that sema failed to
+/// resolve — both indicate that earlier error-handling should have
+/// short-circuited before IR lowering.
 pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
     match ty {
         Type::Int => IrType::I64,
@@ -57,10 +84,11 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
             param_types: params.iter().map(|p| lower_type(p, check_result)).collect(),
             return_type: Box::new(lower_type(ret, check_result)),
         },
-        Type::TypeVar(_) => {
-            // Generic type variable — use opaque struct ref for now.
-            // Monomorphization will specialize this later.
-            IrType::StructRef(crate::types::GENERIC_PLACEHOLDER.to_string())
+        Type::TypeVar(name) => {
+            // Generic type variable — carry the name so monomorphization can
+            // substitute it with a concrete type. Post-monomorphization,
+            // `IrType::TypeVar` should not appear in any function body.
+            IrType::TypeVar(name.clone())
         }
         Type::Generic(name, args) => match name.as_str() {
             "List" => {
@@ -182,8 +210,18 @@ impl<'a> LoweringContext<'a> {
                     .variants
                     .iter()
                     .map(|(vname, fields)| {
-                        let ir_fields: Vec<IrType> =
-                            fields.iter().map(|t| lower_type(t, self.check)).collect();
+                        // Enum layouts use the nameless `__generic`
+                        // placeholder for type-parameter fields because
+                        // built-in enums (Option/Result/List/Map) resolve
+                        // concrete payload types at use sites via
+                        // inference strategies in the Cranelift backend
+                        // (see `enum_type_inference.rs`), NOT via
+                        // monomorphization. Convert any TypeVar emitted by
+                        // `lower_type` back to the placeholder.
+                        let ir_fields: Vec<IrType> = fields
+                            .iter()
+                            .map(|t| lower_type(t, self.check).erase_type_vars())
+                            .collect();
                         (vname.clone(), ir_fields)
                     })
                     .collect();
@@ -338,6 +376,22 @@ impl<'a> LoweringContext<'a> {
     /// Converts a source-level [`Type`] to an [`IrType`].
     pub(crate) fn lower_type(&self, ty: &Type) -> IrType {
         lower_type(ty, self.check)
+    }
+
+    /// Look up the concrete generic type arguments inferred at this call
+    /// site (keyed by the call expression's span) and lower each to
+    /// [`IrType`]. Returns an empty vector for non-generic calls. If sema
+    /// failed to resolve a type parameter and fell back to `Type::Error`,
+    /// the entry is suppressed here so that `lower_type` is never invoked
+    /// on `Type::Error` (which would panic).
+    pub(crate) fn resolve_call_type_args(&self, call_span: Span) -> Vec<IrType> {
+        let Some(targs) = self.check.call_type_args.get(&call_span) else {
+            return Vec::new();
+        };
+        if targs.iter().any(Type::is_error) {
+            return Vec::new();
+        }
+        targs.iter().map(|t| lower_type(t, self.check)).collect()
     }
 
     /// Emit a dummy value for void-typed expressions that must still return a

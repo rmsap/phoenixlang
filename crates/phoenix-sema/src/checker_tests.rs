@@ -3104,3 +3104,280 @@ function main() { }
         "definition_span should cover just the name 'add'"
     );
 }
+
+// ── Generic call: unification conflict across argument positions ──
+
+/// `identity<T>(a: T, b: T)` called with `(Int, String)` must report that
+/// `T` was bound to two incompatible types. Previously the unification
+/// failure was silently discarded and the first binding won.
+#[test]
+fn generic_call_reports_unification_conflict() {
+    assert_has_error(
+        r#"
+function pair<T>(a: T, b: T) -> T { a }
+function main() {
+    let _ = pair(1, "two")
+    print(0)
+}
+"#,
+        "conflicting bindings for type parameter `T`",
+    );
+}
+
+// ── Generic call: unresolved type parameter diagnostic ────────────
+
+/// A generic type parameter that is not mentioned in any parameter position
+/// cannot be inferred from argument types. Sema must surface this rather
+/// than silently skipping the call.
+#[test]
+fn generic_call_reports_unresolved_type_parameter_via_return_type() {
+    // `T` appears only in the return position — no argument constrains it.
+    assert_has_error(
+        r#"
+function default<T>() -> T { default() }
+function main() {
+    let _ = default()
+    print(0)
+}
+"#,
+        "cannot infer type parameter `T`",
+    );
+}
+
+/// When multiple type parameters are unresolvable, the diagnostic should
+/// list all of them (rather than stopping at the first).
+#[test]
+fn generic_call_lists_all_unresolved_type_parameters() {
+    let diags = check_source(
+        r#"
+function twoFree<A, B>() -> Int { 0 }
+function main() {
+    let _ = twoFree()
+    print(0)
+}
+"#,
+    );
+    let joined = diags
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("`A`") && joined.contains("`B`"),
+        "expected diagnostic listing both `A` and `B`, got: {:?}",
+        diags
+    );
+}
+
+/// Unresolved-type-parameter diagnostics must be suppressed when an
+/// argument is already `Type::Error` (e.g., undefined identifier),
+/// otherwise the user sees a cascade of misleading "cannot infer"
+/// errors on top of the real error.
+#[test]
+fn generic_call_suppresses_unresolved_cascade_when_arg_is_error() {
+    let diags = check_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function main() {
+    let _ = identity(undefined_var)
+    print(0)
+}
+"#,
+    );
+    let unresolved_count = diags
+        .iter()
+        .filter(|d| d.message.contains("cannot infer type parameter"))
+        .count();
+    assert_eq!(
+        unresolved_count, 0,
+        "should suppress 'cannot infer' cascade when arg is Type::Error, got: {:?}",
+        diags
+    );
+}
+
+// ── Generic method: type parameter recording ──────────────────────
+
+/// A generic method on a *non-generic* struct must record its method-level
+/// type argument into `call_type_args`, keyed by the MethodCallExpr span.
+/// Previously this path silently skipped recording (bug #3 per phase-2.md).
+#[test]
+fn generic_method_on_non_generic_struct_records_call_type_args() {
+    let tokens = tokenize(
+        r#"
+struct Holder {
+    Int tag
+}
+impl Holder {
+    function wrap<U>(self, x: U) -> U { x }
+}
+function main() {
+    let h = Holder(7)
+    let r1 = h.wrap(42)
+    let r2 = h.wrap("hello")
+    print(r1)
+    print(r2)
+}
+"#,
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected errors: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result
+            .call_type_args
+            .values()
+            .any(|v| v.as_slice() == [Type::Int]),
+        "expected call_type_args to contain [Int] from `h.wrap(42)`, got: {:?}",
+        result.call_type_args
+    );
+    assert!(
+        result
+            .call_type_args
+            .values()
+            .any(|v| v.as_slice() == [Type::String]),
+        "expected call_type_args to contain [String] from `h.wrap(\"hello\")`, got: {:?}",
+        result.call_type_args
+    );
+}
+
+// ── Generic method on a *generic* struct ──────────────────────────
+
+/// A generic method on a generic struct must record only the method's own
+/// type parameters into `call_type_args` (the struct's parent type params
+/// come from the receiver type, not from inference). This exercises the
+/// parent-binding merge path in `check_method_call`.
+#[test]
+fn generic_method_on_generic_struct_records_only_method_type_args() {
+    let tokens = tokenize(
+        r#"
+struct Pair<A, B> {
+    A first
+    B second
+}
+impl Pair {
+    function swap<U>(self, x: U) -> U { x }
+}
+function main() {
+    let p: Pair<Int, String> = Pair(1, "hi")
+    print(p.swap(42))
+    print(p.swap("hello"))
+}
+"#,
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected errors: {:?}",
+        result.diagnostics
+    );
+    // The method has one type param (U); call_type_args values should
+    // have length 1 for both call sites, containing the method's inferred
+    // concrete type. The struct's A and B must NOT appear.
+    let recorded: Vec<Vec<Type>> = result.call_type_args.values().cloned().collect();
+    assert!(
+        recorded.iter().any(|v| v.as_slice() == [Type::Int]),
+        "expected [Int] from `p.swap(42)`, have: {:?}",
+        recorded
+    );
+    assert!(
+        recorded.iter().any(|v| v.as_slice() == [Type::String]),
+        "expected [String] from `p.swap(\"hello\")`, have: {:?}",
+        recorded
+    );
+    assert!(
+        recorded.iter().all(|v| v.len() == 1),
+        "method call_type_args must contain only the method's own type params, have: {:?}",
+        recorded
+    );
+}
+
+// ── Generic call: happy-path trait bound records type args ────────
+
+/// When a generic call with trait bounds succeeds (the concrete type does
+/// implement the bound), the inferred type args must still be recorded.
+#[test]
+fn trait_bounded_generic_call_records_type_args() {
+    let tokens = tokenize(
+        r#"
+trait Tag {
+    function tagged(self) -> Int
+}
+struct Point {
+    Int x
+
+    impl Tag {
+        function tagged(self) -> Int { self.x }
+    }
+}
+function tag<T: Tag>(x: T) -> Int { x.tagged() }
+function main() {
+    let p = Point(7)
+    let r = tag(p)
+    print(r)
+}
+"#,
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected errors: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result
+            .call_type_args
+            .values()
+            .any(|v| v.as_slice() == [Type::Named("Point".to_string())]),
+        "expected call_type_args to contain [Point] from `tag(p)`, got: {:?}",
+        result.call_type_args
+    );
+}
+
+// ── Generic call: error-arg path must not panic downstream ────────
+
+/// Regression for IR-lowering panic on `Type::Error` call_type_args entries.
+/// When sema cannot infer a type parameter (e.g., because an argument has
+/// a type error), it must either skip recording or record a well-formed
+/// binding — never `Type::Error`. The key invariant checked here is that
+/// no `Type::Error` ever appears in `CheckResult.call_type_args`.
+#[test]
+fn generic_call_with_arg_error_does_not_leak_type_error_into_call_type_args() {
+    let tokens = tokenize(
+        r#"
+function identity<T>(x: T) -> T { x }
+function main() {
+    // `undefined_var` is not in scope — sema emits an error but should
+    // not panic or leak Type::Error into call_type_args.
+    let r = identity(undefined_var)
+    print(r)
+}
+"#,
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = check(&program);
+    // Sema emits an error; that's expected. The fix is that IR lowering
+    // handles it gracefully. We additionally assert that no `Type::Error`
+    // reaches `call_type_args`, so downstream can't panic on it.
+    for (span, tys) in &result.call_type_args {
+        for t in tys {
+            assert!(
+                !matches!(t, Type::Error),
+                "call_type_args at {span:?} contains Type::Error: {tys:?}"
+            );
+        }
+    }
+}
