@@ -594,3 +594,138 @@ function main() {
 "#,
     );
 }
+
+/// `okOr` on an `Option<Int>` received as a function parameter
+/// must compile. Uses `compile_and_run` to verify the payload
+/// round-trips correctly — a silent slot-count mismatch between payload
+/// and default would corrupt the value, not just the IR shape.
+#[test]
+fn option_okor_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function unwrap_or_err(opt: Option<Int>, err: String) -> Result<Int, String> {
+    return opt.okOr(err)
+}
+function main() {
+    let r = unwrap_or_err(Some(42), "missing")
+    match r {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+    let r2 = unwrap_or_err(None, "missing")
+    match r2 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["42", "missing"]);
+}
+
+/// `okOr` on an `Option<String>` received as a function
+/// parameter. Using`compile_and_run` with exact value
+//  assertions catches the truncation —
+/// `roundtrip` only checks IR equivalence, which can mask a silent
+/// fallback when both code paths make the same wrong choice.
+#[test]
+fn option_okor_string_payload_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function to_result(opt: Option<String>) -> Result<String, String> {
+    return opt.okOr("none")
+}
+function main() {
+    let r = to_result(Some("hello"))
+    match r {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+    let r2 = to_result(None)
+    match r2 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello", "none"]);
+}
+
+/// None-path coverage for `okOr` with a multi-slot default value:
+/// `Option<List<Int>>` passed as `None` must produce the multi-slot
+/// default list, not a truncated I64 (which would underflow the Ok
+/// payload's expected slot count and corrupt subsequent reads).
+#[test]
+fn option_okor_none_multislot_default() {
+    let out = compile_and_run(
+        r#"
+function default_list(opt: Option<List<Int>>) -> Result<List<Int>, String> {
+    return opt.okOr("missing")
+}
+function main() {
+    let r = default_list(None)
+    match r {
+        Ok(xs) -> print(toString(xs.length()))
+        Err(e) -> print(e)
+    }
+    let xs: List<Int> = [10, 20, 30]
+    let r2 = default_list(Some(xs))
+    match r2 {
+        Ok(ys) -> print(toString(ys.length()))
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["missing", "3"]);
+}
+
+/// Nested generics: `Option<Option<Int>>` via a function parameter.
+/// The outer `EnumRef("Option", [EnumRef("Option", [I64])])` must thread
+/// the inner args through lowering so Strategy 0 can resolve the payload
+/// type of the outer `.unwrapOr`. Double-nesting previously only had
+/// in-function coverage via pattern matching (`nested_option_some_none`);
+/// this adds the cross-function method-dispatch path.
+#[test]
+fn option_option_int_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function flatten_or(opt: Option<Option<Int>>, default: Int) -> Int {
+    return opt.unwrapOr(Some(default)).unwrapOr(default)
+}
+function main() {
+    print(toString(flatten_or(Some(Some(7)), -1)))
+    let inner_none: Option<Int> = None
+    print(toString(flatten_or(Some(inner_none), -1)))
+    let outer_none: Option<Option<Int>> = None
+    print(toString(flatten_or(outer_none, -1)))
+}
+"#,
+    );
+    assert_eq!(out, vec!["7", "-1", "-1"]);
+}
+
+/// Nested generics: `Option<List<String>>` via a function parameter.
+/// Exercises the recursive `lower_type` path (List inside EnumRef args)
+/// and payload-inference Strategy 0 unwrapping a `ListRef<StringRef>`
+/// for a multi-slot element type.
+#[test]
+fn option_nested_list_string_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function list_or_default(opt: Option<List<String>>) -> List<String> {
+    return opt.unwrapOr(["empty"])
+}
+function main() {
+    let xs: List<String> = ["hello", "world"]
+    let a = list_or_default(Some(xs))
+    print(a.first().unwrapOr("?"))
+    let none_list: Option<List<String>> = None
+    let b = list_or_default(none_list)
+    print(b.first().unwrapOr("?"))
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello", "empty"]);
+}

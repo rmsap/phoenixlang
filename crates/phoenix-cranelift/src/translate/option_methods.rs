@@ -25,8 +25,9 @@ use super::enum_helpers::{
     build_option_none, build_option_some, build_result_err, build_result_ok, load_disc_and_branch,
 };
 use super::enum_type_inference::{
-    try_type_from_closure_arg, try_type_from_enum_alloc, try_type_from_layout,
-    try_type_from_result, try_type_from_value_arg,
+    payload_inference_error, try_type_from_closure_arg, try_type_from_enum_alloc,
+    try_type_from_enum_args, try_type_from_layout, try_type_from_result, try_type_from_result_args,
+    try_type_from_value_arg,
 };
 use super::layout::TypeLayout;
 use super::{FuncState, get_val, get_val1};
@@ -221,12 +222,36 @@ fn translate_option_ok_or(
 
 /// Get the payload type `T` from an `Option<T>` by examining available context.
 ///
-/// Uses multiple strategies in priority order:
-/// 1. The instruction's `result_type` — for methods that return `T` directly.
-/// 2. The enum layout — if it has concrete (non-generic) field types.
-/// 3. Method argument types — closure parameter types or default value types.
-/// 4. Recorded `EnumAlloc` info — for `okOr` where other strategies fail.
-/// 5. Safe fallback for methods that don't use the payload.
+/// Strategies run in the order below; the first one that yields a type
+/// returns. Each step maps to a labelled `// Strategy N` block in the body,
+/// so this comment and the code stay in sync.
+///
+/// - **Strategy 0 — receiver's `EnumRef` args.** The primary path when
+///   IR lowering preserved `Option<T>`'s type arg at the use site.
+/// - **Strategy 1 — instruction's `result_type`.** For `unwrap` /
+///   `unwrapOr` / `unwrapOrElse`, whose IR result IS the payload type.
+/// - **Strategy 1b — `result_type`'s own args.** For `okOr`, whose
+///   return `Result<T, E>` embeds the Option payload as `args[0]`. Fills
+///   the gap when sema resolved the call's return type from the
+///   receiver's binding type but left the receiver's own EnumRef arg
+///   unresolved (e.g. `let o: Option<Int> = None`, where `None`'s own
+///   sema type is `Option<T>` with a TypeVar).
+/// - **Strategy 2 — enum layout.** Only succeeds if the layout has
+///   concrete (non-placeholder) field types; stdlib `Option`/`Result`
+///   do not.
+/// - **Strategy 3 — method argument types.** Closure parameter types
+///   (`map`, `andThen`, `filter`, `unwrapOrElse`) or the default value's
+///   type (`unwrapOr`).
+/// - **Strategy 3b — dummy for payload-free methods.**
+///   `isSome`/`isNone`/`orElse` never read the payload, so an `I64` is
+///   safe; return here before reaching Strategy 4.
+/// - **Strategy 4 — recorded `EnumAlloc` info.** Scan same-function
+///   allocations of the payload-bearing variant for a consistent
+///   payload type.
+/// - **Strategy 5 — terminate.** Error for methods in
+///   `known_payload_methods` that can't make a safe dummy choice; `I64`
+///   dummy for unknown methods so the dispatch table can still produce
+///   a "not yet supported" error.
 fn option_payload_type(
     state: &FuncState,
     ir_module: &IrModule,
@@ -234,9 +259,29 @@ fn option_payload_type(
     args: &[ValueId],
     result_type: &IrType,
 ) -> Result<IrType, CompileError> {
+    // Strategy 0: read the payload type directly from the receiver's
+    // `EnumRef` generic args.  The preferred path when the IR preserves
+    // the args through lowering.
+    if let Some(ty) = try_type_from_enum_args(state, args[0], "Option", 0) {
+        return Ok(ty);
+    }
+
     // Strategy 1: result_type (for unwrap-family methods).
     if matches!(method, "unwrap" | "unwrapOr" | "unwrapOrElse")
         && let Some(ty) = try_type_from_result(result_type)
+    {
+        return Ok(ty);
+    }
+
+    // Strategy 1b: peel the result_type's args for methods whose return
+    // type re-wraps the Option's payload. Sema resolves the call's return
+    // type using the receiver's *binding* type (post-annotation), even
+    // when the receiver's own `EnumRef` carried an unresolved TypeVar
+    // from a RHS expression like `None` or `Err("boom")`.
+    //
+    // `okOr` returns `Result<T, E>` where args[0] is the Option payload T.
+    if method == "okOr"
+        && let Some(ty) = try_type_from_result_args(result_type, 0)
     {
         return Ok(ty);
     }
@@ -267,7 +312,8 @@ fn option_payload_type(
     }
 
     // Strategy 4: EnumAlloc tracking (for okOr and other difficult cases).
-    if let Some(ty) = try_type_from_enum_alloc(state, args[0], "Option") {
+    // Variant 0 = `Some`, the only payload-bearing variant of `Option`.
+    if let Some(ty) = try_type_from_enum_alloc(state, args[0], "Option", 0) {
         return Ok(ty);
     }
 
@@ -283,13 +329,12 @@ fn option_payload_type(
         "okOr",
     ];
     if known_payload_methods.contains(&method) {
-        return Err(CompileError::new(format!(
-            "could not infer Option payload type for method '{method}'. \
-             All inference strategies failed — the Option value may come from \
-             a function parameter or cross-function return where generic type \
-             arguments are not yet propagated. Use pattern matching as a \
-             workaround. This is a known compiler limitation.",
-        )));
+        return Err(payload_inference_error(
+            "Option",
+            "payload",
+            method,
+            "Option<T>",
+        ));
     }
 
     // Unknown method — use a dummy type so the method dispatch table

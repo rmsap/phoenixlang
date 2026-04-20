@@ -203,7 +203,7 @@ pub(super) fn translate_enum(
                 .get(v)
                 .ok_or_else(|| CompileError::new("unknown type for enum field access"))?;
             let enum_name = match enum_type {
-                IrType::EnumRef(n) => n,
+                IrType::EnumRef(n, _) => n,
                 _ => return Err(CompileError::new("EnumGetField on non-enum")),
             };
             let layout = ir_module

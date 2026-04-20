@@ -24,7 +24,7 @@ Move from interpretation to native code generation. This is what makes Phoenix a
 - All string methods (including `split`)
 - `List<T>` with all functional methods (map, filter, reduce, find, any, all, flatMap, sortBy, first, last, contains, take, drop). Note: `sortBy` uses O(n^2) insertion sort — acceptable for small lists, merge sort planned.
 - `Map<K, V>` with all methods (get, set, contains, remove, keys, values, length)
-- `Option<T>` with combinators (unwrap, unwrapOr, isSome, isNone, map, andThen, orElse, filter, okOr, unwrapOrElse). See [known issues](../../docs/known-issues.md) for `okOr` limitation.
+- `Option<T>` with combinators (unwrap, unwrapOr, isSome, isNone, map, andThen, orElse, filter, okOr, unwrapOrElse).
 - `Result<T, E>` with combinators (unwrap, unwrapOr, isOk, isErr, map, andThen, orElse, mapErr, unwrapOrElse)
 
 All memory is currently leaked (no GC); compiled binaries are not suitable for long-running processes. Next step: garbage collection, then WebAssembly target.
@@ -43,12 +43,6 @@ These decisions pin the ABI / calling convention and must land before 2.2 wraps 
 - **[Dynamic dispatch via `dyn Trait`](../design-decisions.md#dynamic-dispatch-via-dyn-trait)** — vtable ABI `(data_ptr, vtable_ptr)`; static dispatch stays the default.
 - **[Centralized `Layout` trait](../design-decisions.md#centralized-layout-for-reference-types)** — single source of truth for reference-type slot count, alignment, load/store codegen. **✅ Implemented 2026-04-19** as `TypeLayout` in `phoenix-cranelift/src/translate/layout/`.
 - **[Numeric error semantics](../design-decisions.md#numeric-error-semantics-division-overflow-integer-edge-cases)** — Int operators panic on overflow / divide-by-zero / `i64::MIN` negation (ratifies current behavior); Float follows IEEE 754. Stdlib `Int.checked*` family lands in Phase 4.1.
-
-### Bugs to be closed in this phase
-
-See [known-issues.md](../known-issues.md) for the full entries:
-
-- **[`Option.okOr` payload inference](../known-issues.md#optionokor-fails-to-compile-when-payload-type-cannot-be-inferred)** — likely absorbed by monomorphization (see decision above); verify after that lands.
 
 ## 2.3 Runtime and Memory Management
 

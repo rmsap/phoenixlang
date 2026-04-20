@@ -78,7 +78,7 @@ impl TypeLayout {
             },
             // All other reference types are opaque heap pointers.
             IrType::StructRef(_)
-            | IrType::EnumRef(_)
+            | IrType::EnumRef(_, _)
             | IrType::ListRef(_)
             | IrType::MapRef(_, _)
             | IrType::ClosureRef { .. } => Self {
@@ -182,7 +182,8 @@ mod tests {
             IrType::Void,
             IrType::StringRef,
             IrType::StructRef("X".into()),
-            IrType::EnumRef("Y".into()),
+            IrType::EnumRef("Y".into(), Vec::new()),
+            IrType::EnumRef("Option".into(), vec![IrType::I64]),
             IrType::ListRef(Box::new(IrType::I64)),
             IrType::ListRef(Box::new(IrType::StringRef)),
             IrType::MapRef(Box::new(IrType::I64), Box::new(IrType::I64)),
@@ -239,7 +240,7 @@ mod tests {
     fn all_other_ref_types_are_one_slot() {
         let one_slot_refs = [
             IrType::StructRef("X".into()),
-            IrType::EnumRef("Y".into()),
+            IrType::EnumRef("Y".into(), Vec::new()),
             IrType::ListRef(Box::new(IrType::I64)),
             IrType::MapRef(Box::new(IrType::I64), Box::new(IrType::I64)),
             IrType::ClosureRef {

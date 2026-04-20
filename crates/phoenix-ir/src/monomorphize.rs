@@ -150,15 +150,18 @@ fn substitute(ty: &IrType, subst: &HashMap<String, IrType>) -> IrType {
             param_types: param_types.iter().map(|t| substitute(t, subst)).collect(),
             return_type: Box::new(substitute(return_type, subst)),
         },
-        // Value types, strings, named struct/enum refs: no inner types that
-        // can contain TypeVar. Pass through.
+        IrType::EnumRef(name, args) => IrType::EnumRef(
+            name.clone(),
+            args.iter().map(|t| substitute(t, subst)).collect(),
+        ),
+        // Value types, strings, struct refs: no inner types that can contain
+        // TypeVar. Pass through.
         IrType::I64
         | IrType::F64
         | IrType::Bool
         | IrType::Void
         | IrType::StringRef
-        | IrType::StructRef(_)
-        | IrType::EnumRef(_) => ty.clone(),
+        | IrType::StructRef(_) => ty.clone(),
     }
 }
 
@@ -186,7 +189,8 @@ fn substitute_types_in_fn(func: &mut IrFunction, subst: &HashMap<String, IrType>
 /// Grammar (recursive):
 /// - `i64`, `f64`, `bool`, `void`, `string` → `i64`, `f64`, `bool`, `void`, `str`
 /// - `StructRef(name)` → `s_{name}` (names are Phoenix identifiers ⊂ `[A-Za-z0-9_]`)
-/// - `EnumRef(name)` → `e_{name}`
+/// - `EnumRef(name, args)` → `e_{name}` when args is empty, else
+///   `e_{name}__{mangle(arg1)}__…__{mangle(argN)}_E`
 /// - `ListRef(T)` → `L_{mangle(T)}_E`
 /// - `MapRef(K, V)` → `M_{mangle(K)}_{mangle(V)}_E`
 /// - `ClosureRef((P1, …, Pn) -> R)` → `C{n}_{mangle(P1)}_…_{mangle(Pn)}_{mangle(R)}_E`
@@ -194,6 +198,22 @@ fn substitute_types_in_fn(func: &mut IrFunction, subst: &HashMap<String, IrType>
 ///
 /// The `_E` end-marker makes nested encodings unambiguous without
 /// requiring a length prefix.
+///
+/// `EnumRef` uses `__` (double underscore) to delimit its name from its
+/// first arg and to separate subsequent args, because Phoenix identifiers
+/// forbid `__` (the same invariant [`mangle`] relies on). A single-`_`
+/// separator would not be injective: `EnumRef("Opt", [StructRef("foo_i64")])`
+/// and `EnumRef("Opt", [StructRef("foo"), I64])` would both produce
+/// `e_Opt_s_foo_i64_E`. Other constructors (`List`/`Map`/`Closure`) avoid
+/// this by having a fixed arity (or a leading arity prefix), but `EnumRef`
+/// is variadic, so it needs a name/arg delimiter that cannot appear inside
+/// either segment.
+///
+/// Examples:
+/// - `EnumRef("Option", [])` → `e_Option`
+/// - `EnumRef("Option", [I64])` → `e_Option__i64_E`
+/// - `EnumRef("Result", [StringRef, I64])` → `e_Result__str__i64_E`
+/// - `ListRef(EnumRef("Option", [I64]))` → `L_e_Option__i64_E_E`
 pub(crate) fn mangle_type(ty: &IrType) -> String {
     match ty {
         IrType::I64 => "i64".to_string(),
@@ -202,7 +222,19 @@ pub(crate) fn mangle_type(ty: &IrType) -> String {
         IrType::Void => "void".to_string(),
         IrType::StringRef => "str".to_string(),
         IrType::StructRef(name) => format!("s_{name}"),
-        IrType::EnumRef(name) => format!("e_{name}"),
+        IrType::EnumRef(name, args) => {
+            if args.is_empty() {
+                format!("e_{name}")
+            } else {
+                let mut s = format!("e_{name}");
+                for a in args {
+                    s.push_str("__");
+                    s.push_str(&mangle_type(a));
+                }
+                s.push_str("_E");
+                s
+            }
+        }
         IrType::ListRef(inner) => format!("L_{}_E", mangle_type(inner)),
         IrType::MapRef(k, v) => format!("M_{}_{}_E", mangle_type(k), mangle_type(v)),
         IrType::ClosureRef {
@@ -472,7 +504,13 @@ fn contains_type_var(ty: &IrType) -> bool {
             param_types,
             return_type,
         } => param_types.iter().any(contains_type_var) || contains_type_var(return_type),
-        _ => false,
+        IrType::EnumRef(_, args) => args.iter().any(contains_type_var),
+        IrType::I64
+        | IrType::F64
+        | IrType::Bool
+        | IrType::Void
+        | IrType::StringRef
+        | IrType::StructRef(_) => false,
     }
 }
 
@@ -698,7 +736,9 @@ mod tests {
                 return_type: Box::new(IrType::StringRef),
             },
             IrType::StructRef("Point".into()),
-            IrType::EnumRef("Option".into()),
+            IrType::EnumRef("Option".into(), Vec::new()),
+            IrType::EnumRef("Option".into(), vec![IrType::I64]),
+            IrType::EnumRef("Result".into(), vec![IrType::StringRef, IrType::I64]),
         ];
         for ty in cases {
             let name = mangle("fn", std::slice::from_ref(&ty));
@@ -707,6 +747,56 @@ mod tests {
                 "mangled name `{name}` (from {ty:?}) contains non-symbol-safe chars"
             );
         }
+    }
+
+    /// Lock in the exact mangle grammar for `EnumRef` with args. Injectivity
+    /// is covered separately; this test guards against silent reformatting
+    /// (e.g. changing the `_E` terminator or the per-arg separator) that
+    /// would change the Cranelift symbol names Phoenix binaries are linked
+    /// against.
+    #[test]
+    fn mangles_enum_ref_with_args_verbatim() {
+        assert_eq!(
+            mangle_type(&IrType::EnumRef("Option".into(), Vec::new())),
+            "e_Option"
+        );
+        assert_eq!(
+            mangle_type(&IrType::EnumRef("Option".into(), vec![IrType::I64])),
+            "e_Option__i64_E"
+        );
+        assert_eq!(
+            mangle_type(&IrType::EnumRef(
+                "Result".into(),
+                vec![IrType::StringRef, IrType::I64]
+            )),
+            "e_Result__str__i64_E"
+        );
+        // Nesting is unambiguous thanks to the `_E` terminator.
+        assert_eq!(
+            mangle_type(&IrType::ListRef(Box::new(IrType::EnumRef(
+                "Option".into(),
+                vec![IrType::I64]
+            )))),
+            "L_e_Option__i64_E_E"
+        );
+    }
+
+    /// Regression guard for the name/arg delimiter ambiguity: with a single-
+    /// underscore separator, `EnumRef("Opt", [StructRef("foo_i64")])` and
+    /// `EnumRef("Opt", [StructRef("foo"), I64])` would both mangle to
+    /// `e_Opt_s_foo_i64_E`. The `__` delimiter splits these cleanly because
+    /// Phoenix identifiers forbid `__`, so the boundary between name and
+    /// first arg (and between adjacent args) is unambiguous.
+    #[test]
+    fn enum_ref_mangle_is_injective_under_underscore_in_arg_names() {
+        let a = IrType::EnumRef("Opt".into(), vec![IrType::StructRef("foo_i64".into())]);
+        let b = IrType::EnumRef(
+            "Opt".into(),
+            vec![IrType::StructRef("foo".into()), IrType::I64],
+        );
+        assert_ne!(mangle_type(&a), mangle_type(&b));
+        assert_eq!(mangle_type(&a), "e_Opt__s_foo_i64_E");
+        assert_eq!(mangle_type(&b), "e_Opt__s_foo__i64_E");
     }
 
     #[test]
@@ -747,6 +837,73 @@ mod tests {
         assert!(module.function_index.contains_key("noop__i64"));
     }
 
+    /// `substitute` must recurse into `EnumRef.args` so a `TypeVar` inside
+    /// an `Option<T>` or `Result<T, E>` position is replaced when the
+    /// template is specialized. Without this the backend would see an
+    /// unsubstituted `TypeVar` at a reference-type use site, which has no
+    /// Cranelift lowering.
+    #[test]
+    fn substitute_recurses_into_enum_ref_args() {
+        let mut subst = HashMap::new();
+        subst.insert("T".to_string(), IrType::I64);
+        subst.insert("E".to_string(), IrType::StringRef);
+
+        let ty = IrType::EnumRef("Result".into(), vec![tv("T"), tv("E")]);
+        assert_eq!(
+            substitute(&ty, &subst),
+            IrType::EnumRef("Result".into(), vec![IrType::I64, IrType::StringRef])
+        );
+
+        // Nested: Option<List<T>>
+        let nested = IrType::EnumRef("Option".into(), vec![IrType::ListRef(Box::new(tv("T")))]);
+        assert_eq!(
+            substitute(&nested, &subst),
+            IrType::EnumRef(
+                "Option".into(),
+                vec![IrType::ListRef(Box::new(IrType::I64))]
+            )
+        );
+
+        // Empty-args EnumRef is untouched (no TypeVars to substitute).
+        let bare = IrType::EnumRef("Color".into(), Vec::new());
+        assert_eq!(substitute(&bare, &subst), bare);
+    }
+
+    /// `contains_type_var` must recurse into every compound type constructor
+    /// — a missing arm would let an orphan `TypeVar` slip past the Pass A
+    /// `debug_assert` guard. Regression test for a prior miss on `EnumRef`.
+    #[test]
+    fn contains_type_var_recurses_into_every_compound() {
+        assert!(contains_type_var(&tv("T")));
+        assert!(contains_type_var(&IrType::ListRef(Box::new(tv("T")))));
+        assert!(contains_type_var(&IrType::MapRef(
+            Box::new(IrType::I64),
+            Box::new(tv("V"))
+        )));
+        assert!(contains_type_var(&IrType::ClosureRef {
+            param_types: vec![IrType::I64, tv("P")],
+            return_type: Box::new(IrType::Void),
+        }));
+        assert!(contains_type_var(&IrType::EnumRef(
+            "Option".into(),
+            vec![tv("T")]
+        )));
+        // Deeply nested: Option<List<T>>.
+        assert!(contains_type_var(&IrType::EnumRef(
+            "Option".into(),
+            vec![IrType::ListRef(Box::new(tv("T")))]
+        )));
+
+        // Atomic and concrete compound types report false.
+        assert!(!contains_type_var(&IrType::I64));
+        assert!(!contains_type_var(&IrType::StructRef("Point".into())));
+        assert!(!contains_type_var(&IrType::EnumRef(
+            "Result".into(),
+            vec![IrType::I64, IrType::StringRef]
+        )));
+        assert!(!contains_type_var(&IrType::EnumRef("Color".into(), vec![])));
+    }
+
     #[test]
     fn residual_type_var_erased_to_placeholder_when_no_specializations() {
         // Non-template function with an orphan TypeVar (e.g., empty list
@@ -766,6 +923,36 @@ mod tests {
             IrType::ListRef(Box::new(IrType::StructRef(
                 crate::types::GENERIC_PLACEHOLDER.to_string()
             )))
+        );
+    }
+
+    /// An orphan `TypeVar` inside an `EnumRef` arg (e.g. `Option<T>` where
+    /// `T` was never bound) must be erased to `GENERIC_PLACEHOLDER` by
+    /// Pass D, matching the treatment of orphan TypeVars in `ListRef` /
+    /// `MapRef` positions. Without this, the backend would hit an
+    /// unsubstituted `TypeVar` at a reference-type use site.
+    #[test]
+    fn residual_type_var_in_enum_ref_args_erased_by_pass_d() {
+        let mut module = module_of(vec![
+            FnBuilder::new(0, "main")
+                .instr(
+                    Op::ListAlloc(vec![]),
+                    IrType::EnumRef("Option".into(), vec![tv("T")]),
+                )
+                .build(),
+        ]);
+
+        monomorphize(&mut module);
+
+        let instr = &module.functions[0].blocks[0].instructions[0];
+        assert_eq!(
+            instr.result_type,
+            IrType::EnumRef(
+                "Option".into(),
+                vec![IrType::StructRef(
+                    crate::types::GENERIC_PLACEHOLDER.to_string()
+                )]
+            )
         );
     }
 }

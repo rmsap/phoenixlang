@@ -655,3 +655,278 @@ function main() {
     );
     assert_eq!(out, vec!["404"]);
 }
+
+/// `mapErr` on a `Result<String, String>` received as a function
+/// parameter. Mirrors `option_okor_*_via_function_parameter` — exercises
+/// Strategy 0 (`try_result_payload_types_from_args`) for Result.
+#[test]
+fn result_map_err_string_payload_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function rewrap(r: Result<String, String>) -> Result<String, String> {
+    return r.mapErr(function(e: String) -> String { "wrapped: " + e })
+}
+function main() {
+    let r1 = rewrap(Ok("hello"))
+    match r1 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+    let r2 = rewrap(Err("boom"))
+    match r2 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello", "wrapped: boom"]);
+}
+
+/// Strategy 0 coverage: `unwrap` on a `Result<String, String>` received as
+/// a function parameter.  Exercises the Ok-slot read without any closure
+/// arg present to drive Strategy 3.
+#[test]
+fn result_unwrap_string_ok_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function get_ok(r: Result<String, String>) -> String {
+    return r.unwrap()
+}
+function main() {
+    print(get_ok(Ok("hello")))
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello"]);
+}
+
+/// Strategy 0 coverage: `orElse` on a `Result<Int, String>` received as a
+/// function parameter.  The closure returns another `Result`, so Strategy
+/// 3's `try_type_from_closure_arg` would give us the *input* of the closure
+/// (Err type) — Strategy 0 is what tells us the Ok type so the combiner
+/// lays out both slots correctly.
+#[test]
+fn result_or_else_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function recover(r: Result<Int, String>) -> Result<Int, String> {
+    return r.orElse(function(_e: String) -> Result<Int, String> { Ok(0) })
+}
+function main() {
+    let r1 = recover(Ok(7))
+    match r1 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+    let r2 = recover(Err("bad"))
+    match r2 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["7", "0"]);
+}
+
+/// Strategy 0 coverage: `unwrapOrElse` on a `Result<String, Int>` received
+/// as a function parameter.  Both Ok and Err payloads are resolved from
+/// the receiver's `EnumRef` args (Ok via Strategy 1 via `result_type`,
+/// Err via Strategy 0 since the closure's input tells us Err).
+#[test]
+fn result_unwrap_or_else_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function or_default(r: Result<String, Int>) -> String {
+    return r.unwrapOrElse(function(code: Int) -> String { "code=" + toString(code) })
+}
+function main() {
+    print(or_default(Ok("good")))
+    print(or_default(Err(42)))
+}
+"#,
+    );
+    assert_eq!(out, vec!["good", "code=42"]);
+}
+
+/// Strategy 0 coverage: `map` on a `Result<String, String>` received as a
+/// function parameter, with the closure rebuilding a multi-slot payload.
+/// Guards against layout fallbacks silently picking an `I64` Ok slot.
+#[test]
+fn result_map_string_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function shout(r: Result<String, String>) -> Result<String, String> {
+    return r.map(function(s: String) -> String { s + "!" })
+}
+function main() {
+    let r = shout(Ok("hi"))
+    match r {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+    let r2 = shout(Err("nope"))
+    match r2 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["hi!", "nope"]);
+}
+
+/// Strategy 0 coverage: `andThen` on a `Result<Int, String>` received as a
+/// function parameter, where the closure returns a different Ok type
+/// (`Result<String, String>`).  Ok slot is driven by closure input;
+/// Err slot must come from the receiver's args (Strategy 0).
+#[test]
+fn result_and_then_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function stringify(r: Result<Int, String>) -> Result<String, String> {
+    return r.andThen(function(n: Int) -> Result<String, String> { Ok("n=" + toString(n)) })
+}
+function main() {
+    let r = stringify(Ok(7))
+    match r {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+    let r2 = stringify(Err("bad"))
+    match r2 {
+        Ok(v) -> print(v)
+        Err(e) -> print(e)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["n=7", "bad"]);
+}
+
+/// Deep nesting: `Result<Option<String>, String>` via a function parameter.
+/// Exercises `try_type_from_enum_args` reading an outer `EnumRef("Result",
+/// [EnumRef("Option", [String]), String])` and downstream inference of the
+/// inner `Option<String>`'s payload via another Strategy 0 read.
+#[test]
+fn result_of_option_string_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function extract(r: Result<Option<String>, String>) -> String {
+    match r {
+        Ok(opt) -> opt.unwrapOr("empty")
+        Err(e) -> e
+    }
+}
+function main() {
+    print(extract(Ok(Some("hello"))))
+    print(extract(Ok(None)))
+    print(extract(Err("boom")))
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello", "empty", "boom"]);
+}
+
+/// Chained method dispatch on nested generics: `Result<Option<Int>,
+/// String>` → `.map(closure that calls Option.unwrapOr)` → `.unwrapOr`.
+/// Exercises Strategy 0 threading the Option args through the closure
+/// parameter's `type_map` entry and then through the Option method's
+/// own payload inference. Previously only pattern matching covered the
+/// nested-generics case; this guards the method-dispatch path too.
+#[test]
+fn result_map_inner_option_unwrap_or_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function process(r: Result<Option<Int>, String>) -> Int {
+    return r.map(function(opt: Option<Int>) -> Int { opt.unwrapOr(0) }).unwrapOr(-1)
+}
+function main() {
+    print(toString(process(Ok(Some(42)))))
+    print(toString(process(Ok(None))))
+    print(toString(process(Err("boom"))))
+}
+"#,
+    );
+    assert_eq!(out, vec!["42", "0", "-1"]);
+}
+
+/// Asymmetric slot counts: `Result<String, Int>` via function parameter.
+/// This is the exact shape of the pre-fix bug — Ok is 2 slots (pointer +
+/// length), Err is 1. The old fallback picked a single `I64` for both
+/// slots and silently corrupted the Ok payload. Strategy 0 must read the
+/// receiver's args and produce the right Cranelift slot counts for each
+/// branch so the Ok value survives the round trip intact.
+#[test]
+fn result_asymmetric_slot_counts_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function render(r: Result<String, Int>) -> String {
+    match r {
+        Ok(s) -> s
+        Err(code) -> "code=" + toString(code)
+    }
+}
+function main() {
+    print(render(Ok("hello world")))
+    print(render(Err(404)))
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello world", "code=404"]);
+}
+
+/// Nested enums with different payload shapes: `Result<Option<Int>,
+/// Option<String>>` via function parameter. Exercises `EnumRef` arg
+/// recursion at both Ok and Err positions with different inner payload
+/// types, guarding against a uniform fallback that would pick one shape
+/// for both slots.
+#[test]
+fn result_nested_option_asymmetric_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function describe(r: Result<Option<Int>, Option<String>>) -> String {
+    match r {
+        Ok(opt) -> match opt {
+            Some(n) -> "ok=" + toString(n)
+            None -> "ok=none"
+        }
+        Err(opt) -> match opt {
+            Some(e) -> "err=" + e
+            None -> "err=none"
+        }
+    }
+}
+function main() {
+    print(describe(Ok(Some(7))))
+    let ok_none: Option<Int> = None
+    print(describe(Ok(ok_none)))
+    print(describe(Err(Some("boom"))))
+    let err_none: Option<String> = None
+    print(describe(Err(err_none)))
+}
+"#,
+    );
+    assert_eq!(out, vec!["ok=7", "ok=none", "err=boom", "err=none"]);
+}
+
+/// `Result<List<Int>, String>` via function parameter with `.map` whose
+/// closure reads the inner List. Multi-slot list payload must not fall
+/// back to an `I64` dummy.
+#[test]
+fn result_map_inner_list_via_function_parameter() {
+    let out = compile_and_run(
+        r#"
+function first_or(r: Result<List<Int>, String>, default: Int) -> Int {
+    return r.map(function(xs: List<Int>) -> Int { xs.first().unwrapOr(default) }).unwrapOr(default)
+}
+function main() {
+    let xs: List<Int> = [7, 8, 9]
+    print(toString(first_or(Ok(xs), -1)))
+    print(toString(first_or(Err("nope"), -1)))
+}
+"#,
+    );
+    assert_eq!(out, vec!["7", "-1"]);
+}

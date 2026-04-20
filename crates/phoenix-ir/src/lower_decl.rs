@@ -155,11 +155,33 @@ impl<'a> LoweringContext<'a> {
         let has_self = method.params.first().is_some_and(|p| p.name == "self");
 
         if has_self {
-            // Determine the self type from sema info.
+            // Determine the self type from sema info. The enum branch emits
+            // empty generic args because Phoenix does not yet support
+            // user-defined methods on generic enums — once that lands, this
+            // must be taught to propagate the enum's type parameters so
+            // payload inference inside the method body can read them via
+            // Strategy 0 instead of falling through to fallbacks.  The
+            // `debug_assert` below fails loudly the first time a caller
+            // introduces a generic enum with methods, so the fix is scoped
+            // to here rather than manifesting as a silent miscompile.
             let self_type = if self.check.structs.contains_key(type_name) {
                 IrType::StructRef(type_name.to_string())
             } else {
-                IrType::EnumRef(type_name.to_string())
+                debug_assert!(
+                    self.check
+                        .enums
+                        .get(type_name)
+                        .is_none_or(|info| info.type_params.is_empty()),
+                    "method on generic enum `{type_name}` — lower_decl must be \
+                     taught to propagate type params into the self `EnumRef` \
+                     before this path is reachable. Tracked under phase 2.2 in \
+                     `docs/phases/phase-2.md`; fix here by threading the \
+                     enum's `info.type_params` into the self `EnumRef` args \
+                     and revisiting the Strategy 1–4 fallbacks in \
+                     `phoenix-cranelift/src/translate/enum_type_inference.rs` \
+                     (module doc FIXME)."
+                );
+                IrType::EnumRef(type_name.to_string(), Vec::new())
             };
             param_types.insert(0, self_type);
             param_names.insert(0, "self".to_string());

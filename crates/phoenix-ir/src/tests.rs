@@ -1,7 +1,7 @@
 //! Integration tests for IR lowering.
 
 use crate::lower;
-use crate::types::{OPTION_ENUM, RESULT_ENUM};
+use crate::types::{IrType, OPTION_ENUM, RESULT_ENUM};
 use crate::verify;
 use phoenix_common::span::SourceId;
 use phoenix_lexer::lexer::tokenize;
@@ -1308,7 +1308,17 @@ fn mangling_is_injective_for_distinct_type_args() {
         IrType::Void,
         IrType::StringRef,
         IrType::StructRef("Point".into()),
-        IrType::EnumRef("Point".into()), // distinct encoding from StructRef of same name
+        IrType::EnumRef("Point".into(), Vec::new()), // distinct encoding from StructRef of same name
+        IrType::EnumRef("Option".into(), vec![IrType::I64]),
+        IrType::EnumRef("Result".into(), vec![IrType::StringRef, IrType::I64]),
+        // Collision guard: single-underscore delimiter would produce
+        // `e_Opt_s_foo_i64_E` for both of these distinct types.  The `__`
+        // delimiter in `mangle_type` must keep them apart.
+        IrType::EnumRef("Opt".into(), vec![IrType::StructRef("foo_i64".into())]),
+        IrType::EnumRef(
+            "Opt".into(),
+            vec![IrType::StructRef("foo".into()), IrType::I64],
+        ),
         IrType::ListRef(Box::new(IrType::I64)),
         IrType::ListRef(Box::new(IrType::StringRef)),
         IrType::MapRef(Box::new(IrType::StringRef), Box::new(IrType::I64)),
@@ -1482,4 +1492,208 @@ function main() {
              the internal call was not rewritten"
         );
     }
+}
+
+/// `enum_type_at` is a private helper on `LoweringContext` used by
+/// `lower_ident`, `lower_call`, and `lower_struct_literal` to decide
+/// whether an identifier / call / struct-literal expression is actually
+/// an enum variant construction. Rather than testing the helper directly
+/// (CheckResult has too many fields to mock), we drive it through
+/// `lower_source` and assert on the resulting `EnumAlloc`'s result type
+/// — that type is precisely the output of `enum_type_at` threaded through
+/// `lower_type_args`.
+///
+/// Sema types the RHS expression independently of the `let` annotation,
+/// so every arg must be inferable from the variant's own arguments for
+/// this test to observe a concrete `EnumRef`.  `Some(42)` pins `T = Int`
+/// from the literal, so the resulting `EnumAlloc` carries `[I64]`.
+#[test]
+fn enum_type_at_preserves_args_for_generic_constructor_call() {
+    let module = lower_source(
+        r#"
+function main() {
+    let o: Option<Int> = Some(42)
+}
+"#,
+    );
+    let main = &module.functions[module.function_index["main"].0 as usize];
+    let alloc_inst = main.blocks[0]
+        .instructions
+        .iter()
+        .find(|i| matches!(&i.op, crate::instruction::Op::EnumAlloc(name, _, _) if name == OPTION_ENUM))
+        .expect("expected an EnumAlloc for Some(42)");
+    assert_eq!(
+        alloc_inst.result_type,
+        IrType::EnumRef(OPTION_ENUM.to_string(), vec![IrType::I64]),
+    );
+}
+
+/// `enum_type_at` on a call inside a function parameter context:
+/// `unwrap_or_default(Some("x"))` — the `Some(...)` is typed by sema
+/// from the literal, so `enum_type_at` returns
+/// `Type::Generic("Option", [String])` and the EnumAlloc's result type
+/// carries `[StringRef]`.
+#[test]
+fn enum_type_at_preserves_multi_slot_payload() {
+    let module = lower_source(
+        r#"
+function main() {
+    let o = Some("hello")
+}
+"#,
+    );
+    let main = &module.functions[module.function_index["main"].0 as usize];
+    let alloc_inst = main.blocks[0]
+        .instructions
+        .iter()
+        .find(|i| matches!(&i.op, crate::instruction::Op::EnumAlloc(name, _, _) if name == OPTION_ENUM))
+        .expect("expected an EnumAlloc for Some(\"hello\")");
+    assert_eq!(
+        alloc_inst.result_type,
+        IrType::EnumRef(OPTION_ENUM.to_string(), vec![IrType::StringRef]),
+    );
+}
+
+/// User-defined *generic* enum: `lower_type`'s `other` branch (neither
+/// stdlib Option/Result nor a struct) must carry args through
+/// `EnumRef(name, args)` just like stdlib enums. End-to-end compilation
+/// is blocked on generic-enum monomorphization landing, but IR lowering
+/// already produces the correct `EnumRef` — which is what this guards.
+#[test]
+fn user_defined_generic_enum_preserves_args_in_enum_ref() {
+    let module = lower_source(
+        r#"
+enum Box<T> {
+    Wrap(T)
+    Empty
+}
+function main() {
+    let b: Box<Int> = Wrap(42)
+}
+"#,
+    );
+    let main = &module.functions[module.function_index["main"].0 as usize];
+    let alloc_inst = main.blocks[0]
+        .instructions
+        .iter()
+        .find(|i| matches!(&i.op, crate::instruction::Op::EnumAlloc(name, _, _) if name == "Box"))
+        .expect("expected an EnumAlloc for Wrap(42)");
+    assert_eq!(
+        alloc_inst.result_type,
+        IrType::EnumRef("Box".to_string(), vec![IrType::I64]),
+    );
+}
+
+/// Zero-field variant of a non-generic user enum — `enum_type_at` must
+/// resolve `Red` via its span's `Type::Named("Color")` fallback branch
+/// and produce `EnumRef("Color", [])`.
+#[test]
+fn enum_type_at_handles_zero_field_non_generic_variant() {
+    let module = lower_source(
+        r#"
+enum Color { Red  Green  Blue }
+function main() {
+    let c = Red
+}
+"#,
+    );
+    let main = &module.functions[module.function_index["main"].0 as usize];
+    let alloc_inst = main.blocks[0]
+        .instructions
+        .iter()
+        .find(|i| matches!(&i.op, crate::instruction::Op::EnumAlloc(name, _, _) if name == "Color"))
+        .expect("expected an EnumAlloc for Red");
+    assert_eq!(
+        alloc_inst.result_type,
+        IrType::EnumRef("Color".to_string(), Vec::new()),
+    );
+}
+
+/// Zero-field variant of a *generic* user enum: `Empty` in `Box<T>`
+/// (companion to `enum_type_at_handles_zero_field_non_generic_variant`).
+///
+/// Sema cannot infer `T` from the `Empty` literal alone — the variant
+/// carries no payload to pin the type parameter, and sema does *not*
+/// currently thread the `let: Box<Int>` binding annotation back into the
+/// RHS expression's type. The result is
+/// `EnumRef("Box", [GENERIC_PLACEHOLDER])`, which Pass D would preserve
+/// as-is (the placeholder is a concrete `StructRef`, not a `TypeVar`).
+///
+/// This test locks in the current behavior so a future sema improvement
+/// that propagates annotations to zero-field variants is caught by the
+/// test failing — at which point the expectation should switch to
+/// `[I64]`. Guards the enum_type_at path from regressing in the opposite
+/// direction (e.g. dropping args entirely).
+#[test]
+fn enum_type_at_handles_zero_field_generic_variant() {
+    let module = lower_source(
+        r#"
+enum Box<T> {
+    Wrap(T)
+    Empty
+}
+function main() {
+    let b: Box<Int> = Empty
+}
+"#,
+    );
+    let main = &module.functions[module.function_index["main"].0 as usize];
+    let alloc_inst = main.blocks[0]
+        .instructions
+        .iter()
+        .find(|i| matches!(&i.op, crate::instruction::Op::EnumAlloc(name, _, _) if name == "Box"))
+        .expect("expected an EnumAlloc for Empty");
+    assert_eq!(
+        alloc_inst.result_type,
+        IrType::EnumRef(
+            "Box".to_string(),
+            vec![IrType::StructRef(
+                crate::types::GENERIC_PLACEHOLDER.to_string()
+            )]
+        ),
+    );
+}
+
+/// Monomorphizing a generic function that returns a user-defined generic
+/// enum: `wrap<T>(x: T) -> Box<T>` specialized at `Int` must rewrite the
+/// return type to `EnumRef("Box", [I64])`, and the inner `EnumAlloc`
+/// that builds the result must carry the same substituted args. Guards
+/// the interaction between `monomorphize::substitute` (which now recurses
+/// into `EnumRef` args) and user-defined generic enums.
+#[test]
+fn monomorphization_substitutes_into_user_defined_enum_return_type() {
+    let module = lower_source(
+        r#"
+enum Box<T> {
+    Wrap(T)
+    Empty
+}
+function wrap<T>(x: T) -> Box<T> { Wrap(x) }
+function main() {
+    let b: Box<Int> = wrap(42)
+}
+"#,
+    );
+    let spec = &module.functions[module.function_index["wrap__i64"].0 as usize];
+    assert_eq!(
+        spec.return_type,
+        IrType::EnumRef("Box".to_string(), vec![IrType::I64]),
+    );
+    assert_eq!(spec.param_types, vec![IrType::I64]);
+
+    // The inner `EnumAlloc` that builds the `Wrap(x)` value inside the
+    // specialization must also carry the substituted arg — otherwise
+    // downstream consumers (e.g. backend payload inference) would see a
+    // `Box` alloc with empty args inside a function whose signature
+    // claims `Box<Int>`.
+    let alloc_inst = spec
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find(|i| matches!(&i.op, crate::instruction::Op::EnumAlloc(name, _, _) if name == "Box"))
+        .expect("expected an EnumAlloc for Wrap(x) in the specialization");
+    assert_eq!(
+        alloc_inst.result_type,
+        IrType::EnumRef("Box".to_string(), vec![IrType::I64]),
+    );
 }

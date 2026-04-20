@@ -194,3 +194,12 @@ function main() {
 "#,
     );
 }
+
+// Round-trip a user-defined *generic* enum end-to-end is blocked on a
+// separate limitation (user-defined generic enum layout specialization
+// is a deferred feature — see `docs/design-decisions.md`). The IR-level
+// propagation of generic args through `EnumRef(name, args)` is covered
+// by `enum_type_at_preserves_args_for_generic_constructor_call` in the
+// `phoenix-ir` crate, and the extended mangler grammar (`e_{name}__…_E`)
+// is covered by `mangles_enum_ref_with_args_verbatim` in the same crate.
+// Once generic-enum monomorphization lands, add an end-to-end test here.

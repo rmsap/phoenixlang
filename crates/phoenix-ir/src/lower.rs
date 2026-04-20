@@ -71,7 +71,9 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
             if check_result.structs.contains_key(name) {
                 IrType::StructRef(name.clone())
             } else if check_result.enums.contains_key(name) {
-                IrType::EnumRef(name.clone())
+                // `Type::Named` has no generic args by construction (that
+                // shape is `Type::Generic` below), so the args vec is empty.
+                IrType::EnumRef(name.clone(), Vec::new())
             } else {
                 // Unknown named type — treat as opaque struct reference.
                 // This should not happen: sema resolves all named types.
@@ -110,15 +112,29 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
                 IrType::MapRef(Box::new(key), Box::new(val))
             }
             crate::types::OPTION_ENUM | crate::types::RESULT_ENUM => {
-                // Option and Result are enums at the IR level
-                IrType::EnumRef(name.clone())
+                // Option and Result are enums at the IR level.  Carry the
+                // concrete type args so payload-type inference in the
+                // Cranelift backend can read them directly (Strategy 0 in
+                // `option_payload_type` / `result_payload_types`).
+                IrType::EnumRef(
+                    name.clone(),
+                    args.iter().map(|t| lower_type(t, check_result)).collect(),
+                )
             }
             other => {
-                // Generic struct or enum
+                // Generic struct or enum. `StructRef` drops its args while
+                // `EnumRef` keeps them — see the "EnumRef carries args but
+                // StructRef drops them" subsection of
+                // `docs/design-decisions.md` under
+                // "Generic function monomorphization strategy" for the
+                // rationale.
                 if check_result.structs.contains_key(other) {
                     IrType::StructRef(other.to_string())
                 } else {
-                    IrType::EnumRef(other.to_string())
+                    IrType::EnumRef(
+                        other.to_string(),
+                        args.iter().map(|t| lower_type(t, check_result)).collect(),
+                    )
                 }
             }
         },

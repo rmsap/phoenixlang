@@ -4,7 +4,7 @@
 //! each producing an SSA [`ValueId`].
 
 use crate::instruction::{Op, VOID_SENTINEL, ValueId};
-use crate::lower::{LoweringContext, VarBinding};
+use crate::lower::{LoweringContext, VarBinding, lower_type};
 use crate::module::IrFunction;
 use crate::terminator::Terminator;
 use crate::types::IrType;
@@ -18,6 +18,35 @@ use phoenix_parser::ast::{
 use phoenix_sema::types::Type;
 
 impl<'a> LoweringContext<'a> {
+    /// Lower a slice of sema [`Type`]s to their IR counterparts. Used when
+    /// propagating enum generic args (e.g. `Option<Int>` → `EnumRef("Option",
+    /// [I64])`) through enum-variant construction sites.
+    fn lower_type_args(&self, args: &[Type]) -> Vec<IrType> {
+        args.iter().map(|t| lower_type(t, self.check)).collect()
+    }
+
+    /// If sema resolved the type at `span` to a known enum, return its name
+    /// and sema-level type args. Returns `None` for non-enum types, unresolved
+    /// spans, or names absent from `enum_layouts`.
+    ///
+    /// Callers still do variant-name lookup against the layout; this helper
+    /// unifies the "is the thing at this span an enum construction, and if so
+    /// with what name + args" question that `lower_ident`, `lower_call`, and
+    /// `lower_struct_literal` all need to answer.
+    fn enum_type_at(&self, span: &Span) -> Option<(String, Vec<Type>)> {
+        let source_ty = self.source_type(span)?;
+        let (name, args) = match source_ty {
+            Type::Generic(n, a) => (n.clone(), a.clone()),
+            Type::Named(n) => (n.clone(), Vec::new()),
+            _ => return None,
+        };
+        if self.module.enum_layouts.contains_key(&name) {
+            Some((name, args))
+        } else {
+            None
+        }
+    }
+
     /// Lower an expression and return the [`ValueId`] of its result.
     pub(crate) fn lower_expr(&mut self, expr: &Expr) -> ValueId {
         match expr {
@@ -162,47 +191,46 @@ impl<'a> LoweringContext<'a> {
     }
 
     /// Lower an identifier expression.
+    ///
+    /// Identifiers fall into three buckets, checked in order:
+    ///
+    /// 1. **Zero-field enum variant** (`None`, `Some` via `None` is elsewhere,
+    ///    user-defined `enum Color { Red, Green }` → `Red`). Sema tags the
+    ///    span with a `Type::Generic(enum_name, args)` or `Type::Named(enum)`;
+    ///    combined with an `enum_layouts` hit on a zero-field variant named
+    ///    `ident.name`, we emit an `EnumAlloc` with the concrete args carried
+    ///    forward on the resulting `EnumRef`. This handles `None` uniformly
+    ///    with every other zero-field variant — no separate `None` branch.
+    /// 2. **Bound variable** — standard lookup in the current scope chain.
+    /// 3. **Otherwise**: sema should have rejected the program; panic.
     fn lower_ident(&mut self, ident: &phoenix_parser::ast::IdentExpr) -> ValueId {
-        // Check if it is a zero-field enum variant (e.g. `None`, `True`).
-        // The sema checker resolves these as identifiers.
-        if let Some(source_ty) = self.source_type(&ident.span) {
-            let enum_name = match source_ty {
-                Type::Generic(name, _) => Some(name.clone()),
-                Type::Named(name) => Some(name.clone()),
-                _ => None,
-            };
-            if let Some(enum_name) = enum_name
-                && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()
-                && let Some((idx, _)) = variants
-                    .iter()
-                    .enumerate()
-                    .find(|(_, (name, fields))| *name == ident.name && fields.is_empty())
-            {
-                return self.emit(
-                    Op::EnumAlloc(enum_name.clone(), idx as u32, Vec::new()),
-                    IrType::EnumRef(enum_name),
-                    Some(ident.span),
-                );
-            }
+        if let Some((enum_name, type_args)) = self.enum_type_at(&ident.span)
+            && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()
+            && let Some((idx, _)) = variants
+                .iter()
+                .enumerate()
+                .find(|(_, (name, fields))| *name == ident.name && fields.is_empty())
+        {
+            let ir_args = self.lower_type_args(&type_args);
+            return self.emit(
+                Op::EnumAlloc(enum_name.clone(), idx as u32, Vec::new()),
+                IrType::EnumRef(enum_name, ir_args),
+                Some(ident.span),
+            );
         }
 
-        // Regular variable lookup.
         if let Some(binding) = self.lookup_var(&ident.name).cloned() {
             match binding {
                 VarBinding::Direct(val, _) => val,
                 VarBinding::Mutable(slot, ty) => self.emit(Op::Load(slot), ty, Some(ident.span)),
             }
-        } else if ident.name == "None" {
-            // Built-in Option::None — emit as enum variant (discriminant 1).
-            self.emit(
-                Op::EnumAlloc(crate::types::OPTION_ENUM.to_string(), 1, Vec::new()),
-                IrType::EnumRef(crate::types::OPTION_ENUM.to_string()),
-                Some(ident.span),
-            )
         } else {
-            // Unknown variable — sema should have caught this.
+            // Sema should have caught this — including `None` without a
+            // resolvable `Option<T>` context, which the zero-field-variant
+            // branch above handles when sema does its job.
             unreachable!(
-                "unknown identifier `{}` at {:?} — sema should have rejected this",
+                "unknown identifier `{}` at {:?} — sema should have rejected this \
+                 (or failed to resolve an Option<T> type for a bare `None`)",
                 ident.name, ident.span
             )
         }
@@ -413,17 +441,17 @@ impl<'a> LoweringContext<'a> {
             }
 
             // Check for an enum variant constructor (e.g. `Some(42)`).
-            if let Some(source_ty) = self.source_type(&call.span).cloned()
-                && let Type::Generic(ref enum_name, _) = source_ty
-                && let Some(variants) = self.module.enum_layouts.get(enum_name).cloned()
+            if let Some((enum_name, type_args)) = self.enum_type_at(&call.span)
+                && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()
                 && let Some((idx, _)) = variants
                     .iter()
                     .enumerate()
                     .find(|(_, (name, _))| *name == ident.name)
             {
-                let result_type = IrType::EnumRef(enum_name.clone());
+                let ir_args = self.lower_type_args(&type_args);
+                let result_type = IrType::EnumRef(enum_name.clone(), ir_args);
                 return self.emit(
-                    Op::EnumAlloc(enum_name.clone(), idx as u32, positional),
+                    Op::EnumAlloc(enum_name, idx as u32, positional),
                     result_type,
                     span,
                 );
@@ -599,25 +627,17 @@ impl<'a> LoweringContext<'a> {
         let span = Some(sl.span);
 
         // Check if this is an enum variant constructor.
-        let source_ty = self.source_type(&sl.span).cloned();
-        let enum_name = match &source_ty {
-            Some(Type::Generic(name, _)) | Some(Type::Named(name)) => self
-                .module
-                .enum_layouts
-                .contains_key(name)
-                .then(|| name.clone()),
-            _ => None,
-        };
-        if let Some(enum_name) = enum_name
+        if let Some((enum_name, type_args)) = self.enum_type_at(&sl.span)
             && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()
             && let Some((idx, _)) = variants
                 .iter()
                 .enumerate()
                 .find(|(_, (name, _))| *name == sl.name)
         {
+            let ir_args = self.lower_type_args(&type_args);
             return self.emit(
                 Op::EnumAlloc(enum_name.clone(), idx as u32, args),
-                IrType::EnumRef(enum_name),
+                IrType::EnumRef(enum_name, ir_args),
                 span,
             );
         }

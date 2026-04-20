@@ -5,6 +5,34 @@ use phoenix_ir::module::{IrFunction, IrModule};
 use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
 
+/// Shorthand for an unresolved generic-arg slot in a stdlib enum layout,
+/// matching what `phoenix-ir/src/stdlib.rs` emits.
+fn placeholder() -> IrType {
+    IrType::StructRef(phoenix_ir::types::GENERIC_PLACEHOLDER.to_string())
+}
+
+/// Register the standard `Option` + `Result` enum layouts on `module`
+/// using `GENERIC_PLACEHOLDER` payload slots, matching what the real
+/// stdlib emits. Factored so payload-inference error tests can share a
+/// single source of truth — if a layout detail changes (e.g. a new
+/// variant), only this helper moves.
+fn register_stdlib_option_result_layouts(module: &mut IrModule) {
+    module.enum_layouts.insert(
+        "Option".to_string(),
+        vec![
+            ("Some".to_string(), vec![placeholder()]),
+            ("None".to_string(), vec![]),
+        ],
+    );
+    module.enum_layouts.insert(
+        "Result".to_string(),
+        vec![
+            ("Ok".to_string(), vec![placeholder()]),
+            ("Err".to_string(), vec![placeholder()]),
+        ],
+    );
+}
+
 /// A `ClosureAlloc` that captures a value whose type
 /// is not known must produce a compile error, not silently default to I64.
 ///
@@ -119,8 +147,8 @@ fn unsupported_string_method_returns_error() {
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("not yet supported"),
-        "error should mention unsupported method, got: {err_msg}"
+        err_msg.contains("string method 'nonexistent' not yet supported"),
+        "error should name the method and its carrier, got: {err_msg}"
     );
 }
 
@@ -165,8 +193,8 @@ fn unsupported_list_method_returns_error() {
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("not yet supported"),
-        "error should mention unsupported method, got: {err_msg}"
+        err_msg.contains("list method 'nonexistent' not yet supported"),
+        "error should name the method and its carrier, got: {err_msg}"
     );
 }
 
@@ -211,8 +239,8 @@ fn unsupported_map_method_returns_error() {
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("not yet supported"),
-        "error should mention unsupported method, got: {err_msg}"
+        err_msg.contains("map method 'nonexistent' not yet supported"),
+        "error should name the method and its carrier, got: {err_msg}"
     );
 }
 
@@ -236,7 +264,7 @@ fn unsupported_option_method_returns_error() {
     let opt_val = main_fn.emit_value(
         bb0,
         Op::ConstI64(0),
-        IrType::EnumRef("Option".to_string()),
+        IrType::EnumRef("Option".to_string(), Vec::new()),
         None,
     );
     // Call a non-existent option method.
@@ -257,8 +285,8 @@ fn unsupported_option_method_returns_error() {
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("not yet supported"),
-        "error should mention unsupported method, got: {err_msg}"
+        err_msg.contains("option method 'nonexistent' not yet supported"),
+        "error should name the method and its carrier, got: {err_msg}"
     );
 }
 
@@ -282,7 +310,7 @@ fn unsupported_result_method_returns_error() {
     let res_val = main_fn.emit_value(
         bb0,
         Op::ConstI64(0),
-        IrType::EnumRef("Result".to_string()),
+        IrType::EnumRef("Result".to_string(), Vec::new()),
         None,
     );
     // Call a non-existent result method.
@@ -303,8 +331,8 @@ fn unsupported_result_method_returns_error() {
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("not yet supported"),
-        "error should mention unsupported method, got: {err_msg}"
+        err_msg.contains("result method 'nonexistent' not yet supported"),
+        "error should name the method and its carrier, got: {err_msg}"
     );
 }
 
@@ -314,38 +342,7 @@ fn unsupported_result_method_returns_error() {
 #[test]
 fn option_okor_unknown_payload_type_returns_error() {
     let mut module = IrModule::new();
-
-    // Register the Option enum layout with generic placeholders.
-    module.enum_layouts.insert(
-        "Option".to_string(),
-        vec![
-            (
-                "Some".to_string(),
-                vec![IrType::StructRef(
-                    phoenix_ir::types::GENERIC_PLACEHOLDER.to_string(),
-                )],
-            ),
-            ("None".to_string(), vec![]),
-        ],
-    );
-    // Register the Result enum layout.
-    module.enum_layouts.insert(
-        "Result".to_string(),
-        vec![
-            (
-                "Ok".to_string(),
-                vec![IrType::StructRef(
-                    phoenix_ir::types::GENERIC_PLACEHOLDER.to_string(),
-                )],
-            ),
-            (
-                "Err".to_string(),
-                vec![IrType::StructRef(
-                    phoenix_ir::types::GENERIC_PLACEHOLDER.to_string(),
-                )],
-            ),
-        ],
-    );
+    register_stdlib_option_result_layouts(&mut module);
 
     // Build a function that uses an Option value with no EnumAlloc origin.
     // No EnumAlloc in this function → all inference strategies fail.
@@ -360,14 +357,15 @@ fn option_okor_unknown_payload_type_returns_error() {
     );
     let bb0 = main_fn.create_block();
 
-    // Simulate an Option value with no EnumAlloc origin (e.g. a function
-    // parameter or cross-function return).  Using ConstI64 with an EnumRef
-    // type means no EnumAlloc entry exists, so all payload type inference
-    // strategies will fail.
+    // Simulate an Option value with no EnumAlloc origin and no generic args
+    // (e.g. a synthetic IR fragment that bypasses sema's type flow). Using
+    // `EnumRef("Option", vec![])` forces all inference strategies to fail:
+    // Strategy 0 sees empty args, Strategies 2-4 fail for the reasons listed
+    // below.
     let opt_param = main_fn.emit_value(
         bb0,
         Op::ConstI64(0),
-        IrType::EnumRef("Option".to_string()),
+        IrType::EnumRef("Option".to_string(), Vec::new()),
         None,
     );
     // The error argument for okOr.
@@ -375,7 +373,7 @@ fn option_okor_unknown_payload_type_returns_error() {
     // Call Option.okOr — should fail because T cannot be inferred.
     main_fn.block_mut(bb0).instructions.push(Instruction {
         result: Some(ValueId(100)),
-        result_type: IrType::EnumRef("Result".to_string()),
+        result_type: IrType::EnumRef("Result".to_string(), Vec::new()),
         op: Op::BuiltinCall("Option.okOr".to_string(), vec![opt_param, err_val]),
         span: None,
     });
@@ -391,7 +389,137 @@ fn option_okor_unknown_payload_type_returns_error() {
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("could not infer Option payload type"),
-        "error should explain the inference failure, got: {err_msg}"
+        "error should name the unresolved enum, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("'okOr'"),
+        "error should name the offending method, got: {err_msg}"
+    );
+    // Guard against the old silent-miscompile behavior leaking back into
+    // the error path as a misleading hint — the fix is for lowering to
+    // propagate args, not for the user to switch methods.
+    assert!(
+        !err_msg.contains("try"),
+        "error should not suggest a workaround, got: {err_msg}"
+    );
+}
+
+/// `okOr` on an `Option` whose generic arg is the `GENERIC_PLACEHOLDER`
+/// sentinel must still fail — Strategy 0 in `try_type_from_enum_args`
+/// explicitly rejects placeholder args so inference falls through to the
+/// fallback strategies, which in this synthetic setup have nothing to
+/// work with.  Locks in the `is_generic_placeholder` branch.
+#[test]
+fn option_okor_placeholder_arg_returns_error() {
+    let mut module = IrModule::new();
+    register_stdlib_option_result_layouts(&mut module);
+
+    let main_fid = FuncId(0);
+    let mut main_fn = IrFunction::new(
+        main_fid,
+        "main".to_string(),
+        vec![],
+        vec![],
+        IrType::Void,
+        None,
+    );
+    let bb0 = main_fn.create_block();
+
+    // Args contain the GENERIC_PLACEHOLDER sentinel — Strategy 0 must
+    // skip this (same outcome as empty args) rather than returning the
+    // sentinel as the payload type.
+    let opt_param = main_fn.emit_value(
+        bb0,
+        Op::ConstI64(0),
+        IrType::EnumRef("Option".to_string(), vec![placeholder()]),
+        None,
+    );
+    let err_val = main_fn.emit_value(bb0, Op::ConstI64(0), IrType::I64, None);
+    main_fn.block_mut(bb0).instructions.push(Instruction {
+        result: Some(ValueId(100)),
+        result_type: IrType::EnumRef("Result".to_string(), Vec::new()),
+        op: Op::BuiltinCall("Option.okOr".to_string(), vec![opt_param, err_val]),
+        span: None,
+    });
+    main_fn.set_terminator(bb0, Terminator::Return(None));
+    module.functions.push(main_fn);
+    module.function_index.insert("main".to_string(), main_fid);
+
+    let result = phoenix_cranelift::compile(&module);
+    assert!(
+        result.is_err(),
+        "placeholder-arg Option must still error — Strategy 0 should reject the sentinel"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("could not infer Option payload type"),
+        "error should name the unresolved enum, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("'okOr'"),
+        "error should name the offending method, got: {err_msg}"
+    );
+}
+
+/// Result mirror of `option_okor_placeholder_arg_returns_error`:
+/// `try_result_payload_types_from_args` must reject `GENERIC_PLACEHOLDER`
+/// args in the Ok/Err slots rather than returning the sentinel as a real
+/// payload type. With a single-element closure-arg method like
+/// `Result.mapErr`, filtering Err lets Strategy 3 fill Err from the closure
+/// arg, but Ok remains unresolvable and the compile must fail.
+#[test]
+fn result_map_err_placeholder_args_returns_error() {
+    let mut module = IrModule::new();
+    register_stdlib_option_result_layouts(&mut module);
+
+    let main_fid = FuncId(0);
+    let mut main_fn = IrFunction::new(
+        main_fid,
+        "main".to_string(),
+        vec![],
+        vec![],
+        IrType::Void,
+        None,
+    );
+    let bb0 = main_fn.create_block();
+
+    // Both Result args are placeholders — Strategy 0 must reject both.
+    let res_param = main_fn.emit_value(
+        bb0,
+        Op::ConstI64(0),
+        IrType::EnumRef("Result".to_string(), vec![placeholder(), placeholder()]),
+        None,
+    );
+    // Non-closure second arg so Strategy 3 (`try_type_from_closure_arg`)
+    // cannot seed either slot from the method argument.
+    let non_closure = main_fn.emit_value(bb0, Op::ConstI64(0), IrType::I64, None);
+    main_fn.block_mut(bb0).instructions.push(Instruction {
+        result: Some(ValueId(100)),
+        result_type: IrType::EnumRef("Result".to_string(), Vec::new()),
+        op: Op::BuiltinCall("Result.mapErr".to_string(), vec![res_param, non_closure]),
+        span: None,
+    });
+    main_fn.set_terminator(bb0, Terminator::Return(None));
+    module.functions.push(main_fn);
+    module.function_index.insert("main".to_string(), main_fid);
+
+    let result = phoenix_cranelift::compile(&module);
+    assert!(
+        result.is_err(),
+        "placeholder-arg Result must still error — Strategy 0 should reject the sentinels"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    // `mapErr` only needs the Err slot (Ok isn't read by the method), and
+    // the second arg isn't a closure here — so Strategy 3 can't fill Err
+    // from `try_type_from_closure_arg`. The error must name the Err slot
+    // specifically, not just "Result" generically.
+    assert!(
+        err_msg.contains("could not infer Result Err type"),
+        "error should name the specific unresolved slot (Err), got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("'mapErr'"),
+        "error should name the offending method, got: {err_msg}"
     );
 }
 

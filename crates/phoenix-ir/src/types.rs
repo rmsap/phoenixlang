@@ -39,8 +39,40 @@ pub enum IrType {
     /// used for layout lookup.
     StructRef(String),
     /// Heap-allocated enum value (tagged union).  The [`String`] is the enum
-    /// name, used for variant layout lookup.
-    EnumRef(String),
+    /// name, used for variant layout lookup.  The [`Vec<IrType>`] carries the
+    /// concrete generic arguments at the use site (e.g. `EnumRef("Option",
+    /// [I64])` for `Option<Int>`).  Empty for non-generic enums.
+    ///
+    /// Enum *types* are keyed by name + args, but enum *layouts* in
+    /// [`crate::module::IrModule::enum_layouts`] are keyed by name alone —
+    /// the args exist so payload-type inference in the Cranelift backend
+    /// can read them directly instead of relying on fallback strategies.
+    /// See the "Enum layouts are keyed by name" subsection of
+    /// `docs/design-decisions.md#generic-function-monomorphization-strategy`
+    /// for the rationale and the condition under which layouts would need
+    /// to start keying on args too (inline-packed payload specialization).
+    ///
+    /// # Args-vector invariants
+    ///
+    /// - For stdlib `Option`/`Result`, `args` is parallel to the payload
+    ///   slots: `Option<T>` has `args = [T]` (Some's payload); `Result<T,
+    ///   E>` has `args = [T, E]` (Ok and Err payloads). The slot index
+    ///   equals the variant index of the variant that carries that slot's
+    ///   payload. Backend inference helpers rely on this.
+    /// - For user-defined generic enums, `args` matches the enum's
+    ///   declared type-parameter order.
+    /// - An arg slot MAY be the [`GENERIC_PLACEHOLDER`] sentinel when
+    ///   lowering couldn't resolve the concrete type (e.g. an expression
+    ///   whose sema type still contains a `TypeVar` after
+    ///   [`IrType::erase_type_vars`] is applied). Consumers that want the
+    ///   concrete type MUST call [`IrType::is_generic_placeholder`] on
+    ///   the slot before trusting it; a placeholder is a "don't know
+    ///   yet," not a valid type.
+    /// - `args` MAY also be empty when lowering has no type information
+    ///   at all (e.g. the `self` parameter on a user-defined method of a
+    ///   non-generic enum). Consumers must fall back to other inference
+    ///   strategies when `args.get(i)` is `None`.
+    EnumRef(String, Vec<IrType>),
     /// Heap-allocated `List<T>`.
     ListRef(Box<IrType>),
     /// Heap-allocated `Map<K, V>`.
@@ -82,7 +114,7 @@ impl IrType {
             IrType::I64 | IrType::F64 | IrType::Bool | IrType::Void => true,
             IrType::StringRef
             | IrType::StructRef(_)
-            | IrType::EnumRef(_)
+            | IrType::EnumRef(_, _)
             | IrType::ListRef(_)
             | IrType::MapRef(_, _)
             | IrType::ClosureRef { .. } => false,
@@ -136,13 +168,16 @@ impl IrType {
                 param_types: param_types.iter().map(IrType::erase_type_vars).collect(),
                 return_type: Box::new(return_type.erase_type_vars()),
             },
+            IrType::EnumRef(name, args) => IrType::EnumRef(
+                name.clone(),
+                args.iter().map(IrType::erase_type_vars).collect(),
+            ),
             IrType::I64
             | IrType::F64
             | IrType::Bool
             | IrType::Void
             | IrType::StringRef
-            | IrType::StructRef(_)
-            | IrType::EnumRef(_) => self.clone(),
+            | IrType::StructRef(_) => self.clone(),
         }
     }
 }
@@ -156,7 +191,20 @@ impl fmt::Display for IrType {
             IrType::Void => write!(f, "void"),
             IrType::StringRef => write!(f, "string"),
             IrType::StructRef(name) => write!(f, "struct.{name}"),
-            IrType::EnumRef(name) => write!(f, "enum.{name}"),
+            IrType::EnumRef(name, args) => {
+                write!(f, "enum.{name}")?;
+                if !args.is_empty() {
+                    write!(f, "<")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{a}")?;
+                    }
+                    write!(f, ">")?;
+                }
+                Ok(())
+            }
             IrType::ListRef(elem) => write!(f, "list<{elem}>"),
             IrType::MapRef(k, v) => write!(f, "map<{k}, {v}>"),
             IrType::ClosureRef {
@@ -174,5 +222,73 @@ impl fmt::Display for IrType {
             }
             IrType::TypeVar(name) => write!(f, "{name}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_ref_display_with_no_args() {
+        assert_eq!(
+            format!("{}", IrType::EnumRef("Point".into(), Vec::new())),
+            "enum.Point"
+        );
+    }
+
+    #[test]
+    fn enum_ref_display_with_single_arg() {
+        assert_eq!(
+            format!("{}", IrType::EnumRef("Option".into(), vec![IrType::I64])),
+            "enum.Option<i64>"
+        );
+    }
+
+    #[test]
+    fn enum_ref_display_with_multiple_args() {
+        assert_eq!(
+            format!(
+                "{}",
+                IrType::EnumRef("Result".into(), vec![IrType::StringRef, IrType::I64])
+            ),
+            "enum.Result<string, i64>"
+        );
+    }
+
+    #[test]
+    fn erase_type_vars_recurses_into_enum_args() {
+        let ty = IrType::EnumRef("Option".into(), vec![IrType::TypeVar("T".into())]);
+        let erased = ty.erase_type_vars();
+        assert_eq!(
+            erased,
+            IrType::EnumRef(
+                "Option".into(),
+                vec![IrType::StructRef(GENERIC_PLACEHOLDER.to_string())]
+            )
+        );
+    }
+
+    #[test]
+    fn erase_type_vars_recurses_into_nested_enum_args() {
+        let ty = IrType::EnumRef(
+            "Result".into(),
+            vec![
+                IrType::ListRef(Box::new(IrType::TypeVar("T".into()))),
+                IrType::TypeVar("E".into()),
+            ],
+        );
+        let erased = ty.erase_type_vars();
+        let expected_placeholder = IrType::StructRef(GENERIC_PLACEHOLDER.to_string());
+        assert_eq!(
+            erased,
+            IrType::EnumRef(
+                "Result".into(),
+                vec![
+                    IrType::ListRef(Box::new(expected_placeholder.clone())),
+                    expected_placeholder,
+                ]
+            )
+        );
     }
 }

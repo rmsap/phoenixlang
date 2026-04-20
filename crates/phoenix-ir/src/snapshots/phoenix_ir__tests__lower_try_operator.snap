@@ -1,15 +1,16 @@
 ---
 source: crates/phoenix-ir/src/tests.rs
+assertion_line: 703
 expression: ir
 ---
-func @fallible() -> enum.Result {
+func @fallible() -> enum.Result<i64, string> {
   bb0:
     v0 = const_i64 42
     v1 = enum_alloc @Result:0(v0)
     return v1
 }
 
-func @main() -> enum.Result {
+func @main() -> enum.Result<i64, string> {
   bb0:
     v0 = call f0()
     v1 = enum_discriminant v0

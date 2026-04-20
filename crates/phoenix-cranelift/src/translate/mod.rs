@@ -60,10 +60,17 @@ pub(crate) struct FuncState {
     /// Tracks which `ClosureAlloc` produced each `ValueId`, so `CallIndirect`
     /// can look up the target function directly instead of using a heuristic.
     pub closure_func_map: HashMap<ValueId, PhxFuncId>,
-    /// Records the concrete payload field types from `EnumAlloc` instructions.
-    /// Used by `option_payload_type` to infer the `T` in `Option<T>` for
-    /// methods like `okOr` where the result type doesn't directly reveal `T`.
-    pub enum_payload_types: HashMap<ValueId, Vec<IrType>>,
+    /// Records the allocated variant and concrete payload field types from
+    /// `EnumAlloc` instructions. Used by `option_payload_type` /
+    /// `result_payload_types` as a Strategy 4 fallback when Strategy 0 can't
+    /// read the payload type directly from `EnumRef` args.
+    ///
+    /// The variant index is tracked so `Result<T, E>` can distinguish an
+    /// `Ok(t)` allocation (payload type = T) from an `Err(e)` allocation
+    /// (payload type = E) — both record `field_types[0]`, but the meaning
+    /// differs per variant. Option-like enums only allocate the payload-
+    /// bearing variant so this is trivially 0 for them.
+    pub enum_payload_types: HashMap<ValueId, (u32, Vec<IrType>)>,
     /// Mapping from Phoenix `BlockId` to Cranelift block.
     pub block_map: HashMap<PhxBlockId, ir::Block>,
 }
@@ -166,19 +173,32 @@ fn translate_function(
                     state.closure_func_map.insert(vid, *target_fid);
                 }
                 // Record concrete payload types from EnumAlloc for later inference.
-                if let Op::EnumAlloc(_name, _idx, fields) = &inst.op
+                if let Op::EnumAlloc(_name, variant_idx, fields) = &inst.op
                     && !fields.is_empty()
                 {
                     // Use the actual type of each field, falling back to I64
-                    // if the type is not yet known (e.g., for forward
-                    // references).  Using `map` instead of `filter_map`
-                    // preserves the field count so downstream consumers
-                    // get the correct payload arity.
+                    // only if the type is not yet known (forward references
+                    // within a function — rare in practice because IR is
+                    // emitted in depth-first order). This is a Strategy 4
+                    // backstop: Strategy 0 (reading `EnumRef` args) already
+                    // ran and preferred its result via the agreement
+                    // `debug_assert` in `enum_type_inference.rs`, so the
+                    // I64 here only surfaces if *every* earlier strategy
+                    // also failed. If that path ever widens (e.g. new op
+                    // shapes defer type resolution), this fallback is the
+                    // same shape as the `okOr` payload bug — a silent
+                    // corruption of multi-slot payloads — and must be
+                    // replaced with a real lookup or an explicit error.
+                    // Using `map` instead of `filter_map` preserves the
+                    // field count so downstream consumers get the correct
+                    // payload arity.
                     let field_types: Vec<IrType> = fields
                         .iter()
                         .map(|fid| state.type_map.get(fid).cloned().unwrap_or(IrType::I64))
                         .collect();
-                    state.enum_payload_types.insert(vid, field_types);
+                    state
+                        .enum_payload_types
+                        .insert(vid, (*variant_idx, field_types));
                 }
             }
         }

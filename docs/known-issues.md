@@ -22,15 +22,6 @@ When an integer or float literal is out of range, the parser emits a diagnostic 
 
 **Target phase:** None — no fix planned. Acceptable as-is; revisit if it causes real-world confusion, at which point add an `ErrorLiteral` AST variant.
 
-### `Option.okOr()` fails to compile when payload type cannot be inferred
-
-The `okOr` combinator on `Option<T>` values produces a compile error when the Cranelift backend cannot infer the payload type `T`. This happens when the `Option` value comes from a function parameter or cross-function return (where generic type arguments are not propagated through the IR's `EnumRef` type). Previously this silently fell back to `IrType::I64` (1 slot), which corrupted multi-slot types like `String` (pointer + length = 2 slots). The fix surfaces a clear compile error instead of silently miscompiling.
-
-**Workaround:** Use pattern matching instead of `okOr` when the Option comes from a function parameter.
-**Root cause:** `IrType::EnumRef("Option")` does not carry generic type arguments.
-**Tracked in:** Cranelift `option_methods.rs` `option_payload_type` function.
-**Target phase:** Phase 2.2. Likely resolved as a side effect of [generic monomorphization](design-decisions.md#generic-function-monomorphization-strategy) — once `Option<String>` and `Option<Int>` are distinct specialized types, payload inference has concrete types to work with. Verify after monomorphization lands; fix directly if it doesn't absorb the issue.
-
 ### Closure capture type ambiguity with indirect calls
 
 When a closure is passed through a block parameter (phi node), the compiler
@@ -109,6 +100,15 @@ Not actively miscompiling today: Phoenix's `substitute` is a single-pass walk, s
 **File:** `phoenix-sema/src/check_types.rs` — `UnifyError::OccursCheck` variant kept for future use.
 **Planned fix:** Introduce alpha-renaming (fresh-name each template's type parameter binders during inference) so the occurs-check can distinguish "same name, different binder" from "genuine cycle", then re-enable the check.
 **Target phase:** Phase 3 or deferred until it causes a real diagnostic complaint.
+
+### Methods on generic enums are gated off; payload-inference fallbacks kept alive as a consequence
+
+User-defined `impl<T> MyEnum<T> { ... }` is rejected by a `debug_assert!` in `phoenix-ir/src/lower_decl.rs:170` because `register_method` emits `IrType::EnumRef(type_name, Vec::new())` for the `self` parameter — empty args, not the enum's declared type parameters. Landing this feature requires threading the enum's `info.type_params` into the `self` `EnumRef` args and teaching monomorphization to specialize methods on generic enums (already handles generic functions + methods on non-generic user types).
+
+As a side effect, the Cranelift backend's payload-inference fallback chain in `phoenix-cranelift/src/translate/enum_type_inference.rs` (Strategies 1 / 1b / 2 / 3 / 4) stays load-bearing: today the `self` `EnumRef` on an enum method has empty args, so Strategy 0 (`try_type_from_enum_args`) returns `None` and the fallbacks pick up the slack. Once this gate lifts and args are threaded through, every `EnumRef` reaching the backend carries concrete args, Strategy 0 becomes total, and Strategies 1–4 + their tests collapse into a single pass. See the in-file FIXME (lines 46–53).
+
+**File:** `phoenix-ir/src/lower_decl.rs` (gate + fix site); `phoenix-cranelift/src/translate/enum_type_inference.rs` (dead code after the gate lifts).
+**Target phase:** Phase 4 (Stdlib) by default — when user-facing generic containers with methods ship, this is the natural moment. **Earlier if demand-triggered:** the `debug_assert!` at `lower_decl.rs:170` is the tripwire; whoever first writes `impl<T> MyEnum<T>` hits it and picks up the feature + the strategy collapse in one motion.
 
 ### Generic-template stubs tracked by a `bool` flag
 

@@ -175,13 +175,29 @@ User-defined generic functions currently lower to a `GENERIC_PLACEHOLDER` sentin
 |---|---|
 | `Int` / `Float` / `Bool` / `Void` / `String` | `i64` / `f64` / `bool` / `void` / `str` |
 | `StructRef(name)` | `s_{name}` |
-| `EnumRef(name)` | `e_{name}` |
+| `EnumRef(name, args)` | `e_{name}` (empty args) or `e_{name}__{mangle(arg1)}__…__{mangle(argN)}_E` |
 | `List<T>` | `L_{mangle(T)}_E` |
 | `Map<K, V>` | `M_{mangle(K)}_{mangle(V)}_E` |
 | `(P1, …, Pn) -> R` | `C{n}_{mangle(P1)}_…_{mangle(Pn)}_{mangle(R)}_E` |
 
 The `__` segment separator cannot appear in a Phoenix identifier, so specialized names are collision-free with user-defined function names. The Cranelift context prepends `phx_` to the final mangled name and replaces `.` with `__` for method symbols (e.g. `TypeName__method`). No further symbol sanitization is required.
+
+**`EnumRef`'s name/arg delimiter.** `EnumRef` is the only variadic-arg type constructor without an arity prefix, so its mangling needs a delimiter that cannot appear inside a name or arg encoding:
+
+- A single-`_` separator would collide: `EnumRef("Opt", [StructRef("foo_i64")])` and `EnumRef("Opt", [StructRef("foo"), I64])` would both mangle to `e_Opt_s_foo_i64_E`.
+- Phoenix identifiers forbid `__`, so `__` splits cleanly between name and first arg and between adjacent args.
+- `Closure` dodges the problem differently — it starts with an arity prefix (`C3_…`) — but `EnumRef` reuses the identifier invariant the outer mangler already relies on.
+
 **Rationale:** Phoenix is positioned as a compiled language with native performance, and the stdlib generics are already hand-monomorphized in the Cranelift backend. Any other strategy creates a two-tier world where stdlib is fast and user generics are slow. Monomorphization also stacks cleanly with a future vtable ABI for `dyn Trait`. The compile-time fan-out cost is real but mitigable (shared specialization where layouts match, incremental caching of instantiations) and only bites meaningfully once the stdlib grows in Phase 4.
+
+**Enum layouts are keyed by name, enum *types* by name + args.** `IrType::EnumRef(name, args)` carries generic args so backend payload-type inference can read them directly, but `IrModule.enum_layouts` (and the `e_{name}` prefix of mangled symbols) keys on the bare name. This works today because payloads are uniformly heap-boxed and one-slot, so every `Option<T>` shares a layout. If a future specialization ever packs payloads inline (e.g. `Option<Int>` unboxed vs `Option<String>` boxed), layouts must also key on name + args, and the mangle grammar's `_E` terminator on the args segment is already unambiguous for that.
+
+**`EnumRef` carries args but `StructRef` drops them.** The two reference types are asymmetric by design:
+
+- **Struct fields are reified at monomorphization time.** When a generic struct `Pair<A, B>` is used as `Pair<Int, String>`, the mono pass substitutes each field's `TypeVar` before `struct_layouts` is finalized. The backend reads field types from the layout, never from the use-site args, so `StructRef` does not need to carry them.
+- **Enum layouts are shared across type arguments.** Stdlib `Option`/`Result` encode their payload fields as the `GENERIC_PLACEHOLDER` sentinel in `enum_layouts` (one layout, any `T`). The concrete payload type is resolved per use site by Cranelift inference strategies — Strategy 0 reads `EnumRef.args[i]` directly — so `EnumRef` must carry the args forward through lowering.
+
+If the "layouts keyed by name" decision above is ever reversed (inline-packed payloads), this asymmetry shrinks: enum layouts would also be reified, and the args on `EnumRef` would exist purely as a key into `enum_layouts`, mirroring how `StructRef` would then work.
 
 **Alternatives considered:**
 - **Uniform boxed representation (Go / Java-erasure style)** — one compiled copy, values passed as type-tagged pointers. Rejected: contradicts the native-performance positioning, forces the hand-monomorphized stdlib to either be rewritten boxed or live in a different world than user generics, and overlaps awkwardly with the planned `dyn Trait` vtable ABI.
