@@ -18,7 +18,10 @@ mod enum_helpers;
 mod enum_type_inference;
 mod helpers;
 mod ir_analysis;
-mod layout;
+// `layout` is `pub(crate)` so `abi.rs` can name `TypeLayout` when building
+// function signatures. No other crate-level consumers — within `translate`,
+// submodules reach it via `super::layout`.
+pub(crate) mod layout;
 mod list_methods;
 mod list_methods_closure;
 mod list_methods_complex;
@@ -36,7 +39,7 @@ use cranelift_module::Module;
 
 use crate::context::CompileContext;
 use crate::error::CompileError;
-use crate::types::ir_type_to_cl;
+use crate::translate::layout::TypeLayout;
 use phoenix_ir::block::BlockId as PhxBlockId;
 use phoenix_ir::instruction::{FuncId as PhxFuncId, Op, VOID_SENTINEL, ValueId};
 use phoenix_ir::module::{IrFunction, IrModule};
@@ -116,10 +119,9 @@ fn translate_function(
         let cl_block = state.block_map[&block.id];
         for (vid, ir_ty) in &block.params {
             state.type_map.insert(*vid, ir_ty.clone());
-            let cl_types = ir_type_to_cl(ir_ty);
             let mut vals = Vec::new();
-            for cl_ty in &cl_types {
-                let val = builder.append_block_param(cl_block, *cl_ty);
+            for &cl_ty in TypeLayout::of(ir_ty).cl_types() {
+                let val = builder.append_block_param(cl_block, cl_ty);
                 vals.push(val);
             }
             state.value_map.insert(*vid, vals);

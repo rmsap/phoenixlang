@@ -16,8 +16,8 @@ use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
 use super::closure_call::{call_closure_ptr, closure_return_elem_type};
-use super::helpers::{call_runtime, slots_for_type};
-use super::layout::{LIST_HEADER, elem_size_bytes};
+use super::helpers::call_runtime;
+use super::layout::{LIST_HEADER, TypeLayout, elem_size_bytes};
 use super::list_methods::{load_list_element, store_list_element, store_to_temp};
 use super::{FuncState, get_val1};
 
@@ -266,13 +266,14 @@ pub(super) fn translate_list_sortby(
         .icmp_imm(IntCC::SignedGreaterThan, cmp_result[0], 0);
     let swap_block = builder.create_block();
     let no_swap_block = builder.create_block();
-    let elem_cl_types = crate::types::ir_type_to_cl(elem_ty);
-    let elem_slots = slots_for_type(elem_ty);
-    for cl_ty in &elem_cl_types {
-        builder.append_block_param(swap_block, *cl_ty); // elem_a
+    let elem_layout = TypeLayout::of(elem_ty);
+    let elem_cl_types = elem_layout.cl_types();
+    let elem_slots = elem_layout.slots();
+    for &cl_ty in elem_cl_types {
+        builder.append_block_param(swap_block, cl_ty); // elem_a
     }
-    for cl_ty in &elem_cl_types {
-        builder.append_block_param(swap_block, *cl_ty); // elem_b
+    for &cl_ty in elem_cl_types {
+        builder.append_block_param(swap_block, cl_ty); // elem_b
     }
     let mut swap_args: Vec<Value> = elem_a.clone();
     swap_args.extend(&elem_b);

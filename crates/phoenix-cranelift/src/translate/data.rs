@@ -11,7 +11,8 @@ use phoenix_ir::instruction::Op;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::{emit_str_cmp, load_fat_value, slots_for_type, store_fat_value};
+use super::helpers::emit_str_cmp;
+use super::layout::{SLOT_SIZE, TypeLayout};
 use super::{FuncState, get_val, get_val1};
 
 /// Translate a string operation (concat, comparison).
@@ -58,8 +59,11 @@ pub(super) fn translate_struct(
                 .struct_layouts
                 .get(name.as_str())
                 .ok_or_else(|| CompileError::new(format!("unknown struct: {name}")))?;
-            let total_slots: usize = layout.iter().map(|(_, ty)| slots_for_type(ty)).sum();
-            let size = (total_slots * super::layout::SLOT_SIZE) as i64;
+            let total_slots: usize = layout
+                .iter()
+                .map(|(_, ty)| TypeLayout::of(ty).slots())
+                .sum();
+            let size = (total_slots * SLOT_SIZE) as i64;
             let alloc_ref = ctx
                 .module
                 .declare_func_in_func(ctx.runtime.alloc, builder.func);
@@ -70,8 +74,9 @@ pub(super) fn translate_struct(
             for (i, fid) in fields.iter().enumerate() {
                 let field_vals = get_val(state, *fid)?;
                 let field_ty = &layout[i].1;
-                store_fat_value(builder, &field_vals, field_ty, ptr, slot);
-                slot += slots_for_type(field_ty);
+                let field_layout = TypeLayout::of(field_ty);
+                field_layout.store(builder, ptr, slot, &field_vals);
+                slot += field_layout.slots();
             }
             Ok(vec![ptr])
         }
@@ -92,9 +97,9 @@ pub(super) fn translate_struct(
             let slot = layout
                 .iter()
                 .take(*idx as usize)
-                .map(|(_, ty)| slots_for_type(ty))
+                .map(|(_, ty)| TypeLayout::of(ty).slots())
                 .sum::<usize>();
-            load_fat_value(builder, result_type, ptr, slot)
+            Ok(TypeLayout::of(result_type).load(builder, ptr, slot))
         }
         Op::StructSetField(obj, idx, val) => {
             let ptr = get_val1(state, *obj)?;
@@ -113,11 +118,11 @@ pub(super) fn translate_struct(
             let slot = layout
                 .iter()
                 .take(*idx as usize)
-                .map(|(_, ty)| slots_for_type(ty))
+                .map(|(_, ty)| TypeLayout::of(ty).slots())
                 .sum::<usize>();
             let field_ty = &layout[*idx as usize].1;
             let field_vals = get_val(state, *val)?;
-            store_fat_value(builder, &field_vals, field_ty, ptr, slot);
+            TypeLayout::of(field_ty).store(builder, ptr, slot, &field_vals);
             Ok(vec![])
         }
         _ => unreachable!(),
@@ -141,7 +146,7 @@ pub(super) fn translate_enum(
                 .ok_or_else(|| CompileError::new(format!("unknown enum: {name}")))?;
             let mut max_payload_slots: usize = layout
                 .iter()
-                .map(|(_, fs)| fs.iter().map(slots_for_type).sum::<usize>())
+                .map(|(_, fs)| fs.iter().map(|t| TypeLayout::of(t).slots()).sum::<usize>())
                 .max()
                 .unwrap_or(0);
             // Also account for the actual field types of this variant,
@@ -150,16 +155,20 @@ pub(super) fn translate_enum(
                 .iter()
                 .map(|fid| {
                     // Default to 2 slots when the type is unknown — this is
-                    // the max for any current type (StringRef).  Under-sizing
-                    // would cause a buffer overrun when store_fat_value writes
-                    // the second slot.
-                    state.type_map.get(fid).map(slots_for_type).unwrap_or(2)
+                    // the max for any current type (StringRef). Under-sizing
+                    // would cause a buffer overrun when TypeLayout::store
+                    // writes the second slot.
+                    state
+                        .type_map
+                        .get(fid)
+                        .map(|t| TypeLayout::of(t).slots())
+                        .unwrap_or(2)
                 })
                 .sum();
             if actual_slots > max_payload_slots {
                 max_payload_slots = actual_slots;
             }
-            let size = ((1 + max_payload_slots) * super::layout::SLOT_SIZE) as i64;
+            let size = ((1 + max_payload_slots) * SLOT_SIZE) as i64;
             let alloc_ref = ctx
                 .module
                 .declare_func_in_func(ctx.runtime.alloc, builder.func);
@@ -176,8 +185,9 @@ pub(super) fn translate_enum(
                 // (possibly generic) layout type, so fat values like strings
                 // are stored with the correct number of slots.
                 let field_ty = state.type_map.get(fid).unwrap_or(&variant_types[i]);
-                store_fat_value(builder, &field_vals, field_ty, ptr, slot);
-                slot += slots_for_type(field_ty);
+                let field_layout = TypeLayout::of(field_ty);
+                field_layout.store(builder, ptr, slot, &field_vals);
+                slot += field_layout.slots();
             }
             Ok(vec![ptr])
         }
@@ -204,9 +214,9 @@ pub(super) fn translate_enum(
             let slot = 1 + variant_fields
                 .iter()
                 .take(*field_idx as usize)
-                .map(slots_for_type)
+                .map(|t| TypeLayout::of(t).slots())
                 .sum::<usize>();
-            load_fat_value(builder, result_type, ptr, slot)
+            Ok(TypeLayout::of(result_type).load(builder, ptr, slot))
         }
         _ => unreachable!(),
     }

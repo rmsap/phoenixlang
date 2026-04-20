@@ -24,7 +24,7 @@ use super::enum_helpers::{build_result_err, build_result_ok, load_disc_and_branc
 use super::enum_type_inference::{
     try_type_from_closure_arg, try_type_from_layout, try_type_from_result, try_type_from_value_arg,
 };
-use super::helpers::load_fat_value;
+use super::layout::TypeLayout;
 use super::{FuncState, get_val, get_val1};
 
 /// Translate a `Result.*` builtin method call.
@@ -97,7 +97,7 @@ pub(super) fn translate_result_method(
             builder.ins().jump(br.merge_block, &[recv_ptr]);
 
             enter_block(builder, br.negative_block);
-            let payload = load_fat_value(builder, &err_ty, recv_ptr, 1)?;
+            let payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
             let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
             let mapped_ty = closure_return_type(state, closure_vid)?;
             let new_err = build_result_err(builder, ctx, &result, &mapped_ty, ir_module)?;
@@ -132,7 +132,7 @@ pub(super) fn translate_result_method(
             builder.ins().jump(br.merge_block, &[recv_ptr]);
 
             enter_block(builder, br.negative_block);
-            let payload = load_fat_value(builder, &err_ty, recv_ptr, 1)?;
+            let payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
             let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
             builder.ins().jump(br.merge_block, &[result[0]]);
 
@@ -140,15 +140,15 @@ pub(super) fn translate_result_method(
         }
         "unwrapOrElse" => {
             let closure_vid = args[1];
-            let cl_types = crate::types::ir_type_to_cl(&ok_ty);
-            let br = load_disc_and_branch(builder, recv_ptr, ir_module, "Result", "Ok", &cl_types)?;
+            let cl_types = TypeLayout::of(&ok_ty).cl_types();
+            let br = load_disc_and_branch(builder, recv_ptr, ir_module, "Result", "Ok", cl_types)?;
 
             enter_block(builder, br.positive_block);
-            let payload = load_fat_value(builder, &ok_ty, recv_ptr, 1)?;
+            let payload = TypeLayout::of(&ok_ty).load(builder, recv_ptr, 1);
             builder.ins().jump(br.merge_block, &payload);
 
             enter_block(builder, br.negative_block);
-            let err_payload = load_fat_value(builder, &err_ty, recv_ptr, 1)?;
+            let err_payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
             let result = call_closure(builder, ctx, ir_module, closure_vid, &err_payload, state)?;
             builder.ins().jump(br.merge_block, &result);
 

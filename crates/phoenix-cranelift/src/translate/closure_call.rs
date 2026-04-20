@@ -14,8 +14,8 @@ use phoenix_ir::instruction::ValueId;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::{load_fat_value, slots_for_type};
 use super::ir_analysis::{find_capture_types_by_func_id, find_closure_capture_types};
+use super::layout::TypeLayout;
 use super::{FuncState, get_val1};
 
 /// Call a closure given its ValueId and user arguments.
@@ -79,9 +79,9 @@ pub(super) fn call_closure_ptr(
     let mut cl_args = Vec::new();
     let mut slot = 1usize;
     for cap_ty in &capture_param_types {
-        let vals = load_fat_value(builder, cap_ty, closure_ptr, slot)?;
-        cl_args.extend(vals);
-        slot += slots_for_type(cap_ty);
+        let cap_layout = TypeLayout::of(cap_ty);
+        cl_args.extend(cap_layout.load(builder, closure_ptr, slot));
+        slot += cap_layout.slots();
     }
 
     // Append user args.

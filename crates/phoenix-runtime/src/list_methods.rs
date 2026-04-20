@@ -22,10 +22,11 @@ pub(crate) const HEADER_SIZE: usize = 24;
 /// [`elements_equal`].  Currently 16 (pointer + length, two 8-byte slots).
 ///
 /// **Invariant:** The Cranelift codegen must ensure that no non-string type
-/// produces elements of this size.  The `slots_for_type` function in
-/// `helpers.rs` explicitly lists all IR types so that adding a new 2-slot
-/// type triggers a compile error.  If a new 2-slot non-string type is added,
-/// both `elements_equal` and `slots_for_type` must be updated.
+/// produces elements of this size.  `TypeLayout::of` in
+/// `phoenix-cranelift/src/translate/layout/type_layout.rs` matches every IR
+/// type explicitly, so that adding a new 2-slot type triggers a compile
+/// error.  If a new 2-slot non-string type is added, both `elements_equal`
+/// and `TypeLayout::of` must be updated.
 pub(crate) const STRING_FAT_POINTER_SIZE: usize = 16;
 
 /// Read the length and elem_size from a list header.
@@ -54,10 +55,11 @@ unsafe fn list_header(list: *const u8) -> (usize, usize) {
 ///
 /// - Both `a` and `b` must point to `size` valid bytes.
 /// - The caller must guarantee that 16-byte elements are string fat pointers.
-///   The Cranelift codegen enforces this via `slots_for_type` in `helpers.rs`,
-///   which explicitly lists every `IrType` variant so that adding a new 2-slot
-///   non-string type triggers a compile error.  If a new 2-slot type is added,
-///   a `kind` tag must be added to this function's signature.
+///   The Cranelift codegen enforces this via `TypeLayout::of` in
+///   `phoenix-cranelift/src/translate/layout/type_layout.rs`, which matches
+///   every `IrType` variant explicitly so that adding a new 2-slot non-string
+///   type triggers a compile error.  If a new 2-slot type is added, a `kind`
+///   tag must be added to this function's signature.
 pub(crate) unsafe fn elements_equal(
     a: *const u8,
     b: *const u8,

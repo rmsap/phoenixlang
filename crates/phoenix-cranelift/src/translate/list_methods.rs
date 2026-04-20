@@ -7,7 +7,7 @@
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl;
-use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{self, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::context::CompileContext;
@@ -18,8 +18,8 @@ use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
 use super::enum_helpers::{build_option_none, build_option_some};
-use super::helpers::{call_runtime, load_fat_value, slots_for_type, store_fat_value};
-use super::layout::{LIST_HEADER, elem_size_bytes};
+use super::helpers::call_runtime;
+use super::layout::{LIST_HEADER, SLOT_SIZE, TypeLayout, elem_size_bytes};
 use super::{FuncState, get_val, get_val1};
 use phoenix_ir::instruction::Op;
 
@@ -46,27 +46,14 @@ fn list_elem_type(state: &FuncState, recv_id: ValueId) -> Result<IrType, Compile
 /// collapses stack slots with non-overlapping live ranges during regalloc,
 /// so the actual stack usage should not grow unboundedly.
 pub(super) fn store_to_temp(builder: &mut FunctionBuilder, vals: &[Value], ty: &IrType) -> Value {
-    let slots = slots_for_type(ty);
+    let layout = TypeLayout::of(ty);
     let ss = builder.create_sized_stack_slot(ir::StackSlotData::new(
         ir::StackSlotKind::ExplicitSlot,
-        (slots * super::layout::SLOT_SIZE) as u32,
+        layout.size_bytes() as u32,
         0,
     ));
     let addr = builder.ins().stack_addr(POINTER_TYPE, ss, 0);
-    match ty {
-        IrType::StringRef => {
-            builder.ins().store(MemFlags::new(), vals[0], addr, 0);
-            builder.ins().store(
-                MemFlags::new(),
-                vals[1],
-                addr,
-                super::layout::SLOT_SIZE as i32,
-            );
-        }
-        _ => {
-            builder.ins().store(MemFlags::new(), vals[0], addr, 0);
-        }
-    }
+    layout.store(builder, addr, 0, vals);
     addr
 }
 
@@ -86,7 +73,7 @@ pub(super) fn load_list_element(
     let es_val = builder.ins().iconst(cl::I64, es);
     let offset = builder.ins().imul(index, es_val);
     let elem_addr = builder.ins().iadd(base, offset);
-    load_fat_value(builder, elem_ty, elem_addr, 0)
+    Ok(TypeLayout::of(elem_ty).load(builder, elem_addr, 0))
 }
 
 /// Store a value into the list data region at a dynamic byte offset from base.
@@ -98,20 +85,7 @@ pub(super) fn store_list_element(
     elem_ty: &IrType,
 ) {
     let addr = builder.ins().iadd(base, byte_offset);
-    match elem_ty {
-        IrType::StringRef => {
-            builder.ins().store(MemFlags::new(), vals[0], addr, 0);
-            builder.ins().store(
-                MemFlags::new(),
-                vals[1],
-                addr,
-                super::layout::SLOT_SIZE as i32,
-            );
-        }
-        _ => {
-            builder.ins().store(MemFlags::new(), vals[0], addr, 0);
-        }
-    }
+    TypeLayout::of(elem_ty).store(builder, addr, 0, vals);
 }
 
 /// Translate a `List.*` builtin method call.
@@ -138,7 +112,7 @@ pub(super) fn translate_list_method(
         "get" => {
             let index = get_val1(state, args[1])?;
             let elem_ptr = call_runtime(builder, ctx, ctx.runtime.list_get_raw, &[list_ptr, index]);
-            load_fat_value(builder, &elem_ty, elem_ptr[0], 0)
+            Ok(TypeLayout::of(&elem_ty).load(builder, elem_ptr[0], 0))
         }
         "push" => {
             let elem_vals = get_val(state, args[1])?;
@@ -297,10 +271,11 @@ pub(super) fn translate_list_alloc(
     let ptr = list_ptr[0];
 
     // Store each element into the data region.
+    let elem_layout = TypeLayout::of(elem_ty);
     for (i, vid) in elements.iter().enumerate() {
         let vals = get_val(state, *vid)?;
-        let slot = LIST_HEADER as usize / super::layout::SLOT_SIZE + i * slots_for_type(elem_ty);
-        store_fat_value(builder, &vals, elem_ty, ptr, slot);
+        let slot = LIST_HEADER as usize / SLOT_SIZE + i * elem_layout.slots();
+        elem_layout.store(builder, ptr, slot, &vals);
     }
 
     Ok(vec![ptr])

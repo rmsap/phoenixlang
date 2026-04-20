@@ -23,8 +23,8 @@ use phoenix_ir::types::IrType;
 
 use super::closure_call::{call_closure_ptr, closure_return_type};
 use super::enum_helpers::{build_option_none, build_option_some};
-use super::helpers::{call_runtime, slots_for_type};
-use super::layout::{LIST_HEADER, elem_size_bytes};
+use super::helpers::call_runtime;
+use super::layout::{LIST_HEADER, TypeLayout, elem_size_bytes};
 use super::list_methods::{load_list_element, store_list_element};
 use super::{FuncState, get_val, get_val1};
 
@@ -174,8 +174,9 @@ pub(super) fn translate_list_filter(
     let exit_block = builder.create_block();
 
     // Block params: i, output_count, plus element values to pass through.
-    let elem_slots = slots_for_type(elem_ty);
-    let elem_cl_types = crate::types::ir_type_to_cl(elem_ty);
+    let elem_layout = TypeLayout::of(elem_ty);
+    let elem_slots = elem_layout.slots();
+    let elem_cl_types = elem_layout.cl_types();
 
     builder.append_block_param(header_block, cl::I64); // i
     builder.append_block_param(header_block, cl::I64); // output_count
@@ -209,8 +210,8 @@ pub(super) fn translate_list_filter(
     let is_true = builder.ins().icmp_imm(IntCC::NotEqual, pred[0], 0);
 
     // Set up store_block to receive element values via block params.
-    for cl_ty in &elem_cl_types {
-        builder.append_block_param(store_block, *cl_ty);
+    for &cl_ty in elem_cl_types {
+        builder.append_block_param(store_block, cl_ty);
     }
     builder.append_block_param(store_block, cl::I64); // out_count
 
@@ -441,11 +442,11 @@ pub(super) fn translate_list_reduce(
     let exit_block = builder.create_block();
 
     builder.append_block_param(header_block, cl::I64); // i
-    let acc_slots = slots_for_type(&acc_ty);
-    let acc_cl_types = crate::types::ir_type_to_cl(&acc_ty);
-    for cl_ty in &acc_cl_types {
-        builder.append_block_param(header_block, *cl_ty);
-        builder.append_block_param(exit_block, *cl_ty);
+    let acc_layout = TypeLayout::of(&acc_ty);
+    let acc_slots = acc_layout.slots();
+    for &cl_ty in acc_layout.cl_types() {
+        builder.append_block_param(header_block, cl_ty);
+        builder.append_block_param(exit_block, cl_ty);
     }
 
     let zero = builder.ins().iconst(cl::I64, 0);

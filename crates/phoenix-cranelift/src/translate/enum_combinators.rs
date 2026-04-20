@@ -17,7 +17,8 @@ use phoenix_ir::types::IrType;
 use super::FuncState;
 use super::closure_call::{call_closure, closure_return_type};
 use super::enum_helpers::{EnumBranch, load_disc_and_branch};
-use super::helpers::{emit_panic_with_message, load_fat_value};
+use super::helpers::emit_panic_with_message;
+use super::layout::TypeLayout;
 
 /// Function pointer type for wrapping closure results into an enum variant.
 ///
@@ -131,7 +132,7 @@ pub(super) fn translate_enum_unwrap(
     builder.ins().jump(br.merge_block, &[]);
     builder.seal_block(br.merge_block);
     builder.switch_to_block(br.merge_block);
-    load_fat_value(builder, payload_ty, recv_ptr, 1)
+    Ok(TypeLayout::of(payload_ty).load(builder, recv_ptr, 1))
 }
 
 /// Translate `unwrapOr` on `Option` or `Result`: load payload or use default.
@@ -146,19 +147,19 @@ pub(super) fn translate_enum_unwrap_or(
     default_vals: &[Value],
     payload_ty: &IrType,
 ) -> Result<Vec<Value>, CompileError> {
-    let cl_types = crate::types::ir_type_to_cl(payload_ty);
+    let cl_types = TypeLayout::of(payload_ty).cl_types();
     let br = load_disc_and_branch(
         builder,
         recv_ptr,
         ir_module,
         enum_name,
         positive_variant,
-        &cl_types,
+        cl_types,
     )?;
 
     builder.seal_block(br.positive_block);
     builder.switch_to_block(br.positive_block);
-    let payload = load_fat_value(builder, payload_ty, recv_ptr, 1)?;
+    let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
     builder.ins().jump(br.merge_block, &payload);
 
     builder.seal_block(br.negative_block);
@@ -218,7 +219,7 @@ pub(super) fn translate_enum_map(
     )?;
 
     enter_block(builder, br.positive_block);
-    let payload = load_fat_value(builder, payload_ty, recv_ptr, 1)?;
+    let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
     let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
     let result_ty = closure_return_type(state, closure_vid)?;
     let wrapped = wrap_fn(builder, ctx, &result, &result_ty, ir_module)?;
@@ -257,7 +258,7 @@ pub(super) fn translate_enum_and_then(
     )?;
 
     enter_block(builder, br.positive_block);
-    let payload = load_fat_value(builder, payload_ty, recv_ptr, 1)?;
+    let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
     let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
     if result.is_empty() {
         return Err(CompileError::new(
@@ -288,18 +289,18 @@ pub(super) fn translate_enum_unwrap_or_else(
     closure_args: &[Value],
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
-    let cl_types = crate::types::ir_type_to_cl(payload_ty);
+    let cl_types = TypeLayout::of(payload_ty).cl_types();
     let br = load_disc_and_branch(
         builder,
         recv_ptr,
         ir_module,
         enum_name,
         positive_variant,
-        &cl_types,
+        cl_types,
     )?;
 
     enter_block(builder, br.positive_block);
-    let payload = load_fat_value(builder, payload_ty, recv_ptr, 1)?;
+    let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
     builder.ins().jump(br.merge_block, &payload);
 
     enter_block(builder, br.negative_block);

@@ -1,127 +1,23 @@
 //! Shared helper functions for Cranelift IR translation.
 //!
-//! Provides fat-value memory operations, division-by-zero checks,
-//! runtime function calls, and string comparison emission.
+//! Provides division-by-zero checks, runtime function calls, string
+//! comparison emission, and panic emission.
+//!
+//! Memory load/store and slot sizing for Phoenix values live on
+//! [`super::layout::TypeLayout`].
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl;
-use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{self, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
 use crate::context::CompileContext;
 use crate::error::CompileError;
-use crate::types::{POINTER_TYPE, ir_type_to_cl_single};
+use crate::types::POINTER_TYPE;
 use phoenix_ir::instruction::ValueId;
-use phoenix_ir::types::IrType;
 
 use super::FuncState;
-
-/// Number of 8-byte slots a value of the given IR type occupies.
-///
-/// `StringRef` is a fat pointer (ptr + len) and takes 2 slots.
-/// All other types occupy 1 slot.
-///
-/// # Important
-///
-/// The runtime's `phx_list_contains` and `phx_map_*` functions use
-/// `elem_size == STRING_FAT_POINTER_SIZE` (16) as a heuristic for "this is
-/// a string fat pointer" and compare by content rather than by raw bytes.
-/// If a future IR type also requires 2 slots, both this function and the
-/// runtime's `elements_equal` / `STRING_FAT_POINTER_SIZE` must be updated.
-pub(crate) fn slots_for_type(ty: &IrType) -> usize {
-    match ty {
-        IrType::StringRef => 2,
-        // All known single-slot types are listed explicitly so that adding
-        // a new IrType variant forces a compiler error here, preventing
-        // silent miscompilation if the new type needs 2+ slots.
-        IrType::I64
-        | IrType::F64
-        | IrType::Bool
-        | IrType::Void
-        | IrType::StructRef(_)
-        | IrType::EnumRef(_)
-        | IrType::ListRef(_)
-        | IrType::MapRef(_, _)
-        | IrType::ClosureRef { .. } => 1,
-    }
-}
-
-/// Store a (possibly fat) value into heap memory at the given slot offset.
-///
-/// For `StringRef`, stores both the pointer and length at consecutive slots.
-/// For all other types, stores a single value.
-pub(crate) fn store_fat_value(
-    builder: &mut FunctionBuilder,
-    vals: &[Value],
-    ty: &IrType,
-    base_ptr: Value,
-    slot: usize,
-) {
-    match ty {
-        IrType::StringRef => {
-            builder.ins().store(
-                MemFlags::new(),
-                vals[0],
-                base_ptr,
-                (slot * super::layout::SLOT_SIZE) as i32,
-            );
-            builder.ins().store(
-                MemFlags::new(),
-                vals[1],
-                base_ptr,
-                ((slot + 1) * super::layout::SLOT_SIZE) as i32,
-            );
-        }
-        _ => {
-            builder.ins().store(
-                MemFlags::new(),
-                vals[0],
-                base_ptr,
-                (slot * super::layout::SLOT_SIZE) as i32,
-            );
-        }
-    }
-}
-
-/// Load a (possibly fat) value from heap memory at the given slot offset.
-///
-/// For `StringRef`, loads both the pointer and length from consecutive slots.
-/// For all other types, loads a single value.
-pub(crate) fn load_fat_value(
-    builder: &mut FunctionBuilder,
-    ty: &IrType,
-    base_ptr: Value,
-    slot: usize,
-) -> Result<Vec<Value>, CompileError> {
-    match ty {
-        IrType::StringRef => {
-            let ptr_val = builder.ins().load(
-                POINTER_TYPE,
-                MemFlags::new(),
-                base_ptr,
-                (slot * super::layout::SLOT_SIZE) as i32,
-            );
-            let len_val = builder.ins().load(
-                cl::I64,
-                MemFlags::new(),
-                base_ptr,
-                ((slot + 1) * super::layout::SLOT_SIZE) as i32,
-            );
-            Ok(vec![ptr_val, len_val])
-        }
-        _ => {
-            let cl_ty = ir_type_to_cl_single(ty)?;
-            let val = builder.ins().load(
-                cl_ty,
-                MemFlags::new(),
-                base_ptr,
-                (slot * super::layout::SLOT_SIZE) as i32,
-            );
-            Ok(vec![val])
-        }
-    }
-}
 
 /// Emit a call to a runtime function, returning the Cranelift results.
 pub(crate) fn call_runtime(

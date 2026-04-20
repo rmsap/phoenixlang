@@ -28,7 +28,7 @@ use super::enum_type_inference::{
     try_type_from_closure_arg, try_type_from_enum_alloc, try_type_from_layout,
     try_type_from_result, try_type_from_value_arg,
 };
-use super::helpers::load_fat_value;
+use super::layout::TypeLayout;
 use super::{FuncState, get_val, get_val1};
 
 /// Translate an `Option.*` builtin method call.
@@ -133,7 +133,7 @@ pub(super) fn translate_option_method(
             )?;
 
             enter_block(builder, br.positive_block);
-            let payload = load_fat_value(builder, &payload_ty, recv_ptr, 1)?;
+            let payload = TypeLayout::of(&payload_ty).load(builder, recv_ptr, 1);
             let pred = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
             let pred_true = builder.ins().icmp_imm(IntCC::NotEqual, pred[0], 0);
 
@@ -203,7 +203,7 @@ fn translate_option_ok_or(
     )?;
 
     enter_block(builder, br.positive_block);
-    let payload = load_fat_value(builder, payload_ty, recv_ptr, 1)?;
+    let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
     let ok_ptr = build_result_ok(builder, ctx, &payload, payload_ty, ir_module)?;
     builder.ins().jump(br.merge_block, &[ok_ptr]);
 

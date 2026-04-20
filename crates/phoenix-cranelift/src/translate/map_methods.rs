@@ -17,8 +17,8 @@ use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
 use super::enum_helpers::{build_option_none, build_option_some};
-use super::helpers::{call_runtime, load_fat_value, slots_for_type, store_fat_value};
-use super::layout::{MAP_HEADER, elem_size_bytes};
+use super::helpers::call_runtime;
+use super::layout::{MAP_HEADER, SLOT_SIZE, TypeLayout, elem_size_bytes};
 use super::list_methods::store_to_temp;
 use super::{FuncState, get_val, get_val1};
 use phoenix_ir::instruction::Op;
@@ -130,7 +130,7 @@ pub(super) fn translate_map_method(
             // Found: load value, wrap in Some.
             builder.seal_block(found_block);
             builder.switch_to_block(found_block);
-            let loaded_val = load_fat_value(builder, &val_ty, val_ptr, 0)?;
+            let loaded_val = TypeLayout::of(&val_ty).load(builder, val_ptr, 0);
             let some_ptr = build_option_some(builder, ctx, &loaded_val, &val_ty, ir_module)?;
             builder.ins().jump(merge_block, &[some_ptr]);
 
@@ -234,18 +234,20 @@ pub(super) fn translate_map_alloc(
     );
     let ptr = map_ptr[0];
 
-    let key_slots = slots_for_type(key_ty);
-    let val_slots = slots_for_type(val_ty);
+    let key_layout = TypeLayout::of(key_ty);
+    let val_layout = TypeLayout::of(val_ty);
+    let key_slots = key_layout.slots();
+    let val_slots = val_layout.slots();
 
     // Store each key-value pair.
     for (i, (k_vid, v_vid)) in entries.iter().enumerate() {
         let k_vals = get_val(state, *k_vid)?;
-        let key_slot = MAP_HEADER as usize / super::layout::SLOT_SIZE + i * (key_slots + val_slots);
-        store_fat_value(builder, &k_vals, key_ty, ptr, key_slot);
+        let key_slot = MAP_HEADER as usize / SLOT_SIZE + i * (key_slots + val_slots);
+        key_layout.store(builder, ptr, key_slot, &k_vals);
 
         let v_vals = get_val(state, *v_vid)?;
         let val_slot = key_slot + key_slots;
-        store_fat_value(builder, &v_vals, val_ty, ptr, val_slot);
+        val_layout.store(builder, ptr, val_slot, &v_vals);
     }
 
     Ok(vec![ptr])

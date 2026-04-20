@@ -16,7 +16,8 @@ use phoenix_ir::instruction::{Op, ValueId};
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::{call_runtime, slots_for_type, store_fat_value};
+use super::helpers::call_runtime;
+use super::layout::{SLOT_SIZE, TypeLayout};
 use super::{FuncState, get_val, get_val1};
 
 /// Translate a `ClosureAlloc` operation.
@@ -39,13 +40,13 @@ pub(super) fn translate_closure_alloc(
             let ty = state.type_map.get(cap).cloned().ok_or_else(|| {
                 CompileError::new(format!("unknown type for closure capture {cap}"))
             })?;
-            Ok(slots_for_type(&ty))
+            Ok(TypeLayout::of(&ty).slots())
         })
         .collect::<Result<Vec<usize>, CompileError>>()?
         .into_iter()
         .sum();
     let num_slots = 1 + capture_slots;
-    let size = (num_slots * super::layout::SLOT_SIZE) as i64;
+    let size = (num_slots * SLOT_SIZE) as i64;
     let alloc_ref = ctx
         .module
         .declare_func_in_func(ctx.runtime.alloc, builder.func);
@@ -67,8 +68,9 @@ pub(super) fn translate_closure_alloc(
             state.type_map.get(cap).cloned().ok_or_else(|| {
                 CompileError::new(format!("unknown type for closure capture {cap}"))
             })?;
-        store_fat_value(builder, &cap_vals, &ty, ptr, slot);
-        slot += slots_for_type(&ty);
+        let cap_layout = TypeLayout::of(&ty);
+        cap_layout.store(builder, ptr, slot, &cap_vals);
+        slot += cap_layout.slots();
     }
     Ok(vec![ptr])
 }

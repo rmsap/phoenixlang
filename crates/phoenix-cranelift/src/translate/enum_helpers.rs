@@ -25,7 +25,7 @@ use crate::error::CompileError;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::{slots_for_type, store_fat_value};
+use super::layout::{SLOT_SIZE, TypeLayout};
 
 /// Look up the variant index for a named variant within an enum layout.
 pub(super) fn enum_variant_index(
@@ -61,7 +61,7 @@ pub(super) fn enum_max_payload_slots(
         .ok_or_else(|| CompileError::new(format!("{name} enum not found in module layouts")))?;
     Ok(variants
         .iter()
-        .map(|(_, fs)| fs.iter().map(slots_for_type).sum::<usize>())
+        .map(|(_, fs)| fs.iter().map(|t| TypeLayout::of(t).slots()).sum::<usize>())
         .max()
         .unwrap_or(0))
 }
@@ -83,9 +83,9 @@ pub(super) fn build_enum_variant(
     let disc_idx = enum_variant_index(ir_module, enum_name, variant_name)?;
     let max_slots = enum_max_payload_slots(ir_module, enum_name)?;
     // Ensure we allocate enough for the actual payload (may exceed generic layout).
-    let actual_slots = payload_ty.map(slots_for_type).unwrap_or(0);
+    let actual_slots = payload_ty.map(|t| TypeLayout::of(t).slots()).unwrap_or(0);
     let slots = max_slots.max(actual_slots);
-    let size = ((1 + slots) * super::layout::SLOT_SIZE) as i64;
+    let size = ((1 + slots) * SLOT_SIZE) as i64;
     let alloc_ref = ctx
         .module
         .declare_func_in_func(ctx.runtime.alloc, builder.func);
@@ -95,7 +95,7 @@ pub(super) fn build_enum_variant(
     let disc = builder.ins().iconst(cl::I64, disc_idx as i64);
     builder.ins().store(MemFlags::new(), disc, ptr, 0);
     if let Some(ty) = payload_ty {
-        store_fat_value(builder, payload, ty, ptr, 1);
+        TypeLayout::of(ty).store(builder, ptr, 1, payload);
     }
     Ok(ptr)
 }

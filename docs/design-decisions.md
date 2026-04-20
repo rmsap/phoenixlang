@@ -192,11 +192,12 @@ Traits in Phoenix are statically dispatched only today — every trait use must 
 
 ### Centralized layout for reference types
 
-Fat-pointer layouts (e.g., `String` as `(ptr, len)`) and their slot counts are scattered across `phoenix-cranelift/src/types.rs`, `translate/helpers.rs`, and per-method files (`store_fat_value`, `slots_for_type`, etc.). Every new heap-backed type (`Bytes`, `BigInt`, `Date`, future `Vec` / `Buffer`, etc.) requires touching each of them, and the invariants live implicitly in whoever last edited the backend. This is a compiler-internals question, not a user-facing one.
+Fat-pointer layouts (e.g., `String` as `(ptr, len)`) and their slot counts were scattered across `phoenix-cranelift/src/types.rs`, `translate/helpers.rs`, and per-method files (`store_fat_value`, `slots_for_type`, etc.). Every new heap-backed type (`Bytes`, `BigInt`, `Date`, future `Vec` / `Buffer`, etc.) required touching each of them, and the invariants lived implicitly in whoever last edited the backend. This is a compiler-internals question, not a user-facing one.
 
 **Decision:** Introduce a single `Layout` trait or registry that owns slot count, alignment, load/store codegen, and calling-convention handling per reference type. Each reference type becomes one entry in the abstraction; the scattered branches in the Cranelift backend become calls into it.
 **Decided:** 2026-04-19
 **Target phase:** Phase 2.2 (Cranelift native compilation, in flight)
+**Status:** Implemented as `TypeLayout` in `phoenix-cranelift/src/translate/layout/`. Adding a new reference type is now a single match-arm edit in `TypeLayout::of`; load/store/sizing are data-driven from there.
 **Rationale:** Scattered layout knowledge is not feasible long-term. Phase 4 will add several heap-backed types (`Date`, `Bytes`, regex values, etc.); without a central abstraction, each one touches 3–5 files and silently drifts the invariants. The monomorphization pass (above) and the `dyn Trait` vtable codegen (above) both need to reason about arbitrary-type layouts at codegen time — centralizing first means both passes consume the same abstraction rather than growing their own ad-hoc per-type dispatch.
 
 **Alternatives considered:**
