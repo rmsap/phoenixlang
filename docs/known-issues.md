@@ -39,20 +39,16 @@ closures share the same user-param types, return type, and capture types, they
 are silently conflated.  Different capture layouts are caught (compile error),
 but identical-layout mismatches are invisible.
 
+Not actively miscompiling today: when the heuristic conflates closures with
+identical capture layouts, the emitted load code works correctly regardless
+of which concrete closure the function pointer targets at runtime. The
+concern is fragility — future changes could introduce layouts where the
+conflation matters.
+
 **Workaround:** Pass closures directly to methods rather than through conditional block parameters.
 **Root cause:** The IR's closure representation does not carry capture metadata alongside the function pointer.
 **Tracked in:** Cranelift `ir_analysis.rs` `find_closure_capture_types`.
-**Target phase:** Phase 2.2. Fix requires adding capture metadata to the IR closure representation. The [`Value::Closure` refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) scheduled for Phase 2.6 touches the same representation — check whether the 2.2 fix can be staged to align with that refactor, or whether they should stay independent.
-
-### `Result.ok()` and `Result.err()` not supported in compiled mode
-
-The `Result.ok()` (returns `Option<T>`) and `Result.err()` (returns `Option<E>`)
-methods work in the IR interpreter but are not yet implemented in the Cranelift
-backend.  Calling them produces a "not yet supported in compiled mode" error.
-
-**Workaround:** Use pattern matching to convert a Result to an Option manually.
-**Tracked in:** Cranelift `result_methods.rs` dispatch table.
-**Target phase:** Phase 2.2. Straightforward addition to the Cranelift dispatch table.
+**Target phase:** Phase 2.6. Deferred from 2.2 — the proper fix requires changes to the IR closure representation, which is naturally reworked in the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) scheduled for 2.6. Addressing this bug alongside that refactor is cheaper than doing either in isolation.
 
 ### O(n) map key lookup
 

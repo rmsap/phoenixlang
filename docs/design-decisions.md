@@ -272,3 +272,5 @@ Diagnostics are currently constructed inline everywhere via `self.error(format!(
 - **Status quo — keep AST-backed closures.** Rejected: the coupling persists indefinitely and every parser change requires manual interpreter rewiring.
 - **Late Phase 2.2** — do it while Cranelift work is still landing. Rejected: IR is still evolving during 2.2 with monomorphization and dyn-trait machinery; better to target a stable IR in 2.6.
 - **Explicit standalone phase.** Rejected: not large enough to justify a dedicated phase slot; pairs cleanly with other 2.6 work.
+
+**Bundled scope:** The [closure capture type ambiguity bug](known-issues.md#closure-capture-type-ambiguity-with-indirect-calls) is absorbed into this refactor. Both concern the IR's closure representation, and adding capture metadata alongside the function pointer falls naturally out of the same change.

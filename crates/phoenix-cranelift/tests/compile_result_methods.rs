@@ -553,3 +553,105 @@ function main() {
     );
     assert_eq!(out, vec!["error: not found", "42"]);
 }
+
+#[test]
+fn result_ok_on_ok() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let r: Result<Int, String> = Ok(42)
+    let o: Option<Int> = r.ok()
+    match o {
+        Some(v) -> print(v)
+        None -> print(-1)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["42"]);
+}
+
+#[test]
+fn result_ok_on_err() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let r: Result<Int, String> = Err("boom")
+    let o: Option<Int> = r.ok()
+    match o {
+        Some(v) -> print(v)
+        None -> print(-1)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["-1"]);
+}
+
+#[test]
+fn result_err_on_ok() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let r: Result<Int, String> = Ok(42)
+    let o: Option<String> = r.err()
+    match o {
+        Some(e) -> print(e)
+        None -> print("no error")
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["no error"]);
+}
+
+#[test]
+fn result_err_on_err() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let r: Result<Int, String> = Err("boom")
+    let o: Option<String> = r.err()
+    match o {
+        Some(e) -> print(e)
+        None -> print("no error")
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["boom"]);
+}
+
+#[test]
+fn result_ok_with_string_payload() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let r: Result<String, Int> = Ok("hello")
+    let o: Option<String> = r.ok()
+    match o {
+        Some(s) -> print(s)
+        None -> print("nope")
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["hello"]);
+}
+
+#[test]
+fn result_err_with_int_payload() {
+    let out = compile_and_run(
+        r#"
+function main() {
+    let r: Result<String, Int> = Err(404)
+    let o: Option<Int> = r.err()
+    match o {
+        Some(code) -> print(code)
+        None -> print(-1)
+    }
+}
+"#,
+    );
+    assert_eq!(out, vec!["404"]);
+}

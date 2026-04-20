@@ -46,11 +46,9 @@ These decisions pin the ABI / calling convention and must land before 2.2 wraps 
 
 ### Bugs to be closed in this phase
 
-See [known-issues.md](../known-issues.md) for the full entries. Three Cranelift-specific bugs should close out by the end of 2.2:
+See [known-issues.md](../known-issues.md) for the full entries:
 
 - **[`Option.okOr` payload inference](../known-issues.md#optionokor-fails-to-compile-when-payload-type-cannot-be-inferred)** — likely absorbed by monomorphization (see decision above); verify after that lands.
-- **[Closure capture type ambiguity with indirect calls](../known-issues.md#closure-capture-type-ambiguity-with-indirect-calls)** — IR closure representation needs capture metadata. Check whether to stage this fix alongside the Phase 2.6 `Value::Closure` refactor.
-- **[`Result.ok()` / `Result.err()` not in Cranelift](../known-issues.md#resultok-and-resulterr-not-supported-in-compiled-mode)** — straightforward dispatch-table addition.
 
 ## 2.3 Runtime and Memory Management
 
@@ -189,6 +187,10 @@ Two codebase-hygiene refactors land alongside the module-system work — both pa
 
 - **[Diagnostic builder pattern](../design-decisions.md#diagnostic-builder-pattern)** — replace inline `self.error(msg, span)` with a fluent `Diagnostic::error(span, msg).with_note(...).with_suggestion(...).emit()` API. Module-system diagnostics are a natural first consumer (multi-span "symbol X is private, defined here: [other file]" errors). Hard deadline: before Phase 3.2.
 - **[Interpreter-parser coupling via `Value::Closure`](../design-decisions.md#interpreter-parser-coupling-via-valueclosure)** — switch closures to store IR blocks instead of parser AST blocks, so the interpreter consumes IR like the Cranelift backend does. IR stabilizes during Phase 2.2; doing this in 2.6 targets a settled IR.
+
+### Bugs bundled into this phase
+
+- **[Closure capture type ambiguity with indirect calls](../known-issues.md#closure-capture-type-ambiguity-with-indirect-calls)** — deferred from Phase 2.2. The proper fix requires capture metadata in the IR closure representation, which the `Value::Closure` refactor above already touches. Address as part of that refactor rather than independently.
 
 ## 2.7 Benchmark Suite
 

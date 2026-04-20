@@ -20,9 +20,12 @@ use super::enum_combinators::{
     translate_enum_unwrap, translate_enum_unwrap_or, translate_is_not_variant,
     translate_is_variant,
 };
-use super::enum_helpers::{build_result_err, build_result_ok, load_disc_and_branch};
+use super::enum_helpers::{
+    build_option_none, build_option_some, build_result_err, build_result_ok, load_disc_and_branch,
+};
 use super::enum_type_inference::{
-    try_type_from_closure_arg, try_type_from_layout, try_type_from_result, try_type_from_value_arg,
+    try_type_from_closure_arg, try_type_from_enum_alloc, try_type_from_layout,
+    try_type_from_result, try_type_from_value_arg,
 };
 use super::layout::TypeLayout;
 use super::{FuncState, get_val, get_val1};
@@ -154,6 +157,50 @@ pub(super) fn translate_result_method(
 
             Ok(finish_merge(builder, &br))
         }
+        // Convert `Result<T, E>` to `Option<T>`: `Ok(v) → Some(v)`, `Err(_) → None`.
+        "ok" => {
+            let br = load_disc_and_branch(
+                builder,
+                recv_ptr,
+                ir_module,
+                "Result",
+                "Ok",
+                &[POINTER_TYPE],
+            )?;
+
+            enter_block(builder, br.positive_block);
+            let payload = TypeLayout::of(&ok_ty).load(builder, recv_ptr, 1);
+            let some_ptr = build_option_some(builder, ctx, &payload, &ok_ty, ir_module)?;
+            builder.ins().jump(br.merge_block, &[some_ptr]);
+
+            enter_block(builder, br.negative_block);
+            let none_ptr = build_option_none(builder, ctx, ir_module)?;
+            builder.ins().jump(br.merge_block, &[none_ptr]);
+
+            Ok(finish_merge(builder, &br))
+        }
+        // Convert `Result<T, E>` to `Option<E>`: `Ok(_) → None`, `Err(e) → Some(e)`.
+        "err" => {
+            let br = load_disc_and_branch(
+                builder,
+                recv_ptr,
+                ir_module,
+                "Result",
+                "Ok",
+                &[POINTER_TYPE],
+            )?;
+
+            enter_block(builder, br.positive_block);
+            let none_ptr = build_option_none(builder, ctx, ir_module)?;
+            builder.ins().jump(br.merge_block, &[none_ptr]);
+
+            enter_block(builder, br.negative_block);
+            let err_payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
+            let some_ptr = build_option_some(builder, ctx, &err_payload, &err_ty, ir_module)?;
+            builder.ins().jump(br.merge_block, &[some_ptr]);
+
+            Ok(finish_merge(builder, &br))
+        }
         _ => Err(CompileError::new(format!(
             "result method '{method}' not yet supported in compiled mode"
         ))),
@@ -216,20 +263,43 @@ fn result_payload_types(
     // For methods that use the payload, require at least the relevant type.
     let needs_ok = matches!(
         method,
-        "unwrap" | "unwrapOr" | "unwrapOrElse" | "map" | "andThen"
+        "unwrap" | "unwrapOr" | "unwrapOrElse" | "map" | "andThen" | "ok"
     );
-    let needs_err = matches!(method, "mapErr" | "orElse" | "unwrapOrElse");
+    let needs_err = matches!(method, "mapErr" | "orElse" | "unwrapOrElse" | "err");
+
+    // Strategy 4: EnumAlloc tracking — when prior strategies fail, inspect
+    // recorded `EnumAlloc` payload types on the receiver (or consistent
+    // same-enum allocations in the function). Mirrors the pattern used by
+    // `option_methods::option_payload_type`.
+    if needs_ok
+        && ok_ty.is_none()
+        && let Some(ty) = try_type_from_enum_alloc(state, args[0], "Result")
+    {
+        ok_ty = Some(ty);
+    }
+    if needs_err
+        && err_ty.is_none()
+        && let Some(ty) = try_type_from_enum_alloc(state, args[0], "Result")
+    {
+        err_ty = Some(ty);
+    }
 
     if needs_ok && ok_ty.is_none() {
         return Err(CompileError::new(format!(
             "could not infer Result Ok type for method '{method}'. \
-             All inference strategies failed — this is a compiler bug."
+             All inference strategies failed — the Result value may come from \
+             a function parameter or cross-function return where generic type \
+             arguments are not yet propagated. Use pattern matching as a \
+             workaround. This is a known compiler limitation."
         )));
     }
     if needs_err && err_ty.is_none() {
         return Err(CompileError::new(format!(
             "could not infer Result Err type for method '{method}'. \
-             All inference strategies failed — this is a compiler bug."
+             All inference strategies failed — the Result value may come from \
+             a function parameter or cross-function return where generic type \
+             arguments are not yet propagated. Use pattern matching as a \
+             workaround. This is a known compiler limitation."
         )));
     }
 
