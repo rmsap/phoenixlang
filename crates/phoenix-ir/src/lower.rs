@@ -69,7 +69,9 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
         Type::Void => IrType::Void,
         Type::Named(name) => {
             if check_result.structs.contains_key(name) {
-                IrType::StructRef(name.clone())
+                // `Type::Named` has no generic args by construction (that
+                // shape is `Type::Generic` below), so args is empty.
+                IrType::StructRef(name.clone(), Vec::new())
             } else if check_result.enums.contains_key(name) {
                 // `Type::Named` has no generic args by construction (that
                 // shape is `Type::Generic` below), so the args vec is empty.
@@ -123,19 +125,17 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
                 )
             }
             other => {
-                // Generic struct or enum. `StructRef` drops its args while
-                // `EnumRef` keeps them — see the "EnumRef carries args but
-                // StructRef drops them" subsection of
-                // `docs/design-decisions.md` under
-                // "Generic function monomorphization strategy" for the
-                // rationale.
+                // Generic struct or enum.  Both carry their concrete args
+                // through to IR — `StructRef` relies on them for
+                // struct-monomorphization (per-instantiation layout +
+                // method specialization); `EnumRef` carries them for
+                // payload-type inference.
+                let ir_args: Vec<IrType> =
+                    args.iter().map(|t| lower_type(t, check_result)).collect();
                 if check_result.structs.contains_key(other) {
-                    IrType::StructRef(other.to_string())
+                    IrType::StructRef(other.to_string(), ir_args)
                 } else {
-                    IrType::EnumRef(
-                        other.to_string(),
-                        args.iter().map(|t| lower_type(t, check_result)).collect(),
-                    )
+                    IrType::EnumRef(other.to_string(), ir_args)
                 }
             }
         },

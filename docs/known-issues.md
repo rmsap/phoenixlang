@@ -201,27 +201,6 @@ The parser today fails with "expected '>'" on the `+` in `<T: Foo + Bar>`. The d
 
 **Target phase:** Phase 3. **Tripwire:** the `"expected '>'"` error message at any `+` inside a type-parameter bound list. No workaround except "split into two type parameters" which usually doesn't achieve what the user wanted.
 
-### Generic user-defined structs are not supported in compiled mode
-
-See also: [design-decisions.md: *Dynamic dispatch via `dyn Trait`*](design-decisions.md#dynamic-dispatch-via-dyn-trait) — `dyn Trait` over generic structs is blocked by the same gap and lands with the fix here.
-
-Programs that declare a generic struct (`struct Container<T> { T value }`) and use it at a concrete type (`Container(42)`) run fine under `phoenix run` (AST interpreter) but fail under `phoenix build`. Two related failure modes exist today, both with clear tripwires:
-
-- **With methods:** a new `debug_assert!` in `register_method` (`phoenix-ir/src/lower_decl.rs`, struct branch) fires at IR-lowering time with a message pointing at this entry. Reason: `register_method` emits `IrType::StructRef(type_name)` for `self` with no type args, so monomorphization has no handle to specialize on and the body is left as an inert generic template.
-- **Without methods:** field access on a use-site `Generic("Container", [Int])` hits an `unreachable!` in `phoenix-ir/src/lower_expr.rs` (`lower_field_access`) because `struct_layouts` is keyed by bare name (`"Container"`) and holds layouts still containing `IrType::TypeVar(T)`. The struct layout is never reified per-instantiation, so the backend has no concrete field type to materialize.
-
-**`dyn Trait` interaction.** `dyn Trait` over a generic struct — `struct Container<T> { ... impl SomeTrait { ... } }` used as `dyn SomeTrait` — is blocked by the same gap: the IR `dyn_vtables` registry is keyed by `(concrete_type_name, trait_name)` using the struct's bare name and stores the template's `FuncId`. Even if the vtable emission succeeded, the Cranelift signature-build step would read template `param_types` still carrying `TypeVar` and crash in `TypeLayout::of`. Users who try this hit the `register_method` gate first.
-
-**Why this is the same shape as the enum-side gap below.** Both come from `register_method` emitting a bare `{Struct,Enum}Ref(name)` for `self`, and both interact with monomorphization only understanding "generic function bodies", not "generic data types whose layout must be reified per use". The real fix spans four sites:
-
-1. `register_method` threads the type's `info.type_params` into the self-type's args.
-2. `struct_layouts` (and `enum_layouts`) are keyed by name+args, or reified per instantiation.
-3. Monomorphization specializes the methods alongside the layouts.
-4. `IrModule::dyn_vtables` and `method_index` are keyed by the specialized concrete type so `dyn Trait` resolves to the specialized method.
-
-**File:** `phoenix-ir/src/lower_decl.rs` (struct-side `register_method` gate; parallel to enum-side gate). **Workaround:** use `phoenix run` (AST interpreter) for programs with generic user-defined structs, or hand-specialize (write `struct ContainerInt { Int value }` instead of `struct Container<T>`).
-**Target phase:** **Phase 2.2 — committed to fix before this phase closes.** Rationale: generic structs are a day-one abstraction (`Container<T>`, `Pair<A, B>`, user-defined linked lists / trees / caches), so the `phoenix run` vs. `phoenix build` disagreement on whether a program is valid undermines the Phase 2.2 "compiled mode is production-viable" narrative. Fixing now also keeps the struct-layout / method-dispatch / dyn-vtable invariants malleable while monomorphization (2026-04-19) is still fresh. The enum-side twin entry below remains demand-triggered and deferred.
-
 ### Methods on generic enums are gated off; payload-inference fallbacks kept alive as a consequence
 
 User-defined `impl<T> MyEnum<T> { ... }` is rejected by a `debug_assert!` in `phoenix-ir/src/lower_decl.rs` (enum branch) because `register_method` emits `IrType::EnumRef(type_name, Vec::new())` for the `self` parameter — empty args, not the enum's declared type parameters. Landing this feature requires threading the enum's `info.type_params` into the `self` `EnumRef` args and teaching monomorphization to specialize methods on generic enums (already handles generic functions + methods on non-generic user types).

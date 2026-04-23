@@ -87,7 +87,7 @@ pub(super) fn translate_struct(
                 .get(obj)
                 .ok_or_else(|| CompileError::new("unknown type for struct field access"))?;
             let struct_name = match struct_type {
-                IrType::StructRef(n) => n,
+                IrType::StructRef(n, _) => n,
                 _ => return Err(CompileError::new("StructGetField on non-struct")),
             };
             let layout = ir_module
@@ -108,7 +108,7 @@ pub(super) fn translate_struct(
                 .get(obj)
                 .ok_or_else(|| CompileError::new("unknown type for struct field set"))?;
             let struct_name = match struct_type {
-                IrType::StructRef(n) => n,
+                IrType::StructRef(n, _) => n,
                 _ => return Err(CompileError::new("StructSetField on non-struct")),
             };
             let layout = ir_module

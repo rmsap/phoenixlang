@@ -34,6 +34,33 @@ pub struct IrModule {
     /// `__generic` placeholder back to its source type parameter by index.
     /// Example: `"Result" → ["T", "E"]`.
     pub enum_type_params: HashMap<String, Vec<String>>,
+    /// Struct type parameter names: name → ordered list of type param names.
+    /// Mirrors [`Self::enum_type_params`]; empty entry (or absent key)
+    /// means the struct is not generic.
+    ///
+    /// **Lifecycle.**
+    ///
+    /// - **Written** during IR lowering by
+    ///   [`crate::lower_decl::LoweringContext::register_struct`], which
+    ///   inserts one entry per generic struct declaration from sema's
+    ///   `StructInfo.type_params`. Never mutated after lowering ends.
+    /// - **Read** at two distinct points: (1)
+    ///   [`crate::lower_expr::LoweringContext::resolve_field_type`] uses
+    ///   it at lowering time to substitute `IrType::TypeVar` out of a
+    ///   generic struct's field type at concrete use sites (the receiver
+    ///   carries `Generic("Container", [Int])`, the layout holds
+    ///   `TypeVar("T")`, we substitute here so the emitted
+    ///   `StructGetField` has a fully-resolved result type); (2)
+    ///   [`crate::monomorphize::monomorphize_structs`] uses it to build
+    ///   the per-instantiation TypeVar → concrete substitution map and
+    ///   to identify which `StructRef` names refer to generic templates
+    ///   worth enqueuing on the specialization worklist.
+    ///
+    /// The map is keyed by the struct's source-level (bare) name.
+    /// Post-monomorphization, specialized layouts registered under
+    /// mangled names (e.g. `Container__i64`) do *not* get entries here —
+    /// they are already concrete and have no type parameters to track.
+    pub struct_type_params: HashMap<String, Vec<String>>,
     /// Function name → [`FuncId`] mapping for call resolution.
     pub function_index: HashMap<String, FuncId>,
     /// Method dispatch table: `(type_name, method_name)` → [`FuncId`].
@@ -55,20 +82,18 @@ pub struct IrModule {
     /// (method dispatch) and the Cranelift backend (rodata vtable
     /// emission).
     ///
-    /// **Provisional keying.** The `concrete_type` key is the struct /
-    /// enum's *bare* name. This is correct for every concrete type
-    /// supported in compiled mode today, because generic user-defined
-    /// structs are not yet supported
-    /// ([docs/known-issues.md](../../../../docs/known-issues.md#generic-user-defined-structs-are-not-supported-in-compiled-mode)).
-    /// Once that gate lifts (committed before Phase 2.2 closes), the key
-    /// will need to carry the full generic instantiation — otherwise
-    /// `Container<Int>` and `Container<String>` collide on `"Container"`
-    /// and the second registration silently clobbers the first. The
-    /// planned migration is to key on a `ConcreteTypeSignature` newtype
-    /// wrapping `(name, Vec<IrType>)`; the `FuncId` values inside the
-    /// entries stay stable, so the change is contained to this map plus
-    /// `register_dyn_vtable`, `verify_dyn_vtable_shapes`, and the
-    /// Cranelift vtable-emission cache.
+    /// **Keying invariant.** The `concrete_type` key is a struct / enum
+    /// name. For non-generic types it is the source-level name
+    /// (`"Point"`). For generic structs it starts life as the bare
+    /// template name at lowering time (`"Container"`), and
+    /// [`crate::monomorphize::monomorphize_structs`] rekeys each entry
+    /// to the mangled per-instantiation name (`"Container__i64"`) and
+    /// drops the template entry during Pass 2's vtable rekey. Every
+    /// entry's `FuncId` values are also re-resolved through the
+    /// specialized `method_index` at that time, so post-mono the map
+    /// contains only concrete-instantiation keys pointing at concrete
+    /// (non-template) functions. Generic enums are gated off at
+    /// trait-registration, so their bare name still suffices.
     pub dyn_vtables: HashMap<(String, String), DynVtable>,
     /// Trait declarations visible at the IR level, keyed by trait name.
     ///
@@ -119,6 +144,7 @@ impl IrModule {
             struct_layouts: HashMap::new(),
             enum_layouts: HashMap::new(),
             enum_type_params: HashMap::new(),
+            struct_type_params: HashMap::new(),
             function_index: HashMap::new(),
             method_index: HashMap::new(),
             dyn_vtables: HashMap::new(),

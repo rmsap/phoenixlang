@@ -35,7 +35,7 @@ impl<'a> LoweringContext<'a> {
             return value;
         }
         let concrete_type = match actual {
-            IrType::StructRef(name) => name.clone(),
+            IrType::StructRef(name, _) => name.clone(),
             IrType::EnumRef(name, _) => name.clone(),
             // Sema's `Checker::concrete_type_impls_trait`
             // (phoenix-sema/src/check_types.rs) rejects non-struct/enum

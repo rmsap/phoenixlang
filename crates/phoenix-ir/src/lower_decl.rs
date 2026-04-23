@@ -98,6 +98,11 @@ impl<'a> LoweringContext<'a> {
                 .map(|f| (f.name.clone(), lower_type(&f.ty, self.check)))
                 .collect();
             self.module.struct_layouts.insert(s.name.clone(), fields);
+            if !info.type_params.is_empty() {
+                self.module
+                    .struct_type_params
+                    .insert(s.name.clone(), info.type_params.clone());
+            }
         }
     }
 
@@ -184,37 +189,31 @@ impl<'a> LoweringContext<'a> {
         let has_self = method.params.first().is_some_and(|p| p.name == "self");
 
         if has_self {
-            // Both branches emit an unparameterized self-type reference
-            // because methods on generic structs/enums aren't yet
-            // supported in compiled mode. Hard `panic!` (not
-            // `debug_assert!`) because silent miscompilation would return
-            // if the gate is relaxed without also fixing the name-keyed
-            // `struct_layouts` / `method_index` / `dyn_vtables` tables.
+            // Self type for the method template.  For generic structs,
+            // the self-type args are the declared type-parameter names
+            // lifted into `IrType::TypeVar`; struct-monomorphization
+            // substitutes them with concrete types and clones the body
+            // into a specialized `method_index` entry keyed by the
+            // mangled struct name.  See
+            // `phoenix-ir/src/monomorphize.rs::monomorphize_structs`.
             //
-            // Sema contract: `Checker::register_struct` / `register_enum`
-            // / `register_impl` (phoenix-sema/src/check_register.rs) are
-            // expected to reject `impl Trait for GenericStruct<T>` before
-            // lowering runs. If either gate moves upstream
-            // (e.g. generic-struct support lands) these panics MUST be
-            // replaced with a proper per-instantiation lowering path —
-            // do not simply relax them.
+            // The enum branch still carries the legacy gate: methods on
+            // generic enums remain unsupported (separate `known-issues`
+            // entry, Phase 4 target).  Touching the gate requires the
+            // same struct-mono-style reification for enum layouts, which
+            // is out of scope for this PR.
             let self_type = if self.check.structs.contains_key(type_name) {
-                let is_generic = self
+                let type_params = self
                     .check
                     .structs
                     .get(type_name)
-                    .is_some_and(|info| !info.type_params.is_empty());
-                if is_generic {
-                    panic!(
-                        "method on generic struct `{type_name}` reached IR lowering — \
-                         `Checker::register_impl` (phoenix-sema/src/check_register.rs) \
-                         is expected to reject this until monomorphization reifies \
-                         struct_layouts and dyn_vtables per-instantiation. See \
-                         docs/known-issues.md: \"Generic user-defined structs are not \
-                         supported in compiled mode\"."
-                    );
-                }
-                IrType::StructRef(type_name.to_string())
+                    .map(|info| info.type_params.clone())
+                    .unwrap_or_default();
+                let args: Vec<IrType> = type_params
+                    .iter()
+                    .map(|name| IrType::TypeVar(name.clone()))
+                    .collect();
+                IrType::StructRef(type_name.to_string(), args)
             } else {
                 let is_generic = self
                     .check
@@ -251,7 +250,17 @@ impl<'a> LoweringContext<'a> {
             Some(method.span),
         );
         func.type_param_names = method.type_params.clone();
-        func.is_generic_template = !method.type_params.is_empty();
+        // A method on a generic struct is a template even when it has no
+        // method-level type params — the struct's type params flow into
+        // the body via the `self` parameter's `StructRef` args, so the
+        // body contains `IrType::TypeVar` and cannot reach Cranelift
+        // until struct-monomorphization specializes it.
+        let parent_is_generic_struct = self
+            .check
+            .structs
+            .get(type_name)
+            .is_some_and(|info| !info.type_params.is_empty());
+        func.is_generic_template = !method.type_params.is_empty() || parent_is_generic_struct;
 
         self.module.functions.push(func);
         self.module

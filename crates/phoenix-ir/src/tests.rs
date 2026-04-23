@@ -1307,17 +1307,21 @@ fn mangling_is_injective_for_distinct_type_args() {
         IrType::Bool,
         IrType::Void,
         IrType::StringRef,
-        IrType::StructRef("Point".into()),
+        IrType::StructRef("Point".into(), Vec::new()),
+        IrType::StructRef("Container".into(), vec![IrType::I64]),
         IrType::EnumRef("Point".into(), Vec::new()), // distinct encoding from StructRef of same name
         IrType::EnumRef("Option".into(), vec![IrType::I64]),
         IrType::EnumRef("Result".into(), vec![IrType::StringRef, IrType::I64]),
         // Collision guard: single-underscore delimiter would produce
         // `e_Opt_s_foo_i64_E` for both of these distinct types.  The `__`
         // delimiter in `mangle_type` must keep them apart.
-        IrType::EnumRef("Opt".into(), vec![IrType::StructRef("foo_i64".into())]),
         IrType::EnumRef(
             "Opt".into(),
-            vec![IrType::StructRef("foo".into()), IrType::I64],
+            vec![IrType::StructRef("foo_i64".into(), Vec::new())],
+        ),
+        IrType::EnumRef(
+            "Opt".into(),
+            vec![IrType::StructRef("foo".into(), Vec::new()), IrType::I64],
         ),
         IrType::ListRef(Box::new(IrType::I64)),
         IrType::ListRef(Box::new(IrType::StringRef)),
@@ -1402,7 +1406,9 @@ function main() {
     fn walk(t: &IrType, saw_placeholder: &mut bool) {
         match t {
             IrType::TypeVar(name) => panic!("residual TypeVar({name}) survived Pass D"),
-            IrType::StructRef(n) if n == GENERIC_PLACEHOLDER => *saw_placeholder = true,
+            IrType::StructRef(n, args) if n == GENERIC_PLACEHOLDER && args.is_empty() => {
+                *saw_placeholder = true
+            }
             IrType::ListRef(inner) => walk(inner, saw_placeholder),
             IrType::MapRef(k, v) => {
                 walk(k, saw_placeholder);
@@ -1648,7 +1654,8 @@ function main() {
         IrType::EnumRef(
             "Box".to_string(),
             vec![IrType::StructRef(
-                crate::types::GENERIC_PLACEHOLDER.to_string()
+                crate::types::GENERIC_PLACEHOLDER.to_string(),
+                Vec::new()
             )]
         ),
     );

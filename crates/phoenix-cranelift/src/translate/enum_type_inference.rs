@@ -337,7 +337,7 @@ mod tests {
     }
 
     fn placeholder() -> IrType {
-        IrType::StructRef(GENERIC_PLACEHOLDER.to_string())
+        IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new())
     }
 
     // ── try_type_from_enum_args ──────────────────────────────────────

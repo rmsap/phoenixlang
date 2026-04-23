@@ -35,9 +35,21 @@ pub enum IrType {
     // --- Reference types (GC-managed pointers) ---
     /// Heap-allocated, immutable UTF-8 string.
     StringRef,
-    /// Heap-allocated struct instance.  The [`String`] is the struct name,
-    /// used for layout lookup.
-    StructRef(String),
+    /// Heap-allocated struct instance.  The [`String`] is the struct name
+    /// used for layout lookup; the [`Vec<IrType>`] carries the concrete
+    /// generic arguments at the use site (e.g. `StructRef("Container",
+    /// [I64])` for `Container<Int>`).  Empty for non-generic structs.
+    ///
+    /// Pre-monomorphization, args may contain `TypeVar`s (a template
+    /// method's `self` parameter on a generic struct).
+    /// Post-monomorphization, the struct-specialization pass rewrites
+    /// every `StructRef(name, non_empty_args)` into
+    /// `StructRef(mangled_name, Vec::new())` and registers a specialized
+    /// layout under `mangled_name` in
+    /// [`crate::module::IrModule::struct_layouts`]. Every concrete
+    /// function post-mono sees `StructRef` with empty args, and the
+    /// Cranelift backend looks up layouts by bare string as before.
+    StructRef(String, Vec<IrType>),
     /// Heap-allocated enum value (tagged union).  The [`String`] is the enum
     /// name, used for variant layout lookup.  The [`Vec<IrType>`] carries the
     /// concrete generic arguments at the use site (e.g. `EnumRef("Option",
@@ -120,7 +132,7 @@ impl IrType {
         match self {
             IrType::I64 | IrType::F64 | IrType::Bool | IrType::Void => true,
             IrType::StringRef
-            | IrType::StructRef(_)
+            | IrType::StructRef(_, _)
             | IrType::EnumRef(_, _)
             | IrType::DynRef(_)
             | IrType::ListRef(_)
@@ -152,7 +164,7 @@ impl IrType {
     /// Returns `true` if this type is the [`GENERIC_PLACEHOLDER`] sentinel,
     /// representing an unresolved generic type parameter.
     pub fn is_generic_placeholder(&self) -> bool {
-        matches!(self, IrType::StructRef(n) if n == GENERIC_PLACEHOLDER)
+        matches!(self, IrType::StructRef(n, args) if n == GENERIC_PLACEHOLDER && args.is_empty())
     }
 
     /// Recursively replace every [`IrType::TypeVar`] occurrence in `self`
@@ -164,7 +176,7 @@ impl IrType {
     /// backend, not by monomorphization).
     pub fn erase_type_vars(&self) -> IrType {
         match self {
-            IrType::TypeVar(_) => IrType::StructRef(GENERIC_PLACEHOLDER.to_string()),
+            IrType::TypeVar(_) => IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new()),
             IrType::ListRef(inner) => IrType::ListRef(Box::new(inner.erase_type_vars())),
             IrType::MapRef(k, v) => {
                 IrType::MapRef(Box::new(k.erase_type_vars()), Box::new(v.erase_type_vars()))
@@ -180,12 +192,15 @@ impl IrType {
                 name.clone(),
                 args.iter().map(IrType::erase_type_vars).collect(),
             ),
+            IrType::StructRef(name, args) => IrType::StructRef(
+                name.clone(),
+                args.iter().map(IrType::erase_type_vars).collect(),
+            ),
             IrType::I64
             | IrType::F64
             | IrType::Bool
             | IrType::Void
             | IrType::StringRef
-            | IrType::StructRef(_)
             | IrType::DynRef(_) => self.clone(),
         }
     }
@@ -199,7 +214,20 @@ impl fmt::Display for IrType {
             IrType::Bool => write!(f, "bool"),
             IrType::Void => write!(f, "void"),
             IrType::StringRef => write!(f, "string"),
-            IrType::StructRef(name) => write!(f, "struct.{name}"),
+            IrType::StructRef(name, args) => {
+                write!(f, "struct.{name}")?;
+                if !args.is_empty() {
+                    write!(f, "<")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{a}")?;
+                    }
+                    write!(f, ">")?;
+                }
+                Ok(())
+            }
             IrType::EnumRef(name, args) => {
                 write!(f, "enum.{name}")?;
                 if !args.is_empty() {
@@ -274,7 +302,10 @@ mod tests {
             erased,
             IrType::EnumRef(
                 "Option".into(),
-                vec![IrType::StructRef(GENERIC_PLACEHOLDER.to_string())]
+                vec![IrType::StructRef(
+                    GENERIC_PLACEHOLDER.to_string(),
+                    Vec::new()
+                )]
             )
         );
     }
@@ -289,7 +320,7 @@ mod tests {
             ],
         );
         let erased = ty.erase_type_vars();
-        let expected_placeholder = IrType::StructRef(GENERIC_PLACEHOLDER.to_string());
+        let expected_placeholder = IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new());
         assert_eq!(
             erased,
             IrType::EnumRef(

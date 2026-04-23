@@ -8,7 +8,10 @@ use phoenix_ir::types::IrType;
 /// Shorthand for an unresolved generic-arg slot in a stdlib enum layout,
 /// matching what `phoenix-ir/src/stdlib.rs` emits.
 fn placeholder() -> IrType {
-    IrType::StructRef(phoenix_ir::types::GENERIC_PLACEHOLDER.to_string())
+    IrType::StructRef(
+        phoenix_ir::types::GENERIC_PLACEHOLDER.to_string(),
+        Vec::new(),
+    )
 }
 
 /// Register the standard `Option` + `Result` enum layouts on `module`

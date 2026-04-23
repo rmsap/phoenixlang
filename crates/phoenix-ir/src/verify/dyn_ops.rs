@@ -229,7 +229,7 @@ mod dyn_verifier_tests {
             None,
         );
         let entry = func.create_block();
-        let val = func.add_block_param(entry, IrType::StructRef("Concrete".into()));
+        let val = func.add_block_param(entry, IrType::StructRef("Concrete".into(), Vec::new()));
         func.emit(
             entry,
             Op::DynAlloc("Trait".into(), "Concrete".into(), val),
@@ -343,7 +343,7 @@ mod dyn_verifier_tests {
             None,
         );
         let entry = func.create_block();
-        let val = func.add_block_param(entry, IrType::StructRef("Concrete".into()));
+        let val = func.add_block_param(entry, IrType::StructRef("Concrete".into(), Vec::new()));
         // DynAlloc with result type DynRef("OtherTrait") — mismatch.
         func.emit(
             entry,
@@ -522,7 +522,8 @@ mod dyn_verifier_tests {
             None,
         );
         let entry = func.create_block();
-        let concrete = func.add_block_param(entry, IrType::StructRef("Concrete".into()));
+        let concrete =
+            func.add_block_param(entry, IrType::StructRef("Concrete".into(), Vec::new()));
         let wrapped = func
             .emit(
                 entry,

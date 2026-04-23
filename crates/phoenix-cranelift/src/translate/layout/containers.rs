@@ -40,7 +40,10 @@ mod tests {
         assert_eq!(elem_size_bytes(&IrType::F64), 8);
         assert_eq!(elem_size_bytes(&IrType::Bool), 8);
         assert_eq!(elem_size_bytes(&IrType::StringRef), 16);
-        assert_eq!(elem_size_bytes(&IrType::StructRef("X".into())), 8);
+        assert_eq!(
+            elem_size_bytes(&IrType::StructRef("X".into(), Vec::new())),
+            8
+        );
         assert_eq!(elem_size_bytes(&IrType::Void), 0);
     }
 

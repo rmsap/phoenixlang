@@ -47,6 +47,66 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    /// If sema resolved the type at `span` to a known struct, return its
+    /// name and sema-level type args. Mirrors [`Self::enum_type_at`] —
+    /// the struct-construction lowering paths use it to thread concrete
+    /// type arguments into `IrType::StructRef(name, args)` so
+    /// struct-monomorphization can specialize per-instantiation.
+    ///
+    /// Returns `None` for non-struct types, unresolved spans, or names
+    /// absent from `struct_layouts`.
+    fn struct_type_at(&self, span: &Span) -> Option<(String, Vec<Type>)> {
+        let source_ty = self.source_type(span)?;
+        let (name, args) = match source_ty {
+            Type::Generic(n, a) => (n.clone(), a.clone()),
+            Type::Named(n) => (n.clone(), Vec::new()),
+            _ => return None,
+        };
+        if self.module.struct_layouts.contains_key(&name) {
+            Some((name, args))
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a struct field's IR type at a concrete use site.
+    ///
+    /// The layout in `struct_layouts` is keyed by the template's bare
+    /// name and its field types may contain `IrType::TypeVar(T)` for
+    /// generic structs.  When the receiver's sema type carries concrete
+    /// args (e.g. `Container<Int>`), substitute each `TypeVar` with the
+    /// corresponding concrete type so callers see a fully-resolved field
+    /// type.
+    ///
+    /// This is the *lowering-time* half of Phoenix's dual TypeVar
+    /// substitution (see the module-level doc in `monomorphize.rs`).
+    /// Template method bodies — where the receiver's sema type is a bare
+    /// `Named("Foo")` with no args — take the no-op path here and are
+    /// substituted later by [`crate::monomorphize::substitute_types_in_fn`]
+    /// when struct-mono clones and specializes the method body.
+    fn resolve_field_type(
+        &self,
+        struct_name: &str,
+        sema_args: &[Type],
+        raw_field_ty: &IrType,
+    ) -> IrType {
+        if sema_args.is_empty() {
+            return raw_field_ty.clone();
+        }
+        let Some(type_params) = self.module.struct_type_params.get(struct_name) else {
+            return raw_field_ty.clone();
+        };
+        if type_params.len() != sema_args.len() {
+            return raw_field_ty.clone();
+        }
+        let subst: std::collections::HashMap<String, IrType> = type_params
+            .iter()
+            .cloned()
+            .zip(sema_args.iter().map(|t| lower_type(t, self.check)))
+            .collect();
+        crate::monomorphize::substitute(raw_field_ty, &subst)
+    }
+
     /// Lower an expression and return the [`ValueId`] of its result.
     pub(crate) fn lower_expr(&mut self, expr: &Expr) -> ValueId {
         match expr {
@@ -461,7 +521,11 @@ impl<'a> LoweringContext<'a> {
 
             // Check for a struct constructor (e.g. `Point(1, 2)` parsed as a call).
             if let Some(args) = self.coerce_struct_ctor_args(&ident.name, &positional, call.span) {
-                let result_type = IrType::StructRef(ident.name.clone());
+                let type_args: Vec<IrType> = self
+                    .struct_type_at(&call.span)
+                    .map(|(_, sema_args)| self.lower_type_args(&sema_args))
+                    .unwrap_or_default();
+                let result_type = IrType::StructRef(ident.name.clone(), type_args);
                 return self.emit(Op::StructAlloc(ident.name.clone(), args), result_type, span);
             }
         }
@@ -555,11 +619,16 @@ impl<'a> LoweringContext<'a> {
             .source_type(&fa.object.span())
             .cloned()
             .unwrap_or_else(|| unreachable!("missing sema type for field assignment object"));
-        if let Type::Named(ref struct_name) = obj_type
-            && let Some(layout) = self.module.struct_layouts.get(struct_name).cloned()
+        let (struct_name, sema_args) = match &obj_type {
+            Type::Named(n) => (Some(n.clone()), Vec::new()),
+            Type::Generic(n, args) => (Some(n.clone()), args.clone()),
+            _ => (None, Vec::new()),
+        };
+        if let Some(struct_name) = struct_name
+            && let Some(layout) = self.module.struct_layouts.get(&struct_name).cloned()
             && let Some(idx) = layout.iter().position(|(name, _)| *name == fa.field)
         {
-            let field_type = layout[idx].1.clone();
+            let field_type = self.resolve_field_type(&struct_name, &sema_args, &layout[idx].1);
             let val = self.coerce_expr_to_expected(val, fa.value.span(), &field_type, fa.span);
             self.emit_void(Op::StructSetField(obj, idx as u32, val), Some(fa.span));
         }
@@ -577,11 +646,25 @@ impl<'a> LoweringContext<'a> {
             .cloned()
             .unwrap_or_else(|| unreachable!("missing sema type for field access object"));
 
-        if let Type::Named(ref struct_name) = obj_type
-            && let Some(layout) = self.module.struct_layouts.get(struct_name).cloned()
+        // Extract the struct name and any concrete type args from either
+        // `Named("Foo")` or `Generic("Foo", [...])`. The latter arises on
+        // field accesses against generic-struct values (`c.value` where
+        // `c: Container<Int>`). Layouts are still keyed by bare name
+        // pre-mono — struct-monomorphization rewrites post-mono
+        // StructRefs to mangled names — but the *sema* type carries the
+        // original Generic form, so lowering must accept both.
+        // `resolve_field_type` handles the per-use-site TypeVar
+        // substitution.
+        let (struct_name, sema_args) = match &obj_type {
+            Type::Named(n) => (Some(n.clone()), Vec::new()),
+            Type::Generic(n, args) => (Some(n.clone()), args.clone()),
+            _ => (None, Vec::new()),
+        };
+        if let Some(struct_name) = struct_name
+            && let Some(layout) = self.module.struct_layouts.get(&struct_name).cloned()
             && let Some(idx) = layout.iter().position(|(name, _)| *name == fa.field)
         {
-            let field_type = layout[idx].1.clone();
+            let field_type = self.resolve_field_type(&struct_name, &sema_args, &layout[idx].1);
             return self.emit(Op::StructGetField(obj, idx as u32), field_type, span);
         }
 
@@ -664,7 +747,11 @@ impl<'a> LoweringContext<'a> {
         let args = self
             .coerce_struct_ctor_args(&sl.name, &args, sl.span)
             .unwrap_or(args);
-        let result_type = IrType::StructRef(sl.name.clone());
+        let type_args: Vec<IrType> = self
+            .struct_type_at(&sl.span)
+            .map(|(_, sema_args)| self.lower_type_args(&sema_args))
+            .unwrap_or_default();
+        let result_type = IrType::StructRef(sl.name.clone(), type_args);
         self.emit(Op::StructAlloc(sl.name.clone(), args), result_type, span)
     }
 
