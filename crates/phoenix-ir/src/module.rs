@@ -1,4 +1,13 @@
 //! Top-level IR module and function definitions.
+//!
+//! Trait-registry types and helpers ([`IrTraitInfo`], [`IrTraitMethod`],
+//! [`DynVtable`], [`VtableEntry`]) live in the [`trait_registry`]
+//! submodule and are re-exported at this level so existing imports
+//! (`use phoenix_ir::module::IrTraitInfo`) keep working.
+
+pub mod trait_registry;
+
+pub use trait_registry::{DynVtable, IrTraitInfo, IrTraitMethod, VtableEntry};
 
 use crate::block::{BasicBlock, BlockId};
 use crate::instruction::{FuncId, Instruction, Op, ValueId};
@@ -29,6 +38,50 @@ pub struct IrModule {
     pub function_index: HashMap<String, FuncId>,
     /// Method dispatch table: `(type_name, method_name)` → [`FuncId`].
     pub method_index: HashMap<(String, String), FuncId>,
+    /// Trait-object vtable registry: `(concrete_type, trait_name)` →
+    /// ordered list of `(method_name, FuncId)` pairs.
+    ///
+    /// **Slot-index contract:** `entries[i]` corresponds to
+    /// `traits[trait_name].methods[i]` — i.e. declaration order is the
+    /// vtable slot index. Every `Op::DynCall` carries this pre-resolved
+    /// index, and codegen is a direct `vtable_ptr[i * POINTER_SIZE]`
+    /// load. Do not sort, reorder, or de-duplicate entries.
+    ///
+    /// Method names ride alongside `FuncId`s for debug display and so the
+    /// interpreter can surface method names in runtime errors.
+    ///
+    /// Populated by IR lowering (pre-monomorphization) at every
+    /// concrete-to-`dyn` coercion site. Consumed by the IR interpreter
+    /// (method dispatch) and the Cranelift backend (rodata vtable
+    /// emission).
+    ///
+    /// **Provisional keying.** The `concrete_type` key is the struct /
+    /// enum's *bare* name. This is correct for every concrete type
+    /// supported in compiled mode today, because generic user-defined
+    /// structs are not yet supported
+    /// ([docs/known-issues.md](../../../../docs/known-issues.md#generic-user-defined-structs-are-not-supported-in-compiled-mode)).
+    /// Once that gate lifts (committed before Phase 2.2 closes), the key
+    /// will need to carry the full generic instantiation — otherwise
+    /// `Container<Int>` and `Container<String>` collide on `"Container"`
+    /// and the second registration silently clobbers the first. The
+    /// planned migration is to key on a `ConcreteTypeSignature` newtype
+    /// wrapping `(name, Vec<IrType>)`; the `FuncId` values inside the
+    /// entries stay stable, so the change is contained to this map plus
+    /// `register_dyn_vtable`, `verify_dyn_vtable_shapes`, and the
+    /// Cranelift vtable-emission cache.
+    pub dyn_vtables: HashMap<(String, String), DynVtable>,
+    /// Trait declarations visible at the IR level, keyed by trait name.
+    ///
+    /// Mirrors sema's `TraitInfo` but holds [`IrType`]-lowered method
+    /// signatures so downstream passes (verifier, Cranelift backend, IR
+    /// interpreter) do not have to reach back into sema metadata.
+    ///
+    /// Populated during IR lowering registration for every declared
+    /// trait that is *object-safe* (i.e. sema's `object_safety_error` is
+    /// `None`). Non-object-safe traits are omitted: they cannot appear
+    /// in `DynRef` / `DynCall` positions, so no IR-level consumer needs
+    /// their signatures.
+    pub traits: HashMap<String, IrTraitInfo>,
 }
 
 impl IrModule {
@@ -43,9 +96,22 @@ impl IrModule {
     pub fn concrete_functions(&self) -> impl Iterator<Item = &IrFunction> {
         self.functions.iter().filter(|f| !f.is_generic_template)
     }
-}
 
-impl IrModule {
+    /// Look up the (params, return_type) of `trait_name`'s method at slot
+    /// `method_idx`.
+    ///
+    /// Reads directly from [`Self::traits`] — the IR-level trait metadata
+    /// populated at lowering time — so the result is available for every
+    /// object-safe trait in the program, including traits whose
+    /// `impl` blocks have not been exercised by any coercion site.
+    pub fn trait_method_signature(
+        &self,
+        trait_name: &str,
+        method_idx: usize,
+    ) -> Option<(&[IrType], &IrType)> {
+        self.traits.get(trait_name)?.method_signature(method_idx)
+    }
+
     /// Creates an empty module.
     pub fn new() -> Self {
         Self {
@@ -55,6 +121,8 @@ impl IrModule {
             enum_type_params: HashMap::new(),
             function_index: HashMap::new(),
             method_index: HashMap::new(),
+            dyn_vtables: HashMap::new(),
+            traits: HashMap::new(),
         }
     }
 }
@@ -83,6 +151,17 @@ pub struct IrFunction {
     pub blocks: Vec<BasicBlock>,
     /// Counter for fresh [`ValueId`] allocation.
     next_value_id: u32,
+    /// Per-value type index, parallel to [`ValueId`] allocation: the type at
+    /// position `i` is the IR type of `ValueId(i)`, or `None` if that value
+    /// was allocated as a fresh id but never attached to an instruction
+    /// result or block parameter (should not occur in well-formed IR).
+    ///
+    /// Populated by [`Self::emit`] and [`Self::add_block_param`] as a side
+    /// effect so [`Self::instruction_result_type`] can answer in O(1)
+    /// instead of scanning every block. Function parameters appear here too
+    /// because lowering binds them as entry-block parameters (see
+    /// `phoenix-ir/src/lower_stmt.rs::lower_function_body`).
+    value_types: Vec<Option<IrType>>,
     /// Counter for fresh [`BlockId`] allocation.
     next_block_id: u32,
     /// Source span of the original function declaration (for debug info).
@@ -125,6 +204,7 @@ impl IrFunction {
             return_type,
             blocks: Vec::new(),
             next_value_id: 0,
+            value_types: Vec::new(),
             next_block_id: 0,
             span,
             type_param_names: Vec::new(),
@@ -137,10 +217,27 @@ impl IrFunction {
         self.next_value_id
     }
 
-    /// Allocates a fresh [`ValueId`].
+    /// Length of the per-value type index. Equal to `value_count()` in
+    /// well-formed IR; the verifier (`verify_value_types_index`) pins the
+    /// invariant.
+    pub fn value_types_len(&self) -> usize {
+        self.value_types.len()
+    }
+
+    /// Mutable view of the per-value type index for use by passes that
+    /// substitute types after the fact (e.g. monomorphization). Callers
+    /// must preserve the `value_id → type` parallel with
+    /// `result_type` / `block.params.1`.
+    pub fn value_types_mut(&mut self) -> &mut [Option<IrType>] {
+        &mut self.value_types
+    }
+
+    /// Allocates a fresh [`ValueId`]. The value has no type until
+    /// [`Self::emit`] or [`Self::add_block_param`] attaches one.
     pub fn fresh_value(&mut self) -> ValueId {
         let id = ValueId(self.next_value_id);
         self.next_value_id += 1;
+        self.value_types.push(None);
         id
     }
 
@@ -177,6 +274,43 @@ impl IrFunction {
         &self.blocks[id.0 as usize]
     }
 
+    /// Look up the IR type that was recorded for a [`ValueId`] when it was
+    /// emitted into one of this function's blocks, attached as a block
+    /// parameter, or bound as a function parameter (function parameters are
+    /// represented as entry-block parameters in Phoenix IR).
+    ///
+    /// Returns `None` for a `ValueId` that belongs to a different function
+    /// (out-of-range index). O(1): the type is recorded in `value_types`
+    /// at allocation time by [`Self::emit`] and [`Self::add_block_param`].
+    ///
+    /// Used by IR lowering's dyn-coercion path (see
+    /// [`crate::lower::LoweringContext::coerce_args_to_expected`]) to
+    /// recover an argument's current IR type at the call site.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `ValueId` is in-range for this function's
+    /// `value_types` vector but the slot is `None`. That case indicates
+    /// a compiler bug: a pass allocated a fresh `ValueId` via
+    /// [`Self::fresh_value`] without attaching a type via
+    /// [`Self::emit`] or [`Self::add_block_param`]. Silently returning
+    /// `None` here would let dyn-coercion sites lose the actual type
+    /// and silently miscompile. See
+    /// [known-issues.md](../../docs/known-issues.md#irfunctionvalue_types-is-a-parallel-index-without-a-type-level-guarantee)
+    /// for the planned `ValueIdAllocator` newtype that turns this into
+    /// a type-level invariant.
+    pub fn instruction_result_type(&self, value: ValueId) -> Option<&IrType> {
+        let slot = self.value_types.get(value.0 as usize)?;
+        Some(slot.as_ref().unwrap_or_else(|| {
+            panic!(
+                "instruction_result_type: ValueId({}) in function `{}` has no recorded \
+                 type — a pass allocated a fresh id without emit/add_block_param. See \
+                 docs/known-issues.md: `IrFunction.value_types` parallel-index invariant.",
+                value.0, self.name,
+            )
+        }))
+    }
+
     /// Appends an instruction to the specified block and returns its result
     /// [`ValueId`] (if the instruction produces a value).
     pub fn emit(
@@ -187,7 +321,9 @@ impl IrFunction {
         span: Option<Span>,
     ) -> Option<ValueId> {
         let result = if result_type != IrType::Void {
-            Some(self.fresh_value())
+            let id = self.fresh_value();
+            self.value_types[id.0 as usize] = Some(result_type.clone());
+            Some(id)
         } else {
             None
         };
@@ -229,7 +365,36 @@ impl IrFunction {
     /// Adds a block parameter and returns its [`ValueId`].
     pub fn add_block_param(&mut self, block: BlockId, ty: IrType) -> ValueId {
         let id = self.fresh_value();
+        self.value_types[id.0 as usize] = Some(ty.clone());
         self.block_mut(block).params.push((id, ty));
         id
+    }
+
+    /// Call `f` on every mutable [`IrType`] annotation inside this
+    /// function: parameters, return, block-parameter types, every
+    /// instruction's result type, and the per-value type index.
+    ///
+    /// Intended for passes that substitute types after the fact
+    /// (monomorphization is the canonical caller). Going through this
+    /// method instead of hand-rolling a walk keeps the four parallel
+    /// type annotations on [`IrFunction`] in sync — forgetting one of
+    /// them is a silent mis-compile, and adding a new list-of-types to
+    /// this struct requires updating exactly one place here.
+    pub fn for_each_type_mut(&mut self, mut f: impl FnMut(&mut IrType)) {
+        for pt in &mut self.param_types {
+            f(pt);
+        }
+        f(&mut self.return_type);
+        for block in &mut self.blocks {
+            for instr in &mut block.instructions {
+                f(&mut instr.result_type);
+            }
+            for bp in &mut block.params {
+                f(&mut bp.1);
+            }
+        }
+        for ty in self.value_types.iter_mut().flatten() {
+            f(ty);
+        }
     }
 }

@@ -325,6 +325,7 @@ impl<'src> Lexer<'src> {
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
             "trait" => TokenKind::Trait,
+            "dyn" => TokenKind::Dyn,
             "type" => TokenKind::Type,
             "endpoint" => TokenKind::Endpoint,
             "body" => TokenKind::Body,

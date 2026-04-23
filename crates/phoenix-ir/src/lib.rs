@@ -38,6 +38,7 @@ pub mod verify;
 /// AST-to-IR lowering pass.
 pub mod lower;
 mod lower_decl;
+mod lower_dyn;
 mod lower_expr;
 mod lower_match;
 mod lower_stmt;

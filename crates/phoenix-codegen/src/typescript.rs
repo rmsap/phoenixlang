@@ -985,6 +985,10 @@ fn type_to_ts(ty: &Type) -> String {
             format!("({}) => {}", ps.join(", "), type_to_ts(ret))
         }
         Type::TypeVar(name) => name.clone(),
+        // Trait objects erase to the trait name on the TS side (structural
+        // interface dispatch handles the runtime variance); sharper mappings
+        // can replace this when specific traits get per-trait TS shims.
+        Type::Dyn(name) => name.clone(),
         Type::Error => "unknown".to_string(),
     }
 }
@@ -1018,6 +1022,7 @@ fn type_expr_to_ts(te: &TypeExpr) -> String {
                 .collect();
             format!("({}) => {}", ps.join(", "), type_expr_to_ts(&f.return_type))
         }
+        TypeExpr::Dyn(d) => d.trait_name.clone(),
     }
 }
 
@@ -1846,5 +1851,29 @@ struct User { Int id  String name }
             !files.types.contains("validateUser"),
             "should not emit struct validation function when no constraints"
         );
+    }
+
+    // ── dyn Trait handling ───────────────────────────────────────────
+
+    /// `dyn Trait` erases to the trait name on the TypeScript side —
+    /// structural interface dispatch handles the runtime variance.
+    #[test]
+    fn dyn_type_erases_to_trait_name() {
+        use phoenix_sema::types::Type;
+        assert_eq!(type_to_ts(&Type::Dyn("Drawable".to_string())), "Drawable");
+    }
+
+    /// End-to-end: a parser-level `TypeExpr::Dyn` erases to the trait
+    /// name at the parser-expr codegen site too (exercises
+    /// `type_expr_to_ts`, not just `type_to_ts`).
+    #[test]
+    fn dyn_type_expr_erases_to_trait_name() {
+        use phoenix_common::span::Span;
+        use phoenix_parser::ast::{DynType, TypeExpr};
+        let te = TypeExpr::Dyn(DynType {
+            trait_name: "Drawable".to_string(),
+            span: Span::BUILTIN,
+        });
+        assert_eq!(type_expr_to_ts(&te), "Drawable");
     }
 }

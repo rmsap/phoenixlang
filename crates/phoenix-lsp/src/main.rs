@@ -458,6 +458,7 @@ fn format_type(ty: &Type) -> String {
             format!("({}) -> {}", params_str.join(", "), format_type(ret))
         }
         Type::TypeVar(name) => name.clone(),
+        Type::Dyn(name) => format!("dyn {}", name),
         Type::Error => "?".to_string(),
     }
 }
@@ -721,6 +722,108 @@ mod tests {
     #[test]
     fn format_type_error() {
         assert_eq!(format_type(&Type::Error), "?");
+    }
+
+    /// Hover over a `dyn Trait` value must render as `dyn Trait` — not as
+    /// the erased trait name or an `unknown` fallback. Pins the user-visible
+    /// hover text to the source syntax so editor tooltips mirror what the
+    /// programmer wrote.
+    #[test]
+    fn format_type_dyn_trait() {
+        assert_eq!(
+            format_type(&Type::Dyn("Drawable".to_string())),
+            "dyn Drawable"
+        );
+    }
+
+    /// `dyn Trait` nested inside a generic (e.g. `List<dyn Drawable>`)
+    /// should render naturally too — not collapse the `dyn` into the
+    /// generic's arg list or lose the keyword.
+    #[test]
+    fn format_type_dyn_inside_generic() {
+        let ty = Type::Generic("List".to_string(), vec![Type::Dyn("Drawable".to_string())]);
+        assert_eq!(format_type(&ty), "List<dyn Drawable>");
+    }
+
+    /// Hover on a function value whose parameter is `dyn Trait` — the
+    /// signature-rendering path must preserve the `dyn` keyword so
+    /// editor tooltips over higher-order function types are accurate.
+    #[test]
+    fn format_type_dyn_in_function_param() {
+        let ty = Type::Function(
+            vec![Type::Dyn("Drawable".to_string())],
+            Box::new(Type::String),
+        );
+        assert_eq!(format_type(&ty), "(dyn Drawable) -> String");
+    }
+
+    /// Hover on a function value returning `dyn Trait` — same contract
+    /// at return position.
+    #[test]
+    fn format_type_dyn_in_function_return() {
+        let ty = Type::Function(
+            vec![Type::Bool],
+            Box::new(Type::Dyn("Drawable".to_string())),
+        );
+        assert_eq!(format_type(&ty), "(Bool) -> dyn Drawable");
+    }
+
+    /// Deeply nested dyn: `Option<List<dyn Drawable>>`. Exercises two
+    /// levels of generic recursion around a `dyn` leaf.
+    #[test]
+    fn format_type_dyn_two_levels_nested() {
+        let ty = Type::Generic(
+            "Option".to_string(),
+            vec![Type::Generic(
+                "List".to_string(),
+                vec![Type::Dyn("Drawable".to_string())],
+            )],
+        );
+        assert_eq!(format_type(&ty), "Option<List<dyn Drawable>>");
+    }
+
+    /// `find_definition_span` on a struct that declares a `dyn Trait`
+    /// field still locates the struct's own definition span. Goto-def
+    /// on the struct name from a `dyn Trait`-carrying type should
+    /// behave identically to a plain struct. (Separate feature gap:
+    /// goto-def *on the trait name inside `dyn Trait`* requires a
+    /// `SymbolKind::Trait` variant, not yet modelled.)
+    #[test]
+    fn find_definition_span_struct_with_dyn_field() {
+        let src = "trait Drawable { function draw(self) -> String }\n\
+                   struct Scene { dyn Drawable hero }\n\
+                   function main() { }";
+        let tokens = tokenize(src, SourceId(0));
+        let (program, _) = parser::parse(&tokens);
+        let result = checker::check(&program);
+        let span = find_definition_span(&SymbolKind::Struct, "Scene", &result);
+        assert!(span.is_some(), "struct Scene with dyn field should resolve");
+        let s = span.unwrap();
+        assert!(s.start < s.end);
+    }
+
+    /// A struct field typed `dyn Trait` resolves to the correct field
+    /// span — exercises `SymbolKind::Field` on a `dyn`-carrying
+    /// layout, pinning that the dyn work didn't break the per-field
+    /// resolver.
+    #[test]
+    fn find_definition_span_dyn_field() {
+        let src = "trait Drawable { function draw(self) -> String }\n\
+                   struct Scene { dyn Drawable hero }\n\
+                   function main() { }";
+        let tokens = tokenize(src, SourceId(0));
+        let (program, _) = parser::parse(&tokens);
+        let result = checker::check(&program);
+        let span = find_definition_span(
+            &SymbolKind::Field {
+                struct_name: "Scene".to_string(),
+            },
+            "hero",
+            &result,
+        );
+        assert!(span.is_some(), "dyn-typed field `hero` should resolve");
+        let s = span.unwrap();
+        assert!(s.start < s.end);
     }
 
     // ── find_definition_span: method and enum variant ───────────────

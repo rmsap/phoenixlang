@@ -73,6 +73,13 @@ pub enum IrType {
     ///   non-generic enum). Consumers must fall back to other inference
     ///   strategies when `args.get(i)` is `None`.
     EnumRef(String, Vec<IrType>),
+    /// A trait object `dyn TraitName`: a `(data_ptr, vtable_ptr)` pair,
+    /// represented inline as two slots (parallel to [`IrType::StringRef`]'s
+    /// two-slot `(ptr, len)` layout).  The string is the trait name; the
+    /// vtable layout for a given `(concrete_type, trait)` pair lives in
+    /// [`crate::module::IrModule::dyn_vtables`].  See `docs/design-decisions.md`
+    /// for the ABI rationale and the "why explicit `dyn`" discussion.
+    DynRef(String),
     /// Heap-allocated `List<T>`.
     ListRef(Box<IrType>),
     /// Heap-allocated `Map<K, V>`.
@@ -115,6 +122,7 @@ impl IrType {
             IrType::StringRef
             | IrType::StructRef(_)
             | IrType::EnumRef(_, _)
+            | IrType::DynRef(_)
             | IrType::ListRef(_)
             | IrType::MapRef(_, _)
             | IrType::ClosureRef { .. } => false,
@@ -177,7 +185,8 @@ impl IrType {
             | IrType::Bool
             | IrType::Void
             | IrType::StringRef
-            | IrType::StructRef(_) => self.clone(),
+            | IrType::StructRef(_)
+            | IrType::DynRef(_) => self.clone(),
         }
     }
 }
@@ -220,6 +229,7 @@ impl fmt::Display for IrType {
                 }
                 write!(f, ") -> {return_type}")
             }
+            IrType::DynRef(name) => write!(f, "dyn.{name}"),
             IrType::TypeVar(name) => write!(f, "{name}"),
         }
     }

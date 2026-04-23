@@ -270,12 +270,14 @@ impl Checker {
                 })
                 .collect()
         });
+        let object_safety_error = crate::object_safety::validate(&methods);
         self.traits.insert(
             t.name.clone(),
             TraitInfo {
                 definition_span: t.name_span,
                 type_params: t.type_params.clone(),
                 methods,
+                object_safety_error,
             },
         );
     }

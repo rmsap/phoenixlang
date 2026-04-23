@@ -13,6 +13,7 @@ mod calls;
 mod closure_call;
 mod control;
 mod data;
+mod dyn_trait;
 mod enum_combinators;
 mod enum_helpers;
 mod enum_type_inference;
@@ -375,6 +376,10 @@ fn translate_op(
         // Function calls
         Op::Call(..) | Op::CallIndirect(..) | Op::BuiltinCall(..) => {
             calls::translate_call(builder, ctx, ir_module, op, result_type, state)
+        }
+
+        Op::DynAlloc(..) | Op::DynCall(..) => {
+            dyn_trait::translate_dyn_op(builder, ctx, ir_module, op, state)
         }
 
         // Mutable variables

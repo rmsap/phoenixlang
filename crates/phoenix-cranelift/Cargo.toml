@@ -19,6 +19,7 @@ phoenix-common = { path = "../phoenix-common" }
 phoenix-lexer = { path = "../phoenix-lexer" }
 phoenix-parser = { path = "../phoenix-parser" }
 phoenix-sema = { path = "../phoenix-sema" }
+phoenix-interp = { path = "../phoenix-interp" }
 phoenix-ir-interp = { path = "../phoenix-ir-interp" }
 phoenix-runtime = { path = "../phoenix-runtime" }
 insta = { workspace = true }

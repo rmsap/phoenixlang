@@ -3381,3 +3381,352 @@ function main() {
         }
     }
 }
+
+// ── dyn Trait negative tests ─────────────────────────────────────────
+
+/// `dyn NonexistentTrait` in a function parameter position must be
+/// rejected with the "unknown trait" diagnostic — not silently accepted.
+#[test]
+fn dyn_unknown_trait_in_param_position_is_rejected() {
+    assert_has_error(
+        "function take(x: dyn Unknown) -> Int { 0 }
+         function main() { }",
+        "unknown trait `Unknown`",
+    );
+}
+
+#[test]
+fn dyn_unknown_trait_in_return_position_is_rejected() {
+    assert_has_error(
+        "function make() -> dyn Unknown { }
+         function main() { }",
+        "unknown trait `Unknown`",
+    );
+}
+
+#[test]
+fn dyn_unknown_trait_in_let_annotation_is_rejected() {
+    assert_has_error(
+        "function main() { let x: dyn Unknown = 0 }",
+        "unknown trait `Unknown`",
+    );
+}
+
+#[test]
+fn dyn_unknown_trait_in_struct_field_is_rejected() {
+    assert_has_error(
+        "struct Holder { dyn Unknown value }
+         function main() { }",
+        "unknown trait `Unknown`",
+    );
+}
+
+#[test]
+fn dyn_unknown_trait_in_list_element_is_rejected() {
+    assert_has_error(
+        "function main() { let xs: List<dyn Unknown> = [] }",
+        "unknown trait `Unknown`",
+    );
+}
+
+/// `dyn` over a trait whose method takes `Self` as a parameter must
+/// surface the object-safety error and point users at static dispatch.
+#[test]
+fn dyn_non_object_safe_trait_self_in_param_is_rejected() {
+    assert_has_error(
+        "trait Eq { function eq(self, other: Self) -> Bool }
+         struct Point { Int x }
+         function main() { let e: dyn Eq = Point(0) }",
+        "not object-safe",
+    );
+}
+
+/// `dyn` over a trait whose method returns `Self` must surface the
+/// object-safety error.
+#[test]
+fn dyn_non_object_safe_trait_self_in_return_is_rejected() {
+    assert_has_error(
+        "trait Cloneable { function duplicate(self) -> Self }
+         struct Point { Int x }
+         function main() { let c: dyn Cloneable = Point(0) }",
+        "not object-safe",
+    );
+}
+
+/// `Self` nested inside a generic arg (e.g. `Option<Self>`) must also be
+/// caught by object-safety.
+#[test]
+fn dyn_non_object_safe_trait_self_nested_in_generic_arg() {
+    assert_has_error(
+        "trait MaybeSelf { function maybe(self) -> Option<Self> }
+         struct Point { Int x }
+         function main() { let m: dyn MaybeSelf = Point(0) }",
+        "not object-safe",
+    );
+}
+
+/// Even when `dyn NonObjectSafeTrait` is rejected, the trait must still
+/// be usable as a generic bound — that's the whole point of allowing
+/// non-object-safe traits into the program.
+#[test]
+fn non_object_safe_trait_still_usable_as_generic_bound() {
+    assert_no_errors(
+        "trait Eq { function eq(self, other: Self) -> Bool }
+         function takeEq<T: Eq>(x: T) -> Int { 0 }
+         function main() { }",
+    );
+}
+
+/// Coercion of a concrete type that does not implement the trait into a
+/// `dyn Trait` slot should be rejected at the assignment boundary, not
+/// silently accepted via a fallthrough in `types_compatible`.
+#[test]
+fn dyn_rejects_concrete_that_does_not_impl_trait() {
+    assert_has_error(
+        "trait Drawable { function draw(self) -> String }
+         struct Point { Int x }
+         // Point has no `impl Drawable`, so the coercion must fail.
+         function main() { let d: dyn Drawable = Point(0) }",
+        "type mismatch",
+    );
+}
+
+/// Empty list literal annotated as `List<dyn Trait>` — the documented
+/// half-broken `push` workaround. Sema rejects with a "type mismatch"
+/// because the empty `[]` types as `List<T>` and the annotation's
+/// `List<dyn Drawable>` doesn't propagate. Pins the user-visible failure
+/// mode until bidirectional inference lands. See
+/// `docs/known-issues.md` ("`List<dyn Trait>` literal initialization in
+/// compiled mode") for the full rationale.
+#[test]
+fn empty_list_of_dyn_literal_is_rejected() {
+    assert_has_error(
+        "trait Drawable { function draw(self) -> String }
+         function main() {
+             let xs: List<dyn Drawable> = []
+         }",
+        "type mismatch",
+    );
+}
+
+/// Populated `List<dyn Trait>` literals (`[Circle(1), Circle(2)]` typed
+/// `List<dyn Drawable>`) are *accepted by sema* today (the recursive
+/// `types_compatible` rule applies the dyn coercion element-wise). They
+/// then fail in IR lowering / Cranelift codegen because element-wise
+/// `Op::DynAlloc` wraps are never materialized. This test pins the
+/// current "sema accepts" behaviour so a future tightening at the sema
+/// layer is a deliberate change, not a silent regression. The IR-side
+/// rejection is exercised by the `#[ignore]`d compile test
+/// `dyn_list_via_push_workaround`.
+#[test]
+fn populated_list_of_dyn_literal_is_currently_accepted_by_sema() {
+    assert_no_errors(
+        "trait Drawable { function draw(self) -> String }
+         struct Circle { Int r }
+         impl Drawable for Circle {
+             function draw(self) -> String { return \"c\" }
+         }
+         function takeList(xs: List<dyn Drawable>) -> Int { 0 }
+         function main() {
+             takeList([Circle(1), Circle(2)])
+         }",
+    );
+}
+
+/// Multi-bound trait objects (`dyn Foo + Bar`) are out of scope for Phase
+/// 2.2. The parser must surface a clean diagnostic at the `+` rather than
+/// silently accepting one bound and leaving the other dangling.
+#[test]
+fn dyn_multi_bound_is_rejected() {
+    // The exact diagnostic depends on which layer rejects (parser vs. sema).
+    // Today the parser hits the `+` after `dyn Drawable` mid-expression and
+    // surfaces a parse-shaped error; either layer rejecting is fine, the
+    // contract is "the program fails to compile cleanly".
+    let source = "trait Drawable { function draw(self) -> String }
+                  trait Sized { function size(self) -> Int }
+                  function f(x: dyn Drawable + Sized) -> Int { 0 }
+                  function main() { }";
+    let tokens = phoenix_lexer::lexer::tokenize(source, phoenix_common::span::SourceId(0));
+    let (program, parse_errors) = phoenix_parser::parser::parse(&tokens);
+    let result = crate::checker::check(&program);
+    assert!(
+        !parse_errors.is_empty() || !result.diagnostics.is_empty(),
+        "expected parser or sema to reject `dyn Drawable + Sized` — got no \
+         diagnostics. parse_errors={parse_errors:?}, sema_diagnostics={:?}",
+        result.diagnostics
+    );
+}
+
+/// `dyn Trait` in *value* position (not type position) — `let x = dyn Foo`
+/// — must be rejected. `dyn` is a type-expression keyword; using it as an
+/// expression is a parse error.
+#[test]
+fn dyn_in_value_position_is_rejected() {
+    let source = "trait Drawable { function draw(self) -> String }
+                  function main() { let x = dyn Drawable }";
+    let tokens = phoenix_lexer::lexer::tokenize(source, phoenix_common::span::SourceId(0));
+    let (_program, parse_errors) = phoenix_parser::parser::parse(&tokens);
+    assert!(
+        !parse_errors.is_empty(),
+        "expected parser to reject `dyn` in value position — got no parse errors"
+    );
+}
+
+/// Coercion from a type variable bound by trait `Foo` into `dyn Bar` (an
+/// unrelated trait) must fail. `concrete_type_impls_trait` should not
+/// accept any TypeVar/dyn pair just because both sides happen to be
+/// type-system-shaped.
+#[test]
+fn dyn_coercion_with_mismatched_trait_bound_is_rejected() {
+    assert_has_error(
+        "trait Foo { function f(self) -> Int }
+         trait Bar { function b(self) -> Int }
+         function go<T: Foo>(x: T) -> Int {
+             let d: dyn Bar = x
+             d.b()
+         }
+         function main() { }",
+        "type mismatch",
+    );
+}
+
+// ── dyn Trait positive coercion-boundary tests ───────────────────────
+//
+// The 6 coercion boundaries documented in `docs/dyn-trait.md` ("When
+// the wrap happens"):
+//   1. function-call argument
+//   2. let binding with `dyn` annotation              (covered: dyn_unknown_trait_in_let_annotation_is_rejected exercises the path)
+//   3. reassignment to a `let mut` typed `dyn`
+//   4. function return
+//   5. struct field typed `dyn`
+//   6. enum variant field typed `dyn`
+//
+// These tests pin that *successful* coercion of an implementor into
+// each boundary type-checks cleanly. Each is the positive companion
+// to the existing rejection tests, so the next regression is loud.
+
+const DRAWABLE_PRELUDE: &str = "trait Drawable { function draw(self) -> String }
+                                struct Circle { Int radius }
+                                impl Drawable for Circle {
+                                    function draw(self) -> String { return \"c\" }
+                                }
+                                struct Square { Int side }
+                                impl Drawable for Square {
+                                    function draw(self) -> String { return \"s\" }
+                                }";
+
+fn with_drawable_prelude(body: &str) -> String {
+    format!("{DRAWABLE_PRELUDE}\n{body}")
+}
+
+/// Boundary 1: a concrete implementor flowing into a `dyn Trait` *call
+/// argument* must type-check.
+#[test]
+fn dyn_coercion_in_call_argument_typechecks() {
+    assert_no_errors(&with_drawable_prelude(
+        "function takeDyn(x: dyn Drawable) -> String { return x.draw() }
+         function main() { takeDyn(Circle(3)) }",
+    ));
+}
+
+/// Method dispatch on a `dyn Trait` receiver must resolve the trait
+/// method and return its declared return type.
+#[test]
+fn dyn_method_call_on_dyn_receiver_typechecks() {
+    assert_no_errors(&with_drawable_prelude(
+        "function render(s: dyn Drawable) -> String { return s.draw() }
+         function main() { render(Circle(1)) }",
+    ));
+}
+
+/// Calling a method that is *not* on the trait through a `dyn Trait`
+/// receiver must surface a "trait has no method" diagnostic, not panic
+/// or fall through to the unknown-method path.
+#[test]
+fn dyn_method_call_unknown_method_is_rejected() {
+    assert_has_error(
+        &with_drawable_prelude(
+            "function render(s: dyn Drawable) -> String { return s.area() }
+             function main() { render(Circle(1)) }",
+        ),
+        "trait `Drawable` has no method `area`",
+    );
+}
+
+/// Boundary 3: reassignment to a `let mut` slot typed `dyn Trait` must
+/// re-coerce the new value. Also covers heterogeneity at the same
+/// binding (Circle then Square).
+#[test]
+fn dyn_coercion_in_reassignment_typechecks() {
+    assert_no_errors(&with_drawable_prelude(
+        "function main() {
+             let mut d: dyn Drawable = Circle(1)
+             d = Square(2)
+         }",
+    ));
+}
+
+/// Boundary 4: returning a concrete implementor from a function whose
+/// declared return type is `dyn Trait` must type-check.
+#[test]
+fn dyn_coercion_in_return_value_typechecks() {
+    assert_no_errors(&with_drawable_prelude(
+        "function makeDrawable() -> dyn Drawable { return Circle(1) }
+         function main() { makeDrawable() }",
+    ));
+}
+
+/// Boundary 5: passing a concrete implementor into a struct constructor
+/// position whose field is typed `dyn Trait` must type-check.
+#[test]
+fn dyn_coercion_in_struct_field_typechecks() {
+    assert_no_errors(&with_drawable_prelude(
+        "struct Scene { dyn Drawable hero }
+         function main() { Scene(Circle(1)) }",
+    ));
+}
+
+/// Boundary 6: passing a concrete implementor into an enum variant
+/// constructor position whose field is typed `dyn Trait` must
+/// type-check.
+#[test]
+fn dyn_coercion_in_enum_variant_field_typechecks() {
+    assert_no_errors(&with_drawable_prelude(
+        "enum Slot { Held(dyn Drawable)\n Empty }
+         function main() { Held(Circle(1)) }",
+    ));
+}
+
+/// Generic traits cannot be used as `dyn` (the parser form
+/// `dyn Trait<Concrete>` isn't supported and bare `dyn Trait` would
+/// leave method-signature type parameters unbound). Pinned by
+/// `check_types.rs`. The rejection fires at the `dyn`-type site, so
+/// the test does not need any concrete impl — sema rejects before
+/// it reaches "what implements this trait".
+#[test]
+fn dyn_over_generic_trait_is_rejected() {
+    assert_has_error(
+        "trait Container<T> { function get(self) -> T }
+         function main() {
+             let c: dyn Container = 0
+         }",
+        "generic trait `Container` cannot be used as `dyn`",
+    );
+}
+
+/// Reassigning a `dyn` slot to something that does *not* implement the
+/// trait must fail at the assignment boundary (regression for
+/// `types_compatible`'s `dyn` rule running before the TypeVar wildcard).
+#[test]
+fn dyn_reassignment_with_non_implementor_is_rejected() {
+    assert_has_error(
+        &with_drawable_prelude(
+            "struct Plain { Int v }
+             function main() {
+                 let mut d: dyn Drawable = Circle(1)
+                 d = Plain(0)
+             }",
+        ),
+        "type mismatch",
+    );
+}

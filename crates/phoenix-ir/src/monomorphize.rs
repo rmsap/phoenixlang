@@ -154,32 +154,26 @@ fn substitute(ty: &IrType, subst: &HashMap<String, IrType>) -> IrType {
             name.clone(),
             args.iter().map(|t| substitute(t, subst)).collect(),
         ),
-        // Value types, strings, struct refs: no inner types that can contain
-        // TypeVar. Pass through.
+        // Value types, strings, struct refs, trait objects: no inner types
+        // that can contain TypeVar. Pass through. (DynRef carries only a
+        // trait name, and trait-object generics on the trait itself are out
+        // of scope — see docs/design-decisions.md multi-bound section.)
         IrType::I64
         | IrType::F64
         | IrType::Bool
         | IrType::Void
         | IrType::StringRef
-        | IrType::StructRef(_) => ty.clone(),
+        | IrType::StructRef(_)
+        | IrType::DynRef(_) => ty.clone(),
     }
 }
 
-/// Apply `subst` to every type annotation inside `func` — parameters,
-/// return, block parameters, and every instruction's result type.
+/// Apply `subst` to every type annotation inside `func`. Uses
+/// [`IrFunction::for_each_type_mut`] so all four parallel type
+/// annotations (params / return / block params / per-value index /
+/// instruction result types) stay in sync.
 fn substitute_types_in_fn(func: &mut IrFunction, subst: &HashMap<String, IrType>) {
-    for pt in &mut func.param_types {
-        *pt = substitute(pt, subst);
-    }
-    func.return_type = substitute(&func.return_type, subst);
-    for block in &mut func.blocks {
-        for instr in &mut block.instructions {
-            instr.result_type = substitute(&instr.result_type, subst);
-        }
-        for bp in &mut block.params {
-            bp.1 = substitute(&bp.1, subst);
-        }
-    }
+    func.for_each_type_mut(|ty| *ty = substitute(ty, subst));
 }
 
 /// Symbol-safe encoding of an [`IrType`] for name mangling. The output
@@ -235,6 +229,7 @@ pub(crate) fn mangle_type(ty: &IrType) -> String {
                 s
             }
         }
+        IrType::DynRef(name) => format!("d_{name}"),
         IrType::ListRef(inner) => format!("L_{}_E", mangle_type(inner)),
         IrType::MapRef(k, v) => format!("M_{}_{}_E", mangle_type(k), mangle_type(v)),
         IrType::ClosureRef {
@@ -335,6 +330,22 @@ fn assign_specialization_ids(module: &IrModule, seed: Vec<SpecKey>) -> (SpecMap,
              failed to resolve this, which indicates either a sema bug or a call-site \
              type-arg recorded with a TypeVar that isn't one of the outer's parameters."
         );
+        // Hard check (not debug_assert!) because the consequence of a
+        // regression here is silent miscompile in release builds: mono
+        // would proceed to specialize on a `dyn Trait` type argument with
+        // no vtable-keyed specialization strategy, and Cranelift would
+        // emit codegen that reads past the end of a non-existent vtable.
+        // MVP scope (docs/design-decisions.md: "Dynamic dispatch via dyn
+        // Trait") excludes this; sema's `check_call_type_args` is
+        // expected to reject it. Remove this gate only once a
+        // vtable-keyed specialization strategy lands.
+        if targs.iter().any(contains_dyn_ref) {
+            panic!(
+                "monomorphization reached a call with a `dyn Trait` concrete type argument: \
+                 callee={orig_id:?}, targs={targs:?}. MVP scope excludes generic \
+                 specialization at `dyn Trait`; sema is expected to reject it."
+            );
+        }
 
         // `Entry` lets us check-or-insert without cloning `targs` twice.
         // `HashMap::len()` is stable across the vacant-branch `insert`, so
@@ -510,7 +521,32 @@ fn contains_type_var(ty: &IrType) -> bool {
         | IrType::Bool
         | IrType::Void
         | IrType::StringRef
-        | IrType::StructRef(_) => false,
+        | IrType::StructRef(_)
+        | IrType::DynRef(_) => false,
+    }
+}
+
+/// Returns `true` if `ty` contains an `IrType::DynRef` at any depth.  Used
+/// to enforce the MVP-scope rule that generic specialization never happens
+/// at `dyn Trait`: sema is supposed to reject `foo<dyn Drawable>(...)` and
+/// this guard catches any regression that lets it through to the IR.
+fn contains_dyn_ref(ty: &IrType) -> bool {
+    match ty {
+        IrType::DynRef(_) => true,
+        IrType::ListRef(inner) => contains_dyn_ref(inner),
+        IrType::MapRef(k, v) => contains_dyn_ref(k) || contains_dyn_ref(v),
+        IrType::ClosureRef {
+            param_types,
+            return_type,
+        } => param_types.iter().any(contains_dyn_ref) || contains_dyn_ref(return_type),
+        IrType::EnumRef(_, args) => args.iter().any(contains_dyn_ref),
+        IrType::I64
+        | IrType::F64
+        | IrType::Bool
+        | IrType::Void
+        | IrType::StringRef
+        | IrType::StructRef(_)
+        | IrType::TypeVar(_) => false,
     }
 }
 

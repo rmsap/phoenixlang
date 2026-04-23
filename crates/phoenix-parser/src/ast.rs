@@ -1243,6 +1243,40 @@ pub enum TypeExpr {
     Function(FunctionType),
     /// A generic type application: `Option<Int>`, `Pair<Int, String>`.
     Generic(GenericType),
+    /// A trait-object type: `dyn Drawable`. See `phoenix_sema::types::Type::Dyn`
+    /// for the semantic-level rationale.
+    Dyn(DynType),
+}
+
+impl TypeExpr {
+    /// Source span covering the entire type expression.
+    pub fn span(&self) -> Span {
+        match self {
+            TypeExpr::Named(n) => n.span,
+            TypeExpr::Function(f) => f.span,
+            TypeExpr::Generic(g) => g.span,
+            TypeExpr::Dyn(d) => d.span,
+        }
+    }
+}
+
+/// A trait-object type annotation: `dyn TraitName`.
+///
+/// Parser-level representation; `phoenix_sema::types::Type::Dyn` is the
+/// post-resolution counterpart and carries the full rationale for
+/// explicit `dyn` syntax (see also `docs/design-decisions.md`). The
+/// trait name is stored as a raw string and resolved to a registered,
+/// object-safe trait during semantic analysis — a name that doesn't
+/// resolve, resolves to a non-trait, or resolves to a non-object-safe
+/// trait is rejected at that stage.
+///
+/// Multi-bound forms (`dyn Foo + Bar`) are not supported yet.
+#[derive(Debug, Clone, Serialize)]
+pub struct DynType {
+    /// The name of the trait being object-ified.
+    pub trait_name: String,
+    /// Source span covering `dyn TraitName`.
+    pub span: Span,
 }
 
 /// A function type annotation: `(ParamType, ParamType) -> ReturnType`.

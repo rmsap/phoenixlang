@@ -101,14 +101,135 @@ Not actively miscompiling today: Phoenix's `substitute` is a single-pass walk, s
 **Planned fix:** Introduce alpha-renaming (fresh-name each template's type parameter binders during inference) so the occurs-check can distinguish "same name, different binder" from "genuine cycle", then re-enable the check.
 **Target phase:** Phase 3 or deferred until it causes a real diagnostic complaint.
 
+### `List<dyn Trait>` literal initialization in compiled mode
+
+See also: [design-decisions.md: *Dynamic dispatch via `dyn Trait`*](design-decisions.md#dynamic-dispatch-via-dyn-trait) — this issue is one of the deferred follow-ups in that section's table.
+
+Both the heterogeneous case (`[Circle(1), Square(2)]` typed as `List<dyn Drawable>`) and the *homogeneous* case (`[Circle(1), Circle(2)]` typed as `List<dyn Drawable>`) fail in compiled mode. Sema accepts them (the recursive `types_compatible` rule applies the dyn coercion to each element pair), but IR lowering never materializes element-wise `Op::DynAlloc` wraps — the list is allocated with concrete single-slot elements into a container annotated for 2-slot `dyn` elements, which either fails verification or crashes Cranelift layout.
+
+**Previously suggested workaround (does not work today).** Building the list incrementally via `push()` from `let mut shapes: List<dyn Drawable> = []` fails at type-check: sema types the empty-list literal as `List<T>` and does not propagate the let annotation's element type into the literal, producing `type mismatch: variable 'shapes' declared as 'List<dyn Drawable>' but initialized with 'List<T>'`. Unblocking the literal path and the push path requires the same bidirectional-inference work. An ignored regression test pins the current behaviour (`phoenix-cranelift/tests/compile_dyn_trait.rs::dyn_list_via_push_workaround`).
+
+Until that lands, there is no supported way to build a `List<dyn Trait>` in compiled mode.
+
+**File:** `phoenix-sema/src/check_expr.rs` (`check_list_literal`) for the heterogeneous case; `phoenix-ir/src/lower_expr.rs` (`lower_list_literal`) for the homogeneous case — the literal doesn't see its surrounding let's annotation to know elements should be DynAlloc-wrapped.
+**Planned fix:** Bidirectional type inference — thread the expected element type from the list-literal context into both sema (to accept heterogeneous elements as `dyn`) and IR lowering (to coerce each element). Same machinery that would enable lambda parameter inference at call sites ([design-decisions.md](design-decisions.md#lambda-parameter-inference-at-call-sites)).
+**Target phase:** Phase 3 — tied to the bidirectional-inference rework.
+
+### Default argument values are not supported in compiled mode
+
+`function f(x: T = expr)` is parsed and accepted by sema, and the AST
+interpreter handles the default-fill at call time. The compiled-mode
+pipeline does not: `merge_call_args` in `phoenix-ir/src/lower_expr.rs`
+treats unfilled positional slots as a sema bug (debug_assert!) instead
+of synthesizing the default expression. A call site that relies on a
+default lowers to `Op::Call` with too few args and trips the Cranelift
+verifier.
+
+Not a regression from the dyn work — pre-existing gap, surfaced by the
+audit's H4 test (`dyn_default_argument_coerces`, `#[ignore]`'d in
+`crates/phoenix-cranelift/tests/compile_dyn_trait.rs`). The named-args
+case `f(x: 1)` works because `merge_call_args` does fill from named args.
+
+**Tripwire:** Cranelift "Verifier errors" on any compiled program that
+omits a parameter with a default. **Workaround:** pass every argument
+explicitly, or use `phoenix run`. **Target phase:** Phase 2.2 follow-up
+— the fix is to lower the default expression once into a per-function
+"default initializers" table and synthesize it at the call site, then
+let the existing dyn-coercion path (`coerce_call_args`) handle the
+post-fill arg list as usual.
+
+### Match-arm result coercion to `dyn Trait` return type
+
+`function f() -> dyn Trait { match x { A -> Concrete1(...) B -> Concrete2(...) } }`
+is rejected by sema with "match arm type mismatch: expected `Concrete1`
+but got `Concrete2`" before lowering can attempt the dyn coercion. The
+arm-result inference unifies arm types to a single concrete type rather
+than propagating the function's `dyn Trait` return type as the expected
+join type. Same root cause as the heterogeneous list-literal gap —
+bidirectional inference into expression contexts.
+
+**Workaround:** wrap each arm body in an explicit dyn binding
+(`A -> { let d: dyn Trait = Concrete1(...); d }`) so the coercion
+happens before the match union runs. **Tracked by** the `#[ignore]`'d
+`dyn_match_arm_coerces_to_function_return_type` test in both
+`crates/phoenix-cranelift/tests/compile_dyn_trait.rs` and the
+matching round-trip file. **Target phase:** Phase 3 — pairs with the
+bidirectional-inference rework that also unblocks `List<dyn Trait>`.
+
+### `<T: Trait>` → `dyn Trait` coercion fails in compiled mode
+
+A generic-bounded function that wraps its parameter into a `dyn Trait`
+slot — `function f<T: Drawable>(x: T) -> String { let d: dyn Drawable = x; d.draw() }` —
+panics at IR lowering with `coerce_to_expected: unexpected IR type T flowing into dyn Trait position`.
+Sema accepts the program (the bound + dyn-coercion check passes), but at
+IR-lowering time the source-side type is `IrType::TypeVar(T)` and
+`coerce_to_expected` has no concrete name to key the vtable registration on.
+
+Same shape as the `<T: Trait>` method-call gap below: monomorphization
+runs *after* lowering, so any IR primitive that needs a concrete type
+name has to either be reified during mono or deferred. The fix likely
+emits a placeholder `Op::DynAlloc(trait, TypeVar(T), ...)` at lower-time
+and has the monomorphize pass substitute the concrete name and register
+the vtable at specialization sites — the same maneuver that should
+eventually fix the method-call gap.
+
+**Tripwire:** `unreachable!` in `phoenix-ir/src/lower_dyn.rs::coerce_to_expected`'s
+non-StructRef/EnumRef branch. Pinned by the `#[ignore]`d
+`dyn_alloc_inside_generic_bounded_function` regression test in
+`crates/phoenix-cranelift/tests/compile_dyn_trait.rs`.
+**Workaround:** Wrap concrete values into `dyn Trait` *outside* the generic function;
+or use `phoenix run` for programs that need this pattern.
+**Target phase:** Phase 2.2 follow-up — pairs with the method-call fix below since both
+need the same monomorphization × IR-emission rework.
+
+### `<T: Trait>` method calls fail in compiled mode
+
+See also: [design-decisions.md: *Dynamic dispatch via `dyn Trait`*](design-decisions.md#dynamic-dispatch-via-dyn-trait) — documented as a follow-up in that section's table.
+
+Programs that call a trait-bounded method on a type variable (e.g., `function show<T: Display>(x: T) { print(x.toString()) }` — or any user-defined trait method on `<T: Bound>`) pass sema and run via `phoenix run` (AST interpreter), but fail `phoenix build` with "builtin '.method' not yet supported in compiled mode". The AST interpreter resolves the method by inspecting the runtime value's concrete type; the Cranelift path lowers the method call to `BuiltinCall("", method)` (empty type name prefix) which the backend's dispatcher cannot route.
+
+Monomorphization should fix this naturally: after specializing `show<T: Display>` at `T := Point`, the body's `x.toString()` call has `x: Point`, and a normal `StructRef`-based method lookup via `method_index` works. But the current lowering emits `BuiltinCall` *before* monomorphization sees the call site, so the name has already been mangled to the empty-prefix form.
+
+Not a regression from the `dyn Trait` work — pre-existed and unrelated. Documented here because it's in the same neighborhood and users learning about `dyn Trait` are likely to try the `<T: Trait>` form and hit it.
+
+**File:** `phoenix-ir/src/lower_expr.rs` (`lower_method_call`). **Planned fix:** either (a) defer the method-to-builtin lowering to post-monomorphization, or (b) have monomorphization rewrite `BuiltinCall(".m", ...)` to `Call(method_index[(T_subst, m)], ...)` when the receiver type becomes known. Option (b) is more localized.
+**Target phase:** Phase 2.2 follow-up (demand-triggered — this is the exact error users will hit when trying trait-bounded generic methods in compiled mode for the first time).
+
+### Multi-bound generic parameters (`<T: Foo + Bar>`) rejected by parser
+
+The parser today fails with "expected '>'" on the `+` in `<T: Foo + Bar>`. The design is uncontroversial (bounds are conjunctive), but the parser + sema + monomorphization plumbing needs to thread a `Vec<String>` where today it threads a single `Option<String>`.
+
+**Target phase:** Phase 3. **Tripwire:** the `"expected '>'"` error message at any `+` inside a type-parameter bound list. No workaround except "split into two type parameters" which usually doesn't achieve what the user wanted.
+
+### Generic user-defined structs are not supported in compiled mode
+
+See also: [design-decisions.md: *Dynamic dispatch via `dyn Trait`*](design-decisions.md#dynamic-dispatch-via-dyn-trait) — `dyn Trait` over generic structs is blocked by the same gap and lands with the fix here.
+
+Programs that declare a generic struct (`struct Container<T> { T value }`) and use it at a concrete type (`Container(42)`) run fine under `phoenix run` (AST interpreter) but fail under `phoenix build`. Two related failure modes exist today, both with clear tripwires:
+
+- **With methods:** a new `debug_assert!` in `register_method` (`phoenix-ir/src/lower_decl.rs`, struct branch) fires at IR-lowering time with a message pointing at this entry. Reason: `register_method` emits `IrType::StructRef(type_name)` for `self` with no type args, so monomorphization has no handle to specialize on and the body is left as an inert generic template.
+- **Without methods:** field access on a use-site `Generic("Container", [Int])` hits an `unreachable!` in `phoenix-ir/src/lower_expr.rs` (`lower_field_access`) because `struct_layouts` is keyed by bare name (`"Container"`) and holds layouts still containing `IrType::TypeVar(T)`. The struct layout is never reified per-instantiation, so the backend has no concrete field type to materialize.
+
+**`dyn Trait` interaction.** `dyn Trait` over a generic struct — `struct Container<T> { ... impl SomeTrait { ... } }` used as `dyn SomeTrait` — is blocked by the same gap: the IR `dyn_vtables` registry is keyed by `(concrete_type_name, trait_name)` using the struct's bare name and stores the template's `FuncId`. Even if the vtable emission succeeded, the Cranelift signature-build step would read template `param_types` still carrying `TypeVar` and crash in `TypeLayout::of`. Users who try this hit the `register_method` gate first.
+
+**Why this is the same shape as the enum-side gap below.** Both come from `register_method` emitting a bare `{Struct,Enum}Ref(name)` for `self`, and both interact with monomorphization only understanding "generic function bodies", not "generic data types whose layout must be reified per use". The real fix spans four sites:
+
+1. `register_method` threads the type's `info.type_params` into the self-type's args.
+2. `struct_layouts` (and `enum_layouts`) are keyed by name+args, or reified per instantiation.
+3. Monomorphization specializes the methods alongside the layouts.
+4. `IrModule::dyn_vtables` and `method_index` are keyed by the specialized concrete type so `dyn Trait` resolves to the specialized method.
+
+**File:** `phoenix-ir/src/lower_decl.rs` (struct-side `register_method` gate; parallel to enum-side gate). **Workaround:** use `phoenix run` (AST interpreter) for programs with generic user-defined structs, or hand-specialize (write `struct ContainerInt { Int value }` instead of `struct Container<T>`).
+**Target phase:** **Phase 2.2 — committed to fix before this phase closes.** Rationale: generic structs are a day-one abstraction (`Container<T>`, `Pair<A, B>`, user-defined linked lists / trees / caches), so the `phoenix run` vs. `phoenix build` disagreement on whether a program is valid undermines the Phase 2.2 "compiled mode is production-viable" narrative. Fixing now also keeps the struct-layout / method-dispatch / dyn-vtable invariants malleable while monomorphization (2026-04-19) is still fresh. The enum-side twin entry below remains demand-triggered and deferred.
+
 ### Methods on generic enums are gated off; payload-inference fallbacks kept alive as a consequence
 
-User-defined `impl<T> MyEnum<T> { ... }` is rejected by a `debug_assert!` in `phoenix-ir/src/lower_decl.rs:170` because `register_method` emits `IrType::EnumRef(type_name, Vec::new())` for the `self` parameter — empty args, not the enum's declared type parameters. Landing this feature requires threading the enum's `info.type_params` into the `self` `EnumRef` args and teaching monomorphization to specialize methods on generic enums (already handles generic functions + methods on non-generic user types).
+User-defined `impl<T> MyEnum<T> { ... }` is rejected by a `debug_assert!` in `phoenix-ir/src/lower_decl.rs` (enum branch) because `register_method` emits `IrType::EnumRef(type_name, Vec::new())` for the `self` parameter — empty args, not the enum's declared type parameters. Landing this feature requires threading the enum's `info.type_params` into the `self` `EnumRef` args and teaching monomorphization to specialize methods on generic enums (already handles generic functions + methods on non-generic user types).
 
 As a side effect, the Cranelift backend's payload-inference fallback chain in `phoenix-cranelift/src/translate/enum_type_inference.rs` (Strategies 1 / 1b / 2 / 3 / 4) stays load-bearing: today the `self` `EnumRef` on an enum method has empty args, so Strategy 0 (`try_type_from_enum_args`) returns `None` and the fallbacks pick up the slack. Once this gate lifts and args are threaded through, every `EnumRef` reaching the backend carries concrete args, Strategy 0 becomes total, and Strategies 1–4 + their tests collapse into a single pass. See the in-file FIXME (lines 46–53).
 
-**File:** `phoenix-ir/src/lower_decl.rs` (gate + fix site); `phoenix-cranelift/src/translate/enum_type_inference.rs` (dead code after the gate lifts).
-**Target phase:** Phase 4 (Stdlib) by default — when user-facing generic containers with methods ship, this is the natural moment. **Earlier if demand-triggered:** the `debug_assert!` at `lower_decl.rs:170` is the tripwire; whoever first writes `impl<T> MyEnum<T>` hits it and picks up the feature + the strategy collapse in one motion.
+**File:** `phoenix-ir/src/lower_decl.rs` (gate + fix site, enum branch of `register_method`); `phoenix-cranelift/src/translate/enum_type_inference.rs` (dead code after the gate lifts).
+**Target phase:** Phase 4 (Stdlib) by default — when user-facing generic containers with methods ship, this is the natural moment. **Earlier if demand-triggered:** the `debug_assert!` in `register_method`'s enum branch is the tripwire; whoever first writes `impl<T> MyEnum<T>` hits it and picks up the feature + the strategy collapse in one motion.
 
 ### Generic-template stubs tracked by a `bool` flag
 
@@ -117,3 +238,23 @@ As a side effect, the Cranelift backend's payload-inference fallback chain in `p
 **File:** `phoenix-ir/src/module.rs` — `IrFunction.is_generic_template`; iteration helper `IrModule::concrete_functions`.
 **Planned fix:** Replace the bool flag with a typed split — a `ConcreteFunctions` newtype iterator, or two separate `functions` / `templates` fields — so the filter is enforceable at the type system level rather than at every call site.
 **Target phase:** Phase 2.6 or Phase 3. Pairs naturally with the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) scheduled for 2.6, since both are IR-shape refactors.
+
+### `IrFunction.value_types` is a parallel index without a type-level guarantee
+
+`IrFunction.value_types: Vec<Option<IrType>>` is indexed by `ValueId.0` and kept in sync with `next_value_id` by `fresh_value()`, `emit()`, and `add_block_param()`.  Any pass that allocates a `ValueId` without going through those three entry points would silently desync the index — the `O(1)` type lookup via `instruction_result_type` would then return `None` (or worse, a stale type from an overwritten slot) rather than fail loudly.
+
+Today this is partly mitigated: the verifier's `verify_value_types_index` flags length mismatches, and the centralized `IrFunction::for_each_type_mut` is the only way monomorphization walks all four parallel type annotations (param / return / block-param / per-value / instruction result).  But the invariant lives by convention, not by type — a future pass could bypass both without any compiler error.
+
+**File:** `phoenix-ir/src/module.rs` — `IrFunction.value_types`, `fresh_value`, `emit`, `add_block_param`.
+**Planned fix:** Introduce a `ValueIdAllocator` newtype that owns both the counter and the parallel index; make `ValueId` allocation and type assignment the same operation at the type level (no API for "allocate a ValueId without assigning a type").  Length-mismatch bugs become compile errors instead of runtime verifier errors.
+**Target phase:** Phase 2.6 or Phase 3.  Pairs with the `is_generic_template` typed-split refactor above — both are IR-shape rewrites.
+
+### `dyn Trait` and `StringRef` share a 2-slot layout with no discriminator
+
+`TypeLayout::of` in `phoenix-cranelift/src/translate/layout/type_layout.rs` maps both `StringRef` and `DynRef` to a 2-slot `[POINTER_TYPE, POINTER_TYPE]` layout.  The Phoenix runtime's list/map helpers (`phx_list_contains`, `phx_map_*`) use `elem_size == 16` as a heuristic for "`StringRef` — compare by content"; a `List<dyn Trait>` element is indistinguishable at that boundary.
+
+Today this is harmless because `List<dyn Trait>` does not compile (see [`List<dyn Trait>` literal initialization in compiled mode](#listdyn-trait-literal-initialization-in-compiled-mode)).  The moment the bidirectional-inference fix unblocks `List<dyn Trait>`, the runtime must gain a proper discriminator — options include a per-list element-kind tag, a `dyn`-aware runtime helper set, or embedding a 1-byte type tag in the fat-pointer layout itself (ABI change).
+
+**File:** `phoenix-cranelift/src/translate/layout/type_layout.rs` (layout table + cross-crate-invariant comment); `phoenix-runtime/src/list_methods.rs` (consumer of the heuristic).
+**Planned fix:** decide and implement a dyn-vs-string discriminator before `List<dyn Trait>` lands.  A 1-byte type tag in the first pointer slot was considered during the 2026-04-20 audit and deferred (ABI-scope change; would re-litigate the [centralized Layout trait](design-decisions.md#centralized-layout-for-reference-types) decision).  A discriminator-at-the-list-level fix is lower-impact and currently preferred.
+**Target phase:** Phase 3 — lands with the bidirectional-inference fix for `List<dyn Trait>`.

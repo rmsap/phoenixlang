@@ -57,6 +57,14 @@ impl Checker {
                             var.span,
                         );
                     }
+                    // Record the resolved annotation so IR lowering can
+                    // consult it for boundary coercions (e.g. `dyn Trait`
+                    // wrapping). Skipped for Error types to avoid
+                    // propagating partial results downstream.
+                    if !declared_type.is_error() {
+                        self.var_annotation_types
+                            .insert(var.span, declared_type.clone());
+                    }
                     declared_type
                 } else {
                     // Type inference: use the initializer's type.

@@ -215,6 +215,65 @@ impl<'m> IrInterpreter<'m> {
         }
     }
 
+    /// Dispatch a trait-object method call: look up
+    /// `(concrete_type, trait_name)` in `dyn_vtables`, select slot
+    /// `method_idx`, and invoke the resolved `FuncId` with the concrete
+    /// receiver prepended to `args`. Matches the Cranelift-backend path
+    /// (`translate/dyn_trait.rs::translate_dyn_call`) semantically so
+    /// IR-interp and compiled output stay in lockstep.
+    fn interpret_dyn_call(
+        &mut self,
+        trait_name: &str,
+        method_idx: u32,
+        receiver: IrValue,
+        args: Vec<IrValue>,
+    ) -> Result<IrValue> {
+        let IrValue::Dyn {
+            concrete,
+            concrete_type,
+            trait_name: recv_trait,
+        } = receiver
+        else {
+            return error(format!(
+                "DynCall receiver is not a `dyn` value: {:?}",
+                receiver
+            ));
+        };
+        // Hard check (not `debug_assert`): vtable-wiring bugs that make a
+        // release build silently load the wrong method would be invisible
+        // under an asserts-stripped build.
+        if recv_trait != trait_name {
+            return error(format!(
+                "DynCall trait mismatch: receiver carries `dyn {recv_trait}` \
+                 but the call site is `dyn {trait_name}`"
+            ));
+        }
+        let key = (concrete_type.clone(), trait_name.to_string());
+        let vtable = self
+            .module
+            .dyn_vtables
+            .get(&key)
+            .ok_or_else(|| IrRuntimeError {
+                message: format!("DynCall: no vtable for ({concrete_type}, dyn {trait_name})"),
+            })?;
+        let (_name, func_id) = vtable
+            .get(method_idx as usize)
+            .ok_or_else(|| IrRuntimeError {
+                message: format!("DynCall: slot {method_idx} out of range for dyn {trait_name}"),
+            })?;
+        let func_id = *func_id;
+        // Cross-backend ABI contract: prepend the concrete receiver as
+        // the first argument, matching `self: StructRef/EnumRef(...)`
+        // at index 0 of the trait method's `FuncId`. The Cranelift
+        // backend does the same in
+        // `phoenix-cranelift/src/translate/dyn_trait.rs::build_dyn_call_signature`.
+        // Keep the two sites in lockstep — divergence here is silent
+        // wrong-dispatch with no verifier signal.
+        let mut full_args: Vec<IrValue> = vec![*concrete];
+        full_args.extend(args);
+        self.call_function(func_id, full_args)
+    }
+
     /// Execute a single IR operation.
     fn execute_op(&mut self, op: &Op, frame: &mut CallFrame) -> Result<IrValue> {
         match op {
@@ -409,6 +468,24 @@ impl<'m> IrInterpreter<'m> {
                     .map(|vid| frame.get(*vid).cloned())
                     .collect::<Result<_>>()?;
                 builtins::dispatch(self, name, args)
+            }
+
+            // --- Trait object operations ---
+            Op::DynAlloc(trait_name, concrete_type, value_vid) => {
+                let concrete = frame.get(*value_vid)?.clone();
+                Ok(IrValue::Dyn {
+                    concrete: Box::new(concrete),
+                    concrete_type: concrete_type.clone(),
+                    trait_name: trait_name.clone(),
+                })
+            }
+            Op::DynCall(trait_name, method_idx, receiver_vid, arg_vids) => {
+                let receiver = frame.get(*receiver_vid)?.clone();
+                let args: Vec<IrValue> = arg_vids
+                    .iter()
+                    .map(|vid| frame.get(*vid).cloned())
+                    .collect::<Result<_>>()?;
+                self.interpret_dyn_call(trait_name, *method_idx, receiver, args)
             }
 
             // --- Mutable variables ---

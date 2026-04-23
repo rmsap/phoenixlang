@@ -35,6 +35,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Break => "'break'",
         TokenKind::Continue => "'continue'",
         TokenKind::Trait => "'trait'",
+        TokenKind::Dyn => "'dyn'",
         TokenKind::Type => "'type'",
         TokenKind::Endpoint => "'endpoint'",
         TokenKind::Body => "'body'",
@@ -797,11 +798,7 @@ impl<'src> Parser<'src> {
         let type_params = self.parse_type_params();
         self.expect(TokenKind::Eq)?;
         let target = self.parse_type_expr()?;
-        let end = match &target {
-            TypeExpr::Named(n) => n.span,
-            TypeExpr::Function(f) => f.span,
-            TypeExpr::Generic(g) => g.span,
-        };
+        let end = target.span();
         self.eat(TokenKind::Newline);
         Some(TypeAliasDecl {
             name: name_token.text.clone(),
@@ -1018,11 +1015,7 @@ impl<'src> Parser<'src> {
                 | TypeModifier::Pick { span, .. }
                 | TypeModifier::Partial { span, .. } => *span,
             })
-            .unwrap_or(match &base_type {
-                TypeExpr::Named(n) => n.span,
-                TypeExpr::Function(f) => f.span,
-                TypeExpr::Generic(g) => g.span,
-            });
+            .unwrap_or_else(|| base_type.span());
 
         Some(DerivedType {
             base_type,
@@ -3978,6 +3971,94 @@ schema db {
                 }
             }
             other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    // ── `dyn Trait` integration smoke tests ────────────────────────────
+    //
+    // The unit tests in `crates/phoenix-parser/src/types.rs` cover the
+    // core `parse_type_expr` recursion points (bare, generic arg,
+    // function param/return). These integration tests exercise the
+    // declaration-level productions that *route into* `parse_type_expr`,
+    // pinning that `dyn` is reachable wherever the design promises it
+    // (see `docs/dyn-trait.md` "When the wrap happens").
+
+    #[test]
+    fn parse_dyn_in_struct_field() {
+        let (program, diagnostics) = parse_source("struct Scene { dyn Drawable hero }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.fields.len(), 1);
+                assert_eq!(s.fields[0].name, "hero");
+                match &s.fields[0].type_annotation {
+                    TypeExpr::Dyn(d) => assert_eq!(d.trait_name, "Drawable"),
+                    other => panic!("expected TypeExpr::Dyn, got {:?}", other),
+                }
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dyn_in_enum_variant_field() {
+        let (program, diagnostics) = parse_source("enum Slot { Held(dyn Drawable)\n Empty }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Enum(e) => {
+                assert_eq!(e.variants.len(), 2);
+                assert_eq!(e.variants[0].name, "Held");
+                assert_eq!(e.variants[0].fields.len(), 1);
+                match &e.variants[0].fields[0] {
+                    TypeExpr::Dyn(d) => assert_eq!(d.trait_name, "Drawable"),
+                    other => panic!("expected TypeExpr::Dyn, got {:?}", other),
+                }
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dyn_in_let_annotation() {
+        let (program, diagnostics) =
+            parse_source("function main() { let d: dyn Drawable = Circle(1) }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => match &f.body.statements[0] {
+                Statement::VarDecl(v) => {
+                    let ann = v
+                        .type_annotation
+                        .as_ref()
+                        .expect("let must carry a `dyn` annotation");
+                    match ann {
+                        TypeExpr::Dyn(d) => assert_eq!(d.trait_name, "Drawable"),
+                        other => panic!("expected TypeExpr::Dyn, got {:?}", other),
+                    }
+                }
+                other => panic!("expected VarDecl, got {:?}", other),
+            },
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dyn_in_function_return_annotation() {
+        // Already covered as a unit test on `parse_type_expr`, but this
+        // pins that the *function-decl* production hands its return
+        // type through `parse_type_expr` rather than a parallel path.
+        let (program, diagnostics) =
+            parse_source("function choose() -> dyn Drawable { return Circle(1) }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => match f
+                .return_type
+                .as_ref()
+                .expect("function must have return type")
+            {
+                TypeExpr::Dyn(d) => assert_eq!(d.trait_name, "Drawable"),
+                other => panic!("expected TypeExpr::Dyn, got {:?}", other),
+            },
+            other => panic!("expected Function, got {:?}", other),
         }
     }
 }

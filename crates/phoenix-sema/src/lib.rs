@@ -21,6 +21,7 @@ mod check_types;
 pub mod checker;
 #[cfg(test)]
 mod checker_tests;
+mod object_safety;
 /// Lexical scope stack for variable name resolution.
 pub mod scope;
 /// The Phoenix type system representation.

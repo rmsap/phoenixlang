@@ -66,7 +66,23 @@ pub struct CheckResult {
     /// it. For the single-file, single-pass Phase 2 compiler, spans are
     /// immutable per `SourceId` and unique per syntactic call expression,
     /// so the current keying is sound but should not be generalized.
+    /// Tracked in `docs/known-issues.md`
+    /// ("`CheckResult.call_type_args` is keyed by `Span`").
     pub call_type_args: HashMap<Span, Vec<Type>>,
+    /// Resolved type annotation for each `let` binding that carried one,
+    /// keyed by the `VarDecl`'s source span. Absent entries mean the
+    /// binding was unannotated.
+    ///
+    /// **Internal sema↔IR-lowering contract.** Consumed only by
+    /// [`phoenix_ir::lower`] so its dyn-coercion path sees the resolved
+    /// type (alias-expanded) rather than re-walking the parser `TypeExpr`.
+    /// External consumers should prefer [`Self::expr_types`].
+    ///
+    /// **Same `Span`-keying caveat as [`Self::call_type_args`].** The
+    /// `CallId`-based migration planned for Phase 3 will apply to this
+    /// map too; any AST transformation that reparents or synthesizes
+    /// `VarDecl` nodes before IR lowering will silently lose entries.
+    pub var_annotation_types: HashMap<Span, Type>,
 }
 
 /// A reference from a use-site to a symbol definition.
@@ -137,8 +153,21 @@ pub struct TraitInfo {
     pub definition_span: Span,
     /// Generic type parameters declared on this trait.
     pub type_params: Vec<String>,
-    /// The method signatures required by this trait.
+    /// The method signatures required by this trait.  Iteration order is the
+    /// declaration order and is the ordering contract that the `dyn Trait`
+    /// vtable relies on — each method's index in this `Vec` IS its slot
+    /// index in the emitted vtable.  Do not reorder or sort.
     pub methods: Vec<TraitMethodInfo>,
+    /// `None` if the trait is object-safe (can be used as `dyn TraitName`);
+    /// `Some(human_readable_reason)` if not.  Populated once at trait
+    /// registration time by `object_safety::validate` and read at every
+    /// `dyn TraitName` type-expression resolution site.  A non-object-safe
+    /// trait is still usable as a generic bound (`<T: TraitName>`).
+    ///
+    /// A trait with zero methods is trivially object-safe (`None`) — a
+    /// `dyn EmptyTrait` pair would simply never invoke anything through
+    /// its vtable, which is vacuously correct.
+    pub object_safety_error: Option<String>,
 }
 
 /// Information about a method signature in a trait.
@@ -364,6 +393,10 @@ pub struct Checker {
     /// Concrete type arguments inferred at each generic function call site,
     /// keyed by the call expression's source span.
     pub(crate) call_type_args: HashMap<Span, Vec<Type>>,
+    /// Resolved annotation type for each `let`-with-annotation, keyed by
+    /// the `VarDecl`'s source span. See
+    /// [`CheckResult::var_annotation_types`].
+    pub(crate) var_annotation_types: HashMap<Span, Type>,
 }
 
 impl Default for Checker {
@@ -394,6 +427,7 @@ impl Checker {
             expr_types: HashMap::new(),
             symbol_references: HashMap::new(),
             call_type_args: HashMap::new(),
+            var_annotation_types: HashMap::new(),
         }
     }
 
@@ -994,5 +1028,6 @@ pub fn check(program: &Program) -> CheckResult {
         expr_types: checker.expr_types,
         symbol_references: checker.symbol_references,
         call_type_args: checker.call_type_args,
+        var_annotation_types: checker.var_annotation_types,
     }
 }

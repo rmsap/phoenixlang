@@ -78,6 +78,40 @@ impl Checker {
             return ty;
         }
 
+        // Trait-object method dispatch: single-bound `dyn Trait` only.
+        if let Type::Dyn(trait_name) = &obj_type {
+            // Clone just the method signature so we don't hold a borrow of
+            // `self.traits` across `check_method_args`. Sema rejects
+            // `dyn UnknownTrait` upstream in `resolve_type_expr`, so the
+            // trait must be present here; only the *method name* may be
+            // wrong at this site.
+            let Some(trait_info) = self.traits.get(trait_name) else {
+                unreachable!(
+                    "compiler bug: receiver typed `dyn {trait_name}` but trait is missing \
+                     from sema metadata — `Checker::resolve_type_expr` must reject \
+                     `dyn UnknownTrait` before checker reaches a method call on it"
+                );
+            };
+            let method_sig = trait_info
+                .methods
+                .iter()
+                .find(|m| m.name == mc.method)
+                .map(|m| (m.params.clone(), m.return_type.clone()));
+            return match method_sig {
+                Some((params, ret)) => {
+                    self.check_method_args(mc, &params, &HashMap::new());
+                    ret
+                }
+                None => {
+                    self.error(
+                        format!("trait `{}` has no method `{}`", trait_name, mc.method),
+                        mc.span,
+                    );
+                    Type::Error
+                }
+            };
+        }
+
         // User-defined methods
         if let Some(type_methods) = self.methods.get(&type_name).cloned()
             && let Some(method_info) = type_methods.get(&mc.method)
@@ -212,10 +246,9 @@ impl Checker {
                 let (bindings, _) = self.infer_type_args(&field_types, &arg_types);
                 for (i, arg) in sl.args.iter().enumerate() {
                     let expected = Self::substitute(&struct_info.fields[i].ty, &bindings);
-                    if !arg_types[i].is_error()
-                        && !expected.is_error()
-                        && !expected.has_type_vars()
-                        && arg_types[i] != expected
+                    // `types_compatible` so dyn-typed fields on a generic
+                    // struct still get the concrete-to-dyn coercion.
+                    if !expected.has_type_vars() && !self.types_compatible(&expected, &arg_types[i])
                     {
                         self.error(
                             format!(
@@ -294,10 +327,9 @@ impl Checker {
                 let (bindings, _) = self.infer_type_args(&variant_types, &arg_types);
                 for (i, arg) in sl.args.iter().enumerate() {
                     let expected = Self::substitute(&variant_types[i], &bindings);
-                    if !arg_types[i].is_error()
-                        && !expected.is_error()
-                        && !expected.has_type_vars()
-                        && arg_types[i] != expected
+                    // `types_compatible` so dyn-typed variant fields on a
+                    // generic enum still get the concrete-to-dyn coercion.
+                    if !expected.has_type_vars() && !self.types_compatible(&expected, &arg_types[i])
                     {
                         self.error(
                             format!(
@@ -622,14 +654,17 @@ impl Checker {
         }
         let (bindings, errors) = self.infer_type_args(&func_info.params, &arg_types);
 
-        // Type-check provided args against substituted param types
+        // Type-check provided args against substituted param types.
+        // `!has_type_vars()` gates the check until inference has resolved
+        // every TypeVar in `expected` — leftover vars mean unification
+        // didn't bind the parameter, and the unresolved-type-parameter
+        // diagnostic in `record_inferred_type_args` is the better signal.
+        // The compatibility check uses `types_compatible` (not `==`) so a
+        // concrete arg flowing into a `dyn Trait` parameter coerces just
+        // like in the non-generic call path.
         for (i, arg) in call.args.iter().enumerate() {
             let expected = Self::substitute(&func_info.params[i], &bindings);
-            if !arg_types[i].is_error()
-                && !expected.is_error()
-                && !expected.has_type_vars()
-                && arg_types[i] != expected
-            {
+            if !expected.has_type_vars() && !self.types_compatible(&expected, &arg_types[i]) {
                 self.error(
                     format!(
                         "argument {} of `{}`: expected `{}` but got `{}`",
@@ -645,11 +680,7 @@ impl Checker {
         for (name, expr) in &call.named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name) {
                 let expected = Self::substitute(&func_info.params[idx], &bindings);
-                if !arg_types[idx].is_error()
-                    && !expected.is_error()
-                    && !expected.has_type_vars()
-                    && arg_types[idx] != expected
-                {
+                if !expected.has_type_vars() && !self.types_compatible(&expected, &arg_types[idx]) {
                     self.error(
                         format!(
                             "named argument `{}` of `{}`: expected `{}` but got `{}`",

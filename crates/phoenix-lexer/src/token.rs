@@ -54,6 +54,13 @@ pub enum TokenKind {
     Continue,
     /// The `trait` keyword, introducing a trait declaration.
     Trait,
+    /// The `dyn` keyword, marking a trait-object type (`dyn Trait`).
+    ///
+    /// Phoenix distinguishes static-dispatch trait bounds (`<T: Trait>`) from
+    /// runtime trait-object dispatch (`dyn Trait`) syntactically so the
+    /// performance cost of the latter is visible at use sites. See the
+    /// "why explicit `dyn`" rationale in `docs/design-decisions.md`.
+    Dyn,
     /// The `type` keyword, introducing a type alias declaration.
     Type,
 

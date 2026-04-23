@@ -21,6 +21,10 @@ const CL_F64_SLICE: &[CraneliftType] = &[cl::F64];
 const CL_I8_SLICE: &[CraneliftType] = &[cl::I8];
 const CL_STRING: &[CraneliftType] = &[POINTER_TYPE, cl::I64];
 const CL_POINTER: &[CraneliftType] = &[POINTER_TYPE];
+/// `dyn Trait` ABI — `(data_ptr, vtable_ptr)`.  Both are pointer-sized.
+/// See [`IrType::DynRef`](phoenix_ir::types::IrType::DynRef) and the
+/// rationale in `docs/design-decisions.md`.
+const CL_DYN: &[CraneliftType] = &[POINTER_TYPE, POINTER_TYPE];
 
 /// Layout of a single Phoenix IR type — slot count, Cranelift-type
 /// expansion, and load/store codegen.
@@ -39,15 +43,16 @@ impl TypeLayout {
     /// new `IrType` variant must produce a compile error here so silent
     /// miscompilation of multi-slot types is impossible.
     ///
-    /// # Cross-crate invariant — `StringRef`
+    /// # Cross-crate invariant — 16-byte fat pointers
     ///
-    /// The runtime's `phx_list_contains` and `phx_map_*` functions use
-    /// `elem_size == STRING_FAT_POINTER_SIZE` (16) as a heuristic for
-    /// "this is a string fat pointer" and compare by content rather than
-    /// by raw bytes. If a future `IrType` also requires 2 slots (16
-    /// bytes), **both** this function **and** the runtime's
-    /// `elements_equal` / `STRING_FAT_POINTER_SIZE` in
-    /// `phoenix-runtime/src/list_methods.rs` must be updated.
+    /// The runtime's `phx_list_contains` / `phx_map_*` use `elem_size == 16`
+    /// as a heuristic for "`StringRef` fat pointer — compare by content".
+    /// `DynRef` is also 16 bytes and is indistinguishable from a string at
+    /// the runtime boundary — today this is fine because `List<dyn Trait>`
+    /// is not yet supported end-to-end (see known-issues.md). When it lands,
+    /// `phoenix-runtime/src/list_methods.rs` must be taught a different
+    /// discriminator (e.g. a per-list element-kind tag) before this layout
+    /// acquires a third 16-byte variant.
     #[must_use]
     pub(crate) fn of(ty: &IrType) -> Self {
         match ty {
@@ -74,6 +79,12 @@ impl TypeLayout {
             // See cross-crate invariant note on `TypeLayout::of`.
             IrType::StringRef => Self {
                 cl_types: CL_STRING,
+                slots: 2,
+            },
+            // Trait objects are (data_ptr, vtable_ptr) → 2 slots, parallel
+            // to StringRef but with a second pointer instead of a length.
+            IrType::DynRef(_) => Self {
+                cl_types: CL_DYN,
                 slots: 2,
             },
             // All other reference types are opaque heap pointers.
@@ -191,7 +202,16 @@ mod tests {
                 param_types: vec![],
                 return_type: Box::new(IrType::Void),
             },
+            IrType::DynRef("Test".into()),
         ]
+    }
+
+    #[test]
+    fn dyn_ref_is_two_slots() {
+        let layout = TypeLayout::of(&IrType::DynRef("Test".into()));
+        assert_eq!(layout.slots(), 2);
+        assert_eq!(layout.cl_types(), &[POINTER_TYPE, POINTER_TYPE]);
+        assert_eq!(layout.size_bytes(), 16);
     }
 
     #[test]

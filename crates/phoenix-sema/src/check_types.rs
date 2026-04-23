@@ -42,28 +42,49 @@ pub(crate) enum UnifyError {
 }
 
 impl Checker {
-    /// Checks whether two types are compatible, accounting for type variables
-    /// in generic contexts.
+    /// Checks whether two types are compatible.
     ///
-    /// Compatibility rules:
-    /// - Equal types are always compatible.
-    /// - A [`Type::TypeVar`] is compatible with any type (it acts as a
-    ///   wildcard during generic inference).
-    /// - Two [`Type::Generic`] types are compatible when they share the same
-    ///   base name, the same number of type arguments, and each pair of
-    ///   arguments is recursively compatible.
+    /// Rules, applied in the order listed (order is load-bearing):
+    ///
+    /// 1. **Error suppression.** [`Type::Error`] on either side is treated
+    ///    as compatible so a single upstream failure (e.g. unknown type,
+    ///    undefined identifier) does not cascade follow-on diagnostics.
+    ///    Most callers also pre-filter with `is_error()`, but the guard
+    ///    here makes the contract uniform — callers without the guard
+    ///    (e.g. list-element/then-else unification sites) still suppress
+    ///    cleanly.
+    /// 2. **Reflexive.** Equal types are always compatible.
+    /// 3. **`dyn Trait` coercion.** A concrete (or appropriately bounded
+    ///    type-variable) actual is compatible with a declared
+    ///    [`Type::Dyn`] iff it implements the trait. *Runs before the
+    ///    TypeVar wildcard* so that `let d: dyn Trait = t` where `t: T`
+    ///    type-checks only when `T: Trait` in the declaration's bounds,
+    ///    not unconditionally via the wildcard below.
+    /// 4. **TypeVar wildcard.** An unresolved [`Type::TypeVar`] on
+    ///    either side matches anything. Needed for generic-parameter
+    ///    inference and for active type parameters in generic function
+    ///    bodies.
+    /// 5. **Structural generics.** Two [`Type::Generic`] types match if
+    ///    they share the same base name and argument count and every
+    ///    argument pair is recursively compatible.
     pub(crate) fn types_compatible(&self, declared: &Type, actual: &Type) -> bool {
+        // 1. Error suppression — cascade silencing.
+        if declared.is_error() || actual.is_error() {
+            return true;
+        }
+        // 2. Reflexive.
         if declared == actual {
             return true;
         }
-        // Type variables act as wildcards — they match any type. This is needed
-        // for unresolved generic parameters (e.g. the E in Ok(42) which has type
-        // Result<Int, TypeVar("E")>) and for active type parameters in generic
-        // function bodies.
+        // 3. `dyn Trait` coercion — before the TypeVar wildcard.
+        if let Type::Dyn(trait_name) = declared {
+            return self.concrete_type_impls_trait(actual, trait_name);
+        }
+        // 4. TypeVar wildcard.
         if declared.is_type_var() || actual.is_type_var() {
             return true;
         }
-        // Compare generic types structurally — recurse into type args
+        // 5. Structural generics.
         if let (Type::Generic(name1, args1), Type::Generic(name2, args2)) = (declared, actual) {
             return name1 == name2
                 && args1.len() == args2.len()
@@ -73,6 +94,28 @@ impl Checker {
                     .all(|(a, b)| self.types_compatible(a, b));
         }
         false
+    }
+
+    /// Returns `true` if `concrete` can satisfy `dyn trait_name`. Handles
+    /// three cases: a named struct/enum with a registered impl, or a
+    /// generic application whose base name has a registered impl, or a
+    /// type variable whose declared bounds include the trait.
+    ///
+    /// Callers must filter [`Type::Error`] before reaching here —
+    /// [`Self::types_compatible`] guarantees this. The fall-through
+    /// `false` arm is for non-coercible kinds (`Function`, `Void`, etc.),
+    /// not for error propagation.
+    fn concrete_type_impls_trait(&self, concrete: &Type, trait_name: &str) -> bool {
+        match concrete {
+            Type::Named(n) | Type::Generic(n, _) => self
+                .trait_impls
+                .contains(&(n.clone(), trait_name.to_string())),
+            Type::TypeVar(name) => self
+                .current_type_param_bounds
+                .iter()
+                .any(|(p, bounds)| p == name && bounds.iter().any(|b| b == trait_name)),
+            _ => false,
+        }
     }
 
     /// Resolves a parser-level [`TypeExpr`] into a semantic [`Type`], expanding
@@ -176,6 +219,40 @@ impl Checker {
                     return Type::Error;
                 }
                 Type::Generic(gt.name.clone(), type_args)
+            }
+            TypeExpr::Dyn(dt) => {
+                let Some(trait_info) = self.traits.get(&dt.trait_name) else {
+                    self.error(
+                        format!("unknown trait `{}` in `dyn`", dt.trait_name),
+                        dt.span,
+                    );
+                    return Type::Error;
+                };
+                if let Some(err) = &trait_info.object_safety_error {
+                    self.error(
+                        format!(
+                            "trait `{}` is not object-safe: {err}. Use `<T: {}>` for static dispatch instead.",
+                            dt.trait_name, dt.trait_name
+                        ),
+                        dt.span,
+                    );
+                    return Type::Error;
+                }
+                // Generic traits cannot be used as `dyn` today — the
+                // parser form `dyn Trait<Concrete>` isn't supported
+                // and `dyn Trait` would leave method-signature type
+                // parameters unbound. Reject at the `dyn` type site.
+                if !trait_info.type_params.is_empty() {
+                    self.error(
+                        format!(
+                            "generic trait `{}` cannot be used as `dyn`; use `<T: {}<…>>` for static dispatch instead",
+                            dt.trait_name, dt.trait_name
+                        ),
+                        dt.span,
+                    );
+                    return Type::Error;
+                }
+                Type::Dyn(dt.trait_name.clone())
             }
         }
     }

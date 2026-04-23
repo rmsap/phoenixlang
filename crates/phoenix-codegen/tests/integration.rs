@@ -1058,3 +1058,176 @@ endpoint listUsers: GET "/api/users" {
         "schema should not affect OpenAPI output"
     );
 }
+
+// ── dyn Trait end-to-end codegen ────────────────────────────────────
+
+/// End-to-end TS codegen across a schema containing a `dyn Trait` field.
+/// Parses, checks, and generates the TS models; confirms the `dyn Trait`
+/// is emitted as the bare trait name in the rendered `.ts`. Catches
+/// regressions where codegen would emit `unknown` or a malformed type.
+#[test]
+fn dyn_trait_in_schema_generates_typescript_models() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Card {
+    Int id
+    dyn Renderable hero
+}
+endpoint getCard: GET "/api/cards/{id}" {
+    response Card
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+    assert!(
+        files.types.contains("hero: Renderable"),
+        "expected `hero: Renderable` in TS models, got: {}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("dyn"),
+        "TS output should not contain the literal `dyn` keyword"
+    );
+}
+
+/// TS codegen for a schema where `dyn Trait` appears as an endpoint's
+/// response type. The TS client emits the trait name directly; the
+/// consuming code is expected to supply the implementing interface.
+#[test]
+fn dyn_trait_as_endpoint_response_generates_typescript() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Widget {
+    Int id
+    dyn Renderable body
+}
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+    assert!(
+        files.types.contains("body: Renderable"),
+        "expected `body: Renderable` field in response type, got: {}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("dyn") && !files.types.contains("unknown"),
+        "TS output should not contain `dyn` keyword or fall through to `unknown`"
+    );
+    assert!(
+        files.client.contains("getWidget"),
+        "expected endpoint client method for getWidget in generated client"
+    );
+}
+
+/// TS codegen for two unrelated traits used as `dyn` on fields of the
+/// same struct. Catches regressions where trait-name lookup in the
+/// codegen type mapper gets cached incorrectly and returns the wrong
+/// trait for subsequent `dyn` uses.
+#[test]
+fn dyn_multiple_traits_on_same_struct_generates_typescript() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+trait Serializable {
+    function serialize(self) -> String
+}
+struct Widget {
+    Int id
+    dyn Renderable view
+    dyn Serializable data
+}
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+    assert!(
+        files.types.contains("view: Renderable"),
+        "expected `view: Renderable`, got: {}",
+        files.types
+    );
+    assert!(
+        files.types.contains("data: Serializable"),
+        "expected `data: Serializable`, got: {}",
+        files.types
+    );
+}
+
+/// TS codegen for `dyn Trait` nested inside container types — `List<dyn T>`,
+/// `Option<dyn T>`. The type mapper recurses through `TypeExpr::Generic`
+/// before reaching `TypeExpr::Dyn`, so the nested case must produce
+/// `Renderable[]` and `Renderable | undefined`. Closes the audit gap on
+/// nested-position coverage for codegen backends.
+#[test]
+fn dyn_trait_nested_in_container_types_typescript() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Gallery {
+    Int id
+    List<dyn Renderable> items
+    Option<dyn Renderable> featured
+}
+endpoint getGallery: GET "/api/galleries/{id}" {
+    response Gallery
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+    assert!(
+        files.types.contains("items: Renderable[]"),
+        "expected `items: Renderable[]` for `List<dyn Renderable>`, got: {}",
+        files.types
+    );
+    assert!(
+        files.types.contains("featured?: Renderable | undefined"),
+        "expected `featured?: Renderable | undefined` for `Option<dyn Renderable>`, got: {}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("dyn"),
+        "TS output must not contain `dyn` keyword (should be unwrapped to bare trait name)"
+    );
+}

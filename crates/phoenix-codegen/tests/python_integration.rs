@@ -421,3 +421,165 @@ endpoint getUser: GET "/api/users/{id}" { response User }
     assert_eq!(f1.models, f2.models);
     assert_eq!(f1.client, f2.client);
 }
+
+/// End-to-end Python codegen across a schema containing a `dyn Trait`
+/// field. The Python codegen should emit the trait name verbatim so the
+/// user's hand-written `Protocol` / ABC can line up; a fall-through to
+/// `object` would silently erase the contract.
+#[test]
+fn dyn_trait_in_schema_generates_python_models() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Card {
+    Int id
+    dyn Renderable hero
+}
+endpoint getCard: GET "/api/cards/{id}" {
+    response Card
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_python(&program, &result);
+    assert!(
+        files.models.contains("hero: Renderable"),
+        "expected `hero: Renderable` in Python models, got: {}",
+        files.models
+    );
+}
+
+/// Python codegen: two unrelated `dyn` traits on the same struct must
+/// map each field to the corresponding trait name without cross-
+/// contamination. Regression guard for trait-name caching.
+#[test]
+fn dyn_multiple_traits_on_same_struct_generates_python() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+trait Serializable {
+    function serialize(self) -> String
+}
+struct Widget {
+    Int id
+    dyn Renderable view
+    dyn Serializable data
+}
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_python(&program, &result);
+    assert!(
+        files.models.contains("view: Renderable"),
+        "expected `view: Renderable`, got: {}",
+        files.models
+    );
+    assert!(
+        files.models.contains("data: Serializable"),
+        "expected `data: Serializable`, got: {}",
+        files.models
+    );
+}
+
+/// Python codegen for a schema where `dyn Trait` is the endpoint's
+/// response type. Verifies the generated client uses the trait name
+/// directly rather than falling through to `object`.
+#[test]
+fn dyn_trait_as_endpoint_response_generates_python() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Widget {
+    Int id
+    dyn Renderable body
+}
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_python(&program, &result);
+    assert!(
+        files.models.contains("body: Renderable"),
+        "expected `body: Renderable`, got: {}",
+        files.models
+    );
+    assert!(
+        !files.models.contains(": object") && !files.models.contains(": Any"),
+        "Python output should not fall through to `object` or `Any` for dyn fields"
+    );
+}
+
+/// Python codegen for `dyn Trait` nested inside container types —
+/// `List<dyn T>`, `Option<dyn T>`. The Python type mapper recurses
+/// through generic args, so the nested case must produce
+/// `list[Renderable]` and `Renderable | None`. Closes the audit gap on
+/// nested-position coverage for the Python backend.
+#[test]
+fn dyn_trait_nested_in_container_types_python() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Gallery {
+    Int id
+    List<dyn Renderable> items
+    Option<dyn Renderable> featured
+}
+endpoint getGallery: GET "/api/galleries/{id}" {
+    response Gallery
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_python(&program, &result);
+    assert!(
+        files.models.contains("list[Renderable]"),
+        "expected `list[Renderable]` for `List<dyn Renderable>`, got: {}",
+        files.models
+    );
+    assert!(
+        files.models.contains("Renderable | None"),
+        "expected `Renderable | None` for `Option<dyn Renderable>`, got: {}",
+        files.models
+    );
+    assert!(
+        !files.models.contains(": object") && !files.models.contains(": Any"),
+        "Python output must not fall through to `object` or `Any` for nested dyn"
+    );
+}

@@ -390,6 +390,28 @@ impl Interpreter {
 
     /// Calls a method on a value by looking up the method in the method registry
     /// and dispatching to `call_function` with `self` bound.
+    ///
+    /// # `dyn Trait` dispatch — divergence from the IR interpreter
+    ///
+    /// The AST interpreter has no explicit trait-object value (no `Value::Dyn`).
+    /// It resolves a `dyn Trait` method call by extracting the *concrete*
+    /// runtime type tag from `self_val` (e.g. `Value::Struct(name, ...)`) and
+    /// looking up `(type_name, method_name)` in [`Interpreter::methods`].
+    /// This is late binding by type tag, not vtable dispatch.
+    ///
+    /// The IR interpreter and Cranelift backend, by contrast, materialize a
+    /// `(data_ptr, vtable_ptr)` fat pointer and dispatch through a
+    /// pre-computed vtable slot. The two paths agree today because every
+    /// `dyn Trait` value observed at runtime carries a recoverable concrete
+    /// type tag.
+    ///
+    /// This divergence will surface the first time `dyn Trait` is stored in
+    /// a position where the concrete tag is *not* directly readable — e.g.
+    /// heterogeneous `List<dyn Trait>` once that lands (see
+    /// `docs/known-issues.md`: "`List<dyn Trait>` literal initialization in
+    /// compiled mode"). At that point the AST interpreter must either gain
+    /// an explicit `Value::Dyn` variant or route method dispatch through a
+    /// trait-impl lookup that mirrors `IrModule::dyn_vtables`.
     fn call_method(
         &mut self,
         type_name: &str,

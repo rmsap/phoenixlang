@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{self, isa};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
@@ -28,6 +28,17 @@ pub struct CompileContext {
     pub call_conv: CallConv,
     /// Imported runtime functions.
     pub runtime: RuntimeFunctions,
+    /// Cache of emitted `dyn Trait` vtables, keyed by
+    /// `(concrete_type_name, trait_name)`. Populated lazily by
+    /// `translate::dyn_trait::get_or_emit_vtable`. The registry of which
+    /// pairs *need* a vtable lives on [`IrModule::dyn_vtables`].
+    pub dyn_vtable_cache: HashMap<(String, String), DataId>,
+    /// Cached Cranelift signatures for trait-object dispatch sites, keyed
+    /// by `(trait_name, method_index)`. Built once per trait-method from
+    /// the IR trait declaration and re-imported into each consumer
+    /// function (`SigRef` is per-function, so only the `Signature` is
+    /// module-level cacheable).
+    pub dyn_call_sig_cache: HashMap<(String, usize), cranelift_codegen::ir::Signature>,
 }
 
 impl CompileContext {
@@ -90,6 +101,8 @@ impl CompileContext {
             func_ids,
             call_conv,
             runtime,
+            dyn_vtable_cache: HashMap::new(),
+            dyn_call_sig_cache: HashMap::new(),
         })
     }
 }

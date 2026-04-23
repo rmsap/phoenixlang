@@ -73,6 +73,25 @@ pub fn ir_run(source: &str) -> Vec<String> {
     phoenix_ir_interp::run_and_capture(&module).expect("IR runtime error")
 }
 
+/// Run source through the AST interpreter and capture print() output.
+///
+/// Primary consumer: [`three_way_roundtrip`], which cross-validates the
+/// AST interpreter, the IR interpreter, and the compiled backend against
+/// each other so a silent regression in one backend doesn't get papered
+/// over by the other two producing the same wrong answer.
+pub fn ast_run(source: &str) -> Vec<String> {
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        result.diagnostics
+    );
+    phoenix_interp::run_and_capture(&program, result.lambda_captures).expect("AST runtime error")
+}
+
 /// Assert that compiled output matches the IR interpreter output.
 pub fn roundtrip(source: &str) {
     let ir_out = ir_run(source);
@@ -81,6 +100,24 @@ pub fn roundtrip(source: &str) {
         ir_out, compiled_out,
         "output mismatch\n  IR:       {:?}\n  Compiled: {:?}",
         ir_out, compiled_out
+    );
+}
+
+/// Assert AST interp, IR interp, and compiled output all agree. This is
+/// strictly stronger than `roundtrip`: it catches cases where the IR
+/// interp and the compiled backend happen to agree on a wrong answer, so
+/// a regression in one surfaces immediately rather than propagating.
+pub fn three_way_roundtrip(source: &str) {
+    let ast_out = ast_run(source);
+    let ir_out = ir_run(source);
+    let compiled_out = compile_and_run(source);
+    assert_eq!(
+        ast_out, ir_out,
+        "AST vs IR mismatch\n  AST: {ast_out:?}\n  IR:  {ir_out:?}",
+    );
+    assert_eq!(
+        ir_out, compiled_out,
+        "IR vs Compiled mismatch\n  IR:       {ir_out:?}\n  Compiled: {compiled_out:?}",
     );
 }
 
@@ -121,6 +158,51 @@ fn link_binary(obj_bytes: &[u8], prefix: &str) -> (PathBuf, PathBuf) {
     let status = cmd.status().expect("could not run linker 'cc'");
     assert!(status.success(), "linking failed: {status}");
     (obj_path, exe_path)
+}
+
+/// The Drawable + Circle + Square fixture used by the dyn-trait
+/// integration tests.
+///
+/// Returns Phoenix source for:
+/// ```phoenix
+/// trait Drawable { function draw(self) -> String }
+/// struct Circle { Int radius }
+/// impl Drawable for Circle { function draw(self) -> String { return "circle" } }
+/// struct Square { Int side }
+/// impl Drawable for Square { function draw(self) -> String { return "square" } }
+/// ```
+///
+/// Most tests in `compile_dyn_trait.rs` exercise behaviour against this
+/// exact fixture. Use [`with_drawable_prelude`] to
+/// prepend it to a test-specific body.
+pub fn drawable_prelude() -> &'static str {
+    "trait Drawable {
+    function draw(self) -> String
+}
+
+struct Circle {
+    Int radius
+}
+
+impl Drawable for Circle {
+    function draw(self) -> String { return \"circle\" }
+}
+
+struct Square {
+    Int side
+}
+
+impl Drawable for Square {
+    function draw(self) -> String { return \"square\" }
+}
+"
+}
+
+/// Concatenate [`drawable_prelude`] with the supplied body. The body
+/// supplies the test-specific glue: the function under test plus
+/// `function main() { ... }`.
+pub fn with_drawable_prelude(body: &str) -> String {
+    format!("{}{}", drawable_prelude(), body)
 }
 
 /// Compile a Phoenix program, link it, run it, and assert it panics with

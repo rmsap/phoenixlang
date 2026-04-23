@@ -1,24 +1,20 @@
-//! IR verification.
+//! IR verification — structural invariants after lowering.
 //!
-//! Validates structural invariants of the IR after lowering:
-//! - Every basic block has exactly one terminator.
-//! - All branch targets reference valid blocks.
-//! - All terminator argument counts match target block parameter counts.
-//! - No instruction or terminator operand references [`VOID_SENTINEL`].
-//! - Every [`ValueId`] used as an operand is defined in the same function.
+//! Checks: one terminator per block, valid branch targets, terminator
+//! argument counts match target block params, no operand uses
+//! [`VOID_SENTINEL`], value-ids defined in same function, `dyn`-op
+//! invariants, and `DynRef` def-site legitimacy.
 //!
-//! **Not yet checked:** SSA dominance — the verifier does not verify that
-//! each use of a `ValueId` is dominated by its definition.  A full
-//! dominator-tree check would catch violations like using a value defined
-//! in a non-dominating predecessor.  This is a known gap; until it is
-//! implemented, take care to pass values through block parameters when
-//! crossing block boundaries (see `lower_try` for the canonical pattern).
+//! The `dyn`-specific checks live in [`dyn_ops`] so the core structural
+//! verifier here stays compact.
 //!
-//! Run the verifier after every lowering pass in debug builds to catch
-//! bugs early.
+//! **Not yet checked:** SSA dominance. Pass values through block
+//! parameters across block boundaries (see `lower_try`).
+
+mod dyn_ops;
 
 use crate::block::BlockId;
-use crate::instruction::{Op, VOID_SENTINEL, ValueId};
+use crate::instruction::{VOID_SENTINEL, ValueId};
 use crate::module::{IrFunction, IrModule};
 use crate::terminator::Terminator;
 use std::collections::{HashMap, HashSet};
@@ -45,10 +41,31 @@ pub struct VerifyError {
 /// to walk verifiable functions.
 pub fn verify(module: &IrModule) -> Vec<VerifyError> {
     let mut errors = Vec::new();
+    dyn_ops::verify_dyn_vtable_shapes(module, &mut errors);
     for func in module.concrete_functions() {
         verify_function(func, &mut errors);
+        verify_value_types_index(func, &mut errors);
+        dyn_ops::verify_dyn_ops(module, func, &mut errors);
+        dyn_ops::verify_dyn_def_sites(func, &mut errors);
     }
     errors
+}
+
+/// The per-value type index must have one entry per allocated ValueId.
+/// Out-of-sync state here causes silent wrong-codegen downstream (e.g.
+/// dyn-coercion readings the wrong actual type).
+fn verify_value_types_index(func: &IrFunction, errors: &mut Vec<VerifyError>) {
+    if func.value_count() as usize != func.value_types_len() {
+        errors.push(VerifyError {
+            function: func.name.clone(),
+            message: format!(
+                "value_types length {} out of sync with value_count {} — a pass \
+                 allocated a ValueId without recording its type",
+                func.value_types_len(),
+                func.value_count()
+            ),
+        });
+    }
 }
 
 fn verify_function(func: &IrFunction, errors: &mut Vec<VerifyError>) {
@@ -112,7 +129,7 @@ fn verify_function(func: &IrFunction, errors: &mut Vec<VerifyError>) {
 
         // Check instruction operands: no VOID_SENTINEL, all defined.
         for inst in &block.instructions {
-            for val in op_operands(&inst.op) {
+            for val in inst.op.operands() {
                 if val == VOID_SENTINEL {
                     errors.push(VerifyError {
                         function: func.name.clone(),
@@ -197,84 +214,6 @@ fn terminator_target_args(term: &Terminator) -> Vec<(BlockId, usize)> {
             pairs
         }
         Terminator::Return(_) | Terminator::Unreachable | Terminator::None => Vec::new(),
-    }
-}
-
-/// Extract all [`ValueId`] operands from an instruction's [`Op`].
-fn op_operands(op: &Op) -> Vec<ValueId> {
-    match op {
-        // Constants — no operands.
-        Op::ConstI64(_) | Op::ConstF64(_) | Op::ConstBool(_) | Op::ConstString(_) => Vec::new(),
-
-        // Binary ops.
-        Op::IAdd(a, b)
-        | Op::ISub(a, b)
-        | Op::IMul(a, b)
-        | Op::IDiv(a, b)
-        | Op::IMod(a, b)
-        | Op::FAdd(a, b)
-        | Op::FSub(a, b)
-        | Op::FMul(a, b)
-        | Op::FDiv(a, b)
-        | Op::FMod(a, b)
-        | Op::IEq(a, b)
-        | Op::INe(a, b)
-        | Op::ILt(a, b)
-        | Op::IGt(a, b)
-        | Op::ILe(a, b)
-        | Op::IGe(a, b)
-        | Op::FEq(a, b)
-        | Op::FNe(a, b)
-        | Op::FLt(a, b)
-        | Op::FGt(a, b)
-        | Op::FLe(a, b)
-        | Op::FGe(a, b)
-        | Op::StringEq(a, b)
-        | Op::StringNe(a, b)
-        | Op::StringLt(a, b)
-        | Op::StringGt(a, b)
-        | Op::StringLe(a, b)
-        | Op::StringGe(a, b)
-        | Op::BoolEq(a, b)
-        | Op::BoolNe(a, b)
-        | Op::StringConcat(a, b)
-        | Op::Store(a, b) => vec![*a, *b],
-
-        // Unary ops.
-        Op::INeg(a)
-        | Op::FNeg(a)
-        | Op::BoolNot(a)
-        | Op::Load(a)
-        | Op::Copy(a)
-        | Op::EnumDiscriminant(a) => vec![*a],
-
-        // Struct ops.
-        Op::StructAlloc(_, vals) => vals.clone(),
-        Op::StructGetField(v, _) => vec![*v],
-        Op::StructSetField(obj, _, val) => vec![*obj, *val],
-
-        // Enum ops.
-        Op::EnumAlloc(_, _, vals) => vals.clone(),
-        Op::EnumGetField(v, _, _) => vec![*v],
-
-        // Collection ops.
-        Op::ListAlloc(vals) => vals.clone(),
-        Op::MapAlloc(pairs) => pairs.iter().flat_map(|(k, v)| [*k, *v]).collect(),
-
-        // Closure ops.
-        Op::ClosureAlloc(_, vals) => vals.clone(),
-
-        // Call ops.
-        Op::Call(_, _, args) => args.clone(),
-        Op::CallIndirect(callee, args) => {
-            let mut ops = vec![*callee];
-            ops.extend(args);
-            ops
-        }
-        Op::BuiltinCall(_, args) => args.clone(),
-
-        // Alloca — no value operands.
-        Op::Alloca(_) => Vec::new(),
     }
 }
 

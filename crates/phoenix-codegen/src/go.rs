@@ -588,6 +588,11 @@ fn type_to_go(ty: &Type) -> String {
         Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
             format!("*{}", type_to_go(&args[0]))
         }
+        // Trait objects map to a Go interface named after the trait.  The
+        // interface itself is not emitted by Phoenix codegen today — callers
+        // supplying `dyn Trait` fields must define the matching Go interface
+        // in hand-written code.  Parallel to the TS/Python behavior.
+        Type::Dyn(name) => name.clone(),
         _ => "interface{}".to_string(),
     }
 }
@@ -1077,5 +1082,13 @@ struct User { Int id  String name }
             !files.types.contains("import"),
             "should not emit imports when no constraints"
         );
+    }
+
+    /// `dyn Trait` maps to a bare Go interface name (the interface itself
+    /// is expected to be defined in hand-written Go alongside the generated
+    /// struct).  Parallel to the TS/Python behavior.
+    #[test]
+    fn dyn_type_erases_to_trait_name() {
+        assert_eq!(type_to_go(&Type::Dyn("Drawable".to_string())), "Drawable");
     }
 }

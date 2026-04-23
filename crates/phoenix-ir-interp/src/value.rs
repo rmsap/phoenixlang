@@ -50,6 +50,19 @@ pub enum IrValue {
     Map(Rc<RefCell<Vec<(IrValue, IrValue)>>>),
     /// A closure: target function ID and captured values.
     Closure(FuncId, Vec<IrValue>),
+    /// A `dyn Trait` fat-pointer value, parallel to the Cranelift
+    /// `(data_ptr, vtable_ptr)` ABI. `Op::DynCall` dispatches by looking
+    /// up `(concrete_type, trait_name)` in [`IrModule::dyn_vtables`] and
+    /// indexing into the slot array — the same path the compiled backend
+    /// takes, so vtable-registration bugs surface in both.
+    Dyn {
+        /// The concrete receiver value.
+        concrete: Box<IrValue>,
+        /// The concrete type's name (e.g. `"Circle"`).
+        concrete_type: String,
+        /// The trait name the value was object-ified under.
+        trait_name: String,
+    },
 }
 
 impl IrValue {
@@ -124,6 +137,7 @@ impl IrValue {
                 format!("{{{}}}", strs.join(", "))
             }
             IrValue::Closure(_, _) => "<function>".to_string(),
+            IrValue::Dyn { concrete, .. } => concrete.format(module),
         }
     }
 
@@ -170,6 +184,24 @@ impl PartialEq for IrValue {
             (IrValue::List(a), IrValue::List(b)) => *a.borrow() == *b.borrow(),
             (IrValue::Map(a), IrValue::Map(b)) => *a.borrow() == *b.borrow(),
             (IrValue::Closure(_, _), IrValue::Closure(_, _)) => false,
+            // Trait-object equality: two `dyn` values are equal iff they
+            // carry the same trait *and* the same concrete type *and*
+            // their underlying values are equal. The trait-name check
+            // short-circuits first (cheapest), so `dyn Foo` is never
+            // equal to `dyn Bar` even if both wrap the same concrete —
+            // their vtables differ and the values are not interchangeable.
+            (
+                IrValue::Dyn {
+                    concrete: a,
+                    concrete_type: at,
+                    trait_name: atn,
+                },
+                IrValue::Dyn {
+                    concrete: b,
+                    concrete_type: bt,
+                    trait_name: btn,
+                },
+            ) => atn == btn && at == bt && a == b,
             _ => false,
         }
     }
@@ -225,6 +257,7 @@ impl fmt::Display for IrValue {
                 write!(f, "}}")
             }
             IrValue::Closure(_, _) => write!(f, "<function>"),
+            IrValue::Dyn { concrete, .. } => write!(f, "{concrete}"),
         }
     }
 }

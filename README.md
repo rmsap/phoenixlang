@@ -18,7 +18,7 @@ Phoenix combines functional and object-oriented programming with a clean, famili
 - **SSA-style intermediate representation** with a round-trip IR interpreter for verification
 - **Multi-target API codegen** — generate TypeScript, Python, Go, or OpenAPI 3.1 clients and servers from `.phx` schemas
 - **Full Language Server Protocol** — diagnostics, hover, autocomplete, go-to-definition, find-references, rename
-- **Modern type system** — generics with trait bounds, algebraic data types, pattern matching, closures, first-class functions
+- **Modern type system** — generics with trait bounds, `dyn Trait` dynamic dispatch, algebraic data types, pattern matching, closures, first-class functions
 - **First-class error handling** — built-in `Option<T>`, `Result<T, E>`, the `?` operator, and a rich functional-collection standard library
 
 ---
@@ -115,6 +115,15 @@ function main() {
     None -> print("no shapes")
   }
 }
+```
+
+### Static and dynamic dispatch
+
+`<T: Trait>` gives static dispatch (monomorphized). `dyn Trait` gives runtime dispatch through a vtable — use it when you need one function to accept multiple concrete types behind a trait without a generic type parameter. See **[docs/dyn-trait.md](docs/dyn-trait.md)** for the full guide. Both examples below reuse the `Display` trait defined in the previous snippet.
+
+```phoenix
+function describeStatic<T: Display>(item: T) -> String { item.toString() }
+function describeDyn(item: dyn Display) -> String      { item.toString() }
 ```
 
 ### Error handling with `Result` and `?`

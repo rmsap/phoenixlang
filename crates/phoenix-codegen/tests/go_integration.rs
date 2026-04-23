@@ -329,3 +329,168 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
     assert!(files.server.contains("r.PathValue(\"userId\")"));
     assert!(files.server.contains("r.PathValue(\"postId\")"));
 }
+
+/// End-to-end Go codegen across a schema containing a `dyn Trait` field.
+/// The Go codegen emits the trait name as a bare type reference; the user
+/// is expected to declare a matching Go interface in hand-written code.
+/// A regression to `interface{}` would silently erase the contract.
+#[test]
+fn dyn_trait_in_schema_generates_go_struct_field() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Card {
+    Int id
+    dyn Renderable hero
+}
+endpoint getCard: GET "/api/cards/{id}" {
+    response Card
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_go(&program, &result);
+    assert!(
+        files.types.contains("Hero") && files.types.contains("Renderable"),
+        "expected a `Hero ... Renderable` field in Go types, got: {}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("interface{}"),
+        "Go output should not fall through to `interface{{}}` for dyn fields"
+    );
+}
+
+/// Go codegen: two unrelated `dyn` traits on the same struct must map
+/// each field to the corresponding trait name — the generated Go types
+/// should hand the user distinct interface names to implement.
+#[test]
+fn dyn_multiple_traits_on_same_struct_generates_go() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+trait Serializable {
+    function serialize(self) -> String
+}
+struct Widget {
+    Int id
+    dyn Renderable view
+    dyn Serializable data
+}
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_go(&program, &result);
+    assert!(
+        files.types.contains("Renderable"),
+        "expected `Renderable` interface reference in Go types, got: {}",
+        files.types
+    );
+    assert!(
+        files.types.contains("Serializable"),
+        "expected `Serializable` interface reference in Go types, got: {}",
+        files.types
+    );
+}
+
+/// Go codegen for a schema where `dyn Trait` is the endpoint's
+/// response type. Client should deserialize into the struct type, and
+/// the Go struct should reference the trait interface by name.
+#[test]
+fn dyn_trait_as_endpoint_response_generates_go() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Widget {
+    Int id
+    dyn Renderable body
+}
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_go(&program, &result);
+    assert!(
+        files.types.contains("Renderable"),
+        "expected `Renderable` type reference in Go types, got: {}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("interface{}"),
+        "Go output should not fall through to `interface{{}}`"
+    );
+}
+
+/// Go codegen for `dyn Trait` nested inside container types — `List<dyn T>`,
+/// `Option<dyn T>`. The Go type mapper recurses through generic args, so
+/// the nested case must produce `[]Renderable` and `*Renderable`. Closes
+/// the audit gap on nested-position coverage for the Go backend.
+#[test]
+fn dyn_trait_nested_in_container_types_go() {
+    let source = r#"
+trait Renderable {
+    function render(self) -> String
+}
+struct Gallery {
+    Int id
+    List<dyn Renderable> items
+    Option<dyn Renderable> featured
+}
+endpoint getGallery: GET "/api/galleries/{id}" {
+    response Gallery
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_go(&program, &result);
+    assert!(
+        files.types.contains("[]Renderable"),
+        "expected `[]Renderable` for `List<dyn Renderable>`, got: {}",
+        files.types
+    );
+    assert!(
+        files.types.contains("*Renderable"),
+        "expected `*Renderable` for `Option<dyn Renderable>`, got: {}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("interface{}"),
+        "Go output must not fall through to `interface{{}}` for nested dyn"
+    );
+}

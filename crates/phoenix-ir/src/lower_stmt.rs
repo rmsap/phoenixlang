@@ -5,7 +5,7 @@
 
 use crate::block::BlockId;
 use crate::instruction::{Op, ValueId};
-use crate::lower::{LoweringContext, VarBinding};
+use crate::lower::{LoweringContext, VarBinding, lower_type};
 use crate::terminator::Terminator;
 use crate::types::IrType;
 use phoenix_parser::ast::{
@@ -122,6 +122,15 @@ impl<'a> LoweringContext<'a> {
         if needs_terminator {
             if return_type != IrType::Void {
                 if let Some(val) = result {
+                    // Implicit-return coercion: mirrors the explicit
+                    // `Statement::Return(r)` path so a concrete value
+                    // flowing out of a `-> dyn Trait` via a trailing
+                    // expression is wrapped in a `(data_ptr,
+                    // vtable_ptr)` pair.  Without this, lambdas /
+                    // functions that use implicit return would leave
+                    // the call site expecting two slots and getting
+                    // one, failing Cranelift verification.
+                    let val = self.coerce_value_to_expected(val, &return_type, body.span);
                     self.terminate(Terminator::Return(Some(val)));
                 } else {
                     // Void function with no explicit return.
@@ -192,6 +201,13 @@ impl<'a> LoweringContext<'a> {
             Statement::Return(r) => {
                 if let Some(val_expr) = &r.value {
                     let val = self.lower_expr(val_expr);
+                    // Coerce to the function's declared return type so a
+                    // concrete value flowing out of a `-> dyn Trait`
+                    // function is wrapped in a `(data_ptr, vtable_ptr)`
+                    // pair.  Without this, the returned value would be
+                    // single-slot at call sites that expect two.
+                    let expected = self.current_func().return_type.clone();
+                    let val = self.coerce_expr_to_expected(val, val_expr.span(), &expected, r.span);
                     self.terminate(Terminator::Return(Some(val)));
                 } else {
                     self.terminate(Terminator::Return(None));
@@ -228,15 +244,43 @@ impl<'a> LoweringContext<'a> {
 
         match &v.target {
             VarDeclTarget::Simple(name) => {
+                // Read the sema-resolved annotation (not the raw TypeExpr)
+                // so aliases expanding to `dyn Trait` pick up coercion.
+                //
+                // Span-keying caveat: `var_annotation_types` is keyed by
+                // the `VarDecl`'s parser span. This is sound under the
+                // current single-pass lowering where `VarDecl` spans are
+                // immutable and 1:1 with the sema pass that recorded
+                // them. Any future pass that rewrites, reparents, or
+                // synthesizes `VarDecl` nodes between sema and lowering
+                // (macros, desugaring, cross-file inlining) will silently
+                // lose entries — `.get(&v.span)` returns `None`, dyn
+                // coercion is skipped, and a concrete value flows into a
+                // `dyn Trait` slot unwrapped. The planned Phase-3 fix
+                // re-keys both this map and `call_type_args` on a stable
+                // `NodeId` assigned at parse time; see the field doc on
+                // `phoenix-sema/src/checker.rs::CheckResult::var_annotation_types`.
+                let (init_val, ir_type) = match self.check.var_annotation_types.get(&v.span) {
+                    Some(annotated) => {
+                        let expected = lower_type(annotated, self.check);
+                        let coerced = self.coerce_expr_to_expected(
+                            init_val,
+                            v.initializer.span(),
+                            &expected,
+                            v.span,
+                        );
+                        (coerced, expected)
+                    }
+                    None => (init_val, self.expr_type(&v.initializer.span())),
+                };
+
                 if v.is_mut {
                     // Mutable: allocate a stack slot, store the initial value.
-                    let ir_type = self.expr_type(&v.initializer.span());
                     let slot = self.emit(Op::Alloca(ir_type.clone()), IrType::I64, Some(v.span));
                     self.emit_void(Op::Store(slot, init_val), Some(v.span));
                     self.define_var(name.clone(), VarBinding::Mutable(slot, ir_type));
                 } else {
                     // Immutable: the SSA value IS the variable.
-                    let ir_type = self.expr_type(&v.initializer.span());
                     self.define_var(name.clone(), VarBinding::Direct(init_val, ir_type));
                 }
             }

@@ -646,6 +646,10 @@ fn type_to_python(ty: &Type) -> String {
             let py_args: Vec<String> = args.iter().map(type_to_python).collect();
             format!("{}[{}]", name, py_args.join(", "))
         }
+        // Trait objects erase to the trait name (dispatched at runtime via
+        // duck typing in Python); sharper Protocol-based mappings can replace
+        // this once specific traits need per-trait shims.
+        Type::Dyn(name) => name.clone(),
         _ => "object".to_string(),
     }
 }
@@ -727,6 +731,9 @@ fn collect_python_imports(ty: &Type, imports: &mut BTreeSet<String>) {
             for arg in args {
                 collect_python_imports(arg, imports);
             }
+        }
+        Type::Dyn(name) => {
+            imports.insert(name.clone());
         }
         _ => {}
     }
@@ -1097,5 +1104,24 @@ endpoint replaceUser: PUT "/api/users/{id}" {
         );
         assert_eq!(default_value_to_python(&DefaultValue::Bool(true)), "True");
         assert_eq!(default_value_to_python(&DefaultValue::Bool(false)), "False");
+    }
+
+    /// `dyn Trait` erases to the trait name — callers are expected to have
+    /// a matching Protocol / ABC defined in hand-written Python.
+    #[test]
+    fn dyn_type_erases_to_trait_name() {
+        assert_eq!(
+            type_to_python(&Type::Dyn("Drawable".to_string())),
+            "Drawable"
+        );
+    }
+
+    /// `dyn Trait` gets recorded as an import so the generator wires up the
+    /// user-defined trait symbol the same way it does named structs/enums.
+    #[test]
+    fn dyn_type_records_import() {
+        let mut imports = BTreeSet::new();
+        collect_python_imports(&Type::Dyn("Drawable".to_string()), &mut imports);
+        assert!(imports.contains("Drawable"));
     }
 }

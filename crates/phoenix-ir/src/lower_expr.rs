@@ -436,6 +436,7 @@ impl<'a> LoweringContext<'a> {
             if let Some(&func_id) = self.module.function_index.get(&ident.name) {
                 let result_type = self.expr_type(&call.span);
                 let args = self.merge_call_args(func_id, &positional, &named);
+                let args = self.coerce_call_args(func_id, args, call.span);
                 let type_args = self.resolve_call_type_args(call.span);
                 return self.emit(Op::Call(func_id, type_args, args), result_type, span);
             }
@@ -443,28 +444,25 @@ impl<'a> LoweringContext<'a> {
             // Check for an enum variant constructor (e.g. `Some(42)`).
             if let Some((enum_name, type_args)) = self.enum_type_at(&call.span)
                 && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()
-                && let Some((idx, _)) = variants
+                && let Some((idx, (_, field_types))) = variants
                     .iter()
                     .enumerate()
                     .find(|(_, (name, _))| *name == ident.name)
             {
                 let ir_args = self.lower_type_args(&type_args);
+                let args = self.coerce_args_to_expected(positional, field_types, call.span);
                 let result_type = IrType::EnumRef(enum_name.clone(), ir_args);
                 return self.emit(
-                    Op::EnumAlloc(enum_name, idx as u32, positional),
+                    Op::EnumAlloc(enum_name, idx as u32, args),
                     result_type,
                     span,
                 );
             }
 
             // Check for a struct constructor (e.g. `Point(1, 2)` parsed as a call).
-            if self.module.struct_layouts.contains_key(&ident.name) {
+            if let Some(args) = self.coerce_struct_ctor_args(&ident.name, &positional, call.span) {
                 let result_type = IrType::StructRef(ident.name.clone());
-                return self.emit(
-                    Op::StructAlloc(ident.name.clone(), positional),
-                    result_type,
-                    span,
-                );
+                return self.emit(Op::StructAlloc(ident.name.clone(), args), result_type, span);
             }
         }
 
@@ -529,8 +527,11 @@ impl<'a> LoweringContext<'a> {
         let val = self.lower_expr(&assign.value);
 
         if let Some(binding) = self.lookup_var(&assign.name).cloned()
-            && let VarBinding::Mutable(slot, _) = binding
+            && let VarBinding::Mutable(slot, ty) = binding
         {
+            // Coerce against the binding's declared type so a `let mut x:
+            // dyn Trait` reassigned to a concrete value wraps in DynAlloc.
+            let val = self.coerce_expr_to_expected(val, assign.value.span(), &ty, assign.span);
             self.emit_void(Op::Store(slot, val), Some(assign.span));
         }
 
@@ -538,6 +539,13 @@ impl<'a> LoweringContext<'a> {
     }
 
     /// Lower a field assignment.
+    ///
+    /// Coerces `val` against the field's declared IR type so a concrete
+    /// value flowing into a `dyn Trait` field is wrapped in `Op::DynAlloc`
+    /// — mirrors the constructor path in
+    /// [`Self::coerce_struct_ctor_args`]. Without this step, a mutable
+    /// `dyn Trait` field assigned from a concrete value would land in a
+    /// 2-slot field as a 1-slot value, which miscompiles at codegen.
     fn lower_field_assignment(&mut self, fa: &FieldAssignmentExpr) -> ValueId {
         let obj = self.lower_expr(&fa.object);
         let val = self.lower_expr(&fa.value);
@@ -551,6 +559,8 @@ impl<'a> LoweringContext<'a> {
             && let Some(layout) = self.module.struct_layouts.get(struct_name).cloned()
             && let Some(idx) = layout.iter().position(|(name, _)| *name == fa.field)
         {
+            let field_type = layout[idx].1.clone();
+            let val = self.coerce_expr_to_expected(val, fa.value.span(), &field_type, fa.span);
             self.emit_void(Op::StructSetField(obj, idx as u32, val), Some(fa.span));
         }
 
@@ -593,6 +603,12 @@ impl<'a> LoweringContext<'a> {
             .cloned()
             .unwrap_or_else(|| unreachable!("missing sema type for method call object"));
 
+        // Trait-object method call: receiver is `dyn Trait`. Dispatched
+        // via a pre-resolved slot index — see `lower_dyn.rs`.
+        if let Type::Dyn(trait_name) = &obj_type {
+            return self.lower_dyn_method_call(trait_name, obj, &mc.method, args, mc.span);
+        }
+
         // Determine the type name for method lookup.
         let type_name = match &obj_type {
             Type::Named(name) => name.clone(),
@@ -629,12 +645,13 @@ impl<'a> LoweringContext<'a> {
         // Check if this is an enum variant constructor.
         if let Some((enum_name, type_args)) = self.enum_type_at(&sl.span)
             && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()
-            && let Some((idx, _)) = variants
+            && let Some((idx, (_, field_types))) = variants
                 .iter()
                 .enumerate()
                 .find(|(_, (name, _))| *name == sl.name)
         {
             let ir_args = self.lower_type_args(&type_args);
+            let args = self.coerce_args_to_expected(args, field_types, sl.span);
             return self.emit(
                 Op::EnumAlloc(enum_name.clone(), idx as u32, args),
                 IrType::EnumRef(enum_name, ir_args),
@@ -642,9 +659,29 @@ impl<'a> LoweringContext<'a> {
             );
         }
 
-        // Regular struct constructor.
+        // Regular struct constructor. See `coerce_struct_ctor_args` for
+        // the dyn-coercion rationale; it mirrors the paren-call path.
+        let args = self
+            .coerce_struct_ctor_args(&sl.name, &args, sl.span)
+            .unwrap_or(args);
         let result_type = IrType::StructRef(sl.name.clone());
         self.emit(Op::StructAlloc(sl.name.clone(), args), result_type, span)
+    }
+
+    /// Coerce positional arguments of a struct constructor against the
+    /// struct's declared field types, wrapping any concrete value that
+    /// flows into a `dyn Trait` field in `Op::DynAlloc`. Returns `None`
+    /// when `name` is not a registered struct (caller falls through to
+    /// the next constructor shape or reports an error).
+    fn coerce_struct_ctor_args(
+        &mut self,
+        name: &str,
+        args: &[ValueId],
+        span: Span,
+    ) -> Option<Vec<ValueId>> {
+        let field_layout = self.module.struct_layouts.get(name)?.clone();
+        let expected: Vec<IrType> = field_layout.into_iter().map(|(_, ty)| ty).collect();
+        Some(self.coerce_args_to_expected(args.to_vec(), &expected, span))
     }
 
     // NOTE: `lower_match` is in lower_match.rs
@@ -762,6 +799,16 @@ impl<'a> LoweringContext<'a> {
         let body_result = self.lower_block_implicit(&lambda.body);
         if self.block_needs_terminator() {
             if let Some(val) = body_result {
+                // Implicit-return coercion — same contract as the
+                // top-level function-body path in
+                // `lower_stmt.rs::lower_function_body`: a concrete
+                // trailing expression flowing out of a `-> dyn Trait`
+                // lambda must be wrapped in a `(data_ptr, vtable_ptr)`
+                // pair at the function boundary.
+                let expected = self.module.functions[func_id.0 as usize]
+                    .return_type
+                    .clone();
+                let val = self.coerce_value_to_expected(val, &expected, lambda.body.span);
                 self.terminate(Terminator::Return(Some(val)));
             } else {
                 self.terminate(Terminator::Return(None));

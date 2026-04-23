@@ -92,6 +92,7 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
             // `IrType::TypeVar` should not appear in any function body.
             IrType::TypeVar(name.clone())
         }
+        Type::Dyn(trait_name) => IrType::DynRef(trait_name.clone()),
         Type::Generic(name, args) => match name.as_str() {
             "List" => {
                 let elem = args
@@ -305,6 +306,12 @@ impl<'a> LoweringContext<'a> {
     }
 
     // --- IR construction helpers ---
+
+    /// Returns a shared reference to the current function being lowered.
+    pub(crate) fn current_func(&self) -> &IrFunction {
+        let func_id = self.current_func_id.expect("no current function");
+        &self.module.functions[func_id.0 as usize]
+    }
 
     /// Returns a mutable reference to the current function being lowered.
     pub(crate) fn current_func_mut(&mut self) -> &mut IrFunction {

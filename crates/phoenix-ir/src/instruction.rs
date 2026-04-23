@@ -191,6 +191,20 @@ pub enum Op {
     /// Call a built-in runtime function by name (e.g. `"print"`, `"String.length"`).
     BuiltinCall(String, Vec<ValueId>),
 
+    // --- Trait object operations ---
+    /// `DynAlloc(trait_name, concrete_type, value)` — materialize a
+    /// `dyn Trait` fat pointer from a concrete receiver. Result type is
+    /// `IrType::DynRef(trait_name)`. The verifier requires a registered
+    /// vtable for `(concrete_type, trait_name)`.
+    DynAlloc(String, String, ValueId),
+    /// `DynCall(trait_name, method_idx, receiver, args)` — indirect
+    /// dispatch through a trait-object vtable. `method_idx` is the slot
+    /// index in the trait's declared method order (pinned by
+    /// `TraitInfo::methods`; also the order in `IrModule::dyn_vtables`).
+    /// The verifier requires that `receiver: IrType::DynRef(trait_name)`
+    /// and that the slot index is in range.
+    DynCall(String, u32, ValueId, Vec<ValueId>),
+
     // --- Mutable variables (before mem2reg) ---
     /// Allocate a stack slot for a mutable local variable.
     Alloca(IrType),
@@ -202,4 +216,96 @@ pub enum Op {
     // --- Miscellaneous ---
     /// Copy a value (used for block parameter lowering).
     Copy(ValueId),
+}
+
+impl Op {
+    /// Every [`ValueId`] this op reads as an operand, in a stable order.
+    /// Used by the verifier and by any pass that needs to walk SSA
+    /// use-sites. Adding a new `Op` variant must add a match arm here
+    /// (enforced by exhaustive match — omitting an arm is a compile
+    /// error).
+    pub fn operands(&self) -> Vec<ValueId> {
+        match self {
+            // Constants — no operands.
+            Op::ConstI64(_) | Op::ConstF64(_) | Op::ConstBool(_) | Op::ConstString(_) => Vec::new(),
+
+            // Binary ops.
+            Op::IAdd(a, b)
+            | Op::ISub(a, b)
+            | Op::IMul(a, b)
+            | Op::IDiv(a, b)
+            | Op::IMod(a, b)
+            | Op::FAdd(a, b)
+            | Op::FSub(a, b)
+            | Op::FMul(a, b)
+            | Op::FDiv(a, b)
+            | Op::FMod(a, b)
+            | Op::IEq(a, b)
+            | Op::INe(a, b)
+            | Op::ILt(a, b)
+            | Op::IGt(a, b)
+            | Op::ILe(a, b)
+            | Op::IGe(a, b)
+            | Op::FEq(a, b)
+            | Op::FNe(a, b)
+            | Op::FLt(a, b)
+            | Op::FGt(a, b)
+            | Op::FLe(a, b)
+            | Op::FGe(a, b)
+            | Op::StringEq(a, b)
+            | Op::StringNe(a, b)
+            | Op::StringLt(a, b)
+            | Op::StringGt(a, b)
+            | Op::StringLe(a, b)
+            | Op::StringGe(a, b)
+            | Op::BoolEq(a, b)
+            | Op::BoolNe(a, b)
+            | Op::StringConcat(a, b)
+            | Op::Store(a, b) => vec![*a, *b],
+
+            // Unary ops.
+            Op::INeg(a)
+            | Op::FNeg(a)
+            | Op::BoolNot(a)
+            | Op::Load(a)
+            | Op::Copy(a)
+            | Op::EnumDiscriminant(a) => vec![*a],
+
+            // Struct ops.
+            Op::StructAlloc(_, vals) => vals.clone(),
+            Op::StructGetField(v, _) => vec![*v],
+            Op::StructSetField(obj, _, val) => vec![*obj, *val],
+
+            // Enum ops.
+            Op::EnumAlloc(_, _, vals) => vals.clone(),
+            Op::EnumGetField(v, _, _) => vec![*v],
+
+            // Collection ops.
+            Op::ListAlloc(vals) => vals.clone(),
+            Op::MapAlloc(pairs) => pairs.iter().flat_map(|(k, v)| [*k, *v]).collect(),
+
+            // Closure ops.
+            Op::ClosureAlloc(_, vals) => vals.clone(),
+
+            // Call ops.
+            Op::Call(_, _, args) => args.clone(),
+            Op::CallIndirect(callee, args) => {
+                let mut ops = vec![*callee];
+                ops.extend(args);
+                ops
+            }
+            Op::BuiltinCall(_, args) => args.clone(),
+
+            // Trait object ops.
+            Op::DynAlloc(_, _, value) => vec![*value],
+            Op::DynCall(_, _, receiver, args) => {
+                let mut ops = vec![*receiver];
+                ops.extend_from_slice(args);
+                ops
+            }
+
+            // Alloca — no value operands.
+            Op::Alloca(_) => Vec::new(),
+        }
+    }
 }

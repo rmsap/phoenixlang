@@ -34,6 +34,12 @@ pub enum Type {
     /// The first element is the base type name and the second is the list of
     /// concrete type arguments supplied at the use site.
     Generic(std::string::String, Vec<Type>),
+    /// A trait-object type (`dyn TraitName`).  Concrete values are carried
+    /// behind a `(data_ptr, vtable_ptr)` pair at the IR/runtime level.
+    /// The inner string is the trait name.  See `docs/design-decisions.md`
+    /// for the "why explicit `dyn`" rationale — bare `TraitName` as a type
+    /// remains an error; `dyn TraitName` is the runtime-dispatch opt-in.
+    Dyn(std::string::String),
     /// Error type — used when type checking fails to avoid cascading errors.
     Error,
 }
@@ -145,6 +151,7 @@ impl std::fmt::Display for Type {
                 }
                 write!(f, ">")
             }
+            Type::Dyn(name) => write!(f, "dyn {}", name),
             Type::Error => write!(f, "<error>"),
         }
     }

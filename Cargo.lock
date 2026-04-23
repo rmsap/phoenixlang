@@ -1135,6 +1135,7 @@ dependencies = [
  "cranelift-object",
  "insta",
  "phoenix-common",
+ "phoenix-interp",
  "phoenix-ir",
  "phoenix-ir-interp",
  "phoenix-lexer",

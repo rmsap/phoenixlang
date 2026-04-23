@@ -5,13 +5,19 @@
 
 use crate::instruction::FuncId;
 use crate::lower::{LoweringContext, lower_type};
-use crate::module::IrFunction;
+use crate::module::{IrFunction, IrTraitInfo, IrTraitMethod};
 use crate::types::IrType;
 use phoenix_parser::ast::{Declaration, FunctionDecl, Program};
 
 impl<'a> LoweringContext<'a> {
     /// Pass 1: Register all declarations.
     pub(crate) fn register_declarations(&mut self, program: &Program) {
+        // Mirror sema's object-safe traits into IR-level metadata so
+        // verifier / codegen / interpreter can answer "slot count" and
+        // "method signature" without sampling impls or reaching back
+        // into sema.  See `IrModule::traits`.
+        self.register_traits();
+
         for decl in &program.declarations {
             match decl {
                 Declaration::Struct(s) => self.register_struct(s),
@@ -57,6 +63,29 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Populate `IrModule::traits` from sema's object-safe trait
+    /// declarations. Skips non-object-safe traits (they cannot appear in
+    /// `DynRef` positions, so no IR consumer needs their signatures).
+    fn register_traits(&mut self) {
+        for (name, info) in self.check.traits.iter() {
+            if info.object_safety_error.is_some() {
+                continue;
+            }
+            let methods: Vec<IrTraitMethod> = info
+                .methods
+                .iter()
+                .map(|m| IrTraitMethod {
+                    name: m.name.clone(),
+                    param_types: m.params.iter().map(|t| lower_type(t, self.check)).collect(),
+                    return_type: lower_type(&m.return_type, self.check),
+                })
+                .collect();
+            self.module
+                .traits
+                .insert(name.clone(), IrTraitInfo { methods });
         }
     }
 
@@ -155,32 +184,52 @@ impl<'a> LoweringContext<'a> {
         let has_self = method.params.first().is_some_and(|p| p.name == "self");
 
         if has_self {
-            // Determine the self type from sema info. The enum branch emits
-            // empty generic args because Phoenix does not yet support
-            // user-defined methods on generic enums — once that lands, this
-            // must be taught to propagate the enum's type parameters so
-            // payload inference inside the method body can read them via
-            // Strategy 0 instead of falling through to fallbacks.  The
-            // `debug_assert` below fails loudly the first time a caller
-            // introduces a generic enum with methods, so the fix is scoped
-            // to here rather than manifesting as a silent miscompile.
+            // Both branches emit an unparameterized self-type reference
+            // because methods on generic structs/enums aren't yet
+            // supported in compiled mode. Hard `panic!` (not
+            // `debug_assert!`) because silent miscompilation would return
+            // if the gate is relaxed without also fixing the name-keyed
+            // `struct_layouts` / `method_index` / `dyn_vtables` tables.
+            //
+            // Sema contract: `Checker::register_struct` / `register_enum`
+            // / `register_impl` (phoenix-sema/src/check_register.rs) are
+            // expected to reject `impl Trait for GenericStruct<T>` before
+            // lowering runs. If either gate moves upstream
+            // (e.g. generic-struct support lands) these panics MUST be
+            // replaced with a proper per-instantiation lowering path —
+            // do not simply relax them.
             let self_type = if self.check.structs.contains_key(type_name) {
+                let is_generic = self
+                    .check
+                    .structs
+                    .get(type_name)
+                    .is_some_and(|info| !info.type_params.is_empty());
+                if is_generic {
+                    panic!(
+                        "method on generic struct `{type_name}` reached IR lowering — \
+                         `Checker::register_impl` (phoenix-sema/src/check_register.rs) \
+                         is expected to reject this until monomorphization reifies \
+                         struct_layouts and dyn_vtables per-instantiation. See \
+                         docs/known-issues.md: \"Generic user-defined structs are not \
+                         supported in compiled mode\"."
+                    );
+                }
                 IrType::StructRef(type_name.to_string())
             } else {
-                debug_assert!(
-                    self.check
-                        .enums
-                        .get(type_name)
-                        .is_none_or(|info| info.type_params.is_empty()),
-                    "method on generic enum `{type_name}` — lower_decl must be \
-                     taught to propagate type params into the self `EnumRef` \
-                     before this path is reachable. Tracked under phase 2.2 in \
-                     `docs/phases/phase-2.md`; fix here by threading the \
-                     enum's `info.type_params` into the self `EnumRef` args \
-                     and revisiting the Strategy 1–4 fallbacks in \
-                     `phoenix-cranelift/src/translate/enum_type_inference.rs` \
-                     (module doc FIXME)."
-                );
+                let is_generic = self
+                    .check
+                    .enums
+                    .get(type_name)
+                    .is_some_and(|info| !info.type_params.is_empty());
+                if is_generic {
+                    panic!(
+                        "method on generic enum `{type_name}` reached IR lowering — \
+                         `Checker::register_impl` (phoenix-sema/src/check_register.rs) \
+                         is expected to reject this until monomorphization threads \
+                         enum type_params into the self-type's args. See \
+                         docs/known-issues.md: \"Methods on generic enums are gated off\"."
+                    );
+                }
                 IrType::EnumRef(type_name.to_string(), Vec::new())
             };
             param_types.insert(0, self_type);
