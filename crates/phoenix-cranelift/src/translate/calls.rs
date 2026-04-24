@@ -115,6 +115,11 @@ pub(super) fn translate_call(
         Op::BuiltinCall(name, args) => {
             translate_builtin(builder, ctx, ir_module, name, args, state, result_type)
         }
+        Op::UnresolvedTraitMethod(method, _, _) => Err(CompileError::new(format!(
+            "internal error: unresolved trait-bound method call `.{method}` \
+             reached Cranelift codegen — monomorphization was expected to \
+             rewrite it to a concrete Op::Call"
+        ))),
         _ => unreachable!(),
     }
 }

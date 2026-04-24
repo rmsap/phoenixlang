@@ -469,6 +469,11 @@ impl<'m> IrInterpreter<'m> {
                     .collect::<Result<_>>()?;
                 builtins::dispatch(self, name, args)
             }
+            Op::UnresolvedTraitMethod(method, _, _) => error(format!(
+                "internal error: unresolved trait-bound method call `.{method}` \
+                 reached the IR interpreter — monomorphization was expected to \
+                 rewrite it to a concrete Op::Call"
+            )),
 
             // --- Trait object operations ---
             Op::DynAlloc(trait_name, concrete_type, value_vid) => {

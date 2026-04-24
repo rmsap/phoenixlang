@@ -374,7 +374,10 @@ fn translate_op(
         Op::ClosureAlloc(..) => calls::translate_closure_alloc(builder, ctx, op, state),
 
         // Function calls
-        Op::Call(..) | Op::CallIndirect(..) | Op::BuiltinCall(..) => {
+        Op::Call(..)
+        | Op::CallIndirect(..)
+        | Op::BuiltinCall(..)
+        | Op::UnresolvedTraitMethod(..) => {
             calls::translate_call(builder, ctx, ir_module, op, result_type, state)
         }
 

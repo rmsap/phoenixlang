@@ -158,11 +158,6 @@ phases. None of them are fundamental — they are work-in-progress gaps.
   yet — `function wrap<T: Drawable>(x: T) -> dyn Drawable { x }` runs
   under `phoenix run` but panics at IR lowering under `phoenix build`.
   Wrap concrete values *outside* the generic function as a workaround.
-- **`<T: Trait>` method calls in compiled mode** fall into the same
-  monomorphization-vs-lowering gap. Same workaround.
-- **`dyn Trait` over generic structs** (`struct Box<T> { ... } impl Trait for Box`
-  used as `dyn Trait`) is blocked by the broader generic-struct gap in
-  compiled mode and lands as part of that fix.
 - **Default arguments typed `dyn Trait`** are not supported in compiled
   mode (default arguments themselves are not yet supported in compiled
   mode). Pass every argument explicitly.

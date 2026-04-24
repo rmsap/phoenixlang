@@ -182,19 +182,6 @@ or use `phoenix run` for programs that need this pattern.
 **Target phase:** Phase 2.2 follow-up — pairs with the method-call fix below since both
 need the same monomorphization × IR-emission rework.
 
-### `<T: Trait>` method calls fail in compiled mode
-
-See also: [design-decisions.md: *Dynamic dispatch via `dyn Trait`*](design-decisions.md#dynamic-dispatch-via-dyn-trait) — documented as a follow-up in that section's table.
-
-Programs that call a trait-bounded method on a type variable (e.g., `function show<T: Display>(x: T) { print(x.toString()) }` — or any user-defined trait method on `<T: Bound>`) pass sema and run via `phoenix run` (AST interpreter), but fail `phoenix build` with "builtin '.method' not yet supported in compiled mode". The AST interpreter resolves the method by inspecting the runtime value's concrete type; the Cranelift path lowers the method call to `BuiltinCall("", method)` (empty type name prefix) which the backend's dispatcher cannot route.
-
-Monomorphization should fix this naturally: after specializing `show<T: Display>` at `T := Point`, the body's `x.toString()` call has `x: Point`, and a normal `StructRef`-based method lookup via `method_index` works. But the current lowering emits `BuiltinCall` *before* monomorphization sees the call site, so the name has already been mangled to the empty-prefix form.
-
-Not a regression from the `dyn Trait` work — pre-existed and unrelated. Documented here because it's in the same neighborhood and users learning about `dyn Trait` are likely to try the `<T: Trait>` form and hit it.
-
-**File:** `phoenix-ir/src/lower_expr.rs` (`lower_method_call`). **Planned fix:** either (a) defer the method-to-builtin lowering to post-monomorphization, or (b) have monomorphization rewrite `BuiltinCall(".m", ...)` to `Call(method_index[(T_subst, m)], ...)` when the receiver type becomes known. Option (b) is more localized.
-**Target phase:** Phase 2.2 follow-up (demand-triggered — this is the exact error users will hit when trying trait-bounded generic methods in compiled mode for the first time).
-
 ### Multi-bound generic parameters (`<T: Foo + Bar>`) rejected by parser
 
 The parser today fails with "expected '>'" on the `+` in `<T: Foo + Bar>`. The design is uncontroversial (bounds are conjunctive), but the parser + sema + monomorphization plumbing needs to thread a `Vec<String>` where today it threads a single `Option<String>`.

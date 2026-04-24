@@ -692,6 +692,21 @@ impl<'a> LoweringContext<'a> {
             return self.lower_dyn_method_call(trait_name, obj, &mc.method, args, mc.span);
         }
 
+        // Trait-bounded method call on a type variable receiver
+        // (`x.method()` where `x: T` with `<T: Trait>`). The concrete
+        // impl is not known yet — emit the typed placeholder and let
+        // monomorphization rewrite it to `Op::Call` after substitution.
+        if matches!(&obj_type, Type::TypeVar(_)) {
+            args.insert(0, obj);
+            let result_type = self.expr_type(&mc.span);
+            let type_args = self.resolve_call_type_args(mc.span);
+            return self.emit(
+                Op::UnresolvedTraitMethod(mc.method.clone(), type_args, args),
+                result_type,
+                span,
+            );
+        }
+
         // Determine the type name for method lookup.
         let type_name = match &obj_type {
             Type::Named(name) => name.clone(),

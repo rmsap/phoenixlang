@@ -190,6 +190,25 @@ pub enum Op {
     CallIndirect(ValueId, Vec<ValueId>),
     /// Call a built-in runtime function by name (e.g. `"print"`, `"String.length"`).
     BuiltinCall(String, Vec<ValueId>),
+    /// Placeholder for a trait-bounded method call whose receiver is a
+    /// type variable at lowering time.
+    ///
+    /// Emitted by `lower_method_call` when the receiver's static type
+    /// is `Type::TypeVar(T)` with `<T: Trait>` — the concrete impl is
+    /// not known yet, so the call cannot be materialized as an
+    /// `Op::Call`.  The monomorphization pass rewrites it into a direct
+    /// `Op::Call` after substituting `T` with each concrete type.
+    ///
+    /// Fields: `(method_name, method_type_args, args)`.  `args[0]` is
+    /// the receiver; `args[1..]` are the user-visible arguments.
+    /// `method_type_args` carries concrete type arguments bound to the
+    /// method's own type parameters (`function greet<U>(self, x: U)`)
+    /// — empty for the common zero-generic-method case.
+    ///
+    /// Invariant: no [`Op::UnresolvedTraitMethod`] may survive the
+    /// monomorphization pass — the verifier enforces this for every
+    /// non-template function.
+    UnresolvedTraitMethod(String, Vec<IrType>, Vec<ValueId>),
 
     // --- Trait object operations ---
     /// `DynAlloc(trait_name, concrete_type, value)` — materialize a
@@ -295,6 +314,7 @@ impl Op {
                 ops
             }
             Op::BuiltinCall(_, args) => args.clone(),
+            Op::UnresolvedTraitMethod(_, _, args) => args.clone(),
 
             // Trait object ops.
             Op::DynAlloc(_, _, value) => vec![*value],

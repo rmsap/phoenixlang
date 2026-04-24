@@ -3,7 +3,9 @@
 //! Checks: one terminator per block, valid branch targets, terminator
 //! argument counts match target block params, no operand uses
 //! [`VOID_SENTINEL`], value-ids defined in same function, `dyn`-op
-//! invariants, and `DynRef` def-site legitimacy.
+//! invariants, `DynRef` def-site legitimacy, and that no
+//! [`Op::UnresolvedTraitMethod`](crate::instruction::Op::UnresolvedTraitMethod)
+//! survives into any concrete function post-monomorphization.
 //!
 //! The `dyn`-specific checks live in [`dyn_ops`] so the core structural
 //! verifier here stays compact.
@@ -14,7 +16,7 @@
 mod dyn_ops;
 
 use crate::block::BlockId;
-use crate::instruction::{VOID_SENTINEL, ValueId};
+use crate::instruction::{Op, VOID_SENTINEL, ValueId};
 use crate::module::{IrFunction, IrModule};
 use crate::terminator::Terminator;
 use std::collections::{HashMap, HashSet};
@@ -45,10 +47,31 @@ pub fn verify(module: &IrModule) -> Vec<VerifyError> {
     for func in module.concrete_functions() {
         verify_function(func, &mut errors);
         verify_value_types_index(func, &mut errors);
+        verify_no_unresolved_trait_methods(func, &mut errors);
         dyn_ops::verify_dyn_ops(module, func, &mut errors);
         dyn_ops::verify_dyn_def_sites(func, &mut errors);
     }
     errors
+}
+
+/// Trait-bounded method calls on type-variable receivers are emitted
+/// as [`Op::UnresolvedTraitMethod`] by IR lowering and must be
+/// rewritten to a direct `Op::Call` by the monomorphization pass.  Any
+/// residual placeholder in a concrete function indicates a mono bug.
+fn verify_no_unresolved_trait_methods(func: &IrFunction, errors: &mut Vec<VerifyError>) {
+    for block in &func.blocks {
+        for instr in &block.instructions {
+            if let Op::UnresolvedTraitMethod(method, _, _) = &instr.op {
+                errors.push(VerifyError {
+                    function: func.name.clone(),
+                    message: format!(
+                        "Op::UnresolvedTraitMethod `.{method}` survived \
+                         monomorphization — this is an internal compiler bug",
+                    ),
+                });
+            }
+        }
+    }
 }
 
 /// The per-value type index must have one entry per allocated ValueId.
@@ -248,5 +271,85 @@ fn terminator_operands(term: &Terminator) -> Vec<ValueId> {
         }
         Terminator::Return(Some(v)) => vec![*v],
         Terminator::Return(None) | Terminator::Unreachable | Terminator::None => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod unresolved_trait_method_tests {
+    //! Negative verifier tests for [`Op::UnresolvedTraitMethod`]: the
+    //! placeholder must not survive the monomorphization pass inside a
+    //! concrete (non-template) function.  Positive cases — where the
+    //! placeholder legitimately appears in a template body — are
+    //! covered by the backend-crate integration suite.
+
+    use crate::instruction::{FuncId, Op};
+    use crate::module::{IrFunction, IrModule};
+    use crate::terminator::Terminator;
+    use crate::types::IrType;
+    use crate::verify::verify;
+
+    #[test]
+    fn unresolved_trait_method_in_concrete_function_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "concrete".into(),
+            Vec::new(),
+            Vec::new(),
+            IrType::Void,
+            None,
+        );
+        let entry = func.create_block();
+        let recv = func.add_block_param(entry, IrType::StructRef("Concrete".into(), Vec::new()));
+        func.emit(
+            entry,
+            Op::UnresolvedTraitMethod("greet".into(), Vec::new(), vec![recv]),
+            IrType::Void,
+            None,
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors.iter().any(
+                |e| e.message.contains("UnresolvedTraitMethod") && e.message.contains(".greet")
+            ),
+            "expected unresolved-trait-method error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_trait_method_in_template_is_not_flagged() {
+        let mut module = IrModule::new();
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "tmpl".into(),
+            Vec::new(),
+            Vec::new(),
+            IrType::Void,
+            None,
+        );
+        // Templates are skipped by `concrete_functions()`, so the
+        // placeholder is allowed here.
+        func.is_generic_template = true;
+        let entry = func.create_block();
+        let recv = func.add_block_param(entry, IrType::TypeVar("T".into()));
+        func.emit(
+            entry,
+            Op::UnresolvedTraitMethod("greet".into(), Vec::new(), vec![recv]),
+            IrType::Void,
+            None,
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.message.contains("UnresolvedTraitMethod")),
+            "placeholder in a template must not be flagged, got: {errors:?}"
+        );
     }
 }

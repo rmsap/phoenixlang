@@ -218,6 +218,20 @@ impl fmt::Display for Op {
                 write!(f, "builtin_call @{name}")?;
                 write_value_list(f, args)
             }
+            Op::UnresolvedTraitMethod(method, type_args, args) => {
+                write!(f, "unresolved_trait_method .{method}")?;
+                if !type_args.is_empty() {
+                    write!(f, "<")?;
+                    for (i, t) in type_args.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{t}")?;
+                    }
+                    write!(f, ">")?;
+                }
+                write_value_list(f, args)
+            }
             Op::DynAlloc(trait_name, concrete_type, value) => {
                 write!(f, "dyn_alloc @{trait_name} for {concrete_type}, {value}")
             }
