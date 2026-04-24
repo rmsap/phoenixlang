@@ -275,3 +275,53 @@ function main() {
 "#,
     );
 }
+
+// ── Default arguments ────────────────────────────────────────────────
+//
+// The IR interpreter has no default-expression handling; it sees
+// defaults already materialized by `merge_call_args` in IR lowering.
+// A divergence vs. the AST interpreter here means `merge_call_args`
+// regressed.
+
+#[test]
+fn default_argument_trailing_positional() {
+    roundtrip(
+        r#"
+function add(x: Int, y: Int = 10) -> Int { return x + y }
+function main() {
+    print(add(1))
+    print(add(1, 2))
+}
+"#,
+    );
+}
+
+#[test]
+fn default_argument_with_named_earlier_slot() {
+    roundtrip(
+        r#"
+function greet(name: String = "world", suffix: String = "!") -> String {
+    return "hello " + name + suffix
+}
+function main() {
+    print(greet())
+    print(greet(name: "phoenix"))
+    print(greet(suffix: "."))
+}
+"#,
+    );
+}
+
+#[test]
+fn default_argument_calls_another_function() {
+    roundtrip(
+        r#"
+function origin() -> Int { return 42 }
+function identity(x: Int = origin()) -> Int { return x }
+function main() {
+    print(identity())
+    print(identity(7))
+}
+"#,
+    );
+}

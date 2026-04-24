@@ -115,28 +115,39 @@ Until that lands, there is no supported way to build a `List<dyn Trait>` in comp
 **Planned fix:** Bidirectional type inference — thread the expected element type from the list-literal context into both sema (to accept heterogeneous elements as `dyn`) and IR lowering (to coerce each element). Same machinery that would enable lambda parameter inference at call sites ([design-decisions.md](design-decisions.md#lambda-parameter-inference-at-call-sites)).
 **Target phase:** Phase 3 — tied to the bidirectional-inference rework.
 
-### Default argument values are not supported in compiled mode
+**Last remaining dyn *construction* blocker.** After the 2026-04-24 fixes closed the `<T: Trait>` → `dyn Trait` coercion and default-argument paths, this entry is the final gate on the [`dyn Trait`/`StringRef` 2-slot discriminator](#dyn-trait-and-stringref-share-a-2-slot-layout-with-no-discriminator) below — the discriminator work only becomes urgent once `List<dyn Trait>` can actually be constructed. Schedule them together. (The *match-arm* dyn coercion gap below is a separate bidirectional-inference site — same Phase 3 rework unlocks both, but the two do not block each other.)
 
-`function f(x: T = expr)` is parsed and accepted by sema, and the AST
-interpreter handles the default-fill at call time. The compiled-mode
-pipeline does not: `merge_call_args` in `phoenix-ir/src/lower_expr.rs`
-treats unfilled positional slots as a sema bug (debug_assert!) instead
-of synthesizing the default expression. A call site that relies on a
-default lowers to `Op::Call` with too few args and trips the Cranelift
-verifier.
+### Default arguments are not supported on method calls
 
-Not a regression from the dyn work — pre-existing gap, surfaced by the
-audit's H4 test (`dyn_default_argument_coerces`, `#[ignore]`'d in
-`crates/phoenix-cranelift/tests/compile_dyn_trait.rs`). The named-args
-case `f(x: 1)` works because `merge_call_args` does fill from named args.
+`impl Counter { function bump(self, by: Int = 1) -> Int { ... } }` declares a method with a default.  Free-function calls that omit the defaulted slot now compile (the 2026-04-24 fix synthesizes the default via `merge_call_args` in `phoenix-ir/src/lower_expr.rs`), but method calls do not: `lower_method_call` in the same file builds the arg list directly from `MethodCallExpr.args` and never routes through `merge_call_args`.  `c.bump()` therefore lowers to an `Op::Call` with too few arguments and trips the Cranelift verifier.
 
-**Tripwire:** Cranelift "Verifier errors" on any compiled program that
-omits a parameter with a default. **Workaround:** pass every argument
-explicitly, or use `phoenix run`. **Target phase:** Phase 2.2 follow-up
-— the fix is to lower the default expression once into a per-function
-"default initializers" table and synthesize it at the call site, then
-let the existing dyn-coercion path (`coerce_call_args`) handle the
-post-fill arg list as usual.
+**File:** `phoenix-ir/src/lower_expr.rs` (`lower_method_call`).  **Tripwire:** the `#[ignore]`'d `default_on_method_parameter` test in `crates/phoenix-cranelift/tests/compile_default_args.rs`.  **Workaround:** pass every argument explicitly at method call sites.  **Planned fix:** hoist the `merge_call_args`/`coerce_call_args` pair into `lower_method_call`'s direct and builtin-call branches, treating `self` as a pre-filled slot 0.  The `MethodCallExpr` AST node does not carry named-arg syntax today, so the initial fix is positional-only — named-arg support on methods can follow.  **Target phase:** Phase 2.2 follow-up.
+
+### Default-expression visibility across module boundaries (Phase 2.6 tripwire)
+
+Default-argument expressions are lowered at the *caller's* call site (see [design-decisions.md: *Default-argument lowering strategy*](design-decisions.md#default-argument-lowering-strategy)).  Today every Phoenix program is single-module, so "caller's scope" and "callee's scope" coincide and visibility is a non-issue.  Phase 2.6 (module system + `public` / private) breaks this:
+
+```phoenix
+// models/user.phx
+function hashPassword(plaintext: String) -> String { ... }  // module-private
+public function createUser(name: String, hash: String = hashPassword("")) -> User { ... }
+
+// main.phx
+import models.user { createUser }
+function main() { createUser("Alice") }  // inlines hashPassword("") into main.phx's IR
+```
+
+Three failure modes once modules land: (1) privacy leak — `main.phx`'s compiled output references the private `hashPassword` symbol directly, forcing implicit re-export; (2) contract leak — renaming / changing `hashPassword` silently breaks every caller of `createUser`, yet the module author expected it to be safely private; (3) sema doesn't detect the shape today because defaults are type-checked in the callee's module with full access.
+
+**Planned fix:** Synthesize a private-wrapping helper.  When a public function's default references any private item, the compiler emits a hidden public wrapper (`__default_createUser_hash()`) in the callee's module that can see the private internals.  The caller's IR calls the wrapper, not the private symbol directly.  Preserves the current caller-side ABI; private symbols stay private at the binary level.  Small semantic shift — defaults referencing private state evaluate in the callee's scope rather than the caller's — accepted and to be documented at that time.  Alternatives (reject at sema; declare not-a-problem) rejected for restrictiveness / footgun reasons respectively.
+
+**File:** `phoenix-ir/src/lower_expr.rs` (`merge_call_args`) is where the inlining happens today; Phase 2.6 sema will gain the visibility-at-default-checking pass and the wrapper-synthesis IR pass.  **Tripwire:** none today — no `#[ignore]`d test, since the shape is unreachable from single-module source.  When modules land, add a test that a public function with a private-referencing default compiles (via the wrapper) and that the private symbol is *not* exported.  **Target phase:** Phase 2.6 — lands with the module-system work itself; cannot be deferred beyond it.
+
+### Trait bounds don't propagate through nested generic calls
+
+`function outer<T: Drawable>(x: T) { return inner(x) }` where `inner<U: Drawable>(y: U) { ... }` is rejected by sema with "type `T` does not implement trait `Drawable`".  At the call site to `inner`, sema's trait-bound inference doesn't see that `T: Drawable` (known from the outer function's bound) satisfies `U: Drawable`.  The fix lives in bound-resolution: when inferring type args for a call whose formal has a trait bound, and the inferred concrete type is itself a type variable, consult the enclosing scope's bound environment before rejecting.
+
+**File:** `phoenix-sema/src/check_expr_call.rs` (bound-satisfaction check at call-site type-arg inference).  **Tripwire:** the `#[ignore]`'d `nested_generic_dyn_coercion_specializes` test in `crates/phoenix-cranelift/tests/compile_dyn_trait.rs`.  **Workaround:** monomorphize the inner call by hand (`let d: dyn Drawable = x; d.draw()` at the outer level) instead of delegating to a second trait-bounded generic.  **Target phase:** Phase 3 — pairs naturally with the bidirectional-inference rework since both rely on threading expected-type / bound context through sema.
 
 ### Match-arm result coercion to `dyn Trait` return type
 
@@ -155,32 +166,6 @@ happens before the match union runs. **Tracked by** the `#[ignore]`'d
 `crates/phoenix-cranelift/tests/compile_dyn_trait.rs` and the
 matching round-trip file. **Target phase:** Phase 3 — pairs with the
 bidirectional-inference rework that also unblocks `List<dyn Trait>`.
-
-### `<T: Trait>` → `dyn Trait` coercion fails in compiled mode
-
-A generic-bounded function that wraps its parameter into a `dyn Trait`
-slot — `function f<T: Drawable>(x: T) -> String { let d: dyn Drawable = x; d.draw() }` —
-panics at IR lowering with `coerce_to_expected: unexpected IR type T flowing into dyn Trait position`.
-Sema accepts the program (the bound + dyn-coercion check passes), but at
-IR-lowering time the source-side type is `IrType::TypeVar(T)` and
-`coerce_to_expected` has no concrete name to key the vtable registration on.
-
-Same shape as the `<T: Trait>` method-call gap below: monomorphization
-runs *after* lowering, so any IR primitive that needs a concrete type
-name has to either be reified during mono or deferred. The fix likely
-emits a placeholder `Op::DynAlloc(trait, TypeVar(T), ...)` at lower-time
-and has the monomorphize pass substitute the concrete name and register
-the vtable at specialization sites — the same maneuver that should
-eventually fix the method-call gap.
-
-**Tripwire:** `unreachable!` in `phoenix-ir/src/lower_dyn.rs::coerce_to_expected`'s
-non-StructRef/EnumRef branch. Pinned by the `#[ignore]`d
-`dyn_alloc_inside_generic_bounded_function` regression test in
-`crates/phoenix-cranelift/tests/compile_dyn_trait.rs`.
-**Workaround:** Wrap concrete values into `dyn Trait` *outside* the generic function;
-or use `phoenix run` for programs that need this pattern.
-**Target phase:** Phase 2.2 follow-up — pairs with the method-call fix below since both
-need the same monomorphization × IR-emission rework.
 
 ### Multi-bound generic parameters (`<T: Foo + Bar>`) rejected by parser
 
@@ -210,6 +195,8 @@ As a side effect, the Cranelift backend's payload-inference fallback chain in `p
 `IrFunction.value_types: Vec<Option<IrType>>` is indexed by `ValueId.0` and kept in sync with `next_value_id` by `fresh_value()`, `emit()`, and `add_block_param()`.  Any pass that allocates a `ValueId` without going through those three entry points would silently desync the index — the `O(1)` type lookup via `instruction_result_type` would then return `None` (or worse, a stale type from an overwritten slot) rather than fail loudly.
 
 Today this is partly mitigated: the verifier's `verify_value_types_index` flags length mismatches, and the centralized `IrFunction::for_each_type_mut` is the only way monomorphization walks all four parallel type annotations (param / return / block-param / per-value / instruction result).  But the invariant lives by convention, not by type — a future pass could bypass both without any compiler error.
+
+**New consumer as of 2026-04-24:** `resolve_unresolved_dyn_allocs` in `phoenix-ir/src/monomorphize/function_mono.rs` reads `func.instruction_result_type(value)` after substitution to derive the concrete type name for a `dyn Trait` vtable registration.  A desync in `value_types` here would silently miscompile by registering against the wrong concrete type.  The mono-time hard-panic with a diagnostic is defensive coverage, but the underlying risk is the same as every other consumer — worth folding in when the typed-split refactor lands.
 
 **File:** `phoenix-ir/src/module.rs` — `IrFunction.value_types`, `fresh_value`, `emit`, `add_block_param`.
 **Planned fix:** Introduce a `ValueIdAllocator` newtype that owns both the counter and the parallel index; make `ValueId` allocation and type assignment the same operation at the type level (no API for "allocate a ValueId without assigning a type").  Length-mismatch bugs become compile errors instead of runtime verifier errors.

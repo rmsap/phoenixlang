@@ -122,6 +122,64 @@ impl IrModule {
         self.functions.iter().filter(|f| !f.is_generic_template)
     }
 
+    /// Register a `(concrete_type, trait_name)` entry in
+    /// [`Self::dyn_vtables`] if one is not already present. Idempotent.
+    ///
+    /// This is the single source of truth for vtable construction:
+    /// lowering-time registration (`LoweringContext::register_dyn_vtable`
+    /// in `phoenix-ir/src/lower_dyn.rs`; `LoweringContext` is private
+    /// so not rustdoc-linkable) and monomorphization-time registration
+    /// (`resolve_unresolved_dyn_allocs` in
+    /// `phoenix-ir/src/monomorphize/placeholder_resolution.rs`) both
+    /// route through here. They differ only in where `method_names` is
+    /// sourced from — sema's `TraitInfo` vs. the IR's [`IrTraitInfo`] —
+    /// which the caller is expected to resolve first.
+    ///
+    /// # Slot-index contract
+    ///
+    /// `method_names[i]` becomes `entries[i]` in the stored vtable.
+    /// Every [`Op::DynCall`] carries a pre-resolved slot index that
+    /// indexes this vector, so the caller must pass method names in
+    /// trait-declaration order.
+    ///
+    /// # Panics
+    ///
+    /// Via `unreachable!` if any method in `method_names` has no entry
+    /// in [`Self::method_index`] for `concrete_type`. Sema's
+    /// `check_impl_block` rejects incomplete impls before this function
+    /// is ever called (from either lowering or mono), so reaching here
+    /// is a compiler bug.
+    pub fn register_dyn_vtable(
+        &mut self,
+        trait_name: &str,
+        concrete_type: &str,
+        method_names: &[String],
+    ) {
+        let key = (concrete_type.to_owned(), trait_name.to_owned());
+        if self.dyn_vtables.contains_key(&key) {
+            return;
+        }
+        let entries: DynVtable = method_names
+            .iter()
+            .map(|name| {
+                let fid = self
+                    .method_index
+                    .get(&(concrete_type.to_owned(), name.clone()))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "vtable for `{concrete_type}` as dyn `{trait_name}`: method \
+                             `{name}` not found in method_index — sema's \
+                             `check_impl_block` must reject incomplete impls before \
+                             this function is called"
+                        )
+                    });
+                (name.clone(), fid)
+            })
+            .collect();
+        self.dyn_vtables.insert(key, entries);
+    }
+
     /// Look up the (params, return_type) of `trait_name`'s method at slot
     /// `method_idx`.
     ///

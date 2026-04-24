@@ -37,6 +37,20 @@ impl<'a> LoweringContext<'a> {
         let concrete_type = match actual {
             IrType::StructRef(name, _) => name.clone(),
             IrType::EnumRef(name, _) => name.clone(),
+            // Trait-bounded generic parameter (`<T: Trait>`): the
+            // concrete type is only known after monomorphization
+            // specializes the containing function, so the vtable
+            // registration and concrete-name resolution have to be
+            // deferred.  Emit an `UnresolvedDynAlloc` placeholder;
+            // function-mono's Pass B rewrites it into a concrete
+            // `Op::DynAlloc` once `T` has been substituted.
+            IrType::TypeVar(_) => {
+                return self.emit(
+                    Op::UnresolvedDynAlloc(trait_name.clone(), value),
+                    IrType::DynRef(trait_name.clone()),
+                    Some(span),
+                );
+            }
             // Sema's `Checker::concrete_type_impls_trait`
             // (phoenix-sema/src/check_types.rs) rejects non-struct/enum
             // coercions into `dyn Trait` before lowering runs.
@@ -204,41 +218,50 @@ impl<'a> LoweringContext<'a> {
     /// [`crate::module::IrModule::dyn_vtables`] with the trait's methods
     /// in declaration order. Idempotent.
     ///
-    /// # Ordering constraint
+    /// Thin wrapper around
+    /// [`crate::module::IrModule::register_dyn_vtable`]: this site
+    /// sources the method-name list from sema's `TraitInfo`
+    /// (`Checker::traits` in `phoenix-sema`; not rustdoc-linkable from
+    /// this crate) while the mono-time call site sources it from the
+    /// IR-level [`IrTraitInfo`]. The module method owns the actual
+    /// vtable construction + idempotency + slot-contract.
     ///
-    /// Must run *during* IR lowering, before monomorphization — the
-    /// `FuncId`s cached in each vtable entry have to be those of the
-    /// bodies that mono will specialize. If a `DynAlloc` ever materializes
-    /// after mono (not possible today, since `dyn GenericTrait` is
-    /// rejected at the sema level in `check_types.rs`), mono would have
-    /// to re-register vtables for newly materialized
-    /// `(concrete, trait)` pairs.
+    /// # Ordering
+    ///
+    /// This lowering-time call site is the primary registration point —
+    /// for every concrete-to-`dyn` coercion on a non-generic source,
+    /// the vtable exists before monomorphization runs. Mono-time
+    /// registration (via
+    /// `phoenix-ir/src/monomorphize/function_mono.rs::resolve_unresolved_dyn_allocs`)
+    /// is the secondary registration point: it fires when a generic
+    /// body's `UnresolvedDynAlloc` is specialized and the underlying
+    /// `(concrete, trait)` pair had not already been coerced elsewhere.
+    /// Both routes converge on [`IrModule::register_dyn_vtable`], which
+    /// is idempotent.
     ///
     /// FIXME(phase-2.6/3): the vtables this registers are stored as
     /// `FuncId`s pointing into `module.functions`, which after monomorphize
     /// is a mix of concrete functions and inert generic-template stubs
-    /// (flagged via `is_generic_template`). The stubs are harmless here —
-    /// `register_dyn_vtable` is invoked before mono runs, so the entries
-    /// always point at real bodies — but the pattern of "consumers filter
-    /// via `concrete_functions()`" is proliferating and is tracked as
-    /// tech debt in docs/known-issues.md
-    /// ("Generic-template stubs tracked by a `bool` flag"). When that
-    /// flag is replaced with a typed split, this cache should be re-keyed
-    /// onto the concrete-functions newtype rather than raw `FuncId`.
+    /// (flagged via `is_generic_template`). The stubs are harmless —
+    /// the lowering-time path (this function) registers before mono
+    /// runs, and the mono-time path registers after struct-specialized
+    /// FuncIds are populated, so entries always point at real bodies —
+    /// but the pattern of "consumers filter via `concrete_functions()`"
+    /// is proliferating and is tracked as tech debt in
+    /// docs/known-issues.md ("Generic-template stubs tracked by a
+    /// `bool` flag"). When that flag is replaced with a typed split,
+    /// this cache should be re-keyed onto the concrete-functions
+    /// newtype rather than raw `FuncId`.
     ///
     /// # Panics
     ///
-    /// Via `unreachable!` if a trait method has no registered impl on
-    /// `concrete_type`. Sema rejects incomplete impls, so reaching here
-    /// is a compiler bug.
+    /// If `trait_name` is missing from sema's trait metadata.
+    /// [`IrModule::register_dyn_vtable`] panics in turn if a trait
+    /// method has no registered impl on `concrete_type`. Both conditions
+    /// indicate a sema bug — `Checker::register_trait_decl` must have
+    /// populated `Checker::traits` and `Checker::check_impl_block`
+    /// must reject incomplete impls before lowering runs.
     pub(crate) fn register_dyn_vtable(&mut self, trait_name: &str, concrete_type: &str) {
-        let key = (concrete_type.to_owned(), trait_name.to_owned());
-        if self.module.dyn_vtables.contains_key(&key) {
-            return;
-        }
-        // Borrow `trait_info` rather than clone — the sema `TraitInfo`
-        // carries `Vec<TraitMethodInfo>` plus type-param metadata, and
-        // we only read `.methods[i].name` here.
         let method_names: Vec<String> = self
             .check
             .traits
@@ -256,42 +279,7 @@ impl<'a> LoweringContext<'a> {
             .iter()
             .map(|m| m.name.clone())
             .collect();
-        let entries: Vec<(String, FuncId)> = method_names
-            .iter()
-            .map(|name| {
-                let fid = self
-                    .module
-                    .method_index
-                    .get(&(concrete_type.to_owned(), name.clone()))
-                    .copied()
-                    .unwrap_or_else(|| {
-                        unreachable!(
-                            "vtable for `{concrete_type}` as dyn `{trait_name}`: method `{name}` \
-                             not found in method_index — `Checker::check_impl_block` \
-                             (phoenix-sema/src/check_register.rs) must have rejected an \
-                             incomplete impl before lowering runs"
-                        )
-                    });
-                (name.clone(), fid)
-            })
-            .collect();
-        // Slot-index contract: `entries[i]` must correspond to
-        // `trait_info.methods[i]`. The iteration above preserves that by
-        // construction — this assertion guards the invariant so a future
-        // refactor that filters or reorders the mapped iterator fails
-        // loudly (every `Op::DynCall` carries a pre-resolved slot index
-        // that indexes this vector; out-of-order entries silently
-        // miscompile). Promoted to a hard `assert!` so release builds
-        // catch the cross-file ABI drift before the wrong function
-        // pointer ships to the Cranelift backend.
-        assert!(
-            entries
-                .iter()
-                .zip(method_names.iter())
-                .all(|((entry_name, _), expected)| entry_name == expected),
-            "vtable slot order drifted from trait method declaration order for \
-             `{concrete_type}` as dyn `{trait_name}`"
-        );
-        self.module.dyn_vtables.insert(key, entries);
+        self.module
+            .register_dyn_vtable(trait_name, concrete_type, &method_names);
     }
 }

@@ -3,7 +3,7 @@
 //! Flattens nested Phoenix expressions into sequences of IR instructions,
 //! each producing an SSA [`ValueId`].
 
-use crate::instruction::{Op, VOID_SENTINEL, ValueId};
+use crate::instruction::{FuncId, Op, VOID_SENTINEL, ValueId};
 use crate::lower::{LoweringContext, VarBinding, lower_type};
 use crate::module::IrFunction;
 use crate::terminator::Terminator;
@@ -495,7 +495,7 @@ impl<'a> LoweringContext<'a> {
             // Check for a known function.
             if let Some(&func_id) = self.module.function_index.get(&ident.name) {
                 let result_type = self.expr_type(&call.span);
-                let args = self.merge_call_args(func_id, &positional, &named);
+                let args = self.merge_call_args(func_id, &positional, &named, call.span);
                 let args = self.coerce_call_args(func_id, args, call.span);
                 let type_args = self.resolve_call_type_args(call.span);
                 return self.emit(Op::Call(func_id, type_args, args), result_type, span);
@@ -536,52 +536,117 @@ impl<'a> LoweringContext<'a> {
         self.emit(Op::CallIndirect(callee_val, positional), result_type, span)
     }
 
-    /// Merge positional and named arguments into a single argument list
-    /// ordered by the callee's parameter names.
+    /// Merge positional + named args into a single slot-ordered list,
+    /// synthesizing defaults for slots left unfilled.
     ///
-    /// Positional args fill slots `0..n`, then named args are placed into
-    /// their corresponding parameter slots by name.  If a named arg
-    /// targets a slot already filled by a positional arg, the named arg
-    /// wins (sema should prevent this overlap).
+    /// Named args win over positional on overlap (sema should prevent
+    /// this).  Remaining empty slots are filled by lowering the default
+    /// expression recorded on sema's [`FunctionInfo::default_param_exprs`].
+    /// See [design-decisions.md: *Default-argument lowering strategy*]
+    /// for the caller-site materialization rationale.
     ///
-    /// All parameter slots must be filled after merging — unfilled slots
-    /// indicate a sema bug (no default parameter values exist in the IR).
+    /// **Scope: free-function calls only.**  The direct-call branch of
+    /// [`Self::lower_call`] is the sole caller.  Method calls
+    /// ([`Self::lower_method_call`]) do not route through here today and
+    /// therefore do not synthesize defaults — tracked in
+    /// `docs/known-issues.md` under "Default arguments are not supported
+    /// on method calls."  Indirect calls through closures
+    /// ([`Op::CallIndirect`]) are unreachable because closure params
+    /// cannot carry defaults; if that ever changes, the indirect path
+    /// would need its own synthesis site (the callee's defaults are not
+    /// known at the closure's call site — they'd have to be baked into
+    /// the closure body at construction time).
+    ///
+    /// **Phase 2.6 tripwire:** this inlines the callee's default
+    /// expression into the caller's IR.  Once modules + `public`/private
+    /// land, a default referencing a module-private item would leak that
+    /// item's symbol to every caller.  Fix via synthesized public
+    /// wrappers at that point — see known-issues.md
+    /// "Default-expression visibility across module boundaries".
     fn merge_call_args(
-        &self,
-        func_id: crate::instruction::FuncId,
+        &mut self,
+        func_id: FuncId,
         positional: &[ValueId],
         named: &[(String, ValueId)],
+        call_span: Span,
     ) -> Vec<ValueId> {
-        if named.is_empty() {
+        let total = self.module.functions[func_id.0 as usize].param_names.len();
+        // Fast path: fully positional, correct arity.
+        if named.is_empty() && positional.len() == total {
             return positional.to_vec();
         }
-        let param_names = &self.module.functions[func_id.0 as usize].param_names;
-        let total = param_names.len();
+
+        // Over-long positional is a sema bug — silent truncation here
+        // would lose caller-side side effects (already lowered into the
+        // current block) and leave a ValueId dangling.  Hard assert.
+        assert!(
+            positional.len() <= total,
+            "merge_call_args: {} positional args for `{}` which has {} params \
+             (call at {:?}) — sema should reject over-long call lists",
+            positional.len(),
+            self.module.functions[func_id.0 as usize].name,
+            total,
+            call_span,
+        );
+
+        // Clone owning copies to drop the borrow on `self.module` before
+        // we lower default expressions (which needs `&mut self`).
+        let param_names = self.module.functions[func_id.0 as usize]
+            .param_names
+            .clone();
+        let func_name = self.module.functions[func_id.0 as usize].name.clone();
+
         let mut slots: Vec<Option<ValueId>> = vec![None; total];
-
-        // Fill positional args.
         for (i, val) in positional.iter().enumerate() {
-            if i < total {
-                slots[i] = Some(*val);
-            }
+            slots[i] = Some(*val);
         }
-
-        // Fill named args by matching parameter names.
         for (name, val) in named {
-            if let Some(idx) = param_names.iter().position(|p| p == name) {
-                slots[idx] = Some(*val);
+            match param_names.iter().position(|p| p == name) {
+                Some(idx) => slots[idx] = Some(*val),
+                None => debug_assert!(
+                    false,
+                    "merge_call_args: sema let through named arg `{name}` for `{func_name}` \
+                     (params: {param_names:?}) at {call_span:?} — should have been rejected \
+                     with an 'unknown named arg' error",
+                ),
             }
         }
 
-        // Collect — flatten drops None, which means unfilled slots are
-        // silently skipped.  The debug_assert catches this in test builds.
+        // Collect (slot, expr) pairs before lowering so the borrow on
+        // `self.check.functions` releases before `lower_expr(&mut self)`.
+        let mut missing: Vec<(usize, Expr)> = Vec::new();
+        for (i, slot) in slots.iter().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            if let Some(expr) = self
+                .check
+                .functions
+                .get(&func_name)
+                .and_then(|info| info.default_param_exprs.get(&i))
+            {
+                missing.push((i, expr.clone()));
+            }
+        }
+        for (idx, expr) in missing {
+            let val = self.lower_expr(&expr);
+            slots[idx] = Some(val);
+        }
+
         let result: Vec<ValueId> = slots.into_iter().flatten().collect();
-        debug_assert_eq!(
+        // Hard assert — release-build underfill trips the Cranelift
+        // verifier at best, silent miscompile at worst.  call_span
+        // decorates the failure message only; not propagated into IR.
+        assert_eq!(
             result.len(),
             total,
-            "merge_call_args: {} of {} slots filled — sema should ensure all params are covered",
+            "merge_call_args: {} of {} slots filled for `{}` at {:?} — sema should \
+             ensure every slot is either passed or has a default in \
+             FunctionInfo::default_param_exprs",
             result.len(),
-            total
+            total,
+            func_name,
+            call_span,
         );
         result
     }

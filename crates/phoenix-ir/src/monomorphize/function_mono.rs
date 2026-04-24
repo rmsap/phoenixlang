@@ -17,6 +17,9 @@
 //! - [`rewrite_root_call_sites`] — Pass C: point root generic call
 //!   sites at their specialized `FuncId`s.
 
+use super::placeholder_resolution::{
+    resolve_trait_bound_method_calls, resolve_unresolved_dyn_allocs,
+};
 use super::{
     SpecKey, SpecMap, SpecOrder, contains_dyn_ref, contains_type_var, mangle, substitute,
     substitute_types_in_fn,
@@ -26,133 +29,6 @@ use crate::module::{IrFunction, IrModule};
 use crate::types::IrType;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-
-/// Resolve trait-bound method calls (`animal.greet()` where `animal: T`
-/// has `<T: Greet>`) inside a post-substitution specialized function
-/// body.
-///
-/// IR lowering (`phoenix-ir/src/lower_expr.rs::lower_method_call`)
-/// emits these as [`Op::UnresolvedTraitMethod`] because the receiver
-/// is `Type::TypeVar` at that point and no impl is selected yet.
-/// After function-mono's substitution, the receiver has a concrete IR
-/// type — look it up in `method_index[(type_name, method_name)]` and
-/// rewrite to a direct `Op::Call` (preserving the method's
-/// `method_targs` so nested generic specialization can still fire
-/// once the parser gains support for method-level generics on trait
-/// methods; today those arrive empty and this branch is a no-op
-/// passthrough, but keeping it wired avoids a second mono pass later).
-///
-/// **Generic-struct interaction.** For a receiver whose substituted
-/// type is `StructRef(template, non_empty_args)` (e.g.
-/// `StructRef("Container", [I64])`), this helper resolves to the
-/// *template* method's FuncId by keying on the bare name.
-/// Struct-monomorphization's `rewrite_method_calls` then picks up the
-/// resulting `Op::Call`, sees the receiver's non-empty struct args,
-/// and rewrites the target to the mangled specialized FuncId.  Both
-/// passes cooperate to produce the final concrete `Op::Call`.
-///
-/// **Primitive receivers.** When the substituted receiver is a
-/// primitive (`IrType::I64`/`F64`/`Bool`/`StringRef`), the type name is
-/// recovered via [`primitive_type_name`] so that `impl Trait for Int`
-/// and friends route correctly.
-fn resolve_trait_bound_method_calls(
-    func: &mut IrFunction,
-    method_index: &HashMap<(String, String), FuncId>,
-) {
-    // Collect rewrites under an immutable borrow, then apply.  Needed
-    // because `instruction_result_type` reads the function while the
-    // outer walk would otherwise hold a mutable borrow on the blocks.
-    let mut rewrites: Vec<(usize, usize, Op)> = Vec::new();
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        for (instr_idx, instr) in block.instructions.iter().enumerate() {
-            let Op::UnresolvedTraitMethod(method_name, method_targs, args) = &instr.op else {
-                continue;
-            };
-            let Some(receiver) = args.first() else {
-                debug_assert!(
-                    false,
-                    "Op::UnresolvedTraitMethod `{method_name}` has no receiver \
-                     (args list is empty) in function `{}`",
-                    func.name,
-                );
-                continue;
-            };
-            let recv_ty = func.instruction_result_type(*receiver).unwrap_or_else(|| {
-                panic!(
-                    "Op::UnresolvedTraitMethod `.{method_name}` receiver {receiver} \
-                     has no recorded type in function `{}` — the value_types index \
-                     is out of sync",
-                    func.name,
-                )
-            });
-            let type_name = match receiver_type_name(recv_ty) {
-                Some(name) => name,
-                None => panic!(
-                    "Op::UnresolvedTraitMethod `.{method_name}` in function `{}` has a \
-                     receiver typed {recv_ty} that cannot be mapped to a method-index \
-                     key — sema should have rejected this impl shape",
-                    func.name,
-                ),
-            };
-            let &target_fid = method_index
-                .get(&(type_name.clone(), method_name.clone()))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Op::UnresolvedTraitMethod `.{method_name}` in function `{}`: \
-                         method_index has no entry for ({type_name:?}, {method_name:?}) \
-                         — a trait-impl registration step was skipped",
-                        func.name,
-                    )
-                });
-            let new_op = Op::Call(target_fid, method_targs.clone(), args.clone());
-            rewrites.push((block_idx, instr_idx, new_op));
-        }
-    }
-    for (block_idx, instr_idx, new_op) in rewrites {
-        func.blocks[block_idx].instructions[instr_idx].op = new_op;
-    }
-}
-
-/// Map a receiver IR type to the string key used in
-/// `IrModule::method_index`.  Returns `None` when the type cannot be
-/// keyed — closures, maps, lists, and raw `dyn Trait` receivers all
-/// fall into this bucket (none of them is a legal trait-bound
-/// method-call receiver post-substitution).
-fn receiver_type_name(ty: &IrType) -> Option<String> {
-    match ty {
-        IrType::StructRef(n, _) | IrType::EnumRef(n, _) => Some(n.clone()),
-        IrType::I64 | IrType::F64 | IrType::Bool | IrType::StringRef => {
-            Some(primitive_type_name(ty).to_string())
-        }
-        IrType::TypeVar(name) => {
-            debug_assert!(
-                false,
-                "receiver_type_name called with a residual TypeVar({name}) — \
-                 substitution should have erased this"
-            );
-            None
-        }
-        IrType::Void
-        | IrType::ListRef(_)
-        | IrType::MapRef(_, _)
-        | IrType::ClosureRef { .. }
-        | IrType::DynRef(_) => None,
-    }
-}
-
-/// Surface name for a primitive IR type — the key used to register
-/// impls in `method_index` (e.g. `impl Display for Int` is keyed
-/// `("Int", "toString")`).  Mirrors the inverse mapping in
-/// `lower_expr.rs::lower_method_call`.
-fn primitive_type_name(ty: &IrType) -> &'static str {
-    match ty {
-        IrType::I64 => "Int",
-        IrType::F64 => "Float",
-        IrType::Bool => "Bool",
-        IrType::StringRef => "String",
-        _ => unreachable!("primitive_type_name called on non-primitive {ty}"),
-    }
-}
 
 /// Collect the BFS seed: every `(caller, block, instr, callee, type_args)`
 /// for generic calls in non-template functions. Sorted for determinism so
@@ -305,6 +181,13 @@ pub(super) fn clone_and_substitute_bodies(
         // FuncId; struct-mono's `rewrite_method_calls` picks them up
         // from there.
         resolve_trait_bound_method_calls(&mut spec_fn, &module.method_index);
+
+        // Resolve `dyn Trait` coercions on a type-variable source
+        // (`let d: dyn Drawable = x` where `x: T` has `<T: Drawable>`).
+        // Same structural story as above: lowering emits a
+        // placeholder because vtable registration needs a concrete
+        // name; mono supplies the name and registers the vtable.
+        resolve_unresolved_dyn_allocs(&mut spec_fn, module);
 
         // Rewrite internal generic Op::Call targets and clear their
         // type_args (since the callee is now a concrete specialization).

@@ -235,6 +235,9 @@ impl fmt::Display for Op {
             Op::DynAlloc(trait_name, concrete_type, value) => {
                 write!(f, "dyn_alloc @{trait_name} for {concrete_type}, {value}")
             }
+            Op::UnresolvedDynAlloc(trait_name, value) => {
+                write!(f, "unresolved_dyn_alloc @{trait_name}, {value}")
+            }
             Op::DynCall(trait_name, method_idx, receiver, args) => {
                 write!(f, "dyn_call @{trait_name}[{method_idx}], {receiver}")?;
                 write_value_list(f, args)

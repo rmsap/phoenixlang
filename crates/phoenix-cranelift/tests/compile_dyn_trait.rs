@@ -744,19 +744,22 @@ function main() {
     assert_eq!(output, vec!["circle", "square"]);
 }
 
-/// **Ignored — currently panics at IR lowering.** `coerce_to_expected`
-/// receives `IrType::TypeVar("T")` as the actual type and trips its
-/// `unreachable!` because vtable registration needs a concrete name to
-/// key on. The fix is the same shape as the documented
-/// `<T: Trait>` method-call gap: defer the coercion until
-/// monomorphization, or have monomorphization rewrite TypeVar-keyed
-/// `DynAlloc` ops at specialization time. Tracked under
-/// "`<T: Trait>` → `dyn Trait` coercion fails in compiled mode" in
-/// `docs/known-issues.md`.
+/// Trait-bounded `<T: Trait>` parameters that coerce into a
+/// `dyn Trait` slot are materialized as `Op::UnresolvedDynAlloc` at
+/// IR-lowering time, then rewritten to concrete `Op::DynAlloc`
+/// (with the vtable keyed on the post-substitution type) during
+/// function-monomorphization's Pass B. The specialized bodies
+/// `dyn_describe__s_Circle` and `dyn_describe__s_Square` each
+/// carry a concrete `DynAlloc("Drawable", <concrete>, ...)` and
+/// register `(Circle, Drawable)` / `(Square, Drawable)` vtables.
+///
+/// Uses `three_way_roundtrip` to guarantee the AST interpreter, the
+/// IR interpreter, and the compiled backend all agree — a silent
+/// divergence between the mono-time placeholder resolution and the
+/// AST interp's direct-call path would otherwise escape.
 #[test]
-#[ignore = "monomorphization × dyn coercion gap — see known-issues.md"]
 fn dyn_alloc_inside_generic_bounded_function() {
-    let output = compile_and_run(
+    three_way_roundtrip(
         r#"
 trait Drawable {
     function draw(self) -> String
@@ -779,23 +782,66 @@ function main() {
 }
 "#,
     );
-    assert_eq!(output, vec!["circle", "square"]);
 }
 
-/// **Ignored — default arguments are not yet supported in compiled
-/// mode at all.** Sema accepts `function f(x: T = expr)` and the AST
-/// interpreter handles the default-fill, but `merge_call_args` in IR
-/// lowering does not synthesize the default expression for a missing
-/// positional slot, so the call lowers with too few args and trips the
-/// Cranelift verifier. This is a pre-existing gap, not a dyn-specific
-/// regression — once it's fixed, the dyn-coercion path here will fall
-/// out for free because `coerce_call_args` already runs after
-/// `merge_call_args`. Tracked under "Default argument values are not
-/// supported in compiled mode" in `docs/known-issues.md`.
+/// `<T: Trait>` → `dyn Trait` coercion where `T` is instantiated to a
+/// *generic struct* (`Container<Int>`) rather than a plain concrete
+/// one.  This exercises the load-bearing handoff between
+/// function-monomorphization and struct-monomorphization:
+///
+/// 1. Function-mono specializes `wrap<T: Drawable>` at `T = Container<Int>`.
+///    `resolve_unresolved_dyn_allocs` derives the *bare* concrete name
+///    (`"Container"`, not yet `"Container__i64"`) and registers
+///    `dyn_vtables[("Container", "Drawable")]` with the template
+///    method's FuncId — because `method_index` is still keyed by bare
+///    names at this point.
+/// 2. Struct-mono then mangles `Container<Int>` to `Container__i64`,
+///    rekeys the vtable entry to `("Container__i64", "Drawable")`, and
+///    re-resolves the method FuncId through the mangled `method_index`.
+///
+/// A silent reordering or omission of either pass would install a
+/// template FuncId (inert stub) in the live vtable, which the
+/// verifier accepts but Cranelift would crash on.  Pinned
+/// three-way so the AST / IR / compiled backends all agree on the
+/// resulting dispatch.
 #[test]
-#[ignore = "default args unsupported in compiled mode — see known-issues.md"]
+fn dyn_alloc_inside_generic_bounded_function_with_generic_struct() {
+    three_way_roundtrip(
+        r#"
+trait Drawable {
+    function draw(self) -> String
+}
+struct Container<T> {
+    T value
+
+    impl Drawable {
+        function draw(self) -> String { return "container" }
+    }
+}
+function wrap<T: Drawable>(x: T) -> String {
+    let d: dyn Drawable = x
+    return d.draw()
+}
+function main() {
+    let c: Container<Int> = Container(42)
+    print(wrap(c))
+    let s: Container<String> = Container("hi")
+    print(wrap(s))
+}
+"#,
+    );
+}
+
+/// Default-argument coercion into a `dyn Trait` slot: the callee's
+/// default expression is lowered at the call site via
+/// `merge_call_args` (see `crates/phoenix-ir/src/lower_expr.rs`),
+/// then `coerce_call_args` wraps the concrete value in
+/// `Op::DynAlloc` for the `dyn Drawable` parameter.  Three-way
+/// roundtrip pins AST interp / IR interp / compiled agreement on the
+/// default + coerce sequence.
+#[test]
 fn dyn_default_argument_coerces() {
-    let output = compile_and_run(
+    three_way_roundtrip(
         r#"
 trait Drawable {
     function draw(self) -> String
@@ -810,7 +856,121 @@ function main() {
 }
 "#,
     );
-    assert_eq!(output, vec!["circle"]);
+}
+
+/// Concrete default flowing into a `dyn Trait` slot on a *generic*
+/// callee.  Exercises both 2026-04-24 fixes at once:
+///
+/// - `merge_call_args` synthesizes the missing slot from the default
+///   expression (`Circle(1)`, typed `StructRef("Circle", [])`);
+/// - `coerce_call_args` wraps the concrete value in `Op::DynAlloc`
+///   for the `dyn Drawable` parameter;
+/// - Function-mono then specializes the generic callee at `T = Int`,
+///   leaving the defaulted/coerced `dyn Drawable` slot alone.
+///
+/// Regression site: a bug that runs default synthesis *after*
+/// substitution (or that lets the callee's type-parametricity
+/// contaminate the concrete default's typing) would surface as either
+/// a sema reject or a mono-time `contains_type_var` panic.
+#[test]
+fn dyn_default_argument_coerces_in_generic_callee() {
+    three_way_roundtrip(
+        r#"
+trait Drawable {
+    function draw(self) -> String
+}
+struct Circle { Int r }
+impl Drawable for Circle {
+    function draw(self) -> String { return "circle" }
+}
+function render<T>(tag: T, s: dyn Drawable = Circle(1)) -> String {
+    return s.draw()
+}
+function main() {
+    print(render(0))
+    print(render("ignored"))
+}
+"#,
+    );
+}
+
+/// Pins an orthogonal gap: sema does not propagate the outer generic's
+/// trait bound through a nested generic call.  `outer<T: Drawable>`
+/// calling `inner<U: Drawable>(x)` where `x: T` is rejected with
+/// "type `T` does not implement trait `Drawable`" — sema's
+/// trait-bound inference doesn't see that `T: Drawable` satisfies
+/// `U: Drawable` at the call site.
+///
+/// Separate from the `UnresolvedDynAlloc` / default-argument fixes
+/// landing in this change; parking as an `#[ignore]` regression so
+/// it's trivially discoverable when that gap closes.
+#[test]
+#[ignore = "trait bounds don't propagate through nested generic calls — pre-existing sema gap"]
+fn nested_generic_dyn_coercion_specializes() {
+    three_way_roundtrip(
+        r#"
+trait Drawable {
+    function draw(self) -> String
+}
+struct Circle { Int r }
+impl Drawable for Circle {
+    function draw(self) -> String { return "circle" }
+}
+struct Square { Int s }
+impl Drawable for Square {
+    function draw(self) -> String { return "square" }
+}
+function inner<U: Drawable>(y: U) -> String {
+    let d: dyn Drawable = y
+    return d.draw()
+}
+function outer<T: Drawable>(x: T) -> String {
+    return inner(x)
+}
+function main() {
+    print(outer(Circle(1)))
+    print(outer(Square(2)))
+}
+"#,
+    );
+}
+
+/// Generic function with a defaulted concrete-typed parameter.  The
+/// default expression must lower with a concrete type (Int literal
+/// here) — a `TypeVar`-typed default would be rejected by sema's
+/// new `has_type_vars()` check.  Pins that concrete defaults in
+/// generic callees work end-to-end.
+#[test]
+fn generic_function_with_concrete_default_argument() {
+    three_way_roundtrip(
+        r#"
+function identity<T>(x: T, tag: Int = 7) -> Int { return tag }
+function main() {
+    print(identity("hello"))
+    print(identity(42, 99))
+    print(identity("alice", 3))
+}
+"#,
+    );
+}
+
+/// Named-arg override of a default: caller supplies every slot by name,
+/// which should win over the registered default expressions.  Pins the
+/// "named arg wins over default" branch of `merge_call_args`.
+#[test]
+fn named_argument_overrides_default() {
+    three_way_roundtrip(
+        r#"
+function combine(x: Int = 1, y: Int = 2, z: Int = 3) -> Int {
+    return x * 100 + y * 10 + z
+}
+function main() {
+    print(combine())
+    print(combine(y: 9))
+    print(combine(z: 7, x: 4))
+}
+"#,
+    );
 }
 
 #[test]

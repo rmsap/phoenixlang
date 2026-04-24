@@ -5,6 +5,7 @@
 //! [`VOID_SENTINEL`], value-ids defined in same function, `dyn`-op
 //! invariants, `DynRef` def-site legitimacy, and that no
 //! [`Op::UnresolvedTraitMethod`](crate::instruction::Op::UnresolvedTraitMethod)
+//! or [`Op::UnresolvedDynAlloc`](crate::instruction::Op::UnresolvedDynAlloc)
 //! survives into any concrete function post-monomorphization.
 //!
 //! The `dyn`-specific checks live in [`dyn_ops`] so the core structural
@@ -47,7 +48,7 @@ pub fn verify(module: &IrModule) -> Vec<VerifyError> {
     for func in module.concrete_functions() {
         verify_function(func, &mut errors);
         verify_value_types_index(func, &mut errors);
-        verify_no_unresolved_trait_methods(func, &mut errors);
+        verify_no_unresolved_placeholder_ops(func, &mut errors);
         dyn_ops::verify_dyn_ops(module, func, &mut errors);
         dyn_ops::verify_dyn_def_sites(func, &mut errors);
     }
@@ -56,19 +57,30 @@ pub fn verify(module: &IrModule) -> Vec<VerifyError> {
 
 /// Trait-bounded method calls on type-variable receivers are emitted
 /// as [`Op::UnresolvedTraitMethod`] by IR lowering and must be
-/// rewritten to a direct `Op::Call` by the monomorphization pass.  Any
-/// residual placeholder in a concrete function indicates a mono bug.
-fn verify_no_unresolved_trait_methods(func: &IrFunction, errors: &mut Vec<VerifyError>) {
+/// rewritten to a direct `Op::Call` by the monomorphization pass.
+/// Similarly, `dyn Trait` coercions on type-variable sources are
+/// emitted as [`Op::UnresolvedDynAlloc`] and rewritten to
+/// [`Op::DynAlloc`] by the same pass.  Any residual placeholder in a
+/// concrete function indicates a mono bug.
+fn verify_no_unresolved_placeholder_ops(func: &IrFunction, errors: &mut Vec<VerifyError>) {
     for block in &func.blocks {
         for instr in &block.instructions {
-            if let Op::UnresolvedTraitMethod(method, _, _) = &instr.op {
-                errors.push(VerifyError {
+            match &instr.op {
+                Op::UnresolvedTraitMethod(method, _, _) => errors.push(VerifyError {
                     function: func.name.clone(),
                     message: format!(
                         "Op::UnresolvedTraitMethod `.{method}` survived \
                          monomorphization — this is an internal compiler bug",
                     ),
-                });
+                }),
+                Op::UnresolvedDynAlloc(trait_name, _) => errors.push(VerifyError {
+                    function: func.name.clone(),
+                    message: format!(
+                        "Op::UnresolvedDynAlloc `@{trait_name}` survived \
+                         monomorphization — this is an internal compiler bug",
+                    ),
+                }),
+                _ => {}
             }
         }
     }
@@ -275,12 +287,13 @@ fn terminator_operands(term: &Terminator) -> Vec<ValueId> {
 }
 
 #[cfg(test)]
-mod unresolved_trait_method_tests {
-    //! Negative verifier tests for [`Op::UnresolvedTraitMethod`]: the
-    //! placeholder must not survive the monomorphization pass inside a
-    //! concrete (non-template) function.  Positive cases — where the
-    //! placeholder legitimately appears in a template body — are
-    //! covered by the backend-crate integration suite.
+mod unresolved_placeholder_op_tests {
+    //! Negative verifier tests for [`Op::UnresolvedTraitMethod`] and
+    //! [`Op::UnresolvedDynAlloc`]: both placeholders must not survive
+    //! the monomorphization pass inside a concrete (non-template)
+    //! function.  Positive cases — where the placeholders legitimately
+    //! appear in a template body — are covered by the backend-crate
+    //! integration suite.
 
     use crate::instruction::{FuncId, Op};
     use crate::module::{IrFunction, IrModule};
@@ -320,6 +333,37 @@ mod unresolved_trait_method_tests {
     }
 
     #[test]
+    fn unresolved_dyn_alloc_in_concrete_function_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "concrete".into(),
+            Vec::new(),
+            Vec::new(),
+            IrType::Void,
+            None,
+        );
+        let entry = func.create_block();
+        let src = func.add_block_param(entry, IrType::StructRef("Circle".into(), Vec::new()));
+        func.emit(
+            entry,
+            Op::UnresolvedDynAlloc("Drawable".into(), src),
+            IrType::DynRef("Drawable".into()),
+            None,
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors.iter().any(
+                |e| e.message.contains("UnresolvedDynAlloc") && e.message.contains("@Drawable")
+            ),
+            "expected unresolved-dyn-alloc error, got: {errors:?}"
+        );
+    }
+
+    #[test]
     fn unresolved_trait_method_in_template_is_not_flagged() {
         let mut module = IrModule::new();
         let mut func = IrFunction::new(
@@ -349,6 +393,38 @@ mod unresolved_trait_method_tests {
             !errors
                 .iter()
                 .any(|e| e.message.contains("UnresolvedTraitMethod")),
+            "placeholder in a template must not be flagged, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_dyn_alloc_in_template_is_not_flagged() {
+        let mut module = IrModule::new();
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "tmpl".into(),
+            Vec::new(),
+            Vec::new(),
+            IrType::Void,
+            None,
+        );
+        func.is_generic_template = true;
+        let entry = func.create_block();
+        let src = func.add_block_param(entry, IrType::TypeVar("T".into()));
+        func.emit(
+            entry,
+            Op::UnresolvedDynAlloc("Drawable".into(), src),
+            IrType::DynRef("Drawable".into()),
+            None,
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.message.contains("UnresolvedDynAlloc")),
             "placeholder in a template must not be flagged, got: {errors:?}"
         );
     }

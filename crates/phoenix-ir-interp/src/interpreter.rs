@@ -476,6 +476,11 @@ impl<'m> IrInterpreter<'m> {
             )),
 
             // --- Trait object operations ---
+            Op::UnresolvedDynAlloc(trait_name, _) => error(format!(
+                "internal error: unresolved dyn-alloc coercion into `@{trait_name}` \
+                 reached the IR interpreter — monomorphization was expected to \
+                 rewrite it to a concrete Op::DynAlloc"
+            )),
             Op::DynAlloc(trait_name, concrete_type, value_vid) => {
                 let concrete = frame.get(*value_vid)?.clone();
                 Ok(IrValue::Dyn {

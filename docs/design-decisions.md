@@ -235,6 +235,89 @@ Traits in Phoenix are statically dispatched only today — every trait use must 
 | Heterogeneous list literals (`[Circle(1), Square(2)]` typed `List<dyn Drawable>`) | Phase 3 | Blocked on bidirectional type inference in list-literal checking. The previously suggested `push()` workaround does not work today (sema rejects `let xs: List<dyn Trait> = []` because the empty literal types as `List<T>`). See [known-issues.md](known-issues.md#listdyn-trait-literal-initialization-in-compiled-mode). |
 | `<T: Trait>` method calls in compiled mode | **✅ Implemented 2026-04-21** | Resolved in function-monomorphization: `Op::BuiltinCall(".method", ...)` emitted at IR lowering (with empty type-name prefix because sema's receiver is `TypeVar`) is rewritten to a direct `Op::Call` after substitution, using `method_index[(substituted_type, method)]`. See `phoenix-ir/src/monomorphize.rs::resolve_trait_bound_builtin_calls`. |
 | `dyn Trait` over generic user-defined structs | **✅ Implemented 2026-04-21** | Lands as part of the struct-monomorphization pass — the `dyn_vtables` rekey from `(bare_name, trait)` to `(mangled_name, trait)` runs during struct-mono's rewrite phase, and method FuncIds in the vtable entries are re-resolved through the specialized `method_index`. Two instantiations of the same generic struct implementing the same trait no longer collide. |
+| `<T: Trait>` → `dyn Trait` coercion in compiled mode | **✅ Implemented 2026-04-24** | Same shape as the method-call fix: IR lowering emits `Op::UnresolvedDynAlloc(trait, value)` when the source is a `TypeVar`; function-monomorphization's Pass B rewrites it to a concrete `Op::DynAlloc` after substitution, registering the `(concrete, trait)` vtable through the shared `IrModule::register_dyn_vtable` helper. See `phoenix-ir/src/monomorphize/placeholder_resolution.rs::resolve_unresolved_dyn_allocs`. |
+| Default argument values in compiled mode | **✅ Implemented 2026-04-24** | Sema's `FunctionInfo` now carries `default_param_exprs: HashMap<usize, Expr>` (replacing the previous index-only `default_param_indices`); `merge_call_args` in IR lowering synthesizes each missing positional slot by lowering the default expression at the call site. Matches the AST-interpreter semantics; `coerce_call_args` handles any downstream concrete-to-`dyn` wrap. |
+
+### Default-argument lowering strategy
+
+Phoenix supports default parameter values: `function render(title: String = "untitled") -> String`.  Sema accepts the declaration and the AST interpreter evaluates defaults at call time, but when Cranelift compilation landed, a design question surfaced: *where* does the default expression get materialized?  Two plausible sites exist — at the caller's call site (inline the default once per omitted slot) or at the callee's entry block (synthesize the default once, guarded by a "this slot was omitted" flag passed from every caller).
+
+**Decision:** Caller-site materialization.  `FunctionInfo` on the sema side carries `default_param_exprs: HashMap<usize, Expr>` — the full parsed expression cloned at function registration — and `merge_call_args` in `phoenix-ir/src/lower_expr.rs` lowers each missing slot's default into the caller's IR at the call site, before `coerce_call_args` runs.  No ABI change; no fill-mask; every `Op::Call` is emitted with a complete argument vector.
+**Decided:** 2026-04-24
+**Target phase:** Phase 2.2 (closed).  Landed as the fix for the "Default argument values in compiled mode" entry formerly in known-issues.md.
+
+**Rationale:** The alternative (callee-side synthesis) requires an ABI change — the caller has to tell the callee which slots were omitted, via a fill-mask parameter or a sentinel per slot.  That's a permanent commitment on the calling convention for a language still in Phase 2.  Caller-side lowering is ABI-neutral: it's a pure IR transformation that the backend never sees.  It also matches the AST interpreter's existing semantics (defaults are evaluated at call time with only globals in scope, not at callee entry with a fill-mask), so the three backends (AST interp / IR interp / compiled) agree without a per-backend divergence.
+
+**Principle — default-expression scope.** A default expression is *lexically authored* inside its callee but *evaluated* in the caller's scope.  Sema enforces this as an invariant: Pass 1 of `check_function` (`phoenix-sema/src/checker.rs`) type-checks every default expression with **no parameters of the enclosing function in scope** — only module-level globals, other declared functions, and the callee's own type parameters (for type-resolution of the param annotation, not for identifier lookup).  This is the rule the two accepted downsides below fall out of, not a local patch.
+
+**Accepted downsides, and how they're contained:**
+
+- **Scope mismatch.** The default expression is lexically scoped to the callee but evaluated in the caller's scope.  If the default references an earlier parameter of the same function — `function f(x: Int, y: Int = x + 1)` — the identifier `x` resolves against the caller's scope, not the callee's, which produces either a runtime failure (AST interp) or a sema-hidden miscompile (compiled).  **Resolution:** sema's `check_function` (`phoenix-sema/src/checker.rs`) now type-checks every default expression *before* binding any parameter into scope.  `f(x: Int, y: Int = x)` is rejected at sema time with "undefined identifier `x`" rather than reaching lowering.
+- **Free type variables.** Inside a generic callee, a default expression whose inferred type references the callee's type parameters (`function f<T>(x: T = zero<T>())`) cannot be meaningfully lowered at a concrete caller — the caller's type-arg substitution binds the *caller's* parameters, not the callee's, so residual `TypeVar`s would trip the `contains_type_var` assertion in function-monomorphization.  **Resolution:** sema's `check_function` rejects any default whose inferred type has free type vars (`Type::has_type_vars()`), with a diagnostic that names the offending type.  Defaults that are concrete (plain literals, calls returning concrete types) remain allowed in generic functions.  *Conservative:* this unconditionally rejects defaults whose *inferred* type is type-parametric, even cases the caller-site lowering could in principle handle if bidirectional inference were threaded through (e.g. `function f<T>(x: Option<T> = None)` where the caller's `T` is knowable from context).  Lifting this is tied to the Phase 3 bidirectional-inference rework — same machinery as `List<dyn Trait>` and match-arm dyn coercion — so defaults referencing `T` land alongside that work, not before.
+- **Code size.** Every call site that omits a defaulted slot inlines the default expression.  For simple literal defaults this is a few extra IR ops; for a default like `someHelper<ComplexType>()` the inlining compounds.  Accepted as a tradeoff for ABI neutrality; if this becomes measurable, a CSE pass or a memoizing helper can reduce duplication without changing the ABI.
+
+**Alternatives considered:**
+
+- **Callee-side synthesis with a fill-mask parameter.** The caller passes a `u64` (or per-param bit) indicating which slots were omitted; the callee's entry block contains a conditional initialization per defaulted slot.  Rejected: permanent ABI commitment; interacts poorly with indirect calls through closures (`CallIndirect` would need the same mask shape in every closure signature); forces every defaulted parameter slot to be laid out mutably even when the caller filled it.
+- **Desugar at parse / sema time.** Rewrite `f()` into `f(defaultExpr())` in the AST before lowering.  Rejected: loses the "defaults only" semantics (the desugar is indistinguishable from an explicit argument, so tooling that wants to distinguish "user passed the value" from "default filled it" can't), and the rewrite has to happen after sema has picked the callee, which is itself after type inference — a chicken-and-egg for generic calls.
+- **Per-function "default initializers" table in the IR, lowered once inside the callee's body and invoked from each call site via a new `Op::CallWithDefaults(..., mask)`.** Rejected: same ABI-commitment and closure-shape concerns as the fill-mask option, plus a new IR opcode whose only consumer is default-argument handling.
+
+### Placeholder-op resolution via a dedicated concretize pass
+
+IR lowering emits placeholder ops — `Op::UnresolvedTraitMethod` (for trait-bound method calls on type-variable receivers, 2026-04-21) and `Op::UnresolvedDynAlloc` (for `dyn Trait` coercion from a generic parameter, 2026-04-24) — because their concrete-type arguments are only known after monomorphization substitutes.  Today both are rewritten inline inside function-monomorphization's Pass B, and each new placeholder costs five coordinated edits: enum variant, verifier branch, mono-time resolver, Cranelift error arm, IR-interp error arm.  Phase 2.6 (closure representation via IR blocks), Phase 3 (bidirectional inference for list literals and match arms), and several Phase 3 trait-system follow-ups will each plausibly want one more placeholder — the five-edit tax compounds.
+
+**Decision:** Introduce a dedicated `concretize` IR pass that runs after both function-mono and struct-mono.  Monomorphization's sole job becomes TypeVar substitution; every placeholder→concrete rewrite lives in `concretize`.  The verifier gains one clean invariant: "no `Unresolved*` op after concretize runs."  Each new placeholder adds one enum variant plus one arm inside `concretize`, not five edits across five files.
+**Decided:** 2026-04-24
+**Target phase:** Gate on placeholder count reaching 4, or alongside the first post-mono pass that independently needs one — whichever comes first.  On the current trajectory, somewhere in Phase 2.6 or early Phase 3.
+
+**Near-term preparation — ✅ Landed 2026-04-24.** The two existing resolvers (`resolve_trait_bound_method_calls`, `resolve_unresolved_dyn_allocs`) and their shared helpers (`receiver_type_name`, `primitive_type_name`) live in `phoenix-ir/src/monomorphize/placeholder_resolution.rs`; `function_mono` calls them by `use super::placeholder_resolution::*`.  All placeholder-specific logic colocated; behavior identical.  This makes the eventual promotion-to-its-own-pass a pass-boundary change rather than a structural reorg.  Rule-of-three still applies — don't promote at count 2 or 3.
+
+**Rationale — why a pass, not a collapsed `Op::Unresolved(kind)`.** The alternative (single `Op::Unresolved(UnresolvedKind, payload)` with a uniform payload) loses shape information — placeholder X carries exactly one value, placeholder Y carries receiver + method name + args.  Each resolver relies on that shape; unifying them would reintroduce per-kind dispatch without removing the bookkeeping.  A separate pass with a typed enum variant per placeholder keeps the type system doing the bookkeeping and still centralizes the rewriting.
+
+**Rationale — this simplifies struct-mono, not just function-mono.** Today, function-mono registers `dyn_vtables[(Container, Drawable)]` when it specializes a generic function at `T = Container<Int>`, and struct-mono has to rekey that entry to `(Container__i64, Drawable)` when it mangles the struct name.  With concretize running after both, the placeholder is resolved once, with the final mangled name already in hand — struct-mono's vtable-rekey step disappears entirely.
+
+**Alternatives considered:**
+- **Status quo with per-placeholder resolvers inside mono.** Rejected long-term: five edits per addition; no single enforcement point; struct-mono's rekey step remains load-bearing.
+- **Collapse all placeholders into `Op::Unresolved(UnresolvedKind, payload)`.** Rejected: uniform payload loses shape information; introduces its own verifier / interp match-on-kind dispatch without removing the per-kind logic.
+- **Land the pass now at placeholder count 2.** Rejected: abstraction cost exceeds savings until count 4.  The `mod placeholder_resolution` move gives us the option without paying for it.
+
+### Post-sema ownership: `ResolvedModule` as the sema→IR handoff
+
+Sema's `CheckResult` has grown into a live side-table: `functions: HashMap<String, FunctionInfo>` (now holding cloned default-expression ASTs alongside types and names), `structs`, `enums`, `traits`, `method_index`, `expr_types` (span→type), `call_type_args` (span→[Type]).  IR lowering, Cranelift codegen, and `phoenix-lsp` all read from this structure — typically **by function name**.
+
+This is becoming structurally load-bearing in four ways, each visible today:
+
+1. **Lookup by name, not by id.** `merge_call_args` in `phoenix-ir/src/lower_expr.rs` does `self.check.functions.get(&func_name)`; sema registers by bare source name.  Cross-module name collisions break this pattern the moment Phase 2.6 lands.
+2. **Sema is a live dependency, not a pipeline stage.** Lowering borrows `&CheckResult` for its duration.  Nothing after sema can drop sema's state — it stays rooted until every downstream consumer releases.
+3. **LSP strain.** `phoenix-lsp` holds a `Checker` per workspace and re-checks files against shared state.  Real modules want per-module re-check; the current single-pass `Checker` model does not support it cleanly.
+4. **Drift risk under future incremental checking.** Two sources of truth (sema's `CheckResult`, IR's metadata on `IrModule`) can only stay consistent while sema is strictly single-pass.  That guarantee will not survive Phase 2.6.
+
+**Decision:** Introduce `ResolvedModule` as the single post-sema handoff type.  Everything downstream needs from sema — function signatures, struct / enum layouts, trait registry, method index, per-span expression types, per-span call type args, default-expression clones, visibility metadata once modules land — lives on `ResolvedModule`, indexed by stable ids (`FuncId`, `StructId`, `EnumId`, `TraitId`) not by source name.  Sema is the factory; IR lowering, IR interpreter, Cranelift backend, and LSP are readers.  `Checker` is consumed by `resolve(program) -> ResolvedModule` and dropped.
+**Decided:** 2026-04-24
+**Target phase:** Phase 2.2 — lands before the phase wraps.  Pure refactor, no semantic change.  Ships ahead of Phase 2.6 so the module-system work can build on a settled sema→IR boundary rather than redesigning it mid-phase.
+
+**What moves onto `ResolvedModule`:**
+
+| From `Checker` field | Becomes `ResolvedModule` field | Indexed by |
+|---|---|---|
+| `functions: HashMap<String, FunctionInfo>` | `functions: Vec<FunctionInfo>` | `FuncId` |
+| `structs: HashMap<String, StructInfo>` | `structs: Vec<StructInfo>` | `StructId` |
+| `enums: HashMap<String, EnumInfo>` | `enums: Vec<EnumInfo>` | `EnumId` |
+| `traits: HashMap<String, TraitInfo>` | `traits: Vec<TraitInfo>` | `TraitId` |
+| `method_index: HashMap<(String, String), FuncId>` | unchanged key shape; `FuncId` values stable | direct |
+| `expr_types: HashMap<Span, Type>` | unchanged | span |
+| `call_type_args: HashMap<Span, Vec<Type>>` | unchanged | span |
+
+Name→id lookup tables (`function_by_name: HashMap<String, FuncId>`, etc.) ride alongside.  Callers that still want name-based lookup pay one indirection; IR lowering migrates to id-based lookup wholesale.
+
+**Keeping it a pure refactor.** No sema rule changes.  No IR op changes.  No ABI change.  The existing sema / IR / Cranelift test suites are the correctness bar — if any test behavior changes, the refactor regressed something.
+
+**Rationale — why Phase 2.2, not Phase 2.6.** Phase 2.6's module-system work needs a stable post-sema ownership model to build on.  Landing `ResolvedModule` inside Phase 2.6 means two major redesigns land in the same phase (the handoff + modules), and their decisions tangle — visibility checks want to know about `FuncId`-vs-name keying; cross-file imports want to know where `function_by_name` lives.  Landing `ResolvedModule` first, as a refactor-only milestone inside Phase 2.2, gives Phase 2.6 a clean foundation.  The migration is mechanical across ~20 files; the design work is bounded.
+
+**Alternatives considered:**
+- **Thread the existing `CheckResult` further, keying by `FuncId` instead of name.** Rejected: keeps two sources of truth (sema's struct + IR's metadata), doesn't solve the LSP strain, forces "sema is a live dependency" to persist indefinitely.
+- **Defer to Phase 2.6.** Rejected: tangles with module-system design.
+- **Defer to LSP pressure (Phase 3.2).** Rejected: by then, every IR consumer has compounded the name-keyed lookup pattern; refactor cost scales with how many callers we wait to accumulate.
 
 ### Centralized layout for reference types
 

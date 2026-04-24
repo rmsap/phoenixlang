@@ -169,6 +169,13 @@ pub(super) fn verify_dyn_def_sites(func: &IrFunction, errors: &mut Vec<VerifyErr
             if !matches!(inst.result_type, IrType::DynRef(_)) {
                 continue;
             }
+            // `Op::UnresolvedDynAlloc` is deliberately not listed: the
+            // caller filters via `module.concrete_functions()`, and
+            // `verify_no_unresolved_placeholder_ops` runs on the same
+            // iteration to flag any residual placeholder.  Listing
+            // here would be dead defensive noise — if one shows up at
+            // a def site, the placeholder-op verifier already fires a
+            // clearer diagnostic.
             let op_can_produce_dyn = matches!(
                 inst.op,
                 Op::DynAlloc(..)

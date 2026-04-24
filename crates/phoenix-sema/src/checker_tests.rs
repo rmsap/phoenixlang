@@ -1511,6 +1511,78 @@ function main() { print(greet("Alice")) }
     );
 }
 
+/// Default expressions are evaluated at the caller's call site (see
+/// [design-decisions.md: *Default-argument lowering strategy*]) —
+/// any reference to an earlier parameter would resolve against the
+/// caller's scope rather than the callee's, producing a runtime /
+/// lowering failure.  Sema rejects the shape up front.
+#[test]
+fn default_value_cannot_reference_earlier_parameter() {
+    assert_has_error(
+        r#"
+function f(x: Int, y: Int = x + 1) -> Int { return x + y }
+function main() { print(f(10)) }
+"#,
+        "undefined",
+    );
+}
+
+// Forward-reference case (`function f(x: Int = y, y: Int)`) is
+// rejected at parse time by the "non-default parameter cannot follow
+// a default parameter" rule — no sema test needed.
+
+/// Sema must reject over-long positional calls before IR lowering
+/// sees them.  IR lowering's `merge_call_args` carries a defensive
+/// `assert!(positional.len() <= total)` that would fire only on sema
+/// bugs — this test protects that contract from the sema side.
+#[test]
+fn call_with_too_many_positional_args_rejected_by_sema() {
+    assert_has_error(
+        r#"
+function add(x: Int, y: Int = 10) -> Int { return x + y }
+function main() { print(add(1, 2, 3)) }
+"#,
+        "takes",
+    );
+}
+
+/// Sema must reject named-arg + positional-arg overlap for the same
+/// slot before IR lowering sees them.  `merge_call_args` currently
+/// makes named args win over positional on overlap; that policy is
+/// only reachable via a sema bug, so pinning sema's rejection here
+/// protects the merge step from ever needing to resolve the ambiguity.
+#[test]
+fn call_with_named_and_positional_overlap_rejected_by_sema() {
+    assert_has_error(
+        r#"
+function add(x: Int, y: Int) -> Int { return x + y }
+function main() { print(add(1, x: 2)) }
+"#,
+        "already provided as positional",
+    );
+}
+
+/// A default expression whose inferred type still contains free type
+/// variables cannot be lowered at the caller's call site — the
+/// caller's type-arg substitution binds the caller's parameters, not
+/// the callee's.  Sema rejects at declaration time; the tripwire is
+/// the `has_type_vars()` branch in
+/// `phoenix-sema/src/checker.rs::check_function` pass 1.
+///
+/// Minimal repro: a bare `None` as a default.  Without an expected
+/// type driving inference, sema infers `Option<T>` for the expression,
+/// which still carries the fresh `T`.
+#[test]
+fn default_value_rejected_when_inferred_type_has_free_type_vars() {
+    assert_has_error(
+        r#"
+function f<T>(x: Option<T> = None) -> Option<T> { return x }
+function main() { }
+"#,
+        "generic parameters",
+    );
+}
+
 #[test]
 fn struct_destructuring_valid() {
     assert_no_errors(
@@ -1915,7 +1987,12 @@ function main() { }
     let info = &result.functions["greet"];
     assert_eq!(info.params.len(), 2);
     assert_eq!(info.param_names, vec!["name", "greeting"]);
-    assert_eq!(info.default_param_indices, vec![1]);
+    let default_indices: Vec<usize> = {
+        let mut v: Vec<usize> = info.default_param_exprs.keys().copied().collect();
+        v.sort();
+        v
+    };
+    assert_eq!(default_indices, vec![1]);
 }
 
 // ── 1.13.2: Expression-level type annotations ───────────────────

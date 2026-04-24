@@ -381,7 +381,7 @@ fn translate_op(
             calls::translate_call(builder, ctx, ir_module, op, result_type, state)
         }
 
-        Op::DynAlloc(..) | Op::DynCall(..) => {
+        Op::DynAlloc(..) | Op::UnresolvedDynAlloc(..) | Op::DynCall(..) => {
             dyn_trait::translate_dyn_op(builder, ctx, ir_module, op, state)
         }
 

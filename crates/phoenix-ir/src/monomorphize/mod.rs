@@ -175,6 +175,7 @@
 //! [`struct_mono::monomorphize_structs`].
 
 mod function_mono;
+mod placeholder_resolution;
 mod struct_mono;
 
 use crate::instruction::{FuncId, Op};
@@ -365,7 +366,7 @@ pub(crate) fn monomorphize(module: &mut IrModule) {
         // with no generic functions (`struct Box<T> { T v }` + plain
         // instantiations).  Run struct-mono unconditionally.
         struct_mono::monomorphize_structs(module);
-        debug_assert_no_unresolved_trait_methods(module);
+        debug_assert_no_unresolved_placeholder_ops(module);
         return;
     }
 
@@ -378,27 +379,37 @@ pub(crate) fn monomorphize(module: &mut IrModule) {
     // concrete struct args appear in their final form in each
     // non-template function's types before we begin reifying layouts.
     struct_mono::monomorphize_structs(module);
-    debug_assert_no_unresolved_trait_methods(module);
+    debug_assert_no_unresolved_placeholder_ops(module);
 }
 
-/// Post-mono invariant: every `Op::UnresolvedTraitMethod` in a concrete
-/// function must have been rewritten to a direct `Op::Call` by
+/// Post-mono invariant: every placeholder op emitted by IR lowering for
+/// generic-context receivers / sources
+/// ([`Op::UnresolvedTraitMethod`] for trait-bound method calls and
+/// [`Op::UnresolvedDynAlloc`] for `dyn Trait` coercion from a generic
+/// parameter) must have been rewritten by
 /// [`function_mono::clone_and_substitute_bodies`].  Template bodies are
-/// allowed to retain the placeholder — they exist only as inert stubs.
-fn debug_assert_no_unresolved_trait_methods(module: &IrModule) {
+/// allowed to retain the placeholders — they exist only as inert stubs.
+fn debug_assert_no_unresolved_placeholder_ops(module: &IrModule) {
     if !cfg!(debug_assertions) {
         return;
     }
     for func in module.concrete_functions() {
         for block in &func.blocks {
             for instr in &block.instructions {
-                if let Op::UnresolvedTraitMethod(method, _, _) = &instr.op {
-                    panic!(
+                match &instr.op {
+                    Op::UnresolvedTraitMethod(method, _, _) => panic!(
                         "post-mono invariant violated in `{}`: Op::UnresolvedTraitMethod \
                          `.{method}` survived monomorphization — \
                          resolve_trait_bound_method_calls failed to rewrite it",
                         func.name,
-                    );
+                    ),
+                    Op::UnresolvedDynAlloc(trait_name, _) => panic!(
+                        "post-mono invariant violated in `{}`: Op::UnresolvedDynAlloc \
+                         `@{trait_name}` survived monomorphization — \
+                         resolve_unresolved_dyn_allocs failed to rewrite it",
+                        func.name,
+                    ),
+                    _ => {}
                 }
             }
         }

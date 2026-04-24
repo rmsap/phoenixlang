@@ -478,7 +478,7 @@ impl Checker {
                 covered[idx] = true;
             }
         }
-        for &idx in &func_info.default_param_indices {
+        for &idx in func_info.default_param_exprs.keys() {
             covered[idx] = true; // defaults fill in uncovered params
         }
         let missing: Vec<String> = covered
@@ -642,7 +642,7 @@ impl Checker {
         // For params covered by defaults only, use the declared param type
         for (i, at) in arg_types.iter_mut().enumerate() {
             if *at == Type::Error
-                && func_info.default_param_indices.contains(&i)
+                && func_info.default_param_exprs.contains_key(&i)
                 && i >= positional_count
                 && !call
                     .named_args

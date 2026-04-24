@@ -216,6 +216,35 @@ pub enum Op {
     /// `IrType::DynRef(trait_name)`. The verifier requires a registered
     /// vtable for `(concrete_type, trait_name)`.
     DynAlloc(String, String, ValueId),
+    /// Placeholder `dyn Trait` coercion whose source value is typed by a
+    /// generic type parameter at lowering time.
+    ///
+    /// Fields: `(trait_name, value)`. Result type is
+    /// `IrType::DynRef(trait_name)`.
+    ///
+    /// # Emission
+    ///
+    /// Emitted by `coerce_to_expected` when a value with IR type
+    /// `IrType::TypeVar(T)` flows into a `dyn Trait` slot inside a
+    /// generic function body (e.g. `let d: dyn Drawable = x` where
+    /// `<T: Drawable>`). The concrete type is unknown until
+    /// monomorphization specializes the containing function, so vtable
+    /// registration has to be deferred.
+    ///
+    /// # Resolution
+    ///
+    /// Function-monomorphization's Pass B rewrites this into a concrete
+    /// `Op::DynAlloc` after substituting `T` with each concrete type
+    /// and registers the corresponding `(concrete, trait)` vtable on
+    /// the module. See
+    /// `phoenix-ir/src/monomorphize/placeholder_resolution.rs::resolve_unresolved_dyn_allocs`.
+    ///
+    /// # Invariant
+    ///
+    /// No [`Op::UnresolvedDynAlloc`] may survive the monomorphization
+    /// pass — the verifier enforces this for every non-template
+    /// function.
+    UnresolvedDynAlloc(String, ValueId),
     /// `DynCall(trait_name, method_idx, receiver, args)` — indirect
     /// dispatch through a trait-object vtable. `method_idx` is the slot
     /// index in the trait's declared method order (pinned by
@@ -318,6 +347,7 @@ impl Op {
 
             // Trait object ops.
             Op::DynAlloc(_, _, value) => vec![*value],
+            Op::UnresolvedDynAlloc(_, value) => vec![*value],
             Op::DynCall(_, _, receiver, args) => {
                 let mut ops = vec![*receiver];
                 ops.extend_from_slice(args);

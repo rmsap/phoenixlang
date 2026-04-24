@@ -98,7 +98,7 @@ impl Checker {
     /// during call-site checking.  Reports an error if a function with the
     /// same name has already been registered.
     pub(crate) fn register_function(&mut self, func: &FunctionDecl) {
-        let (params, param_names, default_param_indices, return_type) =
+        let (params, param_names, default_param_exprs, return_type) =
             self.with_type_params(&func.type_params, None, |this| {
                 let non_self_params: Vec<&Param> =
                     func.params.iter().filter(|p| p.name != "self").collect();
@@ -108,18 +108,17 @@ impl Checker {
                     .collect();
                 let param_names: Vec<String> =
                     non_self_params.iter().map(|p| p.name.clone()).collect();
-                let default_param_indices: Vec<usize> = non_self_params
+                let default_param_exprs: std::collections::HashMap<usize, _> = non_self_params
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| p.default_value.is_some())
-                    .map(|(i, _)| i)
+                    .filter_map(|(i, p)| p.default_value.as_ref().map(|e| (i, e.clone())))
                     .collect();
                 let return_type = func
                     .return_type
                     .as_ref()
                     .map(|t| this.resolve_type_expr(t))
                     .unwrap_or(Type::Void);
-                (params, param_names, default_param_indices, return_type)
+                (params, param_names, default_param_exprs, return_type)
             });
 
         if self.functions.contains_key(&func.name) {
@@ -141,7 +140,7 @@ impl Checker {
                     type_param_bounds: func.type_param_bounds.clone(),
                     params,
                     param_names,
-                    default_param_indices,
+                    default_param_exprs,
                     return_type,
                 },
             );

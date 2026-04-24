@@ -39,6 +39,11 @@ pub(super) fn translate_dyn_op(
             let vtable_ptr = builder.ins().global_value(POINTER_TYPE, gv);
             Ok(vec![data_ptr, vtable_ptr])
         }
+        Op::UnresolvedDynAlloc(trait_name, _) => Err(CompileError::new(format!(
+            "internal error: unresolved dyn-alloc coercion into `@{trait_name}` \
+             reached Cranelift codegen — monomorphization was expected to \
+             rewrite it to a concrete Op::DynAlloc"
+        ))),
         Op::DynCall(trait_name, method_idx, receiver, args) => {
             let site = DynCallSite {
                 trait_name,
