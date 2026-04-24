@@ -99,7 +99,19 @@ impl Checker {
                 .map(|m| (m.params.clone(), m.return_type.clone()));
             return match method_sig {
                 Some((params, ret)) => {
-                    self.check_method_args(mc, &params, &HashMap::new());
+                    // Trait-object dispatch does not accept defaults — trait
+                    // method defaults are a separate Phase-3 follow-up.
+                    // Synthesize arg-style names for diagnostics — trait
+                    // metadata does not carry parameter names today.
+                    let param_names: Vec<String> =
+                        (0..params.len()).map(|i| format!("arg{}", i + 1)).collect();
+                    self.check_method_args(
+                        mc,
+                        &params,
+                        &param_names,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    );
                     ret
                 }
                 None => {
@@ -138,7 +150,13 @@ impl Checker {
                     mc.span,
                 );
             }
-            self.check_method_args(mc, &method_info.params, &all_bindings);
+            self.check_method_args(
+                mc,
+                &method_info.params,
+                &method_info.param_names,
+                &all_bindings,
+                &method_info.default_param_exprs,
+            );
             return Self::substitute(&method_info.return_type, &all_bindings);
         }
         // Check trait bounds for type variables
@@ -154,19 +172,52 @@ impl Checker {
 
     /// Validates argument count and types for a method call against expected
     /// parameter types, applying generic substitutions from `bindings`.
+    ///
+    /// Slots in `[mc.args.len()..params.len())` are accepted when covered
+    /// by `default_param_exprs`; callers without defaults (trait-object
+    /// dispatch, trait-bound dispatch) pass an empty map.  Only the
+    /// user-supplied positional args are type-checked here — default
+    /// expressions are type-checked once at declaration time (see
+    /// `check_impl`'s pass-1 in `checker.rs`).
+    ///
+    /// `param_names` must have the same length as `params`; it is used
+    /// only for the "missing argument for parameter `x`" diagnostic.
     pub(crate) fn check_method_args(
         &mut self,
         mc: &MethodCallExpr,
         params: &[Type],
+        param_names: &[String],
         bindings: &HashMap<String, Type>,
+        default_param_exprs: &HashMap<usize, phoenix_parser::ast::Expr>,
     ) {
-        if mc.args.len() != params.len() {
+        debug_assert_eq!(
+            params.len(),
+            param_names.len(),
+            "check_method_args: params/param_names length mismatch",
+        );
+        if mc.args.len() > params.len() {
             self.error(
                 format!(
                     "method `{}` takes {} argument(s), got {}",
                     mc.method,
                     params.len(),
                     mc.args.len()
+                ),
+                mc.span,
+            );
+            return;
+        }
+        // Every uncovered slot in the user-visible tail must have a default.
+        let missing: Vec<String> = (mc.args.len()..params.len())
+            .filter(|i| !default_param_exprs.contains_key(i))
+            .map(|i| param_names[i].clone())
+            .collect();
+        if !missing.is_empty() {
+            self.error(
+                format!(
+                    "method `{}` missing argument(s): {}",
+                    mc.method,
+                    missing.join(", ")
                 ),
                 mc.span,
             );
@@ -214,7 +265,18 @@ impl Checker {
                     None => continue,
                 };
                 let empty_bindings = HashMap::new();
-                self.check_method_args(mc, &trait_method.params, &empty_bindings);
+                // Trait-bound method dispatch ignores defaults for now —
+                // defaults on trait methods require mono-time synthesis.
+                let param_names: Vec<String> = (0..trait_method.params.len())
+                    .map(|i| format!("arg{}", i + 1))
+                    .collect();
+                self.check_method_args(
+                    mc,
+                    &trait_method.params,
+                    &param_names,
+                    &empty_bindings,
+                    &HashMap::new(),
+                );
                 return Some(trait_method.return_type.clone());
             }
         }

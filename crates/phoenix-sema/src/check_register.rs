@@ -384,25 +384,35 @@ impl Checker {
         for func in &imp.methods {
             let mut merged = parent_type_params.clone();
             merged.extend(func.type_params.iter().cloned());
-            let (params, return_type) = self.with_type_params(&merged, None, |this| {
-                let params: Vec<Type> = func
-                    .params
-                    .iter()
-                    .filter(|p| p.name != "self")
-                    .map(|p| this.resolve_type_expr(&p.type_annotation))
-                    .collect();
-                let return_type = func
-                    .return_type
-                    .as_ref()
-                    .map(|t| this.resolve_type_expr(t))
-                    .unwrap_or(Type::Void);
-                (params, return_type)
-            });
+            let (params, param_names, default_param_exprs, return_type) =
+                self.with_type_params(&merged, None, |this| {
+                    let non_self_params: Vec<&phoenix_parser::ast::Param> =
+                        func.params.iter().filter(|p| p.name != "self").collect();
+                    let params: Vec<Type> = non_self_params
+                        .iter()
+                        .map(|p| this.resolve_type_expr(&p.type_annotation))
+                        .collect();
+                    let param_names: Vec<String> =
+                        non_self_params.iter().map(|p| p.name.clone()).collect();
+                    let default_param_exprs: HashMap<usize, _> = non_self_params
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, p)| p.default_value.as_ref().map(|e| (i, e.clone())))
+                        .collect();
+                    let return_type = func
+                        .return_type
+                        .as_ref()
+                        .map(|t| this.resolve_type_expr(t))
+                        .unwrap_or(Type::Void);
+                    (params, param_names, default_param_exprs, return_type)
+                });
             methods_to_add.push((
                 func.name.clone(),
                 MethodInfo {
                     definition_span: func.name_span,
                     params,
+                    param_names,
+                    default_param_exprs,
                     return_type,
                     type_params: func.type_params.clone(),
                 },

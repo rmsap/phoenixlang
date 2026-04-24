@@ -334,7 +334,6 @@ impl Interpreter {
             self.call_depth -= 1;
             return error("stack overflow: maximum recursion depth exceeded");
         }
-        self.env.push_scope();
 
         let non_self_params: Vec<&Param> =
             func.params.iter().filter(|p| p.name != "self").collect();
@@ -357,14 +356,27 @@ impl Interpreter {
             }
         }
 
-        // Fill in defaults for any remaining None slots
+        // Evaluate defaults in the *caller's* scope — before we push
+        // the callee's frame.  Defaults can only reference globals
+        // (sema rejects sibling-param / `self` references in pass 1),
+        // so either scope works semantically; evaluating pre-push
+        // keeps this function's cleanup path single-exit and avoids a
+        // scope/call-depth leak if a default's `eval_expr` errors.
         for (i, param) in non_self_params.iter().enumerate() {
             if param_values[i].is_none()
                 && let Some(ref default_expr) = param.default_value
             {
-                param_values[i] = Some(self.eval_expr(default_expr)?);
+                match self.eval_expr(default_expr) {
+                    Ok(val) => param_values[i] = Some(val),
+                    Err(err) => {
+                        self.call_depth -= 1;
+                        return Err(err);
+                    }
+                }
             }
         }
+
+        self.env.push_scope();
 
         // Check that all params are covered
         for (i, param) in non_self_params.iter().enumerate() {
@@ -435,34 +447,68 @@ impl Interpreter {
                 try_return_value: None,
             })?;
 
-        self.env.push_scope();
-        self.env.define("self".to_string(), self_val);
-
-        let expected = method
+        let non_self_params: Vec<&Param> = method
             .func
             .params
             .iter()
             .filter(|p| p.name != "self")
-            .count();
-        if args.len() != expected {
-            self.env.pop_scope();
+            .collect();
+        let total_params = non_self_params.len();
+
+        // "Too many" positional remains an error.  Under-fill is allowed
+        // when every missing slot has a default.
+        if args.len() > total_params {
             self.call_depth -= 1;
             return error(format!(
                 "method `{}` on `{}` takes {} argument(s), got {}",
                 method_name,
                 type_name,
-                expected,
+                total_params,
                 args.len()
             ));
         }
 
-        let mut arg_idx = 0;
-        for param in &method.func.params {
-            if param.name == "self" {
-                continue;
+        // Fill slots from positional; remaining slots must have defaults.
+        let mut param_values: Vec<Option<Value>> = vec![None; total_params];
+        for (i, val) in args.into_iter().enumerate() {
+            param_values[i] = Some(val);
+        }
+
+        // Evaluate defaults in the *caller's* scope — before we push
+        // the callee's frame.  Matches the IR caller-site semantics
+        // (each call evaluates each missing default fresh) and keeps
+        // cleanup single-exit: a default that errors out does not
+        // leak a pushed scope or a bumped call depth.
+        // See `docs/design-decisions.md` (*Default-argument lowering strategy*).
+        for (i, param) in non_self_params.iter().enumerate() {
+            if param_values[i].is_none()
+                && let Some(ref default_expr) = param.default_value
+            {
+                match self.eval_expr(default_expr) {
+                    Ok(val) => param_values[i] = Some(val),
+                    Err(err) => {
+                        self.call_depth -= 1;
+                        return Err(err);
+                    }
+                }
             }
-            self.env.define(param.name.clone(), args[arg_idx].clone());
-            arg_idx += 1;
+        }
+
+        // Now push the callee's scope, bind `self` and params.
+        self.env.push_scope();
+        self.env.define("self".to_string(), self_val);
+        for (i, param) in non_self_params.iter().enumerate() {
+            match param_values[i].take() {
+                Some(val) => self.env.define(param.name.clone(), val),
+                None => {
+                    self.env.pop_scope();
+                    self.call_depth -= 1;
+                    return error(format!(
+                        "method `{}` on `{}`: missing argument for parameter `{}`",
+                        method_name, type_name, param.name
+                    ));
+                }
+            }
         }
 
         let result = self.exec_block_implicit(&method.func.body);

@@ -325,3 +325,67 @@ function main() {
 "#,
     );
 }
+
+// ── Method-call defaults ─────────────────────────────────────────────
+//
+// The IR interpreter sees defaults already materialized by
+// `merge_method_call_args` in IR lowering, paralleling the
+// free-function pattern.  A divergence vs. the AST interpreter here
+// means either the lowering or the AST-interp `call_method` path
+// regressed.
+
+#[test]
+fn method_default_trailing_positional() {
+    roundtrip(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = 10) -> Int { return self.n + by }
+}
+function main() {
+    let c: Counter = Counter(1)
+    print(c.bump())
+    print(c.bump(2))
+}
+"#,
+    );
+}
+
+#[test]
+fn method_default_calls_another_function() {
+    roundtrip(
+        r#"
+function origin() -> Int { return 42 }
+struct Box { Int value }
+impl Box {
+    function wrap(self, tag: Int = origin()) -> Int { return self.value + tag }
+}
+function main() {
+    let b: Box = Box(1)
+    print(b.wrap())
+    print(b.wrap(7))
+}
+"#,
+    );
+}
+
+/// Positional arg overrides the registered default — IR-interp and
+/// AST-interp must agree that the default is *not* used when the
+/// caller passes a value.  Mirrors the compiled-side
+/// `method_default_overridden_by_positional`.
+#[test]
+fn method_default_overridden_by_positional() {
+    roundtrip(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = 1) -> Int { return self.n + by }
+}
+function main() {
+    let c: Counter = Counter(10)
+    print(c.bump(99))
+    print(c.bump())
+}
+"#,
+    );
+}

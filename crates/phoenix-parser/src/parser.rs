@@ -4061,4 +4061,23 @@ schema db {
             other => panic!("expected Function, got {:?}", other),
         }
     }
+
+    /// Named-argument syntax on method calls is not supported today
+    /// (`MethodCallExpr` carries only positional `args`).  IR lowering
+    /// and sema both assume positional-only here, so a future parser
+    /// change that silently admits `c.bump(by: 5)` would flow through
+    /// paths that ignore the name.  This test pins the parse error so
+    /// the ambiguity must be resolved deliberately when named-args on
+    /// methods lands.
+    #[test]
+    fn parse_named_arg_on_method_call_is_rejected() {
+        let (_, diagnostics) =
+            parse_source("function main() { let c: Counter = Counter(0); c.bump(by: 5) }");
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a parse error for `c.bump(by: 5)`, got none — if named-args on \
+             methods were intentionally enabled, update `MethodCallExpr` + \
+             `merge_method_call_args` to thread names before removing this test",
+        );
+    }
 }

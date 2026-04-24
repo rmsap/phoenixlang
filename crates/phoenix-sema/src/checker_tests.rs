@@ -1995,7 +1995,123 @@ function main() { }
     assert_eq!(default_indices, vec![1]);
 }
 
-// ── 1.13.2: Expression-level type annotations ───────────────────
+/// Method-side parallel of the FunctionInfo shape test: pin that
+/// `MethodInfo.default_param_exprs` captures defaults with indices
+/// relative to non-self params.
+#[test]
+fn check_result_method_with_defaults() {
+    let result = check_full(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = 1, factor: Int = 2) -> Int {
+        return self.n * factor + by
+    }
+}
+function main() { }
+"#,
+    );
+    let info = &result.methods["Counter"]["bump"];
+    assert_eq!(info.params.len(), 2, "non-self params count");
+    let default_indices: Vec<usize> = {
+        let mut v: Vec<usize> = info.default_param_exprs.keys().copied().collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        default_indices,
+        vec![0, 1],
+        "both non-self params carry defaults; indices are 0-based over non-self slots",
+    );
+}
+
+/// Method defaults cannot reference `self`: the default expression
+/// evaluates at the caller's call site where `self` is not yet bound.
+/// Pass-1 of `check_impl` (checker.rs) checks defaults in a scope
+/// with neither `self` nor sibling params bound, so the identifier
+/// falls through as unknown.
+#[test]
+fn method_default_cannot_reference_self() {
+    assert_has_error(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = self.n) -> Int {
+        return self.n + by
+    }
+}
+function main() { }
+"#,
+        "undefined",
+    );
+}
+
+/// Method defaults cannot reference sibling parameters either — same
+/// caller-site-evaluation rule as free functions.
+#[test]
+fn method_default_cannot_reference_earlier_parameter() {
+    assert_has_error(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, x: Int, y: Int = x + 1) -> Int {
+        return self.n + x + y
+    }
+}
+function main() { }
+"#,
+        "undefined",
+    );
+}
+
+/// Over-long arg lists on a defaulted method call still error, and
+/// the message is the arity form (distinct from the by-name
+/// "missing argument(s)" form for under-fill).
+#[test]
+fn method_too_many_args_on_defaulted_method() {
+    assert_has_error(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = 1) -> Int {
+        return self.n + by
+    }
+}
+function main() {
+    let c: Counter = Counter(0)
+    c.bump(1, 2)
+}
+"#,
+        "takes 1 argument(s), got 2",
+    );
+}
+
+/// Under-fill names the missing parameter (not the confusing
+/// "takes N, got M" arity message).  The required-before-defaulted
+/// layout is forced by the parser's "non-default parameter cannot
+/// follow a default parameter" rule, so "user passes zero, the
+/// required slot is missing by name" is the minimal shape that
+/// exercises the named-missing diagnostic.
+#[test]
+fn method_missing_required_arg_names_the_parameter() {
+    assert_has_error(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, factor: Int, by: Int = 1) -> Int {
+        return self.n * factor + by
+    }
+}
+function main() {
+    let c: Counter = Counter(0)
+    c.bump()
+}
+"#,
+        "missing argument(s): factor",
+    );
+}
+
+// ── Expression-level type annotations ───────────────────
 
 #[test]
 fn expr_types_populated_for_literals() {

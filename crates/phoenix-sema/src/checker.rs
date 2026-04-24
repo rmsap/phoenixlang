@@ -231,6 +231,21 @@ pub struct MethodInfo {
     pub definition_span: Span,
     /// Parameter types for the method, excluding the implicit `self` receiver.
     pub params: Vec<Type>,
+    /// Parameter names in source order, aligned with `params` (i.e.
+    /// excluding `self`).  Used for diagnostics — in particular, the
+    /// "missing argument for parameter `x`" message in
+    /// `check_method_args`.  For built-in methods populated via
+    /// [`MethodInfo::builtin`], synthesized `arg1, arg2, …` names stand
+    /// in; the invariant is `param_names.len() == params.len()`.
+    pub param_names: Vec<String>,
+    /// Default-value expressions keyed by parameter index (relative to
+    /// the `params` vector — i.e. excluding `self`).
+    ///
+    /// Populated at registration time in the same shape as
+    /// [`FunctionInfo::default_param_exprs`]; consumed by IR lowering's
+    /// `merge_method_call_args` and by the AST interpreter's
+    /// `call_method`.  `self` is never defaulted and never appears here.
+    pub default_param_exprs: HashMap<usize, Expr>,
     /// The method's return type.
     pub return_type: Type,
     /// The method's own generic type parameters in source order.
@@ -249,9 +264,12 @@ impl MethodInfo {
     /// parameters. Use [`MethodInfo`]'s struct literal form when a method
     /// has its own `type_params`.
     pub fn builtin(params: Vec<Type>, return_type: Type) -> Self {
+        let param_names = (0..params.len()).map(|i| format!("arg{}", i + 1)).collect();
         Self {
             definition_span: Span::BUILTIN,
             params,
+            param_names,
+            default_param_exprs: HashMap::new(),
             return_type,
             type_params: Vec::new(),
         }
@@ -552,56 +570,7 @@ impl Checker {
                 .map(|p| this.resolve_type_expr(&p.type_annotation))
                 .collect();
 
-            // Pass 1: check defaults with *no* parameters in scope.
-            //
-            // Defaults are materialized at the caller's call site (see
-            // [design-decisions.md: *Default-argument lowering strategy*]).
-            // Binding callee params before checking defaults would
-            // accept references like `y: Int = x` that fail at
-            // lowering/runtime.
-            //
-            // The scope push/pop here is load-bearing: pass 1 must run
-            // with an empty (param-free) scope layer so any accidental
-            // `scopes.define()` that creeps into this block fails
-            // loudly instead of silently masking unbound-identifier
-            // diagnostics.  Nothing below should define into the
-            // pass-1 scope.
-            this.scopes.push();
-            for (param, ty) in non_self.iter().zip(param_types.iter()) {
-                let Some(ref default_expr) = param.default_value else {
-                    continue;
-                };
-                let default_ty = this.check_expr(default_expr);
-                if !default_ty.is_error()
-                    && !ty.is_error()
-                    && !this.types_compatible(ty, &default_ty)
-                {
-                    this.error(
-                        format!(
-                            "default value for parameter `{}`: expected `{}` but got `{}`",
-                            param.name, ty, default_ty
-                        ),
-                        default_expr.span(),
-                    );
-                }
-                // Free type vars in the default's inferred type would
-                // trip `contains_type_var` in mono — caller-site
-                // substitution binds the caller's type params, not the
-                // callee's.
-                if !default_ty.is_error() && default_ty.has_type_vars() {
-                    this.error(
-                        format!(
-                            "default value for parameter `{}`: type `{}` references the \
-                             function's own generic parameters — default expressions are \
-                             evaluated at the caller's call site where those parameters \
-                             are not bound",
-                            param.name, default_ty
-                        ),
-                        default_expr.span(),
-                    );
-                }
-            }
-            this.scopes.pop();
+            this.check_param_defaults(&non_self, &param_types);
 
             // Pass 2: fresh scope, bind params, check body.
             this.scopes.push();
@@ -696,6 +665,19 @@ impl Checker {
                     .map(|t| this.resolve_type_expr(t))
                     .unwrap_or(Type::Void);
                 this.current_return_type = Some(return_type.clone());
+
+                // Resolve non-self parameter types under `with_type_params`
+                // scope; no params / `self` bound yet.
+                let non_self: Vec<&Param> =
+                    func.params.iter().filter(|p| p.name != "self").collect();
+                let param_types: Vec<Type> = non_self
+                    .iter()
+                    .map(|p| this.resolve_type_expr(&p.type_annotation))
+                    .collect();
+
+                this.check_param_defaults(&non_self, &param_types);
+
+                // Pass 2: fresh scope, bind `self` and params, check body.
                 this.scopes.push();
 
                 // Build proper self type with TypeVar args for generic types
@@ -717,11 +699,7 @@ impl Checker {
                     },
                 );
 
-                for param in &func.params {
-                    if param.name == "self" {
-                        continue;
-                    }
-                    let ty = this.resolve_type_expr(&param.type_annotation);
+                for (param, ty) in non_self.into_iter().zip(param_types.into_iter()) {
                     this.scopes.define(
                         param.name.clone(),
                         VarInfo {
@@ -745,6 +723,63 @@ impl Checker {
         for stmt in &block.statements {
             self.check_statement(stmt);
         }
+    }
+
+    /// Pass-1 validation of parameter default expressions.
+    ///
+    /// Shared by [`Self::check_function`] and [`Self::check_impl`]'s
+    /// method-body pass.  Defaults are materialized at the caller's
+    /// call site (see [design-decisions.md: *Default-argument lowering
+    /// strategy*]), so at this point neither `self` nor sibling params
+    /// are legal references — a default referencing either would fail
+    /// at lowering/runtime.
+    ///
+    /// The scope push/pop here is load-bearing: pass 1 must run with
+    /// an empty (param-free) scope layer so any accidental
+    /// `scopes.define()` that creeps into a default expression fails
+    /// loudly rather than silently masking unbound-identifier
+    /// diagnostics.  Callers must *not* rely on any definitions
+    /// surviving this call.
+    ///
+    /// `params` and `param_types` must be aligned and in source order.
+    pub(crate) fn check_param_defaults(&mut self, params: &[&Param], param_types: &[Type]) {
+        debug_assert_eq!(
+            params.len(),
+            param_types.len(),
+            "check_param_defaults: params/param_types length mismatch",
+        );
+        self.scopes.push();
+        for (param, ty) in params.iter().zip(param_types.iter()) {
+            let Some(ref default_expr) = param.default_value else {
+                continue;
+            };
+            let default_ty = self.check_expr(default_expr);
+            if !default_ty.is_error() && !ty.is_error() && !self.types_compatible(ty, &default_ty) {
+                self.error(
+                    format!(
+                        "default value for parameter `{}`: expected `{}` but got `{}`",
+                        param.name, ty, default_ty
+                    ),
+                    default_expr.span(),
+                );
+            }
+            // Free type vars in the default's inferred type would trip
+            // `contains_type_var` in mono — caller-site substitution
+            // binds the caller's type params, not the callee's.
+            if !default_ty.is_error() && default_ty.has_type_vars() {
+                self.error(
+                    format!(
+                        "default value for parameter `{}`: type `{}` references the \
+                         function's own generic parameters — default expressions are \
+                         evaluated at the caller's call site where those parameters \
+                         are not bound",
+                        param.name, default_ty
+                    ),
+                    default_expr.span(),
+                );
+            }
+        }
+        self.scopes.pop();
     }
 
     /// Checks a block and returns its type.

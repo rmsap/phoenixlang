@@ -142,17 +142,15 @@ function main() {
     assert_eq!(output, vec!["103"]);
 }
 
-/// Pins the known gap: `lower_method_call` in
-/// `crates/phoenix-ir/src/lower_expr.rs` does not route through
-/// `merge_call_args`, so method calls that omit a defaulted trailing
-/// positional argument never synthesize the default.  The fix is the
-/// same shape as the free-function version shipped on 2026-04-24 —
-/// hoist the `merge_call_args` path into the method branch too — but
-/// it's a separate site and lands separately.  Tracked in
-/// `docs/known-issues.md` under "Default arguments are not supported
-/// on method calls".
+/// Method call omitting a defaulted trailing positional argument.
+/// `c.bump()` now synthesizes the default via the new
+/// `merge_method_call_args` helper in
+/// `crates/phoenix-ir/src/lower_expr.rs`; sema's
+/// `check_method_args` accepts the elided slot when
+/// `MethodInfo.default_param_exprs[by_idx]` is populated.  Pinned
+/// three-way to guarantee AST / IR / compiled agree on the
+/// caller-site-materialized default.
 #[test]
-#[ignore = "method-call site does not route through merge_call_args — see known-issues.md"]
 fn default_on_method_parameter() {
     three_way_roundtrip(
         r#"
@@ -166,6 +164,142 @@ function main() {
     let c: Counter = Counter(10)
     print(c.bump())
     print(c.bump(5))
+}
+"#,
+    );
+}
+
+/// A positional arg wins over a registered default.  Redundant with
+/// the above's second call but separated so the "override" case can
+/// regress independently of the "elided" case.  Three-way so all
+/// backends agree on the override path.
+#[test]
+fn method_default_overridden_by_positional() {
+    three_way_roundtrip(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = 1) -> Int {
+        return self.n + by
+    }
+}
+function main() {
+    let c: Counter = Counter(10)
+    print(c.bump(99))
+}
+"#,
+    );
+}
+
+/// Pins the caller-site-re-evaluation contract for method defaults:
+/// each call that omits the defaulted slot must evaluate the default
+/// afresh.  Observable via a `print` side effect in the default
+/// helper; a hoisted-into-callee rewrite would print fewer lines.
+/// See the free-function analogue
+/// `default_expression_evaluates_at_each_call_site`.
+#[test]
+fn method_default_references_global_function_each_call() {
+    let output = compile_and_run(
+        r#"
+function defaultBump() -> Int {
+    print("default")
+    return 1
+}
+struct Counter { Int n }
+impl Counter {
+    function bump(self, by: Int = defaultBump()) -> Int {
+        return self.n + by
+    }
+}
+function main() {
+    let c: Counter = Counter(10)
+    print(c.bump())
+    print(c.bump())
+    print(c.bump())
+}
+"#,
+    );
+    assert_eq!(
+        output,
+        vec!["default", "11", "default", "11", "default", "11"],
+        "each `c.bump()` call must re-evaluate `defaultBump()`; fewer `default` lines \
+         means the default was hoisted into a once-per-function initializer",
+    );
+}
+
+/// Method default on a *generic struct*: exercises the
+/// `merge_method_call_args` lookup through the base-name key that
+/// struct-mono later mangles, paired with the method-mono specialization.
+/// Pins that the default lookup uses the bare base name (`"Box"`),
+/// not the mangled `"Box__i64"`, since sema's `methods` registry keys
+/// on the unmangled type name.
+#[test]
+fn method_default_on_generic_struct() {
+    three_way_roundtrip(
+        r#"
+struct Box<T> {
+    T value
+
+    function padded(self, width: Int = 5) -> Int {
+        return width
+    }
+}
+function main() {
+    let b: Box<Int> = Box(7)
+    print(b.padded())
+    print(b.padded(12))
+}
+"#,
+    );
+}
+
+/// Method-level generic parameters (distinct from the enclosing
+/// struct's) with a defaulted slot whose type is concrete.  The
+/// default must not be rejected as "references the function's own
+/// generic parameters" — the default's type (`Int`) has no free type
+/// vars — and the method-mono + default-synthesis interact cleanly.
+#[test]
+fn method_default_with_method_level_type_params() {
+    three_way_roundtrip(
+        r#"
+struct Counter { Int n }
+impl Counter {
+    function label<U>(self, item: U, prefix: Int = 0) -> Int {
+        return self.n + prefix
+    }
+}
+function main() {
+    let c: Counter = Counter(10)
+    print(c.label("hello"))
+    print(c.label(42, 5))
+}
+"#,
+    );
+}
+
+/// Method default whose expression constructs the enclosing struct
+/// type via a free function returning that struct.  Pins that IR
+/// lowering's default synthesis does not depend on the default
+/// producing a *different* type than the receiver — a prior
+/// implementation might hoist the default's lowering to a context
+/// where the enclosing struct type isn't registered yet.
+#[test]
+fn method_default_calls_function_returning_same_struct_type() {
+    three_way_roundtrip(
+        r#"
+struct Counter { Int n }
+function fresh() -> Counter {
+    return Counter(100)
+}
+impl Counter {
+    function add(self, other: Counter = fresh()) -> Int {
+        return self.n + other.n
+    }
+}
+function main() {
+    let c: Counter = Counter(10)
+    print(c.add())
+    print(c.add(Counter(7)))
 }
 "#,
     );

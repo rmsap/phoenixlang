@@ -117,11 +117,16 @@ Until that lands, there is no supported way to build a `List<dyn Trait>` in comp
 
 **Last remaining dyn *construction* blocker.** After the 2026-04-24 fixes closed the `<T: Trait>` → `dyn Trait` coercion and default-argument paths, this entry is the final gate on the [`dyn Trait`/`StringRef` 2-slot discriminator](#dyn-trait-and-stringref-share-a-2-slot-layout-with-no-discriminator) below — the discriminator work only becomes urgent once `List<dyn Trait>` can actually be constructed. Schedule them together. (The *match-arm* dyn coercion gap below is a separate bidirectional-inference site — same Phase 3 rework unlocks both, but the two do not block each other.)
 
-### Default arguments are not supported on method calls
+### Default arguments on trait-method calls (object-safe dispatch + trait-bounded generics)
 
-`impl Counter { function bump(self, by: Int = 1) -> Int { ... } }` declares a method with a default.  Free-function calls that omit the defaulted slot now compile (the 2026-04-24 fix synthesizes the default via `merge_call_args` in `phoenix-ir/src/lower_expr.rs`), but method calls do not: `lower_method_call` in the same file builds the arg list directly from `MethodCallExpr.args` and never routes through `merge_call_args`.  `c.bump()` therefore lowers to an `Op::Call` with too few arguments and trips the Cranelift verifier.
+Default-argument values work for inherent-impl methods as of 2026-04-24 (see [phase-2.md](phases/phase-2.md)), but *trait-method* defaults declared inside a `trait` block are not yet handled.  Two dispatch sites fall through sema's `check_method_args` with empty default maps today:
 
-**File:** `phoenix-ir/src/lower_expr.rs` (`lower_method_call`).  **Tripwire:** the `#[ignore]`'d `default_on_method_parameter` test in `crates/phoenix-cranelift/tests/compile_default_args.rs`.  **Workaround:** pass every argument explicitly at method call sites.  **Planned fix:** hoist the `merge_call_args`/`coerce_call_args` pair into `lower_method_call`'s direct and builtin-call branches, treating `self` as a pre-filled slot 0.  The `MethodCallExpr` AST node does not carry named-arg syntax today, so the initial fix is positional-only — named-arg support on methods can follow.  **Target phase:** Phase 2.2 follow-up.
+- Trait-object dispatch (`x: dyn Drawable; x.draw()`): `check_expr_call.rs` around the `Type::Dyn` branch passes `&HashMap::new()` for defaults because `TraitInfo::methods` does not carry `default_param_exprs`.
+- Trait-bounded dispatch (`x.m()` where `x: T, T: Trait`): `resolve_trait_bound_method` similarly passes no defaults.
+
+**Planned fix:** Add `default_param_exprs: HashMap<usize, Expr>` to `TraitMethodInfo`, populate in `register_trait_decl`, and thread through both dispatch sites in `check_method_args`.  The IR-side synthesis is trickier for trait-bounded calls — they lower to `Op::UnresolvedTraitMethod` at first and only become a concrete `Op::Call` at monomorphization time, so defaults must be materialized *after* substitution.  The clean approach is to defer default lowering to `placeholder_resolution::resolve_trait_bound_method_calls` (same site that rewrites the placeholder), consulting the trait's `default_param_exprs` keyed by method name.
+
+**Tripwire:** a test shape like `trait Bumpable { function bump(by: Int = 1) -> Int } ... x.bump()` on a trait-bound `x: T` fails at sema with "method takes 1 argument, got 0".  **Workaround:** declare the default at the `impl` site rather than the trait site.  **Target phase:** Phase 3 — pairs naturally with the bidirectional-inference rework since trait-method default lowering shares the placeholder-resolution machinery.
 
 ### Default-expression visibility across module boundaries (Phase 2.6 tripwire)
 

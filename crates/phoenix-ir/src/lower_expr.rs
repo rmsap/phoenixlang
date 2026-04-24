@@ -16,6 +16,7 @@ use phoenix_parser::ast::{
     UnaryOp,
 };
 use phoenix_sema::types::Type;
+use std::collections::HashMap;
 
 impl<'a> LoweringContext<'a> {
     /// Lower a slice of sema [`Type`]s to their IR counterparts. Used when
@@ -536,95 +537,84 @@ impl<'a> LoweringContext<'a> {
         self.emit(Op::CallIndirect(callee_val, positional), result_type, span)
     }
 
-    /// Merge positional + named args into a single slot-ordered list,
-    /// synthesizing defaults for slots left unfilled.
+    /// Shared slot-filling core for both free-function and method calls.
     ///
-    /// Named args win over positional on overlap (sema should prevent
-    /// this).  Remaining empty slots are filled by lowering the default
-    /// expression recorded on sema's [`FunctionInfo::default_param_exprs`].
-    /// See [design-decisions.md: *Default-argument lowering strategy*]
-    /// for the caller-site materialization rationale.
+    /// Builds a fully-ordered argument list of length `total`, filling
+    /// from:
+    /// 1. `positional` in source order (first wins),
+    /// 2. each `named` by resolving its key via `named_to_slot`
+    ///    (`None` = unknown named arg; debug-asserts since sema should
+    ///    have rejected it), and
+    /// 3. `defaults.get(&slot)` for any remaining empty slot, lowered
+    ///    into the current block via `lower_expr`.
     ///
-    /// **Scope: free-function calls only.**  The direct-call branch of
-    /// [`Self::lower_call`] is the sole caller.  Method calls
-    /// ([`Self::lower_method_call`]) do not route through here today and
-    /// therefore do not synthesize defaults — tracked in
-    /// `docs/known-issues.md` under "Default arguments are not supported
-    /// on method calls."  Indirect calls through closures
-    /// ([`Op::CallIndirect`]) are unreachable because closure params
-    /// cannot carry defaults; if that ever changes, the indirect path
-    /// would need its own synthesis site (the callee's defaults are not
-    /// known at the closure's call site — they'd have to be baked into
-    /// the closure body at construction time).
+    /// Caller-site materialization contract (see [design-decisions.md:
+    /// *Default-argument lowering strategy*]): each missing slot's
+    /// default expression is lowered fresh at this call site, so
+    /// side-effectful defaults (e.g. `= randomInt()`) re-evaluate per
+    /// call.
+    ///
+    /// `site_desc` identifies the callee for panic messages (e.g.
+    /// `"free function `foo`"` or `"method `Counter.bump`"`).
     ///
     /// **Phase 2.6 tripwire:** this inlines the callee's default
     /// expression into the caller's IR.  Once modules + `public`/private
-    /// land, a default referencing a module-private item would leak that
-    /// item's symbol to every caller.  Fix via synthesized public
+    /// land, a default referencing a module-private item would leak
+    /// that item's symbol to every caller.  Fix via synthesized public
     /// wrappers at that point — see known-issues.md
     /// "Default-expression visibility across module boundaries".
-    fn merge_call_args(
+    #[allow(clippy::too_many_arguments)] // parameters are all distinct inputs; grouping would obscure, not clarify
+    fn assemble_call_args(
         &mut self,
-        func_id: FuncId,
+        total: usize,
         positional: &[ValueId],
         named: &[(String, ValueId)],
+        named_to_slot: impl Fn(&str) -> Option<usize>,
+        defaults: &HashMap<usize, Expr>,
+        site_desc: &str,
         call_span: Span,
     ) -> Vec<ValueId> {
-        let total = self.module.functions[func_id.0 as usize].param_names.len();
-        // Fast path: fully positional, correct arity.
-        if named.is_empty() && positional.len() == total {
-            return positional.to_vec();
-        }
-
-        // Over-long positional is a sema bug — silent truncation here
-        // would lose caller-side side effects (already lowered into the
+        // Over-long positional is a sema bug — silent truncation would
+        // lose caller-side side effects (already lowered into the
         // current block) and leave a ValueId dangling.  Hard assert.
         assert!(
             positional.len() <= total,
-            "merge_call_args: {} positional args for `{}` which has {} params \
-             (call at {:?}) — sema should reject over-long call lists",
+            "assemble_call_args: {} positional args for {site_desc} which has {total} \
+             params (call at {call_span:?}) — sema should reject over-long arg lists",
             positional.len(),
-            self.module.functions[func_id.0 as usize].name,
-            total,
-            call_span,
         );
 
-        // Clone owning copies to drop the borrow on `self.module` before
-        // we lower default expressions (which needs `&mut self`).
-        let param_names = self.module.functions[func_id.0 as usize]
-            .param_names
-            .clone();
-        let func_name = self.module.functions[func_id.0 as usize].name.clone();
+        // Fast path: fully positional with correct arity and no named.
+        if named.is_empty() && positional.len() == total {
+            return positional.to_vec();
+        }
 
         let mut slots: Vec<Option<ValueId>> = vec![None; total];
         for (i, val) in positional.iter().enumerate() {
             slots[i] = Some(*val);
         }
         for (name, val) in named {
-            match param_names.iter().position(|p| p == name) {
+            match named_to_slot(name) {
                 Some(idx) => slots[idx] = Some(*val),
                 None => debug_assert!(
                     false,
-                    "merge_call_args: sema let through named arg `{name}` for `{func_name}` \
-                     (params: {param_names:?}) at {call_span:?} — should have been rejected \
-                     with an 'unknown named arg' error",
+                    "assemble_call_args: sema let through named arg `{name}` for \
+                     {site_desc} at {call_span:?} — should have been rejected with \
+                     an 'unknown named arg' error",
                 ),
             }
         }
 
-        // Collect (slot, expr) pairs before lowering so the borrow on
-        // `self.check.functions` releases before `lower_expr(&mut self)`.
+        // Pre-collect missing (slot, expr) pairs.  `defaults` was
+        // cloned out of whatever owning borrow the caller held, so
+        // this loop doesn't hold anything that conflicts with
+        // `lower_expr(&mut self)` below.
         let mut missing: Vec<(usize, Expr)> = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
             if slot.is_some() {
                 continue;
             }
-            if let Some(expr) = self
-                .check
-                .functions
-                .get(&func_name)
-                .and_then(|info| info.default_param_exprs.get(&i))
-            {
+            if let Some(expr) = defaults.get(&i) {
                 missing.push((i, expr.clone()));
             }
         }
@@ -635,20 +625,119 @@ impl<'a> LoweringContext<'a> {
 
         let result: Vec<ValueId> = slots.into_iter().flatten().collect();
         // Hard assert — release-build underfill trips the Cranelift
-        // verifier at best, silent miscompile at worst.  call_span
-        // decorates the failure message only; not propagated into IR.
+        // verifier at best, silent miscompile at worst.
         assert_eq!(
             result.len(),
             total,
-            "merge_call_args: {} of {} slots filled for `{}` at {:?} — sema should \
-             ensure every slot is either passed or has a default in \
-             FunctionInfo::default_param_exprs",
+            "assemble_call_args: {} of {total} slots filled for {site_desc} at \
+             {call_span:?} — sema should ensure every slot is either passed or has \
+             a default",
             result.len(),
-            total,
-            func_name,
-            call_span,
         );
         result
+    }
+
+    /// Free-function call wrapper around [`Self::assemble_call_args`].
+    ///
+    /// Reads param names from the IR module (already cloned at
+    /// definition time) and defaults from
+    /// [`FunctionInfo::default_param_exprs`].
+    ///
+    /// **Scope: free-function calls only.**  The direct-call branch of
+    /// [`Self::lower_call`] is the sole caller.  The method-call path
+    /// routes through [`Self::merge_method_call_args`] instead — same
+    /// caller-site materialization rule, different lookup source
+    /// (sema's `methods` registry) and slot space (excludes `self`).
+    /// Indirect calls through closures ([`Op::CallIndirect`]) are
+    /// unreachable because closure params cannot carry defaults; if
+    /// that ever changes, the indirect path would need its own
+    /// synthesis site (the callee's defaults are not known at the
+    /// closure's call site — they'd have to be baked into the closure
+    /// body at construction time).
+    fn merge_call_args(
+        &mut self,
+        func_id: FuncId,
+        positional: &[ValueId],
+        named: &[(String, ValueId)],
+        call_span: Span,
+    ) -> Vec<ValueId> {
+        // Clone owning copies to drop the borrow on `self.module`
+        // before we call `lower_expr(&mut self)`.
+        let func = &self.module.functions[func_id.0 as usize];
+        let total = func.param_names.len();
+        let param_names = func.param_names.clone();
+        let func_name = func.name.clone();
+        let defaults = self
+            .check
+            .functions
+            .get(&func_name)
+            .map(|info| info.default_param_exprs.clone())
+            .unwrap_or_default();
+
+        let site_desc = format!("free function `{func_name}`");
+        self.assemble_call_args(
+            total,
+            positional,
+            named,
+            |name| param_names.iter().position(|p| p == name),
+            &defaults,
+            &site_desc,
+            call_span,
+        )
+    }
+
+    /// Method-call counterpart of [`Self::merge_call_args`] — operates
+    /// on the *user-visible* slot space (`self` excluded) and reads
+    /// defaults from sema's `methods` registry rather than `functions`.
+    ///
+    /// Returns a vector of length `method_info.params.len()` — still
+    /// without `self`. Callers in [`Self::lower_method_call`] insert
+    /// the receiver at slot 0 after this helper returns.
+    ///
+    /// Positional-only today: `MethodCallExpr` carries no named-arg
+    /// syntax.  The shared [`Self::assemble_call_args`] core accepts a
+    /// `named` slice, so adding named-args on methods is a
+    /// parser-level change only.
+    fn merge_method_call_args(
+        &mut self,
+        type_name: &str,
+        method_name: &str,
+        positional: &[ValueId],
+        call_span: Span,
+    ) -> Vec<ValueId> {
+        // Single MethodInfo lookup; clone out what we need so the
+        // immutable borrow on `self.check` releases before
+        // `assemble_call_args(&mut self)` runs.
+        let (total, param_names, defaults) = self
+            .check
+            .methods
+            .get(type_name)
+            .and_then(|m| m.get(method_name))
+            .map(|info| {
+                (
+                    info.params.len(),
+                    info.param_names.clone(),
+                    info.default_param_exprs.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "merge_method_call_args: no MethodInfo for `{type_name}.{method_name}` \
+                     — sema's `check_method_call` must reject unknown methods before \
+                     lowering runs"
+                )
+            });
+
+        let site_desc = format!("method `{type_name}.{method_name}`");
+        self.assemble_call_args(
+            total,
+            positional,
+            &[],
+            |name| param_names.iter().position(|p| p == name),
+            &defaults,
+            &site_desc,
+            call_span,
+        )
     }
 
     /// Lower a variable assignment.
@@ -741,6 +830,24 @@ impl<'a> LoweringContext<'a> {
     }
 
     /// Lower a method call.
+    ///
+    /// Four dispatch branches:
+    /// - **`dyn Trait`** receiver: delegated to [`Self::lower_dyn_method_call`]
+    ///   (vtable slot indirection).
+    /// - **Trait-bounded type-variable** receiver (`<T: Trait>`): emits
+    ///   an `Op::UnresolvedTraitMethod` placeholder; monomorphization
+    ///   rewrites it to a concrete `Op::Call` after substitution.
+    /// - **User-defined method** on a concrete type: delegated to
+    ///   [`Self::lower_user_method_call`], which is the *only* branch
+    ///   today that synthesizes default-argument values (via
+    ///   [`Self::merge_method_call_args`]).
+    /// - **Built-in method**: emits `Op::BuiltinCall`.
+    ///
+    /// When trait-method defaults land (see
+    /// `docs/known-issues.md`: "Default arguments on trait-method
+    /// calls"), the dyn and trait-bounded branches will also thread
+    /// defaults — at monomorphization time for the trait-bounded
+    /// branch, since the concrete impl is not known here.
     fn lower_method_call(&mut self, mc: &MethodCallExpr) -> ValueId {
         let obj = self.lower_expr(&mc.object);
         let mut args: Vec<ValueId> = mc.args.iter().map(|a| self.lower_expr(a)).collect();
@@ -783,14 +890,10 @@ impl<'a> LoweringContext<'a> {
             _ => String::new(),
         };
 
-        // Check for a user-defined method.
+        // User-defined method on a concrete type.
         let key = (type_name.clone(), mc.method.clone());
         if let Some(&func_id) = self.module.method_index.get(&key) {
-            // Pass `self` as the first argument.
-            args.insert(0, obj);
-            let result_type = self.expr_type(&mc.span);
-            let type_args = self.resolve_call_type_args(mc.span);
-            return self.emit(Op::Call(func_id, type_args, args), result_type, span);
+            return self.lower_user_method_call(func_id, &type_name, mc, obj, args, span);
         }
 
         // Built-in method: emit as BuiltinCall.
@@ -798,6 +901,29 @@ impl<'a> LoweringContext<'a> {
         let builtin_name = format!("{type_name}.{}", mc.method);
         let result_type = self.expr_type(&mc.span);
         self.emit(Op::BuiltinCall(builtin_name, args), result_type, span)
+    }
+
+    /// User-method branch of [`Self::lower_method_call`].
+    ///
+    /// Split out so it's visibly the only dispatch path that threads
+    /// defaults today.  Synthesizes any omitted trailing positional
+    /// slots via [`Self::merge_method_call_args`] (caller-site
+    /// materialization — see `merge_call_args`'s doc), then prepends
+    /// the receiver `obj` at slot 0 before emitting `Op::Call`.
+    fn lower_user_method_call(
+        &mut self,
+        func_id: FuncId,
+        type_name: &str,
+        mc: &MethodCallExpr,
+        obj: ValueId,
+        user_args: Vec<ValueId>,
+        span: Option<Span>,
+    ) -> ValueId {
+        let mut merged = self.merge_method_call_args(type_name, &mc.method, &user_args, mc.span);
+        merged.insert(0, obj);
+        let result_type = self.expr_type(&mc.span);
+        let type_args = self.resolve_call_type_args(mc.span);
+        self.emit(Op::Call(func_id, type_args, merged), result_type, span)
     }
 
     /// Lower a struct literal expression.
