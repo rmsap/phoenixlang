@@ -10,7 +10,8 @@ func @main() -> string {
     return v2
 }
 
-func @__closure_0(__cap_greeting: string) -> string {
-  bb0(v0: string):
-    return v0
+func @__closure_0(__env: closure() -> string) -> string {
+  bb0(v0: closure() -> string):
+    v1 = closure_load_capture v0[0]
+    return v1
 }

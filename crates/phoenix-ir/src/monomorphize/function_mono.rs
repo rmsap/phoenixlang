@@ -37,10 +37,7 @@ pub(super) fn collect_seed(module: &IrModule) -> Vec<SpecKey> {
     /// `(caller, block, instr)` position key for deterministic ordering.
     type Pos = (FuncId, u32, u32);
     let mut seed: Vec<(Pos, SpecKey)> = Vec::new();
-    for caller in &module.functions {
-        if caller.is_generic_template {
-            continue;
-        }
+    for caller in module.concrete_functions() {
         for (block_idx, block) in caller.blocks.iter().enumerate() {
             for (instr_idx, instr) in block.instructions.iter().enumerate() {
                 if let Op::Call(callee, targs, _) = &instr.op
@@ -109,7 +106,7 @@ pub(super) fn assign_specialization_ids(
 
         // Build substitution for this specialization. The template's
         // `type_param_names` and `targs` are parallel lists.
-        let orig = &module.functions[orig_id.index()];
+        let orig = module.functions[orig_id.index()].func();
         let subst: HashMap<String, IrType> = orig
             .type_param_names
             .iter()
@@ -156,7 +153,7 @@ pub(super) fn clone_and_substitute_bodies(
     let mut new_funcs: Vec<IrFunction> = Vec::with_capacity(order.len());
 
     for (orig_id, targs, new_id) in order {
-        let orig = &module.functions[orig_id.index()];
+        let orig = module.functions[orig_id.index()].func();
         let subst: HashMap<String, IrType> = orig
             .type_param_names
             .iter()
@@ -164,11 +161,16 @@ pub(super) fn clone_and_substitute_bodies(
             .zip(targs.iter().cloned())
             .collect();
 
+        // Specializations are always concrete (the whole point of mono):
+        // we collect them as bare `IrFunction`s and push via
+        // `push_concrete` below. `push_concrete` will assign each
+        // specialization's id from its slot index — push order matches
+        // `new_id` allocation order, so the id reaches the value that
+        // pass A wrote into `specialized`.
         let mut spec_fn = orig.clone();
         spec_fn.id = *new_id;
         spec_fn.name = mangle(&orig.name, targs);
         spec_fn.type_param_names = Vec::new();
-        spec_fn.is_generic_template = false;
         substitute_types_in_fn(&mut spec_fn, &subst);
 
         // Resolve trait-bound method calls on a type-variable receiver
@@ -219,18 +221,22 @@ pub(super) fn clone_and_substitute_bodies(
     }
 
     for spec in new_funcs {
-        module.function_index.insert(spec.name.clone(), spec.id);
-        module.functions.push(spec);
+        let name = spec.name.clone();
+        let expected_id = spec.id;
+        let pushed = module.push_concrete(spec);
+        debug_assert_eq!(
+            pushed, expected_id,
+            "push order desync: pass A allocated {expected_id:?} but push_concrete \
+             assigned {pushed:?}"
+        );
+        module.function_index.insert(name, pushed);
     }
 }
 
 /// Pass C. Rewrite every generic `Op::Call` in non-template callers to
 /// point at the specialized `FuncId` and clear its `type_args`.
 pub(super) fn rewrite_root_call_sites(module: &mut IrModule, specialized: &SpecMap) {
-    for func in module.functions.iter_mut() {
-        if func.is_generic_template {
-            continue;
-        }
+    for func in module.concrete_functions_mut() {
         for block in func.blocks.iter_mut() {
             for instr in block.instructions.iter_mut() {
                 let Op::Call(callee, call_targs, _) = &mut instr.op else {

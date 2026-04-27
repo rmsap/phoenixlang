@@ -22,10 +22,12 @@ fn gcall(callee: u32, type_args: Vec<IrType>) -> Op {
 }
 
 /// Fluent builder for an `IrFunction` with a single entry block.
-/// Non-empty `type_params` flip `is_generic_template` automatically.
+/// Non-empty `type_params` flip the slot variant to
+/// [`crate::module::FunctionSlot::Template`] automatically.
 struct FnBuilder {
     func: IrFunction,
     instrs: Vec<Instruction>,
+    is_template: bool,
 }
 
 impl FnBuilder {
@@ -40,12 +42,13 @@ impl FnBuilder {
                 None,
             ),
             instrs: Vec::new(),
+            is_template: false,
         }
     }
 
     fn generic(mut self, names: &[&str]) -> Self {
         self.func.type_param_names = names.iter().map(|s| (*s).to_string()).collect();
-        self.func.is_generic_template = !names.is_empty();
+        self.is_template = !names.is_empty();
         self
     }
 
@@ -69,31 +72,41 @@ impl FnBuilder {
         self
     }
 
-    fn build(mut self) -> IrFunction {
+    fn build(mut self) -> crate::module::FunctionSlot {
         self.func.blocks.push(BasicBlock {
             id: BlockId(0),
             params: vec![],
             instructions: self.instrs,
             terminator: Terminator::Return(None),
         });
-        self.func
+        if self.is_template {
+            crate::module::FunctionSlot::Template(self.func)
+        } else {
+            crate::module::FunctionSlot::Concrete(self.func)
+        }
     }
 }
 
-/// Build a module from a list of functions, registering each in
+/// Build a module from a list of function slots, registering each in
 /// `function_index` automatically.
-fn module_of(funcs: Vec<IrFunction>) -> IrModule {
+fn module_of(slots: Vec<crate::module::FunctionSlot>) -> IrModule {
     let mut m = IrModule::new();
-    for f in funcs {
+    for s in slots {
+        let f = s.func();
         m.function_index.insert(f.name.clone(), f.id);
-        m.functions.push(f);
+        m.functions.push(s);
     }
     m
 }
 
 /// Look up a function by name and return a reference.
 fn lookup<'a>(m: &'a IrModule, name: &str) -> &'a IrFunction {
-    &m.functions[m.function_index[name].index()]
+    m.functions[m.function_index[name].index()].func()
+}
+
+/// `true` iff the slot at `name` is a template.
+fn is_template(m: &IrModule, name: &str) -> bool {
+    m.functions[m.function_index[name].index()].is_template()
 }
 
 /// Destructure the `Op::Call` at `(block, instr)` within `func`,
@@ -125,7 +138,7 @@ fn specializes_identity_at_int_and_string() {
     monomorphize(&mut module);
 
     let int_spec = lookup(&module, "identity__i64");
-    assert!(!int_spec.is_generic_template);
+    assert!(!is_template(&module, "identity__i64"));
     assert_eq!(int_spec.param_types, vec![IrType::I64]);
     assert_eq!(int_spec.return_type, IrType::I64);
 
@@ -133,7 +146,7 @@ fn specializes_identity_at_int_and_string() {
     assert_eq!(str_spec.param_types, vec![IrType::StringRef]);
 
     // Template preserved as inert stub at FuncId(0).
-    assert!(module.functions[0].is_generic_template);
+    assert!(module.functions[0].is_template());
 
     // Call sites rewritten: targets point at specializations,
     // type_args are cleared.
@@ -201,7 +214,7 @@ fn uninstantiated_template_leaves_module_unchanged_up_to_erasure() {
     monomorphize(&mut module);
 
     assert_eq!(module.functions.len(), 1);
-    assert!(module.functions[0].is_generic_template);
+    assert!(module.functions[0].is_template());
     assert!(module.concrete_functions().next().is_none());
 }
 
@@ -406,7 +419,7 @@ fn residual_type_var_erased_to_placeholder_when_no_specializations() {
 
     monomorphize(&mut module);
 
-    let instr = &module.functions[0].blocks[0].instructions[0];
+    let instr = &module.functions[0].func().blocks[0].instructions[0];
     assert_eq!(
         instr.result_type,
         IrType::ListRef(Box::new(IrType::StructRef(
@@ -434,7 +447,7 @@ fn residual_type_var_in_enum_ref_args_erased_by_pass_d() {
 
     monomorphize(&mut module);
 
-    let instr = &module.functions[0].blocks[0].instructions[0];
+    let instr = &module.functions[0].func().blocks[0].instructions[0];
     assert_eq!(
         instr.result_type,
         IrType::EnumRef(
@@ -506,7 +519,7 @@ fn struct_mono_registers_specialized_layout_and_rewrites_alloc() {
     assert_eq!(specialized, &vec![("value".to_string(), IrType::I64)]);
 
     // StructAlloc name rewritten and result_type's args cleared.
-    let instr = &module.functions[0].blocks[0].instructions[0];
+    let instr = &module.functions[0].func().blocks[0].instructions[0];
     match &instr.op {
         Op::StructAlloc(name, _) => assert_eq!(name, "Container__i64"),
         other => panic!("expected StructAlloc, got {other:?}"),
@@ -554,16 +567,17 @@ fn struct_mono_two_instantiations_dont_collide() {
 #[test]
 fn struct_mono_specializes_methods_and_updates_method_index() {
     // Template method `Container.get(self) -> T { self.value }`,
-    // plus `main` constructing `Container<Int>`.
-    let template_method = FnBuilder::new(0, "Container.get")
-        .generic(&[]) // no method-level type params; generic via struct
+    // plus `main` constructing `Container<Int>`. The method is a
+    // template because its parent struct is generic, even though it
+    // has no method-level type params.
+    let template_method_fn = FnBuilder::new(0, "Container.get")
         .params(vec![IrType::StructRef("Container".into(), vec![tv("T")])])
         .ret(tv("T"))
         .instr(Op::StructGetField(ValueId(0), 0), tv("T"))
-        .build();
-    let mut template_method = template_method;
-    // Mark as template because its parent struct is generic.
-    template_method.is_generic_template = true;
+        .build()
+        .func()
+        .clone();
+    let template_method = crate::module::FunctionSlot::Template(template_method_fn);
 
     let mut module = module_of(vec![
         template_method,
@@ -587,8 +601,8 @@ fn struct_mono_specializes_methods_and_updates_method_index() {
         .get(&("Container__i64".to_string(), "get".to_string()))
         .copied()
         .expect("specialized method_index entry missing");
-    let spec = &module.functions[spec_fid.index()];
-    assert!(!spec.is_generic_template);
+    let spec = module.functions[spec_fid.index()].func();
+    assert!(!module.functions[spec_fid.index()].is_template());
     assert_eq!(spec.name, "Container__i64.get");
     // self param's StructRef args rewritten to empty (mangled form).
     assert_eq!(
@@ -602,7 +616,7 @@ fn struct_mono_specializes_methods_and_updates_method_index() {
     assert_eq!(instr.result_type, IrType::I64);
 
     // Original template preserved as inert stub.
-    assert!(module.functions[0].is_generic_template);
+    assert!(module.functions[0].is_template());
 }
 
 /// `Op::DynAlloc` for a generic struct receiver is rewritten to the
@@ -614,13 +628,17 @@ fn struct_mono_rekeys_dyn_vtables_for_generic_struct() {
     // Generic struct `Box<T>` with method `show(self) -> String`,
     // impl Show for Box, and a `main` that coerces `Box<Int>` to
     // `dyn Show`.
-    let mut template_show = FnBuilder::new(0, "Box.show")
+    // Bare-name template method on a generic struct — promoted to a
+    // Template slot below.
+    let template_show_fn = FnBuilder::new(0, "Box.show")
         .params(vec![IrType::StructRef("Box".into(), vec![tv("T")])])
         .ret(IrType::StringRef)
-        .build();
-    template_show.is_generic_template = true;
+        .build()
+        .func()
+        .clone();
+    let template_show = crate::module::FunctionSlot::Template(template_show_fn);
 
-    // Build `main` via the canonical API so value_types stays in sync.
+    // Build `main` via the canonical API so the value allocator stays in sync.
     let mut main = IrFunction::new(
         FuncId(1),
         "main".to_string(),
@@ -643,7 +661,10 @@ fn struct_mono_rekeys_dyn_vtables_for_generic_struct() {
         None,
     );
 
-    let mut module = module_of(vec![template_show, main]);
+    let mut module = module_of(vec![
+        template_show,
+        crate::module::FunctionSlot::Concrete(main),
+    ]);
     register_generic_struct(&mut module, "Box", &["T"], vec![("v", tv("T"))]);
     module
         .method_index
@@ -676,7 +697,7 @@ fn struct_mono_rekeys_dyn_vtables_for_generic_struct() {
 
     // DynAlloc op's concrete name rewritten.
     let main_fid = module.function_index["main"];
-    let dyn_instr = &module.functions[main_fid.index()].blocks[0].instructions[1];
+    let dyn_instr = &module.functions[main_fid.index()].func().blocks[0].instructions[1];
     match &dyn_instr.op {
         Op::DynAlloc(trait_name, concrete, _) => {
             assert_eq!(trait_name, "Show");
@@ -755,4 +776,126 @@ fn struct_mono_no_op_when_no_generic_structs() {
     monomorphize(&mut module);
 
     assert_eq!(module.struct_layouts, before);
+}
+
+/// `for_each_type_mut` (the helper that drives every type substitution
+/// in monomorphization) must reach all closure-related type
+/// annotations: the `IrFunction.capture_types` vector and the
+/// per-value type of an `Op::ClosureLoadCapture` result.
+///
+/// This pins the contract regardless of whether monomorphization
+/// currently *invokes* substitution on closure functions defined inside
+/// generic templates — that end-to-end gap is tracked separately (see
+/// the cross-width fixture and `docs/known-issues.md`). When the gap
+/// closes by cloning closure functions per enclosing-generic
+/// substitution, this test guarantees the cloned bodies will have
+/// their TypeVars correctly rewritten.
+#[test]
+fn for_each_type_mut_substitutes_capture_types_and_load_result() {
+    use crate::module::IrFunction;
+
+    // A toy closure function shaped like `__closure(env) -> T` whose
+    // single capture is of type `T` and whose body performs
+    // `Op::ClosureLoadCapture(env, 0)` returning `T`.
+    let env_ty = IrType::ClosureRef {
+        param_types: vec![],
+        return_type: Box::new(tv("T")),
+    };
+    let mut func = IrFunction::new_closure(
+        FuncId(0),
+        "__closure_under_T".into(),
+        vec![env_ty.clone()],
+        vec!["__env".into()],
+        tv("T"),
+        None,
+        vec![tv("T")],
+    );
+    let entry = func.create_block();
+    let env = func.add_block_param(entry, env_ty);
+    let loaded = func
+        .emit(entry, Op::ClosureLoadCapture(env, 0), tv("T"), None)
+        .expect("non-void emit");
+    func.set_terminator(entry, Terminator::Return(Some(loaded)));
+
+    // Substitute T -> Int. After this, capture_types[0], the recorded
+    // type of `loaded` (queried via instruction_result_type, which
+    // reads from the value allocator), the function's return type,
+    // and the env-param's nested return_type must all be `I64`.
+    let mut subst = std::collections::HashMap::new();
+    subst.insert("T".to_string(), IrType::I64);
+    crate::monomorphize::substitute_types_in_fn(&mut func, &subst);
+
+    assert_eq!(
+        func.capture_types,
+        vec![IrType::I64],
+        "capture_types[0] should have been substituted T -> I64"
+    );
+    assert_eq!(
+        func.return_type,
+        IrType::I64,
+        "return type should have been substituted"
+    );
+    assert_eq!(
+        func.instruction_result_type(loaded),
+        Some(&IrType::I64),
+        "Op::ClosureLoadCapture's per-value-allocator type should have \
+         been substituted"
+    );
+    // The env parameter's nested ClosureRef return_type also rewrites.
+    match &func.param_types[0] {
+        IrType::ClosureRef { return_type, .. } => {
+            assert_eq!(**return_type, IrType::I64);
+        }
+        other => panic!("env param should be ClosureRef, got {other:?}"),
+    }
+}
+
+/// Companion to the test above: substitution at a *2-slot* type
+/// (StringRef) must reach the same annotations. If
+/// monomorphization ever does start cloning closure functions per
+/// enclosing-generic substitution, this is the case where the
+/// Cranelift backend's slot accounting will diverge from the
+/// erased-placeholder fallback — pinning that the substitution
+/// itself is correct keeps the eventual fix's blast radius
+/// confined to the cloning machinery.
+#[test]
+fn for_each_type_mut_substitutes_capture_types_at_string() {
+    use crate::module::IrFunction;
+
+    let env_ty = IrType::ClosureRef {
+        param_types: vec![],
+        return_type: Box::new(tv("T")),
+    };
+    let mut func = IrFunction::new_closure(
+        FuncId(0),
+        "__closure_under_T_str".into(),
+        vec![env_ty],
+        vec!["__env".into()],
+        tv("T"),
+        None,
+        vec![tv("T")],
+    );
+    let entry = func.create_block();
+    let env_vid = func.add_block_param(
+        entry,
+        IrType::ClosureRef {
+            param_types: vec![],
+            return_type: Box::new(tv("T")),
+        },
+    );
+    let loaded = func
+        .emit(entry, Op::ClosureLoadCapture(env_vid, 0), tv("T"), None)
+        .expect("non-void emit");
+    func.set_terminator(entry, Terminator::Return(Some(loaded)));
+
+    let mut subst = std::collections::HashMap::new();
+    subst.insert("T".to_string(), IrType::StringRef);
+    crate::monomorphize::substitute_types_in_fn(&mut func, &subst);
+
+    assert_eq!(func.capture_types, vec![IrType::StringRef]);
+    assert_eq!(func.return_type, IrType::StringRef);
+    assert_eq!(
+        func.instruction_result_type(loaded),
+        Some(&IrType::StringRef)
+    );
 }

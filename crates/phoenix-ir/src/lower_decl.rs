@@ -68,14 +68,14 @@ impl<'a> LoweringContext<'a> {
         );
         self.module.functions.reserve(total_callables);
         self.module.functions.resize_with(total_callables, || {
-            IrFunction::new(
+            crate::module::FunctionSlot::Concrete(IrFunction::new(
                 FuncId(u32::MAX),
                 String::new(),
                 Vec::new(),
                 Vec::new(),
                 IrType::Void,
                 None,
-            )
+            ))
         });
 
         // Free functions in FuncId order (matches sema pre-pass A).
@@ -95,7 +95,10 @@ impl<'a> LoweringContext<'a> {
         // `pending_function_ids.len() + pending_user_method_ids.len()`
         // and the populated `functions` / `user_methods` Vec lengths.
         debug_assert!(
-            self.module.functions.iter().all(|f| f.id.0 != u32::MAX),
+            self.module
+                .functions
+                .iter()
+                .all(|s| s.func().id.0 != u32::MAX),
             "register_declarations left an unfilled FuncId slot — \
              ResolvedModule's functions/user_methods Vec did not cover \
              every pre-allocated id"
@@ -226,9 +229,13 @@ impl<'a> LoweringContext<'a> {
             Some(info.definition_span),
         );
         func.type_param_names = info.type_params.clone();
-        func.is_generic_template = !info.type_params.is_empty();
 
-        self.module.functions[func_id.index()] = func;
+        let slot = if info.type_params.is_empty() {
+            crate::module::FunctionSlot::Concrete(func)
+        } else {
+            crate::module::FunctionSlot::Template(func)
+        };
+        self.module.functions[func_id.index()] = slot;
         self.module.function_index.insert(name.to_string(), func_id);
     }
 
@@ -239,8 +246,8 @@ impl<'a> LoweringContext<'a> {
     /// `info.has_self`, and installs the stub into both
     /// [`IrModule::functions`] (at the matching `FuncId` slot) and
     /// [`IrModule::method_index`] (keyed by `(type_name, method_name)`).
-    /// Methods on generic structs are flagged
-    /// [`IrFunction::is_generic_template`] so monomorphization
+    /// Methods on generic structs are placed in a
+    /// [`crate::module::FunctionSlot::Template`] slot so monomorphization
     /// specializes them per concrete `StructId` substitution.
     fn register_method_from_info(
         &mut self,
@@ -258,7 +265,7 @@ impl<'a> LoweringContext<'a> {
         let mut param_names: Vec<String> = info.param_names.clone();
 
         // Single struct lookup — reused for both the self-type
-        // construction and the `is_generic_template` decision below.
+        // construction and the slot-variant decision below.
         let struct_info = self.check.struct_info_by_name(type_name);
 
         if info.has_self {
@@ -318,9 +325,14 @@ impl<'a> LoweringContext<'a> {
         // so the body contains `IrType::TypeVar` and cannot reach
         // Cranelift until struct-monomorphization specializes it.
         let parent_is_generic_struct = struct_info.is_some_and(|s| !s.type_params.is_empty());
-        func.is_generic_template = !info.type_params.is_empty() || parent_is_generic_struct;
+        let is_template = !info.type_params.is_empty() || parent_is_generic_struct;
 
-        self.module.functions[func_id.index()] = func;
+        let slot = if is_template {
+            crate::module::FunctionSlot::Template(func)
+        } else {
+            crate::module::FunctionSlot::Concrete(func)
+        };
+        self.module.functions[func_id.index()] = slot;
         self.module
             .method_index
             .insert((type_name.to_string(), method_name.to_string()), func_id);

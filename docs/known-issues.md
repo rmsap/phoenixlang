@@ -22,25 +22,6 @@ When an integer or float literal is out of range, the parser emits a diagnostic 
 
 **Target phase:** None — no fix planned. Acceptable as-is; revisit if it causes real-world confusion, at which point add an `ErrorLiteral` AST variant.
 
-### Closure capture type ambiguity with indirect calls
-
-When a closure is passed through a block parameter (phi node), the compiler
-falls back to a heuristic scan of IR functions to find capture types.  If two
-closures share the same user-param types, return type, and capture types, they
-are silently conflated.  Different capture layouts are caught (compile error),
-but identical-layout mismatches are invisible.
-
-Not actively miscompiling today: when the heuristic conflates closures with
-identical capture layouts, the emitted load code works correctly regardless
-of which concrete closure the function pointer targets at runtime. The
-concern is fragility — future changes could introduce layouts where the
-conflation matters.
-
-**Workaround:** Pass closures directly to methods rather than through conditional block parameters.
-**Root cause:** The IR's closure representation does not carry capture metadata alongside the function pointer.
-**Tracked in:** Cranelift `ir_analysis.rs` `find_closure_capture_types`.
-**Target phase:** Phase 2.6. Deferred from 2.2 — the proper fix requires changes to the IR closure representation, which is naturally reworked in the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) scheduled for 2.6. Addressing this bug alongside that refactor is cheaper than doing either in isolation.
-
 ### O(n) map key lookup
 
 `Map<K, V>` key lookup, insertion, removal, and contains operations use a
@@ -49,6 +30,27 @@ linear scan over a flat array.  Building an n-entry map is O(n²).
 **Planned fix:** Hash-based implementation.
 **Tracked in:** `phoenix-runtime/src/map_methods.rs` module header.
 **Target phase:** Phase 2.3 (Runtime and Memory Management).
+
+### Closure functions inside generic templates are not cloned per specialization
+
+When a generic function `f<T>(...)` defines a closure whose body or captures reference `T`, the closure function is pushed to `IrModule.functions` as a single concrete entry at lowering time. Monomorphization specializes `f<T>` per concrete type substitution but does **not** clone the closure function — the same `FuncId` is shared by every `f<T1>` / `f<T2>` / ... specialization. Pass D (`erase_type_vars_in_non_templates`) then erases the closure body's residual TypeVars to the `__generic` placeholder.
+
+**Symptoms.**
+
+- `phoenix run` (tree-walk) and `phoenix run-ir` (IR-interp) produce correct output. They dispatch on the runtime value shape, not on a static layout, so the erased placeholder is harmless.
+- `phoenix build` (Cranelift) is unsafe whenever the closure body's slot layout depends on `T`. `TypeLayout::of(__generic)` falls back to a 1-slot layout, so the codegen happens to work for 1-slot type instantiations (Int / Bool) and silently miscompiles for wider ones (String / fat-pointer types) — observed as wild allocations or out-of-bounds loads on the wider instantiation.
+- Where the closure body *directly* references `T` in a position Cranelift cannot finesse — e.g. `Op::ClosureLoadCapture` whose result type is `T` and is consumed by an op needing a known layout — Cranelift emits an explicit ICE: `TypeLayout::of on IrType::TypeVar(T) — monomorphization should have eliminated all type variables before codegen`.
+
+**Workaround.** Avoid generic functions that return or contain closures referencing `T` in their captures or body. For now, write monomorphic closures or manually specialize the generic at each concrete type.
+
+**Planned fix.** Extend monomorphization to clone closure functions per substitution of their enclosing generic, mirroring how struct-mono clones methods on generic structs. The substitution machinery itself already reaches `IrFunction.capture_types` and the `Op::ClosureLoadCapture` result-type slot via `for_each_type_mut` — pinned by tests in `crates/phoenix-ir/src/monomorphize/tests.rs::for_each_type_mut_substitutes_capture_types_*`. The remaining work is in the cloning machinery (`crates/phoenix-ir/src/monomorphize/function_mono.rs::clone_and_substitute_bodies`): when a generic template body contains an `Op::ClosureAlloc(closure_fid, ...)`, the specialization needs its own clone of `closure_fid` registered, with TypeVars substituted, and the `Op::ClosureAlloc` rewritten to point at the clone.
+
+**Tracked in:**
+- `tests/fixtures/closures_over_generic.phx` — passing fixture covering single-instantiation cases that work today.
+- `tests/fixtures/closures_over_generic_cross_width.phx` — `#[ignore]`d regression marker for the cross-width case.
+- `crates/phoenix-driver/tests/three_backend_matrix.rs::matrix_closures_over_generic_cross_width`.
+
+**Target phase:** Phase 2.6 if a module-system fixture trips the gap; otherwise Phase 3 (defer until generic-closure-over-T patterns appear in real code).
 
 ### O(n²) `List.sortBy` insertion sort
 
@@ -202,26 +204,6 @@ As a side effect, the Cranelift backend's payload-inference fallback chain in `p
 
 **File:** `phoenix-ir/src/lower_decl.rs` (gate + fix site, enum branch of `register_method`); `phoenix-cranelift/src/translate/enum_type_inference.rs` (dead code after the gate lifts).
 **Target phase:** Phase 4 (Stdlib) by default — when user-facing generic containers with methods ship, this is the natural moment. **Earlier if demand-triggered:** the `debug_assert!` in `register_method`'s enum branch is the tripwire; whoever first writes `impl<T> MyEnum<T>` hits it and picks up the feature + the strategy collapse in one motion.
-
-### Generic-template stubs tracked by a `bool` flag
-
-`IrFunction.is_generic_template: bool` marks templates that remain in `module.functions` as inert stubs after monomorphization (to preserve the `FuncId`-as-vector-index invariant). Every downstream consumer must either check the flag or iterate via `IrModule::concrete_functions()` — forgetting does not fail loudly, it just exposes `IrType::TypeVar` to code that panics on it (`IrType::is_value_type`, classification helpers). The audit on 2026-04-20 caught two slips (`IrModule::Display` and `ir_analysis.rs`) that had bypassed the filter.
-
-**File:** `phoenix-ir/src/module.rs` — `IrFunction.is_generic_template`; iteration helper `IrModule::concrete_functions`.
-**Planned fix:** Replace the bool flag with a typed split — a `ConcreteFunctions` newtype iterator, or two separate `functions` / `templates` fields — so the filter is enforceable at the type system level rather than at every call site.
-**Target phase:** Phase 2.6 (locked in 2026-04-27). Bundled with the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) and the [`ValueId` allocator typed split](#irfunctionvalue_types-is-a-parallel-index-without-a-type-level-guarantee), since all three touch the same `IrModule` / `IrFunction` surface — bundling amortizes the disruption rather than ripping the IR open three times.
-
-### `IrFunction.value_types` is a parallel index without a type-level guarantee
-
-`IrFunction.value_types: Vec<Option<IrType>>` is indexed by `ValueId.0` and kept in sync with `next_value_id` by `fresh_value()`, `emit()`, and `add_block_param()`.  Any pass that allocates a `ValueId` without going through those three entry points would silently desync the index — the `O(1)` type lookup via `instruction_result_type` would then return `None` (or worse, a stale type from an overwritten slot) rather than fail loudly.
-
-Today this is partly mitigated: the verifier's `verify_value_types_index` flags length mismatches, and the centralized `IrFunction::for_each_type_mut` is the only way monomorphization walks all four parallel type annotations (param / return / block-param / per-value / instruction result).  But the invariant lives by convention, not by type — a future pass could bypass both without any compiler error.
-
-**New consumer as of 2026-04-24:** `resolve_unresolved_dyn_allocs` in `phoenix-ir/src/monomorphize/function_mono.rs` reads `func.instruction_result_type(value)` after substitution to derive the concrete type name for a `dyn Trait` vtable registration.  A desync in `value_types` here would silently miscompile by registering against the wrong concrete type.  The mono-time hard-panic with a diagnostic is defensive coverage, but the underlying risk is the same as every other consumer — worth folding in when the typed-split refactor lands.
-
-**File:** `phoenix-ir/src/module.rs` — `IrFunction.value_types`, `fresh_value`, `emit`, `add_block_param`.
-**Planned fix:** Introduce a `ValueIdAllocator` newtype that owns both the counter and the parallel index; make `ValueId` allocation and type assignment the same operation at the type level (no API for "allocate a ValueId without assigning a type").  Length-mismatch bugs become compile errors instead of runtime verifier errors.
-**Target phase:** Phase 2.6 (locked in 2026-04-27). Bundled with the [`is_generic_template` typed-split refactor](#generic-template-stubs-tracked-by-a-bool-flag) and the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) — all three are `IrModule` / `IrFunction` shape changes that share editors and risk surface.
 
 ### `dyn Trait` and `StringRef` share a 2-slot layout with no discriminator
 

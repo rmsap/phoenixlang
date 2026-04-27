@@ -663,7 +663,7 @@ impl<'a> LoweringContext<'a> {
     ) -> Vec<ValueId> {
         // Clone owning copies to drop the borrow on `self.module`
         // before we call `lower_expr(&mut self)`.
-        let func = &self.module.functions[func_id.index()];
+        let func = self.module.functions[func_id.index()].func();
         let total = func.param_names.len();
         let param_names = func.param_names.clone();
         let func_name = func.name.clone();
@@ -1010,60 +1010,72 @@ impl<'a> LoweringContext<'a> {
         let closure_name = format!("__closure_{}", self.closure_counter);
         self.closure_counter += 1;
 
-        let func_id = crate::instruction::FuncId(self.module.functions.len() as u32);
+        // Env-pointer calling convention: the closure function's first
+        // parameter is the closure env pointer (typed as the closure's
+        // own ClosureRef so the heap object's slot 0 fn-ptr load and
+        // slot 1+ capture loads have a coherent type), followed by the
+        // user-visible params. Captures are NOT in the parameter list —
+        // they live in the env and are read via Op::ClosureLoadCapture.
 
-        // Build parameter types for the closure function.
-        // Captures come first, then the actual parameters.
-        let mut param_types: Vec<IrType> = capture_types;
-        let mut param_names: Vec<String> = captures
-            .iter()
-            .map(|cap| format!("__cap_{}", cap.name))
-            .collect();
-
-        // Add the actual lambda parameters.
-        // Extract user param types from the ClosureRef type if available,
-        // falling back to expr_type lookup for each parameter.
-        let user_param_types: Vec<IrType> = match &result_type {
+        // Single source of truth for the lambda's user-facing signature
+        // `(param_types, return_type)`. In the well-typed case sema
+        // gives us an `IrType::ClosureRef` and we read both fields off
+        // it directly. The fallback (sema gave a non-ClosureRef result
+        // type, which should not happen in well-formed input) recovers
+        // each parameter type from its own span and leaves the return
+        // type as `Void` — a conservative default rather than the
+        // ill-defined "type of the lambda expression itself", which
+        // would double-wrap into a nested `ClosureRef`.
+        let (user_param_types, user_return_type): (Vec<IrType>, IrType) = match &result_type {
             IrType::ClosureRef {
-                param_types: pt, ..
-            } => pt.clone(),
-            _ => lambda
-                .params
-                .iter()
-                .map(|p| self.expr_type(&p.span))
-                .collect(),
+                param_types: pt,
+                return_type: rt,
+            } => (pt.clone(), (**rt).clone()),
+            _ => {
+                let pts: Vec<IrType> = lambda
+                    .params
+                    .iter()
+                    .map(|p| self.expr_type(&p.span))
+                    .collect();
+                (pts, IrType::Void)
+            }
         };
+        let closure_self_type = IrType::ClosureRef {
+            param_types: user_param_types.clone(),
+            return_type: Box::new(user_return_type.clone()),
+        };
+
+        // Build full parameter list: env first, then user params. Each
+        // user param's type comes from `user_param_types`; the indexed
+        // access is in-bounds by construction (parallel with
+        // `lambda.params`).
+        let mut param_types: Vec<IrType> = vec![closure_self_type];
+        let mut param_names: Vec<String> = vec!["__env".to_string()];
         for (i, p) in lambda.params.iter().enumerate() {
-            let ty = user_param_types
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| self.expr_type(&p.span));
-            param_types.push(ty);
+            param_types.push(user_param_types[i].clone());
             param_names.push(p.name.clone());
         }
 
-        let return_type = lambda
-            .return_type
-            .as_ref()
-            .map(|_| self.expr_type(&lambda.span))
-            .and_then(|t| {
-                if let IrType::ClosureRef { return_type, .. } = t {
-                    Some(*return_type)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(IrType::Void);
-
-        let closure_func = IrFunction::new(
-            func_id,
+        // `id` is overwritten by `push_concrete` to match the slot
+        // index; passing `FuncId(u32::MAX)` here makes that explicit.
+        // Closures are always concrete — they have no type parameters
+        // of their own. (Their bodies may still carry `IrType::TypeVar`
+        // from an enclosing generic; monomorphization substitutes those
+        // via the same `for_each_type_mut` walk that visits regular
+        // functions.) `new_closure` is used over `new` to record the
+        // capture-type vector on the function in one step — backends
+        // and the verifier index it when handling
+        // `Op::ClosureLoadCapture`.
+        let closure_func = IrFunction::new_closure(
+            crate::instruction::FuncId(u32::MAX),
             closure_name,
             param_types,
             param_names.clone(),
-            return_type,
+            user_return_type,
             Some(lambda.span),
+            capture_types.clone(),
         );
-        self.module.functions.push(closure_func);
+        let func_id = self.module.push_concrete(closure_func);
 
         // Save current function state and lower the lambda body.
         let saved_func_id = self.current_func_id;
@@ -1077,12 +1089,37 @@ impl<'a> LoweringContext<'a> {
         let entry = self.create_block();
         self.switch_to_block(entry);
 
-        // Bind captures and parameters.
-        for (i, name) in param_names.iter().enumerate() {
-            let param_type = self.module.functions[func_id.index()].param_types[i].clone();
+        // Bind the env parameter and the user parameters as block params.
+        let entry_param_types: Vec<IrType> = self.module.functions[func_id.index()]
+            .func()
+            .param_types
+            .clone();
+        let env_vid = self.add_block_param(entry, entry_param_types[0].clone());
+        // Skip the env at index 0; the rest are user params (parallel to
+        // `lambda.params`).
+        for (i, name) in param_names.iter().enumerate().skip(1) {
+            let param_type = entry_param_types[i].clone();
             let val = self.add_block_param(entry, param_type.clone());
-            let clean_name = name.strip_prefix("__cap_").unwrap_or(name);
-            self.define_var(clean_name.to_string(), VarBinding::Direct(val, param_type));
+            self.define_var(name.clone(), VarBinding::Direct(val, param_type));
+        }
+        // Bind each capture by emitting an Op::ClosureLoadCapture from
+        // the env pointer at the capture's ordinal index. Captures are
+        // loaded eagerly at function entry whether the body uses them
+        // or not — this keeps lowering simple (no use-site discovery
+        // pass). Cost in compiled mode is nil: Cranelift's DCE drops
+        // any load whose result is never consumed. Cost in the IR
+        // interpreter is one extra `Op::ClosureLoadCapture` dispatch
+        // per unused capture (a vector index plus a clone) — small
+        // enough that we accept it rather than complicate lowering
+        // with a use-site walk.
+        for (cap_idx, cap) in captures.iter().enumerate() {
+            let cap_ty = capture_types[cap_idx].clone();
+            let cap_vid = self.emit(
+                Op::ClosureLoadCapture(env_vid, cap_idx as u32),
+                cap_ty.clone(),
+                span,
+            );
+            self.define_var(cap.name.clone(), VarBinding::Direct(cap_vid, cap_ty));
         }
 
         // Lower the body.
@@ -1095,7 +1132,10 @@ impl<'a> LoweringContext<'a> {
                 // trailing expression flowing out of a `-> dyn Trait`
                 // lambda must be wrapped in a `(data_ptr, vtable_ptr)`
                 // pair at the function boundary.
-                let expected = self.module.functions[func_id.index()].return_type.clone();
+                let expected = self.module.functions[func_id.index()]
+                    .func()
+                    .return_type
+                    .clone();
                 let val = self.coerce_value_to_expected(val, &expected, lambda.body.span);
                 self.terminate(Terminator::Return(Some(val)));
             } else {

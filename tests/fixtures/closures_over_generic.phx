@@ -1,0 +1,46 @@
+// Closures returned from generic functions, single specialization
+// only. The closure body references the enclosing generic's `T` via a
+// capture, exercising the path that monomorphization's
+// `for_each_type_mut` walk visits: `IrFunction.capture_types` and the
+// result type of `Op::ClosureLoadCapture`.
+//
+// **Scope.** This fixture covers single-instantiation cases that all
+// three backends agree on today. The cases where the same generic
+// closure factory is instantiated at *different widths* (e.g. Int and
+// String) are tracked as a known issue — the inner closure function
+// is shared across specializations rather than cloned, so its
+// `capture_types` retains the erased `__generic` placeholder and the
+// Cranelift backend mis-sizes its heap layout for at least one of the
+// instantiations. See `tests/fixtures/closures_over_generic_cross_width.phx`
+// for the regression marker covering that gap.
+//
+// Three-backend matrix: `phoenix run`, `phoenix run-ir`, and `phoenix
+// build` must agree on stdout, byte-for-byte. A divergence here would
+// indicate a regression in either:
+//   - capture_types substitution under monomorphization
+//   - Op::ClosureLoadCapture result_type substitution (when the body
+//     does not directly reference `T` in a position that escapes the
+//     closure's heap layout)
+//   - the env-pointer ABI plumbing for closures defined inside generics
+
+function makeBox<T>(x: T) -> () -> T {
+  return function() -> T { x }
+}
+
+function applyTwice<T>(f: (T) -> T, seed: T) -> T {
+  let once: T = f(seed)
+  return f(once)
+}
+
+function main() {
+  // Single Int specialization: confirms `T -> Int` substitutes through
+  // capture_types and the ClosureLoadCapture's result type.
+  let intBox: () -> Int = makeBox(42)
+  print(intBox())
+
+  // applyTwice<Int>: pins that a generic function consuming a closure
+  // (rather than producing one) substitutes T correctly through the
+  // closure-typed parameter.
+  let twice: Int = applyTwice(function(x: Int) -> Int { x + 1 }, 10)
+  print(twice)
+}

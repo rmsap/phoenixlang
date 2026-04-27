@@ -18,7 +18,6 @@ mod enum_combinators;
 mod enum_helpers;
 mod enum_type_inference;
 mod helpers;
-mod ir_analysis;
 // `layout` is `pub(crate)` so `abi.rs` can name `TypeLayout` when building
 // function signatures. No other crate-level consumers — within `translate`,
 // submodules reach it via `super::layout`.
@@ -42,7 +41,7 @@ use crate::context::CompileContext;
 use crate::error::CompileError;
 use crate::translate::layout::TypeLayout;
 use phoenix_ir::block::BlockId as PhxBlockId;
-use phoenix_ir::instruction::{FuncId as PhxFuncId, Op, VOID_SENTINEL, ValueId};
+use phoenix_ir::instruction::{Op, VOID_SENTINEL, ValueId};
 use phoenix_ir::module::{IrFunction, IrModule};
 use phoenix_ir::types::IrType;
 
@@ -58,9 +57,12 @@ pub(crate) struct FuncState {
     pub alloca_map: HashMap<ValueId, (ir::StackSlot, IrType)>,
     /// The `IrType` of each `ValueId`, for type-dispatched operations (e.g. print).
     pub type_map: HashMap<ValueId, IrType>,
-    /// Tracks which `ClosureAlloc` produced each `ValueId`, so `CallIndirect`
-    /// can look up the target function directly instead of using a heuristic.
-    pub closure_func_map: HashMap<ValueId, PhxFuncId>,
+    /// Capture types of the function currently being translated, in
+    /// capture-slot order. Populated for closure functions only;
+    /// empty for regular functions. Indexed by
+    /// [`Op::ClosureLoadCapture`]'s `capture_idx` field to recover
+    /// the slot offset / type of each capture in the env heap object.
+    pub current_capture_types: Vec<IrType>,
     /// Records the allocated variant and concrete payload field types from
     /// `EnumAlloc` instructions. Used by `option_payload_type` /
     /// `result_payload_types` as a Strategy 4 fallback when Strategy 0 can't
@@ -113,7 +115,7 @@ fn translate_function(
         value_map: HashMap::new(),
         alloca_map: HashMap::new(),
         type_map: HashMap::new(),
-        closure_func_map: HashMap::new(),
+        current_capture_types: func.capture_types.clone(),
         enum_payload_types: HashMap::new(),
         block_map: HashMap::new(),
     };
@@ -168,10 +170,6 @@ fn translate_function(
                     && let Some(slot_info) = state.alloca_map.remove(&VOID_SENTINEL)
                 {
                     state.alloca_map.insert(vid, slot_info);
-                }
-                // Record closure → func mapping for CallIndirect.
-                if let Op::ClosureAlloc(target_fid, _) = &inst.op {
-                    state.closure_func_map.insert(vid, *target_fid);
                 }
                 // Record concrete payload types from EnumAlloc for later inference.
                 if let Op::EnumAlloc(_name, variant_idx, fields) = &inst.op
@@ -372,6 +370,13 @@ fn translate_op(
 
         // Closure operations
         Op::ClosureAlloc(..) => calls::translate_closure_alloc(builder, ctx, op, state),
+        Op::ClosureLoadCapture(env_vid, capture_idx) => calls::translate_closure_load_capture(
+            builder,
+            *env_vid,
+            *capture_idx,
+            result_type,
+            state,
+        ),
 
         // Function calls
         Op::Call(..)

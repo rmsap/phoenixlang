@@ -76,10 +76,7 @@ fn debug_assert_no_pending_generic_calls(module: &IrModule) {
     if !cfg!(debug_assertions) {
         return;
     }
-    for func in &module.functions {
-        if func.is_generic_template {
-            continue;
-        }
+    for func in module.concrete_functions() {
         for (block_idx, block) in func.blocks.iter().enumerate() {
             for (instr_idx, instr) in block.instructions.iter().enumerate() {
                 if let Op::Call(_, targs, _) = &instr.op {
@@ -107,10 +104,7 @@ fn debug_assert_no_pending_generic_calls(module: &IrModule) {
 fn seed_struct_worklist(module: &IrModule) -> (StructWorklist, StructQueued) {
     let mut worklist: StructWorklist = VecDeque::new();
     let mut queued: StructQueued = HashSet::new();
-    for func in &module.functions {
-        if func.is_generic_template {
-            continue;
-        }
+    for func in module.concrete_functions() {
         enqueue_types_from_fn(func, module, &mut worklist, &mut queued);
     }
     (worklist, queued)
@@ -123,17 +117,16 @@ fn seed_struct_worklist(module: &IrModule) -> (StructWorklist, StructQueued) {
 /// struct uses.  Returns the `rename_map` used by Pass 2 to rewrite
 /// references in concrete function bodies.
 ///
-/// **Clone-bypass note.** Specialized methods are created by cloning an
-/// existing `IrFunction` and mutating its fields, rather than going
-/// through [`IrFunction::new`] and the usual `fresh_value` /
-/// `add_block_param` entry points.  This preserves the parallel
-/// `value_types` index (which the clone carries with it) but joins the
-/// small set of sites that bypass the three canonical allocation paths
-/// — see known-issues.md's *`IrFunction.value_types` parallel-index
-/// invariant* entry.  If `IrFunction::new` ever starts tracking state
-/// that clone doesn't copy, this call site will need to be revisited
-/// alongside the monomorphization template-clone at
-/// `clone_and_substitute_bodies`.
+/// **Clone-bypass note.** Specialized methods are created by cloning
+/// an existing `IrFunction` and mutating its fields, rather than going
+/// through [`IrFunction::new`] and the usual
+/// [`IrFunction::add_block_param`] / [`IrFunction::emit`] entry
+/// points.  Clone-then-mutate copies the
+/// [`crate::value_alloc::ValueIdAllocator`] verbatim, so the
+/// per-value type index stays consistent with the cloned blocks. If
+/// `IrFunction::new` ever starts tracking state that clone doesn't
+/// copy, this call site will need to be revisited alongside the
+/// monomorphization template-clone at `clone_and_substitute_bodies`.
 fn specialize_layouts_and_methods(
     module: &mut IrModule,
     mut worklist: StructWorklist,
@@ -225,18 +218,19 @@ fn specialize_one_struct(
         })
         .collect();
     for (method_name, template_fid) in template_methods {
-        let new_fid = FuncId(module.functions.len() as u32);
-        let mut new_fn = module.functions[template_fid.index()].clone();
-        new_fn.id = new_fid;
+        // Clone the underlying IrFunction (the template's body) and
+        // promote it to a concrete slot — struct-mono produces fully-
+        // specialized methods. `push_concrete` assigns the new id from
+        // the slot index; no need to set `new_fn.id` ahead of time.
+        let mut new_fn = module.functions[template_fid.index()].func().clone();
         new_fn.name = format!("{mangled}.{method_name}");
-        new_fn.is_generic_template = false;
         // Apply the struct's type-param substitution to every type
         // annotation in the method body.
         substitute_types_in_fn(&mut new_fn, subst);
         // Enqueue any nested generic structs exposed by the
         // substituted body before moving the function.
         enqueue_types_from_fn(&new_fn, module, worklist, queued);
-        module.functions.push(new_fn);
+        let new_fid = module.push_concrete(new_fn);
         module
             .method_index
             .insert((mangled.to_string(), method_name), new_fid);
@@ -260,7 +254,7 @@ fn rewrite_all_references(
 ) -> Vec<DynVtableRekey> {
     let mut dyn_vtable_rekeys: Vec<DynVtableRekey> = Vec::new();
     for func_idx in 0..module.functions.len() {
-        if module.functions[func_idx].is_generic_template {
+        if module.functions[func_idx].is_template() {
             continue;
         }
         rewrite_method_calls(module, func_idx, rename_map);
@@ -269,10 +263,10 @@ fn rewrite_all_references(
     }
     // Rewrite StructRef types themselves (erases the args).
     for func_idx in 0..module.functions.len() {
-        if module.functions[func_idx].is_generic_template {
+        if module.functions[func_idx].is_template() {
             continue;
         }
-        let func = &mut module.functions[func_idx];
+        let func = module.functions[func_idx].func_mut();
         func.for_each_type_mut(|ty| rewrite_struct_refs_in_type(ty, rename_map));
     }
 
@@ -432,8 +426,8 @@ fn mangle_struct_instantiation(template_name: &str, args: &[IrType]) -> String {
 /// Rewrite `Op::Call` whose callee is a method on a generic struct,
 /// redirecting to the specialized method registered under the mangled
 /// struct name.  Must run before struct-ref types are rewritten, because
-/// it reads the receiver's IR type from the function's `value_types`
-/// index to figure out which instantiation's method to call.
+/// it reads the receiver's IR type from the function's value allocator
+/// to figure out which instantiation's method to call.
 ///
 /// **Second-stage role for trait-bound method calls.**  Function-mono's
 /// [`crate::monomorphize::function_mono`] rewrites
@@ -448,7 +442,7 @@ fn rewrite_method_calls(module: &mut IrModule, func_idx: usize, rename_map: &Str
     // Snapshot the data we need so we can mutably borrow the function.
     let mut rewrites: Vec<(usize, usize, FuncId)> = Vec::new();
     {
-        let func = &module.functions[func_idx];
+        let func = module.functions[func_idx].func();
         for (block_idx, block) in func.blocks.iter().enumerate() {
             for (instr_idx, instr) in block.instructions.iter().enumerate() {
                 if let Op::Call(callee_fid, targs, args) = &instr.op
@@ -456,7 +450,7 @@ fn rewrite_method_calls(module: &mut IrModule, func_idx: usize, rename_map: &Str
                     && let Some(first_arg) = args.first()
                 {
                     // Is the callee a method on a generic struct?
-                    let callee_name = &module.functions[callee_fid.index()].name;
+                    let callee_name = &module.functions[callee_fid.index()].func().name;
                     let (ty_name, method_name) = match callee_name.rsplit_once('.') {
                         Some((t, m)) => (t, m),
                         None => continue,
@@ -465,8 +459,8 @@ fn rewrite_method_calls(module: &mut IrModule, func_idx: usize, rename_map: &Str
                         continue;
                     }
                     // Read the receiver's StructRef args from the
-                    // function's value_types index (populated at emit
-                    // time via IrFunction::value_types).
+                    // function's value allocator (populated at emit
+                    // time by ValueIdAllocator::alloc).
                     let recv_ty = func.instruction_result_type(*first_arg);
                     let Some(IrType::StructRef(recv_name, recv_args)) = recv_ty else {
                         continue;
@@ -490,7 +484,7 @@ fn rewrite_method_calls(module: &mut IrModule, func_idx: usize, rename_map: &Str
         }
     }
     // Apply rewrites.
-    let func = &mut module.functions[func_idx];
+    let func = module.functions[func_idx].func_mut();
     for (block_idx, instr_idx, new_fid) in rewrites {
         let instr = &mut func.blocks[block_idx].instructions[instr_idx];
         if let Op::Call(callee, _, _) = &mut instr.op {
@@ -508,7 +502,7 @@ fn rewrite_method_calls(module: &mut IrModule, func_idx: usize, rename_map: &Str
 fn rewrite_struct_alloc(module: &mut IrModule, func_idx: usize, rename_map: &StructRenameMap) {
     let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
     {
-        let func = &module.functions[func_idx];
+        let func = module.functions[func_idx].func();
         for (block_idx, block) in func.blocks.iter().enumerate() {
             for (instr_idx, instr) in block.instructions.iter().enumerate() {
                 if let Op::StructAlloc(name, _) = &instr.op
@@ -522,7 +516,7 @@ fn rewrite_struct_alloc(module: &mut IrModule, func_idx: usize, rename_map: &Str
             }
         }
     }
-    let func = &mut module.functions[func_idx];
+    let func = module.functions[func_idx].func_mut();
     for (block_idx, instr_idx, mangled) in rewrites {
         if let Op::StructAlloc(name, _) = &mut func.blocks[block_idx].instructions[instr_idx].op {
             *name = mangled;
@@ -542,7 +536,7 @@ fn rewrite_dyn_alloc(
 ) {
     let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
     {
-        let func = &module.functions[func_idx];
+        let func = module.functions[func_idx].func();
         for (block_idx, block) in func.blocks.iter().enumerate() {
             for (instr_idx, instr) in block.instructions.iter().enumerate() {
                 let Op::DynAlloc(trait_name, concrete, value) = &instr.op else {
@@ -564,7 +558,7 @@ fn rewrite_dyn_alloc(
             }
         }
     }
-    let func = &mut module.functions[func_idx];
+    let func = module.functions[func_idx].func_mut();
     for (block_idx, instr_idx, mangled) in rewrites {
         if let Op::DynAlloc(_, concrete, _) = &mut func.blocks[block_idx].instructions[instr_idx].op
         {

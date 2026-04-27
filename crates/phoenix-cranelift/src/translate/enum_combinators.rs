@@ -220,7 +220,7 @@ pub(super) fn translate_enum_map(
 
     enter_block(builder, br.positive_block);
     let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
-    let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
+    let result = call_closure(builder, ctx, closure_vid, &payload, state)?;
     let result_ty = closure_return_type(state, closure_vid)?;
     let wrapped = wrap_fn(builder, ctx, &result, &result_ty, ir_module)?;
     builder.ins().jump(br.merge_block, &[wrapped]);
@@ -259,7 +259,7 @@ pub(super) fn translate_enum_and_then(
 
     enter_block(builder, br.positive_block);
     let payload = TypeLayout::of(payload_ty).load(builder, recv_ptr, 1);
-    let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
+    let result = call_closure(builder, ctx, closure_vid, &payload, state)?;
     if result.is_empty() {
         return Err(CompileError::new(
             "andThen closure returned no value (expected enum pointer)",
@@ -304,7 +304,7 @@ pub(super) fn translate_enum_unwrap_or_else(
     builder.ins().jump(br.merge_block, &payload);
 
     enter_block(builder, br.negative_block);
-    let result = call_closure(builder, ctx, ir_module, closure_vid, closure_args, state)?;
+    let result = call_closure(builder, ctx, closure_vid, closure_args, state)?;
     builder.ins().jump(br.merge_block, &result);
 
     Ok(finish_merge(builder, &br))

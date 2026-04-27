@@ -174,7 +174,26 @@ pub enum Op {
     // --- Closure operations ---
     /// Allocate a closure on the GC heap.
     /// `ClosureAlloc(target_func_id, captured_values)`.
+    ///
+    /// Heap layout: `[fn_ptr, capture_0, capture_1, ...]`. The closure
+    /// pointer this op produces is also the *environment pointer* the
+    /// closure function receives as its first argument under the
+    /// env-pointer calling convention (see [`Op::CallIndirect`]).
     ClosureAlloc(FuncId, Vec<ValueId>),
+    /// Read a captured value from a closure environment pointer, by
+    /// **capture index** in the enclosing function's
+    /// [`crate::module::IrFunction::capture_types`] vector.
+    ///
+    /// Emitted only inside closure-function bodies (the function whose
+    /// `capture_types` this op indexes into). The codegen backend
+    /// resolves the byte/slot offset by walking the prior capture
+    /// types — slot widths vary (e.g. `StringRef` is 2 slots), so the
+    /// op carries the ordinal index, not the cumulative slot offset.
+    ///
+    /// Fields: `(env_vid, capture_idx)`. `env_vid` is the closure
+    /// function's first parameter (its environment pointer); the
+    /// instruction's `result_type` is the type of the loaded capture.
+    ClosureLoadCapture(ValueId, u32),
 
     // --- Function calls ---
     /// Direct call to a known function.
@@ -186,6 +205,16 @@ pub enum Op {
     /// specialized `FuncId`s and clears the type-args).
     Call(FuncId, Vec<IrType>, Vec<ValueId>),
     /// Indirect call through a closure value.
+    ///
+    /// The closure value (heap layout `[fn_ptr, capture_0, ...]`) is
+    /// passed verbatim as the first argument to the callee — this is
+    /// the env-pointer calling convention. The callee reads its
+    /// captures via [`Op::ClosureLoadCapture`] indexed off that env
+    /// pointer; the indirect-call site does not need to know the
+    /// capture layout. This is what structurally eliminates the
+    /// closure-capture-ambiguity bug for closures flowing through
+    /// phi nodes (multiple closures with the same user signature but
+    /// different captures unify cleanly).
     CallIndirect(ValueId, Vec<ValueId>),
     /// Call a built-in runtime function by name (e.g. `"print"`, `"String.length"`).
     BuiltinCall(String, Vec<ValueId>),
@@ -333,6 +362,7 @@ impl Op {
 
             // Closure ops.
             Op::ClosureAlloc(_, vals) => vals.clone(),
+            Op::ClosureLoadCapture(env, _) => vec![*env],
 
             // Call ops.
             Op::Call(_, _, args) => args.clone(),

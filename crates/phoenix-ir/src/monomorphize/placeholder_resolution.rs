@@ -92,8 +92,8 @@ pub(super) fn resolve_trait_bound_method_calls(
             let recv_ty = func.instruction_result_type(*receiver).unwrap_or_else(|| {
                 panic!(
                     "Op::UnresolvedTraitMethod `.{method_name}` receiver {receiver} \
-                     has no recorded type in function `{}` — the value_types index \
-                     is out of sync",
+                     is out of range for function `{}`'s value allocator — \
+                     cross-function leak",
                     func.name,
                 )
             });
@@ -181,8 +181,9 @@ pub(super) fn resolve_unresolved_dyn_allocs(func: &mut IrFunction, module: &mut 
             };
             let actual_ty = func.instruction_result_type(*value).unwrap_or_else(|| {
                 panic!(
-                    "Op::UnresolvedDynAlloc trait=`{trait_name}` value={value} in function \
-                     `{}` has no recorded type — value_types index is out of sync",
+                    "Op::UnresolvedDynAlloc trait=`{trait_name}` value={value} \
+                     is out of range for function `{}`'s value allocator — \
+                     cross-function leak",
                     func.name,
                 )
             });

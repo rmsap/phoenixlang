@@ -39,10 +39,13 @@
 //!    empty list literals) to the `GENERIC_PLACEHOLDER` sentinel so the
 //!    Cranelift backend's use-site inference can resolve them.
 //!
-//! Generic templates are kept in `module.functions` as inert stubs
-//! (`is_generic_template = true`) to preserve the `FuncId`-as-vector-index
-//! invariant relied on across the codebase. Every downstream pass should
-//! iterate via [`crate::module::IrModule::concrete_functions`] to skip them.
+//! Generic templates are kept in `module.functions` as inert
+//! [`crate::module::FunctionSlot::Template`] slots to preserve the
+//! `FuncId`-as-vector-index invariant relied on across the codebase.
+//! Every downstream pass iterates via
+//! [`crate::module::IrModule::concrete_functions`] to skip them — the
+//! tagged-slot type makes the filter type-system-enforced rather than
+//! convention-only.
 //!
 //! ## Integration with earlier passes
 //!
@@ -139,7 +142,7 @@
 //!    [`crate::lower_expr::LoweringContext::resolve_field_type`]
 //!    substitutes `T → Int` to emit an `Op::StructGetField` with a
 //!    fully-resolved `result_type`. Without this, the concrete use-site
-//!    body would carry `TypeVar` in its `value_types` index — a
+//!    body would carry `TypeVar` in its value-allocator type index — a
 //!    verifier violation.
 //!
 //! 2. **At struct-mono time**, inside a *template* method body. The
@@ -150,8 +153,8 @@
 //!    lowering time, and the `StructGetField` result type stays as
 //!    `TypeVar("T")`. [`struct_mono::monomorphize_structs`] clones the
 //!    template at each concrete instantiation and runs
-//!    [`substitute_types_in_fn`] over the clone's
-//!    `param_types` / `return_type` / `value_types` / block params —
+//!    [`substitute_types_in_fn`] over the clone's `param_types` /
+//!    `return_type` / per-value type index / block params —
 //!    substituting `T → Int`, etc. — so the specialized body is
 //!    fully concrete.
 //!
@@ -420,10 +423,8 @@ fn debug_assert_no_unresolved_placeholder_ops(module: &IrModule) {
 /// (from unresolved sema inference) to the `GENERIC_PLACEHOLDER` sentinel.
 /// Template bodies are left untouched — they remain as inert stubs.
 fn erase_type_vars_in_non_templates(module: &mut IrModule) {
-    for func in &mut module.functions {
-        if !func.is_generic_template {
-            erase_type_vars_in_fn(func);
-        }
+    for func in module.concrete_functions_mut() {
+        erase_type_vars_in_fn(func);
     }
 }
 

@@ -34,18 +34,17 @@ pub(super) fn translate_closure_alloc(
         ice!("translate_closure_alloc dispatched on non-ClosureAlloc op: {op:?}")
     };
 
-    let capture_slots: usize = captures
-        .iter()
-        .map(|cap| {
-            let ty = state.type_map.get(cap).cloned().ok_or_else(|| {
-                CompileError::new(format!("unknown type for closure capture {cap}"))
-            })?;
-            Ok(TypeLayout::of(&ty).slots())
-        })
-        .collect::<Result<Vec<usize>, CompileError>>()?
-        .into_iter()
-        .sum();
-    let num_slots = 1 + capture_slots;
+    let capture_types: Vec<IrType> =
+        captures
+            .iter()
+            .map(|cap| {
+                state.type_map.get(cap).cloned().ok_or_else(|| {
+                    CompileError::new(format!("unknown type for closure capture {cap}"))
+                })
+            })
+            .collect::<Result<Vec<_>, CompileError>>()?;
+    // 1 slot for the fn-ptr at slot 0, then captures laid out back-to-back.
+    let num_slots = 1 + TypeLayout::cumulative_slots(&capture_types);
     let size = (num_slots * SLOT_SIZE) as i64;
     let alloc_ref = ctx
         .module
@@ -60,19 +59,56 @@ pub(super) fn translate_closure_alloc(
     let func_addr = builder.ins().func_addr(POINTER_TYPE, func_ref);
     builder.ins().store(MemFlags::new(), func_addr, ptr, 0);
 
-    // Store captures starting at slot 1, respecting fat values.
+    // Store captures starting at slot 1 (slot 0 holds the fn-ptr).
+    // The load side (`translate_closure_load_capture`) computes a slot
+    // offset for one capture at a time via `TypeLayout::cumulative_slots`
+    // against the same `capture_types` vector, so both paths agree by
+    // construction. Here we maintain a running offset rather than
+    // recomputing the prefix sum each iteration.
     let mut slot = 1usize;
-    for cap in captures.iter() {
+    for (i, cap) in captures.iter().enumerate() {
         let cap_vals = get_val(state, *cap)?;
-        let ty =
-            state.type_map.get(cap).cloned().ok_or_else(|| {
-                CompileError::new(format!("unknown type for closure capture {cap}"))
-            })?;
-        let cap_layout = TypeLayout::of(&ty);
+        let cap_layout = TypeLayout::of(&capture_types[i]);
         cap_layout.store(builder, ptr, slot, &cap_vals);
         slot += cap_layout.slots();
     }
     Ok(vec![ptr])
+}
+
+/// Translate `Op::ClosureLoadCapture(env_vid, capture_idx)`.
+///
+/// Loads the `capture_idx`-th capture from the env pointer (the
+/// closure heap object). The slot offset is computed by walking the
+/// enclosing closure function's `capture_types` (read from
+/// [`super::FuncState::current_capture_types`], populated at
+/// translate-function entry) — capture widths vary (e.g. `StringRef`
+/// is 2 slots), so we sum the prior widths via
+/// [`TypeLayout::cumulative_slots`] (the same helper the store side
+/// uses, so the two sides cannot drift).
+///
+/// Closure heap layout: `[fn_ptr, capture_0, capture_1, ...]`. Slot
+/// 0 holds the fn-ptr; captures start at slot 1.
+pub(super) fn translate_closure_load_capture(
+    builder: &mut FunctionBuilder,
+    env_vid: ValueId,
+    capture_idx: u32,
+    result_type: &IrType,
+    state: &FuncState,
+) -> Result<Vec<Value>, CompileError> {
+    let env_ptr = get_val1(state, env_vid)?;
+
+    let capture_idx = capture_idx as usize;
+    if capture_idx >= state.current_capture_types.len() {
+        return Err(CompileError::new(format!(
+            "Op::ClosureLoadCapture: capture index {capture_idx} out of range \
+             (current function has {} captures)",
+            state.current_capture_types.len()
+        )));
+    }
+
+    let slot = 1 + TypeLayout::cumulative_slots(&state.current_capture_types[..capture_idx]);
+    let layout = TypeLayout::of(result_type);
+    Ok(layout.load(builder, env_ptr, slot))
 }
 
 /// Translate a function call operation (direct, indirect, or builtin).
@@ -110,7 +146,7 @@ pub(super) fn translate_call(
                 user_args.extend(get_val(state, *arg)?);
             }
             // Delegate to the shared closure-calling helper.
-            super::closure_call::call_closure(builder, ctx, ir_module, *closure, &user_args, state)
+            super::closure_call::call_closure(builder, ctx, *closure, &user_args, state)
         }
         Op::BuiltinCall(name, args) => {
             translate_builtin(builder, ctx, ir_module, name, args, state, result_type)

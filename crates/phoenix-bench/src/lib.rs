@@ -93,7 +93,7 @@ fn check_fixture(name: &str, source: &str) -> (phoenix_parser::Program, phoenix_
 pub fn compile(name: &str, source: &str) -> usize {
     let (program, check_result) = check_fixture(name, source);
     let ir_module = phoenix_ir::lower(&program, &check_result.module);
-    ir_module.functions.len()
+    ir_module.function_count()
 }
 
 /// Run a fixture through the full compilation pipeline and tree-walk

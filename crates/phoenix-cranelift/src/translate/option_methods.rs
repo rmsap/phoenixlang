@@ -117,7 +117,7 @@ pub(super) fn translate_option_method(
             builder.ins().jump(br.merge_block, &[recv_ptr]);
 
             enter_block(builder, br.negative_block);
-            let result = call_closure(builder, ctx, ir_module, closure_vid, &[], state)?;
+            let result = call_closure(builder, ctx, closure_vid, &[], state)?;
             builder.ins().jump(br.merge_block, &[result[0]]);
 
             Ok(finish_merge(builder, &br))
@@ -135,7 +135,7 @@ pub(super) fn translate_option_method(
 
             enter_block(builder, br.positive_block);
             let payload = TypeLayout::of(&payload_ty).load(builder, recv_ptr, 1);
-            let pred = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
+            let pred = call_closure(builder, ctx, closure_vid, &payload, state)?;
             let pred_true = builder.ins().icmp_imm(IntCC::NotEqual, pred[0], 0);
 
             let keep_block = builder.create_block();

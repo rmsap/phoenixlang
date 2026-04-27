@@ -13,8 +13,123 @@ use crate::block::{BasicBlock, BlockId};
 use crate::instruction::{FuncId, Instruction, Op, ValueId};
 use crate::terminator::Terminator;
 use crate::types::IrType;
+use crate::value_alloc::ValueIdAllocator;
 use phoenix_common::span::Span;
 use std::collections::HashMap;
+
+/// One slot in [`IrModule::functions`]. Tagged so the consumer must
+/// dispatch on the variant before touching the body — it is impossible
+/// to look at a function and forget whether it is a template (which may
+/// contain `IrType::TypeVar` and is unverifiable / non-codegen-able) or
+/// a concrete callable.
+///
+/// Templates are kept in the module post-monomorphization as inert stubs
+/// so that the `FuncId`-as-vector-index invariant survives. Codegen and
+/// the verifier walk only `Concrete` slots; monomorphization walks both.
+#[derive(Debug, Clone)]
+pub enum FunctionSlot {
+    /// A fully concrete function — every type annotation is free of
+    /// `IrType::TypeVar` and the body is safe to verify and code-gen.
+    Concrete(IrFunction),
+    /// A generic-template stub. Its body may contain
+    /// `IrType::TypeVar` annotations that monomorphization specializes
+    /// away; the verifier and backends must skip it.
+    Template(IrFunction),
+}
+
+/// Why [`IrModule::resolve_concrete`] could not return an `&IrFunction`.
+/// Both variants signal a compiler bug — the variants exist so callers
+/// can `panic!` (or otherwise diagnose) with the right message.
+#[derive(Debug)]
+pub enum ResolveError<'a> {
+    /// The `FuncId` is past the end of [`IrModule::functions`] —
+    /// almost always an id from a different module or a stale id
+    /// captured before a module was rebuilt.
+    OutOfRange {
+        /// The id that was looked up.
+        id: FuncId,
+        /// The length of `module.functions` at lookup time.
+        len: usize,
+    },
+    /// The slot exists but holds a [`FunctionSlot::Template`] — the
+    /// caller expected monomorphization to have rewritten this id to a
+    /// specialized concrete `FuncId` before reaching this site.
+    Template {
+        /// The id whose slot resolved to a template.
+        id: FuncId,
+        /// The template's name, for diagnostics.
+        name: &'a str,
+    },
+}
+
+impl<'a> std::fmt::Display for ResolveError<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::OutOfRange { id, len } => write!(
+                f,
+                "FuncId({}) is out of range for module.functions (len={len})",
+                id.0,
+            ),
+            ResolveError::Template { id, name } => write!(
+                f,
+                "FuncId({}) resolves to template `{name}` — \
+                 monomorphization should have rewritten this call to a \
+                 specialized FuncId",
+                id.0,
+            ),
+        }
+    }
+}
+
+impl FunctionSlot {
+    /// Return the underlying [`IrFunction`] regardless of variant.
+    /// Use this only when the distinction does not matter (e.g. name
+    /// inspection, FuncId access). Callers that rely on the body being
+    /// concrete (code generation, verification, type-classification
+    /// helpers) must use [`Self::as_concrete`] instead.
+    pub fn func(&self) -> &IrFunction {
+        match self {
+            FunctionSlot::Concrete(f) | FunctionSlot::Template(f) => f,
+        }
+    }
+
+    /// Mutable counterpart of [`Self::func`]. Same caveat applies.
+    pub fn func_mut(&mut self) -> &mut IrFunction {
+        match self {
+            FunctionSlot::Concrete(f) | FunctionSlot::Template(f) => f,
+        }
+    }
+
+    /// `Some(&func)` if this slot is concrete, `None` if it is a
+    /// template.
+    pub fn as_concrete(&self) -> Option<&IrFunction> {
+        match self {
+            FunctionSlot::Concrete(f) => Some(f),
+            FunctionSlot::Template(_) => None,
+        }
+    }
+
+    /// Mutable counterpart of [`Self::as_concrete`].
+    pub fn as_concrete_mut(&mut self) -> Option<&mut IrFunction> {
+        match self {
+            FunctionSlot::Concrete(f) => Some(f),
+            FunctionSlot::Template(_) => None,
+        }
+    }
+
+    /// `Some(&func)` if this slot is a template, `None` if concrete.
+    pub fn as_template(&self) -> Option<&IrFunction> {
+        match self {
+            FunctionSlot::Template(f) => Some(f),
+            FunctionSlot::Concrete(_) => None,
+        }
+    }
+
+    /// `true` if this slot is a template.
+    pub fn is_template(&self) -> bool {
+        matches!(self, FunctionSlot::Template(_))
+    }
+}
 
 /// The top-level IR container for a compilation unit.
 ///
@@ -22,8 +137,21 @@ use std::collections::HashMap;
 /// struct/enum layout metadata, and name-to-ID lookup tables.
 #[derive(Debug, Clone)]
 pub struct IrModule {
-    /// All functions in the module.
-    pub functions: Vec<IrFunction>,
+    /// All functions in the module, indexed by [`FuncId`]. Each slot is
+    /// tagged as [`FunctionSlot::Concrete`] or
+    /// [`FunctionSlot::Template`] so consumers cannot accidentally treat
+    /// a template as a concrete function.
+    ///
+    /// `pub(crate)` so the typed-split is genuinely enforced: external
+    /// callers must go through [`Self::concrete_functions`] (codegen /
+    /// verifier), [`Self::templates`] (template walks),
+    /// [`Self::lookup`] / [`Self::get_concrete`] / [`Self::resolve_concrete`]
+    /// (`FuncId`-keyed lookup), [`Self::push_concrete`] /
+    /// [`Self::push_template`] (append), [`Self::function_count`] /
+    /// [`Self::iter_slots`] (iteration). Direct vector access from
+    /// outside this crate would let a caller forget that templates
+    /// exist and read a TypeVar-bearing body.
+    pub(crate) functions: Vec<FunctionSlot>,
     /// Struct layout info: name → ordered `(field_name, field_type)` pairs.
     pub struct_layouts: HashMap<String, Vec<(String, IrType)>>,
     /// Enum layout info: name → variant list, each variant has
@@ -138,7 +266,116 @@ impl IrModule {
     /// lowering. Every consumer that walks functions should go through
     /// this iterator.
     pub fn concrete_functions(&self) -> impl Iterator<Item = &IrFunction> {
-        self.functions.iter().filter(|f| !f.is_generic_template)
+        self.functions.iter().filter_map(FunctionSlot::as_concrete)
+    }
+
+    /// Mutable counterpart of [`Self::concrete_functions`].
+    pub fn concrete_functions_mut(&mut self) -> impl Iterator<Item = &mut IrFunction> {
+        self.functions
+            .iter_mut()
+            .filter_map(FunctionSlot::as_concrete_mut)
+    }
+
+    /// Iterate over the generic-template stubs, paired with their
+    /// `FuncId` so callers know which slot they came from.
+    pub fn templates(&self) -> impl Iterator<Item = (FuncId, &IrFunction)> {
+        self.functions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_template().map(|f| (FuncId(i as u32), f)))
+    }
+
+    /// Look up a function by `FuncId` regardless of whether it is
+    /// concrete or a template. Returns `None` if the id is out of range.
+    /// Use [`Self::get_concrete`] when the caller cannot tolerate a
+    /// template body (codegen, runtime call dispatch).
+    pub fn lookup(&self, id: FuncId) -> Option<&IrFunction> {
+        self.functions.get(id.index()).map(FunctionSlot::func)
+    }
+
+    /// Mutable counterpart of [`Self::lookup`].
+    pub fn lookup_mut(&mut self, id: FuncId) -> Option<&mut IrFunction> {
+        self.functions
+            .get_mut(id.index())
+            .map(FunctionSlot::func_mut)
+    }
+
+    /// Look up a concrete function by `FuncId`. Returns `None` if the
+    /// slot is a template (caller almost certainly has a bug — codegen
+    /// and the IR interpreter should never resolve a template at
+    /// runtime).
+    pub fn get_concrete(&self, id: FuncId) -> Option<&IrFunction> {
+        self.functions
+            .get(id.index())
+            .and_then(FunctionSlot::as_concrete)
+    }
+
+    /// Resolve `id` to a concrete function or report which way it
+    /// failed. Use this when both failure modes are bugs but you want
+    /// distinct diagnostics (out-of-range vs. template-resolution).
+    /// Codegen and the IR interpreter typically `unwrap` the result and
+    /// panic — both paths are reachable only through compiler bugs, but
+    /// the variants make the panic message accurate without a two-step
+    /// `lookup` / `get_concrete` dance at the call site.
+    pub fn resolve_concrete(&self, id: FuncId) -> Result<&IrFunction, ResolveError<'_>> {
+        match self.functions.get(id.index()) {
+            None => Err(ResolveError::OutOfRange {
+                id,
+                len: self.functions.len(),
+            }),
+            Some(FunctionSlot::Concrete(f)) => Ok(f),
+            Some(FunctionSlot::Template(f)) => Err(ResolveError::Template { id, name: &f.name }),
+        }
+    }
+
+    /// Append a new concrete function. Returns its `FuncId`, which is
+    /// equal to the slot index just appended; the function's own
+    /// `func.id` field is overwritten to match. Centralizes the
+    /// "id agrees with vector position" invariant for new appends.
+    pub fn push_concrete(&mut self, mut func: IrFunction) -> FuncId {
+        let id = FuncId(self.functions.len() as u32);
+        func.id = id;
+        self.functions.push(FunctionSlot::Concrete(func));
+        id
+    }
+
+    /// Append a new generic-template function. Companion to
+    /// [`Self::push_concrete`]; same id-as-position contract. Used by
+    /// tests that want to construct a template stub explicitly.
+    pub fn push_template(&mut self, mut func: IrFunction) -> FuncId {
+        let id = FuncId(self.functions.len() as u32);
+        func.id = id;
+        self.functions.push(FunctionSlot::Template(func));
+        id
+    }
+
+    /// Number of [`FunctionSlot`]s in the module — concrete functions
+    /// plus template stubs combined. Use this when you need a count
+    /// for diagnostics or `FuncId`-bound checks; for "how many
+    /// runnable functions are in the module" use
+    /// [`Self::concrete_functions`]`.count()`.
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// Iterate over every [`FunctionSlot`] paired with its [`FuncId`].
+    /// Use this for tests that need to inspect both concrete and
+    /// template slots without unwrapping the variant; otherwise prefer
+    /// [`Self::concrete_functions`] or [`Self::templates`] which
+    /// return `&IrFunction` directly.
+    pub fn iter_slots(&self) -> impl Iterator<Item = (FuncId, &FunctionSlot)> {
+        self.functions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (FuncId(i as u32), s))
+    }
+
+    /// Look up a [`FunctionSlot`] by `FuncId`. Returns `None` if the
+    /// id is out of range. Use this when you need to dispatch on the
+    /// concrete/template variant explicitly (e.g. monomorphization
+    /// passes that walk both kinds).
+    pub fn slot_at(&self, id: FuncId) -> Option<&FunctionSlot> {
+        self.functions.get(id.index())
     }
 
     /// Register a `(concrete_type, trait_name)` entry in
@@ -262,19 +499,16 @@ pub struct IrFunction {
     pub return_type: IrType,
     /// The basic blocks, in order.  `blocks[0]` is always the entry block.
     pub blocks: Vec<BasicBlock>,
-    /// Counter for fresh [`ValueId`] allocation.
-    next_value_id: u32,
-    /// Per-value type index, parallel to [`ValueId`] allocation: the type at
-    /// position `i` is the IR type of `ValueId(i)`, or `None` if that value
-    /// was allocated as a fresh id but never attached to an instruction
-    /// result or block parameter (should not occur in well-formed IR).
+    /// Owns the [`ValueId`] counter and the parallel per-value type
+    /// index. The only way to mint a `ValueId` is via
+    /// [`ValueIdAllocator::alloc`], which atomically bumps the counter
+    /// and records the type — so the index can never desync from the
+    /// counter (it *is* the counter).
     ///
-    /// Populated by [`Self::emit`] and [`Self::add_block_param`] as a side
-    /// effect so [`Self::instruction_result_type`] can answer in O(1)
-    /// instead of scanning every block. Function parameters appear here too
-    /// because lowering binds them as entry-block parameters (see
+    /// Function parameters appear in here too because lowering binds
+    /// them as entry-block parameters (see
     /// `phoenix-ir/src/lower_stmt.rs::lower_function_body`).
-    value_types: Vec<Option<IrType>>,
+    values: ValueIdAllocator,
     /// Counter for fresh [`BlockId`] allocation.
     next_block_id: u32,
     /// Source span of the original function declaration (for debug info).
@@ -284,19 +518,12 @@ pub struct IrFunction {
     /// functions. Monomorphization uses this to build the substitution map
     /// from `IrType::TypeVar(name)` to concrete types.
     pub type_param_names: Vec<String>,
-    /// `true` if this function is a generic template that has not been
-    /// specialized. Templates are kept in the module after monomorphization
-    /// as inert stubs (to preserve `FuncId`-as-vector-index) and are skipped
-    /// by the verifier and by downstream backends.
-    ///
-    /// **Consumers must not iterate `IrModule::functions` directly after
-    /// monomorphization.** Use [`IrModule::concrete_functions`] (which
-    /// filters on this flag) or explicitly check `is_generic_template`
-    /// before touching a function's body — a template may still contain
-    /// `IrType::TypeVar`, which panics
-    /// [`IrType::is_value_type`](crate::types::IrType::is_value_type) and
-    /// friends.
-    pub is_generic_template: bool,
+    /// Capture types in capture-slot order, for closure functions
+    /// only. Empty for non-closure functions. Indexed by
+    /// [`Op::ClosureLoadCapture`]'s `capture_idx` field — backends
+    /// walk this vector to compute byte/slot offsets into the closure
+    /// heap object (slot widths vary, e.g. `StringRef` is 2 slots).
+    pub capture_types: Vec<IrType>,
 }
 
 impl IrFunction {
@@ -316,52 +543,37 @@ impl IrFunction {
             param_names,
             return_type,
             blocks: Vec::new(),
-            next_value_id: 0,
-            value_types: Vec::new(),
+            values: ValueIdAllocator::new(),
             next_block_id: 0,
             span,
             type_param_names: Vec::new(),
-            is_generic_template: false,
+            capture_types: Vec::new(),
         }
+    }
+
+    /// Construct a closure function: same shape as [`Self::new`] but
+    /// records `capture_types` in one step. Use this from
+    /// [`crate::lower_expr`]'s lambda lowering so the
+    /// "closure functions carry their capture_types" invariant is
+    /// constructor-enforced rather than relying on a post-construction
+    /// field assignment that the next refactor might forget.
+    pub fn new_closure(
+        id: FuncId,
+        name: String,
+        param_types: Vec<IrType>,
+        param_names: Vec<String>,
+        return_type: IrType,
+        span: Option<Span>,
+        capture_types: Vec<IrType>,
+    ) -> Self {
+        let mut f = Self::new(id, name, param_types, param_names, return_type, span);
+        f.capture_types = capture_types;
+        f
     }
 
     /// Returns the number of [`ValueId`]s allocated in this function.
     pub fn value_count(&self) -> u32 {
-        self.next_value_id
-    }
-
-    /// Length of the per-value type index. Equal to `value_count()` in
-    /// well-formed IR; the verifier (`verify_value_types_index`) pins the
-    /// invariant.
-    pub fn value_types_len(&self) -> usize {
-        self.value_types.len()
-    }
-
-    /// Mutable view of the per-value type index for use by passes that
-    /// substitute types after the fact (e.g. monomorphization). Callers
-    /// must preserve the `value_id → type` parallel with
-    /// `result_type` / `block.params.1`.
-    pub fn value_types_mut(&mut self) -> &mut [Option<IrType>] {
-        &mut self.value_types
-    }
-
-    /// Test-only: bump `next_value_id` without pushing into
-    /// `value_types`, simulating a buggy pass that allocated a value
-    /// without recording its type. Exists solely so the verifier's
-    /// `value_types`-sync invariant can be exercised by a negative
-    /// test; not callable from outside test builds.
-    #[cfg(test)]
-    pub(crate) fn debug_desync_value_types(&mut self) {
-        self.next_value_id += 1;
-    }
-
-    /// Allocates a fresh [`ValueId`]. The value has no type until
-    /// [`Self::emit`] or [`Self::add_block_param`] attaches one.
-    pub fn fresh_value(&mut self) -> ValueId {
-        let id = ValueId(self.next_value_id);
-        self.next_value_id += 1;
-        self.value_types.push(None);
-        id
+        self.values.next_value_id().0
     }
 
     /// Creates a new basic block and returns its [`BlockId`].
@@ -397,41 +609,23 @@ impl IrFunction {
         &self.blocks[id.0 as usize]
     }
 
-    /// Look up the IR type that was recorded for a [`ValueId`] when it was
-    /// emitted into one of this function's blocks, attached as a block
-    /// parameter, or bound as a function parameter (function parameters are
-    /// represented as entry-block parameters in Phoenix IR).
+    /// Look up the IR type that was recorded for a [`ValueId`] when it
+    /// was emitted into one of this function's blocks, attached as a
+    /// block parameter, or bound as a function parameter (function
+    /// parameters are represented as entry-block parameters in Phoenix
+    /// IR).
     ///
-    /// Returns `None` for a `ValueId` that belongs to a different function
-    /// (out-of-range index). O(1): the type is recorded in `value_types`
-    /// at allocation time by [`Self::emit`] and [`Self::add_block_param`].
+    /// Returns `None` for a `ValueId` that belongs to a different
+    /// function (out-of-range index). O(1): the type is recorded by
+    /// [`ValueIdAllocator::alloc`] at allocation time. Within a
+    /// function, every allocated id has a type by construction — there
+    /// is no public API to mint a `ValueId` without recording its type.
     ///
     /// Used by IR lowering's dyn-coercion path (see
     /// [`crate::lower::LoweringContext::coerce_args_to_expected`]) to
     /// recover an argument's current IR type at the call site.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a `ValueId` is in-range for this function's
-    /// `value_types` vector but the slot is `None`. That case indicates
-    /// a compiler bug: a pass allocated a fresh `ValueId` via
-    /// [`Self::fresh_value`] without attaching a type via
-    /// [`Self::emit`] or [`Self::add_block_param`]. Silently returning
-    /// `None` here would let dyn-coercion sites lose the actual type
-    /// and silently miscompile. See
-    /// [known-issues.md](../../docs/known-issues.md#irfunctionvalue_types-is-a-parallel-index-without-a-type-level-guarantee)
-    /// for the planned `ValueIdAllocator` newtype that turns this into
-    /// a type-level invariant.
     pub fn instruction_result_type(&self, value: ValueId) -> Option<&IrType> {
-        let slot = self.value_types.get(value.0 as usize)?;
-        Some(slot.as_ref().unwrap_or_else(|| {
-            panic!(
-                "instruction_result_type: ValueId({}) in function `{}` has no recorded \
-                 type — a pass allocated a fresh id without emit/add_block_param. See \
-                 docs/known-issues.md: `IrFunction.value_types` parallel-index invariant.",
-                value.0, self.name,
-            )
-        }))
+        self.values.type_of(value)
     }
 
     /// Appends an instruction to the specified block and returns its result
@@ -444,9 +638,7 @@ impl IrFunction {
         span: Option<Span>,
     ) -> Option<ValueId> {
         let result = if result_type != IrType::Void {
-            let id = self.fresh_value();
-            self.value_types[id.0 as usize] = Some(result_type.clone());
-            Some(id)
+            Some(self.values.alloc(result_type.clone()))
         } else {
             None
         };
@@ -487,8 +679,7 @@ impl IrFunction {
 
     /// Adds a block parameter and returns its [`ValueId`].
     pub fn add_block_param(&mut self, block: BlockId, ty: IrType) -> ValueId {
-        let id = self.fresh_value();
-        self.value_types[id.0 as usize] = Some(ty.clone());
+        let id = self.values.alloc(ty.clone());
         self.block_mut(block).params.push((id, ty));
         id
     }
@@ -508,6 +699,9 @@ impl IrFunction {
             f(pt);
         }
         f(&mut self.return_type);
+        for ct in &mut self.capture_types {
+            f(ct);
+        }
         for block in &mut self.blocks {
             for instr in &mut block.instructions {
                 f(&mut instr.result_type);
@@ -516,8 +710,6 @@ impl IrFunction {
                 f(&mut bp.1);
             }
         }
-        for ty in self.value_types.iter_mut().flatten() {
-            f(ty);
-        }
+        self.values.for_each_type_mut(|ty| f(ty));
     }
 }

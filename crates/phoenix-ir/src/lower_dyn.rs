@@ -79,12 +79,11 @@ impl<'a> LoweringContext<'a> {
     /// where the caller only has a [`ValueId`] (no source span to look up
     /// via sema's `expr_types`).
     ///
-    /// If the IR type is unavailable (parallel `value_types` index out of
-    /// sync with `value_count` — see the fragility note in
-    /// `docs/known-issues.md`) the original value is returned without
-    /// coercion. A `debug_assert!` flags this in debug builds so the
-    /// underlying invariant break surfaces in tests rather than silently
-    /// dropping a `dyn` wrap in release.
+    /// If the `ValueId` belongs to a different function (out-of-range
+    /// for this function's allocator), the original value is returned
+    /// uncoerced and a `debug_assert!` fires. This indicates a compiler
+    /// bug — within a function, every `ValueId` has a recorded type by
+    /// construction (see [`crate::value_alloc::ValueIdAllocator`]).
     pub(crate) fn coerce_value_to_expected(
         &mut self,
         value: ValueId,
@@ -94,9 +93,9 @@ impl<'a> LoweringContext<'a> {
         let Some(actual) = self.current_func().instruction_result_type(value).cloned() else {
             debug_assert!(
                 false,
-                "coerce_value_to_expected: no recorded IR type for ValueId {value:?} \
-                 (expected `{expected}`); `IrFunction::value_types` is out of sync with \
-                 `value_count` — see docs/known-issues.md, parallel-index fragility"
+                "coerce_value_to_expected: ValueId {value:?} (expected `{expected}`) \
+                 is out of range for the current function's value allocator — \
+                 likely a cross-function leak"
             );
             return value;
         };
@@ -128,16 +127,18 @@ impl<'a> LoweringContext<'a> {
         args: Vec<ValueId>,
         span: Span,
     ) -> Vec<ValueId> {
-        let param_types = self.module.functions[callee.index()].param_types.clone();
+        let param_types = self.module.functions[callee.index()]
+            .func()
+            .param_types
+            .clone();
         self.coerce_args_to_expected(args, &param_types, span)
     }
 
     /// Coerce each argument against the corresponding expected type.
-    /// Extra args or missing expecteds pass through unchanged. If a
-    /// `ValueId`'s IR type is missing from the parallel `value_types`
-    /// index, a `debug_assert!` fires (see
-    /// [`Self::coerce_value_to_expected`] for the fragility note) and
-    /// the argument passes through uncoerced.
+    /// Extra args or missing expecteds pass through unchanged. A
+    /// `debug_assert!` fires if a `ValueId` is out of range for the
+    /// current function's allocator (cross-function leak — compiler
+    /// bug).
     pub(crate) fn coerce_args_to_expected(
         &mut self,
         args: Vec<ValueId>,
@@ -153,10 +154,9 @@ impl<'a> LoweringContext<'a> {
                 let Some(actual) = self.current_func().instruction_result_type(val).cloned() else {
                     debug_assert!(
                         false,
-                        "coerce_args_to_expected: no recorded IR type for ValueId {val:?} \
-                         at arg position {i} (expected `{expected}`); \
-                         `IrFunction::value_types` is out of sync with `value_count` — \
-                         see docs/known-issues.md, parallel-index fragility"
+                        "coerce_args_to_expected: ValueId {val:?} at arg position {i} \
+                         (expected `{expected}`) is out of range for the current \
+                         function's value allocator — likely a cross-function leak"
                     );
                     return val;
                 };
@@ -239,19 +239,15 @@ impl<'a> LoweringContext<'a> {
     /// Both routes converge on [`IrModule::register_dyn_vtable`], which
     /// is idempotent.
     ///
-    /// FIXME(phase-2.6/3): the vtables this registers are stored as
-    /// `FuncId`s pointing into `module.functions`, which after monomorphize
-    /// is a mix of concrete functions and inert generic-template stubs
-    /// (flagged via `is_generic_template`). The stubs are harmless —
-    /// the lowering-time path (this function) registers before mono
-    /// runs, and the mono-time path registers after struct-specialized
-    /// FuncIds are populated, so entries always point at real bodies —
-    /// but the pattern of "consumers filter via `concrete_functions()`"
-    /// is proliferating and is tracked as tech debt in
-    /// docs/known-issues.md ("Generic-template stubs tracked by a
-    /// `bool` flag"). When that flag is replaced with a typed split,
-    /// this cache should be re-keyed onto the concrete-functions
-    /// newtype rather than raw `FuncId`.
+    /// The vtables this registers are stored as `FuncId`s pointing
+    /// into `module.functions`, which after monomorphize is a mix of
+    /// concrete-function and template
+    /// [`crate::module::FunctionSlot`]s. The stubs are harmless: the
+    /// lowering-time path (this function) registers before mono runs,
+    /// and the mono-time path registers after struct-specialized
+    /// FuncIds are populated, so entries always point at real bodies.
+    /// Consumers that walk vtable FuncIds at runtime should look them
+    /// up via [`IrModule::get_concrete`].
     ///
     /// # Panics
     ///

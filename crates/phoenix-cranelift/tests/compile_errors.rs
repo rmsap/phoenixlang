@@ -61,7 +61,7 @@ fn closure_with_unknown_capture_type_returns_error() {
     let _p0 = closure_fn.add_block_param(bb0, IrType::I64);
     let p1 = closure_fn.add_block_param(bb0, IrType::I64);
     closure_fn.set_terminator(bb0, Terminator::Return(Some(p1)));
-    module.functions.push(closure_fn);
+    module.push_concrete(closure_fn);
     module
         .function_index
         .insert("__closure_0".to_string(), closure_fid);
@@ -89,7 +89,7 @@ fn closure_with_unknown_capture_type_returns_error() {
     });
     let ret_val = main_fn.emit_value(bb0, Op::ConstI64(0), IrType::I64, None);
     main_fn.set_terminator(bb0, Terminator::Return(Some(ret_val)));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -140,7 +140,7 @@ fn unsupported_string_method_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -186,7 +186,7 @@ fn unsupported_list_method_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -232,7 +232,7 @@ fn unsupported_map_method_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -278,7 +278,7 @@ fn unsupported_option_method_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -324,7 +324,7 @@ fn unsupported_result_method_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -381,7 +381,7 @@ fn option_okor_unknown_payload_type_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -445,7 +445,7 @@ fn option_okor_placeholder_arg_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -503,7 +503,7 @@ fn result_map_err_placeholder_args_returns_error() {
         span: None,
     });
     main_fn.set_terminator(bb0, Terminator::Return(None));
-    module.functions.push(main_fn);
+    module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
     let result = phoenix_cranelift::compile(&module);
@@ -524,18 +524,4 @@ fn result_map_err_placeholder_args_returns_error() {
         err_msg.contains("'mapErr'"),
         "error should name the offending method, got: {err_msg}"
     );
-}
-
-/// The `find_closure_capture_types` ambiguity error path in
-/// `ir_analysis.rs` is documented and handled but cannot be tested at the
-/// integration level without constructing a multi-function IR module with
-/// valid closure bodies — Cranelift's verifier rejects synthetic closure
-/// stubs.  The error path is covered by code review and documentation
-/// (see `ir_analysis.rs` "Known limitation" comment).
-#[test]
-#[ignore = "requires synthetic multi-closure IR module; see ir_analysis.rs known limitation"]
-fn closure_capture_ambiguity_error() {
-    // This test is a placeholder to track the untested error path.
-    // When the closure representation is enriched to carry capture metadata,
-    // this test should be implemented to verify the ambiguity error.
 }

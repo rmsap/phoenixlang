@@ -112,6 +112,17 @@ impl TypeLayout {
         self.slots
     }
 
+    /// Total slot count for a sequence of types laid out back-to-back.
+    /// Used by both the closure-capture store path
+    /// ([`super::super::calls::translate_closure_alloc`]) and the
+    /// closure-capture load path
+    /// ([`super::super::calls::translate_closure_load_capture`]) so the
+    /// two sides cannot drift on slot accounting.
+    #[must_use]
+    pub(crate) fn cumulative_slots(types: &[IrType]) -> usize {
+        types.iter().map(|t| TypeLayout::of(t).slots()).sum()
+    }
+
     /// Total size of this value in bytes (`slots * SLOT_SIZE`).
     #[must_use]
     pub(crate) fn size_bytes(&self) -> i64 {

@@ -1,0 +1,58 @@
+// Regression test for the closure-capture ambiguity bug fixed in
+// Phase 2.6 by switching closure functions to the env-pointer ABI.
+//
+// Two closures with identical user signatures `(Int) -> Int` but
+// different capture layouts (1-slot Int vs. (Int, 2-slot StringRef))
+// flow through the same block parameter (the `pickOne` return).
+//
+// Pre-fix failure mode (what a regression of the env-pointer ABI
+// would resurface): the Cranelift backend in `ir_analysis.rs`
+// (`find_closure_capture_types`) walked all closure functions with a
+// matching user signature and intersected their capture types. With
+// these two closures it produced either:
+//   (a) a hard `CompileError`: "ambiguous indirect call: multiple
+//       closures with the same user signature but different captures",
+//       on the `applyTwice(chosen_*)` calls, OR
+//   (b) silent miscompilation if both captures happened to share the
+//       same total slot width (not the case here — 1 vs. 3 slots).
+//
+// Post-fix, the env-pointer ABI never crosses capture types over the
+// indirect-call boundary: the closure value itself is the env, and
+// each closure function unpacks its own captures via
+// `Op::ClosureLoadCapture` indexed off that env. So both closures
+// dispatch correctly through the same phi regardless of capture
+// layout.
+//
+// Three-backend matrix (matrix_closures_ambiguous_captures) asserts
+// byte-identical stdout across `phoenix run`, `phoenix run-ir`, and
+// `phoenix build` — a regression of the env-pointer ABI surfaces as
+// either a `CompileError` from the resurrected heuristic or as
+// stdout drift across backends.
+
+function applyTwice(f: (Int) -> Int, x: Int) -> Int {
+  f(f(x))
+}
+
+function pickOne(cond: Bool, a: (Int) -> Int, b: (Int) -> Int) -> (Int) -> Int {
+  // Block-param phi join: `a` and `b` both flow into the return slot.
+  // Their user signatures match but their capture layouts differ.
+  if cond { a } else { b }
+}
+
+function main() {
+  let bias_a: Int = 100
+  let bias_b: Int = 200
+  let label: String = "labelled: "
+  let add_a = function(x: Int) -> Int { x + bias_a }
+  let add_b = function(x: Int) -> Int {
+    print(label)
+    x + bias_b
+  }
+
+  let chosen_true = pickOne(true, add_a, add_b)
+  let chosen_false = pickOne(false, add_a, add_b)
+  print(applyTwice(chosen_true, 1))
+  // applyTwice on add_b also prints "labelled: " twice (once per
+  // closure invocation), then returns 1 + 200 + 200 = 401.
+  print(applyTwice(chosen_false, 1))
+}

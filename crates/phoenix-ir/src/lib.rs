@@ -32,6 +32,8 @@ pub mod module;
 pub mod terminator;
 /// IR-level type representation.
 pub mod types;
+/// Type-safe allocator for SSA [`instruction::ValueId`]s.
+pub mod value_alloc;
 /// IR verification (structural invariants).
 pub mod verify;
 

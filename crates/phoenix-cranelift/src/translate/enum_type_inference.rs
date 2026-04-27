@@ -330,7 +330,7 @@ mod tests {
             value_map: HashMap::new(),
             alloca_map: HashMap::new(),
             type_map: types.into_iter().collect(),
-            closure_func_map: HashMap::new(),
+            current_capture_types: Vec::new(),
             enum_payload_types: HashMap::new(),
             block_map: HashMap::new(),
         }
@@ -501,7 +501,7 @@ mod tests {
             value_map: HashMap::new(),
             alloca_map: HashMap::new(),
             type_map: type_map.into_iter().collect(),
-            closure_func_map: HashMap::new(),
+            current_capture_types: Vec::new(),
             enum_payload_types: enum_allocs
                 .into_iter()
                 .map(|(v, variant, fields)| (v, (variant, fields)))

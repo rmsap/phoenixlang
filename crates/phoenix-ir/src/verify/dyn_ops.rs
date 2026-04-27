@@ -187,6 +187,7 @@ pub(super) fn verify_dyn_def_sites(func: &IrFunction, errors: &mut Vec<VerifyErr
                     | Op::EnumGetField(..)
                     | Op::Load(_)
                     | Op::Copy(_)
+                    | Op::ClosureLoadCapture(..)
             );
             if !op_can_produce_dyn {
                 errors.push(VerifyError {
@@ -209,7 +210,7 @@ mod dyn_verifier_tests {
     //! covered by the compile + roundtrip tests in the backend crates.
 
     use crate::instruction::{FuncId, Op};
-    use crate::module::{IrFunction, IrModule, IrTraitInfo, IrTraitMethod};
+    use crate::module::{FunctionSlot, IrFunction, IrModule, IrTraitInfo, IrTraitMethod};
     use crate::terminator::Terminator;
     use crate::types::IrType;
     use crate::verify::verify;
@@ -244,7 +245,7 @@ mod dyn_verifier_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -287,7 +288,7 @@ mod dyn_verifier_tests {
                 }],
             },
         );
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -317,7 +318,7 @@ mod dyn_verifier_tests {
         func.set_terminator(entry, Terminator::Return(None));
 
         let mut module = IrModule::new();
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -359,7 +360,7 @@ mod dyn_verifier_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -387,7 +388,7 @@ mod dyn_verifier_tests {
         func.set_terminator(entry, Terminator::Return(None));
 
         let mut module = IrModule::new();
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
         // No trait metadata needed — the def-site check is independent.
 
         let errors = verify(&module);
@@ -434,7 +435,7 @@ mod dyn_verifier_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -489,7 +490,7 @@ mod dyn_verifier_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -546,7 +547,7 @@ mod dyn_verifier_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");

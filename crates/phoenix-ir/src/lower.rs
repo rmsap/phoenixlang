@@ -32,12 +32,13 @@ use std::collections::HashMap;
 /// site has non-empty `Op::Call` type-args, and every call to a generic
 /// template has been rewritten to target a specialized `FuncId`.
 ///
-/// Templates themselves remain in `module.functions` as inert stubs (with
-/// `is_generic_template = true`) to preserve the `FuncId`-as-vector-index
-/// invariant. **Downstream consumers must iterate via
-/// [`IrModule::concrete_functions`](crate::module::IrModule::concrete_functions)**,
-/// not `module.functions` directly, or they will encounter unspecialized
-/// bodies that still contain `IrType::TypeVar`. Do not call
+/// Templates themselves remain in `module.functions` as inert
+/// [`crate::module::FunctionSlot::Template`] stubs to preserve the
+/// `FuncId`-as-vector-index invariant. **Downstream consumers should
+/// iterate via
+/// [`IrModule::concrete_functions`](crate::module::IrModule::concrete_functions)**
+/// — the tagged-slot type makes accidentally walking templates a
+/// type-system error rather than a silent miscompile. Do not call
 /// `monomorphize` separately after `lower` — it is not idempotent and
 /// would attempt to re-specialize the already-specialized module.
 pub fn lower(program: &Program, check_result: &ResolvedModule) -> IrModule {
@@ -61,9 +62,9 @@ pub fn lower(program: &Program, check_result: &ResolvedModule) -> IrModule {
 /// belt-and-braces for the post-monomorphization state.
 #[cfg(debug_assertions)]
 fn debug_assert_no_placeholder_funcs(module: &IrModule) {
-    for (i, func) in module.functions.iter().enumerate() {
+    for (i, slot) in module.functions.iter().enumerate() {
         assert_ne!(
-            func.id.0,
+            slot.func().id.0,
             u32::MAX,
             "IrModule.functions[{i}] retains the FuncId(u32::MAX) placeholder \
              — sema pre-allocated an id with no matching ResolvedModule entry, \
@@ -334,13 +335,13 @@ impl<'a> LoweringContext<'a> {
     /// Returns a shared reference to the current function being lowered.
     pub(crate) fn current_func(&self) -> &IrFunction {
         let func_id = self.current_func_id.expect("no current function");
-        &self.module.functions[func_id.index()]
+        self.module.functions[func_id.index()].func()
     }
 
     /// Returns a mutable reference to the current function being lowered.
     pub(crate) fn current_func_mut(&mut self) -> &mut IrFunction {
         let func_id = self.current_func_id.expect("no current function");
-        &mut self.module.functions[func_id.index()]
+        self.module.functions[func_id.index()].func_mut()
     }
 
     /// Returns the current function ID.

@@ -96,7 +96,6 @@ impl ListLoopPreamble {
 pub(super) fn translate_list_map(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
@@ -121,15 +120,7 @@ pub(super) fn translate_list_map(
     let lp = ListLoopPreamble::new(builder, ctx, list_ptr);
     // Body: load element, call closure, store result.
     let elem_vals = load_list_element(builder, list_ptr, lp.i, elem_ty)?;
-    let call_result = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &elem_vals,
-        state,
-    )?;
+    let call_result = call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &elem_vals, state)?;
     let header_const = builder.ins().iconst(cl::I64, LIST_HEADER as i64);
     let result_base = builder.ins().iadd(result_ptr, header_const);
     let out_es_body = builder.ins().iconst(cl::I64, out_es);
@@ -150,7 +141,6 @@ pub(super) fn translate_list_map(
 pub(super) fn translate_list_filter(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
@@ -195,15 +185,7 @@ pub(super) fn translate_list_filter(
     builder.seal_block(body_block);
     builder.switch_to_block(body_block);
     let elem_vals = load_list_element(builder, list_ptr, i, elem_ty)?;
-    let pred = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &elem_vals,
-        state,
-    )?;
+    let pred = call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &elem_vals, state)?;
 
     // Branch: if predicate is true, go to store_block with element values;
     // otherwise skip to next_block.
@@ -281,15 +263,7 @@ pub(super) fn translate_list_find(
     let lp = ListLoopPreamble::new(builder, ctx, list_ptr);
     // Body: load elem, call predicate.
     let elem_vals = load_list_element(builder, list_ptr, lp.i, elem_ty)?;
-    let pred = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &elem_vals,
-        state,
-    )?;
+    let pred = call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &elem_vals, state)?;
     let is_true = builder.ins().icmp_imm(IntCC::NotEqual, pred[0], 0);
 
     let continue_block = builder.create_block();
@@ -325,38 +299,30 @@ pub(super) fn translate_list_find(
 pub(super) fn translate_list_any(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
-    translate_list_any_all_inner(
-        builder, ctx, ir_module, list_ptr, elem_ty, args, state, true,
-    )
+    translate_list_any_all_inner(builder, ctx, list_ptr, elem_ty, args, state, true)
 }
 
 /// `List.all`: short-circuit boolean — returns true if all elements satisfy the predicate.
 pub(super) fn translate_list_all(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
-    translate_list_any_all_inner(
-        builder, ctx, ir_module, list_ptr, elem_ty, args, state, false,
-    )
+    translate_list_any_all_inner(builder, ctx, list_ptr, elem_ty, args, state, false)
 }
 
 /// Shared implementation for `List.any` and `List.all`.
-#[allow(clippy::too_many_arguments)]
 fn translate_list_any_all_inner(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
@@ -373,15 +339,7 @@ fn translate_list_any_all_inner(
     let lp = ListLoopPreamble::new(builder, ctx, list_ptr);
     // Body: call predicate, short-circuit on match.
     let elem_vals = load_list_element(builder, list_ptr, lp.i, elem_ty)?;
-    let pred = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &elem_vals,
-        state,
-    )?;
+    let pred = call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &elem_vals, state)?;
 
     let continue_block = builder.create_block();
     if is_any {
@@ -418,7 +376,6 @@ fn translate_list_any_all_inner(
 pub(super) fn translate_list_reduce(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
@@ -467,15 +424,7 @@ pub(super) fn translate_list_reduce(
     let elem_vals = load_list_element(builder, list_ptr, i, elem_ty)?;
     let mut closure_args = acc_vals;
     closure_args.extend(&elem_vals);
-    let new_acc = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &closure_args,
-        state,
-    )?;
+    let new_acc = call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &closure_args, state)?;
     let one = builder.ins().iconst(cl::I64, 1);
     let next_i = builder.ins().iadd(i, one);
     let mut loop_args = vec![next_i];

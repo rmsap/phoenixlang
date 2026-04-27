@@ -1,12 +1,7 @@
 // Closures with String captures + indirect call through a function
 // parameter. Exercises the closure ABI: function pointer + heap
 // capture record, fat-pointer String captures, and indirect-call
-// dispatch.
-//
-// Single indirect-call site is intentional: two closures with
-// identical user signatures (e.g., two `(Int) -> Int`) trip the
-// "Closure capture type ambiguity with indirect calls" known issue
-// in compiled mode. See known-issues.md.
+// dispatch via the env-pointer calling convention.
 
 function applyTwice(f: (Int) -> Int, x: Int) -> Int {
   f(f(x))

@@ -102,7 +102,7 @@ pub(super) fn translate_result_method(
 
             enter_block(builder, br.negative_block);
             let payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
-            let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
+            let result = call_closure(builder, ctx, closure_vid, &payload, state)?;
             let mapped_ty = closure_return_type(state, closure_vid)?;
             let new_err = build_result_err(builder, ctx, &result, &mapped_ty, ir_module)?;
             builder.ins().jump(br.merge_block, &[new_err]);
@@ -137,7 +137,7 @@ pub(super) fn translate_result_method(
 
             enter_block(builder, br.negative_block);
             let payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
-            let result = call_closure(builder, ctx, ir_module, closure_vid, &payload, state)?;
+            let result = call_closure(builder, ctx, closure_vid, &payload, state)?;
             builder.ins().jump(br.merge_block, &[result[0]]);
 
             Ok(finish_merge(builder, &br))
@@ -153,7 +153,7 @@ pub(super) fn translate_result_method(
 
             enter_block(builder, br.negative_block);
             let err_payload = TypeLayout::of(&err_ty).load(builder, recv_ptr, 1);
-            let result = call_closure(builder, ctx, ir_module, closure_vid, &err_payload, state)?;
+            let result = call_closure(builder, ctx, closure_vid, &err_payload, state)?;
             builder.ins().jump(br.merge_block, &result);
 
             Ok(finish_merge(builder, &br))

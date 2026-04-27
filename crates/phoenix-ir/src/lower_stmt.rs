@@ -86,8 +86,9 @@ impl<'a> LoweringContext<'a> {
         self.switch_to_block(entry);
 
         // Bind parameters as variables.
-        let param_types = self.module.functions[func_id.index()].param_types.clone();
-        let param_names = self.module.functions[func_id.index()].param_names.clone();
+        let func = self.module.functions[func_id.index()].func();
+        let param_types = func.param_types.clone();
+        let param_names = func.param_names.clone();
 
         // Allocate ValueIds for parameters by emitting Copy ops from
         // block parameters (parameters are the first values in the entry block).
@@ -102,7 +103,10 @@ impl<'a> LoweringContext<'a> {
 
         // If the function returns non-void and we have a result, return it.
         // Otherwise return void.
-        let return_type = self.module.functions[func_id.index()].return_type.clone();
+        let return_type = self.module.functions[func_id.index()]
+            .func()
+            .return_type
+            .clone();
 
         // Check if the current block already has a terminator (e.g. from a return statement).
         let needs_terminator = {

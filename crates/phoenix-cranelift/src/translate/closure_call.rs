@@ -3,6 +3,14 @@
 //! Used by list methods (map, filter, etc.), option methods (map, andThen, etc.),
 //! and result methods (map, mapErr, etc.) when they need to call user-provided
 //! closure arguments.
+//!
+//! All calls go through the env-pointer ABI: the closure value (a
+//! pointer to a `[fn_ptr, capture_0, ...]` heap object) is passed as
+//! the first argument, and the closure function reads its captures
+//! from that env pointer via [`phoenix_ir::instruction::Op::ClosureLoadCapture`].
+//! Capture types never cross the indirect-call boundary, which is
+//! what structurally eliminates the closure-capture-ambiguity bug
+//! for closures that flow through phi nodes.
 
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
@@ -11,42 +19,29 @@ use crate::context::CompileContext;
 use crate::error::CompileError;
 use crate::types::POINTER_TYPE;
 use phoenix_ir::instruction::ValueId;
-use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::ir_analysis::{find_capture_types_by_func_id, find_closure_capture_types};
-use super::layout::TypeLayout;
 use super::{FuncState, get_val1};
 
 /// Call a closure given its ValueId and user arguments.
 ///
-/// Resolves the closure's function pointer, loads captured values,
-/// builds the full argument list, and emits a `call_indirect`.
+/// Loads the function pointer from slot 0 of the closure heap object,
+/// then issues a `call_indirect` with `(closure_ptr, user_args...)`.
 pub(super) fn call_closure(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     closure_vid: ValueId,
     user_args: &[Value],
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     let closure_ptr = get_val1(state, closure_vid)?;
-    call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        user_args,
-        state,
-    )
+    call_closure_ptr(builder, ctx, closure_ptr, closure_vid, user_args, state)
 }
 
 /// Call a closure given its pointer and the ValueId (for type lookup).
 pub(super) fn call_closure_ptr(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     closure_ptr: Value,
     closure_vid: ValueId,
     user_args: &[Value],
@@ -69,26 +64,18 @@ pub(super) fn call_closure_ptr(
         }
     };
 
-    let capture_param_types = if let Some(target_fid) = state.closure_func_map.get(&closure_vid) {
-        find_capture_types_by_func_id(ir_module, *target_fid, user_param_types.len())?
-    } else {
-        find_closure_capture_types(ir_module, user_param_types, return_type)?
-    };
-
-    // Load captures.
-    let mut cl_args = Vec::new();
-    let mut slot = 1usize;
-    for cap_ty in &capture_param_types {
-        let cap_layout = TypeLayout::of(cap_ty);
-        cl_args.extend(cap_layout.load(builder, closure_ptr, slot));
-        slot += cap_layout.slots();
-    }
-
-    // Append user args.
+    // Env-pointer ABI: prepend the closure pointer as the first arg.
+    // The callee will read its captures via Op::ClosureLoadCapture
+    // indexed off this env. No capture types cross this boundary —
+    // closures with the same user signature unify regardless of their
+    // capture layouts.
+    let mut cl_args = Vec::with_capacity(user_args.len() + 1);
+    cl_args.push(closure_ptr);
     cl_args.extend(user_args);
 
-    // Build full signature.
-    let mut full_param_types = capture_param_types;
+    // Build the closure function's signature: env-ptr first, then user
+    // params. The env-ptr's IR type is the closure's own ClosureRef.
+    let mut full_param_types: Vec<IrType> = vec![closure_type.clone()];
     full_param_types.extend(user_param_types.iter().cloned());
     let sig = crate::abi::build_signature(&full_param_types, return_type, ctx.call_conv);
     let sig_ref = builder.import_signature(sig);

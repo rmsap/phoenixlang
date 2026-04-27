@@ -534,7 +534,9 @@ fn verifier_catches_missing_terminator() {
         instructions: vec![],
         terminator: Terminator::None,
     });
-    module.functions.push(func);
+    module
+        .functions
+        .push(crate::module::FunctionSlot::Concrete(func));
 
     let errors = verify::verify(&module);
     assert!(
@@ -575,7 +577,9 @@ fn verifier_catches_invalid_block_target() {
             args: vec![],
         },
     });
-    module.functions.push(func);
+    module
+        .functions
+        .push(crate::module::FunctionSlot::Concrete(func));
 
     let errors = verify::verify(&module);
     assert!(!errors.is_empty(), "verifier should catch invalid target");
@@ -1128,7 +1132,11 @@ function main() { print(identity(1)) }
     );
 
     // The module contains the template and the specialization.
-    let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    let names: Vec<&str> = module
+        .functions
+        .iter()
+        .map(|s| s.func().name.as_str())
+        .collect();
     assert!(names.contains(&"identity"), "expected template");
     assert!(
         names.contains(&"identity__i64"),
@@ -1144,6 +1152,65 @@ function main() { print(identity(1)) }
     );
 }
 
+/// `IrModule::lookup` resolves a template's `FuncId` to its
+/// underlying `IrFunction`; `IrModule::get_concrete` returns `None`
+/// for the same id. Pins the typed-split contract: lookups that don't
+/// care about the kind use `lookup`, lookups that do (codegen,
+/// runtime call dispatch) use `get_concrete` and get `None` rather
+/// than a TypeVar-bearing body.
+#[test]
+fn module_lookup_template_returns_some_get_concrete_returns_none() {
+    let module = lower_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function main() { print(identity(1)) }
+"#,
+    );
+    let (template_fid, _) = module
+        .templates()
+        .find(|(_, f)| f.name == "identity")
+        .expect("identity template should exist");
+    assert!(
+        module.lookup(template_fid).is_some(),
+        "lookup(template) returns Some"
+    );
+    assert!(
+        module.get_concrete(template_fid).is_none(),
+        "get_concrete(template) returns None"
+    );
+
+    // Conversely, the specialization at a different FuncId is concrete.
+    let spec_fid = module.function_index["identity__i64"];
+    assert!(module.lookup(spec_fid).is_some());
+    assert!(module.get_concrete(spec_fid).is_some());
+}
+
+/// After monomorphization, the original template stays in
+/// `module.functions` at its original `FuncId` as a Template slot,
+/// while the specialization is appended as a new Concrete slot at a
+/// higher FuncId. `concrete_functions()` yields only the latter.
+#[test]
+fn concrete_functions_excludes_template_after_specialization() {
+    let module = lower_source(
+        r#"
+function identity<T>(x: T) -> T { x }
+function main() { print(identity(1)) }
+"#,
+    );
+    // The bare `identity` name resolves to the template's FuncId
+    // (sema doesn't rewrite function_index entries during mono).
+    let template_fid = module.function_index["identity"];
+    let concrete_fids: Vec<_> = module.concrete_functions().map(|f| f.id).collect();
+    assert!(
+        !concrete_fids.contains(&template_fid),
+        "concrete_functions yielded the template at FuncId({})",
+        template_fid.0
+    );
+    // ...and the specialization *is* yielded.
+    let spec_fid = module.function_index["identity__i64"];
+    assert!(concrete_fids.contains(&spec_fid));
+}
+
 /// `IrModule::concrete_functions` must filter out generic templates.
 #[test]
 fn concrete_functions_filters_templates() {
@@ -1153,13 +1220,18 @@ function identity<T>(x: T) -> T { x }
 function main() { print(identity(1)) }
 "#,
     );
-    for f in module.concrete_functions() {
-        assert!(
-            !f.is_generic_template,
-            "concrete_functions yielded template `{}`",
-            f.name
-        );
+    // `concrete_functions()` returns `&IrFunction` directly — there is
+    // no `is_template`-style flag to inspect, so a non-empty iteration
+    // *is* the proof that templates were filtered out.
+    let mut concrete_count = 0;
+    for _ in module.concrete_functions() {
+        concrete_count += 1;
     }
+    assert!(concrete_count > 0, "no concrete functions iterated");
+    assert!(
+        module.templates().count() > 0,
+        "module should also contain at least one template"
+    );
 }
 
 /// Generic methods on user-defined types are monomorphized just like
@@ -1183,7 +1255,11 @@ function main() {
     );
 
     // Expect two specializations: at Int and at String.
-    let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    let names: Vec<&str> = module
+        .functions
+        .iter()
+        .map(|s| s.func().name.as_str())
+        .collect();
     assert!(
         names.iter().any(|n| n.contains("wrap__i64")),
         "missing Int specialization, have: {names:?}"
@@ -1217,15 +1293,14 @@ function main() {
     // Find the template's FuncId — any specialization targeting this id
     // would be a regression.
     let template_id = module
-        .functions
-        .iter()
-        .find(|f| f.name == "Holder.wrap" && f.is_generic_template)
+        .templates()
+        .find(|(_, f)| f.name == "Holder.wrap")
         .expect("expected a template function for Holder.wrap")
+        .1
         .id;
 
     let main = module
-        .functions
-        .iter()
+        .concrete_functions()
         .find(|f| f.name == "main")
         .expect("main function");
     for block in &main.blocks {
@@ -1271,7 +1346,11 @@ function main() {
 }
 "#,
     );
-    let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    let names: Vec<&str> = module
+        .functions
+        .iter()
+        .map(|s| s.func().name.as_str())
+        .collect();
     // Pin exact mangled names so a silent mangling regression is caught.
     // Note: `hasValue` is inferred as `T := Int` from `Option<Int>`, so the
     // specialization is `hasValue__i64` — not `hasValue__e_Option`.
@@ -1480,6 +1559,7 @@ function main() {
         let func = module
             .functions
             .iter()
+            .map(|s| s.func())
             .find(|f| f.id == *spec_id)
             .unwrap_or_else(|| panic!("specialization `{name}` not found"));
         let mut saw_self_call = false;
@@ -1522,7 +1602,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].index()];
+    let main = module.functions[module.function_index["main"].index()].func();
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1548,7 +1628,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].index()];
+    let main = module.functions[module.function_index["main"].index()].func();
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1578,7 +1658,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].index()];
+    let main = module.functions[module.function_index["main"].index()].func();
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1603,7 +1683,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].index()];
+    let main = module.functions[module.function_index["main"].index()].func();
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1643,7 +1723,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].index()];
+    let main = module.functions[module.function_index["main"].index()].func();
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1681,7 +1761,7 @@ function main() {
 }
 "#,
     );
-    let spec = &module.functions[module.function_index["wrap__i64"].index()];
+    let spec = module.functions[module.function_index["wrap__i64"].index()].func();
     assert_eq!(
         spec.return_type,
         IrType::EnumRef("Box".to_string(), vec![IrType::I64]),

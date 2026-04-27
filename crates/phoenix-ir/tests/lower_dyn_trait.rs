@@ -99,8 +99,7 @@ fn lowering_materializes_vtables_for_each_concrete_implementor() {
 fn dyn_call_resolves_to_correct_method_slot() {
     let module = lower_program(DRAWABLE_PROGRAM);
     let render = module
-        .functions
-        .iter()
+        .concrete_functions()
         .find(|f| f.name == "render")
         .expect("`render` must be present in the lowered module");
 
@@ -121,8 +120,7 @@ fn dyn_call_resolves_to_correct_method_slot() {
 fn dyn_alloc_emitted_at_call_argument_coercion_site() {
     let module = lower_program(DRAWABLE_PROGRAM);
     let main = module
-        .functions
-        .iter()
+        .concrete_functions()
         .find(|f| f.name == "main")
         .expect("`main` must be present");
 
@@ -195,8 +193,7 @@ function main() {
 ",
     );
     let main = module
-        .functions
-        .iter()
+        .concrete_functions()
         .find(|f| f.name == "main")
         .expect("`main` must be present");
     let ctor_alloc = main
@@ -218,8 +215,7 @@ function main() {
 /// Helper: count `Op::DynAlloc` instructions in `func_name`'s body.
 fn dyn_alloc_count(module: &phoenix_ir::module::IrModule, func_name: &str) -> usize {
     module
-        .functions
-        .iter()
+        .concrete_functions()
         .find(|f| f.name == func_name)
         .unwrap_or_else(|| panic!("function `{func_name}` not present in module"))
         .blocks

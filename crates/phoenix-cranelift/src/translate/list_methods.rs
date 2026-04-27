@@ -163,28 +163,28 @@ pub(super) fn translate_list_method(
             ))
         }
         "map" => super::list_methods_closure::translate_list_map(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         "filter" => super::list_methods_closure::translate_list_filter(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         "find" => super::list_methods_closure::translate_list_find(
             builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
         ),
         "any" => super::list_methods_closure::translate_list_any(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         "all" => super::list_methods_closure::translate_list_all(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         "reduce" => super::list_methods_closure::translate_list_reduce(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         "flatMap" => super::list_methods_complex::translate_list_flatmap(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         "sortBy" => super::list_methods_complex::translate_list_sortby(
-            builder, ctx, ir_module, list_ptr, &elem_ty, args, state,
+            builder, ctx, list_ptr, &elem_ty, args, state,
         ),
         _ => Err(CompileError::new(format!(
             "list method '{method}' not yet supported in compiled mode"

@@ -36,7 +36,7 @@ pub struct VerifyError {
 /// Returns a list of errors found.  An empty list means the module is
 /// well-formed.
 ///
-/// Generic templates (functions with `is_generic_template = true`) are
+/// Generic templates ([`crate::module::FunctionSlot::Template`]) are
 /// intentionally skipped: their bodies carry `IrType::TypeVar`
 /// annotations that the monomorphization pass consumes to produce
 /// specialized copies, and no downstream backend ever reads them.
@@ -47,7 +47,6 @@ pub fn verify(module: &IrModule) -> Vec<VerifyError> {
     dyn_ops::verify_dyn_vtable_shapes(module, &mut errors);
     for func in module.concrete_functions() {
         verify_function(func, &mut errors);
-        verify_value_types_index(func, &mut errors);
         verify_no_unresolved_placeholder_ops(func, &mut errors);
         dyn_ops::verify_dyn_ops(module, func, &mut errors);
         dyn_ops::verify_dyn_def_sites(func, &mut errors);
@@ -83,23 +82,6 @@ fn verify_no_unresolved_placeholder_ops(func: &IrFunction, errors: &mut Vec<Veri
                 _ => {}
             }
         }
-    }
-}
-
-/// The per-value type index must have one entry per allocated ValueId.
-/// Out-of-sync state here causes silent wrong-codegen downstream (e.g.
-/// dyn-coercion readings the wrong actual type).
-fn verify_value_types_index(func: &IrFunction, errors: &mut Vec<VerifyError>) {
-    if func.value_count() as usize != func.value_types_len() {
-        errors.push(VerifyError {
-            function: func.name.clone(),
-            message: format!(
-                "value_types length {} out of sync with value_count {} — a pass \
-                 allocated a ValueId without recording its type",
-                func.value_types_len(),
-                func.value_count()
-            ),
-        });
     }
 }
 
@@ -182,6 +164,26 @@ fn verify_function(func: &IrFunction, errors: &mut Vec<VerifyError>) {
                         ),
                     });
                 }
+            }
+            // `Op::ClosureLoadCapture` carries an immediate ordinal
+            // index (not a `ValueId`), so the generic operand walk
+            // above doesn't see it. Check the bound here instead — the
+            // Cranelift backend's bound check fires only at codegen
+            // time, by which point we've already lost the IR-level
+            // diagnostic context.
+            if let Op::ClosureLoadCapture(_, capture_idx) = inst.op
+                && (capture_idx as usize) >= func.capture_types.len()
+            {
+                errors.push(VerifyError {
+                    function: func.name.clone(),
+                    message: format!(
+                        "block {} Op::ClosureLoadCapture: capture index {} out of \
+                         range (function has {} captures)",
+                        block.id,
+                        capture_idx,
+                        func.capture_types.len(),
+                    ),
+                });
             }
         }
 
@@ -296,7 +298,7 @@ mod unresolved_placeholder_op_tests {
     //! integration suite.
 
     use crate::instruction::{FuncId, Op};
-    use crate::module::{IrFunction, IrModule};
+    use crate::module::{FunctionSlot, IrFunction, IrModule};
     use crate::terminator::Terminator;
     use crate::types::IrType;
     use crate::verify::verify;
@@ -321,7 +323,7 @@ mod unresolved_placeholder_op_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -352,7 +354,7 @@ mod unresolved_placeholder_op_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -376,7 +378,6 @@ mod unresolved_placeholder_op_tests {
         );
         // Templates are skipped by `concrete_functions()`, so the
         // placeholder is allowed here.
-        func.is_generic_template = true;
         let entry = func.create_block();
         let recv = func.add_block_param(entry, IrType::TypeVar("T".into()));
         func.emit(
@@ -386,7 +387,7 @@ mod unresolved_placeholder_op_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Template(func));
 
         let errors = verify(&module);
         assert!(
@@ -408,7 +409,6 @@ mod unresolved_placeholder_op_tests {
             IrType::Void,
             None,
         );
-        func.is_generic_template = true;
         let entry = func.create_block();
         let src = func.add_block_param(entry, IrType::TypeVar("T".into()));
         func.emit(
@@ -418,7 +418,7 @@ mod unresolved_placeholder_op_tests {
             None,
         );
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Template(func));
 
         let errors = verify(&module);
         assert!(
@@ -433,15 +433,20 @@ mod unresolved_placeholder_op_tests {
 #[cfg(test)]
 mod structural_verifier_tests {
     //! Negative tests for the core structural invariants in
-    //! [`verify_function`] and [`verify_value_types_index`]. Companion
-    //! to the four `unresolved_placeholder_op_tests` above and the
-    //! `dyn`-op tests in [`super::dyn_ops`]. Each test constructs a
-    //! minimal IR module that violates one specific invariant and
-    //! asserts the verifier rejects it with a recognisable message.
+    //! [`verify_function`]. Companion to the four
+    //! `unresolved_placeholder_op_tests` above and the `dyn`-op tests in
+    //! [`super::dyn_ops`]. Each test constructs a minimal IR module that
+    //! violates one specific invariant and asserts the verifier rejects
+    //! it with a recognisable message.
+    //!
+    //! The historical `value_types`-desync invariant has no test here:
+    //! [`crate::value_alloc::ValueIdAllocator`] makes
+    //! [`crate::instruction::ValueId`] allocation and type-recording the
+    //! same operation, so desync is structurally impossible.
 
     use crate::block::BlockId;
     use crate::instruction::{FuncId, Op, VOID_SENTINEL, ValueId};
-    use crate::module::{IrFunction, IrModule};
+    use crate::module::{FunctionSlot, IrFunction, IrModule};
     use crate::terminator::Terminator;
     use crate::types::IrType;
     use crate::verify::verify;
@@ -471,7 +476,7 @@ mod structural_verifier_tests {
                 args: Vec::new(),
             },
         );
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -491,7 +496,7 @@ mod structural_verifier_tests {
         // RHS is VOID_SENTINEL — the verifier must catch this.
         func.emit(entry, Op::IAdd(lhs, VOID_SENTINEL), IrType::I64, None);
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -511,7 +516,7 @@ mod structural_verifier_tests {
         // RHS is ValueId(99) — never allocated.
         func.emit(entry, Op::IAdd(lhs, ValueId(99)), IrType::I64, None);
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -529,7 +534,7 @@ mod structural_verifier_tests {
         let entry = func.create_block();
         // Return VOID_SENTINEL from a function declared to return I64.
         func.set_terminator(entry, Terminator::Return(Some(VOID_SENTINEL)));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -558,7 +563,7 @@ mod structural_verifier_tests {
                 false_args: Vec::new(),
             },
         );
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -570,35 +575,13 @@ mod structural_verifier_tests {
     }
 
     #[test]
-    fn value_types_index_out_of_sync_is_flagged() {
-        let mut module = IrModule::new();
-        let mut func = empty_func();
-        let entry = func.create_block();
-        func.set_terminator(entry, Terminator::Return(None));
-        // Bump next_value_id without pushing a slot into value_types,
-        // simulating a buggy pass that allocated a ValueId but skipped
-        // the type index.
-        func.debug_desync_value_types();
-        module.functions.push(func);
-
-        let errors = verify(&module);
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("value_types length")
-                    && e.message.contains("out of sync")),
-            "expected value_types desync error, got: {errors:?}"
-        );
-    }
-
-    #[test]
     fn block_with_no_terminator_is_flagged() {
         let mut module = IrModule::new();
         let mut func = empty_func();
         // create_block leaves Terminator::None in place; never call
         // set_terminator on it.
         func.create_block();
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -622,7 +605,7 @@ mod structural_verifier_tests {
                 args: Vec::new(),
             },
         );
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(
@@ -642,9 +625,72 @@ mod structural_verifier_tests {
         let mut func = empty_func();
         let entry = func.create_block();
         func.set_terminator(entry, Terminator::Return(None));
-        module.functions.push(func);
+        module.functions.push(FunctionSlot::Concrete(func));
 
         let errors = verify(&module);
         assert!(errors.is_empty(), "expected clean verify, got: {errors:?}");
+    }
+
+    /// `Op::ClosureLoadCapture(env, idx)` with `idx >= capture_types.len()`
+    /// must be flagged. The op carries an immediate ordinal index (not a
+    /// `ValueId`), so the generic undefined-operand walk doesn't catch
+    /// it; this test pins the dedicated bounds check.
+    #[test]
+    fn closure_load_capture_out_of_range_is_flagged() {
+        let mut module = IrModule::new();
+        // Closure-shaped function: env is param 0, capture_types has
+        // length 1 (a single Int capture). Emitting
+        // `ClosureLoadCapture(env, 5)` is out of range.
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "__closure_oob".into(),
+            vec![IrType::I64], // env-ptr; type detail doesn't matter for this check
+            vec!["__env".into()],
+            IrType::Void,
+            None,
+        );
+        func.capture_types = vec![IrType::I64];
+        let entry = func.create_block();
+        let env = func.add_block_param(entry, IrType::I64);
+        func.emit(entry, Op::ClosureLoadCapture(env, 5), IrType::I64, None);
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("ClosureLoadCapture")
+                    && e.message.contains("out of range")),
+            "expected out-of-range capture-index error, got: {errors:?}"
+        );
+    }
+
+    /// In-range `Op::ClosureLoadCapture` must not be flagged.
+    #[test]
+    fn closure_load_capture_in_range_passes_verification() {
+        let mut module = IrModule::new();
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "__closure_ok".into(),
+            vec![IrType::I64],
+            vec!["__env".into()],
+            IrType::Void,
+            None,
+        );
+        func.capture_types = vec![IrType::I64, IrType::I64];
+        let entry = func.create_block();
+        let env = func.add_block_param(entry, IrType::I64);
+        func.emit(entry, Op::ClosureLoadCapture(env, 1), IrType::I64, None);
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        let errors = verify(&module);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.message.contains("ClosureLoadCapture")),
+            "expected clean verify on in-range ClosureLoadCapture, got: {errors:?}"
+        );
     }
 }

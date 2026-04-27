@@ -194,6 +194,9 @@ impl fmt::Display for Op {
                 }
                 Ok(())
             }
+            Op::ClosureLoadCapture(env, idx) => {
+                write!(f, "closure_load_capture {env}[{idx}]")
+            }
 
             // Call ops
             Op::Call(func, type_args, args) => {

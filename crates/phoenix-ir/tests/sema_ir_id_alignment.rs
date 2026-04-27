@@ -46,7 +46,7 @@ function gamma() { }
     // Every free function in ResolvedModule has an IR function at the
     // same FuncId.
     for (name, fid, _info) in resolved.functions_with_names() {
-        let ir_func = &ir.functions[fid.index()];
+        let ir_func = ir.lookup(fid).expect("FuncId in range");
         assert_eq!(ir_func.id, fid, "FuncId mismatch at sema name `{name}`");
         assert_eq!(
             ir_func.name, name,
@@ -85,7 +85,7 @@ function main() { }
     // Every user method in ResolvedModule has an IR function at the
     // same FuncId, with the canonical mangled name.
     for ((tn, mn), fid, _info) in resolved.user_methods_with_names() {
-        let ir_func = &ir.functions[fid.index()];
+        let ir_func = ir.lookup(fid).expect("FuncId in range");
         assert_eq!(ir_func.id, fid);
         let expected = format!("{tn}.{mn}");
         assert_eq!(
@@ -118,9 +118,9 @@ function main() {
     );
     let sema_count = analysis.module.functions.len() + analysis.module.user_methods.len();
     assert!(
-        ir.functions.len() >= sema_count,
+        ir.function_count() >= sema_count,
         "IR must have at least {sema_count} functions, has {}",
-        ir.functions.len()
+        ir.function_count()
     );
 }
 
@@ -140,9 +140,9 @@ function main() {
     // If any function exists past synthesized_start, it must be a
     // closure / specialization (`is_synthesized` must agree) and its
     // FuncId must match its position.
-    for (i, func) in ir.functions.iter().enumerate() {
-        let fid = func.id;
-        assert_eq!(fid.index(), i, "FuncId disagrees with vector position");
+    for (fid, slot) in ir.iter_slots() {
+        let i = fid.index();
+        assert_eq!(slot.func().id, fid, "FuncId disagrees with vector position");
         if i >= sema_count {
             assert!(
                 ir.is_synthesized(fid),
@@ -174,11 +174,12 @@ function main() {
 }
 "#,
     );
-    for (i, func) in ir.functions.iter().enumerate() {
+    for (fid, slot) in ir.iter_slots() {
         assert_ne!(
-            func.id.0,
+            slot.func().id.0,
             u32::MAX,
-            "IrModule.functions[{i}] still has FuncId(u32::MAX) sentinel"
+            "IrModule.functions[{}] still has FuncId(u32::MAX) sentinel",
+            fid.index()
         );
     }
 }

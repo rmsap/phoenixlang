@@ -111,7 +111,10 @@ impl<'m> IrInterpreter<'m> {
             return error("stack overflow: maximum call depth exceeded");
         }
 
-        let func = &self.module.functions[func_id.0 as usize];
+        let func = self
+            .module
+            .resolve_concrete(func_id)
+            .unwrap_or_else(|e| panic!("call_function: {e}"));
         let mut frame = CallFrame::new(func.value_count());
 
         // Bind arguments to entry block parameters.
@@ -438,6 +441,24 @@ impl<'m> IrInterpreter<'m> {
                     .collect::<Result<_>>()?;
                 Ok(IrValue::Closure(*func_id, captures))
             }
+            Op::ClosureLoadCapture(env_vid, capture_idx) => {
+                let env = frame.get(*env_vid)?;
+                match env {
+                    IrValue::Closure(_, captures) => captures
+                        .get(*capture_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| IrRuntimeError {
+                            message: format!(
+                                "Op::ClosureLoadCapture: capture index {capture_idx} out of range \
+                                 (closure has {} captures)",
+                                captures.len()
+                            ),
+                        }),
+                    other => error(format!(
+                        "Op::ClosureLoadCapture: env value is not a closure, got {other}"
+                    )),
+                }
+            }
 
             // --- Function calls ---
             Op::Call(func_id, type_args, arg_vids) => {
@@ -742,12 +763,103 @@ impl<'m> IrInterpreter<'m> {
         closure: &IrValue,
         user_args: Vec<IrValue>,
     ) -> Result<IrValue> {
-        if let IrValue::Closure(func_id, captures) = closure {
-            let mut all_args = captures.clone();
+        if let IrValue::Closure(func_id, _captures) = closure {
+            // Env-pointer calling convention: pass the closure value
+            // itself as the first arg. The callee reads its captures
+            // via Op::ClosureLoadCapture indexed off this env value.
+            let mut all_args = Vec::with_capacity(user_args.len() + 1);
+            all_args.push(closure.clone());
             all_args.extend(user_args);
             self.call_function(*func_id, all_args)
         } else {
             error(format!("expected closure, got {closure}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod closure_load_capture_tests {
+    //! Focused unit tests for [`Op::ClosureLoadCapture`] interpreter
+    //! semantics. The end-to-end roundtrip suite in
+    //! `tests/roundtrip_closures.rs` exercises the same op via lowered
+    //! source programs; these tests pin the op's contract independently
+    //! of the lowering path so an IR-side regression surfaces here even
+    //! if frontend lowering happens to mask it.
+    use super::*;
+    use phoenix_ir::types::IrType;
+
+    /// Build a minimal closure function `__closure(env: ClosureRef) -> Int`
+    /// whose body returns the capture at `capture_idx`. Captures are
+    /// recorded in `func.capture_types` and supplied at call time via
+    /// `IrValue::Closure(func_id, captures)`.
+    fn closure_loading(
+        capture_types: Vec<IrType>,
+        capture_idx: u32,
+        return_type: IrType,
+    ) -> IrModule {
+        let mut module = IrModule::new();
+        let env_ty = IrType::ClosureRef {
+            param_types: vec![],
+            return_type: Box::new(return_type.clone()),
+        };
+        let mut func = IrFunction::new_closure(
+            FuncId(u32::MAX),
+            "__closure_test".into(),
+            vec![env_ty.clone()],
+            vec!["__env".into()],
+            return_type.clone(),
+            None,
+            capture_types,
+        );
+        let entry = func.create_block();
+        let env = func.add_block_param(entry, env_ty);
+        let loaded = func
+            .emit(
+                entry,
+                Op::ClosureLoadCapture(env, capture_idx),
+                return_type,
+                None,
+            )
+            .expect("non-void emit returns Some");
+        func.set_terminator(entry, Terminator::Return(Some(loaded)));
+        module.push_concrete(func);
+        module
+    }
+
+    #[test]
+    fn loads_capture_at_index_zero() {
+        let module = closure_loading(vec![IrType::I64], 0, IrType::I64);
+        let mut interp = IrInterpreter::new(&module, Box::new(std::io::sink()));
+        let closure = IrValue::Closure(FuncId(0), vec![IrValue::Int(42)]);
+        let result = interp.call_closure(&closure, vec![]).unwrap();
+        assert_eq!(result, IrValue::Int(42));
+    }
+
+    #[test]
+    fn loads_capture_at_higher_index() {
+        let module = closure_loading(vec![IrType::I64, IrType::I64, IrType::I64], 2, IrType::I64);
+        let mut interp = IrInterpreter::new(&module, Box::new(std::io::sink()));
+        let closure = IrValue::Closure(
+            FuncId(0),
+            vec![IrValue::Int(10), IrValue::Int(20), IrValue::Int(30)],
+        );
+        let result = interp.call_closure(&closure, vec![]).unwrap();
+        assert_eq!(result, IrValue::Int(30));
+    }
+
+    #[test]
+    fn out_of_range_capture_index_errors() {
+        // `capture_idx = 5` against a closure value with 1 capture →
+        // `Op::ClosureLoadCapture` must surface a runtime error rather
+        // than panic or read past the end of the capture vector.
+        let module = closure_loading(vec![IrType::I64], 5, IrType::I64);
+        let mut interp = IrInterpreter::new(&module, Box::new(std::io::sink()));
+        let closure = IrValue::Closure(FuncId(0), vec![IrValue::Int(1)]);
+        let err = interp.call_closure(&closure, vec![]).unwrap_err();
+        assert!(
+            err.message.contains("ClosureLoadCapture") && err.message.contains("out of range"),
+            "expected out-of-range error, got: {}",
+            err.message
+        );
     }
 }

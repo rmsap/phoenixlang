@@ -12,7 +12,6 @@ use crate::context::CompileContext;
 use crate::error::CompileError;
 use crate::types::POINTER_TYPE;
 use phoenix_ir::instruction::ValueId;
-use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
 use super::closure_call::{call_closure_ptr, closure_return_elem_type};
@@ -50,7 +49,6 @@ use super::{FuncState, get_val1};
 pub(super) fn translate_list_flatmap(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
@@ -91,15 +89,8 @@ pub(super) fn translate_list_flatmap(
     builder.seal_block(body_block);
     builder.switch_to_block(body_block);
     let elem_vals = load_list_element(builder, list_ptr, i, elem_ty)?;
-    let inner_list_vals = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &elem_vals,
-        state,
-    )?;
+    let inner_list_vals =
+        call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &elem_vals, state)?;
     let inner_list = inner_list_vals[0];
 
     // Inner loop: for j in 0..inner_len, push to acc.
@@ -193,7 +184,6 @@ pub(super) fn translate_list_flatmap(
 pub(super) fn translate_list_sortby(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
-    ir_module: &IrModule,
     list_ptr: Value,
     elem_ty: &IrType,
     args: &[ValueId],
@@ -251,15 +241,7 @@ pub(super) fn translate_list_sortby(
     let elem_b = load_list_element(builder, copy_ptr, j, elem_ty)?;
     let mut cmp_args = elem_a.clone();
     cmp_args.extend(&elem_b);
-    let cmp_result = call_closure_ptr(
-        builder,
-        ctx,
-        ir_module,
-        closure_ptr,
-        closure_vid,
-        &cmp_args,
-        state,
-    )?;
+    let cmp_result = call_closure_ptr(builder, ctx, closure_ptr, closure_vid, &cmp_args, state)?;
     // If cmp_result > 0, swap.
     let should_swap = builder
         .ins()

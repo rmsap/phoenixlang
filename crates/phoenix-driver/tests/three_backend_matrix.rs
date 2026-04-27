@@ -142,3 +142,30 @@ backend_matrix_test!(matrix_collections, "collections.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 backend_matrix_test!(matrix_closures, "closures.phx");
+backend_matrix_test!(
+    matrix_closures_ambiguous_captures,
+    "closures_ambiguous_captures.phx"
+);
+backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx");
+
+/// Regression marker for closures returned from generic functions at
+/// *cross-width* instantiations (Int + String). Currently fails in
+/// `phoenix build` because the inner closure function is shared across
+/// specializations rather than cloned, and pass D erases its
+/// TypeVar-bearing `capture_types` to the `__generic` placeholder.
+/// Cranelift then mis-sizes the closure heap object for the wider
+/// instantiation. See the fixture's header comment and
+/// `docs/known-issues.md` for the full diagnosis.
+///
+/// Flip this to a `backend_matrix_test!` invocation when
+/// monomorphization clones closure functions per enclosing-generic
+/// substitution. `phoenix run` / `phoenix run-ir` already agree on
+/// the expected output (`15\nhi:there\n`).
+#[test]
+#[ignore = "closures-over-generic at cross-width instantiations: \
+            inner closure shared across specializations, capture_types \
+            erased to __generic, Cranelift mis-sizes heap layout. See \
+            docs/known-issues.md."]
+fn matrix_closures_over_generic_cross_width() {
+    assert_three_backend_agreement("closures_over_generic_cross_width.phx");
+}
