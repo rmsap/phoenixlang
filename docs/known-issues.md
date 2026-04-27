@@ -209,7 +209,7 @@ As a side effect, the Cranelift backend's payload-inference fallback chain in `p
 
 **File:** `phoenix-ir/src/module.rs` — `IrFunction.is_generic_template`; iteration helper `IrModule::concrete_functions`.
 **Planned fix:** Replace the bool flag with a typed split — a `ConcreteFunctions` newtype iterator, or two separate `functions` / `templates` fields — so the filter is enforceable at the type system level rather than at every call site.
-**Target phase:** Phase 2.6 or Phase 3. Pairs naturally with the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) scheduled for 2.6, since both are IR-shape refactors.
+**Target phase:** Phase 2.6 (locked in 2026-04-27). Bundled with the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) and the [`ValueId` allocator typed split](#irfunctionvalue_types-is-a-parallel-index-without-a-type-level-guarantee), since all three touch the same `IrModule` / `IrFunction` surface — bundling amortizes the disruption rather than ripping the IR open three times.
 
 ### `IrFunction.value_types` is a parallel index without a type-level guarantee
 
@@ -221,7 +221,7 @@ Today this is partly mitigated: the verifier's `verify_value_types_index` flags 
 
 **File:** `phoenix-ir/src/module.rs` — `IrFunction.value_types`, `fresh_value`, `emit`, `add_block_param`.
 **Planned fix:** Introduce a `ValueIdAllocator` newtype that owns both the counter and the parallel index; make `ValueId` allocation and type assignment the same operation at the type level (no API for "allocate a ValueId without assigning a type").  Length-mismatch bugs become compile errors instead of runtime verifier errors.
-**Target phase:** Phase 2.6 or Phase 3.  Pairs with the `is_generic_template` typed-split refactor above — both are IR-shape rewrites.
+**Target phase:** Phase 2.6 (locked in 2026-04-27). Bundled with the [`is_generic_template` typed-split refactor](#generic-template-stubs-tracked-by-a-bool-flag) and the [`Value::Closure` → IR blocks refactor](design-decisions.md#interpreter-parser-coupling-via-valueclosure) — all three are `IrModule` / `IrFunction` shape changes that share editors and risk surface.
 
 ### `dyn Trait` and `StringRef` share a 2-slot layout with no discriminator
 
