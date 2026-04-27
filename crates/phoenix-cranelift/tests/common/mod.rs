@@ -50,7 +50,7 @@ pub fn compile_to_obj(source: &str) -> Vec<u8> {
         "type errors: {:?}",
         result.diagnostics
     );
-    let module = phoenix_ir::lower(&program, &result);
+    let module = phoenix_ir::lower(&program, &result.module);
     let errors = phoenix_ir::verify::verify(&module);
     assert!(errors.is_empty(), "IR verification errors: {:?}", errors);
     phoenix_cranelift::compile(&module).expect("compilation failed")
@@ -67,7 +67,7 @@ pub fn ir_run(source: &str) -> Vec<String> {
         "type errors: {:?}",
         result.diagnostics
     );
-    let module = phoenix_ir::lower(&program, &result);
+    let module = phoenix_ir::lower(&program, &result.module);
     let errors = phoenix_ir::verify::verify(&module);
     assert!(errors.is_empty(), "IR verification errors: {:?}", errors);
     phoenix_ir_interp::run_and_capture(&module).expect("IR runtime error")
@@ -89,7 +89,8 @@ pub fn ast_run(source: &str) -> Vec<String> {
         "type errors: {:?}",
         result.diagnostics
     );
-    phoenix_interp::run_and_capture(&program, result.lambda_captures).expect("AST runtime error")
+    phoenix_interp::run_and_capture(&program, result.module.lambda_captures)
+        .expect("AST runtime error")
 }
 
 /// Assert that compiled output matches the IR interpreter output.

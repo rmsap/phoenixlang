@@ -295,20 +295,72 @@ This is becoming structurally load-bearing in four ways, each visible today:
 **Decision:** Introduce `ResolvedModule` as the single post-sema handoff type.  Everything downstream needs from sema — function signatures, struct / enum layouts, trait registry, method index, per-span expression types, per-span call type args, default-expression clones, visibility metadata once modules land — lives on `ResolvedModule`, indexed by stable ids (`FuncId`, `StructId`, `EnumId`, `TraitId`) not by source name.  Sema is the factory; IR lowering, IR interpreter, Cranelift backend, and LSP are readers.  `Checker` is consumed by `resolve(program) -> ResolvedModule` and dropped.
 **Decided:** 2026-04-24
 **Target phase:** Phase 2.2 — lands before the phase wraps.  Pure refactor, no semantic change.  Ships ahead of Phase 2.6 so the module-system work can build on a settled sema→IR boundary rather than redesigning it mid-phase.
+**Status:** ✅ **Implemented 2026-04-24.**  Sema now returns [`Analysis`](../crates/phoenix-sema/src/resolved.rs) from [`check`](../crates/phoenix-sema/src/checker.rs).  `Analysis` wraps a [`ResolvedModule`](../crates/phoenix-sema/src/resolved.rs) (the IR-facing schema) alongside auxiliary sema outputs that don't participate in the schema:
 
-**What moves onto `ResolvedModule`:**
+- **`Analysis.module: ResolvedModule`** — the id-indexed schema of resolved declarations: callables (free functions, user methods, built-in methods), types (structs, enums, traits), and the per-span maps (`expr_types`, `call_type_args`, `var_annotation_types`, `lambda_captures`).  This is what IR lowering, the IR interpreter, and the Cranelift backend consume.
+- **`Analysis.{diagnostics, endpoints, symbol_references, trait_impls, type_aliases}`** — auxiliary outputs.  `phoenix-codegen` reads `endpoints`; the LSP reads `symbol_references` and `diagnostics`; the driver/tests read `diagnostics`; `trait_impls` and `type_aliases` are sema-internal but kept around for future tooling.
 
-| From `Checker` field | Becomes `ResolvedModule` field | Indexed by |
+Stable ids (`FuncId`, `StructId`, `EnumId`, `TraitId`) live in [`phoenix_common::ids`](../crates/phoenix-common/src/ids.rs) and are allocated by [`Checker`](../crates/phoenix-sema/src/checker.rs)'s registration pass.  IR lowering does **not** re-walk the AST to assign or look up ids; it iterates [`ResolvedModule`'s id-indexed tables](../crates/phoenix-sema/src/resolved.rs) directly (see `register_declarations` in [`phoenix_ir::lower_decl`](../crates/phoenix-ir/src/lower_decl.rs)).  Because both sides agree by construction — IR doesn't have a registration walk order to drift from — `IrModule.functions[id.index()]` corresponds 1:1 with either `ResolvedModule.functions[id.index()]` (free function) or `ResolvedModule.user_methods[id.index() - user_method_offset]` (user method).  Synthesized callables (closures, generic specializations) are appended past the user-method range during lowering and monomorphization, and `IrModule.synthesized_start` / `IrModule.is_synthesized(id)` mark the boundary.
+
+The previously-deferred Phase 2.6 follow-up landed in the same diff: user-declared methods now carry their own [`FuncId`]s in [`MethodInfo::func_id`](../crates/phoenix-sema/src/checker.rs) and live in [`ResolvedModule::user_methods`].  Built-in stdlib methods (`Option.unwrap`, `List.push`, `String.length`, …) carry `func_id: None` and live in [`ResolvedModule::builtin_methods`] — they have no IR function (the Cranelift backend inlines each one), so issuing `FuncId`s for them would be wrong.
+
+**The journey of a `function f()` from source to IR.**  Useful as a contributor's first read:
+
+1. Parser produces `Declaration::Function(FunctionDecl { name: "f", … })` in `program.declarations`.
+2. Sema pre-pass A walks `program.declarations` once and allocates `FuncId(0..N)` to free functions in source order; pre-pass B does the same for user methods, allocating `FuncId(N..N+M)`.  Pre-pass results live in `Checker::pending_function_ids` / `pending_user_method_ids`.
+3. Sema's main checking pass populates `Checker::functions[name] → FunctionInfo { func_id, params, return_type, … }` for each declaration; the `func_id` field adopts the pre-allocated id verbatim.
+4. `phoenix_sema::checker::check` consumes the `Checker` (ownership move, then drop) and calls `build_from_checker` to flatten everything into `Analysis { module: ResolvedModule { functions: Vec<FunctionInfo>, user_methods: Vec<MethodInfo>, … }, diagnostics, endpoints, … }`.  The `Vec`s are indexed by id.
+5. IR's `lower_decl::register_declarations` iterates `resolved.functions_with_names()` and `resolved.user_methods_with_names()` in id order and creates one `IrFunction` stub per entry at the matching `FuncId` slot.  No AST walk is involved in pass 1 — registration is driven entirely by sema's id tables.
+6. IR's `lower_function_bodies` does walk the AST (because that's where the bodies live) and looks up the matching `FuncId` from `function_index` / `method_index` to attach each body to the right stub.
+
+**`Checker` ownership model.**  `Checker` is a mutable, internal accumulator used during checking; it never appears in any consumer's API.  `phoenix_sema::checker::check(program) -> Analysis` constructs a `Checker`, runs the registration + checking passes, calls `build_from_checker(program, checker)` (which moves rather than clones), and drops the `Checker`.  Consumers (codegen, IR lowering, LSP, driver, bench) receive `Analysis` (or just `&Analysis::module`) — never `Checker`.  This is what enables the LSP to keep multiple `Analysis` snapshots in flight without sharing mutable state.
+
+**Sema → IR consumer matrix.**  Who consumes which view of the sema product:
+
+| Crate | Takes | Why |
 |---|---|---|
-| `functions: HashMap<String, FunctionInfo>` | `functions: Vec<FunctionInfo>` | `FuncId` |
-| `structs: HashMap<String, StructInfo>` | `structs: Vec<StructInfo>` | `StructId` |
-| `enums: HashMap<String, EnumInfo>` | `enums: Vec<EnumInfo>` | `EnumId` |
-| `traits: HashMap<String, TraitInfo>` | `traits: Vec<TraitInfo>` | `TraitId` |
-| `method_index: HashMap<(String, String), FuncId>` | unchanged key shape; `FuncId` values stable | direct |
-| `expr_types: HashMap<Span, Type>` | unchanged | span |
-| `call_type_args: HashMap<Span, Vec<Type>>` | unchanged | span |
+| `phoenix-ir` | `&ResolvedModule` | Schema only — needs callable signatures, types, per-span maps. |
+| `phoenix-ir-interp` | `&ResolvedModule` | Same as above; runs IR directly. |
+| `phoenix-cranelift` | `&ResolvedModule` | Same as above; emits machine code from IR. |
+| `phoenix-codegen` | `&Analysis` | Reads `endpoints` (auxiliary) plus `module.struct_by_name` etc. for body types. |
+| `phoenix-lsp` | `&Analysis` | Reads `symbol_references` + `diagnostics` (auxiliary) plus `module` for hover/definition. |
+| `phoenix-driver` | `&Analysis` | Routes `diagnostics` to user, threads `&module` to IR lowering. |
+| `phoenix-bench` | `&Analysis` | Same shape as the driver. |
 
-Name→id lookup tables (`function_by_name: HashMap<String, FuncId>`, etc.) ride alongside.  Callers that still want name-based lookup pay one indirection; IR lowering migrates to id-based lookup wholesale.
+**Why two types instead of one.**  An earlier pass collapsed everything onto a single `ResolvedModule`, but that produced a schema-shaped name carrying schema-irrelevant data (semantic diagnostics on a "resolved" module reads contradictorily), forced IR lowering to take a 17-field god-struct when it only needed the schema slice, and made it ambiguous which fields a future addition belonged on.  The split keeps `ResolvedModule`'s contract clean ("the resolved schema; IR consumes this") and gives auxiliary outputs a dedicated home (`Analysis`) so adding new ones (e.g. macro-expansion traces, dependency edges) doesn't widen IR's parameter type.
+
+**Reserved-id zones.**  `EnumId(0)` is built-in `Option`; `EnumId(1)` is built-in `Result`.  User-declared enums start at `EnumId(2)`.  These three positions are exposed as the named constants [`OPTION_ENUM_ID`](../crates/phoenix-common/src/ids.rs), [`RESULT_ENUM_ID`](../crates/phoenix-common/src/ids.rs), and [`FIRST_USER_ENUM_ID`](../crates/phoenix-common/src/ids.rs) — `phoenix_sema::resolved::build_from_checker` `assert_eq!`s the placed position against the constants so a future built-in addition surfaces as a deliberate code change in three places (the constants, the placement loop, and the cross-check).  No other id space (`FuncId`, `StructId`, `TraitId`) has a reserved zone.
+
+**Pass-order invariant.**  `phoenix_sema::checker::Checker::check_program` runs three id-touching passes in strict order: pre-pass A (allocate `FuncId`s for free functions, AST order) → pre-pass B (allocate `FuncId`s for user methods, AST order, captured `user_method_offset = next_func_id` between the two) → registration (each `register_*` consumes the pending id from `pending_function_ids` / `pending_user_method_ids`).  A `debug_assert!` at the start of registration verifies `user_method_offset == pending_function_ids.len()` and that the boundary between A and B was captured correctly — a future refactor that reorders the passes fails loudly here instead of HashMap-index-panicking deep inside `register_function`.
+
+**No placeholder slots in the resolved Vecs.**  `build_from_checker` builds `Vec<Option<FunctionInfo>>` and `Vec<Option<MethodInfo>>` first, populates each slot exactly once during the registration drain (a second write panics — the dedup contract above is the gate for that), and `unwrap`s every slot when collecting into the final `Vec<FunctionInfo>` / `Vec<MethodInfo>`.  An unwritten slot panics with a clear "FuncId(N) was pre-allocated but never registered" diagnostic.  The released `ResolvedModule` therefore has no sentinel values and no unfilled slots — IR lowering can index by id without a defensive check.  IR's own `IrModule.functions` follows a related but distinct pattern: it pre-sizes its function table with `IrFunction(FuncId(u32::MAX))` placeholders and a debug-only assertion at the end of `register_declarations` confirms every slot was written; an unwritten IR slot would indicate a sema↔IR alignment bug, not a sema-internal one.
+
+**Final shape:**
+
+`ResolvedModule` (taken by `phoenix-ir`, `phoenix-ir-interp`, `phoenix-cranelift`):
+
+| Field | Type | Indexed by | Notes |
+|---|---|---|---|
+| `functions` | `Vec<FunctionInfo>` | `FuncId(0..N)` | Free functions in AST order |
+| `function_by_name` | `HashMap<String, FuncId>` | name | O(1) name → id |
+| `user_methods` | `Vec<MethodInfo>` | `FuncId(N..N+M) - user_method_offset` | User-declared methods in AST order |
+| `user_method_offset` | `u32` | — | `= functions.len()` |
+| `method_index` | `HashMap<String, HashMap<String, FuncId>>` | `type → method` | User methods only; nested so accessors borrow `&str` without allocating |
+| `builtin_methods` | `HashMap<String, HashMap<String, MethodInfo>>` | `(type, method)` | Stdlib methods; no `FuncId` |
+| `structs` / `enums` / `traits` | `Vec<…Info>` | `StructId` / `EnumId` / `TraitId` | `Option`/`Result` lead `enums` |
+| `*_by_name` | `HashMap<String, *Id>` | name | O(1) name → id |
+| `expr_types` / `call_type_args` / `var_annotation_types` / `lambda_captures` | `HashMap<Span, …>` | span | Pass-through from sema |
+
+`Analysis` (taken by `phoenix-codegen`, `phoenix-lsp`, `phoenix-driver`, `phoenix-bench`):
+
+| Field | Type | Notes |
+|---|---|---|
+| `module` | `ResolvedModule` | The IR-facing schema |
+| `diagnostics` | `Vec<Diagnostic>` | Empty iff valid |
+| `endpoints` | `Vec<EndpointInfo>` | `phoenix-codegen` |
+| `symbol_references` | `HashMap<Span, SymbolRef>` | LSP |
+| `trait_impls` | `HashSet<(String, String)>` | Sema-internal; preserved for tooling |
+| `type_aliases` | `HashMap<String, TypeAliasInfo>` | LSP completion / hover |
 
 **Keeping it a pure refactor.** No sema rule changes.  No IR op changes.  No ABI change.  The existing sema / IR / Cranelift test suites are the correctness bar — if any test behavior changes, the refactor regressed something.
 

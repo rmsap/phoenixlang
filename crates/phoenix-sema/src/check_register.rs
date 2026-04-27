@@ -132,9 +132,26 @@ impl Checker {
                 crate::checker::SymbolKind::Function,
                 func.name.clone(),
             );
+            // Adopt the pre-allocated FuncId from pre-pass A so sema
+            // and IR share an id space.  The id should always be
+            // present because `pre_allocate_function_ids` walks the
+            // same AST nodes — but we look it up safely so a future
+            // refactor that diverges the walks fails with a clear
+            // diagnostic instead of an unindexed-HashMap panic.
+            let func_id = *self
+                .pending_function_ids
+                .get(&func.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: function `{}` has no pre-allocated FuncId — \
+                         pre_allocate_function_ids and register_function disagree on AST walk order",
+                        func.name
+                    )
+                });
             self.functions.insert(
                 func.name.clone(),
                 FunctionInfo {
+                    func_id,
                     definition_span: func.name_span,
                     type_params: func.type_params.clone(),
                     type_param_bounds: func.type_param_bounds.clone(),
@@ -406,21 +423,55 @@ impl Checker {
                         .unwrap_or(Type::Void);
                     (params, param_names, default_param_exprs, return_type)
                 });
+            // Adopt the pre-allocated FuncId from pre-pass B so sema
+            // and IR share an id space.  The id should always be
+            // present because `pre_allocate_user_method_ids` walks
+            // the same AST nodes — but we look it up safely so a
+            // future refactor that diverges the walks fails with a
+            // clear diagnostic instead of an unindexed-HashMap panic.
+            let key = (imp.type_name.clone(), func.name.clone());
+            let func_id = *self.pending_user_method_ids.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "internal compiler error: method `{}.{}` has no pre-allocated FuncId — \
+                     pre_allocate_user_method_ids and register_impl disagree on AST walk order",
+                    imp.type_name, func.name
+                )
+            });
+            let has_self = func.params.first().is_some_and(|p| p.name == "self");
             methods_to_add.push((
                 func.name.clone(),
                 MethodInfo {
+                    func_id: Some(func_id),
                     definition_span: func.name_span,
                     params,
                     param_names,
                     default_param_exprs,
                     return_type,
                     type_params: func.type_params.clone(),
+                    has_self,
                 },
             ));
         }
         let type_methods = self.methods.entry(imp.type_name.clone()).or_default();
+        let mut duplicates: Vec<(String, Span)> = Vec::new();
         for (name, info) in methods_to_add {
-            type_methods.insert(name, info);
+            match type_methods.entry(name) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(info);
+                }
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    duplicates.push((slot.key().clone(), info.definition_span));
+                }
+            }
+        }
+        for (name, span) in duplicates {
+            self.error(
+                format!(
+                    "method `{}` is already defined for type `{}`",
+                    name, imp.type_name
+                ),
+                span,
+            );
         }
 
         if let Some(ref trait_name) = imp.trait_name {

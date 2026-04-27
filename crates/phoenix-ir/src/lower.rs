@@ -1,7 +1,7 @@
 //! AST-to-IR lowering pass.
 //!
 //! The main entry point is [`lower`], which takes a parsed AST and a
-//! [`CheckResult`] from semantic analysis and produces an [`IrModule`].
+//! [`ResolvedModule`] from semantic analysis and produces an [`IrModule`].
 //!
 //! The lowering is structured as two passes:
 //! - **Pass 1 (registration):** Walk all declarations to register struct/enum
@@ -17,13 +17,13 @@ use crate::terminator::Terminator;
 use crate::types::IrType;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::Program;
-use phoenix_sema::checker::CheckResult;
+use phoenix_sema::ResolvedModule;
 use phoenix_sema::types::Type;
 use std::collections::HashMap;
 
 /// Lower a type-checked Phoenix program into an IR module.
 ///
-/// Takes the parsed AST and the [`CheckResult`] from semantic analysis,
+/// Takes the parsed AST and the [`ResolvedModule`] from semantic analysis,
 /// and produces a fully-formed [`IrModule`] with all functions, methods,
 /// struct/enum layouts, and dispatch tables populated.
 ///
@@ -40,12 +40,36 @@ use std::collections::HashMap;
 /// bodies that still contain `IrType::TypeVar`. Do not call
 /// `monomorphize` separately after `lower` — it is not idempotent and
 /// would attempt to re-specialize the already-specialized module.
-pub fn lower(program: &Program, check_result: &CheckResult) -> IrModule {
+pub fn lower(program: &Program, check_result: &ResolvedModule) -> IrModule {
     let mut ctx = LoweringContext::new(check_result);
     ctx.lower_program(program);
     let mut module = ctx.module;
     crate::monomorphize::monomorphize(&mut module);
+    #[cfg(debug_assertions)]
+    debug_assert_no_placeholder_funcs(&module);
     module
+}
+
+/// Verify that no `IrFunction` retains the `FuncId(u32::MAX)`
+/// sentinel that `register_declarations` writes into pre-allocated
+/// slots.  If a slot survived all of registration, body lowering,
+/// and monomorphization unfilled, it points at a divergence between
+/// the size sema told us to allocate and the entries we actually
+/// wrote — i.e. the sema↔IR id contract is broken.  Debug-only
+/// because the check is O(N) and the contract is already guarded by
+/// the assertion at the end of `register_declarations`; this is
+/// belt-and-braces for the post-monomorphization state.
+#[cfg(debug_assertions)]
+fn debug_assert_no_placeholder_funcs(module: &IrModule) {
+    for (i, func) in module.functions.iter().enumerate() {
+        assert_ne!(
+            func.id.0,
+            u32::MAX,
+            "IrModule.functions[{i}] retains the FuncId(u32::MAX) placeholder \
+             — sema pre-allocated an id with no matching ResolvedModule entry, \
+             or a downstream pass wrote a placeholder without filling it"
+        );
+    }
 }
 
 /// Convert a source-level [`Type`] to an IR-level [`IrType`].
@@ -60,7 +84,7 @@ pub fn lower(program: &Program, check_result: &CheckResult) -> IrModule {
 /// Panics on `Type::Error` or on a `Type::Named` that sema failed to
 /// resolve — both indicate that earlier error-handling should have
 /// short-circuited before IR lowering.
-pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
+pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
     match ty {
         Type::Int => IrType::I64,
         Type::Float => IrType::F64,
@@ -68,11 +92,11 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
         Type::String => IrType::StringRef,
         Type::Void => IrType::Void,
         Type::Named(name) => {
-            if check_result.structs.contains_key(name) {
+            if check_result.struct_by_name.contains_key(name) {
                 // `Type::Named` has no generic args by construction (that
                 // shape is `Type::Generic` below), so args is empty.
                 IrType::StructRef(name.clone(), Vec::new())
-            } else if check_result.enums.contains_key(name) {
+            } else if check_result.enum_by_name.contains_key(name) {
                 // `Type::Named` has no generic args by construction (that
                 // shape is `Type::Generic` below), so the args vec is empty.
                 IrType::EnumRef(name.clone(), Vec::new())
@@ -132,7 +156,7 @@ pub fn lower_type(ty: &Type, check_result: &CheckResult) -> IrType {
                 // payload-type inference.
                 let ir_args: Vec<IrType> =
                     args.iter().map(|t| lower_type(t, check_result)).collect();
-                if check_result.structs.contains_key(other) {
+                if check_result.struct_by_name.contains_key(other) {
                     IrType::StructRef(other.to_string(), ir_args)
                 } else {
                     IrType::EnumRef(other.to_string(), ir_args)
@@ -169,8 +193,8 @@ pub(crate) struct LoopContext {
 
 /// Mutable context carried through the lowering pass.
 pub(crate) struct LoweringContext<'a> {
-    /// The sema [`CheckResult`] for type and signature lookups.
-    pub(crate) check: &'a CheckResult,
+    /// The sema [`ResolvedModule`] for type and signature lookups.
+    pub(crate) check: &'a ResolvedModule,
     /// The module being built.
     pub(crate) module: IrModule,
 
@@ -189,7 +213,7 @@ pub(crate) struct LoweringContext<'a> {
 
 impl<'a> LoweringContext<'a> {
     /// Creates a new lowering context.
-    fn new(check: &'a CheckResult) -> Self {
+    fn new(check: &'a ResolvedModule) -> Self {
         Self {
             check,
             module: IrModule::new(),
@@ -208,7 +232,7 @@ impl<'a> LoweringContext<'a> {
         self.register_builtin_enum_layouts();
 
         // Pass 1: Register all declarations (layouts, function stubs, indices).
-        self.register_declarations(program);
+        self.register_declarations();
 
         // Pass 2: Lower all function bodies.
         self.lower_function_bodies(program);
@@ -222,7 +246,7 @@ impl<'a> LoweringContext<'a> {
     /// each use site via type inference.
     fn register_builtin_enum_layouts(&mut self) {
         for name in &[crate::types::OPTION_ENUM, crate::types::RESULT_ENUM] {
-            if let Some(info) = self.check.enums.get(*name) {
+            if let Some(info) = self.check.enum_info_by_name(name) {
                 let variants: Vec<(String, Vec<IrType>)> = info
                     .variants
                     .iter()
@@ -310,13 +334,13 @@ impl<'a> LoweringContext<'a> {
     /// Returns a shared reference to the current function being lowered.
     pub(crate) fn current_func(&self) -> &IrFunction {
         let func_id = self.current_func_id.expect("no current function");
-        &self.module.functions[func_id.0 as usize]
+        &self.module.functions[func_id.index()]
     }
 
     /// Returns a mutable reference to the current function being lowered.
     pub(crate) fn current_func_mut(&mut self) -> &mut IrFunction {
         let func_id = self.current_func_id.expect("no current function");
-        &mut self.module.functions[func_id.0 as usize]
+        &mut self.module.functions[func_id.index()]
     }
 
     /// Returns the current function ID.

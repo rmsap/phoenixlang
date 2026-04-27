@@ -12,7 +12,8 @@
 use std::collections::BTreeSet;
 
 use phoenix_parser::ast::{Declaration, EnumDecl, Program, StructDecl};
-use phoenix_sema::checker::{CheckResult, DefaultValue, EndpointInfo};
+use phoenix_sema::Analysis;
+use phoenix_sema::checker::{DefaultValue, EndpointInfo};
 use phoenix_sema::types::Type;
 
 /// The output of Go code generation: four file contents.
@@ -28,14 +29,14 @@ pub struct GoFiles {
 }
 
 /// Generates Go code from a parsed and type-checked Phoenix program.
-pub fn generate_go(program: &Program, check_result: &CheckResult) -> GoFiles {
+pub fn generate_go(program: &Program, check_result: &Analysis) -> GoFiles {
     let generator = GoGenerator::new(check_result);
     generator.generate(program)
 }
 
 /// Internal Go code generator.
 struct GoGenerator<'a> {
-    check_result: &'a CheckResult,
+    check_result: &'a Analysis,
     types_out: String,
     client_out: String,
     handlers_out: String,
@@ -49,7 +50,7 @@ struct GoGenerator<'a> {
 
 impl<'a> GoGenerator<'a> {
     /// Creates a new Go generator with the given semantic analysis results.
-    fn new(check_result: &'a CheckResult) -> Self {
+    fn new(check_result: &'a Analysis) -> Self {
         Self {
             check_result,
             types_out: String::new(),
@@ -177,7 +178,7 @@ impl<'a> GoGenerator<'a> {
         self.types_out
             .push_str(&format!("type {} struct {{\n", s.name));
 
-        if let Some(info) = self.check_result.structs.get(&s.name) {
+        if let Some(info) = self.check_result.module.struct_info_by_name(&s.name) {
             for f in &info.fields {
                 let go_type = type_to_go(&f.ty);
                 let field_name = to_pascal_case(&f.name);
@@ -248,7 +249,7 @@ impl<'a> GoGenerator<'a> {
     /// Emits a `Validate() error` method on a Go struct if any of its fields
     /// have `where` constraints.
     fn emit_validate_method(&mut self, s: &StructDecl) {
-        let Some(info) = self.check_result.structs.get(&s.name) else {
+        let Some(info) = self.check_result.module.struct_info_by_name(&s.name) else {
             return;
         };
         if !info.fields.iter().any(|f| f.constraint.is_some()) {

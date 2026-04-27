@@ -18,7 +18,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `output` (or the input filename without `.phx`).
 pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
     let (program, check_result) = super::parse_and_check(path);
-    let ir_module = phoenix_ir::lower(&program, &check_result);
+    let ir_module = phoenix_ir::lower(&program, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
     if !errors.is_empty() {

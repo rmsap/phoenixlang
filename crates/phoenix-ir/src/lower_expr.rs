@@ -663,14 +663,13 @@ impl<'a> LoweringContext<'a> {
     ) -> Vec<ValueId> {
         // Clone owning copies to drop the borrow on `self.module`
         // before we call `lower_expr(&mut self)`.
-        let func = &self.module.functions[func_id.0 as usize];
+        let func = &self.module.functions[func_id.index()];
         let total = func.param_names.len();
         let param_names = func.param_names.clone();
         let func_name = func.name.clone();
         let defaults = self
             .check
-            .functions
-            .get(&func_name)
+            .function_info_by_name(&func_name)
             .map(|info| info.default_param_exprs.clone())
             .unwrap_or_default();
 
@@ -710,9 +709,7 @@ impl<'a> LoweringContext<'a> {
         // `assemble_call_args(&mut self)` runs.
         let (total, param_names, defaults) = self
             .check
-            .methods
-            .get(type_name)
-            .and_then(|m| m.get(method_name))
+            .method_info_by_name(type_name, method_name)
             .map(|info| {
                 (
                     info.params.len(),
@@ -1082,7 +1079,7 @@ impl<'a> LoweringContext<'a> {
 
         // Bind captures and parameters.
         for (i, name) in param_names.iter().enumerate() {
-            let param_type = self.module.functions[func_id.0 as usize].param_types[i].clone();
+            let param_type = self.module.functions[func_id.index()].param_types[i].clone();
             let val = self.add_block_param(entry, param_type.clone());
             let clean_name = name.strip_prefix("__cap_").unwrap_or(name);
             self.define_var(clean_name.to_string(), VarBinding::Direct(val, param_type));
@@ -1098,9 +1095,7 @@ impl<'a> LoweringContext<'a> {
                 // trailing expression flowing out of a `-> dyn Trait`
                 // lambda must be wrapped in a `(data_ptr, vtable_ptr)`
                 // pair at the function boundary.
-                let expected = self.module.functions[func_id.0 as usize]
-                    .return_type
-                    .clone();
+                let expected = self.module.functions[func_id.index()].return_type.clone();
                 let val = self.coerce_value_to_expected(val, &expected, lambda.body.span);
                 self.terminate(Terminator::Return(Some(val)));
             } else {

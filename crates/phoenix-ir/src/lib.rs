@@ -2,7 +2,7 @@
 //!
 //! This crate defines a flat, typed IR with basic blocks, explicit control
 //! flow, and SSA values.  The main entry point is [`lower::lower`], which
-//! takes a parsed AST and a [`phoenix_sema::CheckResult`] and produces an
+//! takes a parsed AST and a [`phoenix_sema::ResolvedModule`] and produces an
 //! [`IrModule`].
 //!
 //! # Architecture
@@ -10,7 +10,7 @@
 //! The IR sits between semantic analysis and code generation:
 //!
 //! ```text
-//! Source → Lexer → Parser (AST) → Sema (CheckResult)
+//! Source → Lexer → Parser (AST) → Sema (ResolvedModule)
 //!                                       ↓
 //!                                   IR Lowering (this crate)
 //!                                       ↓

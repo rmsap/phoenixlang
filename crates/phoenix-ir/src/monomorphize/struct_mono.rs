@@ -226,7 +226,7 @@ fn specialize_one_struct(
         .collect();
     for (method_name, template_fid) in template_methods {
         let new_fid = FuncId(module.functions.len() as u32);
-        let mut new_fn = module.functions[template_fid.0 as usize].clone();
+        let mut new_fn = module.functions[template_fid.index()].clone();
         new_fn.id = new_fid;
         new_fn.name = format!("{mangled}.{method_name}");
         new_fn.is_generic_template = false;
@@ -456,7 +456,7 @@ fn rewrite_method_calls(module: &mut IrModule, func_idx: usize, rename_map: &Str
                     && let Some(first_arg) = args.first()
                 {
                     // Is the callee a method on a generic struct?
-                    let callee_name = &module.functions[callee_fid.0 as usize].name;
+                    let callee_name = &module.functions[callee_fid.index()].name;
                     let (ty_name, method_name) = match callee_name.rsplit_once('.') {
                         Some((t, m)) => (t, m),
                         None => continue,

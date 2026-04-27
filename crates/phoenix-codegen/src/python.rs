@@ -13,7 +13,8 @@
 use std::collections::BTreeSet;
 
 use phoenix_parser::ast::{Declaration, EnumDecl, Program, StructDecl};
-use phoenix_sema::checker::{CheckResult, DefaultValue, EndpointInfo};
+use phoenix_sema::Analysis;
+use phoenix_sema::checker::{DefaultValue, EndpointInfo};
 use phoenix_sema::types::Type;
 
 /// The output of Python code generation: four file contents.
@@ -29,14 +30,14 @@ pub struct PythonFiles {
 }
 
 /// Generates Python code from a parsed and type-checked Phoenix program.
-pub fn generate_python(program: &Program, check_result: &CheckResult) -> PythonFiles {
+pub fn generate_python(program: &Program, check_result: &Analysis) -> PythonFiles {
     let generator = PyGenerator::new(check_result);
     generator.generate(program)
 }
 
 /// Internal Python code generator.
 struct PyGenerator<'a> {
-    check_result: &'a CheckResult,
+    check_result: &'a Analysis,
     models_out: String,
     client_out: String,
     handlers_out: String,
@@ -46,7 +47,7 @@ struct PyGenerator<'a> {
 
 impl<'a> PyGenerator<'a> {
     /// Creates a new Python generator with the given semantic analysis results.
-    fn new(check_result: &'a CheckResult) -> Self {
+    fn new(check_result: &'a Analysis) -> Self {
         Self {
             check_result,
             models_out: String::new(),
@@ -134,7 +135,7 @@ impl<'a> PyGenerator<'a> {
         for decl in &program.declarations {
             match decl {
                 Declaration::Struct(s) => {
-                    if let Some(info) = self.check_result.structs.get(&s.name)
+                    if let Some(info) = self.check_result.module.struct_info_by_name(&s.name)
                         && info.fields.iter().any(|f| f.constraint.is_some())
                     {
                         needs_field = true;
@@ -173,7 +174,7 @@ impl<'a> PyGenerator<'a> {
         self.models_out
             .push_str(&format!("class {}(BaseModel):\n", s.name));
 
-        if let Some(info) = self.check_result.structs.get(&s.name) {
+        if let Some(info) = self.check_result.module.struct_info_by_name(&s.name) {
             if info.fields.is_empty() {
                 self.models_out.push_str("    pass\n");
             } else {

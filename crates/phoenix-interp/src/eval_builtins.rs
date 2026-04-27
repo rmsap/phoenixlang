@@ -624,7 +624,7 @@ mod tests {
             "type errors: {:?}",
             result.diagnostics
         );
-        crate::interpreter::run_and_capture(&program, result.lambda_captures)
+        crate::interpreter::run_and_capture(&program, result.module.lambda_captures)
             .expect("runtime error")
     }
 
@@ -639,7 +639,8 @@ mod tests {
             "type errors: {:?}",
             result.diagnostics
         );
-        let run_result = crate::interpreter::run_and_capture(&program, result.lambda_captures);
+        let run_result =
+            crate::interpreter::run_and_capture(&program, result.module.lambda_captures);
         assert!(run_result.is_err(), "expected runtime error");
         let err_msg = run_result.unwrap_err().to_string();
         assert!(

@@ -128,7 +128,7 @@ fn float_division_by_zero() {
     assert!(parse_errors.is_empty());
     let check_result = checker::check(&program);
     assert!(check_result.diagnostics.is_empty());
-    let result = interpreter::run(&program, check_result.lambda_captures);
+    let result = interpreter::run(&program, check_result.module.lambda_captures);
     assert!(result.is_err());
 }
 
@@ -153,7 +153,7 @@ function main() {
     assert!(parse_errors.is_empty());
     let check_result = phoenix_sema::checker::check(&program);
     assert!(check_result.diagnostics.is_empty());
-    let result = phoenix_interp::interpreter::run(&program, check_result.lambda_captures);
+    let result = phoenix_interp::interpreter::run(&program, check_result.module.lambda_captures);
     assert!(
         result.is_err(),
         "expected runtime error for float division by zero"
@@ -173,7 +173,7 @@ function main() {
     assert!(parse_errors.is_empty());
     let check_result = phoenix_sema::checker::check(&program);
     assert!(check_result.diagnostics.is_empty());
-    let result = phoenix_interp::interpreter::run(&program, check_result.lambda_captures);
+    let result = phoenix_interp::interpreter::run(&program, check_result.module.lambda_captures);
     assert!(
         result.is_err(),
         "expected runtime error for integer division by zero"
@@ -222,7 +222,7 @@ function main() {
     assert!(parse_errors.is_empty());
     let check_result = phoenix_sema::checker::check(&program);
     assert!(check_result.diagnostics.is_empty());
-    let result = phoenix_interp::interpreter::run(&program, check_result.lambda_captures);
+    let result = phoenix_interp::interpreter::run(&program, check_result.module.lambda_captures);
     assert!(
         result.is_err(),
         "expected runtime error for integer overflow"
@@ -243,7 +243,7 @@ function main() {
     assert!(parse_errors.is_empty());
     let check_result = phoenix_sema::checker::check(&program);
     assert!(check_result.diagnostics.is_empty());
-    let result = phoenix_interp::interpreter::run(&program, check_result.lambda_captures);
+    let result = phoenix_interp::interpreter::run(&program, check_result.module.lambda_captures);
     assert!(
         result.is_err(),
         "expected runtime error for integer overflow"

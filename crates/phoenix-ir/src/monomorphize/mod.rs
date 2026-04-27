@@ -48,7 +48,7 @@
 //!
 //! The concrete type arguments this pass consumes are populated by sema's
 //! `Checker::record_inferred_type_args` (in `phoenix-sema/src/check_expr_call.rs`)
-//! into `CheckResult.call_type_args`, keyed by each call expression's
+//! into `ResolvedModule.call_type_args`, keyed by each call expression's
 //! source span. IR lowering (`crate::lower_expr`) looks them up at call
 //! sites via `LowerContext::resolve_call_type_args` and embeds them into
 //! the middle slot of `Op::Call`. This pass reads that middle slot, rewrites

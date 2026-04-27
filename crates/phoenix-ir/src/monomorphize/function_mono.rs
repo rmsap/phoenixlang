@@ -109,7 +109,7 @@ pub(super) fn assign_specialization_ids(
 
         // Build substitution for this specialization. The template's
         // `type_param_names` and `targs` are parallel lists.
-        let orig = &module.functions[orig_id.0 as usize];
+        let orig = &module.functions[orig_id.index()];
         let subst: HashMap<String, IrType> = orig
             .type_param_names
             .iter()
@@ -156,7 +156,7 @@ pub(super) fn clone_and_substitute_bodies(
     let mut new_funcs: Vec<IrFunction> = Vec::with_capacity(order.len());
 
     for (orig_id, targs, new_id) in order {
-        let orig = &module.functions[orig_id.0 as usize];
+        let orig = &module.functions[orig_id.index()];
         let subst: HashMap<String, IrType> = orig
             .type_param_names
             .iter()

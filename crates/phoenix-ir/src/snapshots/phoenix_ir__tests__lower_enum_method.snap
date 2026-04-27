@@ -2,6 +2,13 @@
 source: crates/phoenix-ir/src/tests.rs
 expression: ir
 ---
+func @main() -> bool {
+  bb0:
+    v0 = enum_alloc @Color:0
+    v1 = call f1(v0)
+    return v1
+}
+
 func @Color.is_red(self: enum.Color) -> bool {
   bb0(v0: enum.Color):
     v2 = enum_discriminant v0
@@ -20,11 +27,4 @@ func @Color.is_red(self: enum.Color) -> bool {
     jump bb3
   bb5:
     unreachable
-}
-
-func @main() -> bool {
-  bb0:
-    v0 = enum_alloc @Color:0
-    v1 = call f0(v0)
-    return v1
 }

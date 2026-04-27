@@ -78,11 +78,11 @@ fn bench_pipeline(c: &mut Criterion) {
 
         // Stage 4: IR lowering
         group.bench_function("ir_lower", |b| {
-            b.iter(|| phoenix_ir::lower(black_box(&program), black_box(&check_result)));
+            b.iter(|| phoenix_ir::lower(black_box(&program), black_box(&check_result.module)));
         });
 
         // Pre-compute IR module for IR interpreter benchmark
-        let ir_module = phoenix_ir::lower(&program, &check_result);
+        let ir_module = phoenix_ir::lower(&program, &check_result.module);
 
         // Stage 5: Cranelift native code generation.
         // Like the IR interpreter bench, probe support at setup time and
@@ -111,7 +111,7 @@ fn bench_pipeline(c: &mut Criterion) {
         // Stage 7: Tree-walk interpretation
         // Uses iter_batched so that the captures.clone() setup cost is excluded
         // from the measurement (run_and_capture takes ownership of the map).
-        let captures = check_result.lambda_captures.clone();
+        let captures = check_result.module.lambda_captures.clone();
         group.bench_function("interp", |b| {
             b.iter_batched(
                 || captures.clone(),
@@ -135,7 +135,7 @@ fn bench_pipeline(c: &mut Criterion) {
                 let tokens = phoenix_lexer::tokenize(black_box(source), BENCH_SOURCE_ID);
                 let (program, _) = phoenix_parser::parse(&tokens);
                 let check_result = phoenix_sema::check(&program);
-                phoenix_ir::lower(&program, &check_result)
+                phoenix_ir::lower(&program, &check_result.module)
             });
         });
 
@@ -148,7 +148,7 @@ fn bench_pipeline(c: &mut Criterion) {
                     let tokens = phoenix_lexer::tokenize(black_box(source), BENCH_SOURCE_ID);
                     let (program, _) = phoenix_parser::parse(&tokens);
                     let check_result = phoenix_sema::check(&program);
-                    let ir_module = phoenix_ir::lower(&program, &check_result);
+                    let ir_module = phoenix_ir::lower(&program, &check_result.module);
                     phoenix_cranelift::compile(&ir_module)
                 });
             });

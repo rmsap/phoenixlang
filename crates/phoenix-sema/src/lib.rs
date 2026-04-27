@@ -21,14 +21,18 @@ mod check_types;
 pub mod checker;
 #[cfg(test)]
 mod checker_tests;
+mod id_alloc;
 mod object_safety;
+/// The post-sema handoff type [`ResolvedModule`](resolved::ResolvedModule).
+pub mod resolved;
 /// Lexical scope stack for variable name resolution.
 pub mod scope;
 /// The Phoenix type system representation.
 pub mod types;
 
 pub use checker::{
-    CheckResult, DefaultValue, DerivedField, EndpointInfo, EnumInfo, FieldInfo, FunctionInfo,
-    MethodInfo, QueryParamInfo, ResolvedDerivedType, StructInfo, SymbolKind, SymbolRef, TraitInfo,
+    DefaultValue, DerivedField, EndpointInfo, EnumInfo, FieldInfo, FunctionInfo, MethodInfo,
+    QueryParamInfo, ResolvedDerivedType, StructInfo, SymbolKind, SymbolRef, TraitInfo,
     TraitMethodInfo, TypeAliasInfo, check,
 };
+pub use resolved::{Analysis, ResolvedModule};

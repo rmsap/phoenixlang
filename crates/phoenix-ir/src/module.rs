@@ -107,6 +107,25 @@ pub struct IrModule {
     /// in `DynRef` / `DynCall` positions, so no IR-level consumer needs
     /// their signatures.
     pub traits: HashMap<String, IrTraitInfo>,
+    /// Boundary between user-declared callables and synthesized ones
+    /// in [`Self::functions`].  Free functions occupy
+    /// `FuncId(0..user_method_offset)`, user-declared methods occupy
+    /// `FuncId(user_method_offset..user_method_offset + n_user_methods)`,
+    /// and any [`FuncId`] past that point is a synthesized callable
+    /// (closure or generic specialization) appended during body
+    /// lowering and monomorphization.
+    ///
+    /// Mirrors `phoenix_sema::ResolvedModule::user_method_offset` and
+    /// is set in lockstep at the end of
+    /// [`crate::lower_decl::LoweringContext::register_declarations`].
+    /// Zero on a freshly-constructed `IrModule::new()`.
+    pub user_method_offset: u32,
+    /// Total count of callables registered from sema's tables (free
+    /// functions + user methods).  `FuncId(synthesized_start..)` is
+    /// reserved for closures and monomorphized specializations.
+    /// Equal to `user_method_offset + n_user_methods` after
+    /// `register_declarations` runs.
+    pub synthesized_start: u32,
 }
 
 impl IrModule {
@@ -207,7 +226,17 @@ impl IrModule {
             method_index: HashMap::new(),
             dyn_vtables: HashMap::new(),
             traits: HashMap::new(),
+            user_method_offset: 0,
+            synthesized_start: 0,
         }
+    }
+
+    /// `true` if `id` was synthesized post-registration (closure or
+    /// monomorphized specialization), as opposed to coming from
+    /// sema's id pre-allocation.
+    #[inline]
+    pub fn is_synthesized(&self, id: FuncId) -> bool {
+        id.0 >= self.synthesized_start
     }
 }
 

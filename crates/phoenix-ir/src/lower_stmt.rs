@@ -86,12 +86,8 @@ impl<'a> LoweringContext<'a> {
         self.switch_to_block(entry);
 
         // Bind parameters as variables.
-        let param_types = self.module.functions[func_id.0 as usize]
-            .param_types
-            .clone();
-        let param_names = self.module.functions[func_id.0 as usize]
-            .param_names
-            .clone();
+        let param_types = self.module.functions[func_id.index()].param_types.clone();
+        let param_names = self.module.functions[func_id.index()].param_names.clone();
 
         // Allocate ValueIds for parameters by emitting Copy ops from
         // block parameters (parameters are the first values in the entry block).
@@ -106,9 +102,7 @@ impl<'a> LoweringContext<'a> {
 
         // If the function returns non-void and we have a result, return it.
         // Otherwise return void.
-        let return_type = self.module.functions[func_id.0 as usize]
-            .return_type
-            .clone();
+        let return_type = self.module.functions[func_id.index()].return_type.clone();
 
         // Check if the current block already has a terminator (e.g. from a return statement).
         let needs_terminator = {
@@ -259,7 +253,7 @@ impl<'a> LoweringContext<'a> {
                 // `dyn Trait` slot unwrapped. The planned Phase-3 fix
                 // re-keys both this map and `call_type_args` on a stable
                 // `NodeId` assigned at parse time; see the field doc on
-                // `phoenix-sema/src/checker.rs::CheckResult::var_annotation_types`.
+                // `phoenix-sema/src/checker.rs::ResolvedModule::var_annotation_types`.
                 let (init_val, ir_type) = match self.check.var_annotation_types.get(&v.span) {
                     Some(annotated) => {
                         let expected = lower_type(annotated, self.check);

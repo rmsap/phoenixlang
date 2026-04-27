@@ -18,7 +18,8 @@ pub fn ast_run(source: &str) -> Vec<String> {
         "type errors: {:?}",
         result.diagnostics
     );
-    phoenix_interp::run_and_capture(&program, result.lambda_captures).expect("AST runtime error")
+    phoenix_interp::run_and_capture(&program, result.module.lambda_captures)
+        .expect("AST runtime error")
 }
 
 /// Run source through the IR interpreter and capture print() output.
@@ -32,7 +33,7 @@ pub fn ir_run(source: &str) -> Vec<String> {
         "type errors: {:?}",
         result.diagnostics
     );
-    let module = phoenix_ir::lower(&program, &result);
+    let module = phoenix_ir::lower(&program, &result.module);
     let errors = phoenix_ir::verify::verify(&module);
     assert!(errors.is_empty(), "IR verification errors: {:?}", errors);
     phoenix_ir_interp::run_and_capture(&module).expect("IR runtime error")
@@ -62,7 +63,7 @@ pub fn ir_run_result(
         "type errors: {:?}",
         result.diagnostics
     );
-    let module = phoenix_ir::lower(&program, &result);
+    let module = phoenix_ir::lower(&program, &result.module);
     let errors = phoenix_ir::verify::verify(&module);
     assert!(errors.is_empty(), "IR verification errors: {:?}", errors);
     phoenix_ir_interp::run_and_capture(&module)

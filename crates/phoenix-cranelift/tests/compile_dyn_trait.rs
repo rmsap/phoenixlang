@@ -642,7 +642,7 @@ function main() {
 /// pair appearing at many DynAlloc sites yields exactly one entry in
 /// `IrModule::dyn_vtables`.  A direct unit test of
 /// `register_dyn_vtable` isn't practical (it's tied to `LoweringContext`
-/// which needs a `CheckResult`), so we exercise it end-to-end via the
+/// which needs a `ResolvedModule`), so we exercise it end-to-end via the
 /// public lowering entry point and inspect the resulting module.
 #[test]
 fn dyn_vtable_registration_is_idempotent() {
@@ -673,7 +673,7 @@ function main() {
     assert!(parse_errors.is_empty());
     let result = checker::check(&program);
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-    let module = phoenix_ir::lower(&program, &result);
+    let module = phoenix_ir::lower(&program, &result.module);
 
     let matching: Vec<_> = module
         .dyn_vtables

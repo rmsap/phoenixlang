@@ -22,7 +22,7 @@ pub fn run(source: &str) {
         "type errors: {:?}",
         result.diagnostics
     );
-    interpreter::run(&program, result.lambda_captures).expect("runtime error");
+    interpreter::run(&program, result.module.lambda_captures).expect("runtime error");
 }
 
 /// Run source through the full pipeline and capture `print()` output.
@@ -37,7 +37,7 @@ pub fn run_capturing(source: &str) -> Vec<String> {
         "type errors: {:?}",
         result.diagnostics
     );
-    interpreter::run_and_capture(&program, result.lambda_captures).expect("runtime error")
+    interpreter::run_and_capture(&program, result.module.lambda_captures).expect("runtime error")
 }
 
 /// Run source and assert that `print()` output matches expected lines exactly.
@@ -90,7 +90,7 @@ pub fn expect_runtime_error(source: &str, expected: &str) {
         "type errors: {:?}",
         check_result.diagnostics
     );
-    let result = interpreter::run(&program, check_result.lambda_captures);
+    let result = interpreter::run(&program, check_result.module.lambda_captures);
     assert!(
         result.is_err(),
         "expected runtime error containing '{}'",

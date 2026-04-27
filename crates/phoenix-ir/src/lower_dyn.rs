@@ -128,7 +128,7 @@ impl<'a> LoweringContext<'a> {
         args: Vec<ValueId>,
         span: Span,
     ) -> Vec<ValueId> {
-        let param_types = self.module.functions[callee.0 as usize].param_types.clone();
+        let param_types = self.module.functions[callee.index()].param_types.clone();
         self.coerce_args_to_expected(args, &param_types, span)
     }
 
@@ -264,8 +264,7 @@ impl<'a> LoweringContext<'a> {
     pub(crate) fn register_dyn_vtable(&mut self, trait_name: &str, concrete_type: &str) {
         let method_names: Vec<String> = self
             .check
-            .traits
-            .get(trait_name)
+            .trait_info_by_name(trait_name)
             .unwrap_or_else(|| {
                 unreachable!(
                     "compiler bug: register_dyn_vtable for `{concrete_type}` as \

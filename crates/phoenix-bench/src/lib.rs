@@ -70,7 +70,7 @@ pub const TYPE_ERROR: &str = include_str!("../benches/fixtures/type_error.phx");
 
 /// Lex → parse → sema, panicking on errors.  Returns the checked program and
 /// sema result so callers can feed them to an interpreter or IR lowering.
-fn check_fixture(name: &str, source: &str) -> (phoenix_parser::Program, phoenix_sema::CheckResult) {
+fn check_fixture(name: &str, source: &str) -> (phoenix_parser::Program, phoenix_sema::Analysis) {
     let tokens = phoenix_lexer::tokenize(source, BENCH_SOURCE_ID);
     let (program, parse_diags) = phoenix_parser::parse(&tokens);
     assert!(
@@ -92,7 +92,7 @@ fn check_fixture(name: &str, source: &str) -> (phoenix_parser::Program, phoenix_
 /// any errors.  Returns the number of functions in the resulting IR module.
 pub fn compile(name: &str, source: &str) -> usize {
     let (program, check_result) = check_fixture(name, source);
-    let ir_module = phoenix_ir::lower(&program, &check_result);
+    let ir_module = phoenix_ir::lower(&program, &check_result.module);
     ir_module.functions.len()
 }
 
@@ -100,7 +100,7 @@ pub fn compile(name: &str, source: &str) -> usize {
 /// interpreter.  Returns the captured output lines.
 pub fn run_tree_walk(name: &str, source: &str) -> Vec<String> {
     let (program, check_result) = check_fixture(name, source);
-    phoenix_interp::run_and_capture(&program, check_result.lambda_captures)
+    phoenix_interp::run_and_capture(&program, check_result.module.lambda_captures)
         .unwrap_or_else(|e| panic!("{name} failed in tree-walk interpreter: {e:?}"))
 }
 
@@ -108,7 +108,7 @@ pub fn run_tree_walk(name: &str, source: &str) -> Vec<String> {
 /// Returns the captured output lines.
 pub fn run_ir(name: &str, source: &str) -> Vec<String> {
     let (program, check_result) = check_fixture(name, source);
-    let ir_module = phoenix_ir::lower(&program, &check_result);
+    let ir_module = phoenix_ir::lower(&program, &check_result.module);
     phoenix_ir_interp::run_and_capture(&ir_module)
         .unwrap_or_else(|e| panic!("{name} failed in IR interpreter: {e:?}"))
 }

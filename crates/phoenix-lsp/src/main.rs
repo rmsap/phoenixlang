@@ -11,8 +11,9 @@ use phoenix_common::source::SourceMap;
 use phoenix_common::span::{SourceId, Span};
 use phoenix_lexer::lexer::tokenize;
 use phoenix_parser::parser;
-use phoenix_sema::checker::{self, CheckResult, SymbolKind};
+use phoenix_sema::checker::{self, SymbolKind};
 use phoenix_sema::types::Type;
+use phoenix_sema::{Analysis, ResolvedModule};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -27,7 +28,7 @@ struct DocumentState {
     /// The source file identifier within the source map.
     source_id: SourceId,
     /// Semantic analysis results (types, diagnostics, symbol references).
-    check_result: CheckResult,
+    check_result: Analysis,
 }
 
 /// The Phoenix language server backend.
@@ -164,7 +165,7 @@ impl LanguageServer for Backend {
         let offset = position_to_offset(&state.source, pos);
 
         // Check if cursor is on an expression with a known type
-        for (span, ty) in &state.check_result.expr_types {
+        for (span, ty) in &state.check_result.module.expr_types {
             if span.source_id == state.source_id && span.start <= offset && offset < span.end {
                 let type_str = format_type(ty);
                 return Ok(Some(Hover {
@@ -191,7 +192,7 @@ impl LanguageServer for Backend {
         let mut items = Vec::new();
 
         // Suggest struct names
-        for name in state.check_result.structs.keys() {
+        for name in state.check_result.module.struct_by_name.keys() {
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::STRUCT),
@@ -200,7 +201,7 @@ impl LanguageServer for Backend {
         }
 
         // Suggest enum names
-        for name in state.check_result.enums.keys() {
+        for name in state.check_result.module.enum_by_name.keys() {
             items.push(CompletionItem {
                 label: name.clone(),
                 kind: Some(CompletionItemKind::ENUM),
@@ -209,7 +210,8 @@ impl LanguageServer for Backend {
         }
 
         // Suggest function names
-        for (name, info) in &state.check_result.functions {
+        for (name, &id) in &state.check_result.module.function_by_name {
+            let info = state.check_result.module.function(id);
             let params: Vec<String> = info
                 .param_names
                 .iter()
@@ -264,7 +266,7 @@ impl LanguageServer for Backend {
                 && span.start <= offset
                 && offset < span.end
                 && let Some(def_span) =
-                    find_definition_span(&sym_ref.kind, &sym_ref.name, &state.check_result)
+                    find_definition_span(&sym_ref.kind, &sym_ref.name, &state.check_result.module)
             {
                 let range = span_to_range(&def_span, &state.source_map, state.source_id);
                 return Ok(Some(GotoDefinitionResponse::Scalar(Location {
@@ -464,24 +466,24 @@ fn format_type(ty: &Type) -> String {
 }
 
 /// Finds the definition span for a symbol given its kind and name.
-fn find_definition_span(kind: &SymbolKind, name: &str, cr: &CheckResult) -> Option<Span> {
+fn find_definition_span(kind: &SymbolKind, name: &str, cr: &ResolvedModule) -> Option<Span> {
     match kind {
-        SymbolKind::Function => cr.functions.get(name).map(|f| f.definition_span),
-        SymbolKind::Struct => cr.structs.get(name).map(|s| s.definition_span),
-        SymbolKind::Enum => cr.enums.get(name).map(|e| e.definition_span),
-        SymbolKind::Variable => None, // Variable definitions tracked via VarInfo, not in CheckResult
-        SymbolKind::Field { struct_name } => cr.structs.get(struct_name).and_then(|s| {
+        SymbolKind::Function => cr.function_info_by_name(name).map(|f| f.definition_span),
+        SymbolKind::Struct => cr.struct_info_by_name(name).map(|s| s.definition_span),
+        SymbolKind::Enum => cr.enum_info_by_name(name).map(|e| e.definition_span),
+        SymbolKind::Variable => None, // Variable definitions tracked via VarInfo, not in ResolvedModule
+        SymbolKind::Field { struct_name } => cr.struct_info_by_name(struct_name).and_then(|s| {
             s.fields
                 .iter()
                 .find(|f| f.name == name)
                 .map(|f| f.definition_span)
         }),
         SymbolKind::Method { type_name } => cr
-            .methods
-            .get(type_name)
-            .and_then(|ms| ms.get(name))
+            .method_info_by_name(type_name, name)
             .map(|m| m.definition_span),
-        SymbolKind::EnumVariant { enum_name } => cr.enums.get(enum_name).map(|e| e.definition_span),
+        SymbolKind::EnumVariant { enum_name } => {
+            cr.enum_info_by_name(enum_name).map(|e| e.definition_span)
+        }
     }
 }
 
@@ -590,7 +592,7 @@ mod tests {
         );
         let (program, _) = parser::parse(&tokens);
         let result = checker::check(&program);
-        let span = find_definition_span(&SymbolKind::Function, "add", &result);
+        let span = find_definition_span(&SymbolKind::Function, "add", &result.module);
         assert!(
             span.is_some(),
             "should find definition span for function add"
@@ -604,7 +606,7 @@ mod tests {
         let tokens = tokenize("struct User { Int id }\nfunction main() { }", SourceId(0));
         let (program, _) = parser::parse(&tokens);
         let result = checker::check(&program);
-        let span = find_definition_span(&SymbolKind::Struct, "User", &result);
+        let span = find_definition_span(&SymbolKind::Struct, "User", &result.module);
         assert!(
             span.is_some(),
             "should find definition span for struct User"
@@ -616,7 +618,7 @@ mod tests {
         let tokens = tokenize("function main() { }", SourceId(0));
         let (program, _) = parser::parse(&tokens);
         let result = checker::check(&program);
-        let span = find_definition_span(&SymbolKind::Function, "nonexistent", &result);
+        let span = find_definition_span(&SymbolKind::Function, "nonexistent", &result.module);
         assert!(span.is_none());
     }
 
@@ -683,7 +685,7 @@ mod tests {
                 struct_name: "Point".to_string(),
             },
             "x",
-            &result,
+            &result.module,
         );
         assert!(
             span.is_some(),
@@ -796,7 +798,7 @@ mod tests {
         let tokens = tokenize(src, SourceId(0));
         let (program, _) = parser::parse(&tokens);
         let result = checker::check(&program);
-        let span = find_definition_span(&SymbolKind::Struct, "Scene", &result);
+        let span = find_definition_span(&SymbolKind::Struct, "Scene", &result.module);
         assert!(span.is_some(), "struct Scene with dyn field should resolve");
         let s = span.unwrap();
         assert!(s.start < s.end);
@@ -819,7 +821,7 @@ mod tests {
                 struct_name: "Scene".to_string(),
             },
             "hero",
-            &result,
+            &result.module,
         );
         assert!(span.is_some(), "dyn-typed field `hero` should resolve");
         let s = span.unwrap();
@@ -839,7 +841,7 @@ mod tests {
                 type_name: "Point".to_string(),
             },
             "display",
-            &result,
+            &result.module,
         );
         assert!(
             span.is_some(),
@@ -861,7 +863,7 @@ mod tests {
                 enum_name: "Shape".to_string(),
             },
             "Circle",
-            &result,
+            &result.module,
         );
         assert!(
             span.is_some(),

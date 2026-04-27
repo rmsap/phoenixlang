@@ -93,7 +93,7 @@ fn module_of(funcs: Vec<IrFunction>) -> IrModule {
 
 /// Look up a function by name and return a reference.
 fn lookup<'a>(m: &'a IrModule, name: &str) -> &'a IrFunction {
-    &m.functions[m.function_index[name].0 as usize]
+    &m.functions[m.function_index[name].index()]
 }
 
 /// Destructure the `Op::Call` at `(block, instr)` within `func`,
@@ -587,7 +587,7 @@ fn struct_mono_specializes_methods_and_updates_method_index() {
         .get(&("Container__i64".to_string(), "get".to_string()))
         .copied()
         .expect("specialized method_index entry missing");
-    let spec = &module.functions[spec_fid.0 as usize];
+    let spec = &module.functions[spec_fid.index()];
     assert!(!spec.is_generic_template);
     assert_eq!(spec.name, "Container__i64.get");
     // self param's StructRef args rewritten to empty (mangled form).
@@ -676,7 +676,7 @@ fn struct_mono_rekeys_dyn_vtables_for_generic_struct() {
 
     // DynAlloc op's concrete name rewritten.
     let main_fid = module.function_index["main"];
-    let dyn_instr = &module.functions[main_fid.0 as usize].blocks[0].instructions[1];
+    let dyn_instr = &module.functions[main_fid.index()].blocks[0].instructions[1];
     match &dyn_instr.op {
         Op::DynAlloc(trait_name, concrete, _) => {
             assert_eq!(trait_name, "Show");

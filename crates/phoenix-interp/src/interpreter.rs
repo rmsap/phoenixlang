@@ -1385,7 +1385,7 @@ impl Interpreter {
 /// let check_result = checker::check(&program);
 /// assert!(check_result.diagnostics.is_empty());
 ///
-/// let result = interpreter::run(&program, check_result.lambda_captures);
+/// let result = interpreter::run(&program, check_result.module.lambda_captures);
 /// assert!(result.is_ok());
 /// ```
 pub fn run(
@@ -1439,7 +1439,7 @@ impl Write for SharedWriter {
 /// let (program, _) = parser::parse(&tokens);
 /// let check_result = checker::check(&program);
 ///
-/// let output = interpreter::run_and_capture(&program, check_result.lambda_captures).unwrap();
+/// let output = interpreter::run_and_capture(&program, check_result.module.lambda_captures).unwrap();
 /// assert_eq!(output, vec!["hello", "42"]);
 /// ```
 pub fn run_and_capture(

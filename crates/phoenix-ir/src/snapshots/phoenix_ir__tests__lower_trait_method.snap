@@ -2,16 +2,16 @@
 source: crates/phoenix-ir/src/tests.rs
 expression: ir
 ---
-func @Person.greet(self: struct.Person) -> string {
-  bb0(v0: struct.Person):
-    v1 = struct_get_field v0, 0
-    return v1
-}
-
 func @main() -> string {
   bb0:
     v0 = const_string "Alice"
     v1 = struct_alloc @Person(v0)
-    v2 = call f0(v1)
+    v2 = call f1(v1)
     return v2
+}
+
+func @Person.greet(self: struct.Person) -> string {
+  bb0(v0: struct.Person):
+    v1 = struct_get_field v0, 0
+    return v1
 }

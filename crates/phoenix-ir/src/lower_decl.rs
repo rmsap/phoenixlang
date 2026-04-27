@@ -1,76 +1,112 @@
 //! Pass 1: Declaration registration.
 //!
-//! Walks all top-level declarations to register struct/enum layouts,
-//! create function stubs, and populate the module's lookup tables.
+//! Registers struct/enum layouts, function stubs, and the lookup
+//! tables.  Driven entirely by [`phoenix_sema::ResolvedModule`]'s
+//! id-indexed tables (no AST walk) — see
+//! [`phoenix_common::ids`] for the id contract and
+//! [`phoenix_sema::resolved`] for the schema.  Synthesized callables
+//! (closures, monomorphized specializations) are appended past
+//! [`crate::module::IrModule::synthesized_start`] in later passes.
 
 use crate::instruction::FuncId;
 use crate::lower::{LoweringContext, lower_type};
 use crate::module::{IrFunction, IrTraitInfo, IrTraitMethod};
 use crate::types::IrType;
-use phoenix_parser::ast::{Declaration, FunctionDecl, Program};
+use phoenix_sema::checker::{FunctionInfo, MethodInfo};
+
+/// `(type_name, type_params, fields)` triple staged by
+/// `register_struct_layouts` before installing into `IrModule`.
+type StructLayoutEntry = (String, Vec<String>, Vec<(String, IrType)>);
+
+/// `(type_name, type_params, variants)` triple staged by
+/// `register_enum_layouts` before installing into `IrModule`.
+type EnumLayoutEntry = (String, Vec<String>, Vec<(String, Vec<IrType>)>);
 
 impl<'a> LoweringContext<'a> {
     /// Pass 1: Register all declarations.
-    pub(crate) fn register_declarations(&mut self, program: &Program) {
+    ///
+    /// Drives off [`ResolvedModule`]'s id-indexed tables, so the
+    /// resulting `IrModule` automatically agrees with sema on every
+    /// [`FuncId`] / [`StructId`] / [`EnumId`] / [`TraitId`] without
+    /// needing to coordinate two AST walks.  No `Program` argument
+    /// is needed because registration draws every name and id from
+    /// the resolved tables — only `lower_function_bodies` (pass 2)
+    /// walks the AST.
+    pub(crate) fn register_declarations(&mut self) {
         // Mirror sema's object-safe traits into IR-level metadata so
         // verifier / codegen / interpreter can answer "slot count" and
         // "method signature" without sampling impls or reaching back
         // into sema.  See `IrModule::traits`.
         self.register_traits();
 
-        for decl in &program.declarations {
-            match decl {
-                Declaration::Struct(s) => self.register_struct(s),
-                Declaration::Enum(e) => self.register_enum(e),
-                Declaration::Function(f) => {
-                    self.register_function(f);
-                }
-                Declaration::Impl(imp) => {
-                    // ImplBlock has `methods` directly (trait_name is optional).
-                    for method in &imp.methods {
-                        self.register_method(&imp.type_name, method);
-                    }
-                }
-                Declaration::Trait(_)
-                | Declaration::TypeAlias(_)
-                | Declaration::Endpoint(_)
-                | Declaration::Schema(_) => {
-                    // Traits and type aliases don't produce IR entities.
-                    // Endpoints and schemas are for codegen, not compilation.
-                }
-            }
+        // Layouts (struct / enum) carry no FuncIds but are read by
+        // body lowering and monomorphization; register both up front.
+        self.register_struct_layouts();
+        self.register_enum_layouts();
+
+        // Pre-size `module.functions` with `FuncId(u32::MAX)`
+        // sentinels, then overwrite each slot at its matching FuncId.
+        //
+        // Why a sentinel here instead of `Vec<Option<IrFunction>>`
+        // (the shape `build_from_checker` uses on the sema side)?
+        // Every downstream pass — body lowering, monomorphization,
+        // verifier, codegen — reads `module.functions[id.index()]`
+        // hot.  `Option<IrFunction>` would force an `unwrap` at
+        // every call site for a contract that's already enforced
+        // here at the boundary; a sentinel keeps reads zero-cost
+        // and the `debug_assert!` at the end of this function
+        // catches any unfilled slot before pass 2 runs.
+        let n_functions = self.check.functions.len();
+        let n_user_methods = self.check.user_methods.len();
+        let total_callables = n_functions + n_user_methods;
+        self.module.user_method_offset = self.check.user_method_offset;
+        self.module.synthesized_start = total_callables as u32;
+        debug_assert_eq!(
+            self.module.user_method_offset as usize, n_functions,
+            "ResolvedModule.user_method_offset disagrees with functions.len(); \
+             build_from_checker invariants violated"
+        );
+        self.module.functions.reserve(total_callables);
+        self.module.functions.resize_with(total_callables, || {
+            IrFunction::new(
+                FuncId(u32::MAX),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+                IrType::Void,
+                None,
+            )
+        });
+
+        // Free functions in FuncId order (matches sema pre-pass A).
+        for (name, func_id, info) in self.check.functions_with_names() {
+            self.register_function_from_info(name, func_id, info);
         }
 
-        // Register inline methods and trait impls on structs.
-        for decl in &program.declarations {
-            if let Declaration::Struct(s) = decl {
-                for method in &s.methods {
-                    self.register_method(&s.name, method);
-                }
-                for trait_impl in &s.trait_impls {
-                    for method in &trait_impl.methods {
-                        self.register_method(&s.name, method);
-                    }
-                }
-            }
-            if let Declaration::Enum(e) = decl {
-                for method in &e.methods {
-                    self.register_method(&e.name, method);
-                }
-                for trait_impl in &e.trait_impls {
-                    for method in &trait_impl.methods {
-                        self.register_method(&e.name, method);
-                    }
-                }
-            }
+        // User methods in FuncId order (matches sema pre-pass B).
+        for ((type_name, method_name), func_id, info) in self.check.user_methods_with_names() {
+            self.register_method_from_info(type_name, method_name, func_id, info);
         }
+
+        // Sanity-check: every slot we sized for must have been
+        // filled.  An unfilled `FuncId(u32::MAX)` slot indicates a
+        // pre-allocated id with no matching ResolvedModule entry —
+        // either a sema bug or a divergence between
+        // `pending_function_ids.len() + pending_user_method_ids.len()`
+        // and the populated `functions` / `user_methods` Vec lengths.
+        debug_assert!(
+            self.module.functions.iter().all(|f| f.id.0 != u32::MAX),
+            "register_declarations left an unfilled FuncId slot — \
+             ResolvedModule's functions/user_methods Vec did not cover \
+             every pre-allocated id"
+        );
     }
 
     /// Populate `IrModule::traits` from sema's object-safe trait
     /// declarations. Skips non-object-safe traits (they cannot appear in
     /// `DynRef` positions, so no IR consumer needs their signatures).
     fn register_traits(&mut self) {
-        for (name, info) in self.check.traits.iter() {
+        for (name, info) in self.check.traits_with_names() {
             if info.object_safety_error.is_some() {
                 continue;
             }
@@ -85,131 +121,162 @@ impl<'a> LoweringContext<'a> {
                 .collect();
             self.module
                 .traits
-                .insert(name.clone(), IrTraitInfo { methods });
+                .insert(name.to_string(), IrTraitInfo { methods });
         }
     }
 
-    /// Register a struct's layout (field names and types).
-    fn register_struct(&mut self, s: &phoenix_parser::ast::StructDecl) {
-        if let Some(info) = self.check.structs.get(&s.name) {
-            let fields: Vec<(String, IrType)> = info
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), lower_type(&f.ty, self.check)))
-                .collect();
-            self.module.struct_layouts.insert(s.name.clone(), fields);
-            if !info.type_params.is_empty() {
-                self.module
-                    .struct_type_params
-                    .insert(s.name.clone(), info.type_params.clone());
+    /// Register every user-declared struct's IR layout.
+    ///
+    /// Reads `(name, type_params, fields)` from
+    /// [`ResolvedModule::structs`](phoenix_sema::ResolvedModule::structs)
+    /// in [`StructId`] order and installs each entry into
+    /// [`IrModule::struct_layouts`].  Generic structs additionally
+    /// register their type parameters in
+    /// [`IrModule::struct_type_params`] for `monomorphize::struct_mono`
+    /// to consume.  This pass carries no [`FuncId`]s — it just makes
+    /// layouts available before body lowering / monomorphization.
+    fn register_struct_layouts(&mut self) {
+        // Collect to a Vec because `self.check` borrow conflicts with
+        // mutating `self.module` inside the loop.  Length is small
+        // (number of structs in the program), so the Vec is cheap.
+        let entries: Vec<StructLayoutEntry> = self
+            .check
+            .structs_with_names()
+            .map(|(name, _id, info)| {
+                let fields: Vec<(String, IrType)> = info
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), lower_type(&f.ty, self.check)))
+                    .collect();
+                (name.to_string(), info.type_params.clone(), fields)
+            })
+            .collect();
+        for (name, type_params, fields) in entries {
+            self.module.struct_layouts.insert(name.clone(), fields);
+            if !type_params.is_empty() {
+                self.module.struct_type_params.insert(name, type_params);
             }
         }
     }
 
-    /// Register an enum's layout (variant names and field types).
-    fn register_enum(&mut self, e: &phoenix_parser::ast::EnumDecl) {
-        if let Some(info) = self.check.enums.get(&e.name) {
-            let check = self.check;
-            let variants: Vec<(String, Vec<IrType>)> = info
-                .variants
-                .iter()
-                .map(
-                    |(name, fields): &(String, Vec<phoenix_sema::types::Type>)| {
+    /// Register every enum's IR layout.
+    ///
+    /// Reads `(name, type_params, variants)` from
+    /// [`ResolvedModule::enums`](phoenix_sema::ResolvedModule::enums)
+    /// in [`EnumId`] order and installs each entry into
+    /// [`IrModule::enum_layouts`].  Generic enums additionally
+    /// register their type parameters in
+    /// [`IrModule::enum_type_params`].  Built-in `Option` and
+    /// `Result` are skipped here — they're installed by
+    /// `register_builtin_enum_layouts` because their generic
+    /// payload-type handling differs from user-declared enums.
+    fn register_enum_layouts(&mut self) {
+        let check = self.check;
+        let entries: Vec<EnumLayoutEntry> = check
+            .enums_with_names()
+            .filter(|(name, _, _)| {
+                *name != crate::types::OPTION_ENUM && *name != crate::types::RESULT_ENUM
+            })
+            .map(|(name, _id, info)| {
+                let variants: Vec<(String, Vec<IrType>)> = info
+                    .variants
+                    .iter()
+                    .map(|(vname, fields)| {
                         let ir_fields: Vec<IrType> =
                             fields.iter().map(|t| lower_type(t, check)).collect();
-                        (name.clone(), ir_fields)
-                    },
-                )
-                .collect();
-            self.module.enum_layouts.insert(e.name.clone(), variants);
-            if !info.type_params.is_empty() {
-                self.module
-                    .enum_type_params
-                    .insert(e.name.clone(), info.type_params.clone());
+                        (vname.clone(), ir_fields)
+                    })
+                    .collect();
+                (name.to_string(), info.type_params.clone(), variants)
+            })
+            .collect();
+        for (name, type_params, variants) in entries {
+            self.module.enum_layouts.insert(name.clone(), variants);
+            if !type_params.is_empty() {
+                self.module.enum_type_params.insert(name, type_params);
             }
         }
     }
 
-    /// Register a top-level function: create a stub and add it to the index.
-    fn register_function(&mut self, f: &FunctionDecl) -> FuncId {
-        let func_id = FuncId(self.module.functions.len() as u32);
-
-        let (param_types, param_names) = self.lower_params(f);
-        let return_type = self.resolve_return_type(f);
+    /// Register a free function stub from sema's [`FunctionInfo`].
+    ///
+    /// Adopts `func_id` verbatim from sema (which pre-allocated it in
+    /// pre-pass A) so the stub lands at the same slot in
+    /// [`IrModule::functions`] that
+    /// [`ResolvedModule::functions`](phoenix_sema::ResolvedModule::functions)
+    /// already occupies — this is the load-bearing sema↔IR id
+    /// contract.  Lowers param and return types via [`lower_type`]
+    /// using the resolved-module's type tables; body lowering
+    /// (`lower_function_bodies`) attaches IR ops to the stub later.
+    fn register_function_from_info(&mut self, name: &str, func_id: FuncId, info: &FunctionInfo) {
+        let param_types: Vec<IrType> = info
+            .params
+            .iter()
+            .map(|t| lower_type(t, self.check))
+            .collect();
+        let param_names = info.param_names.clone();
+        let return_type = lower_type(&info.return_type, self.check);
 
         let mut func = IrFunction::new(
             func_id,
-            f.name.clone(),
+            name.to_string(),
             param_types,
             param_names,
             return_type,
-            Some(f.span),
+            Some(info.definition_span),
         );
-        func.type_param_names = f.type_params.clone();
-        func.is_generic_template = !f.type_params.is_empty();
+        func.type_param_names = info.type_params.clone();
+        func.is_generic_template = !info.type_params.is_empty();
 
-        self.module.functions.push(func);
-        self.module.function_index.insert(f.name.clone(), func_id);
-        func_id
+        self.module.functions[func_id.index()] = func;
+        self.module.function_index.insert(name.to_string(), func_id);
     }
 
-    /// Register a method: create a stub with an explicit `self` parameter
-    /// and add it to the method index.
-    fn register_method(&mut self, type_name: &str, method: &FunctionDecl) {
-        let func_id = FuncId(self.module.functions.len() as u32);
-        let mangled_name = format!("{type_name}.{}", method.name);
+    /// Register a user-method stub from sema's [`MethodInfo`].
+    ///
+    /// Adopts `func_id` verbatim from sema (pre-allocated in pre-pass
+    /// B), prepends the receiver type as the first parameter when
+    /// `info.has_self`, and installs the stub into both
+    /// [`IrModule::functions`] (at the matching `FuncId` slot) and
+    /// [`IrModule::method_index`] (keyed by `(type_name, method_name)`).
+    /// Methods on generic structs are flagged
+    /// [`IrFunction::is_generic_template`] so monomorphization
+    /// specializes them per concrete `StructId` substitution.
+    fn register_method_from_info(
+        &mut self,
+        type_name: &str,
+        method_name: &str,
+        func_id: FuncId,
+        info: &MethodInfo,
+    ) {
+        let mangled_name = format!("{type_name}.{method_name}");
+        let mut param_types: Vec<IrType> = info
+            .params
+            .iter()
+            .map(|t| lower_type(t, self.check))
+            .collect();
+        let mut param_names: Vec<String> = info.param_names.clone();
 
-        // Look up method info from sema for parameter types and return type.
-        let method_info = self
-            .check
-            .methods
-            .get(type_name)
-            .and_then(|methods| methods.get(&method.name));
+        // Single struct lookup — reused for both the self-type
+        // construction and the `is_generic_template` decision below.
+        let struct_info = self.check.struct_info_by_name(type_name);
 
-        let (mut param_types, mut param_names) = if let Some(info) = method_info {
-            // Use sema-resolved parameter types (excludes self).
-            let types: Vec<IrType> = info
-                .params
-                .iter()
-                .map(|t| lower_type(t, self.check))
-                .collect();
-            // Sema MethodInfo doesn't store param names, so get them from AST.
-            let names: Vec<String> = method
-                .params
-                .iter()
-                .filter(|p| p.name != "self")
-                .map(|p| p.name.clone())
-                .collect();
-            (types, names)
-        } else {
-            self.lower_params(method)
-        };
-
-        // Check if this method has a `self` parameter by inspecting the AST.
-        let has_self = method.params.first().is_some_and(|p| p.name == "self");
-
-        if has_self {
+        if info.has_self {
             // Self type for the method template.  For generic structs,
             // the self-type args are the declared type-parameter names
             // lifted into `IrType::TypeVar`; struct-monomorphization
             // substitutes them with concrete types and clones the body
             // into a specialized `method_index` entry keyed by the
-            // mangled struct name.  See
-            // `phoenix-ir/src/monomorphize.rs::monomorphize_structs`.
+            // mangled struct name.  See `monomorphize::struct_mono`.
             //
-            // The enum branch still carries the legacy gate: methods on
-            // generic enums remain unsupported (separate `known-issues`
-            // entry, Phase 4 target).  Touching the gate requires the
-            // same struct-mono-style reification for enum layouts, which
-            // is out of scope for this PR.
-            let self_type = if self.check.structs.contains_key(type_name) {
-                let type_params = self
-                    .check
-                    .structs
-                    .get(type_name)
-                    .map(|info| info.type_params.clone())
-                    .unwrap_or_default();
-                let args: Vec<IrType> = type_params
+            // The enum branch still carries the legacy gate: methods
+            // on generic enums remain unsupported (separate
+            // `known-issues` entry, Phase 4 target).  Touching the
+            // gate requires the same struct-mono-style reification
+            // for enum layouts, which is out of scope for this PR.
+            let self_type = if let Some(s) = struct_info {
+                let args: Vec<IrType> = s
+                    .type_params
                     .iter()
                     .map(|name| IrType::TypeVar(name.clone()))
                     .collect();
@@ -217,8 +284,7 @@ impl<'a> LoweringContext<'a> {
             } else {
                 let is_generic = self
                     .check
-                    .enums
-                    .get(type_name)
+                    .enum_info_by_name(type_name)
                     .is_some_and(|info| !info.type_params.is_empty());
                 if is_generic {
                     panic!(
@@ -235,81 +301,28 @@ impl<'a> LoweringContext<'a> {
             param_names.insert(0, "self".to_string());
         }
 
-        let return_type = if let Some(info) = method_info {
-            lower_type(&info.return_type, self.check)
-        } else {
-            self.resolve_return_type(method)
-        };
+        let return_type = lower_type(&info.return_type, self.check);
 
         let mut func = IrFunction::new(
             func_id,
-            mangled_name.clone(),
+            mangled_name,
             param_types,
             param_names,
             return_type,
-            Some(method.span),
+            Some(info.definition_span),
         );
-        func.type_param_names = method.type_params.clone();
-        // A method on a generic struct is a template even when it has no
-        // method-level type params — the struct's type params flow into
-        // the body via the `self` parameter's `StructRef` args, so the
-        // body contains `IrType::TypeVar` and cannot reach Cranelift
-        // until struct-monomorphization specializes it.
-        let parent_is_generic_struct = self
-            .check
-            .structs
-            .get(type_name)
-            .is_some_and(|info| !info.type_params.is_empty());
-        func.is_generic_template = !method.type_params.is_empty() || parent_is_generic_struct;
+        func.type_param_names = info.type_params.clone();
+        // A method on a generic struct is a template even when it has
+        // no method-level type params — the struct's type params flow
+        // into the body via the `self` parameter's `StructRef` args,
+        // so the body contains `IrType::TypeVar` and cannot reach
+        // Cranelift until struct-monomorphization specializes it.
+        let parent_is_generic_struct = struct_info.is_some_and(|s| !s.type_params.is_empty());
+        func.is_generic_template = !info.type_params.is_empty() || parent_is_generic_struct;
 
-        self.module.functions.push(func);
+        self.module.functions[func_id.index()] = func;
         self.module
             .method_index
-            .insert((type_name.to_string(), method.name.clone()), func_id);
-    }
-
-    /// Lower a function's parameters to IR types and names.
-    /// Excludes `self` parameters (those are handled separately for methods).
-    fn lower_params(&self, f: &FunctionDecl) -> (Vec<IrType>, Vec<String>) {
-        if let Some(info) = self.check.functions.get(&f.name) {
-            let types: Vec<IrType> = info
-                .params
-                .iter()
-                .map(|t| lower_type(t, self.check))
-                .collect();
-            let names = info.param_names.clone();
-            (types, names)
-        } else {
-            // Fallback: use AST parameter info directly (for methods not
-            // in the function registry).
-            let types: Vec<IrType> = f
-                .params
-                .iter()
-                .filter(|p| p.name != "self")
-                .map(|p| self.resolve_type_expr_fallback(&p.type_annotation))
-                .collect();
-            let names: Vec<String> = f
-                .params
-                .iter()
-                .filter(|p| p.name != "self")
-                .map(|p| p.name.clone())
-                .collect();
-            (types, names)
-        }
-    }
-
-    /// Resolve the return type of a function.
-    fn resolve_return_type(&self, f: &FunctionDecl) -> IrType {
-        if let Some(info) = self.check.functions.get(&f.name) {
-            lower_type(&info.return_type, self.check)
-        } else {
-            IrType::Void
-        }
-    }
-
-    /// Fallback type resolution from a TypeExpr (when sema info is unavailable).
-    fn resolve_type_expr_fallback(&self, _type_expr: &phoenix_parser::ast::TypeExpr) -> IrType {
-        // Minimal fallback — in practice, sema should always have the info.
-        IrType::Void
+            .insert((type_name.to_string(), method_name.to_string()), func_id);
     }
 }

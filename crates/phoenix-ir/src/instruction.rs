@@ -25,14 +25,13 @@ impl fmt::Display for ValueId {
 }
 
 /// A unique identifier for a function within a module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FuncId(pub u32);
-
-impl fmt::Display for FuncId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "f{}", self.0)
-    }
-}
+///
+/// Re-exported from [`phoenix_common::ids`] so sema and IR share a
+/// single id space. Sema's registration pass allocates ids in AST
+/// order; IR lowering adopts them for user-declared functions and
+/// appends synthesized ones (closures, generic specializations) past
+/// the end.
+pub use phoenix_common::ids::FuncId;
 
 /// An IR instruction that performs an operation and optionally produces
 /// an SSA value.

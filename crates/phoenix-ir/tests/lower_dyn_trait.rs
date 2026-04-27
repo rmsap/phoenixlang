@@ -31,7 +31,7 @@ fn lower_program(source: &str) -> phoenix_ir::module::IrModule {
         "sema errors: {:?}",
         result.diagnostics
     );
-    let module = lower(&program, &result);
+    let module = lower(&program, &result.module);
     let verify_errors = verify(&module);
     assert!(
         verify_errors.is_empty(),

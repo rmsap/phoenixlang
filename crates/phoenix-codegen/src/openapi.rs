@@ -5,7 +5,8 @@
 //! endpoints to path operations, and error variants to HTTP response status codes.
 
 use phoenix_parser::ast::{Declaration, EnumDecl, LiteralKind, Program, StructDecl};
-use phoenix_sema::checker::{CheckResult, DefaultValue, EndpointInfo};
+use phoenix_sema::Analysis;
+use phoenix_sema::checker::{DefaultValue, EndpointInfo};
 use phoenix_sema::types::Type;
 use serde_json::{Map, Value, json};
 
@@ -16,14 +17,14 @@ use crate::capitalize;
 /// The output is a pretty-printed JSON string representing a complete OpenAPI
 /// document with paths, operations, parameters, request bodies, responses,
 /// and component schemas.
-pub fn generate_openapi(program: &Program, check_result: &CheckResult) -> String {
+pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
     let mut schemas = Map::new();
 
     // Emit component schemas for structs and enums
     for decl in &program.declarations {
         match decl {
             Declaration::Struct(s) => {
-                if let Some(info) = check_result.structs.get(&s.name) {
+                if let Some(info) = check_result.module.struct_info_by_name(&s.name) {
                     schemas.insert(s.name.clone(), struct_to_schema(s, info));
                 }
             }

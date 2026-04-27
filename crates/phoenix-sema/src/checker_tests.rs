@@ -1,4 +1,5 @@
-use crate::checker::{CheckResult, DefaultValue, SymbolKind, check};
+use crate::Analysis;
+use crate::checker::{DefaultValue, SymbolKind, check};
 use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::SourceId;
@@ -1796,9 +1797,9 @@ function main() { print(find([1, 3, 4])) }
     );
 }
 
-// ── 1.13.1: CheckResult exposes type registries ─────────────────
+// ── ResolvedModule exposes type registries ─────────────────
 
-fn check_full(source: &str) -> CheckResult {
+fn check_full(source: &str) -> Analysis {
     let tokens = tokenize(source, SourceId(0));
     let (program, parse_errors) = parser::parse(&tokens);
     assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
@@ -1820,15 +1821,15 @@ function greet(name: String) -> String { return name }
 function main() { }
 "#,
     );
-    assert!(result.functions.contains_key("add"));
-    assert!(result.functions.contains_key("greet"));
-    assert!(result.functions.contains_key("main"));
-    let add_info = &result.functions["add"];
+    assert!(result.module.function_by_name.contains_key("add"));
+    assert!(result.module.function_by_name.contains_key("greet"));
+    assert!(result.module.function_by_name.contains_key("main"));
+    let add_info = result.module.function_info_by_name("add").unwrap();
     assert_eq!(add_info.params.len(), 2);
     assert_eq!(add_info.params[0], Type::Int);
     assert_eq!(add_info.params[1], Type::Int);
     assert_eq!(add_info.return_type, Type::Int);
-    let greet_info = &result.functions["greet"];
+    let greet_info = result.module.function_info_by_name("greet").unwrap();
     assert_eq!(greet_info.params, vec![Type::String]);
     assert_eq!(greet_info.return_type, Type::String);
 }
@@ -1842,8 +1843,8 @@ struct Named { String name }
 function main() { }
 "#,
     );
-    assert!(result.structs.contains_key("Point"));
-    let point = &result.structs["Point"];
+    assert!(result.module.struct_by_name.contains_key("Point"));
+    let point = result.module.struct_info_by_name("Point").unwrap();
     assert_eq!(point.fields.len(), 2);
     assert_eq!(point.fields[0].name, "x");
     assert_eq!(point.fields[0].ty, Type::Int);
@@ -1851,8 +1852,11 @@ function main() { }
     assert_eq!(point.fields[1].ty, Type::Int);
     assert!(point.type_params.is_empty());
 
-    assert!(result.structs.contains_key("Named"));
-    assert_eq!(result.structs["Named"].fields[0].ty, Type::String);
+    assert!(result.module.struct_by_name.contains_key("Named"));
+    assert_eq!(
+        result.module.struct_info_by_name("Named").unwrap().fields[0].ty,
+        Type::String
+    );
 }
 
 #[test]
@@ -1863,7 +1867,7 @@ struct Wrapper<T> { T value }
 function main() { }
 "#,
     );
-    let wrapper = &result.structs["Wrapper"];
+    let wrapper = result.module.struct_info_by_name("Wrapper").unwrap();
     assert_eq!(wrapper.type_params, vec!["T".to_string()]);
     assert_eq!(wrapper.fields.len(), 1);
 }
@@ -1877,14 +1881,14 @@ enum Shape { Circle(Float)  Rect(Float, Float) }
 function main() { }
 "#,
     );
-    assert!(result.enums.contains_key("Color"));
-    let color = &result.enums["Color"];
+    assert!(result.module.enum_by_name.contains_key("Color"));
+    let color = result.module.enum_info_by_name("Color").unwrap();
     assert_eq!(color.variants.len(), 3);
     assert_eq!(color.variants[0].0, "Red");
     assert!(color.variants[0].1.is_empty()); // unit variant
 
-    assert!(result.enums.contains_key("Shape"));
-    let shape = &result.enums["Shape"];
+    assert!(result.module.enum_by_name.contains_key("Shape"));
+    let shape = result.module.enum_info_by_name("Shape").unwrap();
     assert_eq!(shape.variants.len(), 2);
     assert_eq!(shape.variants[0].0, "Circle");
     assert_eq!(shape.variants[0].1.len(), 1); // one Float field
@@ -1896,9 +1900,9 @@ function main() { }
 fn check_result_contains_builtin_enums() {
     let result = check_full("function main() { }");
     // Option and Result are pre-registered builtins
-    assert!(result.enums.contains_key("Option"));
-    assert!(result.enums.contains_key("Result"));
-    let option = &result.enums["Option"];
+    assert!(result.module.enum_by_name.contains_key("Option"));
+    assert!(result.module.enum_by_name.contains_key("Result"));
+    let option = result.module.enum_info_by_name("Option").unwrap();
     assert_eq!(option.type_params, vec!["T".to_string()]);
     assert_eq!(option.variants.len(), 2); // Some, None
 }
@@ -1915,12 +1919,22 @@ function inc(self) -> Counter { return Counter(self.val + 1) }
 function main() { }
 "#,
     );
-    assert!(result.methods.contains_key("Counter"));
-    let counter_methods = &result.methods["Counter"];
-    assert!(counter_methods.contains_key("get"));
-    assert!(counter_methods.contains_key("inc"));
-    assert_eq!(counter_methods["get"].return_type, Type::Int);
-    assert!(counter_methods["get"].params.is_empty()); // excludes self
+    assert!(result.module.method_index.contains_key("Counter"));
+    assert!(
+        result
+            .module
+            .method_info_by_name("Counter", "get")
+            .is_some()
+    );
+    assert!(
+        result
+            .module
+            .method_info_by_name("Counter", "inc")
+            .is_some()
+    );
+    let get = result.module.method_info_by_name("Counter", "get").unwrap();
+    assert_eq!(get.return_type, Type::Int);
+    assert!(get.params.is_empty()); // excludes self
 }
 
 #[test]
@@ -1941,8 +1955,8 @@ impl Display {
 function main() { }
 "#,
     );
-    assert!(result.traits.contains_key("Display"));
-    let display = &result.traits["Display"];
+    assert!(result.module.trait_by_name.contains_key("Display"));
+    let display = result.module.trait_info_by_name("Display").unwrap();
     assert_eq!(display.methods.len(), 1);
     assert_eq!(display.methods[0].name, "toString");
     assert_eq!(display.methods[0].return_type, Type::String);
@@ -1984,7 +1998,7 @@ return greeting + " " + name
 function main() { }
 "#,
     );
-    let info = &result.functions["greet"];
+    let info = result.module.function_info_by_name("greet").unwrap();
     assert_eq!(info.params.len(), 2);
     assert_eq!(info.param_names, vec!["name", "greeting"]);
     let default_indices: Vec<usize> = {
@@ -2011,7 +2025,10 @@ impl Counter {
 function main() { }
 "#,
     );
-    let info = &result.methods["Counter"]["bump"];
+    let info = result
+        .module
+        .method_info_by_name("Counter", "bump")
+        .unwrap();
     assert_eq!(info.params.len(), 2, "non-self params count");
     let default_indices: Vec<usize> = {
         let mut v: Vec<usize> = info.default_param_exprs.keys().copied().collect();
@@ -2127,11 +2144,11 @@ let b: Bool = true
     );
     // expr_types should be non-empty — every expression gets recorded
     assert!(
-        !result.expr_types.is_empty(),
+        !result.module.expr_types.is_empty(),
         "expr_types should be populated"
     );
     // Check that all basic types appear in the values
-    let types: Vec<&Type> = result.expr_types.values().collect();
+    let types: Vec<&Type> = result.module.expr_types.values().collect();
     assert!(types.contains(&&Type::Int));
     assert!(types.contains(&&Type::Float));
     assert!(types.contains(&&Type::String));
@@ -2149,7 +2166,7 @@ let z: Float = 1.0 + 2.0
 }
 "#,
     );
-    let types: Vec<&Type> = result.expr_types.values().collect();
+    let types: Vec<&Type> = result.module.expr_types.values().collect();
     assert!(types.contains(&&Type::Int));
     assert!(types.contains(&&Type::Bool));
     assert!(types.contains(&&Type::Float));
@@ -2166,7 +2183,7 @@ let x: Int = add(1, 2)
 "#,
     );
     // The call expression `add(1, 2)` should be recorded as Type::Int
-    let has_int_call = result.expr_types.values().any(|t| *t == Type::Int);
+    let has_int_call = result.module.expr_types.values().any(|t| *t == Type::Int);
     assert!(has_int_call, "call to add() should produce Type::Int");
 }
 
@@ -2184,7 +2201,7 @@ let v: Int = c.get()
 }
 "#,
     );
-    let has_int = result.expr_types.values().any(|t| *t == Type::Int);
+    let has_int = result.module.expr_types.values().any(|t| *t == Type::Int);
     assert!(has_int, "method call should produce Type::Int");
 }
 
@@ -2199,6 +2216,7 @@ let msg: String = "hello {name}"
 "#,
     );
     let string_count = result
+        .module
         .expr_types
         .values()
         .filter(|t| **t == Type::String)
@@ -2813,7 +2831,7 @@ String name
 function main() { }
 "#,
     );
-    let item = &result.structs["Item"];
+    let item = result.module.struct_info_by_name("Item").unwrap();
     assert!(item.fields[0].constraint.is_some());
     assert!(item.fields[1].constraint.is_none());
 }
@@ -2965,7 +2983,7 @@ struct User { Int id  String name }
 function main() { }
 "#,
     );
-    let user = &result.structs["User"];
+    let user = result.module.struct_info_by_name("User").unwrap();
     assert!(
         user.definition_span.start < user.definition_span.end,
         "struct should have a non-empty definition span"
@@ -2981,7 +2999,7 @@ function add(a: Int, b: Int) -> Int { a + b }
 function main() { }
 "#,
     );
-    let add = &result.functions["add"];
+    let add = result.module.function_info_by_name("add").unwrap();
     assert!(
         add.definition_span.start < add.definition_span.end,
         "function should have a non-empty definition span"
@@ -2997,7 +3015,7 @@ enum Color { Red  Green  Blue }
 function main() { }
 "#,
     );
-    let color = &result.enums["Color"];
+    let color = result.module.enum_info_by_name("Color").unwrap();
     assert!(
         color.definition_span.start < color.definition_span.end,
         "enum should have a non-empty definition span"
@@ -3289,7 +3307,7 @@ function add(a: Int, b: Int) -> Int { a + b }
 function main() { }
 "#,
     );
-    let add = &result.functions["add"];
+    let add = result.module.function_info_by_name("add").unwrap();
     // "add" is 3 bytes, so the span length should be 3
     let span_len = add.definition_span.end - add.definition_span.start;
     assert_eq!(
@@ -3423,19 +3441,21 @@ function main() {
     );
     assert!(
         result
+            .module
             .call_type_args
             .values()
             .any(|v| v.as_slice() == [Type::Int]),
         "expected call_type_args to contain [Int] from `h.wrap(42)`, got: {:?}",
-        result.call_type_args
+        result.module.call_type_args
     );
     assert!(
         result
+            .module
             .call_type_args
             .values()
             .any(|v| v.as_slice() == [Type::String]),
         "expected call_type_args to contain [String] from `h.wrap(\"hello\")`, got: {:?}",
-        result.call_type_args
+        result.module.call_type_args
     );
 }
 
@@ -3475,7 +3495,7 @@ function main() {
     // The method has one type param (U); call_type_args values should
     // have length 1 for both call sites, containing the method's inferred
     // concrete type. The struct's A and B must NOT appear.
-    let recorded: Vec<Vec<Type>> = result.call_type_args.values().cloned().collect();
+    let recorded: Vec<Vec<Type>> = result.module.call_type_args.values().cloned().collect();
     assert!(
         recorded.iter().any(|v| v.as_slice() == [Type::Int]),
         "expected [Int] from `p.swap(42)`, have: {:?}",
@@ -3530,11 +3550,12 @@ function main() {
     );
     assert!(
         result
+            .module
             .call_type_args
             .values()
             .any(|v| v.as_slice() == [Type::Named("Point".to_string())]),
         "expected call_type_args to contain [Point] from `tag(p)`, got: {:?}",
-        result.call_type_args
+        result.module.call_type_args
     );
 }
 
@@ -3544,7 +3565,7 @@ function main() {
 /// When sema cannot infer a type parameter (e.g., because an argument has
 /// a type error), it must either skip recording or record a well-formed
 /// binding — never `Type::Error`. The key invariant checked here is that
-/// no `Type::Error` ever appears in `CheckResult.call_type_args`.
+/// no `Type::Error` ever appears in `ResolvedModule.call_type_args`.
 #[test]
 fn generic_call_with_arg_error_does_not_leak_type_error_into_call_type_args() {
     let tokens = tokenize(
@@ -3565,7 +3586,7 @@ function main() {
     // Sema emits an error; that's expected. The fix is that IR lowering
     // handles it gracefully. We additionally assert that no `Type::Error`
     // reaches `call_type_args`, so downstream can't panic on it.
-    for (span, tys) in &result.call_type_args {
+    for (span, tys) in &result.module.call_type_args {
         for t in tys {
             assert!(
                 !matches!(t, Type::Error),

@@ -13,7 +13,8 @@
 use std::collections::BTreeSet;
 
 use phoenix_parser::ast::{Declaration, EnumDecl, Program, StructDecl, TypeExpr};
-use phoenix_sema::checker::{CheckResult, DefaultValue, EndpointInfo, ResolvedDerivedType};
+use phoenix_sema::Analysis;
+use phoenix_sema::checker::{DefaultValue, EndpointInfo, ResolvedDerivedType};
 use phoenix_sema::types::Type;
 
 /// The output of TypeScript code generation: four file contents.
@@ -32,7 +33,7 @@ pub struct GeneratedFiles {
 ///
 /// Iterates over declarations in source order to produce deterministic,
 /// diff-friendly output.
-pub fn generate_typescript(program: &Program, check_result: &CheckResult) -> GeneratedFiles {
+pub fn generate_typescript(program: &Program, check_result: &Analysis) -> GeneratedFiles {
     let generator = TsGenerator::new(check_result);
     generator.generate(program)
 }
@@ -45,7 +46,7 @@ pub fn generate_typescript(program: &Program, check_result: &CheckResult) -> Gen
 struct TsGenerator<'a> {
     /// Semantic analysis results providing resolved types, struct info, and
     /// endpoint definitions.
-    check_result: &'a CheckResult,
+    check_result: &'a Analysis,
     /// Accumulated output for `types.ts`.
     types_out: String,
     /// Accumulated output for `client.ts`.
@@ -62,7 +63,7 @@ struct TsGenerator<'a> {
 
 impl<'a> TsGenerator<'a> {
     /// Creates a new TypeScript generator with the given semantic analysis results.
-    fn new(check_result: &'a CheckResult) -> Self {
+    fn new(check_result: &'a Analysis) -> Self {
         Self {
             check_result,
             types_out: String::new(),
@@ -157,7 +158,7 @@ impl<'a> TsGenerator<'a> {
         self.types_out
             .push_str(&format!("export interface {} {{\n", s.name));
 
-        if let Some(info) = self.check_result.structs.get(&s.name) {
+        if let Some(info) = self.check_result.module.struct_info_by_name(&s.name) {
             for f in &info.fields {
                 let ts_type = type_to_ts(&f.ty);
                 let optional = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
@@ -176,7 +177,7 @@ impl<'a> TsGenerator<'a> {
 
     /// Emits a `validate{StructName}` function for a struct with constrained fields.
     fn emit_struct_validation(&mut self, s: &StructDecl) {
-        let Some(info) = self.check_result.structs.get(&s.name) else {
+        let Some(info) = self.check_result.module.struct_info_by_name(&s.name) else {
             return;
         };
         if !info.fields.iter().any(|f| f.constraint.is_some()) {

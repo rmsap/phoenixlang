@@ -297,7 +297,7 @@ fn cmd_parse(path: &str) {
 /// Returns the program AST and the semantic check result.
 pub(crate) fn parse_and_check(
     path: &str,
-) -> (phoenix_parser::ast::Program, phoenix_sema::CheckResult) {
+) -> (phoenix_parser::ast::Program, phoenix_sema::Analysis) {
     let (source_map, source_id, contents) = read_source(path);
     let tokens = tokenize(&contents, source_id);
     let (program, parse_errors) = parser::parse(&tokens);
@@ -324,7 +324,7 @@ fn cmd_check(path: &str) {
 /// Lower a Phoenix source file to IR and print the textual representation.
 fn cmd_ir(path: &str) {
     let (program, check_result) = parse_and_check(path);
-    let ir_module = phoenix_ir::lower(&program, &check_result);
+    let ir_module = phoenix_ir::lower(&program, &check_result.module);
 
     // Run the IR verifier to catch structural errors.
     let errors = phoenix_ir::verify::verify(&ir_module);
@@ -340,7 +340,7 @@ fn cmd_ir(path: &str) {
 
 fn cmd_run(path: &str) {
     let (program, check_result) = parse_and_check(path);
-    if let Err(err) = interpreter::run(&program, check_result.lambda_captures) {
+    if let Err(err) = interpreter::run(&program, check_result.module.lambda_captures) {
         eprintln!("runtime error: {}", err);
         process::exit(1);
     }
@@ -349,7 +349,7 @@ fn cmd_run(path: &str) {
 /// Run a Phoenix program via the IR interpreter.
 fn cmd_run_ir(path: &str) {
     let (program, check_result) = parse_and_check(path);
-    let ir_module = phoenix_ir::lower(&program, &check_result);
+    let ir_module = phoenix_ir::lower(&program, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
     if !errors.is_empty() {
@@ -416,7 +416,7 @@ fn prepare_out_dir(out_dir: &str) -> impl Fn(&str, &str) -> String + '_ {
 /// Generates TypeScript files (types, client, handlers, server).
 fn cmd_gen_typescript(
     program: &phoenix_parser::ast::Program,
-    check_result: &phoenix_sema::CheckResult,
+    check_result: &phoenix_sema::Analysis,
     out_dir: &str,
     mode: GenMode,
 ) {
@@ -438,7 +438,7 @@ fn cmd_gen_typescript(
 /// Generates Python files (models, client, handlers, server).
 fn cmd_gen_python(
     program: &phoenix_parser::ast::Program,
-    check_result: &phoenix_sema::CheckResult,
+    check_result: &phoenix_sema::Analysis,
     out_dir: &str,
     mode: GenMode,
 ) {
@@ -460,7 +460,7 @@ fn cmd_gen_python(
 /// Generates Go files (types, client, handlers, server).
 fn cmd_gen_go(
     program: &phoenix_parser::ast::Program,
-    check_result: &phoenix_sema::CheckResult,
+    check_result: &phoenix_sema::Analysis,
     out_dir: &str,
     mode: GenMode,
 ) {
@@ -482,7 +482,7 @@ fn cmd_gen_go(
 /// Generates an OpenAPI 3.1 JSON specification.
 fn cmd_gen_openapi(
     program: &phoenix_parser::ast::Program,
-    check_result: &phoenix_sema::CheckResult,
+    check_result: &phoenix_sema::Analysis,
     out_dir: &str,
 ) {
     let spec = phoenix_codegen::generate_openapi(program, check_result);
@@ -513,7 +513,7 @@ fn cmd_gen_openapi(
 /// can decide how to proceed (e.g., continue in watch mode).
 fn try_parse_and_check(
     path: &str,
-) -> Result<(phoenix_parser::ast::Program, phoenix_sema::CheckResult), String> {
+) -> Result<(phoenix_parser::ast::Program, phoenix_sema::Analysis), String> {
     let contents =
         fs::read_to_string(path).map_err(|err| format!("could not read '{}': {}", path, err))?;
     let mut source_map = SourceMap::new();

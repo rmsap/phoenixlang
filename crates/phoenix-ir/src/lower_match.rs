@@ -351,7 +351,7 @@ fn resolve_field_type(
     field_idx: usize,
     generic_offset: usize,
     type_args: &[Type],
-    check: &phoenix_sema::checker::CheckResult,
+    check: &phoenix_sema::ResolvedModule,
 ) -> IrType {
     let mut field_type = field_types.get(field_idx).cloned().unwrap_or(IrType::Void);
     if field_type.is_generic_placeholder() {

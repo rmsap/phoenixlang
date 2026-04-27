@@ -24,7 +24,7 @@ fn lower_source(source: &str) -> crate::IrModule {
             .map(|d| &d.message)
             .collect::<Vec<_>>()
     );
-    lower(&program, &check_result)
+    lower(&program, &check_result.module)
 }
 
 /// Lower source and return the IR as a string.
@@ -1504,7 +1504,7 @@ function main() {
 /// `lower_ident`, `lower_call`, and `lower_struct_literal` to decide
 /// whether an identifier / call / struct-literal expression is actually
 /// an enum variant construction. Rather than testing the helper directly
-/// (CheckResult has too many fields to mock), we drive it through
+/// (ResolvedModule has too many fields to mock), we drive it through
 /// `lower_source` and assert on the resulting `EnumAlloc`'s result type
 /// — that type is precisely the output of `enum_type_at` threaded through
 /// `lower_type_args`.
@@ -1522,7 +1522,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].0 as usize];
+    let main = &module.functions[module.function_index["main"].index()];
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1548,7 +1548,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].0 as usize];
+    let main = &module.functions[module.function_index["main"].index()];
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1578,7 +1578,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].0 as usize];
+    let main = &module.functions[module.function_index["main"].index()];
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1603,7 +1603,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].0 as usize];
+    let main = &module.functions[module.function_index["main"].index()];
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1643,7 +1643,7 @@ function main() {
 }
 "#,
     );
-    let main = &module.functions[module.function_index["main"].0 as usize];
+    let main = &module.functions[module.function_index["main"].index()];
     let alloc_inst = main.blocks[0]
         .instructions
         .iter()
@@ -1681,7 +1681,7 @@ function main() {
 }
 "#,
     );
-    let spec = &module.functions[module.function_index["wrap__i64"].0 as usize];
+    let spec = &module.functions[module.function_index["wrap__i64"].index()];
     assert_eq!(
         spec.return_type,
         IrType::EnumRef("Box".to_string(), vec![IrType::I64]),

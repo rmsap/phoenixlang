@@ -141,7 +141,7 @@ pub(super) fn resolve_trait_bound_method_calls(
 /// [`IrModule::register_dyn_vtable`] — the same helper the lowering-
 /// time registration uses.  Method names are sourced from
 /// `module.traits[trait].methods` (the IR-level trait registry) since
-/// mono runs without a sema `CheckResult`.
+/// mono runs without a sema `ResolvedModule`.
 ///
 /// # Struct-mono invariant (load-bearing)
 ///

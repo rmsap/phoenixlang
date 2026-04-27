@@ -1,6 +1,8 @@
+use crate::resolved::Analysis;
 use crate::scope::{ScopeStack, VarInfo};
 use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
+use phoenix_common::ids::FuncId;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     Block, CaptureInfo, Declaration, ElseBranch, Expr, FunctionDecl, IfExpr, ImplBlock,
@@ -8,86 +10,9 @@ use phoenix_parser::ast::{
 };
 use std::collections::{HashMap, HashSet};
 
-/// The result of semantic analysis, containing diagnostics and resolved
-/// type information needed by downstream passes (interpreter or compiler).
-pub struct CheckResult {
-    /// Semantic errors and warnings found during analysis.
-    pub diagnostics: Vec<Diagnostic>,
-    /// Captured variables for each lambda expression, keyed by the lambda's
-    /// source span. The interpreter/compiler uses this to set up closures
-    /// without needing interior mutability on the AST.
-    pub lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
-    /// Registered function signatures (name → info).
-    pub functions: HashMap<String, FunctionInfo>,
-    /// Registered struct definitions (name → info).
-    pub structs: HashMap<String, StructInfo>,
-    /// Registered enum definitions (name → info).
-    pub enums: HashMap<String, EnumInfo>,
-    /// Registered methods (type_name → method_name → info).
-    pub methods: HashMap<String, HashMap<String, MethodInfo>>,
-    /// Registered trait declarations (trait_name → info).
-    pub traits: HashMap<String, TraitInfo>,
-    /// Set of (type_name, trait_name) pairs recording which types implement
-    /// which traits.
-    pub trait_impls: HashSet<(String, String)>,
-    /// Registered type aliases (alias_name → info).
-    pub type_aliases: HashMap<String, TypeAliasInfo>,
-    /// Resolved endpoint declarations with all types checked.
-    pub endpoints: Vec<EndpointInfo>,
-    /// Resolved type for each expression, keyed by the expression's source
-    /// span. Populated during the checking pass so that downstream passes
-    /// (IR lowering, codegen) can look up the type of any expression without
-    /// re-running type inference.
-    pub expr_types: HashMap<Span, Type>,
-    /// Symbol references: maps each use-site span to the symbol it refers to.
-    /// Used by the LSP for go-to-definition, find-references, and rename.
-    pub symbol_references: HashMap<Span, SymbolRef>,
-    /// Concrete type arguments inferred at each generic function call site,
-    /// keyed by the call expression's source span. Values are ordered by the
-    /// callee's declared type-parameter list (e.g., `function pair<A, B>`
-    /// produces `[type_of_A, type_of_B]`). Non-generic calls are absent.
-    /// Consumed by IR monomorphization.
-    ///
-    /// **Invariants enforced by
-    /// [`Checker::record_inferred_type_args`](crate::checker::Checker::record_inferred_type_args):**
-    /// - No entry contains `Type::Error` or any unresolved `Type::TypeVar`.
-    /// - An entry is present *only* when every declared type parameter of
-    ///   the callee was inferable from the call site. If any parameter is
-    ///   unresolvable, a diagnostic is emitted and no entry is recorded
-    ///   (so IR lowering never sees a partial binding).
-    /// - Covers both free-function generic calls and user-defined method
-    ///   generic calls (keyed by the `MethodCallExpr` span for the latter).
-    ///
-    /// **Known architectural limitation (deferred to Phase 3).** Keying by
-    /// `Span` makes the sema → lowering handoff fragile under any
-    /// transformation that reparents or synthesizes AST nodes (macro
-    /// expansion, cross-file inlining). The intended Phase-3 fix is to
-    /// assign a stable `CallId: u32` at parse time and key this map on
-    /// it. For the single-file, single-pass Phase 2 compiler, spans are
-    /// immutable per `SourceId` and unique per syntactic call expression,
-    /// so the current keying is sound but should not be generalized.
-    /// Tracked in `docs/known-issues.md`
-    /// ("`CheckResult.call_type_args` is keyed by `Span`").
-    pub call_type_args: HashMap<Span, Vec<Type>>,
-    /// Resolved type annotation for each `let` binding that carried one,
-    /// keyed by the `VarDecl`'s source span. Absent entries mean the
-    /// binding was unannotated.
-    ///
-    /// **Internal sema↔IR-lowering contract.** Consumed only by
-    /// [`phoenix_ir::lower`] so its dyn-coercion path sees the resolved
-    /// type (alias-expanded) rather than re-walking the parser `TypeExpr`.
-    /// External consumers should prefer [`Self::expr_types`].
-    ///
-    /// **Same `Span`-keying caveat as [`Self::call_type_args`].** The
-    /// `CallId`-based migration planned for Phase 3 will apply to this
-    /// map too; any AST transformation that reparents or synthesizes
-    /// `VarDecl` nodes before IR lowering will silently lose entries.
-    pub var_annotation_types: HashMap<Span, Type>,
-}
-
 /// A reference from a use-site to a symbol definition.
 ///
-/// Stored in [`CheckResult::symbol_references`] for each identifier,
+/// Stored in [`ResolvedModule::symbol_references`] for each identifier,
 /// field access, or type reference that resolves to a known declaration.
 #[derive(Debug, Clone)]
 pub struct SymbolRef {
@@ -129,6 +54,10 @@ pub enum SymbolKind {
 /// first pass so that call sites can be type-checked in the second pass.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
+    /// Stable id for this function within the resolved module.  Allocated
+    /// by [`Checker`] during the registration pass in AST-declaration
+    /// order; IR lowering adopts the same id.
+    pub func_id: FuncId,
     /// Source span of the function name identifier (for go-to-definition).
     pub definition_span: Span,
     /// Generic type parameters declared on this function.
@@ -227,6 +156,12 @@ pub struct EnumInfo {
 /// Information about a method registered on a type (parameter types exclude `self`).
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
+    /// Stable id for user-declared methods.  `None` for built-in stdlib
+    /// methods (`Option.unwrap`, `List.push`, …) — those have no IR
+    /// function; the Cranelift backend inlines each one.  Allocated by
+    /// [`Checker`] during the registration pass in AST-declaration order
+    /// and adopted unchanged by IR lowering.
+    pub func_id: Option<FuncId>,
     /// Source span of the method name identifier (for go-to-definition).
     pub definition_span: Span,
     /// Parameter types for the method, excluding the implicit `self` receiver.
@@ -257,21 +192,32 @@ pub struct MethodInfo {
     /// binders appear here, and only these are inferred from argument
     /// types at each call site for IR monomorphization.
     pub type_params: Vec<String>,
+    /// `true` if the method's first parameter is the implicit `self`
+    /// receiver. `false` for static / associated functions declared in
+    /// an `impl` block. Recorded at registration time so IR lowering
+    /// can drive method registration from [`crate::ResolvedModule`]
+    /// without re-inspecting the AST.
+    pub has_self: bool,
 }
 
 impl MethodInfo {
     /// Construct a built-in method descriptor with no per-method generic
     /// parameters. Use [`MethodInfo`]'s struct literal form when a method
     /// has its own `type_params`.
-    pub fn builtin(params: Vec<Type>, return_type: Type) -> Self {
+    ///
+    /// Built-in methods are always called as `receiver.method(...)`, so
+    /// `has_self` is `true`.
+    pub(crate) fn builtin(params: Vec<Type>, return_type: Type) -> Self {
         let param_names = (0..params.len()).map(|i| format!("arg{}", i + 1)).collect();
         Self {
+            func_id: None,
             definition_span: Span::BUILTIN,
             params,
             param_names,
             default_param_exprs: HashMap::new(),
             return_type,
             type_params: Vec::new(),
+            has_self: true,
         }
     }
 }
@@ -388,6 +334,28 @@ pub struct TypeAliasInfo {
 }
 
 /// The semantic checker for a Phoenix program.
+///
+/// During checking the [`Checker`] maintains:
+/// - **Name-keyed registries** (`functions`, `structs`, `enums`,
+///   `methods`, `traits`, `type_aliases`) used for in-pass lookup.
+///   These are flattened into id-indexed [`Vec`]s on
+///   [`ResolvedModule`] at the end of [`check`].
+/// - **`FuncId` allocation state** (`next_func_id`,
+///   `pending_user_method_ids`).  Free-function ids are assigned in
+///   AST-declaration order at [`Self::register_function`]; user-method
+///   ids are pre-allocated by [`Self::pre_allocate_user_method_ids`]
+///   in the AST-declaration order that
+///   [`crate::resolved::ResolvedModule`] commits to (struct/enum
+///   inline methods at the type's declaration site, inherent then
+///   trait impls, with standalone `impl` blocks visited at their own
+///   declaration site), so that IR lowering can adopt the same ids
+///   verbatim by walking the AST in identical order.
+/// - **Per-span output maps** (`expr_types`, `call_type_args`,
+///   `var_annotation_types`, `symbol_references`, `lambda_captures`)
+///   that pass through to [`ResolvedModule`] unchanged.
+/// - **Transient checking state** (`scopes`, `current_return_type`,
+///   `loop_depth`, `current_type_params*`) that is dropped when
+///   [`check`] returns.
 pub struct Checker {
     pub(crate) scopes: ScopeStack,
     pub(crate) functions: HashMap<String, FunctionInfo>,
@@ -421,8 +389,28 @@ pub struct Checker {
     pub(crate) call_type_args: HashMap<Span, Vec<Type>>,
     /// Resolved annotation type for each `let`-with-annotation, keyed by
     /// the `VarDecl`'s source span. See
-    /// [`CheckResult::var_annotation_types`].
+    /// [`ResolvedModule::var_annotation_types`].
     pub(crate) var_annotation_types: HashMap<Span, Type>,
+    /// Next `FuncId` to allocate.  Free-function ids occupy `0..N` in
+    /// AST-declaration order, then user-method ids occupy `N..N+M` in
+    /// AST-declaration order; the boundary is recorded as
+    /// [`Self::user_method_offset`].
+    pub(crate) next_func_id: u32,
+    /// `FuncId` at which the user-method range begins.  Captured
+    /// after free-function id allocation completes and reflected onto
+    /// [`ResolvedModule::user_method_offset`].
+    pub(crate) user_method_offset: u32,
+    /// Pre-allocated FuncIds for free functions, keyed by name.
+    /// Populated by [`Self::pre_allocate_function_ids`] before
+    /// registration so [`crate::check_register::Checker::register_function`]
+    /// can stamp each `FunctionInfo` with the id IR will adopt.
+    pub(crate) pending_function_ids: HashMap<String, FuncId>,
+    /// Pre-allocated FuncIds for user methods, keyed by
+    /// `(type_name, method_name)`.  Populated by
+    /// [`Self::pre_allocate_user_method_ids`] before registration so
+    /// that [`crate::check_register::Checker::register_impl`] can
+    /// stamp each `MethodInfo` with the id IR will see.
+    pub(crate) pending_user_method_ids: HashMap<(String, String), FuncId>,
 }
 
 impl Default for Checker {
@@ -454,6 +442,10 @@ impl Checker {
             symbol_references: HashMap::new(),
             call_type_args: HashMap::new(),
             var_annotation_types: HashMap::new(),
+            next_func_id: 0,
+            user_method_offset: 0,
+            pending_function_ids: HashMap::new(),
+            pending_user_method_ids: HashMap::new(),
         }
     }
 
@@ -513,6 +505,38 @@ impl Checker {
                 _ => {}
             }
         }
+
+        // Pre-pass A: allocate `FuncId`s for free functions in AST
+        // declaration order.  Free functions occupy `0..N`.  This runs
+        // before the registration pass so `register_function` can stamp
+        // each `FunctionInfo` with the id IR lowering will adopt.
+        self.pre_allocate_function_ids(program);
+
+        // Pre-pass B: allocate `FuncId`s for user-declared methods,
+        // matching IR lowering's registration order — inline methods at
+        // the struct/enum declaration site (inherent first, then trait
+        // impls in source order), and standalone `impl` blocks at their
+        // own declaration site.  User methods occupy `N..N+M`.
+        self.user_method_offset = self.next_func_id;
+        self.pre_allocate_user_method_ids(program);
+
+        // Pre-pass invariant: pre-pass A allocated exactly
+        // `user_method_offset` ids (one per unique free-function
+        // name), and pre-pass B's count plus that boundary equals
+        // the next available id.  If a future refactor reorders
+        // these passes, this assertion fires with a clear
+        // diagnostic — much better than a HashMap-index panic deep
+        // inside `register_*`.
+        debug_assert_eq!(
+            self.user_method_offset as usize,
+            self.pending_function_ids.len(),
+            "user_method_offset must equal the number of pre-allocated free-function ids"
+        );
+        debug_assert_eq!(
+            self.pending_user_method_ids.len() as u32,
+            self.next_func_id - self.user_method_offset,
+            "pre-pass B id count disagrees with the user-method id range"
+        );
 
         // First pass: register all type/function signatures (field types now
         // resolve correctly because type names were pre-registered above).
@@ -1049,16 +1073,31 @@ impl Checker {
     }
 }
 
-/// Type-checks a Phoenix program and returns diagnostics and resolved type
-/// information.
+/// Type-checks a Phoenix program and returns the [`Analysis`] that
+/// downstream stages consume.
 ///
-/// This is the main entry point for semantic analysis. It performs two passes:
-/// 1. **Registration pass:** collects all type, function, and trait declarations.
-/// 2. **Checking pass:** validates types, resolves names, and checks constraints.
+/// Performs three phases:
+/// 1. **Pre-allocation:** assigns stable [`FuncId`]s for every free
+///    function and user-declared method in AST-declaration order, so
+///    sema and IR lowering share a single id space.
+/// 2. **Registration pass:** collects all type, function, and trait
+///    signatures into name-keyed registries on the [`Checker`].
+/// 3. **Checking pass:** validates types, resolves names, and checks
+///    constraints; populates per-span output maps.
 ///
-/// The returned [`CheckResult`] contains:
-/// - `diagnostics`: empty if the program is semantically valid.
-/// - `lambda_captures`: captured variables for each lambda, keyed by span.
+/// The returned [`Analysis`] contains:
+/// - `module: ResolvedModule` — the IR-facing schema (callables,
+///   types, per-span maps).  IR lowering and the IR interpreter
+///   take `&ResolvedModule` directly.
+/// - `diagnostics` — empty iff the program is semantically valid.
+/// - `endpoints` — for `phoenix-codegen`.
+/// - `symbol_references` — for the LSP.
+/// - `trait_impls` and `type_aliases` — sema-internal outputs kept
+///   for tooling consumers.
+///
+/// At the end, the [`Checker`]'s registries are flattened and
+/// ownership of all collected state is transferred (no clones — see
+/// [`crate::resolved`] for the layout contract).
 ///
 /// # Examples
 ///
@@ -1095,23 +1134,8 @@ impl Checker {
 /// assert!(result.diagnostics[0].message.contains("type mismatch"));
 /// ```
 #[must_use]
-pub fn check(program: &Program) -> CheckResult {
+pub fn check(program: &Program) -> Analysis {
     let mut checker = Checker::new();
     checker.check_program(program);
-    CheckResult {
-        diagnostics: checker.diagnostics,
-        lambda_captures: checker.lambda_captures,
-        functions: checker.functions,
-        structs: checker.structs,
-        enums: checker.enums,
-        methods: checker.methods,
-        traits: checker.traits,
-        trait_impls: checker.trait_impls,
-        type_aliases: checker.type_aliases,
-        endpoints: checker.endpoints,
-        expr_types: checker.expr_types,
-        symbol_references: checker.symbol_references,
-        call_type_args: checker.call_type_args,
-        var_annotation_types: checker.var_annotation_types,
-    }
+    crate::resolved::build_from_checker(program, checker)
 }

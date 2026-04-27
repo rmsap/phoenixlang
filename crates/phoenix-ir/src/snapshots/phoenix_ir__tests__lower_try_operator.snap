@@ -1,6 +1,5 @@
 ---
 source: crates/phoenix-ir/src/tests.rs
-assertion_line: 703
 expression: ir
 ---
 func @fallible() -> enum.Result<i64, string> {
