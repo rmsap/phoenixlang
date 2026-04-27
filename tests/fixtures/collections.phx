@@ -1,0 +1,36 @@
+// List functional methods + Map basic ops.
+// Output is intentionally scalar so it does not depend on map
+// iteration order (Map is order-insensitive).
+
+function main() {
+  let xs: List<Int> = [1, 2, 3, 4, 5]
+
+  // map → filter → reduce
+  let doubled = xs.map(function(x: Int) -> Int { x * 2 })
+  let evens = doubled.filter(function(x: Int) -> Bool { x > 4 })
+  let sum = evens.reduce(0, function(acc: Int, x: Int) -> Int { acc + x })
+  print(sum)
+
+  // sortBy on a small list (insertion sort path).
+  let unsorted: List<Int> = [3, 1, 4, 1, 5, 9, 2, 6]
+  let sorted = unsorted.sortBy(function(a: Int, b: Int) -> Int { a - b })
+  for x in sorted {
+    print(x)
+  }
+
+  // flatMap.
+  let nested: List<Int> = [1, 2, 3]
+  let flat = nested.flatMap(function(n: Int) -> List<Int> { [n, n * 10] })
+  for x in flat {
+    print(x)
+  }
+
+  // Map literal + contains + length + remove (returns a new map).
+  let m: Map<String, Int> = {"alice": 1, "bob": 2, "carol": 3}
+  print(m.length())
+  print(m.contains("bob"))
+  print(m.contains("dan"))
+  let m2 = m.remove("bob")
+  print(m2.length())
+  print(m2.contains("bob"))
+}

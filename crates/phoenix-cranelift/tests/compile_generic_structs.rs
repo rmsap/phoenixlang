@@ -45,8 +45,7 @@ fn generic_struct_method_using_type_param() {
         r#"
 struct Container<T> {
     T value
-}
-impl Container {
+
     function get(self) -> T { self.value }
 }
 
@@ -71,8 +70,7 @@ fn generic_struct_two_instantiations_coexist() {
         r#"
 struct Box<T> {
     T v
-}
-impl Box {
+
     function unwrap(self) -> T { self.v }
 }
 
@@ -127,11 +125,11 @@ trait Show {
 
 struct Box<T> {
     T v
-}
 
-impl Show for Box {
-    function show(self) -> String {
-        return "box"
+    impl Show {
+        function show(self) -> String {
+            return "box"
+        }
     }
 }
 

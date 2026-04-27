@@ -70,11 +70,11 @@ trait Greet {
 
 struct Dog {
     String name
-}
 
-impl Greet for Dog {
-    function greet(self) -> String {
-        return "woof"
+    impl Greet {
+        function greet(self) -> String {
+            return "woof"
+        }
     }
 }
 
@@ -102,11 +102,11 @@ trait Mix {
 
 struct Bowl {
     Int scale
-}
 
-impl Mix for Bowl {
-    function mix(self, a: Int, b: String) -> String {
-        return b
+    impl Mix {
+        function mix(self, a: Int, b: String) -> String {
+            return b
+        }
     }
 }
 
@@ -242,10 +242,11 @@ trait Measure {
 struct Room {
     Int w
     Int h
-}
-impl Measure for Room {
-    function area(self) -> Int { return self.w * self.h }
-    function is_big(self) -> Bool { return self.area() > 50 }
+
+    impl Measure {
+        function area(self) -> Int { return self.w * self.h }
+        function is_big(self) -> Bool { return self.area() > 50 }
+    }
 }
 function main() {
     let r: dyn Measure = Room(4, 5)
@@ -270,11 +271,12 @@ trait Multi {
     function second(self) -> String
     function third(self) -> String
 }
-struct Tri {}
-impl Multi for Tri {
-    function first(self) -> String { return "1" }
-    function second(self) -> String { return "2" }
-    function third(self) -> String { return "3" }
+struct Tri {
+    impl Multi {
+        function first(self) -> String { return "1" }
+        function second(self) -> String { return "2" }
+        function third(self) -> String { return "3" }
+    }
 }
 function main() {
     let m: dyn Multi = Tri()
@@ -298,9 +300,10 @@ fn dyn_same_concrete_trait_pair_reused() {
 trait Show {
     function show(self) -> String
 }
-struct Dot {}
-impl Show for Dot {
-    function show(self) -> String { return "." }
+struct Dot {
+    impl Show {
+        function show(self) -> String { return "." }
+    }
 }
 function one() -> dyn Show { return Dot() }
 function two() -> dyn Show { return Dot() }
@@ -340,8 +343,9 @@ fn dyn_over_zero_method_trait() {
     let output = compile_and_run(
         r#"
 trait Marker {}
-struct Thing {}
-impl Marker for Thing {}
+struct Thing {
+    impl Marker {}
+}
 function take(_: dyn Marker) -> String { return "ok" }
 function main() {
     print(take(Thing()))
@@ -360,8 +364,9 @@ fn dyn_over_zero_method_trait_roundtrips() {
     roundtrip(
         r#"
 trait Marker {}
-struct Thing {}
-impl Marker for Thing {}
+struct Thing {
+    impl Marker {}
+}
 function take(_: dyn Marker) -> String { return "ok" }
 function main() { print(take(Thing())) }
 "#,
@@ -429,13 +434,15 @@ trait Speak {
 trait Echo {
     function echo(self, other: dyn Speak) -> String
 }
-struct Dog {}
-impl Speak for Dog {
-    function greet(self) -> String { return "woof" }
+struct Dog {
+    impl Speak {
+        function greet(self) -> String { return "woof" }
+    }
 }
-struct Room {}
-impl Echo for Room {
-    function echo(self, other: dyn Speak) -> String { return other.greet() }
+struct Room {
+    impl Echo {
+        function echo(self, other: dyn Speak) -> String { return other.greet() }
+    }
 }
 function main() {
     let r: dyn Echo = Room()
@@ -481,20 +488,21 @@ trait Wide {
     function m10(self) -> Int
     function m11(self) -> Int
 }
-struct Counter {}
-impl Wide for Counter {
-    function m0(self) -> Int { return 0 }
-    function m1(self) -> Int { return 1 }
-    function m2(self) -> Int { return 2 }
-    function m3(self) -> Int { return 3 }
-    function m4(self) -> Int { return 4 }
-    function m5(self) -> Int { return 5 }
-    function m6(self) -> Int { return 6 }
-    function m7(self) -> Int { return 7 }
-    function m8(self) -> Int { return 8 }
-    function m9(self) -> Int { return 9 }
-    function m10(self) -> Int { return 10 }
-    function m11(self) -> Int { return 11 }
+struct Counter {
+    impl Wide {
+        function m0(self) -> Int { return 0 }
+        function m1(self) -> Int { return 1 }
+        function m2(self) -> Int { return 2 }
+        function m3(self) -> Int { return 3 }
+        function m4(self) -> Int { return 4 }
+        function m5(self) -> Int { return 5 }
+        function m6(self) -> Int { return 6 }
+        function m7(self) -> Int { return 7 }
+        function m8(self) -> Int { return 8 }
+        function m9(self) -> Int { return 9 }
+        function m10(self) -> Int { return 10 }
+        function m11(self) -> Int { return 11 }
+    }
 }
 function main() {
     let w: dyn Wide = Counter()
@@ -532,11 +540,12 @@ fn dyn_method_with_reference_type_params_and_return() {
 trait Folder {
     function join(self, prefix: String, items: List<Int>) -> String
 }
-struct Glue {}
-impl Folder for Glue {
-    function join(self, prefix: String, items: List<Int>) -> String {
-        let total: Int = items.reduce(0, function(a: Int, b: Int) -> Int { a + b })
-        return prefix + toString(total)
+struct Glue {
+    impl Folder {
+        function join(self, prefix: String, items: List<Int>) -> String {
+            let total: Int = items.reduce(0, function(a: Int, b: Int) -> Int { a + b })
+            return prefix + toString(total)
+        }
     }
 }
 function main() {
@@ -558,15 +567,17 @@ trait Drawable {
 }
 struct Circle {
     Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 struct Square {
     Int s
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
-}
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function main() {
     let mut shapes: List<dyn Drawable> = []
@@ -591,9 +602,12 @@ fn three_way_agreement_on_multi_arg_dispatch() {
 trait Mix {
     function mix(self, a: Int, b: String) -> String
 }
-struct Bowl { Int scale }
-impl Mix for Bowl {
-    function mix(self, a: Int, b: String) -> String { return b }
+struct Bowl {
+    Int scale
+
+    impl Mix {
+        function mix(self, a: Int, b: String) -> String { return b }
+    }
 }
 function main() {
     let m: dyn Mix = Bowl(2)
@@ -655,9 +669,12 @@ fn dyn_vtable_registration_is_idempotent() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function one() -> dyn Drawable { return Circle(1) }
 function two() -> dyn Drawable { return Circle(2) }
@@ -718,13 +735,19 @@ fn dyn_match_arm_coerces_to_function_return_type() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
-struct Square { Int s }
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+struct Square {
+    Int s
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 // Match on an Int discriminator so the arm bodies are the only place
 // the concrete-to-dyn coercion can happen — keeps the test focused
@@ -764,13 +787,19 @@ fn dyn_alloc_inside_generic_bounded_function() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
-struct Square { Int s }
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+struct Square {
+    Int s
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function dyn_describe<T: Drawable>(x: T) -> String {
     let d: dyn Drawable = x
@@ -846,9 +875,12 @@ fn dyn_default_argument_coerces() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function render(s: dyn Drawable = Circle(1)) -> String { return s.draw() }
 function main() {
@@ -879,9 +911,12 @@ fn dyn_default_argument_coerces_in_generic_callee() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function render<T>(tag: T, s: dyn Drawable = Circle(1)) -> String {
     return s.draw()
@@ -912,13 +947,19 @@ fn nested_generic_dyn_coercion_specializes() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
-struct Square { Int s }
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+struct Square {
+    Int s
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function inner<U: Drawable>(y: U) -> String {
     let d: dyn Drawable = y
@@ -1014,12 +1055,13 @@ trait Speak {
 trait Tag {
     function tag(self) -> String
 }
-struct Dog {}
-impl Speak for Dog {
-    function say(self) -> String { return "woof" }
-}
-impl Tag for Dog {
-    function tag(self) -> String { return "dog" }
+struct Dog {
+    impl Speak {
+        function say(self) -> String { return "woof" }
+    }
+    impl Tag {
+        function tag(self) -> String { return "dog" }
+    }
 }
 function main() {
     let s: dyn Speak = Dog()
@@ -1040,10 +1082,11 @@ trait TwoOps {
     function first(self) -> String
     function second(self) -> String
 }
-struct Pair {}
-impl TwoOps for Pair {
-    function first(self) -> String { return "a" }
-    function second(self) -> String { return "b" }
+struct Pair {
+    impl TwoOps {
+        function first(self) -> String { return "a" }
+        function second(self) -> String { return "b" }
+    }
 }
 function main() {
     let p: dyn TwoOps = Pair()
@@ -1125,13 +1168,19 @@ fn dyn_recursive_dispatch() {
 trait Greeter {
     function greet(self) -> String
 }
-struct Hello { Int dummy }
-struct World { Int dummy }
-impl Greeter for Hello {
-    function greet(self) -> String { return "hello" }
+struct Hello {
+    Int dummy
+
+    impl Greeter {
+        function greet(self) -> String { return "hello" }
+    }
 }
-impl Greeter for World {
-    function greet(self) -> String { return "world" }
+struct World {
+    Int dummy
+
+    impl Greeter {
+        function greet(self) -> String { return "world" }
+    }
 }
 function combine(a: dyn Greeter, b: dyn Greeter) -> String {
     return a.greet()

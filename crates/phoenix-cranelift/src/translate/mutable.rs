@@ -56,6 +56,6 @@ pub(super) fn translate_mutable(
                 )))
             }
         }
-        _ => unreachable!(),
+        _ => ice!("translate_mutable dispatched on non-mutable op: {op:?}"),
     }
 }

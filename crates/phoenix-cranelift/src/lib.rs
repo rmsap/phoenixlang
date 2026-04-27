@@ -16,6 +16,27 @@ mod abi;
 mod builtins;
 mod context;
 mod error;
+
+/// Crate-internal macro: panic with a recognisable "internal compiler
+/// error" prefix so the failure is grep-able and clearly distinct from
+/// user-facing diagnostics. Use at sites that are unreachable when the
+/// IR is well-formed (i.e. would have been `unreachable!()`); the
+/// message should name the dispatcher and what was expected so a hit
+/// in the wild points at the right pass to debug. The macro is in
+/// scope crate-wide via `macro_rules!` textual ordering — submodules
+/// can invoke `ice!(...)` directly without importing.
+///
+/// Note: the `mod translate;` and `pub mod link;` declarations below
+/// rely on this macro being defined first. If a future refactor moves
+/// submodule declarations above this point, `ice!` will silently
+/// disappear from those modules — keep this definition above any
+/// submodule that uses it.
+macro_rules! ice {
+    ($($arg:tt)*) => {
+        panic!("internal compiler error in cranelift backend: {}", format_args!($($arg)*))
+    };
+}
+
 /// Runtime library discovery for linking.
 pub mod link;
 mod translate;

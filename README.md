@@ -3,7 +3,7 @@
 **A strict, statically typed programming language for full-stack web development.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-2%2C200%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-2%2C600%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Phoenix combines functional and object-oriented programming with a clean, familiar syntax and a focus on safe concurrency, async-first design, and developer productivity. Programs run on a tree-walk interpreter (`phoenix run`) or compile to native binaries via Cranelift (`phoenix build`), and API schemas can be code-generated to TypeScript, Python, Go, or OpenAPI.
@@ -222,11 +222,12 @@ See **[docs/phoenix-gen.md](docs/phoenix-gen.md)** for the full guide, or [`test
 ## CLI
 
 ```bash
-phoenix run file.phx             # Execute via the tree-walk interpreter
-phoenix build file.phx           # Compile to a native executable via Cranelift
-phoenix check file.phx           # Type-check without running
-phoenix gen file.phx             # Generate API clients/servers (see Phoenix Gen above)
-phoenix lex | parse | ir file.phx   # Inspect internal compiler stages
+phoenix run file.phx                       # Execute via the tree-walk interpreter
+phoenix run-ir file.phx                    # Execute via the IR interpreter (round-trip verification)
+phoenix build file.phx                     # Compile to a native executable via Cranelift
+phoenix check file.phx                     # Type-check without running
+phoenix gen file.phx                       # Generate API clients/servers (see Phoenix Gen above)
+phoenix lex | parse | ir file.phx          # Inspect internal compiler stages
 ```
 
 `phoenix build` requires a C compiler (gcc or clang) for linking. Run `phoenix --help` for the full command list.
@@ -263,7 +264,7 @@ Phoenix is implemented in Rust as a Cargo workspace of 13 crates, each represent
 
 ## Roadmap & Vision
 
-Phase 1 (core language) is complete; Phase 2 (native compilation via Cranelift) is largely done, with garbage collection and a WebAssembly backend next. Planned beyond that: async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language.
+Phase 1 (core language) is complete; Phase 2.2 (native compilation via Cranelift) is complete; Phase 2.6 (module system and visibility) is the active work, with garbage collection, a WebAssembly backend, and JavaScript interop sequenced after it. Planned beyond that: async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language.
 
 See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features.
 

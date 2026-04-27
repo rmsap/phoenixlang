@@ -41,7 +41,7 @@ pub(super) fn translate_const(
             let len = builder.ins().iconst(cl::I64, s.len() as i64);
             Ok(vec![ptr, len])
         }
-        _ => unreachable!(),
+        _ => ice!("translate_const dispatched on non-Const op: {op:?}"),
     }
 }
 
@@ -87,7 +87,7 @@ pub(super) fn translate_int_arith(
             Ok(vec![result])
         }
         Op::INeg(a) => Ok(vec![builder.ins().ineg(get_val1(state, *a)?)]),
-        _ => unreachable!(),
+        _ => ice!("translate_int_arith dispatched on non-int-arith op: {op:?}"),
     }
 }
 
@@ -200,7 +200,7 @@ pub(super) fn translate_float_arith(
             Ok(vec![builder.ins().fsub(va, product)])
         }
         Op::FNeg(a) => Ok(vec![builder.ins().fneg(get_val1(state, *a)?)]),
-        _ => unreachable!(),
+        _ => ice!("translate_float_arith dispatched on non-float-arith op: {op:?}"),
     }
 }
 
@@ -291,6 +291,6 @@ pub(super) fn translate_cmp(
             Ok(vec![builder.ins().bxor_imm(v, 1)])
         }
 
-        _ => unreachable!(),
+        _ => ice!("translate_cmp dispatched on non-cmp op: {op:?}"),
     }
 }

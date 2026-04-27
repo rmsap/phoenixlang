@@ -211,7 +211,7 @@ pub(super) fn translate_map_alloc(
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     let Op::MapAlloc(entries) = op else {
-        unreachable!()
+        ice!("translate_map_alloc dispatched on non-MapAlloc op: {op:?}")
     };
 
     let (key_ty, val_ty) = match result_type {

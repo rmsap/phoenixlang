@@ -40,7 +40,7 @@ pub(super) fn translate_string(
         Op::StringGt(a, b) => emit_str_cmp(builder, ctx, state, *a, *b, ctx.runtime.str_gt),
         Op::StringLe(a, b) => emit_str_cmp(builder, ctx, state, *a, *b, ctx.runtime.str_le),
         Op::StringGe(a, b) => emit_str_cmp(builder, ctx, state, *a, *b, ctx.runtime.str_ge),
-        _ => unreachable!(),
+        _ => ice!("translate_string dispatched on non-string op: {op:?}"),
     }
 }
 
@@ -125,7 +125,7 @@ pub(super) fn translate_struct(
             TypeLayout::of(field_ty).store(builder, ptr, slot, &field_vals);
             Ok(vec![])
         }
-        _ => unreachable!(),
+        _ => ice!("translate_struct dispatched on non-struct op: {op:?}"),
     }
 }
 
@@ -218,6 +218,6 @@ pub(super) fn translate_enum(
                 .sum::<usize>();
             Ok(TypeLayout::of(result_type).load(builder, ptr, slot))
         }
-        _ => unreachable!(),
+        _ => ice!("translate_enum dispatched on non-enum op: {op:?}"),
     }
 }

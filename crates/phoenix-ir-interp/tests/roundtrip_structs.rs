@@ -30,8 +30,7 @@ fn struct_method() {
 struct Rect {
     Int width
     Int height
-}
-impl Rect {
+
     function area(self) -> Int {
         return self.width * self.height
     }
@@ -119,10 +118,11 @@ trait Describable {
 }
 struct Dog {
     String name
-}
-impl Describable for Dog {
-    function describe(self) -> String {
-        return "Dog: " + self.name
+
+    impl Describable {
+        function describe(self) -> String {
+            return "Dog: " + self.name
+        }
     }
 }
 function main() {

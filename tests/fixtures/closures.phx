@@ -1,0 +1,27 @@
+// Closures with String captures + indirect call through a function
+// parameter. Exercises the closure ABI: function pointer + heap
+// capture record, fat-pointer String captures, and indirect-call
+// dispatch.
+//
+// Single indirect-call site is intentional: two closures with
+// identical user signatures (e.g., two `(Int) -> Int`) trip the
+// "Closure capture type ambiguity with indirect calls" known issue
+// in compiled mode. See known-issues.md.
+
+function applyTwice(f: (Int) -> Int, x: Int) -> Int {
+  f(f(x))
+}
+
+function main() {
+  let prefix: String = "result: "
+  // Closure capturing a fat-pointer String.
+  let say = function(name: String) -> String {
+    prefix + name
+  }
+  print(say("alice"))
+  print(say("bob"))
+
+  // Indirect call through a function-typed parameter.
+  let double = function(x: Int) -> Int { x * 2 }
+  print(applyTwice(double, 3))
+}

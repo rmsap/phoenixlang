@@ -1,0 +1,42 @@
+// Option/Result combinator chains. Exercises the closure-receiving
+// combinators (map, andThen, orElse) plus the unwrap family.
+
+function divide(a: Int, b: Int) -> Result<Int, String> {
+  if b == 0 {
+    Err("division by zero")
+  } else {
+    Ok(a / b)
+  }
+}
+
+function main() {
+  // Option chain.
+  let some: Option<Int> = Some(10)
+  let none: Option<Int> = None
+
+  let mapped = some.map(function(x: Int) -> Int { x + 1 })
+  print(mapped.unwrap())
+  print(none.unwrapOr(-1))
+
+  let chained = some.andThen(function(x: Int) -> Option<Int> {
+    if x > 5 { Some(x * 2) } else { None }
+  })
+  print(chained.unwrap())
+
+  // Result chain.
+  let ok = divide(20, 4)
+  let err = divide(1, 0)
+  print(ok.unwrap())
+  print(err.unwrapOr(0))
+
+  let mapped_ok = ok.map(function(x: Int) -> Int { x * 10 })
+  print(mapped_ok.unwrap())
+
+  // Result.andThen carries the error through.
+  let chain_err = err.andThen(function(x: Int) -> Result<Int, String> { Ok(x + 1) })
+  print(chain_err.unwrapOr(-99))
+
+  // isOk / isErr predicates.
+  print(ok.isOk())
+  print(err.isErr())
+}

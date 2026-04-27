@@ -1,0 +1,34 @@
+// Default arguments on a free function and on an inherent method.
+// Regresses both Phase 2.2 default-argument fixes.
+
+function greet(name: String, prefix: String = "hi", times: Int = 1) -> String {
+  let mut out: String = ""
+  let mut i: Int = 0
+  while i < times {
+    out = out + prefix + " " + name + " "
+    i += 1
+  }
+  out
+}
+
+struct Counter {
+  Int n
+
+  function bump(self, by: Int = 1) -> Int {
+    self.n + by
+  }
+}
+
+function main() {
+  // All defaults on the free function.
+  print(greet("Rex"))
+  // Override one default.
+  print(greet("Rex", "hello"))
+  // Override all defaults.
+  print(greet("Rex", "yo", 3))
+
+  // Method default.
+  let c = Counter(10)
+  print(c.bump())
+  print(c.bump(5))
+}

@@ -27,10 +27,10 @@ trait Greet {
 
 struct Dog {
     String name
-}
 
-impl Greet for Dog {
-    function greet(self) -> String { return "woof" }
+    impl Greet {
+        function greet(self) -> String { return "woof" }
+    }
 }
 
 function sayHi<T: Greet>(animal: T) -> String {
@@ -59,16 +59,18 @@ trait Greet {
 
 struct Dog {
     String name
-}
-impl Greet for Dog {
-    function greet(self) -> String { return "woof from " + self.name }
+
+    impl Greet {
+        function greet(self) -> String { return "woof from " + self.name }
+    }
 }
 
 struct Cat {
     String name
-}
-impl Greet for Cat {
-    function greet(self) -> String { return "meow from " + self.name }
+
+    impl Greet {
+        function greet(self) -> String { return "meow from " + self.name }
+    }
 }
 
 function sayHi<T: Greet>(animal: T) -> String {
@@ -292,9 +294,10 @@ trait Greet {
 
 struct Dog {
     String name
-}
-impl Greet for Dog {
-    function greet(self) -> String { return "woof" }
+
+    impl Greet {
+        function greet(self) -> String { return "woof" }
+    }
 }
 
 function sayHi<T: Greet>(x: T) -> String { return x.greet() }

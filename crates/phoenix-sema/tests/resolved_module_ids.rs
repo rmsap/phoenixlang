@@ -43,8 +43,10 @@ fn struct_enum_trait_id_return_none_for_unknown_names() {
 fn method_lookup_returns_none_for_unknown_pair() {
     let result = check_full(
         r#"
-struct Counter { Int v }
-impl Counter { function get(self) -> Int { return self.v } }
+struct Counter {
+    Int v
+    function get(self) -> Int { return self.v }
+}
 function main() { }
 "#,
     );
@@ -62,8 +64,10 @@ function main() { }
 fn method_lookup_finds_user_methods_via_func_id() {
     let result = check_full(
         r#"
-struct Counter { Int v }
-impl Counter { function get(self) -> Int { return self.v } }
+struct Counter {
+    Int v
+    function get(self) -> Int { return self.v }
+}
 function main() { }
 "#,
     );
@@ -119,8 +123,10 @@ fn user_methods_occupy_contiguous_func_ids_after_free_functions() {
     let result = check_full(
         r#"
 function alpha() { }
-struct Counter { Int v }
-impl Counter { function tick(self) -> Int { return self.v + 1 } }
+struct Counter {
+    Int v
+    function tick(self) -> Int { return self.v + 1 }
+}
 function beta() { }
 "#,
     );
@@ -246,8 +252,7 @@ enum Color {
     Red
     Green
     Blue
-}
-impl Color {
+
     function isRed(self) -> Bool { return false }
     function name(self) -> String { return "color" }
 }
@@ -291,8 +296,10 @@ function main() { }
 fn user_method_index_round_trip() {
     let result = check_full(
         r#"
-struct Counter { Int v }
-impl Counter { function inc(self) -> Int { return self.v + 1 } }
+struct Counter {
+    Int v
+    function inc(self) -> Int { return self.v + 1 }
+}
 function main() { }
 "#,
     );
@@ -386,8 +393,8 @@ fn duplicate_method_emits_diagnostic_and_keeps_first_definition() {
     // `slot.is_none()` assertion relies on — this test pins it.
     let tokens = tokenize(
         r#"
-struct Counter { Int v }
-impl Counter {
+struct Counter {
+    Int v
     function get(self) -> Int { return self.v }
     function get(self) -> Bool { return true }
 }
@@ -484,8 +491,8 @@ function gamma() { }
 fn user_methods_with_names_round_trips_through_method_index() {
     let result = check_full(
         r#"
-struct Counter { Int v }
-impl Counter {
+struct Counter {
+    Int v
     function get(self) -> Int { return self.v }
     function bump(self) -> Int { return self.v + 1 }
 }
@@ -527,10 +534,14 @@ fn build_from_checker_invariants_hold_for_realistic_program() {
     let result = check_full(
         r#"
 trait Greet { function hi(self) -> String }
-struct Dog { String name }
-impl Greet for Dog { function hi(self) -> String { return self.name } }
-struct Cat { String name }
-impl Cat { function meow(self) -> String { return self.name } }
+struct Dog {
+    String name
+    impl Greet { function hi(self) -> String { return self.name } }
+}
+struct Cat {
+    String name
+    function meow(self) -> String { return self.name }
+}
 enum Mood {
     Happy
     Grumpy

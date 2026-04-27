@@ -1,0 +1,38 @@
+// Static-dispatch trait bound: `<T: Trait>` calls a trait method on
+// a TypeVar receiver. Regresses the Phase 2.2 fix where this path
+// previously failed in compiled mode with "builtin '.method' not yet
+// supported" because IR lowering emitted Op::BuiltinCall(".method")
+// for the trait-bound path.
+//
+// Bodies use plain string returns to avoid the parser's interpolation
+// span-collision bug (see known-issues.md: "Interpolated-expression
+// spans are zero-based, colliding across functions").
+
+trait Greet {
+  function greet(self) -> String
+}
+
+struct Dog {
+  String name
+
+  impl Greet {
+    function greet(self) -> String { "woof" }
+  }
+}
+
+struct Cat {
+  String name
+
+  impl Greet {
+    function greet(self) -> String { "meow" }
+  }
+}
+
+function sayHi<T: Greet>(animal: T) -> String {
+  animal.greet()
+}
+
+function main() {
+  print(sayHi(Dog("Rex")))
+  print(sayHi(Cat("Whiskers")))
+}

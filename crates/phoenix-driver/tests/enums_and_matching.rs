@@ -8,8 +8,7 @@ fn enum_and_match() {
 enum Shape {
   Circle(Float)
   Rect(Float, Float)
-}
-impl Shape {
+
   function area(self) -> Float {
     return match self {
       Circle(r) -> 3.14 * r * r
@@ -608,8 +607,9 @@ function main() {
 fn enum_with_impl_methods() {
     run_expect(
         r#"
-enum Color { Red Green Blue }
-impl Color {
+enum Color {
+    Red Green Blue
+
     function name(self) -> String {
         return match self {
             Red -> "red"
@@ -1071,8 +1071,7 @@ fn return_in_nested_if_inside_match_arm() {
 enum Shape {
   Circle(Float)
   Rect(Float, Float)
-}
-impl Shape {
+
   function describe(self) -> String {
     return match self {
       Circle(_) -> "circle"

@@ -19,15 +19,17 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 struct Square {
     Int side
-}
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function render(s: dyn Drawable) -> String {
     return s.draw()
@@ -95,9 +97,10 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function print_dyn(x: dyn Drawable) {
     print(x.draw())
@@ -234,9 +237,12 @@ fn dyn_coercion_from_bounded_type_var_accepted() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function wrap<T: Drawable>(x: T) -> String {
     let d: dyn Drawable = x
@@ -271,9 +277,10 @@ trait Display {
 
 struct Tag {
     String label
-}
-impl Display for Tag {
-    function toString(self) -> String { return self.label }
+
+    impl Display {
+        function toString(self) -> String { return self.label }
+    }
 }
 
 // Verbatim from README.md "Static and dynamic dispatch":

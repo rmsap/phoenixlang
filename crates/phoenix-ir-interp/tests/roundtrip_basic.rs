@@ -338,8 +338,9 @@ function main() {
 fn method_default_trailing_positional() {
     roundtrip(
         r#"
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function bump(self, by: Int = 10) -> Int { return self.n + by }
 }
 function main() {
@@ -356,8 +357,9 @@ fn method_default_calls_another_function() {
     roundtrip(
         r#"
 function origin() -> Int { return 42 }
-struct Box { Int value }
-impl Box {
+struct Box {
+    Int value
+
     function wrap(self, tag: Int = origin()) -> Int { return self.value + tag }
 }
 function main() {
@@ -377,8 +379,9 @@ function main() {
 fn method_default_overridden_by_positional() {
     roundtrip(
         r#"
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function bump(self, by: Int = 1) -> Int { return self.n + by }
 }
 function main() {

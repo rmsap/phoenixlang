@@ -19,9 +19,10 @@ trait Greet {
 }
 struct Dog {
     String name
-}
-impl Greet for Dog {
-    function greet(self) -> String { return "woof" }
+
+    impl Greet {
+        function greet(self) -> String { return "woof" }
+    }
 }
 function hello(g: dyn Greet) -> String { return g.greet() }
 function main() { print(hello(Dog("Rex"))) }
@@ -40,10 +41,11 @@ trait Mix {
 }
 struct Bowl {
     Int scale
-}
-impl Mix for Bowl {
-    function mix(self, a: Int, b: String) -> String {
-        return b
+
+    impl Mix {
+        function mix(self, a: Int, b: String) -> String {
+            return b
+        }
     }
 }
 function go(m: dyn Mix) -> String {
@@ -65,15 +67,17 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 struct Square {
     Int side
-}
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function inner(x: dyn Drawable) -> String { return x.draw() }
 function outer(x: dyn Drawable) -> String { return inner(x) }
@@ -96,9 +100,10 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function main() {
     let x: dyn Drawable = Circle(1)
@@ -122,9 +127,10 @@ trait Drawable {
 type Drawn = dyn Drawable
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function main() {
     let x: Drawn = Circle(1)
@@ -144,9 +150,12 @@ fn dyn_in_enum_variant_field() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 enum Wrapper {
     Held(dyn Drawable)
@@ -178,9 +187,10 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 struct Scene {
     dyn Drawable hero
@@ -206,15 +216,17 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 struct Square {
     Int side
-}
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function main() {
     let mut d: dyn Drawable = Circle(1)
@@ -240,9 +252,10 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function make() -> dyn Drawable {
     Circle(1)
@@ -266,9 +279,10 @@ trait Drawable {
 }
 struct Circle {
     Int radius
-}
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function main() {
     let f: (Int) -> dyn Drawable = function(n: Int) -> dyn Drawable { Circle(n) }
@@ -292,13 +306,19 @@ fn dyn_match_arm_coerces_to_function_return_type() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
-struct Square { Int s }
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+struct Square {
+    Int s
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 function choose(k: Int) -> dyn Drawable {
     return match k {
@@ -321,9 +341,12 @@ fn closure_captures_dyn_value_and_dispatches() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function main() {
     let d: dyn Drawable = Circle(1)
@@ -341,9 +364,10 @@ fn same_concrete_two_traits_yields_two_vtables() {
         r#"
 trait Speak { function say(self) -> String }
 trait Tag { function tag(self) -> String }
-struct Dog {}
-impl Speak for Dog { function say(self) -> String { return "woof" } }
-impl Tag for Dog { function tag(self) -> String { return "dog" } }
+struct Dog {
+    impl Speak { function say(self) -> String { return "woof" } }
+    impl Tag { function tag(self) -> String { return "dog" } }
+}
 function main() {
     let s: dyn Speak = Dog()
     let t: dyn Tag = Dog()
@@ -362,10 +386,11 @@ trait TwoOps {
     function first(self) -> String
     function second(self) -> String
 }
-struct Pair {}
-impl TwoOps for Pair {
-    function first(self) -> String { return "a" }
-    function second(self) -> String { return "b" }
+struct Pair {
+    impl TwoOps {
+        function first(self) -> String { return "a" }
+        function second(self) -> String { return "b" }
+    }
 }
 function main() {
     let p: dyn TwoOps = Pair()
@@ -383,9 +408,12 @@ fn dyn_asymmetric_if_branches() {
     roundtrip(
         r#"
 trait Drawable { function draw(self) -> String }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function choose(flag: Bool, base: dyn Drawable) -> dyn Drawable {
     if flag { return Circle(1) } else { return base }
@@ -417,20 +445,21 @@ trait Wide {
     function m10(self) -> Int
     function m11(self) -> Int
 }
-struct Counter {}
-impl Wide for Counter {
-    function m0(self) -> Int { return 0 }
-    function m1(self) -> Int { return 1 }
-    function m2(self) -> Int { return 2 }
-    function m3(self) -> Int { return 3 }
-    function m4(self) -> Int { return 4 }
-    function m5(self) -> Int { return 5 }
-    function m6(self) -> Int { return 6 }
-    function m7(self) -> Int { return 7 }
-    function m8(self) -> Int { return 8 }
-    function m9(self) -> Int { return 9 }
-    function m10(self) -> Int { return 10 }
-    function m11(self) -> Int { return 11 }
+struct Counter {
+    impl Wide {
+        function m0(self) -> Int { return 0 }
+        function m1(self) -> Int { return 1 }
+        function m2(self) -> Int { return 2 }
+        function m3(self) -> Int { return 3 }
+        function m4(self) -> Int { return 4 }
+        function m5(self) -> Int { return 5 }
+        function m6(self) -> Int { return 6 }
+        function m7(self) -> Int { return 7 }
+        function m8(self) -> Int { return 8 }
+        function m9(self) -> Int { return 9 }
+        function m10(self) -> Int { return 10 }
+        function m11(self) -> Int { return 11 }
+    }
 }
 function main() {
     let w: dyn Wide = Counter()
@@ -460,11 +489,12 @@ fn dyn_method_with_reference_type_params_roundtrips() {
 trait Folder {
     function join(self, prefix: String, items: List<Int>) -> String
 }
-struct Glue {}
-impl Folder for Glue {
-    function join(self, prefix: String, items: List<Int>) -> String {
-        let total: Int = items.reduce(0, function(a: Int, b: Int) -> Int { a + b })
-        return prefix + toString(total)
+struct Glue {
+    impl Folder {
+        function join(self, prefix: String, items: List<Int>) -> String {
+            let total: Int = items.reduce(0, function(a: Int, b: Int) -> Int { a + b })
+            return prefix + toString(total)
+        }
     }
 }
 function main() {
@@ -482,9 +512,12 @@ fn dyn_named_argument_coerces_roundtrips() {
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int r }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int r
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
 function render(label: String, s: dyn Drawable) -> String {
     return label + s.draw()
@@ -501,13 +534,19 @@ fn dyn_field_reassignment_coerces_roundtrips() {
     roundtrip(
         r#"
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-struct Square { Int side }
-impl Drawable for Circle {
-    function draw(self) -> String { return "circle" }
+struct Circle {
+    Int radius
+
+    impl Drawable {
+        function draw(self) -> String { return "circle" }
+    }
 }
-impl Drawable for Square {
-    function draw(self) -> String { return "square" }
+struct Square {
+    Int side
+
+    impl Drawable {
+        function draw(self) -> String { return "square" }
+    }
 }
 struct Scene { dyn Drawable hero }
 function main() {

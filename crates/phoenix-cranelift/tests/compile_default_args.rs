@@ -154,8 +154,9 @@ function main() {
 fn default_on_method_parameter() {
     three_way_roundtrip(
         r#"
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function bump(self, by: Int = 1) -> Int {
         return self.n + by
     }
@@ -177,8 +178,9 @@ function main() {
 fn method_default_overridden_by_positional() {
     three_way_roundtrip(
         r#"
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function bump(self, by: Int = 1) -> Int {
         return self.n + by
     }
@@ -205,8 +207,9 @@ function defaultBump() -> Int {
     print("default")
     return 1
 }
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function bump(self, by: Int = defaultBump()) -> Int {
         return self.n + by
     }
@@ -262,8 +265,9 @@ function main() {
 fn method_default_with_method_level_type_params() {
     three_way_roundtrip(
         r#"
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function label<U>(self, item: U, prefix: Int = 0) -> Int {
         return self.n + prefix
     }
@@ -287,14 +291,15 @@ function main() {
 fn method_default_calls_function_returning_same_struct_type() {
     three_way_roundtrip(
         r#"
-struct Counter { Int n }
-function fresh() -> Counter {
-    return Counter(100)
-}
-impl Counter {
+struct Counter {
+    Int n
+
     function add(self, other: Counter = fresh()) -> Int {
         return self.n + other.n
     }
+}
+function fresh() -> Counter {
+    return Counter(100)
 }
 function main() {
     let c: Counter = Counter(10)

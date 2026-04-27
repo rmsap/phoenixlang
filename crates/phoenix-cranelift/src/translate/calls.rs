@@ -31,7 +31,7 @@ pub(super) fn translate_closure_alloc(
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     let Op::ClosureAlloc(target_fid, captures) = op else {
-        unreachable!()
+        ice!("translate_closure_alloc dispatched on non-ClosureAlloc op: {op:?}")
     };
 
     let capture_slots: usize = captures
@@ -120,7 +120,7 @@ pub(super) fn translate_call(
              reached Cranelift codegen — monomorphization was expected to \
              rewrite it to a concrete Op::Call"
         ))),
-        _ => unreachable!(),
+        _ => ice!("translate_call dispatched on non-call op: {op:?}"),
     }
 }
 
@@ -210,7 +210,7 @@ fn translate_string_method(
                 "trim" => ctx.runtime.str_trim,
                 "toLowerCase" => ctx.runtime.str_to_lower,
                 "toUpperCase" => ctx.runtime.str_to_upper,
-                _ => unreachable!(),
+                _ => ice!("translate_string_method outer arm guard mismatch: {method}"),
             };
             Ok(call_runtime(builder, ctx, func, &[recv[0], recv[1]]))
         }
@@ -221,7 +221,7 @@ fn translate_string_method(
                 "startsWith" => ctx.runtime.str_starts_with,
                 "endsWith" => ctx.runtime.str_ends_with,
                 "indexOf" => ctx.runtime.str_index_of,
-                _ => unreachable!(),
+                _ => ice!("translate_string_method outer arm guard mismatch: {method}"),
             };
             Ok(call_runtime(
                 builder,

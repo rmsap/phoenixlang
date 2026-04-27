@@ -1,0 +1,50 @@
+// `dyn Trait` exercises the vtable ABI plus the Phase 2.2
+// `<T: Trait>` → `dyn Trait` coercion fix:
+// - Direct `dyn Trait` parameter (vtable construction at the call site).
+// - `let d: dyn Trait = expr` coercion (Op::DynAlloc on a concrete type).
+// - `<T: Drawable>` → `dyn Drawable` coercion (Op::UnresolvedDynAlloc
+//   placeholder that monomorphization rewrites to Op::DynAlloc).
+//
+// Bodies use plain string returns rather than field-referencing
+// interpolation to avoid the parser's interpolation-span collision bug
+// (see known-issues.md: "Interpolated-expression spans are zero-based,
+// colliding across functions").
+
+trait Drawable {
+  function draw(self) -> String
+}
+
+struct Circle {
+  Int radius
+
+  impl Drawable {
+    function draw(self) -> String { "circle" }
+  }
+}
+
+struct Square {
+  Int side
+
+  impl Drawable {
+    function draw(self) -> String { "square" }
+  }
+}
+
+function render(s: dyn Drawable) -> String {
+  s.draw()
+}
+
+function coerce<T: Drawable>(x: T) -> dyn Drawable {
+  x
+}
+
+function main() {
+  print(render(Circle(3)))
+  print(render(Square(5)))
+
+  let d: dyn Drawable = Circle(7)
+  print(d.draw())
+
+  let c: dyn Drawable = coerce(Square(9))
+  print(c.draw())
+}

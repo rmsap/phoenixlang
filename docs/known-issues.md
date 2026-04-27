@@ -91,6 +91,22 @@ Sema records per-call-site concrete type arguments into `HashMap<Span, Vec<Type>
 **Planned fix:** Assign a stable `CallId: u32` to each call expression at parse time and key the map on it. Decouples the sema→lowering handoff from span identity.
 **Target phase:** Phase 3. Not urgent while compilation stays single-file/single-pass. Must land before any change that synthesizes or reparents call-expression AST nodes.
 
+### Interpolated-expression spans are zero-based, colliding across functions
+
+Field accesses (and other subexpressions) inside string interpolations are parsed by a sub-parser fed only the substring between `{` and `}`, with no offset relative to the enclosing source file. Spans on the resulting AST nodes therefore start at offset 0 and collide whenever two different functions interpolate field accesses with the same length — sema's per-`Span` type map (`source_type_at`) overwrites the earlier entry, and IR lowering then sees the wrong receiver type. The symptom is an `unreachable!()` in `lower_field_access` of the form `field access on unknown struct layout: field 'X' on type Named("Y")`, where X is one impl's field and Y is another impl's struct.
+
+Concrete repro: two impls of the same trait method, each interpolating one of its own fields, e.g.
+```
+impl Drawable for Circle { function draw(self) -> String { "c={self.radius}" } }
+impl Drawable for Square { function draw(self) -> String { "s={self.side}"   } }
+```
+fails under `phoenix run-ir` and `phoenix build`; the AST-walking interpreter (`phoenix run`) is unaffected because it does not consult sema's span map.
+
+**File:** `phoenix-parser/src/expr.rs::parse_interpolation_segments` (sub-parser invocation at the `tokenize(&expr_src, source_id)` line); consumed in `phoenix-ir/src/lower_expr.rs::lower_field_access` and any other lowering that calls `source_type_at(&span)`.
+**Planned fix:** Same root cause as the `call_type_args` entry above. Either adjust the sub-parser to translate spans by the interpolation's start offset, or move sema/lowering off `Span`-keyed maps onto stable per-AST-node ids. The latter retires this whole class of bug.
+**Target phase:** Phase 3 (alongside the broader span-vs-id refactor).
+**Discovered:** 2026-04-27 while building the Phase 2.2 three-backend roundtrip matrix. The fixture pattern is excluded from the matrix until the fix lands.
+
 ### Occurs-check suppressed pending alpha-renaming of type parameters
 
 `Checker::unify` (`phoenix-sema/src/check_types.rs`) detects and reports *conflicting* bindings (`T := Int` and later `T := String` at a different argument position) but does not run an occurs-check against cyclic bindings such as `T := List<T>`. The check is defined on `UnifyError::OccursCheck` but not emitted: Phoenix does not alpha-rename type parameter binders, so a scope-oblivious occurs-check false-positives on every template-body shadowing (`function outer<T> { inner(x) }` where both `outer<T>` and `inner<T>` use the same name `T`).

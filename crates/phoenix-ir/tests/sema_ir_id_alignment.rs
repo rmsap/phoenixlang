@@ -71,8 +71,9 @@ function gamma() { }
 fn ir_user_method_ids_match_resolved_user_method_ids() {
     let (analysis, ir) = lower_program(
         r#"
-struct Counter { Int v }
-impl Counter {
+struct Counter {
+    Int v
+
     function bump(self) -> Int { return self.v + 1 }
     function get(self) -> Int { return self.v }
 }
@@ -160,8 +161,9 @@ fn no_placeholder_funcs_after_lowering() {
     // and closures; if the contract held, none should leak.
     let (_analysis, ir) = lower_program(
         r#"
-struct Counter { Int n }
-impl Counter {
+struct Counter {
+    Int n
+
     function bump(self) -> Int { return self.n + 1 }
 }
 function apply(f: (Int) -> Int, x: Int) -> Int { return f(x) }

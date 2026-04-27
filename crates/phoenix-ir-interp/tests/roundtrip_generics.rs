@@ -177,8 +177,7 @@ fn generic_method_on_non_generic_struct() {
         r#"
 struct Holder {
     Int tag
-}
-impl Holder {
+
     function wrap<U>(self, x: U) -> U { x }
 }
 function main() {

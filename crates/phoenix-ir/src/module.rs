@@ -345,6 +345,16 @@ impl IrFunction {
         &mut self.value_types
     }
 
+    /// Test-only: bump `next_value_id` without pushing into
+    /// `value_types`, simulating a buggy pass that allocated a value
+    /// without recording its type. Exists solely so the verifier's
+    /// `value_types`-sync invariant can be exercised by a negative
+    /// test; not callable from outside test builds.
+    #[cfg(test)]
+    pub(crate) fn debug_desync_value_types(&mut self) {
+        self.next_value_id += 1;
+    }
+
     /// Allocates a fresh [`ValueId`]. The value has no type until
     /// [`Self::emit`] or [`Self::add_block_param`] attaches one.
     pub fn fresh_value(&mut self) -> ValueId {

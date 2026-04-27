@@ -167,10 +167,14 @@ fn link_binary(obj_bytes: &[u8], prefix: &str) -> (PathBuf, PathBuf) {
 /// Returns Phoenix source for:
 /// ```phoenix
 /// trait Drawable { function draw(self) -> String }
-/// struct Circle { Int radius }
-/// impl Drawable for Circle { function draw(self) -> String { return "circle" } }
-/// struct Square { Int side }
-/// impl Drawable for Square { function draw(self) -> String { return "square" } }
+/// struct Circle {
+///     Int radius
+///     impl Drawable { function draw(self) -> String { return "circle" } }
+/// }
+/// struct Square {
+///     Int side
+///     impl Drawable { function draw(self) -> String { return "square" } }
+/// }
 /// ```
 ///
 /// Most tests in `compile_dyn_trait.rs` exercise behaviour against this
@@ -183,18 +187,18 @@ pub fn drawable_prelude() -> &'static str {
 
 struct Circle {
     Int radius
-}
 
-impl Drawable for Circle {
-    function draw(self) -> String { return \"circle\" }
+    impl Drawable {
+        function draw(self) -> String { return \"circle\" }
+    }
 }
 
 struct Square {
     Int side
-}
 
-impl Drawable for Square {
-    function draw(self) -> String { return \"square\" }
+    impl Drawable {
+        function draw(self) -> String { return \"square\" }
+    }
 }
 "
 }

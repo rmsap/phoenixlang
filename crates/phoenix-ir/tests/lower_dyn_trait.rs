@@ -44,13 +44,19 @@ const DRAWABLE_PROGRAM: &str = "
 trait Drawable {
     function draw(self) -> String
 }
-struct Circle { Int radius }
-impl Drawable for Circle {
-    function draw(self) -> String { return \"circle\" }
+struct Circle {
+    Int radius
+
+    impl Drawable {
+        function draw(self) -> String { return \"circle\" }
+    }
 }
-struct Square { Int side }
-impl Drawable for Square {
-    function draw(self) -> String { return \"square\" }
+struct Square {
+    Int side
+
+    impl Drawable {
+        function draw(self) -> String { return \"square\" }
+    }
 }
 function render(s: dyn Drawable) -> String { return s.draw() }
 function main() {
@@ -177,8 +183,10 @@ fn struct_ctor_with_dyn_field_emits_dyn_alloc_at_ctor_site() {
     let module = lower_program(
         "
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-impl Drawable for Circle { function draw(self) -> String { return \"c\" } }
+struct Circle {
+    Int radius
+    impl Drawable { function draw(self) -> String { return \"c\" } }
+}
 struct Scene { dyn Drawable hero }
 function main() {
     let s = Scene(Circle(3))
@@ -228,8 +236,10 @@ fn let_annotation_with_dyn_emits_dyn_alloc() {
     let module = lower_program(
         "
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-impl Drawable for Circle { function draw(self) -> String { return \"c\" } }
+struct Circle {
+    Int radius
+    impl Drawable { function draw(self) -> String { return \"c\" } }
+}
 function main() {
     let d: dyn Drawable = Circle(1)
     print(d.draw())
@@ -250,10 +260,14 @@ fn reassignment_into_dyn_emits_dyn_alloc_on_each_store() {
     let module = lower_program(
         "
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-struct Square { Int side }
-impl Drawable for Circle { function draw(self) -> String { return \"c\" } }
-impl Drawable for Square { function draw(self) -> String { return \"s\" } }
+struct Circle {
+    Int radius
+    impl Drawable { function draw(self) -> String { return \"c\" } }
+}
+struct Square {
+    Int side
+    impl Drawable { function draw(self) -> String { return \"s\" } }
+}
 function main() {
     let mut d: dyn Drawable = Circle(1)
     d = Square(2)
@@ -274,8 +288,10 @@ fn function_return_into_dyn_emits_dyn_alloc() {
     let module = lower_program(
         "
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-impl Drawable for Circle { function draw(self) -> String { return \"c\" } }
+struct Circle {
+    Int radius
+    impl Drawable { function draw(self) -> String { return \"c\" } }
+}
 function make() -> dyn Drawable { return Circle(1) }
 function main() { print(make().draw()) }
 ",
@@ -294,8 +310,10 @@ fn enum_variant_with_dyn_field_emits_dyn_alloc() {
     let module = lower_program(
         "
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-impl Drawable for Circle { function draw(self) -> String { return \"c\" } }
+struct Circle {
+    Int radius
+    impl Drawable { function draw(self) -> String { return \"c\" } }
+}
 enum Slot { Held(dyn Drawable)
             Empty }
 function main() {
@@ -321,8 +339,10 @@ fn repeated_dyn_alloc_for_same_pair_yields_single_vtable_entry() {
     let module = lower_program(
         "
 trait Drawable { function draw(self) -> String }
-struct Circle { Int radius }
-impl Drawable for Circle { function draw(self) -> String { return \"c\" } }
+struct Circle {
+    Int radius
+    impl Drawable { function draw(self) -> String { return \"c\" } }
+}
 function one(x: dyn Drawable) -> String { return x.draw() }
 function two(x: dyn Drawable) -> String { return x.draw() }
 function main() {

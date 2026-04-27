@@ -53,7 +53,7 @@ pub(super) fn translate_dyn_op(
             };
             translate_dyn_call(builder, ctx, ir_module, state, &site)
         }
-        _ => unreachable!("translate_dyn_op dispatched on non-dyn op"),
+        _ => ice!("translate_dyn_op dispatched on non-dyn op: {op:?}"),
     }
 }
 

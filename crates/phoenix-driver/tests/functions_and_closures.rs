@@ -157,8 +157,7 @@ fn implicit_return_method() {
 struct Point {
   Int x
   Int y
-}
-impl Point {
+
   function sum(self) -> Int {
     self.x + self.y
   }

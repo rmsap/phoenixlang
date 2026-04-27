@@ -254,7 +254,7 @@ pub(super) fn translate_list_alloc(
     state: &FuncState,
 ) -> Result<Vec<Value>, CompileError> {
     let Op::ListAlloc(elements) = op else {
-        unreachable!()
+        ice!("translate_list_alloc dispatched on non-ListAlloc op: {op:?}")
     };
 
     let elem_ty = match result_type {

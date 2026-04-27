@@ -429,3 +429,222 @@ mod unresolved_placeholder_op_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod structural_verifier_tests {
+    //! Negative tests for the core structural invariants in
+    //! [`verify_function`] and [`verify_value_types_index`]. Companion
+    //! to the four `unresolved_placeholder_op_tests` above and the
+    //! `dyn`-op tests in [`super::dyn_ops`]. Each test constructs a
+    //! minimal IR module that violates one specific invariant and
+    //! asserts the verifier rejects it with a recognisable message.
+
+    use crate::block::BlockId;
+    use crate::instruction::{FuncId, Op, VOID_SENTINEL, ValueId};
+    use crate::module::{IrFunction, IrModule};
+    use crate::terminator::Terminator;
+    use crate::types::IrType;
+    use crate::verify::verify;
+
+    fn func_returning(ret: IrType) -> IrFunction {
+        IrFunction::new(FuncId(0), "f".into(), Vec::new(), Vec::new(), ret, None)
+    }
+
+    fn empty_func() -> IrFunction {
+        func_returning(IrType::Void)
+    }
+
+    #[test]
+    fn terminator_arg_count_mismatch_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        let entry = func.create_block();
+        let target = func.create_block();
+        // Target expects one Int param.
+        func.add_block_param(target, IrType::I64);
+        func.set_terminator(target, Terminator::Return(None));
+        // Entry jumps to target with zero args.
+        func.set_terminator(
+            entry,
+            Terminator::Jump {
+                target,
+                args: Vec::new(),
+            },
+        );
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("0 args") && e.message.contains("expects 1 params")),
+            "expected arg-count mismatch, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn instruction_operand_void_sentinel_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        let entry = func.create_block();
+        let lhs = func.add_block_param(entry, IrType::I64);
+        // RHS is VOID_SENTINEL — the verifier must catch this.
+        func.emit(entry, Op::IAdd(lhs, VOID_SENTINEL), IrType::I64, None);
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("instruction uses VOID_SENTINEL")),
+            "expected VOID_SENTINEL operand error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn instruction_operand_undefined_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        let entry = func.create_block();
+        let lhs = func.add_block_param(entry, IrType::I64);
+        // RHS is ValueId(99) — never allocated.
+        func.emit(entry, Op::IAdd(lhs, ValueId(99)), IrType::I64, None);
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("instruction uses undefined value")),
+            "expected undefined-operand error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn terminator_operand_void_sentinel_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = func_returning(IrType::I64);
+        let entry = func.create_block();
+        // Return VOID_SENTINEL from a function declared to return I64.
+        func.set_terminator(entry, Terminator::Return(Some(VOID_SENTINEL)));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("terminator uses VOID_SENTINEL")),
+            "expected VOID_SENTINEL terminator-operand error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn terminator_operand_undefined_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = func_returning(IrType::I64);
+        let entry = func.create_block();
+        // Branch on a value that was never allocated.
+        let other = func.create_block();
+        func.set_terminator(other, Terminator::Return(None));
+        func.set_terminator(
+            entry,
+            Terminator::Branch {
+                condition: ValueId(99),
+                true_block: other,
+                true_args: Vec::new(),
+                false_block: other,
+                false_args: Vec::new(),
+            },
+        );
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("terminator uses undefined value")),
+            "expected undefined terminator-operand error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn value_types_index_out_of_sync_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        let entry = func.create_block();
+        func.set_terminator(entry, Terminator::Return(None));
+        // Bump next_value_id without pushing a slot into value_types,
+        // simulating a buggy pass that allocated a ValueId but skipped
+        // the type index.
+        func.debug_desync_value_types();
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("value_types length")
+                    && e.message.contains("out of sync")),
+            "expected value_types desync error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn block_with_no_terminator_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        // create_block leaves Terminator::None in place; never call
+        // set_terminator on it.
+        func.create_block();
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("has no terminator")),
+            "expected missing-terminator error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn terminator_references_invalid_target_is_flagged() {
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        let entry = func.create_block();
+        // Jump to BlockId(99), which was never created.
+        func.set_terminator(
+            entry,
+            Terminator::Jump {
+                target: BlockId(99),
+                args: Vec::new(),
+            },
+        );
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("references invalid target")),
+            "expected invalid-target error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn well_formed_function_passes_verification() {
+        // Sanity check: a minimal well-formed function verifies clean.
+        // Catches regressions where a verifier change starts flagging
+        // legitimate IR.
+        let mut module = IrModule::new();
+        let mut func = empty_func();
+        let entry = func.create_block();
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(func);
+
+        let errors = verify(&module);
+        assert!(errors.is_empty(), "expected clean verify, got: {errors:?}");
+    }
+}

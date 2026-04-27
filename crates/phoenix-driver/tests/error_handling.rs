@@ -290,8 +290,7 @@ fn try_operator_on_method_call() {
         r#"
 struct Db {
   Int id
-}
-impl Db {
+
   function find(self) -> Option<Int> {
     return Some(self.id)
   }
@@ -679,8 +678,9 @@ function main() {
 fn method_returning_option() {
     run_expect(
         r#"
-struct Database { Int count }
-impl Database {
+struct Database {
+    Int count
+
     function find(self, id: Int) -> Option<String> {
         if id <= self.count {
             return Some("user_{id}")

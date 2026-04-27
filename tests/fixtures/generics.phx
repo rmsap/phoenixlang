@@ -1,0 +1,22 @@
+// Generic struct exercising the Phase 2.2 generic-struct fix:
+// two concrete instantiations of `Container<T>` plus a generic
+// method, verifying both run identically across all three backends.
+
+struct Container<T> {
+  T value
+
+  function get(self) -> T { self.value }
+}
+
+function pair<T>(a: T, b: T) -> T {
+  a
+}
+
+function main() {
+  let c1: Container<Int> = Container(42)
+  let c2: Container<String> = Container("hello")
+  print(c1.get())
+  print(c2.get())
+  print(pair(1, 2))
+  print(pair("x", "y"))
+}

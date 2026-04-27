@@ -8,8 +8,7 @@ fn struct_and_methods() {
 struct Point {
   Int x
   Int y
-}
-impl Point {
+
   function sum(self) -> Int {
     return self.x + self.y
   }
@@ -241,8 +240,7 @@ function main() {
         r#"
 struct Counter {
   Int value
-}
-impl Counter {
+
   function get(self) -> Int { return self.value }
 }
 function main() {
@@ -904,8 +902,9 @@ function main() {
 fn struct_method_chaining() {
     run_expect(
         r#"
-struct Counter { Int value }
-impl Counter {
+struct Counter {
+    Int value
+
     function get(self) -> Int { return self.value }
 }
 function main() {
@@ -1026,8 +1025,10 @@ function main() {
 fn struct_method_calls_another_method() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
-impl Point {
+struct Point {
+    Int x
+    Int y
+
     function sum(self) -> Int { return self.x + self.y }
     function describe(self) -> String {
         return "sum=" + toString(self.sum())
@@ -1422,8 +1423,10 @@ function main() {
 fn method_with_multiple_params() {
     run_expect(
         r#"
-struct Rect { Float width  Float height }
-impl Rect {
+struct Rect {
+    Float width
+    Float height
+
     function scale(self, factor: Float) -> Rect {
         return Rect(self.width * factor, self.height * factor)
     }
@@ -1548,8 +1551,9 @@ function main() {
 fn generic_impl_method_returns_type_param() {
     run_expect(
         r#"
-struct Wrapper<T> { T value }
-impl Wrapper {
+struct Wrapper<T> {
+    T value
+
     function get(self) -> T { self.value }
 }
 function main() {
@@ -1565,8 +1569,9 @@ function main() {
 fn generic_impl_method_uses_type_param_in_param() {
     run_expect(
         r#"
-struct Box<T> { T value }
-impl Box {
+struct Box<T> {
+    T value
+
     function set(self, newVal: T) -> Box<T> {
         Box(newVal)
     }
@@ -1585,8 +1590,10 @@ function main() {
 fn generic_impl_two_type_params() {
     run_expect(
         r#"
-struct Pair<A, B> { A first  B second }
-impl Pair {
+struct Pair<A, B> {
+    A first
+    B second
+
     function getFirst(self) -> A { self.first }
     function getSecond(self) -> B { self.second }
 }
@@ -1783,8 +1790,10 @@ function main() {
 fn generic_impl_method_on_enum() {
     run_expect(
         r#"
-enum Wrapper<T> { Wrapped(T)  Empty }
-impl Wrapper {
+enum Wrapper<T> {
+    Wrapped(T)
+    Empty
+
     function getOr(self, default: T) -> T {
         match self {
             Wrapped(v) -> v
@@ -1950,8 +1959,7 @@ function main() {
 fn struct_with_no_fields() {
     run_expect(
         r#"
-struct Unit {}
-impl Unit {
+struct Unit {
   function describe(self) -> String {
     return "unit"
   }
