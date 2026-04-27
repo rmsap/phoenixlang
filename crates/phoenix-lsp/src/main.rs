@@ -62,7 +62,7 @@ impl Backend {
         // Convert parse errors to LSP diagnostics
         let mut diagnostics: Vec<Diagnostic> = parse_errors
             .iter()
-            .map(|d| to_lsp_diagnostic(d, &source_map, source_id))
+            .map(|d| to_lsp_diagnostic(d, &source_map, &uri))
             .collect();
 
         // Run type checker
@@ -71,7 +71,7 @@ impl Backend {
             check_result
                 .diagnostics
                 .iter()
-                .map(|d| to_lsp_diagnostic(d, &source_map, source_id)),
+                .map(|d| to_lsp_diagnostic(d, &source_map, &uri)),
         );
 
         // Publish diagnostics
@@ -173,7 +173,7 @@ impl LanguageServer for Backend {
                         kind: MarkupKind::Markdown,
                         value: format!("```phoenix\n{}\n```", type_str),
                     }),
-                    range: Some(span_to_range(span, &state.source_map, state.source_id)),
+                    range: Some(span_to_range(span, &state.source_map)),
                 }));
             }
         }
@@ -268,7 +268,14 @@ impl LanguageServer for Backend {
                 && let Some(def_span) =
                     find_definition_span(&sym_ref.kind, &sym_ref.name, &state.check_result.module)
             {
-                let range = span_to_range(&def_span, &state.source_map, state.source_id);
+                // Cross-file goto-def isn't wired up yet: we can only
+                // emit `Location { uri, .. }` for the current document,
+                // so a def in another source would mis-label the URI.
+                // Skip it until the LSP can resolve `SourceId → Url`.
+                if def_span.source_id != state.source_id {
+                    return Ok(None);
+                }
+                let range = span_to_range(&def_span, &state.source_map);
                 return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                     uri: uri.clone(),
                     range,
@@ -304,15 +311,19 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // Find all references to the same symbol
+        // Find all references to the same symbol. Filter to spans in
+        // the current document — the response uses `uri` for every
+        // `Location`, so off-source spans would mis-label the URI.
         let locations: Vec<Location> = state
             .check_result
             .symbol_references
             .iter()
-            .filter(|(_, r)| r.name == target.name && r.kind == target.kind)
+            .filter(|(span, r)| {
+                span.source_id == state.source_id && r.name == target.name && r.kind == target.kind
+            })
             .map(|(span, _)| Location {
                 uri: uri.clone(),
-                range: span_to_range(span, &state.source_map, state.source_id),
+                range: span_to_range(span, &state.source_map),
             })
             .collect();
 
@@ -349,14 +360,18 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        // Collect all edits
+        // Collect all edits. Filter to spans in the current document —
+        // the workspace edit only carries one URI, so off-source spans
+        // would be applied to the wrong file.
         let edits: Vec<TextEdit> = state
             .check_result
             .symbol_references
             .iter()
-            .filter(|(_, r)| r.name == target.name && r.kind == target.kind)
+            .filter(|(span, r)| {
+                span.source_id == state.source_id && r.name == target.name && r.kind == target.kind
+            })
             .map(|(span, _)| TextEdit {
-                range: span_to_range(span, &state.source_map, state.source_id),
+                range: span_to_range(span, &state.source_map),
                 new_text: new_name.clone(),
             })
             .collect();
@@ -377,29 +392,74 @@ impl LanguageServer for Backend {
 // ── Helper functions ─────────────────────────────────────────────────
 
 /// Converts a Phoenix `Diagnostic` to an LSP `Diagnostic`.
+///
+/// Hint and suggestion are appended to the LSP `message` (LSP has no
+/// dedicated fields for them) so they show up in IDE tooltips. Notes
+/// become `related_information` entries — IDEs render these as
+/// clickable cross-references.
+///
+/// `document_uri` is used as the URI for every related-information
+/// entry. This is correct as long as every span in `diag` lives in
+/// the same source file as the document being analyzed; once the
+/// module system surfaces notes pointing at other files, this needs
+/// to be replaced with a `SourceId → Url` lookup driven by the
+/// [`SourceMap`].
 fn to_lsp_diagnostic(
     diag: &phoenix_common::diagnostics::Diagnostic,
     source_map: &SourceMap,
-    source_id: SourceId,
+    document_uri: &Url,
 ) -> Diagnostic {
-    let range = span_to_range(&diag.span, source_map, source_id);
+    let range = span_to_range(&diag.span, source_map);
     let severity = match diag.severity {
         phoenix_common::diagnostics::Severity::Error => DiagnosticSeverity::ERROR,
         phoenix_common::diagnostics::Severity::Warning => DiagnosticSeverity::WARNING,
     };
+
+    let mut message = diag.message.clone();
+    if let Some(hint) = &diag.hint {
+        message.push_str("\nhint: ");
+        message.push_str(hint);
+    }
+    if let Some(suggestion) = &diag.suggestion {
+        message.push_str("\nsuggestion: ");
+        message.push_str(suggestion);
+    }
+
+    let related_information = if diag.notes.is_empty() {
+        None
+    } else {
+        Some(
+            diag.notes
+                .iter()
+                .map(|note| DiagnosticRelatedInformation {
+                    location: Location {
+                        uri: document_uri.clone(),
+                        range: span_to_range(&note.span, source_map),
+                    },
+                    message: note.message.clone(),
+                })
+                .collect(),
+        )
+    };
+
     Diagnostic {
         range,
         severity: Some(severity),
         source: Some("phoenix".to_string()),
-        message: diag.message.clone(),
+        message,
+        related_information,
         ..Default::default()
     }
 }
 
 /// Converts a Phoenix `Span` to an LSP `Range`.
-fn span_to_range(span: &Span, source_map: &SourceMap, source_id: SourceId) -> Range {
-    let start = source_map.line_col(source_id, span.start);
-    let end = source_map.line_col(source_id, span.end);
+///
+/// The span carries its own [`SourceId`], so no separate parameter is
+/// needed; the function resolves line/column against the file the
+/// span belongs to.
+fn span_to_range(span: &Span, source_map: &SourceMap) -> Range {
+    let start = source_map.line_col(span.source_id, span.start);
+    let end = source_map.line_col(span.source_id, span.end);
     Range {
         start: Position {
             line: start.line.saturating_sub(1) as u32,
@@ -875,6 +935,10 @@ mod tests {
 
     // ── to_lsp_diagnostic conversion ────────────────────────────────
 
+    fn test_uri() -> Url {
+        Url::parse("file:///tmp/test.phx").expect("test uri parses")
+    }
+
     #[test]
     fn to_lsp_diagnostic_error() {
         let src = "hello\nworld";
@@ -883,10 +947,11 @@ mod tests {
         // Span covering "world" (bytes 6..11, line 2 col 1..6 in 1-based)
         let span = Span::new(source_id, 6, 11);
         let diag = phoenix_common::diagnostics::Diagnostic::error("undefined variable", span);
-        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, source_id);
+        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, &test_uri());
         assert_eq!(lsp_diag.message, "undefined variable");
         assert_eq!(lsp_diag.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(lsp_diag.source, Some("phoenix".to_string()));
+        assert!(lsp_diag.related_information.is_none());
         // "world" is on line 1 (0-based), columns 0..5 (0-based)
         assert_eq!(lsp_diag.range.start.line, 1);
         assert_eq!(lsp_diag.range.start.character, 0);
@@ -902,7 +967,7 @@ mod tests {
         // Span covering "x" (bytes 4..5)
         let span = Span::new(source_id, 4, 5);
         let diag = phoenix_common::diagnostics::Diagnostic::warning("unused variable", span);
-        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, source_id);
+        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, &test_uri());
         assert_eq!(lsp_diag.message, "unused variable");
         assert_eq!(lsp_diag.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(lsp_diag.source, Some("phoenix".to_string()));
@@ -911,6 +976,86 @@ mod tests {
         assert_eq!(lsp_diag.range.start.character, 4);
         assert_eq!(lsp_diag.range.end.line, 0);
         assert_eq!(lsp_diag.range.end.character, 5);
+    }
+
+    #[test]
+    fn to_lsp_diagnostic_appends_hint_and_suggestion_to_message() {
+        let src = "let x = 1";
+        let mut source_map = SourceMap::new();
+        let source_id = source_map.add("test.phx", src);
+        let span = Span::new(source_id, 4, 5);
+        let diag = phoenix_common::diagnostics::Diagnostic::error("type mismatch", span)
+            .with_hint("expected Int, found Bool")
+            .with_suggestion("change to `let x: Bool = true`");
+        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, &test_uri());
+        assert_eq!(
+            lsp_diag.message,
+            "type mismatch\n\
+             hint: expected Int, found Bool\n\
+             suggestion: change to `let x: Bool = true`"
+        );
+    }
+
+    #[test]
+    fn to_lsp_diagnostic_forwards_notes_as_related_information() {
+        let src = "let foo = 1\nlet foo = 2";
+        let mut source_map = SourceMap::new();
+        let source_id = source_map.add("test.phx", src);
+        // primary span on second `foo` (bytes 16..19)
+        let primary = Span::new(source_id, 16, 19);
+        // note span on first `foo` (bytes 4..7)
+        let note_span = Span::new(source_id, 4, 7);
+        let diag = phoenix_common::diagnostics::Diagnostic::error("`foo` redefined", primary)
+            .with_note(note_span, "first defined here");
+        let uri = test_uri();
+        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, &uri);
+        let related = lsp_diag
+            .related_information
+            .expect("notes should produce related_information");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "first defined here");
+        assert_eq!(related[0].location.uri, uri);
+        // first `foo` is at line 0, char 4..7 (0-based)
+        assert_eq!(related[0].location.range.start.line, 0);
+        assert_eq!(related[0].location.range.start.character, 4);
+        assert_eq!(related[0].location.range.end.line, 0);
+        assert_eq!(related[0].location.range.end.character, 7);
+    }
+
+    #[test]
+    fn to_lsp_diagnostic_cross_file_note_uses_document_uri() {
+        // Locks in the documented limitation: when a note's span lives
+        // in a different source file than the document being analyzed,
+        // we still emit `document_uri` for the related-information
+        // entry. The range, however, is resolved against the note's
+        // *own* source. This test guards against a silent regression
+        // when a real `SourceId → Url` lookup is wired up: the new
+        // implementation should make this test fail and need updating.
+        let mut source_map = SourceMap::new();
+        let primary_id = source_map.add("primary.phx", "use other.foo");
+        // Two lines so we exercise the line/col resolution against the
+        // *note's* source, not the primary's.
+        let other_id = source_map.add("other.phx", "// header\nlet foo = 1\n");
+        let primary = Span::new(primary_id, 4, 9);
+        // "let foo = 1" begins at byte 10 in other.phx; "foo" at 14..17
+        let note_span = Span::new(other_id, 14, 17);
+        let diag = phoenix_common::diagnostics::Diagnostic::error("symbol is private", primary)
+            .with_note(note_span, "defined here");
+        let uri = test_uri();
+        let lsp_diag = to_lsp_diagnostic(&diag, &source_map, &uri);
+        let related = lsp_diag
+            .related_information
+            .expect("notes should produce related_information");
+        assert_eq!(related.len(), 1);
+        // URI is the document's, not the note's source — known shortcut.
+        assert_eq!(related[0].location.uri, uri);
+        // Range is resolved against the note's source file (line 2 of
+        // other.phx), so the line/col reflect the note's text, not the
+        // document's.
+        assert_eq!(related[0].location.range.start.line, 1);
+        assert_eq!(related[0].location.range.start.character, 4);
+        assert_eq!(related[0].location.range.end.line, 1);
+        assert_eq!(related[0].location.range.end.character, 7);
     }
 
     // ── span_to_range conversion ────────────────────────────────────
@@ -922,7 +1067,7 @@ mod tests {
         let source_id = source_map.add("test.phx", src);
         // Span covering "main" (bytes 9..13)
         let span = Span::new(source_id, 9, 13);
-        let range = span_to_range(&span, &source_map, source_id);
+        let range = span_to_range(&span, &source_map);
         // 1-based line=1, col=10 → 0-based line=0, char=9
         assert_eq!(range.start.line, 0);
         assert_eq!(range.start.character, 9);
@@ -938,7 +1083,7 @@ mod tests {
         let source_id = source_map.add("test.phx", src);
         // Span covering "two" on the second line (bytes 14..17)
         let span = Span::new(source_id, 14, 17);
-        let range = span_to_range(&span, &source_map, source_id);
+        let range = span_to_range(&span, &source_map);
         // "two" starts at line 2 (1-based), col 6 (1-based) → 0-based line=1, char=5
         assert_eq!(range.start.line, 1);
         assert_eq!(range.start.character, 5);

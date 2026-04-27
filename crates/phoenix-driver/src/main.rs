@@ -247,20 +247,20 @@ fn read_source(path: &str) -> (SourceMap, SourceId, String) {
 }
 
 /// Prints a slice of diagnostics to stderr with `file:line:col` prefixes.
+///
+/// Each diagnostic is rendered through
+/// [`Diagnostic::display_with`](phoenix_common::diagnostics::Diagnostic::display_with),
+/// which resolves every span — primary and notes — against its own
+/// [`SourceId`] inside the [`SourceMap`]. The function does not take
+/// a `source_id` parameter because that would force every diagnostic
+/// to claim a single file, which is wrong for multi-file diagnostics
+/// (e.g. "symbol X is private; defined here: [other_file:line:col]").
 fn report_diagnostics(
     diagnostics: &[phoenix_common::diagnostics::Diagnostic],
     source_map: &SourceMap,
-    source_id: SourceId,
 ) {
     for diag in diagnostics {
-        let loc = source_map.line_col(source_id, diag.span.start);
-        eprintln!(
-            "{}:{}:{}: {}",
-            source_map.name(source_id),
-            loc.line,
-            loc.col,
-            diag,
-        );
+        eprintln!("{}", diag.display_with(source_map));
     }
 }
 
@@ -282,7 +282,7 @@ fn cmd_parse(path: &str) {
     let (program, diagnostics) = parser::parse(&tokens);
 
     if !diagnostics.is_empty() {
-        report_diagnostics(&diagnostics, &source_map, source_id);
+        report_diagnostics(&diagnostics, &source_map);
         process::exit(1);
     }
 
@@ -303,13 +303,13 @@ pub(crate) fn parse_and_check(
     let (program, parse_errors) = parser::parse(&tokens);
 
     if !parse_errors.is_empty() {
-        report_diagnostics(&parse_errors, &source_map, source_id);
+        report_diagnostics(&parse_errors, &source_map);
         process::exit(1);
     }
 
     let result = checker::check(&program);
     if !result.diagnostics.is_empty() {
-        report_diagnostics(&result.diagnostics, &source_map, source_id);
+        report_diagnostics(&result.diagnostics, &source_map);
         process::exit(1);
     }
 
@@ -522,13 +522,13 @@ fn try_parse_and_check(
     let (program, parse_errors) = parser::parse(&tokens);
 
     if !parse_errors.is_empty() {
-        report_diagnostics(&parse_errors, &source_map, source_id);
+        report_diagnostics(&parse_errors, &source_map);
         return Err("parse errors".to_string());
     }
 
     let result = checker::check(&program);
     if !result.diagnostics.is_empty() {
-        report_diagnostics(&result.diagnostics, &source_map, source_id);
+        report_diagnostics(&result.diagnostics, &source_map);
         return Err("type errors".to_string());
     }
 
