@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 phoenix-common = { path = "../phoenix-common" }
 phoenix-lexer = { path = "../phoenix-lexer" }
+phoenix-modules = { path = "../phoenix-modules" }
 phoenix-parser = { path = "../phoenix-parser" }
 phoenix-sema = { path = "../phoenix-sema" }
 phoenix-interp = { path = "../phoenix-interp" }

@@ -31,6 +31,7 @@ use phoenix_common::source::SourceMap;
 use phoenix_common::span::SourceId;
 use phoenix_interp::interpreter;
 use phoenix_lexer::lexer::tokenize;
+use phoenix_modules::{ResolveError, ResolvedSourceModule};
 use phoenix_parser::parser;
 use phoenix_sema::checker;
 
@@ -236,6 +237,12 @@ fn parse_mode(mode: Option<&str>) -> GenMode {
 ///
 /// Returns the source map, the file's [`SourceId`], and the raw contents.
 /// Exits the process with an error message if the file cannot be read.
+///
+/// Used by `cmd_lex` and `cmd_parse`, which operate on a single file
+/// without invoking the module resolver. The full-pipeline commands
+/// (`check`, `run`, `build`, `ir`, `run-ir`, `gen`) go through
+/// [`parse_resolve_check`] instead, which uses [`phoenix_modules::resolve`]
+/// for multi-module discovery.
 fn read_source(path: &str) -> (SourceMap, SourceId, String) {
     let contents = fs::read_to_string(path).unwrap_or_else(|err| {
         eprintln!("error: could not read file '{}': {}", path, err);
@@ -244,6 +251,28 @@ fn read_source(path: &str) -> (SourceMap, SourceId, String) {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add(path, &contents);
     (source_map, source_id, contents)
+}
+
+/// Reports a [`ResolveError`] to stderr in the same shape as parser /
+/// sema diagnostics, then returns the count of diagnostics emitted.
+///
+/// `MalformedSourceFiles` carries a parser-diagnostic vector per failing
+/// file; those are routed through `report_diagnostics` so they render with
+/// full source context. Other variants currently render via `Display`
+/// (rich span-resolved diagnostics for them are a Phase 2.6 follow-up;
+/// see the §2.6 exit criterion "module-system diagnostics exercise the
+/// rich diagnostic shape").
+fn report_resolve_error(err: &ResolveError, source_map: &SourceMap) {
+    match err {
+        ResolveError::MalformedSourceFiles { files } => {
+            for (_path, diags) in files {
+                report_diagnostics(diags, source_map);
+            }
+        }
+        other => {
+            eprintln!("error: {}", other);
+        }
+    }
 }
 
 /// Prints a slice of diagnostics to stderr with `file:line:col` prefixes.
@@ -293,27 +322,61 @@ fn cmd_parse(path: &str) {
     println!("{}", json);
 }
 
-/// Parses and type-checks a source file, exiting on errors.
-/// Returns the program AST and the semantic check result.
+/// Resolves the import graph rooted at `path`, parses every reachable
+/// module, type-checks the project, and exits the process on errors.
+///
+/// Returns the *entry module's* program AST and the project-wide semantic
+/// analysis. For single-file inputs (no `import` declarations), the
+/// returned program, analysis, and diagnostic file labels are identical
+/// to what the previous single-file `parse_and_check` produced — the
+/// resolver finds exactly one module (the entry), uses the caller-supplied
+/// path verbatim as its `SourceMap` display name, and `check_modules` runs
+/// the same registration / checking passes.
+///
+/// IR lowering, the interpreter, and code generators currently consume
+/// the entry program directly. Task #6 (IR module-keying) extends those
+/// to walk the full `Vec<ResolvedSourceModule>`; this entry point's
+/// signature stays stable across that change.
 pub(crate) fn parse_and_check(
     path: &str,
 ) -> (phoenix_parser::ast::Program, phoenix_sema::Analysis) {
-    let (source_map, source_id, contents) = read_source(path);
-    let tokens = tokenize(&contents, source_id);
-    let (program, parse_errors) = parser::parse(&tokens);
+    let (_modules, program, analysis, _source_map) = parse_resolve_check(path);
+    (program, analysis)
+}
 
-    if !parse_errors.is_empty() {
-        report_diagnostics(&parse_errors, &source_map);
+/// Multi-module parse + resolve + type-check entry point.
+///
+/// Returns the full resolver output (in deterministic topological order,
+/// entry first), the entry module's program (cloned for convenience —
+/// callers that don't need the multi-module shape can keep using
+/// [`parse_and_check`]), the project-wide semantic analysis, and the
+/// shared [`SourceMap`] so cross-module diagnostics resolve their own
+/// `SourceId`s. Exits the process on parse, resolve, or type errors.
+fn parse_resolve_check(
+    path: &str,
+) -> (
+    Vec<ResolvedSourceModule>,
+    phoenix_parser::ast::Program,
+    phoenix_sema::Analysis,
+    SourceMap,
+) {
+    let mut source_map = SourceMap::new();
+    let modules = match phoenix_modules::resolve(std::path::Path::new(path), &mut source_map) {
+        Ok(modules) => modules,
+        Err(err) => {
+            report_resolve_error(&err, &source_map);
+            process::exit(1);
+        }
+    };
+
+    let analysis = checker::check_modules(&modules);
+    if !analysis.diagnostics.is_empty() {
+        report_diagnostics(&analysis.diagnostics, &source_map);
         process::exit(1);
     }
 
-    let result = checker::check(&program);
-    if !result.diagnostics.is_empty() {
-        report_diagnostics(&result.diagnostics, &source_map);
-        process::exit(1);
-    }
-
-    (program, result)
+    let entry_program = modules[0].program.clone();
+    (modules, entry_program, analysis, source_map)
 }
 
 fn cmd_check(path: &str) {
@@ -506,33 +569,36 @@ fn cmd_gen_openapi(
 
 // ── Watch mode ──────────────────────────────────────────────────────
 
-/// Parses and type-checks a source file, returning the results or an error.
+/// Resolves and type-checks a source file, returning the results or an error.
 ///
 /// Unlike [`parse_and_check`], this does not call `process::exit` on failure.
 /// Diagnostics are printed to stderr and an `Err` is returned so the caller
 /// can decide how to proceed (e.g., continue in watch mode).
+///
+/// The `Err` payload is an opaque category tag (`"resolve / parse errors"`
+/// or `"type errors"`) — the user-facing detail has already been written
+/// to stderr by `report_resolve_error` / `report_diagnostics`. Callers
+/// should not display the string verbatim.
 fn try_parse_and_check(
     path: &str,
 ) -> Result<(phoenix_parser::ast::Program, phoenix_sema::Analysis), String> {
-    let contents =
-        fs::read_to_string(path).map_err(|err| format!("could not read '{}': {}", path, err))?;
     let mut source_map = SourceMap::new();
-    let source_id = source_map.add(path, &contents);
-    let tokens = tokenize(&contents, source_id);
-    let (program, parse_errors) = parser::parse(&tokens);
+    let modules = match phoenix_modules::resolve(std::path::Path::new(path), &mut source_map) {
+        Ok(modules) => modules,
+        Err(err) => {
+            report_resolve_error(&err, &source_map);
+            return Err("resolve / parse errors".to_string());
+        }
+    };
 
-    if !parse_errors.is_empty() {
-        report_diagnostics(&parse_errors, &source_map);
-        return Err("parse errors".to_string());
-    }
-
-    let result = checker::check(&program);
-    if !result.diagnostics.is_empty() {
-        report_diagnostics(&result.diagnostics, &source_map);
+    let analysis = checker::check_modules(&modules);
+    if !analysis.diagnostics.is_empty() {
+        report_diagnostics(&analysis.diagnostics, &source_map);
         return Err("type errors".to_string());
     }
 
-    Ok((program, result))
+    let entry_program = modules[0].program.clone();
+    Ok((entry_program, analysis))
 }
 
 /// Runs code generation once, returning `Ok(())` on success or `Err(message)`

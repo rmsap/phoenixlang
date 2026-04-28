@@ -1,0 +1,5 @@
+import helpers { add }
+
+function main() {
+  print("ok")
+}

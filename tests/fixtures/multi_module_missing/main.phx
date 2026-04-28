@@ -1,0 +1,3 @@
+import doesnotexist { foo }
+
+function main() {}

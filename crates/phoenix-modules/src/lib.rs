@@ -232,7 +232,17 @@ pub fn resolve(
                 continue;
             }
         };
-        let display_name = display_name_for(&file_path, &root);
+        // Entry's display name reproduces the caller-supplied path so
+        // single-file invocations keep emitting diagnostics under the same
+        // prefix the user typed (`/abs/path/foo.phx:LINE` or
+        // `relative/foo.phx:LINE`). Imported modules use a root-relative
+        // form because their absolute paths are an artifact of the
+        // canonicalize step, not anything the user named.
+        let display_name = if mp.is_entry() {
+            entry_file.display().to_string()
+        } else {
+            display_name_for(&file_path, &root)
+        };
         let source_id = source_map.add(display_name, contents);
         let tokens = tokenize(source_map.contents(source_id), source_id);
         let (program, parse_diags) = phoenix_parser::parser::parse(&tokens);
@@ -888,5 +898,19 @@ mod tests {
             }
             other => panic!("expected MalformedSourceFiles, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn entry_display_name_reproduces_caller_path() {
+        // The entry's SourceMap display name must reproduce the caller-
+        // supplied path verbatim so diagnostics from full-pipeline driver
+        // commands keep the same prefix as the previous single-file flow
+        // (which used `source_map.add(path, contents)` with the raw arg).
+        let td = TempDir::new().unwrap();
+        let entry = write_file(td.path(), "main.phx", "function main() {}\n");
+        let mut sm = SourceMap::new();
+        let out = resolve(&entry, &mut sm).unwrap();
+        let entry_module = &out[0];
+        assert_eq!(sm.name(entry_module.source_id), entry.display().to_string());
     }
 }
