@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-modules"
+description = "Module resolver for the Phoenix programming language: maps an entry .phx file to a deterministic, lazy import-driven set of parsed modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-common = { path = "../phoenix-common" }
+phoenix-lexer = { path = "../phoenix-lexer" }
+phoenix-parser = { path = "../phoenix-parser" }
+
+[dev-dependencies]
+tempfile = "3"

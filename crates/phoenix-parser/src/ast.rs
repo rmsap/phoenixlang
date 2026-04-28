@@ -13,6 +13,19 @@ pub struct Program {
     pub span: Span,
 }
 
+/// Visibility of a declaration or struct field across module boundaries.
+///
+/// Phoenix has two visibility levels: `Public` (exported, importable from
+/// other modules) and `Private` (module-internal, default). See Phase 2.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub enum Visibility {
+    /// The default — visible only within the declaring module.
+    #[default]
+    Private,
+    /// Exported — visible to importing modules.
+    Public,
+}
+
 /// A top-level declaration in a Phoenix program.
 ///
 /// Phoenix programs consist of function definitions, struct and enum type
@@ -35,6 +48,45 @@ pub enum Declaration {
     Endpoint(EndpointDecl),
     /// A database schema declaration: `schema name { table ... }`.
     Schema(SchemaDecl),
+    /// An `import` declaration that brings names from another module into scope.
+    Import(ImportDecl),
+}
+
+/// An `import` declaration that brings names from another module into scope.
+///
+/// ```text
+/// import models.user { User, createUser }
+/// import models.user { * }
+/// import models.user { User as UserModel }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportDecl {
+    /// The dotted module path: `["models", "user"]` for `import models.user`.
+    pub path: Vec<String>,
+    /// The set of items to import from the module.
+    pub items: ImportItems,
+    /// Source span covering the entire `import` declaration.
+    pub span: Span,
+}
+
+/// The set of items brought into scope by an `import` declaration.
+#[derive(Debug, Clone, Serialize)]
+pub enum ImportItems {
+    /// `import a.b { * }` — all public items from the target module.
+    Wildcard,
+    /// `import a.b { Foo, Bar as Baz }` — an explicit list of items.
+    Named(Vec<ImportItem>),
+}
+
+/// A single item in the `Named` form of an `import` declaration.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportItem {
+    /// The original name as exported by the target module.
+    pub name: String,
+    /// An optional local alias (`Foo as Bar` → `Some("Bar")`).
+    pub alias: Option<String>,
+    /// Source span covering this item.
+    pub span: Span,
 }
 
 /// A function declaration, including its name, parameters, optional return
@@ -65,6 +117,8 @@ pub struct FunctionDecl {
     pub return_type: Option<TypeExpr>,
     /// The function body.
     pub body: Block,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
     /// Source span covering the entire function declaration.
     pub span: Span,
 }
@@ -329,6 +383,8 @@ pub struct StructDecl {
     pub trait_impls: Vec<InlineTraitImpl>,
     /// Doc comment attached to this struct, if any.
     pub doc_comment: Option<String>,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
     /// Source span covering the entire struct declaration.
     pub span: Span,
 }
@@ -350,6 +406,11 @@ pub struct FieldDecl {
     pub constraint: Option<Expr>,
     /// Doc comment attached to this field, if any.
     pub doc_comment: Option<String>,
+    /// Module visibility (public or private). Default: private. Independent
+    /// of the parent struct's visibility — a `public struct` can have private
+    /// fields, and a private struct can have `public` fields (only meaningful
+    /// inside the declaring module).
+    pub visibility: Visibility,
     /// Source span covering the field declaration.
     pub span: Span,
 }
@@ -385,6 +446,9 @@ pub struct EnumDecl {
     pub trait_impls: Vec<InlineTraitImpl>,
     /// Doc comment attached to this enum, if any.
     pub doc_comment: Option<String>,
+    /// Module visibility (public or private). Default: private. A public
+    /// enum exports all of its variants automatically.
+    pub visibility: Visibility,
     /// Source span covering the entire enum declaration.
     pub span: Span,
 }
@@ -463,6 +527,8 @@ pub struct TraitDecl {
     pub type_params: Vec<String>,
     /// The method signatures declared in this trait.
     pub methods: Vec<TraitMethodSig>,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
     /// Source span covering the entire trait declaration.
     pub span: Span,
 }
@@ -504,6 +570,8 @@ pub struct TypeAliasDecl {
     pub type_params: Vec<String>,
     /// The type expression that this alias expands to.
     pub target: TypeExpr,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
     /// Source span covering the entire type alias declaration.
     pub span: Span,
 }

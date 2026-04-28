@@ -306,7 +306,8 @@ impl Interpreter {
                 Declaration::Trait(_)
                 | Declaration::TypeAlias(_)
                 | Declaration::Endpoint(_)
-                | Declaration::Schema(_) => {} // Compile-time only
+                | Declaration::Schema(_)
+                | Declaration::Import(_) => {} // Compile-time only
             }
         }
 

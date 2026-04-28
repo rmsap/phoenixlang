@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 phoenix-common = { path = "../phoenix-common" }
+phoenix-modules = { path = "../phoenix-modules" }
 phoenix-parser = { path = "../phoenix-parser" }
 
 [dev-dependencies]

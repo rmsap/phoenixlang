@@ -448,4 +448,66 @@ Diagnostics are currently constructed inline everywhere via `self.error(format!(
 
 **Decision:** Keep `Value::Closure { params, body: ast::Block, captures }` as-is. Treat any future parser-AST changes that affect closures as a normal multi-crate edit, not as a coupling defect. The two interpreters (`phoenix-interp` for AST tree-walking, `phoenix-ir-interp` for IR round-trip verification) are independent by design.
 
+### Module system: discovery, root, `mod.phx`, and entry-point rules
+
+Phase 2.6 introduces multi-file modules. Four interlocking sub-decisions land together because changing any one in isolation would force a redesign of the others. See [phase-2.md §2.6](phases/phase-2.md#26-module-system-and-visibility) for the user-facing surface.
+
+**Decision (1) — Project root.** The project root is `dirname(canonicalize(entry_file))` — i.e., the directory of the `.phx` file passed to `phoenix run` / `phoenix build` / `phoenix run-ir`. No upward walk for a marker file; no `phoenix.toml` requirement. Imports resolve relative to this root.
+**Decided:** 2026-04-27
+**Why this and not a `phoenix.toml` marker:** The package manager (Phase 3.1) is the right moment to introduce `phoenix.toml`. Adding it now to solve project-root discovery means building marker-file machinery now and re-litigating it in 3.1. When 3.1 ships, `phoenix.toml`'s directory cleanly supersedes this heuristic without breaking anything compiled under the heuristic.
+
+**Decision (2) — Discovery is lazy / import-driven.** Only files reachable from the entry's transitive import graph are parsed. Files in the project tree that are not imported are not parsed and produce no diagnostics.
+**Decided:** 2026-04-27
+**Why this and not eager scan:** Eager forces every `.phx` under the root (scratch files, archived experiments, dev-only scripts, codegen output) to parse-clean every build. Lazy matches the model used by Rust (`mod foo;`), Go (explicit imports), TypeScript, Python — reduces user surprise from cross-language transfer.
+**Trade-off accepted:** A typo in an `import` path silently leaves the misnamed file uncompiled. Mitigated long-term by a future `phoenix check` whole-tree command (no commitment date). For the §2.6 multi-module test matrix, each fixture has an explicit entry point so the gate isn't affected.
+
+**Decision (3) — `mod.phx` is optional.** A directory `models/` containing `models/user.phx` is importable as `models.user` whether or not `models/mod.phx` exists. If `mod.phx` exists, *it* is the `models` module (importable as bare `models`); sibling files remain independently importable as `models.<sibling>`.
+**Decided:** 2026-04-27
+**Why this and not "required to make a directory a module":** Forcing `mod.phx` for every directory adds bureaucracy without a corresponding semantic gain in a language without Rust-style attribute-on-mod-decl features. Optional lets users opt in to a directory-level module only when they actually have something to put in it.
+**Resolution rule:** `import a.b.c` tries `<root>/a/b/c.phx` first, then `<root>/a/b/c/mod.phx`. Both existing is an `AmbiguousModule` error; neither existing is a `MissingModule` error. `mod.phx` is consulted *only at the terminal segment* of the path — intermediate directories are walked through as plain directories. Concretely: `import a.b` does not look at `<root>/a/mod.phx`; that file (if it exists) is the bare `a` module, independently importable as `import a { … }` without colliding with `a.b`.
+
+**Decision (4) — `function main()` only in the entry module.** Phoenix's parser already rejects bare top-level statements (every program is `function main()`-rooted today), so the spec's "top-level statements only in entry file" rule reduces to: non-entry modules may not declare `function main()`. Imported modules may declare functions, types, traits, impls, type aliases, and imports — but not `main`.
+**Decided:** 2026-04-27
+**Why:** Multiple `main`s across imported modules would be ambiguous about which is the program entry. Sema would already refuse the second registration via the existing duplicate-name check, but routing through the generic "function `main` is already defined" diagnostic loses the program-entry framing. Rejecting `main`-in-non-entry up front in `check_modules_inner` (before any registration runs) produces the clearer message — "`main` may only be declared in the entry module" — at no extra implementation cost. The FuncId allocator is unaffected either way: `function_id_for` is idempotent, so duplicate names don't allocate two ids.
+
+**Why these four ship together:** Lazy discovery + dirname-as-root means `mod.phx` cannot be the *only* way to mark a module (or the entry directory's `main.phx` siblings would be unreachable without an `entry/mod.phx`); main-only-in-entry keeps the FuncId allocator stable across the resolver's deterministic emit order. Pulling any one decision in isolation would force the others.
+
+**Scope deferred to follow-ups (not part of 2.6):** Explicit `public`/private on `impl` blocks (default for 2.6 = "impls are in scope iff both trait and type are visible"); re-exports (`public import a.b { Item }`); cross-package imports (Phase 3.1).
+
 **Bundled scope:** The [closure capture type ambiguity bug](known-issues.md#closure-capture-type-ambiguity-with-indirect-calls) was originally tied to this refactor on the assumption that capture metadata would land in a unified IR closure representation alongside the AST-to-IR switch. With the reversal, the bug is fixed independently in IR + Cranelift via an env-pointer calling convention (closure functions take their environment pointer as the first arg and unpack captures from the heap object themselves; capture types never cross the indirect-call boundary, structurally eliminating the ambiguity). `phoenix-interp` is not touched by that fix.
+
+### Per-method `public` / private on inline struct/enum methods
+
+Phase 2.6's module-system spec ([phase-2.md §2.6](phases/phase-2.md#26-module-system-and-visibility)) enumerates `public` rules for structs, struct fields, functions, enums, and traits — but is silent on methods. Today's parser stores `Visibility::Private` unconditionally on every inline method (`crates/phoenix-parser/src/parser.rs:663`, `:750`), and `MethodInfo` (`crates/phoenix-sema/src/checker.rs:178`) has no `visibility` field at all. The de-facto behavior is "methods inherit reachability from the containing type": if the type is public, every method on it is callable from importers; if the type is private, none are reachable (since the receiver cannot be named). This contradicts the spec's already-stated principle that *struct fields have independent visibility* — public types routinely need private helper methods, and the asymmetry between fields and methods has no documented justification.
+
+**Decision:** Methods carry independent visibility, symmetric with fields. Inline methods (in `struct` / `enum` bodies and in `impl` blocks) accept an optional `public` modifier; without it, the method is module-private. Two structural rules apply:
+
+1. **A public method on a private type is a sema error.** The modifier has no meaning when no importer can name the receiver, and accepting it silently teaches a wrong mental model. Reject with a diagnostic suggesting either making the type public or dropping the `public` from the method.
+2. **A private method on a public type is allowed and is the encapsulation case.** Internal helpers on an exported type stay module-private even though the type itself is reachable.
+
+Default visibility for methods is private, matching every other declaration form in Phoenix.
+
+**Decided:** 2026-04-28
+**Target phase:** Phase 2.6 — lands with the rest of the visibility surface. Cannot be deferred past 2.6 without shipping a half-done visibility model that no later phase can extend without a breaking change to method call-site resolution.
+
+**Rationale:**
+- **Symmetric with fields.** phase-2.md:201 already commits to *"A struct can be public while some fields are private."* Methods are the obvious sibling case; the asymmetry is unmotivated.
+- **Standard precedent.** Rust, Swift, Kotlin, TypeScript, and C# all let public types have private methods. Cross-language transfer expects this; the current shape would surprise every user.
+- **No regression path.** Without per-method visibility, there is no syntax for an internal helper on a public type. Authors are forced to either expose helpers as part of the public API or hoist them to module-private free functions — both are leaks of implementation detail into the API surface.
+- **Why error on public-on-private-type rather than no-op:** A `public` modifier with no callable consequence is almost always a mistake (typo, half-finished refactor, copy-paste from a different type). A diagnostic catches the mistake at the point it was made; silently accepting it lets it rot.
+
+**Implementation shape:**
+- Parser: accept `public` before `function` inside `struct` / `enum` / `impl` bodies; thread the parsed `Visibility` into `FunctionDecl.visibility` instead of hardcoding `Private`. The two `// Inline method — methods do not carry independent visibility.` comments are removed.
+- AST: no new fields — `FunctionDecl` already carries `visibility`.
+- Sema: `MethodInfo` gains a `visibility: Visibility` field, populated during registration. `check_register` enforces rule 1 (public method on private type) at registration time so the diagnostic points at the method, not a downstream call site. Cross-module method-call resolution (the new Phase 2.6 visibility check) consults `MethodInfo.visibility` the same way it consults `FieldInfo.visibility` for field access.
+- Existing single-module programs are unaffected: every method written today is parsed `private`, every call is intra-module, and intra-module privacy is permissive.
+
+**Alternatives considered:**
+- **Status quo (methods piggyback on type visibility).** Rejected: no way to encapsulate internal helpers on a public type; asymmetric with fields without justification; locks in a model that's harder to relax later than to get right now.
+- **Public methods of public types only — no per-method modifier.** Rejected for the same reason as status quo: the encapsulation case is the whole point.
+- **Allow `public` on methods of private types as a no-op (annotate-now-export-later).** Rejected: silent acceptance of a meaningless modifier is the worst of both worlds — it teaches the wrong mental model and leaves dead annotations that decay as code moves around.
+
+**Interaction with the deferred `impl`-block visibility decision (2.6 follow-up, see above).** Today's deferred rule is *"impls are in scope iff both trait and type are visible."* Per-method visibility is orthogonal to that rule for inherent `impl` blocks (each method is checked independently). For trait `impl` blocks, the trait's method set is part of the trait's contract — a trait `impl` cannot have private methods (the trait already declared them public-by-virtue-of-being-on-a-public-trait). Concretely: `public` is rejected on methods inside a `impl Trait for Type` block (the trait controls visibility); per-method `public` is accepted on methods inside inherent `impl Type` blocks and inline struct/enum bodies. Trait method visibility itself is not in scope here and remains tied to the trait's own visibility.
+
+**Follow-ups (not in scope here):**
+- Revisit the deferred *"explicit `public`/private on `impl` blocks"* decision in light of this rule. The natural extension — *"an inherent `impl` block has no visibility of its own; each method's visibility stands alone"* — looks correct, but the decision lives in its own entry once 2.6's surface settles.

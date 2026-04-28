@@ -63,6 +63,22 @@ pub enum TokenKind {
     Dyn,
     /// The `type` keyword, introducing a type alias declaration.
     Type,
+    /// The `import` keyword, introducing a module import.
+    ///
+    /// Syntax: `import a.b.c { Item, Other as Alias, * }`. See Phase 2.6.
+    Import,
+    /// The `public` keyword, marking a declaration, struct field, or method as exported.
+    ///
+    /// Optional prefix on `function` / `struct` / `enum` / `trait` / `type`
+    /// declarations, on struct fields, and on inline methods (in struct/enum
+    /// bodies and inherent `impl` blocks). Default visibility is private.
+    /// Methods inside `impl Trait for Type` blocks take their visibility from
+    /// the trait and reject an explicit `public` modifier. See Phase 2.6.
+    Public,
+    /// The `as` keyword, used in import-item aliases.
+    ///
+    /// Appears as `import a.b { Foo as Bar }`.
+    As,
 
     // ── Gen keywords ────────────────────────────────────────
     /// The `endpoint` keyword, introducing an endpoint declaration.

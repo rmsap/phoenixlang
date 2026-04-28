@@ -415,7 +415,7 @@ mod tests {
     use super::*;
     use phoenix_common::span::{SourceId, Span};
     use phoenix_lexer::lexer::tokenize;
-    use phoenix_parser::ast::{EnumVariant, NamedType, TypeExpr};
+    use phoenix_parser::ast::{EnumVariant, NamedType, TypeExpr, Visibility};
     use phoenix_parser::parser;
     use phoenix_sema::checker;
 
@@ -534,6 +534,7 @@ mod tests {
             methods: vec![],
             trait_impls: vec![],
             doc_comment: None,
+            visibility: Visibility::Private,
             span: Span::BUILTIN,
         };
         let schema = enum_to_schema(&e);

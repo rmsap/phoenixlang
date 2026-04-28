@@ -3,10 +3,11 @@ use crate::scope::{ScopeStack, VarInfo};
 use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::ids::FuncId;
+use phoenix_common::module_path::ModulePath;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     Block, CaptureInfo, Declaration, ElseBranch, Expr, FunctionDecl, IfExpr, ImplBlock,
-    InlineTraitImpl, MethodCallExpr, Param, Program, Statement,
+    InlineTraitImpl, MethodCallExpr, Param, Program, Statement, Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -81,6 +82,10 @@ pub struct FunctionInfo {
     pub default_param_exprs: HashMap<usize, Expr>,
     /// The resolved return type.
     pub return_type: Type,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
+    /// Module path of the file declaring this function.
+    pub def_module: ModulePath,
 }
 
 /// Information about a registered trait.
@@ -105,6 +110,10 @@ pub struct TraitInfo {
     /// `dyn EmptyTrait` pair would simply never invoke anything through
     /// its vtable, which is vacuously correct.
     pub object_safety_error: Option<String>,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
+    /// Module path of the file declaring this trait.
+    pub def_module: ModulePath,
 }
 
 /// Information about a method signature in a trait.
@@ -129,6 +138,10 @@ pub struct FieldInfo {
     pub constraint: Option<phoenix_parser::ast::Expr>,
     /// Source span of the field declaration.
     pub definition_span: Span,
+    /// Module visibility (public or private). Default: private. Independent
+    /// of the parent struct's visibility — a public struct may have private
+    /// fields that are inaccessible from importing modules.
+    pub visibility: Visibility,
 }
 
 /// Information about a registered struct definition (fields and generic params).
@@ -140,6 +153,10 @@ pub struct StructInfo {
     pub type_params: Vec<String>,
     /// The resolved field definitions.
     pub fields: Vec<FieldInfo>,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
+    /// Module path of the file declaring this struct.
+    pub def_module: ModulePath,
 }
 
 /// Information about a registered enum definition (variants and generic params).
@@ -151,6 +168,11 @@ pub struct EnumInfo {
     pub type_params: Vec<String>,
     /// The enum variants as `(name, field_types)` pairs.
     pub variants: Vec<(String, Vec<Type>)>,
+    /// Module visibility (public or private). Default: private. A public
+    /// enum exports all of its variants automatically.
+    pub visibility: Visibility,
+    /// Module path of the file declaring this enum.
+    pub def_module: ModulePath,
 }
 
 /// Information about a method registered on a type (parameter types exclude `self`).
@@ -331,6 +353,10 @@ pub struct TypeAliasInfo {
     pub type_params: Vec<String>,
     /// The resolved target type that this alias expands to.
     pub target: Type,
+    /// Module visibility (public or private). Default: private.
+    pub visibility: Visibility,
+    /// Module path of the file declaring this alias.
+    pub def_module: ModulePath,
 }
 
 /// The semantic checker for a Phoenix program.
@@ -411,6 +437,11 @@ pub struct Checker {
     /// that [`crate::check_register::Checker::register_impl`] can
     /// stamp each `MethodInfo` with the id IR will see.
     pub(crate) pending_user_method_ids: HashMap<(String, String), FuncId>,
+    /// Module being checked right now. Set by `check_modules` before
+    /// each per-module pass; defaults to [`ModulePath::entry()`] for
+    /// the single-file `check` path. Read by `register_*` to stamp
+    /// `def_module` onto each `*Info`.
+    pub(crate) current_module: ModulePath,
 }
 
 impl Default for Checker {
@@ -446,6 +477,7 @@ impl Checker {
             user_method_offset: 0,
             pending_function_ids: HashMap::new(),
             pending_user_method_ids: HashMap::new(),
+            current_module: ModulePath::entry(),
         }
     }
 
@@ -477,56 +509,115 @@ impl Checker {
     pub fn check_program(&mut self, program: &Program) {
         self.register_builtins();
 
-        // Pass 0: pre-register all type names (struct/enum) so that
-        // self-referential types (e.g. `enum IntList { Cons(Int, IntList), Nil }`)
-        // can reference themselves during field/variant type resolution.
-        for decl in &program.declarations {
-            match decl {
-                Declaration::Struct(s) => {
-                    self.structs.insert(
-                        s.name.clone(),
-                        StructInfo {
-                            definition_span: s.name_span,
-                            type_params: s.type_params.clone(),
-                            fields: Vec::new(),
-                        },
-                    );
+        // Single-file input is the one-module case of `check_modules_inner`
+        // with `current_module = entry`.  Route through the same helpers so
+        // single-file and multi-module behavior cannot drift.
+        self.current_module = ModulePath::entry();
+        self.pre_register_type_names(program);
+
+        self.pre_allocate_function_ids(program);
+        self.user_method_offset = self.next_func_id;
+        self.pre_allocate_user_method_ids(program);
+        self.assert_pre_allocation_invariants();
+
+        self.register_decls(program);
+        self.check_decl_bodies(program);
+    }
+
+    /// Multi-module orchestration for [`check_modules`].
+    ///
+    /// Runs the same passes as [`Self::check_program`] but with
+    /// `current_module` set per-module so each declaration is registered
+    /// with the right `def_module`.
+    ///
+    /// Symbol tables are still keyed by bare name today (cross-module
+    /// name resolution lands in a follow-up). Cross-module collisions
+    /// would silently corrupt the tables, so:
+    ///   1. [`Self::detect_cross_module_collisions`] runs first and emits
+    ///      a diagnostic for every conflicting name.
+    ///   2. The registration helpers use first-write-wins semantics
+    ///      (`HashMap::entry().or_insert(...)`), so a colliding second
+    ///      occurrence cannot overwrite the first definition.
+    ///
+    /// Together these ensure the symbol tables always reflect the
+    /// first-declared definition of any name; the user sees a clear
+    /// collision error rather than confusing downstream type mismatches.
+    pub(crate) fn check_modules_inner(
+        &mut self,
+        modules: &[phoenix_modules::ResolvedSourceModule],
+    ) {
+        // Reject `function main()` declared in any non-entry module before
+        // doing any registration work. Phoenix's parser already disallows
+        // bare top-level statements, so `main` is the only "executable
+        // top-level" surface — having two `main`s across modules would be
+        // ambiguous about which is the program entry, and sema would
+        // refuse the second registration anyway. Diagnose at the source.
+        for module in modules {
+            if module.is_entry {
+                continue;
+            }
+            for decl in &module.program.declarations {
+                if let Declaration::Function(func) = decl
+                    && func.name == "main"
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "`main` may only be declared in the entry module",
+                        func.name_span,
+                    ));
                 }
-                Declaration::Enum(e) => {
-                    self.enums.insert(
-                        e.name.clone(),
-                        EnumInfo {
-                            definition_span: e.name_span,
-                            type_params: e.type_params.clone(),
-                            variants: Vec::new(),
-                        },
-                    );
-                }
-                _ => {}
             }
         }
 
-        // Pre-pass A: allocate `FuncId`s for free functions in AST
-        // declaration order.  Free functions occupy `0..N`.  This runs
-        // before the registration pass so `register_function` can stamp
-        // each `FunctionInfo` with the id IR lowering will adopt.
-        self.pre_allocate_function_ids(program);
+        self.detect_cross_module_collisions(modules);
 
-        // Pre-pass B: allocate `FuncId`s for user-declared methods,
-        // matching IR lowering's registration order — inline methods at
-        // the struct/enum declaration site (inherent first, then trait
-        // impls in source order), and standalone `impl` blocks at their
-        // own declaration site.  User methods occupy `N..N+M`.
+        self.register_builtins();
+
+        // Pass 0: pre-register all type names across every module.
+        self.for_each_module(modules, |this, prog| this.pre_register_type_names(prog));
+
+        // Pre-pass A + B: allocate FuncIds across every module, in
+        // resolver-emit order. Single-file inputs reduce to the
+        // single-module case and are byte-identical to `check_program`.
+        self.for_each_module(modules, |this, prog| this.pre_allocate_function_ids(prog));
         self.user_method_offset = self.next_func_id;
-        self.pre_allocate_user_method_ids(program);
+        self.for_each_module(modules, |this, prog| {
+            this.pre_allocate_user_method_ids(prog)
+        });
+        self.assert_pre_allocation_invariants();
 
-        // Pre-pass invariant: pre-pass A allocated exactly
-        // `user_method_offset` ids (one per unique free-function
-        // name), and pre-pass B's count plus that boundary equals
-        // the next available id.  If a future refactor reorders
-        // these passes, this assertion fires with a clear
-        // diagnostic — much better than a HashMap-index panic deep
-        // inside `register_*`.
+        // Registration pass.
+        self.for_each_module(modules, |this, prog| this.register_decls(prog));
+
+        // Body-check pass.
+        self.for_each_module(modules, |this, prog| this.check_decl_bodies(prog));
+
+        // Reset to entry so any later use of `self.current_module` (e.g.
+        // an extension that adds extra registration after `check_modules`)
+        // doesn't silently inherit the last module's path.
+        self.current_module = ModulePath::entry();
+    }
+
+    /// Run `f` once per module, with `self.current_module` set to that
+    /// module's path before each call. The body is responsible for
+    /// processing the module's `Program`; `current_module` mutation is
+    /// centralized here so we can't forget to set it on a new pass.
+    fn for_each_module(
+        &mut self,
+        modules: &[phoenix_modules::ResolvedSourceModule],
+        mut f: impl FnMut(&mut Self, &Program),
+    ) {
+        for module in modules {
+            self.current_module = module.module_path.clone();
+            f(self, &module.program);
+        }
+    }
+
+    /// Debug-asserts the post-conditions of pre-pass A + B (FuncId
+    /// allocation).  Shared between [`Self::check_program`] and
+    /// [`Self::check_modules_inner`] so a future refactor that reorders
+    /// either path fires the assertion with a clear diagnostic instead
+    /// of an unindexed-HashMap panic deep inside `register_*`.
+    fn assert_pre_allocation_invariants(&self) {
         debug_assert_eq!(
             self.user_method_offset as usize,
             self.pending_function_ids.len(),
@@ -537,9 +628,53 @@ impl Checker {
             self.next_func_id - self.user_method_offset,
             "pre-pass B id count disagrees with the user-method id range"
         );
+    }
 
-        // First pass: register all type/function signatures (field types now
-        // resolve correctly because type names were pre-registered above).
+    /// Pass 0: pre-register struct/enum names with empty fields/variants
+    /// so that self-referential types (e.g.
+    /// `enum IntList { Cons(Int, IntList), Nil }`) can reference
+    /// themselves during field/variant type resolution.
+    ///
+    /// First-write-wins on duplicate names: cross-module collisions are
+    /// already diagnosed by [`Self::detect_cross_module_collisions`] (and
+    /// in-module duplicate types are caught in the registration pass), so
+    /// the second occurrence must not silently overwrite the first
+    /// definition in the symbol table.
+    fn pre_register_type_names(&mut self, program: &Program) {
+        for decl in &program.declarations {
+            match decl {
+                Declaration::Struct(s) => {
+                    self.structs
+                        .entry(s.name.clone())
+                        .or_insert_with(|| StructInfo {
+                            definition_span: s.name_span,
+                            type_params: s.type_params.clone(),
+                            fields: Vec::new(),
+                            visibility: s.visibility,
+                            def_module: self.current_module.clone(),
+                        });
+                }
+                Declaration::Enum(e) => {
+                    self.enums
+                        .entry(e.name.clone())
+                        .or_insert_with(|| EnumInfo {
+                            definition_span: e.name_span,
+                            type_params: e.type_params.clone(),
+                            variants: Vec::new(),
+                            visibility: e.visibility,
+                            def_module: self.current_module.clone(),
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// First pass over a single module's declarations: register all type
+    /// and function signatures so the body-check pass can resolve them.
+    /// Field types now resolve correctly because type names were
+    /// pre-registered by [`Self::pre_register_type_names`].
+    fn register_decls(&mut self, program: &Program) {
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(func) => self.register_function(func),
@@ -549,31 +684,133 @@ impl Checker {
                 Declaration::Trait(t) => self.register_trait(t),
                 Declaration::TypeAlias(ta) => self.register_type_alias(ta),
                 Declaration::Endpoint(ep) => self.check_endpoint(ep),
-                Declaration::Schema(_) => {} // Parse-only, no type checking
+                // Schemas are parse-only; imports are not yet wired into
+                // name resolution (the resolver crate handles discovery,
+                // but bringing imported names into scope is a follow-up).
+                Declaration::Schema(_) | Declaration::Import(_) => {}
             }
         }
+    }
 
-        // Second pass: check bodies
+    /// Second pass over a single module's declarations: type-check each
+    /// function and method body.
+    ///
+    /// Skips bodies whose registered `*Info` is owned by a different
+    /// module (i.e. the registration pass dropped this declaration via
+    /// the cross-module first-write-wins rule). Body-checking such a
+    /// declaration would resolve its name to a *different* module's
+    /// signature and produce a cascade of misleading follow-on errors;
+    /// the cross-module collision diagnostic is enough on its own.
+    fn check_decl_bodies(&mut self, program: &Program) {
         for decl in &program.declarations {
             match decl {
-                Declaration::Function(func) => self.check_function(func),
+                Declaration::Function(func) => {
+                    if self.is_owner_of(self.functions.get(&func.name).map(|i| &i.def_module)) {
+                        self.check_function(func);
+                    }
+                }
                 Declaration::Impl(imp) => self.check_impl(imp),
                 Declaration::Struct(s) => {
-                    self.check_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
+                    if self.is_owner_of(self.structs.get(&s.name).map(|i| &i.def_module)) {
+                        self.check_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
+                    }
                 }
                 Declaration::Enum(e) => {
-                    self.check_inline_methods(&e.name, &e.methods, &e.trait_impls, e.span);
+                    if self.is_owner_of(self.enums.get(&e.name).map(|i| &i.def_module)) {
+                        self.check_inline_methods(&e.name, &e.methods, &e.trait_impls, e.span);
+                    }
                 }
                 Declaration::Trait(_)
                 | Declaration::TypeAlias(_)
                 | Declaration::Endpoint(_)
-                | Declaration::Schema(_) => {} // Parse-only, no checking
+                | Declaration::Schema(_)
+                | Declaration::Import(_) => {}
             }
+        }
+    }
+
+    /// True iff `def_module` is `None` (no entry yet — not possible after
+    /// registration, but safe default) or equals `self.current_module`.
+    /// Used by [`Self::check_decl_bodies`] to skip bodies whose registered
+    /// `*Info` belongs to a different module.
+    fn is_owner_of(&self, def_module: Option<&ModulePath>) -> bool {
+        match def_module {
+            Some(m) => *m == self.current_module,
+            None => true,
         }
     }
 
     // Registration methods (register_function, register_struct, etc.) are in
     // check_register.rs to keep this file focused on the checking pass.
+
+    /// Walk every module's top-level declarations and emit a diagnostic
+    /// for each name that is declared in more than one module. Until the
+    /// symbol tables are keyed by `module_qualify(...)`, two modules that
+    /// each declare `struct User` would silently corrupt the tables —
+    /// surfacing these collisions early gives a clear error rather than
+    /// a confusing downstream type mismatch.
+    ///
+    /// Detection is per-namespace (functions, structs, enums, traits,
+    /// type aliases). A function `Foo` and a struct `Foo` in different
+    /// modules are *not* a collision here — those would be caught when
+    /// imports are wired up to a shared symbol table.
+    fn detect_cross_module_collisions(
+        &mut self,
+        modules: &[phoenix_modules::ResolvedSourceModule],
+    ) {
+        let mut functions: HashMap<String, (ModulePath, Span)> = HashMap::new();
+        let mut structs: HashMap<String, (ModulePath, Span)> = HashMap::new();
+        let mut enums: HashMap<String, (ModulePath, Span)> = HashMap::new();
+        let mut traits: HashMap<String, (ModulePath, Span)> = HashMap::new();
+        let mut aliases: HashMap<String, (ModulePath, Span)> = HashMap::new();
+
+        for module in modules {
+            let mp = &module.module_path;
+            for decl in &module.program.declarations {
+                let (kind, table, name, span) = match decl {
+                    Declaration::Function(f) => ("function", &mut functions, &f.name, f.name_span),
+                    Declaration::Struct(s) => ("struct", &mut structs, &s.name, s.name_span),
+                    Declaration::Enum(e) => ("enum", &mut enums, &e.name, e.name_span),
+                    Declaration::Trait(t) => ("trait", &mut traits, &t.name, t.name_span),
+                    Declaration::TypeAlias(ta) => {
+                        ("type alias", &mut aliases, &ta.name, ta.name_span)
+                    }
+                    _ => continue,
+                };
+                self.record_namespace_collision(kind, table, name, mp, span);
+            }
+        }
+    }
+
+    /// Helper for [`Self::detect_cross_module_collisions`]: emit a diagnostic
+    /// if `name` already appears in `seen` under a different module path,
+    /// otherwise record this declaration as the first occurrence.
+    fn record_namespace_collision(
+        &mut self,
+        kind: &str,
+        seen: &mut HashMap<String, (ModulePath, Span)>,
+        name: &str,
+        module: &ModulePath,
+        span: Span,
+    ) {
+        if let Some((prev_module, prev_span)) = seen.get(name) {
+            if prev_module != module {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "{kind} `{name}` is declared in modules `{prev_module}` and `{module}` — \
+                             cross-module name resolution does not yet disambiguate; \
+                             rename one of the declarations"
+                        ),
+                        span,
+                    )
+                    .with_note(*prev_span, "originally declared here"),
+                );
+            }
+        } else {
+            seen.insert(name.to_string(), (module.clone(), span));
+        }
+    }
 
     /// Type-checks a function body against its declared signature.
     fn check_function(&mut self, func: &FunctionDecl) {
@@ -1138,4 +1375,32 @@ pub fn check(program: &Program) -> Analysis {
     let mut checker = Checker::new();
     checker.check_program(program);
     crate::resolved::build_from_checker(program, checker)
+}
+
+/// Multi-module entry point.
+///
+/// Runs the same registration / checking passes as [`check`] but iterates
+/// over every [`phoenix_modules::ResolvedSourceModule`] in turn, with
+/// `Checker.current_module` set to each module's path before its
+/// declarations are processed. This is the API the driver uses once the
+/// resolver has produced a deterministic module list.
+///
+/// The first module in `modules` is treated as the entry module. The
+/// `Analysis` is built from the entry module's `Program` (matching the
+/// existing single-file contract); cross-module behavior (visibility
+/// enforcement, import-driven name resolution, `main`-in-non-entry
+/// rejection) is layered on in subsequent passes — see Phase 2.6 plan.
+#[must_use]
+pub fn check_modules(modules: &[phoenix_modules::ResolvedSourceModule]) -> Analysis {
+    assert!(
+        !modules.is_empty(),
+        "check_modules requires at least one module (the entry)"
+    );
+    let mut checker = Checker::new();
+    checker.check_modules_inner(modules);
+    // For now the resulting Analysis is built from the entry module's
+    // program. Multi-module Analysis aggregation (cross-module function
+    // index, span maps spanning files) lands in subsequent Phase 2.6 work.
+    let entry_program = &modules[0].program;
+    crate::resolved::build_from_checker(entry_program, checker)
 }

@@ -192,13 +192,14 @@ function hash(input: String) -> String {
 - `public function` — callable from outside the module
 - `public enum` — the enum and all its variants are visible
 - `public trait` — the trait is visible and implementable from outside
-- Functions, structs, enums, and traits without `public` are module-private
+- `public` on an inline method (in a `struct` / `enum` body or inherent `impl` block) — the method is callable from outside the module. Default is private; a public method on a private type is a sema error. Methods inside `impl Trait for Type` blocks take their visibility from the trait. See [design-decisions.md: *Per-method `public` / private on inline struct/enum methods*](../design-decisions.md#per-method-public--private-on-inline-structenum-methods).
+- Functions, structs, enums, traits, and methods without `public` are module-private
 
 ### Design principles
 
 - **Private by default:** Forces authors to think about their public API. Anything not marked `public` is an implementation detail that can change freely.
 - **No `protected` or `internal`:** Two levels (public/private) keep the system simple. If a more granular system is needed later, it can be added without breaking existing code.
-- **Struct fields have independent visibility:** A struct can be `public` (importable) while some fields are private (encapsulated). This supports the common pattern of exposing a type while hiding its internals.
+- **Struct fields and methods have independent visibility:** A struct can be `public` (importable) while some fields and methods are private (encapsulated). This supports the common pattern of exposing a type while hiding its internals. The inverse — a `public` method (or field) on a private type — is a sema error, since the receiver cannot be named from outside.
 
 - **Why before packages:** The package manager (3.1) needs modules to exist. You cannot have cross-package imports without intra-project imports. Module resolution is also needed by the LSP (3.2) for go-to-definition and auto-imports.
 - **Complexity:** High — requires a module resolver (file system → module tree), import resolution, visibility checking across module boundaries, and changes to name resolution in the semantic checker. The two-pass registration design already handles forward references within a file; extending it to cross-file references adds significant complexity.

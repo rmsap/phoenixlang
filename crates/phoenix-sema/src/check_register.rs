@@ -8,12 +8,26 @@ use crate::checker::{
     TypeAliasInfo,
 };
 use crate::types::Type;
+use phoenix_common::module_path::ModulePath;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     EnumDecl, FunctionDecl, ImplBlock, InlineTraitImpl, Param, StructDecl, TraitDecl,
-    TypeAliasDecl, TypeExpr,
+    TypeAliasDecl, TypeExpr, Visibility,
 };
 use std::collections::HashMap;
+
+/// True iff `existing_def_module` is `Some` and refers to a module other
+/// than `current`. Used by the four `register_*` paths to early-return
+/// when the slot is already owned by an earlier-registered, different
+/// module — preserving first-write-wins under cross-module name
+/// collisions (which are separately diagnosed by
+/// [`Checker::detect_cross_module_collisions`](crate::checker::Checker::detect_cross_module_collisions)).
+fn slot_owned_by_other_module(
+    current: &ModulePath,
+    existing_def_module: Option<&ModulePath>,
+) -> bool {
+    matches!(existing_def_module, Some(m) if m != current)
+}
 
 impl Checker {
     /// Pre-registers built-in `Option<T>` and `Result<T, E>` enums along with
@@ -29,6 +43,8 @@ impl Checker {
                     ("Some".to_string(), vec![Type::TypeVar("T".to_string())]),
                     ("None".to_string(), vec![]),
                 ],
+                visibility: Visibility::Public,
+                def_module: ModulePath::builtin(),
             },
         );
 
@@ -42,6 +58,8 @@ impl Checker {
                     ("Ok".to_string(), vec![Type::TypeVar("T".to_string())]),
                     ("Err".to_string(), vec![Type::TypeVar("E".to_string())]),
                 ],
+                visibility: Visibility::Public,
+                def_module: ModulePath::builtin(),
             },
         );
 
@@ -121,11 +139,18 @@ impl Checker {
                 (params, param_names, default_param_exprs, return_type)
             });
 
-        if self.functions.contains_key(&func.name) {
-            self.error(
-                format!("function `{}` is already defined", func.name),
-                func.span,
-            );
+        if let Some(existing) = self.functions.get(&func.name) {
+            if existing.def_module == self.current_module {
+                // In-module duplicate — emit the existing "already defined" diagnostic.
+                self.error(
+                    format!("function `{}` is already defined", func.name),
+                    func.span,
+                );
+            }
+            // Cross-module duplicates are diagnosed by
+            // `detect_cross_module_collisions`; preserve first-write-wins
+            // by skipping this registration so the symbol table keeps the
+            // earlier definition.
         } else {
             self.record_reference(
                 func.name_span,
@@ -159,6 +184,8 @@ impl Checker {
                     param_names,
                     default_param_exprs,
                     return_type,
+                    visibility: func.visibility,
+                    def_module: self.current_module.clone(),
                 },
             );
         }
@@ -167,7 +194,18 @@ impl Checker {
     /// Registers a struct declaration, resolving its field types and storing
     /// them in the struct table for use during constructor and field-access
     /// checking.  Also registers any inline methods and trait implementations.
+    ///
+    /// Cross-module collisions are diagnosed earlier by
+    /// `detect_cross_module_collisions`; this function preserves
+    /// first-write-wins semantics by returning early if the struct's slot
+    /// is already owned by a different module.
     pub(crate) fn register_struct(&mut self, s: &StructDecl) {
+        if slot_owned_by_other_module(
+            &self.current_module,
+            self.structs.get(&s.name).map(|i| &i.def_module),
+        ) {
+            return;
+        }
         let fields: Vec<crate::checker::FieldInfo> =
             self.with_type_params(&s.type_params, None, |this| {
                 s.fields
@@ -207,6 +245,7 @@ impl Checker {
                             ty,
                             constraint: f.constraint.clone(),
                             definition_span: f.span,
+                            visibility: f.visibility,
                         }
                     })
                     .collect()
@@ -222,6 +261,8 @@ impl Checker {
                 definition_span: s.name_span,
                 type_params: s.type_params.clone(),
                 fields,
+                visibility: s.visibility,
+                def_module: self.current_module.clone(),
             },
         );
 
@@ -232,7 +273,17 @@ impl Checker {
     /// storing them in the enum table for use during pattern matching and
     /// constructor checking.  Also registers any inline methods and trait
     /// implementations.
+    ///
+    /// Cross-module collisions are diagnosed earlier; this function
+    /// preserves first-write-wins semantics by returning early if the
+    /// enum's slot is already owned by a different module.
     pub(crate) fn register_enum(&mut self, e: &EnumDecl) {
+        if slot_owned_by_other_module(
+            &self.current_module,
+            self.enums.get(&e.name).map(|i| &i.def_module),
+        ) {
+            return;
+        }
         let variants: Vec<(String, Vec<Type>)> =
             self.with_type_params(&e.type_params, None, |this| {
                 e.variants
@@ -255,6 +306,8 @@ impl Checker {
                 definition_span: e.name_span,
                 type_params: e.type_params.clone(),
                 variants,
+                visibility: e.visibility,
+                def_module: self.current_module.clone(),
             },
         );
 
@@ -262,7 +315,17 @@ impl Checker {
     }
 
     /// Registers a trait declaration, storing its method signatures.
+    ///
+    /// Cross-module collisions are diagnosed earlier; this function
+    /// preserves first-write-wins semantics by returning early if the
+    /// trait's slot is already owned by a different module.
     pub(crate) fn register_trait(&mut self, t: &TraitDecl) {
+        if slot_owned_by_other_module(
+            &self.current_module,
+            self.traits.get(&t.name).map(|i| &i.def_module),
+        ) {
+            return;
+        }
         let methods: Vec<TraitMethodInfo> = self.with_type_params(&t.type_params, None, |this| {
             t.methods
                 .iter()
@@ -294,6 +357,8 @@ impl Checker {
                 type_params: t.type_params.clone(),
                 methods,
                 object_safety_error,
+                visibility: t.visibility,
+                def_module: self.current_module.clone(),
             },
         );
     }
@@ -303,7 +368,17 @@ impl Checker {
     /// Temporarily swaps the alias's own type parameters into scope so that
     /// references like `T` in `type StringResult<T> = Result<T, String>` are
     /// resolved as type variables rather than concrete types.
+    ///
+    /// Cross-module collisions are diagnosed earlier; this function
+    /// preserves first-write-wins semantics by returning early if the
+    /// alias's slot is already owned by a different module.
     pub(crate) fn register_type_alias(&mut self, ta: &TypeAliasDecl) {
+        if slot_owned_by_other_module(
+            &self.current_module,
+            self.type_aliases.get(&ta.name).map(|i| &i.def_module),
+        ) {
+            return;
+        }
         // Detect direct self-reference: `type A = A`
         if let TypeExpr::Named(named) = &ta.target
             && named.name == ta.name
@@ -334,6 +409,8 @@ impl Checker {
                 definition_span: ta.name_span,
                 type_params: ta.type_params.clone(),
                 target,
+                visibility: ta.visibility,
+                def_module: self.current_module.clone(),
             },
         );
     }

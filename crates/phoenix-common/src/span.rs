@@ -14,6 +14,13 @@ pub struct SourceId(pub usize);
 /// inclusive-start / exclusive-end byte positions. They are used throughout the
 /// compiler to attach source-location information to tokens, AST nodes, and
 /// diagnostics.
+///
+/// `Span::BUILTIN` is the sentinel for synthesized nodes with no source
+/// location (e.g. compiler-generated `Option`/`Result`). `Span` deliberately
+/// does *not* derive `Default` — `SourceId(0)` is the first real source file
+/// in any non-empty `SourceMap`, so a `Span::default()` would silently
+/// collide with real source positions if accidentally spread into a real
+/// AST node. Use `Span::BUILTIN` explicitly when a sentinel is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct Span {
     /// The source file this span belongs to.

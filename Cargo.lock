@@ -1223,6 +1223,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-modules"
+version = "0.1.0"
+dependencies = [
+ "phoenix-common",
+ "phoenix-lexer",
+ "phoenix-parser",
+ "tempfile",
+]
+
+[[package]]
 name = "phoenix-parser"
 version = "0.1.0"
 dependencies = [
@@ -1244,6 +1254,7 @@ dependencies = [
  "insta",
  "phoenix-common",
  "phoenix-lexer",
+ "phoenix-modules",
  "phoenix-parser",
 ]
 

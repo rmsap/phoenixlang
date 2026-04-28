@@ -1,11 +1,11 @@
 use crate::ast::{
     Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
-    FieldDecl, FunctionDecl, HttpMethod, ImplBlock, InlineTraitImpl, NamedType, Param, Program,
-    QueryParam, SchemaDecl, SchemaTable, StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl,
-    TypeExpr, TypeModifier,
+    FieldDecl, FunctionDecl, HttpMethod, ImplBlock, ImportDecl, ImportItem, ImportItems,
+    InlineTraitImpl, NamedType, Param, Program, QueryParam, SchemaDecl, SchemaTable, StructDecl,
+    TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
 };
 use phoenix_common::diagnostics::Diagnostic;
-use phoenix_common::span::SourceId;
+use phoenix_common::span::{SourceId, Span};
 use phoenix_lexer::token::{Token, TokenKind};
 
 /// Returns a human-readable name for a [`TokenKind`], suitable for use in
@@ -94,6 +94,9 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Newline => "newline",
         TokenKind::Eof => "end of file",
         TokenKind::Error => "error token",
+        TokenKind::Import => "'import'",
+        TokenKind::Public => "'public'",
+        TokenKind::As => "'as'",
     }
 }
 
@@ -162,27 +165,152 @@ impl<'src> Parser<'src> {
         }
     }
 
-    /// Parses a top-level declaration, optionally preceded by a doc comment.
+    /// Parses a top-level declaration, optionally preceded by a doc comment
+    /// and an optional `public` visibility modifier.
     fn parse_declaration(&mut self) -> Option<Declaration> {
         // Consume a doc comment if present — it attaches to the next declaration.
         let doc_comment = self.try_consume_doc_comment();
 
+        // Consume optional `public` visibility modifier. Capture its span
+        // before advancing so we can emit a precise diagnostic if `public`
+        // precedes a non-public-able decl (e.g. `impl`, `import`).
+        let public_span = if self.peek().kind == TokenKind::Public {
+            let span = self.peek().span;
+            self.advance();
+            Some(span)
+        } else {
+            None
+        };
+        let visibility = if public_span.is_some() {
+            Visibility::Public
+        } else {
+            Visibility::Private
+        };
+
         match self.peek().kind {
-            TokenKind::Function => self.parse_function_decl().map(Declaration::Function),
-            TokenKind::Struct => self.parse_struct_decl(doc_comment).map(Declaration::Struct),
-            TokenKind::Enum => self.parse_enum_decl(doc_comment).map(Declaration::Enum),
-            TokenKind::Impl => self.parse_impl_block().map(Declaration::Impl),
-            TokenKind::Trait => self.parse_trait_decl().map(Declaration::Trait),
-            TokenKind::Type => self.parse_type_alias_decl().map(Declaration::TypeAlias),
-            TokenKind::Endpoint => self
-                .parse_endpoint_decl(doc_comment)
-                .map(Declaration::Endpoint),
-            TokenKind::Schema => self.parse_schema_decl().map(Declaration::Schema),
+            TokenKind::Function => self
+                .parse_function_decl(visibility)
+                .map(Declaration::Function),
+            TokenKind::Struct => self
+                .parse_struct_decl(doc_comment, visibility)
+                .map(Declaration::Struct),
+            TokenKind::Enum => self
+                .parse_enum_decl(doc_comment, visibility)
+                .map(Declaration::Enum),
+            TokenKind::Impl => {
+                self.reject_public_modifier(
+                    public_span,
+                    "`public` cannot precede `impl` — impl visibility is derived from the trait and the type",
+                );
+                self.parse_impl_block().map(Declaration::Impl)
+            }
+            TokenKind::Trait => self.parse_trait_decl(visibility).map(Declaration::Trait),
+            TokenKind::Type => self
+                .parse_type_alias_decl(visibility)
+                .map(Declaration::TypeAlias),
+            TokenKind::Endpoint => {
+                self.reject_public_modifier(public_span, "`public` cannot precede `endpoint`");
+                self.parse_endpoint_decl(doc_comment)
+                    .map(Declaration::Endpoint)
+            }
+            TokenKind::Schema => {
+                self.reject_public_modifier(public_span, "`public` cannot precede `schema`");
+                self.parse_schema_decl().map(Declaration::Schema)
+            }
+            TokenKind::Import => {
+                self.reject_public_modifier(
+                    public_span,
+                    "`import` declarations cannot be marked `public`",
+                );
+                self.parse_import_decl().map(Declaration::Import)
+            }
             _ => {
-                self.error_at_current("expected a declaration (e.g. `function`, `struct`, `enum`, `impl`, `trait`, `type`, `endpoint`, `schema`)");
+                self.error_at_current("expected a declaration (e.g. `function`, `struct`, `enum`, `impl`, `trait`, `type`, `endpoint`, `schema`, `import`)");
                 None
             }
         }
+    }
+
+    /// Emit a diagnostic at `public_span` if a `public` keyword preceded a
+    /// declaration that does not support visibility. Called from the
+    /// declaration-kind arms that don't carry a `Visibility` field.
+    fn reject_public_modifier(&mut self, public_span: Option<Span>, message: &'static str) {
+        if let Some(span) = public_span {
+            self.diagnostics.push(Diagnostic::error(message, span));
+        }
+    }
+
+    /// Parses an `import` declaration:
+    /// `import a.b.c { Foo, Bar as Baz }` or `import a.b.c { * }`.
+    fn parse_import_decl(&mut self) -> Option<ImportDecl> {
+        let start = self.peek().span;
+        self.expect(TokenKind::Import)?;
+
+        // Dotted module path: IDENT (. IDENT)*
+        let mut path = Vec::new();
+        let first = self.expect(TokenKind::Ident)?;
+        path.push(first.text.clone());
+        while self.eat(TokenKind::Dot) {
+            let segment = self.expect(TokenKind::Ident)?;
+            path.push(segment.text.clone());
+        }
+
+        let lbrace_span = self.expect(TokenKind::LBrace)?.span;
+        self.skip_newlines();
+
+        let items = if self.eat(TokenKind::Star) {
+            self.skip_newlines();
+            ImportItems::Wildcard
+        } else {
+            let mut items = Vec::new();
+            loop {
+                self.skip_newlines();
+                if self.peek().kind == TokenKind::RBrace {
+                    break;
+                }
+                let name_tok = self.expect(TokenKind::Ident)?;
+                let name = name_tok.text.clone();
+                let item_start = name_tok.span;
+                let (alias, item_end) = if self.eat(TokenKind::As) {
+                    let alias_tok = self.expect(TokenKind::Ident)?;
+                    (Some(alias_tok.text.clone()), alias_tok.span)
+                } else {
+                    (None, name_tok.span)
+                };
+                items.push(ImportItem {
+                    name,
+                    alias,
+                    span: item_start.merge(item_end),
+                });
+                self.skip_newlines();
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+            if items.is_empty() {
+                // Anchor at the brace pair itself so the caret points at
+                // `{ }`, not at the entire `import a.b { }` declaration.
+                let brace_span = if self.peek().kind == TokenKind::RBrace {
+                    lbrace_span.merge(self.peek().span)
+                } else {
+                    lbrace_span
+                };
+                self.diagnostics.push(Diagnostic::error(
+                    "import list cannot be empty — use `{ * }` for a wildcard import or list at least one item",
+                    brace_span,
+                ));
+            }
+            ImportItems::Named(items)
+        };
+
+        self.skip_newlines();
+        let end = self.expect(TokenKind::RBrace)?.span;
+
+        Some(ImportDecl {
+            path,
+            items,
+            span: start.merge(end),
+        })
     }
 
     /// Consumes a [`TokenKind::DocComment`] token if one is present at the
@@ -208,7 +336,14 @@ impl<'src> Parser<'src> {
     }
 
     /// Parses a function declaration including optional type parameters, params, return type, and body.
-    fn parse_function_decl(&mut self) -> Option<FunctionDecl> {
+    ///
+    /// `visibility` is supplied by the caller — top-level declarations and
+    /// inline methods (struct/enum bodies, inherent `impl` blocks) pass the
+    /// modifier observed before the `function` keyword. Methods inside
+    /// `impl Trait for Type` blocks always pass [`Visibility::Private`]; the
+    /// caller rejects an explicit `public` modifier in that position because
+    /// trait-impl method visibility is fixed by the trait contract.
+    fn parse_function_decl(&mut self, visibility: Visibility) -> Option<FunctionDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Function)?;
 
@@ -238,6 +373,7 @@ impl<'src> Parser<'src> {
             params,
             return_type,
             body,
+            visibility,
             span,
         })
     }
@@ -383,12 +519,35 @@ impl<'src> Parser<'src> {
     ///
     /// Used by `parse_impl_block`, `parse_inline_trait_impl`, and similar
     /// constructs that contain only method definitions.
-    fn parse_methods_block(&mut self) -> Option<Vec<FunctionDecl>> {
+    ///
+    /// `allow_method_visibility` controls whether an optional `public` modifier
+    /// before each method is accepted (inherent `impl Type` blocks) or rejected
+    /// with a diagnostic (trait `impl Trait for Type` blocks, where method
+    /// visibility is fixed by the trait contract).
+    fn parse_methods_block(&mut self, allow_method_visibility: bool) -> Option<Vec<FunctionDecl>> {
         self.expect(TokenKind::LBrace)?;
         self.skip_newlines();
         let mut methods = Vec::new();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
-            if let Some(func) = self.parse_function_decl() {
+            let public_span = if self.peek().kind == TokenKind::Public {
+                let span = self.peek().span;
+                self.advance();
+                Some(span)
+            } else {
+                None
+            };
+            let visibility = if !allow_method_visibility {
+                self.reject_public_modifier(
+                    public_span,
+                    "`public` cannot precede a method in a trait `impl` block — trait-impl method visibility is fixed by the trait",
+                );
+                Visibility::Private
+            } else if public_span.is_some() {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            if let Some(func) = self.parse_function_decl(visibility) {
                 methods.push(func);
             } else {
                 self.synchronize_stmt();
@@ -508,7 +667,11 @@ impl<'src> Parser<'src> {
     /// [`try_consume_doc_comment`](Self::try_consume_doc_comment). It is
     /// stored on the resulting [`StructDecl`] for use by code generators and
     /// documentation tools.
-    pub(crate) fn parse_struct_decl(&mut self, doc_comment: Option<String>) -> Option<StructDecl> {
+    pub(crate) fn parse_struct_decl(
+        &mut self,
+        doc_comment: Option<String>,
+        visibility: Visibility,
+    ) -> Option<StructDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Struct)?;
         let name_token = self.expect(TokenKind::Ident)?;
@@ -520,24 +683,50 @@ impl<'src> Parser<'src> {
         let mut methods = Vec::new();
         let mut trait_impls = Vec::new();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            // Hoist `public` consumption when followed by `function` (public
+            // method) or `impl` (rejected — inline trait impls have no
+            // visibility of their own). For fields, the field branch below
+            // consumes its own `public`.
+            let public_span = if self.peek().kind == TokenKind::Public
+                && matches!(self.peek_at(1).kind, TokenKind::Function | TokenKind::Impl)
+            {
+                let span = self.peek().span;
+                self.advance();
+                Some(span)
+            } else {
+                None
+            };
+
             if self.peek().kind == TokenKind::Function {
-                // Inline method
-                if let Some(func) = self.parse_function_decl() {
+                let visibility = if public_span.is_some() {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                if let Some(func) = self.parse_function_decl(visibility) {
                     methods.push(func);
                 } else {
                     self.synchronize_stmt();
                 }
             } else if self.peek().kind == TokenKind::Impl {
-                // Inline trait impl
+                self.reject_public_modifier(
+                    public_span,
+                    "`public` cannot precede inline `impl` — trait-impl method visibility is fixed by the trait",
+                );
                 if let Some(ti) = self.parse_inline_trait_impl() {
                     trait_impls.push(ti);
                 } else {
                     self.synchronize_stmt();
                 }
             } else {
-                // Field: [doc_comment] Type name [where <constraint-expr>]
+                // Field: [doc_comment] [public] Type name [where <constraint-expr>]
                 let field_doc = self.try_consume_doc_comment();
                 let fstart = self.peek().span;
+                let field_vis = if self.eat(TokenKind::Public) {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
                 if let Some(type_expr) = self.parse_type_expr()
                     && let Some(name_tok) = self.expect_ident_or_contextual()
                 {
@@ -557,6 +746,7 @@ impl<'src> Parser<'src> {
                         name: name_tok.text.clone(),
                         constraint,
                         doc_comment: field_doc,
+                        visibility: field_vis,
                         span,
                     });
                 }
@@ -573,6 +763,7 @@ impl<'src> Parser<'src> {
             methods,
             trait_impls,
             doc_comment,
+            visibility,
             span: start.merge(end),
         })
     }
@@ -584,7 +775,11 @@ impl<'src> Parser<'src> {
     /// [`try_consume_doc_comment`](Self::try_consume_doc_comment). It is
     /// stored on the resulting [`EnumDecl`] for use by code generators and
     /// documentation tools.
-    pub(crate) fn parse_enum_decl(&mut self, doc_comment: Option<String>) -> Option<EnumDecl> {
+    pub(crate) fn parse_enum_decl(
+        &mut self,
+        doc_comment: Option<String>,
+        visibility: Visibility,
+    ) -> Option<EnumDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Enum)?;
         let name_token = self.expect(TokenKind::Ident)?;
@@ -596,15 +791,35 @@ impl<'src> Parser<'src> {
         let mut methods = Vec::new();
         let mut trait_impls = Vec::new();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            // Hoist `public` consumption when followed by `function` (public
+            // method) or `impl` (rejected — inline trait impls have no
+            // visibility of their own). Variants do not accept `public`.
+            let public_span = if self.peek().kind == TokenKind::Public
+                && matches!(self.peek_at(1).kind, TokenKind::Function | TokenKind::Impl)
+            {
+                let span = self.peek().span;
+                self.advance();
+                Some(span)
+            } else {
+                None
+            };
+
             if self.peek().kind == TokenKind::Function {
-                // Inline method
-                if let Some(func) = self.parse_function_decl() {
+                let visibility = if public_span.is_some() {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
+                if let Some(func) = self.parse_function_decl(visibility) {
                     methods.push(func);
                 } else {
                     self.synchronize_stmt();
                 }
             } else if self.peek().kind == TokenKind::Impl {
-                // Inline trait impl
+                self.reject_public_modifier(
+                    public_span,
+                    "`public` cannot precede inline `impl` — trait-impl method visibility is fixed by the trait",
+                );
                 if let Some(ti) = self.parse_inline_trait_impl() {
                     trait_impls.push(ti);
                 } else {
@@ -641,6 +856,7 @@ impl<'src> Parser<'src> {
             methods,
             trait_impls,
             doc_comment,
+            visibility,
             span: start.merge(end),
         })
     }
@@ -660,7 +876,10 @@ impl<'src> Parser<'src> {
             (None, first_ident.text.clone())
         };
 
-        let methods = self.parse_methods_block()?;
+        // Inherent `impl Type` blocks accept per-method `public`; trait
+        // `impl Trait for Type` blocks reject it (trait controls visibility).
+        let allow_method_visibility = trait_name.is_none();
+        let methods = self.parse_methods_block(allow_method_visibility)?;
         let end = self
             .tokens
             .get(self.pos.saturating_sub(1))
@@ -679,7 +898,8 @@ impl<'src> Parser<'src> {
         let start = self.peek().span;
         self.expect(TokenKind::Impl)?;
         let trait_name_token = self.expect(TokenKind::Ident)?;
-        let methods = self.parse_methods_block()?;
+        // Inline trait impls reject per-method `public` (trait controls visibility).
+        let methods = self.parse_methods_block(false)?;
         let end = self
             .tokens
             .get(self.pos.saturating_sub(1))
@@ -725,7 +945,7 @@ impl<'src> Parser<'src> {
     }
 
     /// Parses a trait declaration: `trait Name { method_signatures }`.
-    pub(crate) fn parse_trait_decl(&mut self) -> Option<TraitDecl> {
+    pub(crate) fn parse_trait_decl(&mut self, visibility: Visibility) -> Option<TraitDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Trait)?;
         let name_token = self.expect(TokenKind::Ident)?;
@@ -749,6 +969,7 @@ impl<'src> Parser<'src> {
             name_span: name_token.span,
             type_params,
             methods,
+            visibility,
             span: start.merge(end),
         })
     }
@@ -791,7 +1012,10 @@ impl<'src> Parser<'src> {
 
     /// Parses a type alias declaration: `type Name = TypeExpr` or
     /// `type Name<T> = TypeExpr`.
-    pub(crate) fn parse_type_alias_decl(&mut self) -> Option<TypeAliasDecl> {
+    pub(crate) fn parse_type_alias_decl(
+        &mut self,
+        visibility: Visibility,
+    ) -> Option<TypeAliasDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Type)?;
         let name_token = self.expect(TokenKind::Ident)?;
@@ -805,6 +1029,7 @@ impl<'src> Parser<'src> {
             name_span: name_token.span,
             type_params,
             target,
+            visibility,
             span: start.merge(end),
         })
     }
@@ -1249,7 +1474,9 @@ impl<'src> Parser<'src> {
                 | TokenKind::Trait
                 | TokenKind::Type
                 | TokenKind::Endpoint
-                | TokenKind::Schema => break,
+                | TokenKind::Schema
+                | TokenKind::Import
+                | TokenKind::Public => break,
                 _ => {
                     self.advance();
                 }
@@ -4078,6 +4305,370 @@ schema db {
             "expected a parse error for `c.bump(by: 5)`, got none — if named-args on \
              methods were intentionally enabled, update `MethodCallExpr` + \
              `merge_method_call_args` to thread names before removing this test",
+        );
+    }
+
+    // ── import + visibility tests ────────────────────────────
+
+    #[test]
+    fn parse_import_named() {
+        let (program, diagnostics) =
+            parse_source("import models.user { User, createUser }\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => {
+                assert_eq!(imp.path, vec!["models", "user"]);
+                match &imp.items {
+                    ImportItems::Named(items) => {
+                        assert_eq!(items.len(), 2);
+                        assert_eq!(items[0].name, "User");
+                        assert!(items[0].alias.is_none());
+                        assert_eq!(items[1].name, "createUser");
+                    }
+                    other => panic!("expected Named items, got {:?}", other),
+                }
+            }
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_with_alias() {
+        let (program, diagnostics) =
+            parse_source("import models.user { User as UserModel }\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => match &imp.items {
+                ImportItems::Named(items) => {
+                    assert_eq!(items[0].name, "User");
+                    assert_eq!(items[0].alias.as_deref(), Some("UserModel"));
+                }
+                other => panic!("expected Named items, got {:?}", other),
+            },
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_wildcard() {
+        let (program, diagnostics) = parse_source("import models.user { * }\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => match &imp.items {
+                ImportItems::Wildcard => {}
+                other => panic!("expected Wildcard items, got {:?}", other),
+            },
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_single_segment_path() {
+        let (program, diagnostics) = parse_source("import helpers { add }\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => assert_eq!(imp.path, vec!["helpers"]),
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_public_function() {
+        let (program, diagnostics) =
+            parse_source("public function add(a: Int, b: Int) -> Int { a + b }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => assert_eq!(f.visibility, Visibility::Public),
+            other => panic!("expected Function decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_private_function_default() {
+        let (program, _) = parse_source("function add(a: Int, b: Int) -> Int { a + b }");
+        match &program.declarations[0] {
+            Declaration::Function(f) => assert_eq!(f.visibility, Visibility::Private),
+            other => panic!("expected Function decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_public_struct_with_field_visibilities() {
+        let src = "public struct User {
+            public String name
+            String passwordHash
+        }";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.visibility, Visibility::Public);
+                assert_eq!(s.fields[0].name, "name");
+                assert_eq!(s.fields[0].visibility, Visibility::Public);
+                assert_eq!(s.fields[1].name, "passwordHash");
+                assert_eq!(s.fields[1].visibility, Visibility::Private);
+            }
+            other => panic!("expected Struct decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_public_enum_trait_alias() {
+        let src = "public enum Color { Red Green Blue }
+public trait Display { function show(self) -> String }
+public type UserId = Int";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Enum(e) => assert_eq!(e.visibility, Visibility::Public),
+            other => panic!("expected Enum, got {:?}", other),
+        }
+        match &program.declarations[1] {
+            Declaration::Trait(t) => assert_eq!(t.visibility, Visibility::Public),
+            other => panic!("expected Trait, got {:?}", other),
+        }
+        match &program.declarations[2] {
+            Declaration::TypeAlias(a) => assert_eq!(a.visibility, Visibility::Public),
+            other => panic!("expected TypeAlias, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn public_on_impl_block_rejected() {
+        let (_, diagnostics) =
+            parse_source("struct P { Int x }\npublic impl P { function f(self) {} }");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("`public` cannot precede `impl`")),
+            "expected diagnostic about `public impl`, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn public_on_import_rejected() {
+        let (_, diagnostics) = parse_source("public import a.b { Foo }\nfunction main() {}");
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("`import` declarations cannot be marked `public`")),
+            "expected diagnostic about `public import`, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn import_empty_list_rejected() {
+        let (_, diagnostics) = parse_source("import a.b { }\nfunction main() {}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("import list cannot be empty")),
+            "expected diagnostic about empty import list, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn import_missing_path_recovers() {
+        // `import { Foo }` — no module path.  Parser should error and not panic.
+        let (_, diagnostics) = parse_source("import { Foo }\nfunction main() {}");
+        assert!(!diagnostics.is_empty(), "expected at least one diagnostic");
+    }
+
+    #[test]
+    fn import_unterminated_brace_recovers() {
+        // `import a.b {` — unterminated.  Synchronization should recover at the
+        // following `function` keyword without panicking.
+        let (_, diagnostics) = parse_source("import a.b {\nfunction main() {}");
+        assert!(!diagnostics.is_empty(), "expected at least one diagnostic");
+    }
+
+    #[test]
+    fn import_double_comma_recovers() {
+        let (_, diagnostics) = parse_source("import a.b { Foo,, Bar }\nfunction main() {}");
+        assert!(!diagnostics.is_empty(), "expected at least one diagnostic");
+    }
+
+    #[test]
+    fn malformed_import_does_not_swallow_following_import() {
+        // Synchronize must stop at the next `import`, not skip past it.
+        let src = "import { Foo }\nimport b.c { Bar }\nfunction main() {}";
+        let (program, _diagnostics) = parse_source(src);
+        // The second, well-formed import should have parsed successfully.
+        let import_count = program
+            .declarations
+            .iter()
+            .filter(|d| matches!(d, Declaration::Import(_)))
+            .count();
+        assert!(
+            import_count >= 1,
+            "expected at least one Import decl from recovery; got {} decls: {:?}",
+            program.declarations.len(),
+            program.declarations
+        );
+    }
+
+    #[test]
+    fn parse_import_named_trailing_comma_allowed() {
+        // `import a.b { Foo, Bar, }` — trailing comma in the named-list form
+        // is accepted (consistent with other comma-separated lists in the
+        // language).
+        let (program, diagnostics) = parse_source("import a.b { Foo, Bar, }\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => match &imp.items {
+                ImportItems::Named(items) => {
+                    assert_eq!(items.len(), 2);
+                    assert_eq!(items[0].name, "Foo");
+                    assert_eq!(items[1].name, "Bar");
+                }
+                other => panic!("expected Named items, got {:?}", other),
+            },
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_wildcard_then_extra_token_is_rejected() {
+        // `import a.b { *, Foo }` — wildcard cannot be combined with named
+        // items. After eating `*`, the parser expects `}`, so the trailing
+        // `, Foo }` triggers a diagnostic (the `,` is not the expected
+        // closing brace).
+        let (_, diagnostics) = parse_source("import a.b { *, Foo }\nfunction main() {}");
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for `*, Foo`; got none"
+        );
+    }
+
+    #[test]
+    fn double_public_modifier_rejected() {
+        // `public public function foo()` — only one visibility modifier is
+        // allowed. The first `public` is consumed by `parse_declaration`;
+        // the second is then in the declaration-keyword position and the
+        // parser must reject it (no recovery beyond emitting a diagnostic).
+        let (_, diagnostics) = parse_source("public public function foo() {}");
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for `public public function`; got none"
+        );
+    }
+
+    #[test]
+    fn parse_public_method_in_struct_body() {
+        let src = "struct Counter {
+            Int n
+            public function bump(self) -> Int { self.n + 1 }
+            function reset(self) { }
+        }";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.methods.len(), 2);
+                assert_eq!(s.methods[0].name, "bump");
+                assert_eq!(s.methods[0].visibility, Visibility::Public);
+                assert_eq!(s.methods[1].name, "reset");
+                assert_eq!(s.methods[1].visibility, Visibility::Private);
+            }
+            other => panic!("expected Struct decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_public_method_in_enum_body() {
+        let src = "enum Color {
+            Red Green Blue
+            public function name(self) -> String { \"red\" }
+            function isPrimary(self) -> Bool { true }
+        }";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Enum(e) => {
+                assert_eq!(e.methods.len(), 2);
+                assert_eq!(e.methods[0].name, "name");
+                assert_eq!(e.methods[0].visibility, Visibility::Public);
+                assert_eq!(e.methods[1].name, "isPrimary");
+                assert_eq!(e.methods[1].visibility, Visibility::Private);
+            }
+            other => panic!("expected Enum decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_public_method_in_inherent_impl_block() {
+        let src = "struct P { Int x }\nimpl P {
+            public function get(self) -> Int { self.x }
+            function helper(self) -> Int { self.x + 1 }
+        }";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[1] {
+            Declaration::Impl(i) => {
+                assert!(i.trait_name.is_none(), "expected inherent impl");
+                assert_eq!(i.methods.len(), 2);
+                assert_eq!(i.methods[0].name, "get");
+                assert_eq!(i.methods[0].visibility, Visibility::Public);
+                assert_eq!(i.methods[1].name, "helper");
+                assert_eq!(i.methods[1].visibility, Visibility::Private);
+            }
+            other => panic!("expected Impl decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn public_method_in_trait_impl_rejected() {
+        let src = "struct P { Int x }
+trait T { function f(self) -> Int }
+impl T for P {
+    public function f(self) -> Int { self.x }
+}";
+        let (_, diagnostics) = parse_source(src);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("trait `impl` block")),
+            "expected diagnostic about `public` in trait impl, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn public_method_in_inline_trait_impl_rejected() {
+        let src = "trait Greet { function hello(self) -> String }
+struct P { Int x
+    impl Greet {
+        public function hello(self) -> String { \"hi\" }
+    }
+}";
+        let (_, diagnostics) = parse_source(src);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("trait `impl` block")),
+            "expected diagnostic about `public` in inline trait impl, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn public_on_inline_impl_in_struct_body_rejected() {
+        // `public impl Trait { ... }` inside a struct body is not valid —
+        // inline trait impls do not carry visibility (the trait does).
+        let src = "trait T { function f(self) }
+struct P { Int x
+    public impl T { function f(self) {} }
+}";
+        let (_, diagnostics) = parse_source(src);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("`public` cannot precede inline `impl`")),
+            "expected diagnostic about `public impl`, got: {:?}",
+            diagnostics
         );
     }
 }

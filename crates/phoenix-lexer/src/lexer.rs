@@ -327,6 +327,9 @@ impl<'src> Lexer<'src> {
             "trait" => TokenKind::Trait,
             "dyn" => TokenKind::Dyn,
             "type" => TokenKind::Type,
+            "import" => TokenKind::Import,
+            "public" => TokenKind::Public,
+            "as" => TokenKind::As,
             "endpoint" => TokenKind::Endpoint,
             "body" => TokenKind::Body,
             "response" => TokenKind::Response,
@@ -1340,5 +1343,51 @@ mod tests {
     #[test]
     fn table_is_ident() {
         assert_eq!(token_kinds("table"), vec![Ident, Eof]);
+    }
+
+    // ── Module-system keyword tests ─────────────────────
+
+    #[test]
+    fn import_keyword() {
+        assert_eq!(token_kinds("import"), vec![Import, Eof]);
+    }
+
+    #[test]
+    fn public_keyword() {
+        assert_eq!(token_kinds("public"), vec![Public, Eof]);
+    }
+
+    #[test]
+    fn as_keyword() {
+        assert_eq!(token_kinds("as"), vec![As, Eof]);
+    }
+
+    #[test]
+    fn module_keywords_case_sensitive() {
+        // Capitalized variants should remain identifiers.
+        assert_eq!(token_kinds("Import"), vec![Ident, Eof]);
+        assert_eq!(token_kinds("Public"), vec![Ident, Eof]);
+        assert_eq!(token_kinds("As"), vec![Ident, Eof]);
+    }
+
+    #[test]
+    fn import_decl_tokens() {
+        // `import models.user { User as UserModel, createUser }`
+        let kinds = token_kinds("import models.user { User as UserModel, createUser }");
+        assert_eq!(
+            kinds,
+            vec![
+                Import, Ident, Dot, Ident, LBrace, Ident, As, Ident, Comma, Ident, RBrace, Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn import_wildcard_tokens() {
+        let kinds = token_kinds("import models.user { * }");
+        assert_eq!(
+            kinds,
+            vec![Import, Ident, Dot, Ident, LBrace, Star, RBrace, Eof]
+        );
     }
 }

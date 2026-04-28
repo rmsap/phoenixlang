@@ -28,6 +28,19 @@ impl Checker {
     /// registration; this helper keeps the first-allocated id and
     /// returns it on subsequent calls so the ill-formed program still
     /// has well-defined ids.
+    ///
+    /// **Cross-module caveat.** This map is keyed by the bare function
+    /// name, not by `(module, name)`. Two modules that both declare
+    /// `function helper()` therefore share the *same* `FuncId` —
+    /// which is unsafe under unrecovered cross-module collisions. Sema
+    /// guards against that by emitting a diagnostic in
+    /// [`Checker::detect_cross_module_collisions`](crate::checker::Checker::detect_cross_module_collisions)
+    /// and the registration pass refuses to overwrite the first
+    /// definition. If a future caller bypasses the diagnostic gate
+    /// (e.g. `--ir-only`), IR lowering will resolve the second
+    /// module's `helper` to the first module's body. Re-keying this
+    /// table by `module_qualify(...)` is the proper fix once cross-
+    /// module name resolution lands.
     pub(crate) fn function_id_for(&mut self, name: &str) -> FuncId {
         if let Some(id) = self.pending_function_ids.get(name) {
             return *id;
