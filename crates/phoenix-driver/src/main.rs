@@ -340,26 +340,30 @@ fn cmd_parse(path: &str) {
 pub(crate) fn parse_and_check(
     path: &str,
 ) -> (phoenix_parser::ast::Program, phoenix_sema::Analysis) {
-    let (_modules, program, analysis, _source_map) = parse_resolve_check(path);
-    (program, analysis)
+    let (modules, analysis, _source_map) = parse_resolve_check(path);
+    // `phoenix_modules::resolve` always returns at least the entry module
+    // and places it first; both invariants are load-bearing here.
+    debug_assert!(
+        !modules.is_empty() && modules[0].is_entry,
+        "parse_resolve_check returned modules without the entry first"
+    );
+    let entry_program = modules.into_iter().next().expect("entry module").program;
+    (entry_program, analysis)
 }
 
 /// Multi-module parse + resolve + type-check entry point.
 ///
 /// Returns the full resolver output (in deterministic topological order,
-/// entry first), the entry module's program (cloned for convenience —
-/// callers that don't need the multi-module shape can keep using
-/// [`parse_and_check`]), the project-wide semantic analysis, and the
-/// shared [`SourceMap`] so cross-module diagnostics resolve their own
+/// entry first), the project-wide semantic analysis, and the shared
+/// [`SourceMap`] so cross-module diagnostics resolve their own
 /// `SourceId`s. Exits the process on parse, resolve, or type errors.
-fn parse_resolve_check(
+///
+/// Callers that need the entry [`Program`] standalone use
+/// [`parse_and_check`], which extracts it from `modules[0]` without an
+/// extra clone.
+pub(crate) fn parse_resolve_check(
     path: &str,
-) -> (
-    Vec<ResolvedSourceModule>,
-    phoenix_parser::ast::Program,
-    phoenix_sema::Analysis,
-    SourceMap,
-) {
+) -> (Vec<ResolvedSourceModule>, phoenix_sema::Analysis, SourceMap) {
     let mut source_map = SourceMap::new();
     let modules = match phoenix_modules::resolve(std::path::Path::new(path), &mut source_map) {
         Ok(modules) => modules,
@@ -375,8 +379,7 @@ fn parse_resolve_check(
         process::exit(1);
     }
 
-    let entry_program = modules[0].program.clone();
-    (modules, entry_program, analysis, source_map)
+    (modules, analysis, source_map)
 }
 
 fn cmd_check(path: &str) {
@@ -386,8 +389,8 @@ fn cmd_check(path: &str) {
 
 /// Lower a Phoenix source file to IR and print the textual representation.
 fn cmd_ir(path: &str) {
-    let (program, check_result) = parse_and_check(path);
-    let ir_module = phoenix_ir::lower(&program, &check_result.module);
+    let (modules, check_result, _sm) = parse_resolve_check(path);
+    let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     // Run the IR verifier to catch structural errors.
     let errors = phoenix_ir::verify::verify(&ir_module);
@@ -402,6 +405,10 @@ fn cmd_ir(path: &str) {
 }
 
 fn cmd_run(path: &str) {
+    // The AST interpreter is single-module today, so this path feeds it
+    // only the entry program. `cmd_run_ir` (and `cmd_build`) take the
+    // full multi-module slice via `lower_modules`; the asymmetry is
+    // intentional until the AST interpreter learns to walk imports.
     let (program, check_result) = parse_and_check(path);
     if let Err(err) = interpreter::run(&program, check_result.module.lambda_captures) {
         eprintln!("runtime error: {}", err);
@@ -411,8 +418,8 @@ fn cmd_run(path: &str) {
 
 /// Run a Phoenix program via the IR interpreter.
 fn cmd_run_ir(path: &str) {
-    let (program, check_result) = parse_and_check(path);
-    let ir_module = phoenix_ir::lower(&program, &check_result.module);
+    let (modules, check_result, _sm) = parse_resolve_check(path);
+    let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
     if !errors.is_empty() {

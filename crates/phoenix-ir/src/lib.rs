@@ -53,5 +53,8 @@ mod tests;
 
 /// Lower a type-checked Phoenix program into an [`IrModule`].
 pub use lower::lower;
+/// Multi-module variant: lower a project consisting of a resolver-emitted
+/// list of modules into a single [`IrModule`].
+pub use lower::lower_modules;
 /// The top-level IR container for a compilation unit.
 pub use module::IrModule;

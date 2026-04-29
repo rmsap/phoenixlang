@@ -14,32 +14,42 @@ use phoenix_parser::ast::{
 
 impl<'a> LoweringContext<'a> {
     /// Pass 2: Lower all function bodies.
+    ///
+    /// All `function_index` / `method_index` lookups qualify the
+    /// bare AST name against `self.current_module` so a multi-module
+    /// build resolves each declaration to its mangled key (matching
+    /// sema's tables). Single-file callers leave `current_module`
+    /// at [`ModulePath::entry()`] and the qualification reduces to
+    /// the bare name — no behavior change.
     pub(crate) fn lower_function_bodies(&mut self, program: &Program) {
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(f) => {
-                    if let Some(&func_id) = self.module.function_index.get(&f.name) {
+                    let qname = self.qualify(&f.name);
+                    if let Some(&func_id) = self.module.function_index.get(qname.as_ref()) {
                         self.lower_function_body(func_id, &f.params, &f.body);
                     }
                 }
                 Declaration::Impl(imp) => {
+                    let qtype = self.qualify(&imp.type_name).into_owned();
                     for method in &imp.methods {
-                        let key = (imp.type_name.clone(), method.name.clone());
+                        let key = (qtype.clone(), method.name.clone());
                         if let Some(&func_id) = self.module.method_index.get(&key) {
                             self.lower_function_body(func_id, &method.params, &method.body);
                         }
                     }
                 }
                 Declaration::Struct(s) => {
+                    let qtype = self.qualify(&s.name).into_owned();
                     for method in &s.methods {
-                        let key = (s.name.clone(), method.name.clone());
+                        let key = (qtype.clone(), method.name.clone());
                         if let Some(&func_id) = self.module.method_index.get(&key) {
                             self.lower_function_body(func_id, &method.params, &method.body);
                         }
                     }
                     for trait_impl in &s.trait_impls {
                         for method in &trait_impl.methods {
-                            let key = (s.name.clone(), method.name.clone());
+                            let key = (qtype.clone(), method.name.clone());
                             if let Some(&func_id) = self.module.method_index.get(&key) {
                                 self.lower_function_body(func_id, &method.params, &method.body);
                             }
@@ -47,15 +57,16 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
                 Declaration::Enum(e) => {
+                    let qtype = self.qualify(&e.name).into_owned();
                     for method in &e.methods {
-                        let key = (e.name.clone(), method.name.clone());
+                        let key = (qtype.clone(), method.name.clone());
                         if let Some(&func_id) = self.module.method_index.get(&key) {
                             self.lower_function_body(func_id, &method.params, &method.body);
                         }
                     }
                     for trait_impl in &e.trait_impls {
                         for method in &trait_impl.methods {
-                            let key = (e.name.clone(), method.name.clone());
+                            let key = (qtype.clone(), method.name.clone());
                             if let Some(&func_id) = self.module.method_index.get(&key) {
                                 self.lower_function_body(func_id, &method.params, &method.body);
                             }

@@ -1,10 +1,15 @@
 //! Integration tests for IR lowering.
 
+use crate::instruction::Op;
 use crate::lower;
+use crate::lower::LoweringContext;
+use crate::lower_modules;
 use crate::types::{IrType, OPTION_ENUM, RESULT_ENUM};
 use crate::verify;
+use phoenix_common::module_path::ModulePath;
 use phoenix_common::span::SourceId;
 use phoenix_lexer::lexer::tokenize;
+use phoenix_modules::ResolvedSourceModule;
 use phoenix_parser::parser;
 use phoenix_sema::checker;
 
@@ -1782,5 +1787,185 @@ function main() {
     assert_eq!(
         alloc_inst.result_type,
         IrType::EnumRef("Box".to_string(), vec![IrType::I64]),
+    );
+}
+
+// ── Multi-module lowering ──────────────────────────────────────────────
+
+/// Build a `ResolvedSourceModule` from a raw source string.
+fn make_module(
+    module_path: ModulePath,
+    source: &str,
+    source_id: SourceId,
+    is_entry: bool,
+) -> ResolvedSourceModule {
+    use std::path::PathBuf;
+    let tokens = tokenize(source, source_id);
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    ResolvedSourceModule {
+        module_path,
+        source_id,
+        program,
+        is_entry,
+        file_path: PathBuf::from(format!("<test:{source_id:?}>")),
+    }
+}
+
+/// `lower_modules` registers a non-entry-module function under its
+/// module-qualified key in `function_index`, and pass 2's per-module
+/// `current_module` switch is what lets a within-module call site
+/// (`shout()` inside `lib::shout_twice`) resolve to the same qualified
+/// `lib::shout` key during body lowering. Without the switch the call
+/// site would `function_index.get("shout")` (bare), miss, and fall
+/// through to an indirect call.
+#[test]
+fn lower_modules_qualifies_non_entry_function() {
+    let entry = make_module(ModulePath::entry(), "function main() {}", SourceId(0), true);
+    let lib = make_module(
+        ModulePath(vec!["lib".to_string()]),
+        "public function shout() -> String { \"hi\" }\n\
+         public function shout_twice() -> String { shout() }\n\
+         public function answer() -> Int { 42 }",
+        SourceId(1),
+        false,
+    );
+
+    let modules = vec![entry, lib];
+    let analysis = checker::check_modules(&modules);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "sema errors: {:?}",
+        analysis
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    let ir_module = lower_modules(&modules, &analysis.module);
+
+    // Entry-module function keeps a bare key.
+    assert!(
+        ir_module.function_index.contains_key("main"),
+        "expected `main` under bare name; have: {:?}",
+        ir_module.function_index.keys().collect::<Vec<_>>()
+    );
+    // Non-entry function keys are module-qualified.
+    let shout_id = *ir_module
+        .function_index
+        .get("lib::shout")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected `lib::shout` in function_index; have: {:?}",
+                ir_module.function_index.keys().collect::<Vec<_>>()
+            )
+        });
+    let shout_twice_id = *ir_module
+        .function_index
+        .get("lib::shout_twice")
+        .expect("expected `lib::shout_twice` in function_index");
+    let answer_id = *ir_module
+        .function_index
+        .get("lib::answer")
+        .expect("expected `lib::answer` in function_index");
+
+    // Within-module call resolution: `shout_twice`'s body must contain a
+    // direct `Op::Call` targeting `lib::shout`'s FuncId. This is the
+    // teeth of the multi-module wiring — a registration-only stub or a
+    // wrong-target call would slip past `!blocks.is_empty()`.
+    let shout_twice = ir_module.lookup(shout_twice_id).expect("shout_twice slot");
+    let calls_shout = shout_twice
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|i| matches!(&i.op, Op::Call(target, _, _) if *target == shout_id));
+    assert!(
+        calls_shout,
+        "lib::shout_twice did not resolve `shout()` to FuncId {:?} — \
+         within-module qualification broke",
+        shout_id
+    );
+
+    // Both leaf functions also have to actually have a lowered body; an
+    // empty `blocks` Vec is the observable signature of "registration
+    // ran but body lowering's `function_index.get` missed."
+    let shout = ir_module.lookup(shout_id).expect("shout slot");
+    assert!(
+        !shout.blocks.is_empty(),
+        "lib::shout body was not lowered (empty blocks)"
+    );
+    let answer = ir_module.lookup(answer_id).expect("answer slot");
+    assert!(
+        !answer.blocks.is_empty(),
+        "lib::answer body was not lowered (empty blocks)"
+    );
+
+    // The whole module must verify — catches any structural breakage
+    // (missing terminators, dangling FuncIds) introduced by the
+    // multi-module path.
+    let errs = verify::verify(&ir_module);
+    assert!(
+        errs.is_empty(),
+        "verifier errors: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+/// `qualify_resolved` must pass through any name that already contains
+/// `::` (treating it as canonical) and qualify bare names against
+/// `current_module`. This is the contract the no-field enum-variant
+/// path in `phoenix_sema::check_expr::lower_ident` depends on — it
+/// produces a `Type::Named("lib::Color")` that body-lowering must not
+/// re-prefix to `lib::lib::Color` when looking up `method_index`.
+#[test]
+fn qualify_resolved_passes_through_already_qualified_names() {
+    // Any well-typed entry module gives us a `ResolvedModule` to back
+    // the `LoweringContext`; the fixture's contents don't matter here.
+    let entry = make_module(ModulePath::entry(), "function main() {}", SourceId(0), true);
+    let modules = vec![entry];
+    let analysis = checker::check_modules(&modules);
+    assert!(analysis.diagnostics.is_empty());
+
+    let mut ctx = LoweringContext::new(&analysis.module);
+    ctx.current_module = ModulePath(vec!["lib".to_string()]);
+
+    // Bare name → qualified against current module.
+    assert_eq!(ctx.qualify_resolved("Foo").as_ref(), "lib::Foo");
+    // Already-qualified name from `Type::Named` → pass through unchanged,
+    // even when the qualifier matches the current module.
+    assert_eq!(ctx.qualify_resolved("lib::Color").as_ref(), "lib::Color");
+    // Already-qualified name from a *different* module → also pass
+    // through; cross-module receivers are sema's job to resolve.
+    assert_eq!(ctx.qualify_resolved("other::Foo").as_ref(), "other::Foo");
+
+    // Same checks under entry — `qualify_resolved` reduces to identity
+    // for both branches, matching `module_qualify(&entry, name) == name`.
+    ctx.current_module = ModulePath::entry();
+    assert_eq!(ctx.qualify_resolved("Foo").as_ref(), "Foo");
+    assert_eq!(ctx.qualify_resolved("lib::Color").as_ref(), "lib::Color");
+}
+
+/// `lower_modules` on a single-element (entry-only) input must produce
+/// the same `function_index` shape as the single-file `lower` API. Pins
+/// the contract that `module_qualify(&entry, name) == name` keeps
+/// existing snapshot/IR tests stable as the driver is migrated to the
+/// multi-module path.
+#[test]
+fn lower_modules_single_entry_uses_bare_keys() {
+    let src = "function helper() -> Int { 42 }\n\
+               function main() -> Int { helper() }";
+    let entry = make_module(ModulePath::entry(), src, SourceId(0), true);
+    let modules = vec![entry];
+    let analysis = checker::check_modules(&modules);
+    assert!(analysis.diagnostics.is_empty());
+
+    let ir_module = lower_modules(&modules, &analysis.module);
+    assert!(ir_module.function_index.contains_key("helper"));
+    assert!(ir_module.function_index.contains_key("main"));
+    assert!(
+        !ir_module.function_index.keys().any(|k| k.contains("::")),
+        "entry-only lowering must not produce any qualified keys; have: {:?}",
+        ir_module.function_index.keys().collect::<Vec<_>>()
     );
 }

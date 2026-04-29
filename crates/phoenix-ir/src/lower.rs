@@ -15,10 +15,12 @@ use crate::instruction::{FuncId, Op, ValueId};
 use crate::module::{IrFunction, IrModule};
 use crate::terminator::Terminator;
 use crate::types::IrType;
+use phoenix_common::module_path::ModulePath;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::Program;
 use phoenix_sema::ResolvedModule;
 use phoenix_sema::types::Type;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Lower a type-checked Phoenix program into an IR module.
@@ -42,13 +44,66 @@ use std::collections::HashMap;
 /// `monomorphize` separately after `lower` — it is not idempotent and
 /// would attempt to re-specialize the already-specialized module.
 pub fn lower(program: &Program, check_result: &ResolvedModule) -> IrModule {
+    // `LoweringContext::new` initializes `current_module` to
+    // `ModulePath::entry()`, which keeps `module_qualify` a no-op for
+    // single-file callers (existing IR / snapshot tests).
     let mut ctx = LoweringContext::new(check_result);
     ctx.lower_program(program);
-    let mut module = ctx.module;
-    crate::monomorphize::monomorphize(&mut module);
-    #[cfg(debug_assertions)]
-    debug_assert_no_placeholder_funcs(&module);
-    module
+    ctx.finish()
+}
+
+/// Lower a multi-module Phoenix project into an IR module.
+///
+/// Equivalent to [`lower`] but walks every [`ResolvedSourceModule`]
+/// produced by the resolver, with `current_module` updated per module
+/// before each body-lowering pass so the IR's per-call-site name
+/// lookups consult the same module-qualified keys that sema produced.
+///
+/// On single-element inputs (the entry module only) the result is
+/// byte-identical to `lower(&modules[0].program, check_result)` — the
+/// entry module qualifies to bare names, single-file IR snapshots stay
+/// stable.
+///
+/// **Scope limitation.** Today this only wires per-module function-body
+/// lowering through `current_module`. User struct/enum *types* defined
+/// in a non-entry module still hit a separate "unknown named type in IR
+/// lowering" panic in [`lower_type`] when consumed via parameter or let
+/// bindings, because `ResolvedModule::struct_by_name`/`enum_by_name` are
+/// keyed by qualified names and the type-resolution path doesn't
+/// qualify yet. Multi-module fixtures should stick to built-in types in
+/// non-entry modules until that follow-on lands.
+pub fn lower_modules(
+    modules: &[phoenix_modules::ResolvedSourceModule],
+    check_result: &ResolvedModule,
+) -> IrModule {
+    // Public-API contract: `phoenix_modules::resolve` always returns the
+    // entry module, so a non-empty slice is the well-formed shape. Use
+    // an unconditional `assert!` (not `debug_assert!`) so a misuse from
+    // a release build still fails loudly instead of dereferencing into
+    // an empty slice.
+    assert!(
+        !modules.is_empty(),
+        "lower_modules requires at least one module (the entry)"
+    );
+    let mut ctx = LoweringContext::new(check_result);
+
+    // Pass 1 — registration. Drives off `ResolvedModule`'s id-indexed
+    // tables, so it does not need a per-module loop and does not read
+    // `current_module`. Run once.
+    ctx.register_builtin_enum_layouts();
+    ctx.register_declarations();
+
+    // Pass 2 — lower each module's function bodies with `current_module`
+    // set to that module's path. This is what lets bare-name lookups
+    // inside body-lowering (`function_index.get(&name)`,
+    // `method_index.get((&type, &method))`) qualify against the right
+    // module before probing the sema-mangled tables.
+    for module in modules {
+        ctx.current_module = module.module_path.clone();
+        ctx.lower_function_bodies(&module.program);
+    }
+
+    ctx.finish()
 }
 
 /// Verify that no `IrFunction` retains the `FuncId(u32::MAX)`
@@ -198,6 +253,13 @@ pub(crate) struct LoweringContext<'a> {
     pub(crate) check: &'a ResolvedModule,
     /// The module being built.
     pub(crate) module: IrModule,
+    /// The Phoenix module whose body is being lowered right now. Used by
+    /// body-lowering passes to translate user-source bare names into
+    /// the qualified keys that `IrModule::function_index` and
+    /// `method_index` are stored under (matching sema's mangling).
+    /// Defaults to [`ModulePath::entry()`]; `lower_modules` updates it
+    /// per-module before each body-lowering call.
+    pub(crate) current_module: ModulePath,
 
     // --- Per-function state (reset when entering a new function) ---
     /// The function currently being lowered.
@@ -214,16 +276,66 @@ pub(crate) struct LoweringContext<'a> {
 
 impl<'a> LoweringContext<'a> {
     /// Creates a new lowering context.
-    fn new(check: &'a ResolvedModule) -> Self {
+    pub(crate) fn new(check: &'a ResolvedModule) -> Self {
         Self {
             check,
             module: IrModule::new(),
+            current_module: ModulePath::entry(),
             current_func_id: None,
             current_block: None,
             var_scopes: Vec::new(),
             loop_stack: Vec::new(),
             closure_counter: 0,
         }
+    }
+
+    /// Qualify a bare user-source name against the current module for
+    /// table lookups. Single source of truth for the IR layer's
+    /// mangling — mirrors `phoenix_common::module_path::module_qualify`
+    /// so sema and IR tables stay in lockstep.
+    ///
+    /// Returns `Cow::Borrowed` for entry/builtin modules (the common
+    /// single-file case) so the per-call-site lookup in body lowering
+    /// stays allocation-free; falls back to an owned `String` only when
+    /// a real prefix has to be produced.
+    pub(crate) fn qualify<'n>(&self, name: &'n str) -> Cow<'n, str> {
+        if self.current_module.is_entry() || self.current_module.is_builtin() {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(format!("{}::{}", self.current_module.dotted(), name))
+        }
+    }
+
+    /// Like [`Self::qualify`] but accepts a name that may already be
+    /// sema-qualified. Names containing `::` are treated as canonical
+    /// and returned unchanged; bare names are qualified against the
+    /// current module.
+    ///
+    /// Use this for names sourced from sema's `Type` (e.g. `Type::Named`),
+    /// which is inconsistent today: most paths produce bare names, but
+    /// the no-field enum variant lookup in
+    /// `phoenix_sema::check_expr::lower_ident` iterates the qualified-
+    /// keyed `enums` table and produces `Type::Named("lib::Color")`. A
+    /// blind `qualify` would re-qualify and miss the `method_index`
+    /// slot.
+    pub(crate) fn qualify_resolved<'n>(&self, name: &'n str) -> Cow<'n, str> {
+        if name.contains("::") {
+            Cow::Borrowed(name)
+        } else {
+            self.qualify(name)
+        }
+    }
+
+    /// Run monomorphization and the post-lowering invariant check, then
+    /// surrender the [`IrModule`]. Shared finishing step between
+    /// [`lower`] (single-file) and [`lower_modules`] (multi-module) so
+    /// the two entry points cannot drift on what "done lowering" means.
+    fn finish(self) -> IrModule {
+        let mut module = self.module;
+        crate::monomorphize::monomorphize(&mut module);
+        #[cfg(debug_assertions)]
+        debug_assert_no_placeholder_funcs(&module);
+        module
     }
 
     /// Orchestrates the full lowering of a program.

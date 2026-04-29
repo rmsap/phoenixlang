@@ -493,8 +493,10 @@ impl<'a> LoweringContext<'a> {
                 _ => {}
             }
 
-            // Check for a known function.
-            if let Some(&func_id) = self.module.function_index.get(&ident.name) {
+            // Qualify the bare AST name against `current_module` to match
+            // sema's mangled `function_index` keys.
+            let qname = self.qualify(&ident.name);
+            if let Some(&func_id) = self.module.function_index.get(qname.as_ref()) {
                 let result_type = self.expr_type(&call.span);
                 let args = self.merge_call_args(func_id, &positional, &named, call.span);
                 let args = self.coerce_call_args(func_id, args, call.span);
@@ -887,8 +889,14 @@ impl<'a> LoweringContext<'a> {
             _ => String::new(),
         };
 
-        // User-defined method on a concrete type.
-        let key = (type_name.clone(), mc.method.clone());
+        // User-defined method on a concrete type. Qualify the receiver
+        // against `current_module` to match sema's `method_index` keys
+        // (`qualify_resolved` is a no-op when sema already emitted a
+        // qualified `Type::Named` — see its doc).
+        let key = (
+            self.qualify_resolved(&type_name).into_owned(),
+            mc.method.clone(),
+        );
         if let Some(&func_id) = self.module.method_index.get(&key) {
             return self.lower_user_method_call(func_id, &type_name, mc, obj, args, span);
         }
