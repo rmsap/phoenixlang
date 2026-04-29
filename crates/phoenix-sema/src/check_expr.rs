@@ -143,9 +143,10 @@ impl Checker {
         let obj_type = self.check_expr(&fa.object);
         let (type_name, bindings) = self.extract_type_name_and_bindings(&obj_type);
         if let Some(ref tn) = type_name
-            && let Some(struct_info) = self.structs.get(tn).cloned()
+            && let Some(struct_info) = self.lookup_struct(tn).cloned()
         {
             if let Some(field) = struct_info.fields.iter().find(|f| f.name == fa.field) {
+                self.enforce_cross_module_field_write_privacy(&struct_info, tn, field, fa.span);
                 let resolved = Self::substitute(&field.ty, &bindings);
                 if !value_type.is_error()
                     && !resolved.is_error()
@@ -178,13 +179,19 @@ impl Checker {
 
     /// Type-checks a field access (`obj.field`), verifying the field exists on
     /// the struct and returning the field's type (with generic substitution).
+    ///
+    /// Also enforces cross-module field visibility: a `Private` field on a
+    /// struct from another (non-builtin) module is an error, with a rich
+    /// diagnostic that points at the field's declaration and suggests
+    /// marking it `public`.
     fn check_field_access(&mut self, fa: &FieldAccessExpr) -> Type {
         let obj_type = self.check_expr(&fa.object);
         let (type_name, bindings) = self.extract_type_name_and_bindings(&obj_type);
         if let Some(ref tn) = type_name
-            && let Some(struct_info) = self.structs.get(tn).cloned()
+            && let Some(struct_info) = self.lookup_struct(tn).cloned()
         {
             if let Some(field) = struct_info.fields.iter().find(|f| f.name == fa.field) {
+                self.enforce_cross_module_field_read_privacy(&struct_info, tn, field, fa.span);
                 let result = Self::substitute(&field.ty, &bindings);
                 self.record_reference(
                     fa.span,
@@ -409,7 +416,7 @@ impl Checker {
                 Pattern::Variant(vp) => {
                     // Find the enum and variant to get field types
                     if let Some(ref enum_name) = base_name
-                        && let Some(enum_info) = self.enums.get(enum_name).cloned()
+                        && let Some(enum_info) = self.lookup_enum(enum_name).cloned()
                         && let Some((_, variant_types)) =
                             enum_info.variants.iter().find(|(n, _)| n == &vp.variant)
                     {
@@ -588,7 +595,7 @@ impl Checker {
             Some(name) => name,
             None => return,
         };
-        let enum_info = match self.enums.get(enum_name).cloned() {
+        let enum_info = match self.lookup_enum(enum_name).cloned() {
             Some(info) => info,
             None => return,
         };

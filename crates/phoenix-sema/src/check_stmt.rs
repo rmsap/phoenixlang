@@ -101,8 +101,9 @@ impl Checker {
                 type_name,
                 field_names,
             } => {
-                // Look up the struct definition
-                let struct_info = self.structs.get(type_name).cloned();
+                // Look up the struct definition through the module scope
+                // so the right module's struct is resolved.
+                let struct_info = self.lookup_struct(type_name).cloned();
                 if let Some(info) = struct_info {
                     // Verify the initializer type is compatible with the struct type
                     let expected_type = Type::Named(type_name.clone());

@@ -21,8 +21,13 @@ mod check_types;
 pub mod checker;
 #[cfg(test)]
 mod checker_tests;
+mod field_privacy;
 mod id_alloc;
+mod impl_classify;
+mod import_resolve;
+mod module_scope;
 mod object_safety;
+mod orphan;
 /// The post-sema handoff type [`ResolvedModule`](resolved::ResolvedModule).
 pub mod resolved;
 /// Lexical scope stack for variable name resolution.

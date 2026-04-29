@@ -88,10 +88,43 @@ impl<'a> LoweringContext<'a> {
             self.register_method_from_info(type_name, method_name, func_id, info);
         }
 
+        // Orphan-method slots: sema's `user_methods` Vec includes
+        // entries for methods whose parent decl was rejected
+        // (within-module duplicates, coherence-violating impls). Their
+        // FuncIds were pre-allocated and the slots are filled in
+        // `ResolvedModule::user_methods` (so sema's invariants hold),
+        // but they have no entry in `method_index` and are therefore
+        // skipped by `user_methods_with_names()` above. They still
+        // occupy `IrModule::functions` slots that the sentinel-fill
+        // sized for; install a no-op placeholder at each remaining
+        // slot so the post-registration invariant ("every FuncId slot
+        // is filled") holds. The placeholder is unreachable: nothing
+        // in `function_index` / `method_index` resolves to it, and
+        // body lowering doesn't iterate by id. The driver
+        // short-circuits on diagnostics before IR runs in the normal
+        // path, so this only matters when IR is invoked on a sema
+        // result that produced orphans (e.g. tooling that bypasses
+        // the diagnostic gate).
+        let mut placeholder_fills: u32 = 0;
+        for (i, slot) in self.module.functions.iter_mut().enumerate() {
+            if slot.func().id.0 == u32::MAX {
+                *slot = crate::module::FunctionSlot::Concrete(IrFunction::new(
+                    FuncId(i as u32),
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    IrType::Void,
+                    None,
+                ));
+                placeholder_fills += 1;
+            }
+        }
+
         // Sanity-check: every slot we sized for must have been
-        // filled.  An unfilled `FuncId(u32::MAX)` slot indicates a
-        // pre-allocated id with no matching ResolvedModule entry —
-        // either a sema bug or a divergence between
+        // filled.  An unfilled `FuncId(u32::MAX)` slot would indicate a
+        // pre-allocated id with no matching ResolvedModule entry *and*
+        // no orphan-fill placeholder — either a sema bug or a
+        // divergence between
         // `pending_function_ids.len() + pending_user_method_ids.len()`
         // and the populated `functions` / `user_methods` Vec lengths.
         debug_assert!(
@@ -102,6 +135,17 @@ impl<'a> LoweringContext<'a> {
             "register_declarations left an unfilled FuncId slot — \
              ResolvedModule's functions/user_methods Vec did not cover \
              every pre-allocated id"
+        );
+        // The number of placeholder fills must equal the orphan-method
+        // count sema reported. A mismatch means either the orphan-fill
+        // pass missed a slot (named registration left an unexpected
+        // hole) or it filled extras (named registration didn't cover
+        // every named slot). Both are sema-IR shape divergences.
+        debug_assert_eq!(
+            placeholder_fills, self.check.orphan_method_count,
+            "orphan-fill placeholder count ({placeholder_fills}) disagrees with \
+             ResolvedModule.orphan_method_count ({})",
+            self.check.orphan_method_count
         );
     }
 

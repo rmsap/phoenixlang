@@ -158,7 +158,7 @@ impl Checker {
             }
         };
 
-        let struct_info = match self.structs.get(&base_name) {
+        let struct_info = match self.lookup_struct(&base_name) {
             Some(info) => info,
             None => {
                 self.error(

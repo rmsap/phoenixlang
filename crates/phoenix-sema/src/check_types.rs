@@ -107,9 +107,7 @@ impl Checker {
     /// not for error propagation.
     fn concrete_type_impls_trait(&self, concrete: &Type, trait_name: &str) -> bool {
         match concrete {
-            Type::Named(n) | Type::Generic(n, _) => self
-                .trait_impls
-                .contains(&(n.clone(), trait_name.to_string())),
+            Type::Named(n) | Type::Generic(n, _) => self.has_trait_impl(n, trait_name),
             Type::TypeVar(name) => self
                 .current_type_param_bounds
                 .iter()
@@ -128,7 +126,7 @@ impl Checker {
                     return Type::TypeVar(named.name.clone());
                 }
                 // Check if it's a type alias
-                if let Some(alias_info) = self.type_aliases.get(&named.name).cloned() {
+                if let Some(alias_info) = self.lookup_type_alias(&named.name).cloned() {
                     if alias_info.type_params.is_empty() {
                         return alias_info.target;
                     }
@@ -144,7 +142,7 @@ impl Checker {
                 }
                 let ty = Type::from_name(&named.name);
                 if let Type::Named(ref name) = ty {
-                    if self.structs.contains_key(name) || self.enums.contains_key(name) {
+                    if self.lookup_struct(name).is_some() || self.lookup_enum(name).is_some() {
                         return ty;
                     }
                     if name == "Self" {
@@ -172,7 +170,7 @@ impl Checker {
                     .map(|t| self.resolve_type_expr(t))
                     .collect();
                 // Check if it's a generic type alias (e.g. `StringResult<Int>`)
-                if let Some(alias_info) = self.type_aliases.get(&gt.name)
+                if let Some(alias_info) = self.lookup_type_alias(&gt.name)
                     && !alias_info.type_params.is_empty()
                 {
                     let mut bindings = HashMap::new();
@@ -188,7 +186,7 @@ impl Checker {
                     return Type::Generic(gt.name.clone(), type_args);
                 }
                 // Verify the base type exists and type argument count matches
-                if let Some(si) = self.structs.get(&gt.name) {
+                if let Some(si) = self.lookup_struct(&gt.name) {
                     let expected = si.type_params.len();
                     if type_args.len() != expected {
                         self.error(
@@ -201,7 +199,7 @@ impl Checker {
                             gt.span,
                         );
                     }
-                } else if let Some(ei) = self.enums.get(&gt.name) {
+                } else if let Some(ei) = self.lookup_enum(&gt.name) {
                     let expected = ei.type_params.len();
                     if type_args.len() != expected {
                         self.error(
@@ -221,7 +219,7 @@ impl Checker {
                 Type::Generic(gt.name.clone(), type_args)
             }
             TypeExpr::Dyn(dt) => {
-                let Some(trait_info) = self.traits.get(&dt.trait_name) else {
+                let Some(trait_info) = self.lookup_trait(&dt.trait_name) else {
                     self.error(
                         format!("unknown trait `{}` in `dyn`", dt.trait_name),
                         dt.span,
@@ -422,14 +420,14 @@ impl Checker {
                     if args.len() >= 2 {
                         bindings.insert("V".to_string(), args[1].clone());
                     }
-                } else if let Some(si) = self.structs.get(name) {
+                } else if let Some(si) = self.lookup_struct(name) {
                     // Look up the type params from the struct or enum
                     for (i, param) in si.type_params.iter().enumerate() {
                         if i < args.len() {
                             bindings.insert(param.clone(), args[i].clone());
                         }
                     }
-                } else if let Some(ei) = self.enums.get(name) {
+                } else if let Some(ei) = self.lookup_enum(name) {
                     for (i, param) in ei.type_params.iter().enumerate() {
                         if i < args.len() {
                             bindings.insert(param.clone(), args[i].clone());

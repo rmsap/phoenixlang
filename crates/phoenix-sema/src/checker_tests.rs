@@ -341,20 +341,18 @@ fn generic_struct_valid() {
 }
 
 /// A generic enum with a value-carrying variant type-checks correctly.
+/// Uses the builtin `Option<T>` because user code cannot redeclare it
+/// (builtin names are reserved).
 #[test]
 fn generic_enum_option() {
-    assert_no_errors(
-        "enum Option<T> {\n  Some(T)\n  None\n}\nfunction main() { let x: Option<Int> = Some(42) }",
-    );
+    assert_no_errors("function main() { let x: Option<Int> = Some(42) }");
 }
 
 /// The `None` variant of a generic enum is compatible with any concrete
 /// instantiation because its type arguments remain as type variables.
 #[test]
 fn generic_enum_none_compatible() {
-    assert_no_errors(
-        "enum Option<T> {\n  Some(T)\n  None\n}\nfunction main() { let x: Option<Int> = None }",
-    );
+    assert_no_errors("function main() { let x: Option<Int> = None }");
 }
 
 /// Assigning the result of a generic function to the wrong concrete type
@@ -503,12 +501,14 @@ fn generic_wrong_type_arg_count() {
     );
 }
 
-/// A generic higher-order function `unwrapOr` that takes an `Option<T>`
-/// and a default `T` value type-checks correctly.
+/// A generic higher-order function that takes a builtin `Option<T>`
+/// and a default `T` value type-checks correctly. Renamed from
+/// `unwrapOr` to `defaultedUnwrap` to avoid colliding with the
+/// builtin's `unwrapOr` method.
 #[test]
 fn generic_unwrap_or() {
     assert_no_errors(
-        "enum Option<T> {\n  Some(T)\n  None\n}\nfunction unwrapOr<T>(opt: Option<T>, defaultVal: T) -> T {\n  return match opt {\n    Some(v) -> v\n    None -> defaultVal\n  }\n}\nfunction main() {\n  let x: Option<Int> = Some(42)\n  let result: Int = unwrapOr(x, 0)\n}",
+        "function defaultedUnwrap<T>(opt: Option<T>, defaultVal: T) -> T {\n  return match opt {\n    Some(v) -> v\n    None -> defaultVal\n  }\n}\nfunction main() {\n  let x: Option<Int> = Some(42)\n  let result: Int = defaultedUnwrap(x, 0)\n}",
     );
 }
 

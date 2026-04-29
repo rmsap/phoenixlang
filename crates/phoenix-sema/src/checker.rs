@@ -3,7 +3,7 @@ use crate::scope::{ScopeStack, VarInfo};
 use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::ids::FuncId;
-use phoenix_common::module_path::ModulePath;
+use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     Block, CaptureInfo, Declaration, ElseBranch, Expr, FunctionDecl, IfExpr, ImplBlock,
@@ -388,6 +388,25 @@ pub struct Checker {
     pub(crate) structs: HashMap<String, StructInfo>,
     pub(crate) enums: HashMap<String, EnumInfo>,
     pub(crate) methods: HashMap<String, HashMap<String, MethodInfo>>, // type_name -> method_name -> info
+    /// Methods belonging to *rejected* parent decls — within-module
+    /// duplicate types and coherence-violating impls. Keyed by
+    /// `(qualified_receiver_type, parent_span)` so the entry derived
+    /// from the rejected AST node never collides with the surviving
+    /// methods table. Drained alongside `methods` by the resolved-
+    /// module builder so the pre-allocated FuncIds for these methods
+    /// fill `user_methods` slots and the resolved-module assembly
+    /// invariant ("every pre-allocated FuncId is filled") holds.
+    pub(crate) orphan_methods: HashMap<(String, Span), HashMap<String, MethodInfo>>,
+    /// Cache of every FuncId already filled by a successful insert
+    /// into `methods` or `orphan_methods`. Maintained incrementally so
+    /// the orphan path can probe it in O(1) instead of re-walking
+    /// every methods entry on each rejection. The orphan path needs
+    /// this guard because `pre_allocate_user_method_ids` deduplicates
+    /// FuncIds by `(qualified_type, method_name)` — a duplicate's
+    /// inline method that shares its name with the survivor's gets
+    /// the same FuncId, and `resolved::build_user_and_builtin_methods`
+    /// panics if two slots try to claim it.
+    pub(crate) filled_method_func_ids: HashSet<FuncId>,
     /// Registered trait declarations.
     pub(crate) traits: HashMap<String, TraitInfo>,
     /// Set of (type_name, trait_name) pairs recording which types implement which traits.
@@ -426,17 +445,42 @@ pub struct Checker {
     /// after free-function id allocation completes and reflected onto
     /// [`ResolvedModule::user_method_offset`].
     pub(crate) user_method_offset: u32,
-    /// Pre-allocated FuncIds for free functions, keyed by name.
+    /// Pre-allocated FuncIds for free functions, keyed by the
+    /// module-qualified function name (`module_qualify(def_module, name)`).
     /// Populated by [`Self::pre_allocate_function_ids`] before
     /// registration so [`crate::check_register::Checker::register_function`]
     /// can stamp each `FunctionInfo` with the id IR will adopt.
     pub(crate) pending_function_ids: HashMap<String, FuncId>,
     /// Pre-allocated FuncIds for user methods, keyed by
-    /// `(type_name, method_name)`.  Populated by
-    /// [`Self::pre_allocate_user_method_ids`] before registration so
-    /// that [`crate::check_register::Checker::register_impl`] can
-    /// stamp each `MethodInfo` with the id IR will see.
+    /// `(qualified_type_name, method_name)` — i.e. the receiver type
+    /// is `module_qualify`-mangled, the method name is bare relative to
+    /// its receiver. Populated by [`Self::pre_allocate_user_method_ids`]
+    /// before registration so that
+    /// [`crate::check_register::Checker::register_impl`] can stamp each
+    /// `MethodInfo` with the id IR will see.
     pub(crate) pending_user_method_ids: HashMap<(String, String), FuncId>,
+    /// Per-module visibility scopes (`local_name → qualified_key in the
+    /// global symbol tables`). Built in two phases by
+    /// [`Self::check_modules_inner`] (Phase A: own decls + builtins;
+    /// Phase B: imports, AST-based) and by [`Self::check_program`] for
+    /// the single-file path (Phase A only — single-file inputs reject
+    /// `import` declarations up front, so Phase B has no work).
+    /// Always populated for `current_module` after `check_program` or
+    /// `check_modules_inner` returns.
+    ///
+    /// Consumed by the lookup helpers (`lookup_function`,
+    /// `lookup_struct`, …) to translate a user-source name into its
+    /// module-qualified table key. See
+    /// [`crate::module_scope::ModuleScope`].
+    pub(crate) module_scopes: HashMap<ModulePath, crate::module_scope::ModuleScope>,
+    /// Bare names of every builtin currently registered in the symbol
+    /// tables. Captured once after [`crate::check_register::Checker::register_builtins`]
+    /// (via [`Self::snapshot_builtin_names`]) so per-module scope
+    /// construction can extend each module's `visible_symbols` cheaply
+    /// instead of rescanning all six tables per module. `HashSet`
+    /// keeps `is_builtin_name` O(1) — every register_* path consults
+    /// it once per declaration name.
+    pub(crate) builtin_local_names: std::collections::HashSet<String>,
     /// Module being checked right now. Set by `check_modules` before
     /// each per-module pass; defaults to [`ModulePath::entry()`] for
     /// the single-file `check` path. Read by `register_*` to stamp
@@ -459,6 +503,8 @@ impl Checker {
             structs: HashMap::new(),
             enums: HashMap::new(),
             methods: HashMap::new(),
+            orphan_methods: HashMap::new(),
+            filled_method_func_ids: HashSet::new(),
             traits: HashMap::new(),
             trait_impls: HashSet::new(),
             type_aliases: HashMap::new(),
@@ -478,6 +524,8 @@ impl Checker {
             pending_function_ids: HashMap::new(),
             pending_user_method_ids: HashMap::new(),
             current_module: ModulePath::entry(),
+            module_scopes: HashMap::new(),
+            builtin_local_names: std::collections::HashSet::new(),
         }
     }
 
@@ -508,11 +556,35 @@ impl Checker {
     /// available without explicit declaration.
     pub fn check_program(&mut self, program: &Program) {
         self.register_builtins();
+        self.snapshot_builtin_names();
 
         // Single-file input is the one-module case of `check_modules_inner`
         // with `current_module = entry`.  Route through the same helpers so
         // single-file and multi-module behavior cannot drift.
         self.current_module = ModulePath::entry();
+
+        // Build the entry module's Phase-A scope before any registration
+        // so `resolve_type_expr` (called from `register_*`) can route
+        // type/trait/alias lookups through the scope from the start.
+        self.build_one_module_scope_phase_a(&self.current_module.clone(), program);
+
+        // Single-file inputs have no other modules to import from, so
+        // any `import` declaration here is a programmer error. Phase B
+        // doesn't run on this path (there are no modules to resolve
+        // against), so emit a diagnostic up front rather than letting
+        // imports be silently ignored and producing confusing
+        // "undefined function" diagnostics downstream.
+        for decl in &program.declarations {
+            if let Declaration::Import(imp) = decl {
+                self.error(
+                    "`import` is only valid in multi-module compilation; \
+                     this input is being checked as a single file"
+                        .to_string(),
+                    imp.span,
+                );
+            }
+        }
+
         self.pre_register_type_names(program);
 
         self.pre_allocate_function_ids(program);
@@ -530,18 +602,12 @@ impl Checker {
     /// `current_module` set per-module so each declaration is registered
     /// with the right `def_module`.
     ///
-    /// Symbol tables are still keyed by bare name today (cross-module
-    /// name resolution lands in a follow-up). Cross-module collisions
-    /// would silently corrupt the tables, so:
-    ///   1. [`Self::detect_cross_module_collisions`] runs first and emits
-    ///      a diagnostic for every conflicting name.
-    ///   2. The registration helpers use first-write-wins semantics
-    ///      (`HashMap::entry().or_insert(...)`), so a colliding second
-    ///      occurrence cannot overwrite the first definition.
-    ///
-    /// Together these ensure the symbol tables always reflect the
-    /// first-declared definition of any name; the user sees a clear
-    /// collision error rather than confusing downstream type mismatches.
+    /// Symbol tables are keyed by `module_qualify(&def_module, &name)`,
+    /// so two modules can both declare e.g. `function helper()` and the
+    /// registrations land under distinct keys (`helper` and
+    /// `models.user::helper`). Cross-module collision detection is
+    /// therefore unnecessary; within-module duplicates remain caught
+    /// by the registration helpers.
     pub(crate) fn check_modules_inner(
         &mut self,
         modules: &[phoenix_modules::ResolvedSourceModule],
@@ -568,11 +634,27 @@ impl Checker {
             }
         }
 
-        self.detect_cross_module_collisions(modules);
-
         self.register_builtins();
+        self.snapshot_builtin_names();
+
+        // Both phases of module-scope construction run *before*
+        // registration so that `resolve_type_expr` (invoked from each
+        // `register_*`) can route lookups through the per-module scope
+        // from the start, including imported names. Phase A inserts
+        // own-module decls + builtins into each scope; Phase B walks
+        // each `import` against the *target module's AST* (not the
+        // registered tables — visibility lives on the parser-level
+        // decl, so Phase B doesn't need registration to have run).
+        self.build_module_scopes_phase_a(modules);
+        self.build_module_scopes_phase_b(modules);
 
         // Pass 0: pre-register all type names across every module.
+        // Type/struct/enum/trait placeholders make signatures during
+        // registration able to resolve forward and across-module
+        // references. Type aliases are *not* pre-registered (their
+        // `target` resolution itself depends on other types being
+        // resolved); imported type aliases used in registration-time
+        // positions remain a known limitation.
         self.for_each_module(modules, |this, prog| this.pre_register_type_names(prog));
 
         // Pre-pass A + B: allocate FuncIds across every module, in
@@ -632,38 +714,63 @@ impl Checker {
 
     /// Pass 0: pre-register struct/enum names with empty fields/variants
     /// so that self-referential types (e.g.
-    /// `enum IntList { Cons(Int, IntList), Nil }`) can reference
-    /// themselves during field/variant type resolution.
+    /// `enum IntList { Cons(Int, IntList), Nil }`), forward references
+    /// within a module, and *imported* struct/enum types used in
+    /// registration-time positions (parameter types, return types) all
+    /// resolve correctly.
     ///
-    /// First-write-wins on duplicate names: cross-module collisions are
-    /// already diagnosed by [`Self::detect_cross_module_collisions`] (and
-    /// in-module duplicate types are caught in the registration pass), so
-    /// the second occurrence must not silently overwrite the first
-    /// definition in the symbol table.
+    /// Traits and type aliases are intentionally *not* pre-registered.
+    /// A trait placeholder would have `object_safety_error: None`, so
+    /// `dyn ImportedTrait` in a signature would silently accept even
+    /// non-object-safe traits when the use-site is registered before
+    /// the trait's full registration. A type-alias placeholder would
+    /// need a resolved `target: Type`, which itself depends on other
+    /// names being resolvable. Both are known limitations: imported
+    /// `dyn ImportedTrait` and imported type-alias use in
+    /// registration-time positions still fail with `unknown trait` /
+    /// `unknown type` (mirroring the existing same-module forward-
+    /// reference behavior). Trait *bounds* (`<T: ImportedTrait>`) work
+    /// because they store the name as a string without a lookup.
+    ///
+    /// Cross-module collisions are impossible — placeholders are keyed
+    /// by `module_qualify(def_module, name)`, so two modules can both
+    /// declare `struct Foo`. Within-module duplicates are caught in the
+    /// registration pass via `is_within_module_duplicate`; the
+    /// `or_insert_with` here keeps the first AST node's span so that
+    /// the later span-equality check classifies subsequent decls as
+    /// duplicates.
     fn pre_register_type_names(&mut self, program: &Program) {
         for decl in &program.declarations {
             match decl {
                 Declaration::Struct(s) => {
-                    self.structs
-                        .entry(s.name.clone())
-                        .or_insert_with(|| StructInfo {
-                            definition_span: s.name_span,
-                            type_params: s.type_params.clone(),
-                            fields: Vec::new(),
-                            visibility: s.visibility,
-                            def_module: self.current_module.clone(),
-                        });
+                    // Builtin-named decls are rejected by
+                    // `register_struct`; skip the placeholder so a
+                    // stale half-registered slot doesn't leak into
+                    // `build_structs`'s resolved output.
+                    if self.is_builtin_name(&s.name) {
+                        continue;
+                    }
+                    let qualified = module_qualify(&self.current_module, &s.name);
+                    self.structs.entry(qualified).or_insert_with(|| StructInfo {
+                        definition_span: s.name_span,
+                        type_params: s.type_params.clone(),
+                        fields: Vec::new(),
+                        visibility: s.visibility,
+                        def_module: self.current_module.clone(),
+                    });
                 }
                 Declaration::Enum(e) => {
-                    self.enums
-                        .entry(e.name.clone())
-                        .or_insert_with(|| EnumInfo {
-                            definition_span: e.name_span,
-                            type_params: e.type_params.clone(),
-                            variants: Vec::new(),
-                            visibility: e.visibility,
-                            def_module: self.current_module.clone(),
-                        });
+                    if self.is_builtin_name(&e.name) {
+                        continue;
+                    }
+                    let qualified = module_qualify(&self.current_module, &e.name);
+                    self.enums.entry(qualified).or_insert_with(|| EnumInfo {
+                        definition_span: e.name_span,
+                        type_params: e.type_params.clone(),
+                        variants: Vec::new(),
+                        visibility: e.visibility,
+                        def_module: self.current_module.clone(),
+                    });
                 }
                 _ => {}
             }
@@ -683,11 +790,12 @@ impl Checker {
                 Declaration::Impl(imp) => self.register_impl(imp),
                 Declaration::Trait(t) => self.register_trait(t),
                 Declaration::TypeAlias(ta) => self.register_type_alias(ta),
-                Declaration::Endpoint(ep) => self.check_endpoint(ep),
-                // Schemas are parse-only; imports are not yet wired into
-                // name resolution (the resolver crate handles discovery,
-                // but bringing imported names into scope is a follow-up).
-                Declaration::Schema(_) | Declaration::Import(_) => {}
+                // Endpoints are checked in the body-check pass — see
+                // "Endpoints are checked in the body-check pass" in
+                // docs/design-decisions.md for the rationale. Schemas
+                // are parse-only; imports were already processed by
+                // `build_module_scopes_phase_b` before this pass.
+                Declaration::Endpoint(_) | Declaration::Schema(_) | Declaration::Import(_) => {}
             }
         }
     }
@@ -695,122 +803,132 @@ impl Checker {
     /// Second pass over a single module's declarations: type-check each
     /// function and method body.
     ///
-    /// Skips bodies whose registered `*Info` is owned by a different
-    /// module (i.e. the registration pass dropped this declaration via
-    /// the cross-module first-write-wins rule). Body-checking such a
-    /// declaration would resolve its name to a *different* module's
-    /// signature and produce a cascade of misleading follow-on errors;
-    /// the cross-module collision diagnostic is enough on its own.
+    /// Per-module name mangling guarantees no cross-module key
+    /// collisions, but two functions *within the same module* with the
+    /// same name still collide on the qualified key. The registration
+    /// pass keeps the first one (and emits an "is already defined"
+    /// diagnostic for the second via `register_function`). Body-checking
+    /// the second AST node would resolve names against the *first*
+    /// decl's signature and produce a cascade of misleading follow-on
+    /// errors, so we skip any function AST node whose registered
+    /// `FunctionInfo.definition_span` doesn't match — that span
+    /// identifies the surviving decl.
     fn check_decl_bodies(&mut self, program: &Program) {
+        // Surviving-decl pattern: the registration pass keeps the first
+        // AST node for any name that collides within a module, and emits
+        // a diagnostic for each later one. We compare each AST node's
+        // `name_span` against the registered `definition_span`; only the
+        // surviving (first-registered) AST node body-checks. For `impl`
+        // blocks the rule is structural rather than name-based — see
+        // [`Self::is_surviving_impl`].
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(func) => {
-                    if self.is_owner_of(self.functions.get(&func.name).map(|i| &i.def_module)) {
+                    if self.is_surviving_decl(&self.functions, &func.name, func.name_span) {
                         self.check_function(func);
                     }
                 }
-                Declaration::Impl(imp) => self.check_impl(imp),
+                Declaration::Impl(imp) => {
+                    if self.is_surviving_impl(imp) {
+                        self.check_impl(imp);
+                    }
+                }
                 Declaration::Struct(s) => {
-                    if self.is_owner_of(self.structs.get(&s.name).map(|i| &i.def_module)) {
+                    if self.is_surviving_decl(&self.structs, &s.name, s.name_span) {
                         self.check_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
                     }
                 }
                 Declaration::Enum(e) => {
-                    if self.is_owner_of(self.enums.get(&e.name).map(|i| &i.def_module)) {
+                    if self.is_surviving_decl(&self.enums, &e.name, e.name_span) {
                         self.check_inline_methods(&e.name, &e.methods, &e.trait_impls, e.span);
                     }
                 }
+                Declaration::Endpoint(ep) => self.check_endpoint(ep),
                 Declaration::Trait(_)
                 | Declaration::TypeAlias(_)
-                | Declaration::Endpoint(_)
                 | Declaration::Schema(_)
                 | Declaration::Import(_) => {}
             }
         }
     }
 
-    /// True iff `def_module` is `None` (no entry yet — not possible after
-    /// registration, but safe default) or equals `self.current_module`.
-    /// Used by [`Self::check_decl_bodies`] to skip bodies whose registered
-    /// `*Info` belongs to a different module.
-    fn is_owner_of(&self, def_module: Option<&ModulePath>) -> bool {
-        match def_module {
-            Some(m) => *m == self.current_module,
-            None => true,
-        }
+    /// True iff the AST node for `name` is the *first-registered* one
+    /// in the table — i.e., its `name_span` matches the registered
+    /// `definition_span`. False means a later AST node with the same
+    /// name was rejected as a within-module duplicate at registration
+    /// time and should not be body-checked. Used by
+    /// [`Self::check_decl_bodies`] across the function, struct, and
+    /// enum tables (each carries `definition_span` via the
+    /// [`HasDefinitionSpan`] impl below).
+    fn is_surviving_decl<T: HasDefinitionSpan>(
+        &self,
+        table: &HashMap<String, T>,
+        name: &str,
+        name_span: Span,
+    ) -> bool {
+        let qualified = module_qualify(&self.current_module, name);
+        table
+            .get(&qualified)
+            .is_some_and(|info| info.definition_span() == name_span)
+    }
+}
+
+/// Provides access to a registered decl's `definition_span`. Used by
+/// [`Checker::is_surviving_decl`] so a single generic implementation
+/// can probe `functions`, `structs`, and `enums` — each `*Info`
+/// carries its own `definition_span` field, and this trait exposes
+/// them uniformly.
+pub(crate) trait HasDefinitionSpan {
+    fn definition_span(&self) -> Span;
+}
+
+impl HasDefinitionSpan for FunctionInfo {
+    fn definition_span(&self) -> Span {
+        self.definition_span
+    }
+}
+
+impl HasDefinitionSpan for StructInfo {
+    fn definition_span(&self) -> Span {
+        self.definition_span
+    }
+}
+
+impl HasDefinitionSpan for EnumInfo {
+    fn definition_span(&self) -> Span {
+        self.definition_span
+    }
+}
+
+impl Checker {
+    /// True iff this `impl` block targets a type declared in the
+    /// current module (and therefore was registered through the
+    /// success path, not the orphan path). False means registration
+    /// rejected this block for one of: builtin receiver (reserved),
+    /// coherence (foreign type), ambiguous foreign declarations, or
+    /// missing target type. In every rejection case, body-checking
+    /// would resolve `self` against the wrong (or missing) type and
+    /// cascade "unknown name" / "no method" diagnostics on top of the
+    /// registration-time error, so we skip it.
+    ///
+    /// The `def_module == current_module` check is what excludes the
+    /// builtin case: `module_qualify(entry, "Option")` collides with
+    /// the builtin's qualified key, so a bare `contains_key` probe
+    /// would mistakenly accept `impl Option` as surviving — but the
+    /// stored `def_module` is `builtin`, not `entry`, and the equality
+    /// check rejects it.
+    fn is_surviving_impl(&self, imp: &ImplBlock) -> bool {
+        let qualified = module_qualify(&self.current_module, &imp.type_name);
+        let def_module = self
+            .structs
+            .get(&qualified)
+            .map(|i| &i.def_module)
+            .or_else(|| self.enums.get(&qualified).map(|i| &i.def_module));
+        matches!(def_module, Some(m) if *m == self.current_module)
     }
 
     // Registration methods (register_function, register_struct, etc.) are in
     // check_register.rs to keep this file focused on the checking pass.
-
-    /// Walk every module's top-level declarations and emit a diagnostic
-    /// for each name that is declared in more than one module. Until the
-    /// symbol tables are keyed by `module_qualify(...)`, two modules that
-    /// each declare `struct User` would silently corrupt the tables —
-    /// surfacing these collisions early gives a clear error rather than
-    /// a confusing downstream type mismatch.
-    ///
-    /// Detection is per-namespace (functions, structs, enums, traits,
-    /// type aliases). A function `Foo` and a struct `Foo` in different
-    /// modules are *not* a collision here — those would be caught when
-    /// imports are wired up to a shared symbol table.
-    fn detect_cross_module_collisions(
-        &mut self,
-        modules: &[phoenix_modules::ResolvedSourceModule],
-    ) {
-        let mut functions: HashMap<String, (ModulePath, Span)> = HashMap::new();
-        let mut structs: HashMap<String, (ModulePath, Span)> = HashMap::new();
-        let mut enums: HashMap<String, (ModulePath, Span)> = HashMap::new();
-        let mut traits: HashMap<String, (ModulePath, Span)> = HashMap::new();
-        let mut aliases: HashMap<String, (ModulePath, Span)> = HashMap::new();
-
-        for module in modules {
-            let mp = &module.module_path;
-            for decl in &module.program.declarations {
-                let (kind, table, name, span) = match decl {
-                    Declaration::Function(f) => ("function", &mut functions, &f.name, f.name_span),
-                    Declaration::Struct(s) => ("struct", &mut structs, &s.name, s.name_span),
-                    Declaration::Enum(e) => ("enum", &mut enums, &e.name, e.name_span),
-                    Declaration::Trait(t) => ("trait", &mut traits, &t.name, t.name_span),
-                    Declaration::TypeAlias(ta) => {
-                        ("type alias", &mut aliases, &ta.name, ta.name_span)
-                    }
-                    _ => continue,
-                };
-                self.record_namespace_collision(kind, table, name, mp, span);
-            }
-        }
-    }
-
-    /// Helper for [`Self::detect_cross_module_collisions`]: emit a diagnostic
-    /// if `name` already appears in `seen` under a different module path,
-    /// otherwise record this declaration as the first occurrence.
-    fn record_namespace_collision(
-        &mut self,
-        kind: &str,
-        seen: &mut HashMap<String, (ModulePath, Span)>,
-        name: &str,
-        module: &ModulePath,
-        span: Span,
-    ) {
-        if let Some((prev_module, prev_span)) = seen.get(name) {
-            if prev_module != module {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!(
-                            "{kind} `{name}` is declared in modules `{prev_module}` and `{module}` — \
-                             cross-module name resolution does not yet disambiguate; \
-                             rename one of the declarations"
-                        ),
-                        span,
-                    )
-                    .with_note(*prev_span, "originally declared here"),
-                );
-            }
-        } else {
-            seen.insert(name.to_string(), (module.clone(), span));
-        }
-    }
 
     /// Type-checks a function body against its declared signature.
     fn check_function(&mut self, func: &FunctionDecl) {

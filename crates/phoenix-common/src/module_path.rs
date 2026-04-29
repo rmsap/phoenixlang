@@ -96,6 +96,22 @@ pub fn module_qualify(module: &ModulePath, name: &str) -> String {
     }
 }
 
+/// Inverse of [`module_qualify`]: extract the bare name from a qualified
+/// key. For an entry/builtin key like `"Option"` (no `::` separator) the
+/// input is returned unchanged; for a non-entry key like `"a.b::foo"`
+/// the part after the last `::` is returned.
+///
+/// Uses `rsplit_once` so that if a future syntax change ever lets a
+/// qualified key contain more than one `::` separator, the *last* one
+/// (which separates the module path from the identifier) is the
+/// boundary — that matches `module_qualify`'s `format!("{}::{}", …)`.
+pub fn bare_name(qualified: &str) -> &str {
+    qualified
+        .rsplit_once("::")
+        .map(|(_, n)| n)
+        .unwrap_or(qualified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +164,26 @@ mod tests {
     #[test]
     fn module_qualify_builtin_is_bare_name() {
         assert_eq!(module_qualify(&ModulePath::builtin(), "Option"), "Option");
+    }
+
+    #[test]
+    fn bare_name_strips_module_segment() {
+        assert_eq!(bare_name("a.b::foo"), "foo");
+        assert_eq!(bare_name("foo"), "foo");
+    }
+
+    #[test]
+    fn bare_name_round_trips_module_qualify() {
+        let mp = ModulePath(vec!["a".into(), "b".into()]);
+        assert_eq!(bare_name(&module_qualify(&mp, "foo")), "foo");
+        assert_eq!(
+            bare_name(&module_qualify(&ModulePath::entry(), "foo")),
+            "foo"
+        );
+        assert_eq!(
+            bare_name(&module_qualify(&ModulePath::builtin(), "Option")),
+            "Option"
+        );
     }
 
     #[test]

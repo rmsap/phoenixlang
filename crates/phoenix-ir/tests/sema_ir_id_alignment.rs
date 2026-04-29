@@ -183,3 +183,56 @@ function main() {
         );
     }
 }
+
+#[test]
+fn orphan_methods_get_filled_placeholder_slots() {
+    // Sema produces orphan-method slots when registration rejects the
+    // parent decl (within-module duplicate type, coherence-violating
+    // impl). Their FuncIds were pre-allocated and `user_methods.len()`
+    // includes them, so IR must size and fill `module.functions`
+    // matching that count — even though `user_methods_with_names()`
+    // skips them. The orphan-fill pass installs unreachable
+    // placeholders at those slots; the post-registration debug_assert
+    // would panic without them.
+    //
+    // This test bypasses the diagnostic gate in `lower_program` because
+    // this scenario *is* a sema error in the user's program — the
+    // assertion we're pinning is "IR doesn't crash on it", not "this
+    // input is well-formed".
+    let source = r#"
+struct Foo { Int x }
+struct Foo {
+    String y
+    function bar(self) -> Int { return 1 }
+}
+function main() {}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let analysis = checker::check(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`Foo` is already defined")),
+        "expected duplicate-struct diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+    assert!(
+        analysis.module.orphan_method_count > 0,
+        "expected at least one orphan method from the duplicate's `bar`, got 0"
+    );
+    // The orphan-fill pass + debug_asserts in IR's `register_declarations`
+    // and `lower()` exercise the contract; constructing the module
+    // without panicking is the assertion.
+    let ir = lower(&program, &analysis.module);
+    for (fid, slot) in ir.iter_slots() {
+        assert_ne!(
+            slot.func().id.0,
+            u32::MAX,
+            "IrModule.functions[{}] still has FuncId(u32::MAX) sentinel after orphan fill",
+            fid.index()
+        );
+    }
+}

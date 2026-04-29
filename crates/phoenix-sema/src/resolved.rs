@@ -146,6 +146,16 @@ pub struct ResolvedModule {
     /// absent; query [`Self::builtin_methods`] when this lookup misses.
     /// See [`MethodIndex`] for the concrete shape.
     pub method_index: MethodIndex,
+    /// How many entries in [`Self::user_methods`] correspond to
+    /// *orphan* methods — methods on AST nodes that the registration
+    /// pass rejected (within-module duplicate types, coherence-
+    /// violating impls). Their `FuncId`s were pre-allocated so they
+    /// must fill `user_methods` slots, but they are intentionally
+    /// absent from [`Self::method_index`] (no scope-aware lookup ever
+    /// produces a key that resolves to them). Used by
+    /// [`assert_post_build_invariants`] to express the true invariant
+    /// `user_methods.len() == method_index_count + orphan_method_count`.
+    pub orphan_method_count: u32,
 
     /// Stdlib built-in methods (`Option.unwrap`, `List.push`,
     /// `String.length`, …), keyed `type_name → method_name → info`.
@@ -602,6 +612,27 @@ pub(crate) fn build_from_checker(program: &Program, mut checker: Checker) -> Ana
     build_structs(&mut rm, &mut checker, program);
     build_traits(&mut rm, &mut checker, program);
 
+    // The build_{enums,structs,traits} helpers iterate `program`
+    // (the entry program) and remove from `checker.{enums,structs,traits}`
+    // by bare name, so any leftover entries belong to non-entry modules
+    // and indicate "non-entry aggregation hasn't landed yet" rather
+    // than a registration bug. Pin that intent: leftovers must all be
+    // non-entry. If a future change adds non-entry aggregation here,
+    // these checks will either become trivially true (drained) or
+    // need to be removed deliberately.
+    debug_assert!(
+        checker.enums.values().all(|i| !i.def_module.is_entry()),
+        "build_enums left entry-module entries undrained — bare-name removal disagrees with qualified-key registration"
+    );
+    debug_assert!(
+        checker.structs.values().all(|i| !i.def_module.is_entry()),
+        "build_structs left entry-module entries undrained — bare-name removal disagrees with qualified-key registration"
+    );
+    debug_assert!(
+        checker.traits.values().all(|i| !i.def_module.is_entry()),
+        "build_traits left entry-module entries undrained — bare-name removal disagrees with qualified-key registration"
+    );
+
     // ── Per-span maps onto ResolvedModule: move, don't clone.
     rm.expr_types = std::mem::take(&mut checker.expr_types);
     rm.call_type_args = std::mem::take(&mut checker.call_type_args);
@@ -630,6 +661,7 @@ fn empty_resolved_module() -> ResolvedModule {
         user_methods: Vec::new(),
         user_method_offset: 0,
         method_index: HashMap::new(),
+        orphan_method_count: 0,
         builtin_methods: HashMap::new(),
         structs: Vec::new(),
         struct_by_name: HashMap::new(),
@@ -694,31 +726,36 @@ fn build_user_and_builtin_methods(rm: &mut ResolvedModule, checker: &mut Checker
     let mut user_methods_buf: Vec<Option<MethodInfo>> = Vec::with_capacity(n_user_methods);
     user_methods_buf.resize_with(n_user_methods, || None);
     let user_method_offset = rm.user_method_offset;
+    let fill_slot = |buf: &mut Vec<Option<MethodInfo>>,
+                     fid: phoenix_common::ids::FuncId,
+                     info: MethodInfo| {
+        let idx = fid
+            .index()
+            .checked_sub(user_method_offset as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "user-method FuncId({}) is below user_method_offset {}",
+                    fid.0, user_method_offset
+                )
+            });
+        assert!(
+            idx < n_user_methods,
+            "user-method FuncId({}) out of range (n_user_methods={n_user_methods})",
+            fid.0
+        );
+        let slot = &mut buf[idx];
+        assert!(
+            slot.is_none(),
+            "user-method FuncId({}) populated twice — sema registered two methods with the same id",
+            fid.0
+        );
+        *slot = Some(info);
+    };
     for (type_name, type_methods) in checker.methods.drain() {
         for (method_name, info) in type_methods {
             match info.func_id {
                 Some(fid) => {
-                    let idx = fid
-                        .index()
-                        .checked_sub(user_method_offset as usize)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "user-method FuncId({}) is below user_method_offset {}",
-                                fid.0, user_method_offset
-                            )
-                        });
-                    assert!(
-                        idx < n_user_methods,
-                        "user-method FuncId({}) out of range (n_user_methods={n_user_methods})",
-                        fid.0
-                    );
-                    let slot = &mut user_methods_buf[idx];
-                    assert!(
-                        slot.is_none(),
-                        "user-method FuncId({}) populated twice — sema registered two methods with the same id",
-                        fid.0
-                    );
-                    *slot = Some(info);
+                    fill_slot(&mut user_methods_buf, fid, info);
                     rm.method_index
                         .entry(type_name.clone())
                         .or_default()
@@ -733,6 +770,24 @@ fn build_user_and_builtin_methods(rm: &mut ResolvedModule, checker: &mut Checker
             }
         }
     }
+    // Orphan methods only fill `user_methods` slots (their FuncIds
+    // were pre-allocated and must be filled to satisfy the resolved-
+    // module invariant); they are *not* inserted into `method_index`
+    // — no scope-aware lookup ever produces their `(type, span)` key,
+    // so they remain unreachable. `info.func_id` is always `Some` for
+    // an orphan entry (resolve_orphan_method_info constructs it that
+    // way), so the `None` arm above is unreachable here.
+    let mut orphan_count: u32 = 0;
+    for (_, type_methods) in checker.orphan_methods.drain() {
+        for (_, info) in type_methods {
+            let fid = info.func_id.expect(
+                "orphan method without FuncId — `consume_orphan_methods_with` always sets one",
+            );
+            fill_slot(&mut user_methods_buf, fid, info);
+            orphan_count += 1;
+        }
+    }
+    rm.orphan_method_count = orphan_count;
     rm.user_methods = user_methods_buf
         .into_iter()
         .enumerate()
@@ -843,8 +898,11 @@ fn assert_post_build_invariants(rm: &ResolvedModule) {
     let method_index_count: usize = rm.method_index.values().map(|m| m.len()).sum();
     assert_eq!(
         rm.user_methods.len(),
+        method_index_count + rm.orphan_method_count as usize,
+        "user_methods/method_index length mismatch (user_methods={}, method_index={}, orphan={})",
+        rm.user_methods.len(),
         method_index_count,
-        "user_methods/method_index length mismatch"
+        rm.orphan_method_count,
     );
     assert_eq!(
         rm.user_method_offset as usize,

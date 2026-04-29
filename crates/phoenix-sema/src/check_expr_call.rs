@@ -85,7 +85,7 @@ impl Checker {
             // `dyn UnknownTrait` upstream in `resolve_type_expr`, so the
             // trait must be present here; only the *method name* may be
             // wrong at this site.
-            let Some(trait_info) = self.traits.get(trait_name) else {
+            let Some(trait_info) = self.lookup_trait(trait_name) else {
                 unreachable!(
                     "compiler bug: receiver typed `dyn {trait_name}` but trait is missing \
                      from sema metadata — `Checker::resolve_type_expr` must reject \
@@ -124,8 +124,11 @@ impl Checker {
             };
         }
 
-        // User-defined methods
-        if let Some(type_methods) = self.methods.get(&type_name).cloned()
+        // User-defined methods. Go through `lookup_methods` so the
+        // receiver-type name is resolved through the current module's
+        // scope — methods on a type declared in module `lib` are keyed
+        // under `lib::User`, not the bare `User` the use-site wrote.
+        if let Some(type_methods) = self.lookup_methods(&type_name).cloned()
             && let Some(method_info) = type_methods.get(&mc.method)
         {
             // Merge parent-type bindings (from the receiver) with bindings
@@ -256,7 +259,7 @@ impl Checker {
                 continue;
             }
             for bound_trait in bound_traits {
-                let trait_info = match self.traits.get(bound_trait).cloned() {
+                let trait_info = match self.lookup_trait(bound_trait).cloned() {
                     Some(info) => info,
                     None => continue,
                 };
@@ -285,9 +288,16 @@ impl Checker {
 
     /// Type-checks a struct constructor or enum variant constructor expression,
     /// validating field count, field types, and inferring generic type arguments.
+    ///
+    /// Cross-module visibility: constructing a struct declared in another
+    /// (non-builtin) module emits a single batched diagnostic listing
+    /// every private field — otherwise positional construction would let
+    /// any module write a private field that read-side
+    /// `check_field_access` correctly rejects, defeating encapsulation.
     pub(crate) fn check_struct_literal(&mut self, sl: &StructLiteralExpr) -> Type {
         // Check if it's a struct constructor
-        if let Some(struct_info) = self.structs.get(&sl.name).cloned() {
+        if let Some(struct_info) = self.lookup_struct(&sl.name).cloned() {
+            self.enforce_cross_module_construction_privacy(&struct_info, &sl.name, sl.span);
             if sl.args.len() != struct_info.fields.len() {
                 self.error(
                     format!(
@@ -355,20 +365,16 @@ impl Checker {
     /// Type-checks an enum variant constructor expression, validating field
     /// count, field types, and inferring generic type arguments for the
     /// parent enum.
+    ///
+    /// Variant resolution goes through `lookup_visible_enum_variant` so
+    /// only enums actually visible in the current module's scope are
+    /// considered — a variant whose owning enum was never imported (or
+    /// is private) does not resolve from here. The returned enum name
+    /// is the *user-source* name (the alias, if any), not the qualified
+    /// table key, so the `Type::Named(...)` / `Type::Generic(...)`
+    /// produced here matches what users wrote in surrounding source.
     fn check_enum_variant_constructor(&mut self, sl: &StructLiteralExpr) -> Type {
-        let variant_match = self.enums.iter().find_map(|(enum_name, enum_info)| {
-            enum_info
-                .variants
-                .iter()
-                .find(|(n, _)| n == &sl.name)
-                .map(|(_, types)| {
-                    (
-                        enum_name.clone(),
-                        enum_info.type_params.clone(),
-                        types.clone(),
-                    )
-                })
-        });
+        let variant_match = self.lookup_visible_enum_variant(&sl.name, sl.span);
 
         if let Some((enum_name, type_params, variant_types)) = variant_match {
             if sl.args.len() != variant_types.len() {
@@ -479,8 +485,9 @@ impl Checker {
                 return Type::String;
             }
 
-            // User-defined function
-            if let Some(func_info) = self.functions.get(&ident.name).cloned() {
+            // User-defined function — go through the module scope so
+            // imports + visibility (Phase B) are honored once they land.
+            if let Some(func_info) = self.lookup_function(&ident.name).cloned() {
                 self.record_reference(
                     ident.span,
                     crate::checker::SymbolKind::Function,
@@ -754,15 +761,15 @@ impl Checker {
             }
         }
 
-        // Check trait bounds
+        // Check trait bounds. `has_trait_impl` resolves both the
+        // concrete type-name and the trait-name through the current
+        // module's scope so cross-module bounds (e.g. `T: lib::Display`
+        // imported here) are honored.
         for (param_name, bound_traits) in &func_info.type_param_bounds {
             if let Some(concrete) = bindings.get(param_name) {
                 let concrete_name = self.type_name_for_bounds(concrete);
                 for bound_trait in bound_traits {
-                    if !self
-                        .trait_impls
-                        .contains(&(concrete_name.clone(), bound_trait.clone()))
-                    {
+                    if !self.has_trait_impl(&concrete_name, bound_trait) {
                         self.error(
                             format!(
                                 "type `{}` does not implement trait `{}`",

@@ -49,11 +49,6 @@ x = 2 }"#,
 fn generics() {
     run_expect(
         r#"
-enum Option<T> {
-  Some(T)
-  None
-}
-
 struct Pair<A, B> {
   A first
   B second
@@ -63,7 +58,7 @@ function identity<T>(x: T) -> T {
   return x
 }
 
-function unwrapOr<T>(opt: Option<T>, defaultVal: T) -> T {
+function defaultedUnwrap<T>(opt: Option<T>, defaultVal: T) -> T {
   return match opt {
     Some(v) -> v
     None -> defaultVal
@@ -87,9 +82,9 @@ function main() {
 
   let someVal: Option<Int> = Some(10)
   let noneVal: Option<Int> = None
-  let x: Int = unwrapOr(someVal, 0)
+  let x: Int = defaultedUnwrap(someVal, 0)
   print(x)
-  let y: Int = unwrapOr(noneVal, 99)
+  let y: Int = defaultedUnwrap(noneVal, 99)
   print(y)
 
   let someVal2: Option<Int> = Some(10)

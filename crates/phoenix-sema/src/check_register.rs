@@ -7,27 +7,15 @@ use crate::checker::{
     Checker, EnumInfo, FunctionInfo, MethodInfo, StructInfo, TraitInfo, TraitMethodInfo,
     TypeAliasInfo,
 };
+use crate::impl_classify::ImplTarget;
 use crate::types::Type;
-use phoenix_common::module_path::ModulePath;
+use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     EnumDecl, FunctionDecl, ImplBlock, InlineTraitImpl, Param, StructDecl, TraitDecl,
     TypeAliasDecl, TypeExpr, Visibility,
 };
 use std::collections::HashMap;
-
-/// True iff `existing_def_module` is `Some` and refers to a module other
-/// than `current`. Used by the four `register_*` paths to early-return
-/// when the slot is already owned by an earlier-registered, different
-/// module — preserving first-write-wins under cross-module name
-/// collisions (which are separately diagnosed by
-/// [`Checker::detect_cross_module_collisions`](crate::checker::Checker::detect_cross_module_collisions)).
-fn slot_owned_by_other_module(
-    current: &ModulePath,
-    existing_def_module: Option<&ModulePath>,
-) -> bool {
-    matches!(existing_def_module, Some(m) if m != current)
-}
 
 impl Checker {
     /// Pre-registers built-in `Option<T>` and `Result<T, E>` enums along with
@@ -110,12 +98,56 @@ impl Checker {
         );
     }
 
+    /// Emit a diagnostic and return `true` if `name` shadows a builtin —
+    /// callers in the five name-shadow `register_*` paths use this to
+    /// short-circuit before any registration work. `kind_phrase` is the
+    /// full noun phrase (e.g. `"a function name"`, `"an enum name"`)
+    /// embedded into the message; centralising the wording here keeps
+    /// the five callers from drifting.
+    ///
+    /// `register_impl` does *not* go through this helper — `impl Foo`
+    /// where `Foo` is a builtin gets its own coherence-themed
+    /// diagnostic ("cannot implement methods on builtin type") rather
+    /// than the name-reservation wording, and routes the impl's
+    /// methods through the orphan path.
+    fn reject_builtin_name_shadow(&mut self, name: &str, kind_phrase: &str, span: Span) -> bool {
+        if !self.is_builtin_name(name) {
+            return false;
+        }
+        self.error(
+            format!("`{name}` is a reserved builtin name and cannot be used as {kind_phrase}"),
+            span,
+        );
+        true
+    }
+
     /// Registers a top-level function declaration in the function table.
     ///
     /// Resolves parameter and return types and records them for later use
     /// during call-site checking.  Reports an error if a function with the
-    /// same name has already been registered.
+    /// same name has already been registered **in the same module**. With
+    /// per-module name mangling (`module_qualify`), two modules can both
+    /// declare `foo` and the registrations land under distinct keys
+    /// (`foo` for the entry, `models.user::foo` for `models.user`) — no
+    /// cross-module collision arises.
     pub(crate) fn register_function(&mut self, func: &FunctionDecl) {
+        if self.reject_builtin_name_shadow(&func.name, "a function name", func.span) {
+            return;
+        }
+        // Reject within-module duplicates *before* type-resolving the
+        // signature so the duplicate's params don't emit unrelated
+        // type-resolution diagnostics on top of the "already defined"
+        // error. The qualified key collides only within the current
+        // module because `current_module` is fixed for the in-flight
+        // registration.
+        let qualified = module_qualify(&self.current_module, &func.name);
+        if self.functions.contains_key(&qualified) {
+            self.error(
+                format!("function `{}` is already defined", func.name),
+                func.span,
+            );
+            return;
+        }
         let (params, param_names, default_param_exprs, return_type) =
             self.with_type_params(&func.type_params, None, |this| {
                 let non_self_params: Vec<&Param> =
@@ -138,72 +170,64 @@ impl Checker {
                     .unwrap_or(Type::Void);
                 (params, param_names, default_param_exprs, return_type)
             });
-
-        if let Some(existing) = self.functions.get(&func.name) {
-            if existing.def_module == self.current_module {
-                // In-module duplicate — emit the existing "already defined" diagnostic.
-                self.error(
-                    format!("function `{}` is already defined", func.name),
-                    func.span,
-                );
-            }
-            // Cross-module duplicates are diagnosed by
-            // `detect_cross_module_collisions`; preserve first-write-wins
-            // by skipping this registration so the symbol table keeps the
-            // earlier definition.
-        } else {
-            self.record_reference(
-                func.name_span,
-                crate::checker::SymbolKind::Function,
-                func.name.clone(),
-            );
-            // Adopt the pre-allocated FuncId from pre-pass A so sema
-            // and IR share an id space.  The id should always be
-            // present because `pre_allocate_function_ids` walks the
-            // same AST nodes — but we look it up safely so a future
-            // refactor that diverges the walks fails with a clear
-            // diagnostic instead of an unindexed-HashMap panic.
-            let func_id = *self
-                .pending_function_ids
-                .get(&func.name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "internal compiler error: function `{}` has no pre-allocated FuncId — \
-                         pre_allocate_function_ids and register_function disagree on AST walk order",
-                        func.name
-                    )
-                });
-            self.functions.insert(
-                func.name.clone(),
-                FunctionInfo {
-                    func_id,
-                    definition_span: func.name_span,
-                    type_params: func.type_params.clone(),
-                    type_param_bounds: func.type_param_bounds.clone(),
-                    params,
-                    param_names,
-                    default_param_exprs,
-                    return_type,
-                    visibility: func.visibility,
-                    def_module: self.current_module.clone(),
-                },
-            );
-        }
+        self.record_reference(
+            func.name_span,
+            crate::checker::SymbolKind::Function,
+            func.name.clone(),
+        );
+        // Adopt the pre-allocated FuncId from pre-pass A so sema
+        // and IR share an id space.  Pre-pass A keys by the same
+        // qualified name, so the lookup is symmetric.
+        let func_id = *self
+            .pending_function_ids
+            .get(&qualified)
+            .unwrap_or_else(|| {
+                panic!(
+                    "internal compiler error: function `{}` (qualified `{}`) has no pre-allocated FuncId — \
+                     pre_allocate_function_ids and register_function disagree on AST walk order",
+                    func.name, qualified
+                )
+            });
+        self.functions.insert(
+            qualified,
+            FunctionInfo {
+                func_id,
+                definition_span: func.name_span,
+                type_params: func.type_params.clone(),
+                type_param_bounds: func.type_param_bounds.clone(),
+                params,
+                param_names,
+                default_param_exprs,
+                return_type,
+                visibility: func.visibility,
+                def_module: self.current_module.clone(),
+            },
+        );
     }
 
     /// Registers a struct declaration, resolving its field types and storing
     /// them in the struct table for use during constructor and field-access
     /// checking.  Also registers any inline methods and trait implementations.
     ///
-    /// Cross-module collisions are diagnosed earlier by
-    /// `detect_cross_module_collisions`; this function preserves
-    /// first-write-wins semantics by returning early if the struct's slot
-    /// is already owned by a different module.
+    /// Keyed by the module-qualified name (`module_qualify`), so two
+    /// modules can both declare `struct User` without collision.
+    /// Within-module duplicates are diagnosed and dropped so the first
+    /// declaration survives intact (see `is_within_module_duplicate`).
+    /// The duplicate's inline-method `FuncId`s are still consumed via
+    /// `consume_orphan_inline_methods` so the resolved-module assembly
+    /// invariant ("every pre-allocated FuncId is filled") holds.
     pub(crate) fn register_struct(&mut self, s: &StructDecl) {
-        if slot_owned_by_other_module(
-            &self.current_module,
-            self.structs.get(&s.name).map(|i| &i.def_module),
-        ) {
+        if self.reject_builtin_name_shadow(&s.name, "a struct name", s.span) {
+            return;
+        }
+        let qualified = module_qualify(&self.current_module, &s.name);
+        let existing = self
+            .structs
+            .get(&qualified)
+            .map(|i| (i.definition_span, &i.def_module));
+        if self.is_within_module_duplicate(existing, s.name_span) {
+            self.error(format!("struct `{}` is already defined", s.name), s.span);
+            self.consume_orphan_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
             return;
         }
         let fields: Vec<crate::checker::FieldInfo> =
@@ -256,7 +280,7 @@ impl Checker {
             s.name.clone(),
         );
         self.structs.insert(
-            s.name.clone(),
+            qualified,
             StructInfo {
                 definition_span: s.name_span,
                 type_params: s.type_params.clone(),
@@ -274,14 +298,20 @@ impl Checker {
     /// constructor checking.  Also registers any inline methods and trait
     /// implementations.
     ///
-    /// Cross-module collisions are diagnosed earlier; this function
-    /// preserves first-write-wins semantics by returning early if the
-    /// enum's slot is already owned by a different module.
+    /// Keyed by the module-qualified name (`module_qualify`).
+    /// Within-module duplicates are diagnosed and dropped.
     pub(crate) fn register_enum(&mut self, e: &EnumDecl) {
-        if slot_owned_by_other_module(
-            &self.current_module,
-            self.enums.get(&e.name).map(|i| &i.def_module),
-        ) {
+        if self.reject_builtin_name_shadow(&e.name, "an enum name", e.span) {
+            return;
+        }
+        let qualified = module_qualify(&self.current_module, &e.name);
+        let existing = self
+            .enums
+            .get(&qualified)
+            .map(|i| (i.definition_span, &i.def_module));
+        if self.is_within_module_duplicate(existing, e.name_span) {
+            self.error(format!("enum `{}` is already defined", e.name), e.span);
+            self.consume_orphan_inline_methods(&e.name, &e.methods, &e.trait_impls, e.span);
             return;
         }
         let variants: Vec<(String, Vec<Type>)> =
@@ -301,7 +331,7 @@ impl Checker {
             e.name.clone(),
         );
         self.enums.insert(
-            e.name.clone(),
+            qualified,
             EnumInfo {
                 definition_span: e.name_span,
                 type_params: e.type_params.clone(),
@@ -316,14 +346,19 @@ impl Checker {
 
     /// Registers a trait declaration, storing its method signatures.
     ///
-    /// Cross-module collisions are diagnosed earlier; this function
-    /// preserves first-write-wins semantics by returning early if the
-    /// trait's slot is already owned by a different module.
+    /// Keyed by the module-qualified name (`module_qualify`).
+    /// Within-module duplicates are diagnosed and dropped.
     pub(crate) fn register_trait(&mut self, t: &TraitDecl) {
-        if slot_owned_by_other_module(
-            &self.current_module,
-            self.traits.get(&t.name).map(|i| &i.def_module),
-        ) {
+        if self.reject_builtin_name_shadow(&t.name, "a trait name", t.span) {
+            return;
+        }
+        let qualified = module_qualify(&self.current_module, &t.name);
+        let existing = self
+            .traits
+            .get(&qualified)
+            .map(|i| (i.definition_span, &i.def_module));
+        if self.is_within_module_duplicate(existing, t.name_span) {
+            self.error(format!("trait `{}` is already defined", t.name), t.span);
             return;
         }
         let methods: Vec<TraitMethodInfo> = self.with_type_params(&t.type_params, None, |this| {
@@ -351,7 +386,7 @@ impl Checker {
         });
         let object_safety_error = crate::object_safety::validate(&methods);
         self.traits.insert(
-            t.name.clone(),
+            qualified,
             TraitInfo {
                 definition_span: t.name_span,
                 type_params: t.type_params.clone(),
@@ -369,14 +404,22 @@ impl Checker {
     /// references like `T` in `type StringResult<T> = Result<T, String>` are
     /// resolved as type variables rather than concrete types.
     ///
-    /// Cross-module collisions are diagnosed earlier; this function
-    /// preserves first-write-wins semantics by returning early if the
-    /// alias's slot is already owned by a different module.
+    /// Keyed by the module-qualified name (`module_qualify`).
+    /// Within-module duplicates are diagnosed and dropped.
     pub(crate) fn register_type_alias(&mut self, ta: &TypeAliasDecl) {
-        if slot_owned_by_other_module(
-            &self.current_module,
-            self.type_aliases.get(&ta.name).map(|i| &i.def_module),
-        ) {
+        if self.reject_builtin_name_shadow(&ta.name, "a type-alias name", ta.span) {
+            return;
+        }
+        let qualified = module_qualify(&self.current_module, &ta.name);
+        let existing = self
+            .type_aliases
+            .get(&qualified)
+            .map(|i| (i.definition_span, &i.def_module));
+        if self.is_within_module_duplicate(existing, ta.name_span) {
+            self.error(
+                format!("type alias `{}` is already defined", ta.name),
+                ta.span,
+            );
             return;
         }
         // Detect direct self-reference: `type A = A`
@@ -404,7 +447,7 @@ impl Checker {
         }
 
         self.type_aliases.insert(
-            ta.name.clone(),
+            qualified,
             TypeAliasInfo {
                 definition_span: ta.name_span,
                 type_params: ta.type_params.clone(),
@@ -438,6 +481,12 @@ impl Checker {
     }
 
     /// Recursive helper for [`Self::type_alias_creates_cycle`].
+    ///
+    /// Resolves alias chain links through `lookup_type_alias` so that
+    /// aliases declared in non-entry modules — which live under their
+    /// module-qualified key (e.g. `lib::A`) rather than the bare name —
+    /// are still followed and cycles like `type A = B; type B = A` in
+    /// `lib` are detected.
     fn type_alias_cycle_walk(
         &self,
         alias_name: &str,
@@ -452,35 +501,196 @@ impl Checker {
                 return false;
             }
             visited.insert(name.clone());
-            if let Some(alias_info) = self.type_aliases.get(name) {
+            if let Some(alias_info) = self.lookup_type_alias(name) {
                 return self.type_alias_cycle_walk(alias_name, &alias_info.target, visited);
             }
         }
         false
     }
 
-    /// Looks up the generic type parameters declared on a struct or enum.
+    /// True iff a slot in a registration table is already filled by a
+    /// *different* AST node — i.e. a real within-module duplicate.
+    ///
+    /// For structs and enums, [`Checker::pre_register_type_names`] inserts
+    /// a placeholder whose `definition_span` matches the AST node about to
+    /// be registered, so the first call has `existing.span == new_span`
+    /// (returns `false`, registration proceeds and overwrites the
+    /// placeholder); a second AST node with the same name has
+    /// `existing.span = first.name_span != new_span` (returns `true`).
+    ///
+    /// Traits and type aliases have no placeholder pass, so the first
+    /// registration sees `existing = None` (returns `false`); a second
+    /// sees `existing = Some((first.name_span, …)) != new_span`
+    /// (returns `true`). Same logic, the `None` arm short-circuits.
+    ///
+    /// Builtin slots never reach here: each `register_*` checks
+    /// [`Self::is_builtin_name`] up front and rejects, so the only
+    /// `existing` values this sees come from prior user registrations
+    /// (or the placeholder pass) within the current module.
+    fn is_within_module_duplicate(
+        &self,
+        existing: Option<(Span, &ModulePath)>,
+        new_span: Span,
+    ) -> bool {
+        let Some((existing_span, _existing_def_module)) = existing else {
+            return false;
+        };
+        existing_span != new_span
+    }
+
+    /// Looks up the generic type parameters declared on a struct or enum
+    /// in the current module. Used by `register_impl` to derive the
+    /// receiver's parent type parameters. Phoenix's coherence rule —
+    /// enforced by [`Self::classify_impl_target`] — requires that an
+    /// `impl` block target a type declared in the same module, so
+    /// qualification against `current_module` is correct here.
     pub(crate) fn parent_type_params(&self, type_name: &str) -> Vec<String> {
+        let qualified = module_qualify(&self.current_module, type_name);
         self.structs
-            .get(type_name)
+            .get(&qualified)
             .map(|s| s.type_params.clone())
-            .or_else(|| self.enums.get(type_name).map(|e| e.type_params.clone()))
+            .or_else(|| self.enums.get(&qualified).map(|e| e.type_params.clone()))
             .unwrap_or_default()
     }
 
     /// Registers an `impl` block, recording each method's signature in the
     /// method table.  For trait implementations, validates that all required
     /// methods are provided with compatible signatures.
+    ///
+    /// Up-front, the receiver type is classified by
+    /// [`Self::classify_impl_target`]:
+    ///
+    /// - **Local** — type is declared in the current module; proceed.
+    /// - **ForeignModule** — type is declared in another module
+    ///   (Phoenix coherence: `impl` blocks must live in the same
+    ///   module as the type they target). Diagnose and short-circuit.
+    /// - **ForeignAmbiguous** — type's bare name is declared in more
+    ///   than one foreign module; diagnostic lists every candidate.
+    /// - **Unknown** — type isn't declared anywhere reachable.
+    ///   Diagnose with "unknown type" and short-circuit.
+    ///
+    /// A separate up-front [`Self::is_builtin_name`] guard rejects
+    /// `impl <Builtin>` regardless of module, since `module_qualify`
+    /// treats the entry and builtin paths as the same key — letting
+    /// an entry-module `impl Option` slip through as `Local` would
+    /// pollute the builtin's methods table.
+    ///
+    /// On any rejection path, registration routes through
+    /// [`Self::consume_orphan_methods`] so the pre-allocated `FuncId`s
+    /// for the impl's methods are still consumed (the post-
+    /// registration invariant in `resolved::build_*` requires every
+    /// allocated id to be filled). The orphan path stores its
+    /// `MethodInfo`s under a synthesized key that nothing looks up,
+    /// leaving the surviving methods table uncorrupted.
     pub(crate) fn register_impl(&mut self, imp: &ImplBlock) {
-        let parent_type_params = self.parent_type_params(&imp.type_name);
+        if self.is_builtin_name(&imp.type_name) {
+            self.error(
+                format!(
+                    "cannot implement methods on builtin type `{}`: \
+                     builtin types are reserved",
+                    imp.type_name
+                ),
+                imp.span,
+            );
+            self.consume_orphan_methods(&imp.type_name, &imp.methods, imp.span);
+            return;
+        }
+        match self.classify_impl_target(imp) {
+            ImplTarget::Local => {}
+            ImplTarget::ForeignModule(def_module) => {
+                self.error(
+                    format!(
+                        "cannot implement methods on type `{}` from module `{}`: \
+                         `impl` blocks must live in the same module as the type they target",
+                        imp.type_name, def_module
+                    ),
+                    imp.span,
+                );
+                self.consume_orphan_methods(&imp.type_name, &imp.methods, imp.span);
+                return;
+            }
+            ImplTarget::ForeignAmbiguous(modules) => {
+                let candidates = modules
+                    .iter()
+                    .map(|m| format!("`{m}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.error(
+                    format!(
+                        "cannot implement methods on type `{}`: it is declared in modules {} — \
+                         `impl` blocks must live in the same module as the type they target",
+                        imp.type_name, candidates
+                    ),
+                    imp.span,
+                );
+                self.consume_orphan_methods(&imp.type_name, &imp.methods, imp.span);
+                return;
+            }
+            ImplTarget::Unknown => {
+                self.error(format!("unknown type `{}`", imp.type_name), imp.span);
+                self.consume_orphan_methods(&imp.type_name, &imp.methods, imp.span);
+                return;
+            }
+        }
 
-        let mut methods_to_add = Vec::new();
+        // Trait-existence check happens *before* the methods loop so
+        // an unknown trait routes the impl's methods through the
+        // orphan path instead of inserting them into `self.methods`
+        // as inherent methods. Trait resolution goes through the
+        // current module's scope (Phase B has run before
+        // registration), so `impl ImportedTrait for LocalType`
+        // resolves via the importer's `local_name → qualified_key`
+        // mapping. The receiver type is keyed under
+        // `module_qualify(current_module, ...)` because coherence
+        // forces it to live in the current module.
+        let qualified_type = module_qualify(&self.current_module, &imp.type_name);
+        let qualified_trait_info = match self.resolve_impl_trait(imp) {
+            Ok(resolved) => resolved,
+            Err(()) => {
+                self.consume_orphan_methods(&imp.type_name, &imp.methods, imp.span);
+                return;
+            }
+        };
+
+        let methods_to_add = self.build_impl_method_infos(imp, &qualified_type);
+        self.insert_inherent_methods(imp, &qualified_type, methods_to_add);
+
+        if let Some((trait_name, qualified_trait, trait_info)) = qualified_trait_info {
+            if self
+                .trait_impls
+                .contains(&(qualified_type.clone(), qualified_trait.clone()))
+            {
+                self.error(
+                    format!(
+                        "duplicate implementation of trait `{}` for type `{}`",
+                        trait_name, imp.type_name
+                    ),
+                    imp.span,
+                );
+            }
+            self.validate_trait_impl(imp, &trait_name, &trait_info);
+            self.trait_impls.insert((qualified_type, qualified_trait));
+        }
+    }
+
+    /// Resolve every method on `imp` into a `MethodInfo` carrying its
+    /// pre-allocated `FuncId`. Each method is resolved under the
+    /// receiver's parent type-params merged with the method's own
+    /// type-params. Caller is responsible for inserting the result into
+    /// the methods table — this helper just builds the list.
+    fn build_impl_method_infos(
+        &mut self,
+        imp: &ImplBlock,
+        qualified_type: &str,
+    ) -> Vec<(String, MethodInfo)> {
+        let parent_type_params = self.parent_type_params(&imp.type_name);
+        let mut methods_to_add = Vec::with_capacity(imp.methods.len());
         for func in &imp.methods {
             let mut merged = parent_type_params.clone();
             merged.extend(func.type_params.iter().cloned());
             let (params, param_names, default_param_exprs, return_type) =
                 self.with_type_params(&merged, None, |this| {
-                    let non_self_params: Vec<&phoenix_parser::ast::Param> =
+                    let non_self_params: Vec<&Param> =
                         func.params.iter().filter(|p| p.name != "self").collect();
                     let params: Vec<Type> = non_self_params
                         .iter()
@@ -501,17 +711,17 @@ impl Checker {
                     (params, param_names, default_param_exprs, return_type)
                 });
             // Adopt the pre-allocated FuncId from pre-pass B so sema
-            // and IR share an id space.  The id should always be
+            // and IR share an id space. The id should always be
             // present because `pre_allocate_user_method_ids` walks
             // the same AST nodes — but we look it up safely so a
             // future refactor that diverges the walks fails with a
             // clear diagnostic instead of an unindexed-HashMap panic.
-            let key = (imp.type_name.clone(), func.name.clone());
+            let key = (qualified_type.to_string(), func.name.clone());
             let func_id = *self.pending_user_method_ids.get(&key).unwrap_or_else(|| {
                 panic!(
-                    "internal compiler error: method `{}.{}` has no pre-allocated FuncId — \
+                    "internal compiler error: method `{}.{}` (qualified `{}.{}`) has no pre-allocated FuncId — \
                      pre_allocate_user_method_ids and register_impl disagree on AST walk order",
-                    imp.type_name, func.name
+                    imp.type_name, func.name, qualified_type, func.name
                 )
             });
             let has_self = func.params.first().is_some_and(|p| p.name == "self");
@@ -529,11 +739,44 @@ impl Checker {
                 },
             ));
         }
-        let type_methods = self.methods.entry(imp.type_name.clone()).or_default();
+        methods_to_add
+    }
+
+    /// Insert each `(name, MethodInfo)` into the type's method table,
+    /// recording each successful insert's FuncId in
+    /// [`Checker::filled_method_func_ids`] so the orphan path can
+    /// detect already-filled slots in O(1). Duplicate method names
+    /// (within or across impl blocks for the same type) emit a
+    /// "method `M` is already defined for type `T`" diagnostic
+    /// anchored at the duplicate's `definition_span`.
+    ///
+    /// The methods table is keyed by the type's module-qualified
+    /// name. Phoenix's coherence rule (enforced by
+    /// [`Self::classify_impl_target`]) requires the receiver type
+    /// to live in `current_module`, so qualifying `imp.type_name`
+    /// against `current_module` always yields the right key when
+    /// coherence holds. Coherence violations land their methods
+    /// under an orphan key that nothing looks up — see the
+    /// `register_impl` doc comment.
+    fn insert_inherent_methods(
+        &mut self,
+        imp: &ImplBlock,
+        qualified_type: &str,
+        methods_to_add: Vec<(String, MethodInfo)>,
+    ) {
         let mut duplicates: Vec<(String, Span)> = Vec::new();
+        // Split disjoint borrows of `self.methods` and
+        // `self.filled_method_func_ids` so each successful method insert
+        // can record its FuncId in one pass — the borrow checker sees
+        // these as distinct fields when accessed through let-bindings.
+        let type_methods = self.methods.entry(qualified_type.to_string()).or_default();
+        let filled_method_func_ids = &mut self.filled_method_func_ids;
         for (name, info) in methods_to_add {
             match type_methods.entry(name) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
+                    if let Some(fid) = info.func_id {
+                        filled_method_func_ids.insert(fid);
+                    }
                     slot.insert(info);
                 }
                 std::collections::hash_map::Entry::Occupied(slot) => {
@@ -549,28 +792,6 @@ impl Checker {
                 ),
                 span,
             );
-        }
-
-        if let Some(ref trait_name) = imp.trait_name {
-            if self
-                .trait_impls
-                .contains(&(imp.type_name.clone(), trait_name.clone()))
-            {
-                self.error(
-                    format!(
-                        "duplicate implementation of trait `{}` for type `{}`",
-                        trait_name, imp.type_name
-                    ),
-                    imp.span,
-                );
-            }
-            if let Some(trait_info) = self.traits.get(trait_name).cloned() {
-                self.validate_trait_impl(imp, trait_name, &trait_info);
-                self.trait_impls
-                    .insert((imp.type_name.clone(), trait_name.clone()));
-            } else {
-                self.error(format!("unknown trait `{}`", trait_name), imp.span);
-            }
         }
     }
 
