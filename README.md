@@ -3,7 +3,7 @@
 **A strict, statically typed programming language for full-stack web development.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-2%2C600%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-2%2C800%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Phoenix combines functional and object-oriented programming with a clean, familiar syntax and a focus on safe concurrency, async-first design, and developer productivity. Programs run on a tree-walk interpreter (`phoenix run`) or compile to native binaries via Cranelift (`phoenix build`), and API schemas can be code-generated to TypeScript, Python, Go, or OpenAPI.
@@ -16,6 +16,7 @@ Phoenix combines functional and object-oriented programming with a clean, famili
 
 - **Two execution modes** — tree-walk interpreter for fast iteration, Cranelift-backed native compilation for production
 - **SSA-style intermediate representation** with a round-trip IR interpreter for verification
+- **Multi-file modules with `public`/private visibility** — `import a.b.c { Foo }` syntax, lazy import-driven discovery, cross-module visibility enforcement with rich diagnostics
 - **Multi-target API codegen** — generate TypeScript, Python, Go, or OpenAPI 3.1 clients and servers from `.phx` schemas
 - **Full Language Server Protocol** — diagnostics, hover, autocomplete, go-to-definition, find-references, rename
 - **Modern type system** — generics with trait bounds, `dyn Trait` dynamic dispatch, algebraic data types, pattern matching, closures, first-class functions
@@ -150,7 +151,35 @@ function main() {
 }
 ```
 
-See [`tests/fixtures/`](tests/fixtures/) and [`crates/phoenix-bench/benches/fixtures/large.phx`](crates/phoenix-bench/benches/fixtures/large.phx) for more.
+### Modules and visibility
+
+Each `.phx` file is a module. Declarations are private by default; mark them `public` to export. `import a.b.c { Item }` brings names into scope, with `as` aliases and `{ * }` wildcards. Discovery is lazy (only files reachable via imports are parsed), and the project root is the directory of the entry file.
+
+```phoenix
+// models/user.phx
+public struct User {
+  public String name
+  Int passwordHash             // private — set via the constructor, not readable from outside
+}
+
+public function createUser(name: String) -> User {
+  User(name, hash(""))
+}
+
+function hash(input: String) -> String { input }   // private helper; importers can't see it
+```
+
+```phoenix
+// main.phx
+import models.user { User, createUser }
+
+function main() {
+  let alice: User = createUser("alice")
+  print(alice.name)
+}
+```
+
+See [`tests/fixtures/`](tests/fixtures/) and [`tests/fixtures/multi/`](tests/fixtures/multi/) for more, plus [`crates/phoenix-bench/benches/fixtures/large.phx`](crates/phoenix-bench/benches/fixtures/large.phx).
 
 ---
 
@@ -200,6 +229,7 @@ See **[docs/phoenix-gen.md](docs/phoenix-gen.md)** for the full guide, or [`test
 - Generics on functions, structs, and enums with trait bounds (`<T: Display>`)
 - Traits with `trait` declarations and `impl Trait for Type`
 - Type aliases, recursive types, destructuring, implicit returns
+- Modules and visibility — file-as-module, `import a.b.c { Item, Item as Alias, * }`, `public` keyword on declarations and struct fields (private by default)
 - Pipe operator (`|>`), string interpolation, block and line comments
 
 **Collections & Errors**
@@ -242,14 +272,15 @@ A [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.
 
 ## Architecture
 
-Phoenix is implemented in Rust as a Cargo workspace of 13 crates, each representing one stage of the compiler pipeline or an independent tool.
+Phoenix is implemented in Rust as a Cargo workspace of 14 crates, each representing one stage of the compiler pipeline or an independent tool.
 
 | Crate | Purpose |
 |-------|---------|
-| `phoenix-common` | Shared types (spans, diagnostics, source maps) |
+| `phoenix-common` | Shared types (spans, diagnostics, source maps, module paths) |
 | `phoenix-lexer` | Tokenization |
 | `phoenix-parser` | Recursive-descent parser and AST |
-| `phoenix-sema` | Semantic analysis (name resolution and type checking) |
+| `phoenix-modules` | Module resolver: maps an entry `.phx` file to a deterministic, lazy import-driven set of parsed modules |
+| `phoenix-sema` | Semantic analysis (name resolution, visibility, and type checking) |
 | `phoenix-interp` | Tree-walk interpreter |
 | `phoenix-ir` | SSA-style intermediate representation and AST-to-IR lowering |
 | `phoenix-ir-interp` | IR interpreter for round-trip verification |
@@ -264,7 +295,7 @@ Phoenix is implemented in Rust as a Cargo workspace of 13 crates, each represent
 
 ## Roadmap & Vision
 
-Phase 1 (core language) is complete; Phase 2.2 (native compilation via Cranelift) is complete; Phase 2.6 (module system and visibility) is the active work, with garbage collection, a WebAssembly backend, and JavaScript interop sequenced after it. Planned beyond that: async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language.
+Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), and Phase 2.6 (module system and visibility) are complete. Phase 2.3 (garbage collection and runtime) is the active work, with a WebAssembly backend and JavaScript interop sequenced after it. Planned beyond that: async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language.
 
 See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features.
 

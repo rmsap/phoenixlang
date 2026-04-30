@@ -50,7 +50,7 @@ When a generic function `f<T>(...)` defines a closure whose body or captures ref
 - `tests/fixtures/closures_over_generic_cross_width.phx` — `#[ignore]`d regression marker for the cross-width case.
 - `crates/phoenix-driver/tests/three_backend_matrix.rs::matrix_closures_over_generic_cross_width`.
 
-**Target phase:** Phase 2.6 if a module-system fixture trips the gap; otherwise Phase 3 (defer until generic-closure-over-T patterns appear in real code).
+**Target phase:** Phase 3. The Phase 2.6 module-system fixture set landed without tripping this gap.
 
 ### O(n²) `List.sortBy` insertion sort
 
@@ -206,6 +206,14 @@ Phase 2.6 made every `Type::Named` / `Type::Generic` / `Type::Dyn` payload carry
 **Target phase:** Phase 3 or later, demand-triggered by a sema-perf complaint.
 
 **Sibling site to fix in the same pass:** `phoenix-ir/src/lower.rs::LoweringContext::qualify` returns `Cow::Owned(qualified.to_string())` for the cross-module case — the borrowed `&str` from `resolve_visible` is bound to `&self` (via `self.check`), so a longer-lived `Cow<'a, str>` API would let the cross-module case stay zero-alloc too. That's a wider refactor (callers' lifetimes would have to thread `'a`), but worth doing alongside the sema-side change so both layers' allocation profiles improve in lockstep.
+
+### `phoenix-modules` `EscapesRoot` resolver guard is untested
+
+`phoenix-modules` carries a defensive `ResolveError::EscapesRoot` variant for the case where an import probe resolves outside the project root (`dirname(entry_file)`). The Phase 2.6 exit criterion for "module-resolver error paths report cleanly" ticked on *unrepresentability* — the import grammar today has no `..` syntax and no other way to express a root-escaping path, so no live test exercises this branch. The guard is correct as written but bit-rot risk is real: a future symlink-via-`mod.phx` or a relative-path grammar extension could make the path reachable, and there's no regression test pinning the diagnostic shape today.
+
+**File:** `crates/phoenix-modules/src/lib.rs` (`ResolveError::EscapesRoot` + the probe-canonicalization site that emits it).
+**Recommendation:** add a unit test in `phoenix-modules` that constructs a synthetic `EscapesRoot` resolver input directly (bypassing the grammar) and asserts the rendered diagnostic. Cheap to write today, mechanical to do; the alternative is discovering the regression at the moment a grammar change first makes it reachable.
+**Target phase:** opportunistic — pair with whichever change first makes a root-escaping import expressible (symlinked `mod.phx`, relative-path grammar, or a `phoenix-modules` API consumer outside the parser).
 
 ### `drain_remaining_into` callback duplication in `resolved.rs`
 
