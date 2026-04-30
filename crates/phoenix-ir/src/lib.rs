@@ -37,6 +37,7 @@ pub mod value_alloc;
 /// IR verification (structural invariants).
 pub mod verify;
 
+mod default_wrappers;
 /// AST-to-IR lowering pass.
 pub mod lower;
 mod lower_decl;

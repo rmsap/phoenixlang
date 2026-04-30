@@ -193,6 +193,29 @@ pub struct IrModule {
     pub function_index: HashMap<String, FuncId>,
     /// Method dispatch table: `(type_name, method_name)` → [`FuncId`].
     pub method_index: HashMap<(String, String), FuncId>,
+    /// Default-argument wrapper registry, keyed by (callee FuncId,
+    /// param index). Populated by
+    /// [`crate::default_wrappers::synthesize_default_wrappers`] for
+    /// every **non-generic** (function or method, parameter) pair
+    /// whose default expression is not a pure literal — those defaults
+    /// are lowered once into a synthesized zero-arg wrapper function
+    /// so foreign callers don't see private symbols the default may
+    /// reference. Generic callees are excluded by sema's
+    /// `default_needs_wrapper` gate (wrapping them would require
+    /// per-specialization cloning — a deferred follow-on); their
+    /// defaults stay on the inline path, which is privacy-safe within
+    /// a module.
+    ///
+    /// Caller rewrite consults this at every call site that would
+    /// otherwise inline the default expression: if a wrapper exists
+    /// for `(callee, param_idx)`, emit `Op::Call(wrapper_id, [], [])`
+    /// instead. See the "Default-expression visibility across module
+    /// boundaries" bug-closure entry in `docs/phases/phase-2.md`
+    /// (under §2.6 → "Bugs closed in this phase").
+    ///
+    /// Empty when every default is a pure literal, which is the
+    /// common case in single-file programs.
+    pub default_wrapper_index: HashMap<(FuncId, usize), FuncId>,
     /// Trait-object vtable registry: `(concrete_type, trait_name)` →
     /// ordered list of `(method_name, FuncId)` pairs.
     ///
@@ -461,6 +484,7 @@ impl IrModule {
             struct_type_params: HashMap::new(),
             function_index: HashMap::new(),
             method_index: HashMap::new(),
+            default_wrapper_index: HashMap::new(),
             dyn_vtables: HashMap::new(),
             traits: HashMap::new(),
             user_method_offset: 0,

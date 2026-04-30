@@ -93,6 +93,12 @@ pub fn lower_modules(
     ctx.register_builtin_enum_layouts();
     ctx.register_declarations();
 
+    // Pass 1.5 — see [`crate::default_wrappers`] for the rationale.
+    // Must run after Pass 1 (so wrapper bodies can refer to function
+    // stubs by `FuncId`) and before Pass 2 (so call sites consult
+    // `default_wrapper_index` instead of inlining AST defaults).
+    crate::default_wrappers::synthesize_default_wrappers(&mut ctx);
+
     // Pass 2 — lower each module's function bodies with `current_module`
     // set to that module's path. This is what lets bare-name lookups
     // inside body-lowering (`function_index.get(&name)`,
@@ -330,6 +336,14 @@ impl<'a> LoweringContext<'a> {
     /// surrender the [`IrModule`]. Shared finishing step between
     /// [`lower`] (single-file) and [`lower_modules`] (multi-module) so
     /// the two entry points cannot drift on what "done lowering" means.
+    ///
+    /// Default-argument wrapper synthesis is **not** part of `finish`;
+    /// it runs earlier as Pass 1.5 between declaration registration
+    /// and body lowering — see [`crate::default_wrappers`] for the
+    /// reasons. By the time `finish` runs, every wrapper is already
+    /// present in `module.functions` and indexed in
+    /// `default_wrapper_index`, and monomorphization can treat them
+    /// like any other concrete function.
     fn finish(self) -> IrModule {
         let mut module = self.module;
         crate::monomorphize::monomorphize(&mut module);
@@ -346,6 +360,12 @@ impl<'a> LoweringContext<'a> {
 
         // Pass 1: Register all declarations (layouts, function stubs, indices).
         self.register_declarations();
+
+        // Pass 1.5 — see [`crate::default_wrappers`] for the rationale.
+        // Must run after Pass 1 (so wrapper bodies can refer to function
+        // stubs by `FuncId`) and before Pass 2 (so call sites consult
+        // `default_wrapper_index` instead of inlining AST defaults).
+        crate::default_wrappers::synthesize_default_wrappers(self);
 
         // Pass 2: Lower all function bodies.
         self.lower_function_bodies(program);

@@ -559,15 +559,22 @@ impl<'a> LoweringContext<'a> {
     /// `site_desc` identifies the callee for panic messages (e.g.
     /// `"free function `foo`"` or `"method `Counter.bump`"`).
     ///
-    /// **Phase 2.6 tripwire:** this inlines the callee's default
-    /// expression into the caller's IR.  Once modules + `public`/private
-    /// land, a default referencing a module-private item would leak
-    /// that item's symbol to every caller.  Fix via synthesized public
-    /// wrappers at that point — see known-issues.md
-    /// "Default-expression visibility across module boundaries".
+    /// **Default materialization.** For every missing slot, this
+    /// helper first probes
+    /// [`crate::module::IrModule::default_wrapper_index`] for a
+    /// `(callee_id, slot_idx)` entry; if present, emits a zero-arg
+    /// call to the synthesized wrapper, otherwise inlines the AST
+    /// default expression at the caller. `callee_id = None` (built-in
+    /// methods like `Option.unwrap`) skips the probe — those carry no
+    /// `FuncId` and have no defaults today, so the missing-slot loop
+    /// is a no-op for them. See [`crate::default_wrappers`] for the
+    /// full design and the "Default-expression visibility across module
+    /// boundaries" bug-closure entry in `docs/phases/phase-2.md` (§2.6)
+    /// for the privacy rationale.
     #[allow(clippy::too_many_arguments)] // parameters are all distinct inputs; grouping would obscure, not clarify
     fn assemble_call_args(
         &mut self,
+        callee_id: Option<FuncId>,
         total: usize,
         positional: &[ValueId],
         named: &[(String, ValueId)],
@@ -607,21 +614,61 @@ impl<'a> LoweringContext<'a> {
             }
         }
 
-        // Pre-collect missing (slot, expr) pairs.  `defaults` was
-        // cloned out of whatever owning borrow the caller held, so
-        // this loop doesn't hold anything that conflicts with
-        // `lower_expr(&mut self)` below.
-        let mut missing: Vec<(usize, Expr)> = Vec::new();
+        // Pre-collect missing slots. For each, check whether sema +
+        // default-wrapper synthesis registered a wrapper for
+        // `(callee_id, idx)` — if so, emit a zero-arg call to the
+        // wrapper. Otherwise fall back to the inline path: lower the
+        // AST default expression at the caller. The inline path is
+        // the live (not legacy) materialization for pure-literal
+        // defaults — privacy-safe by construction, cheaper than an
+        // extra function-call hop. `defaults` was cloned out of
+        // whatever owning borrow the caller held, so the loop
+        // doesn't hold anything conflicting with `&mut self` below.
+        let mut missing: Vec<(usize, MissingFill)> = Vec::new();
         for (i, slot) in slots.iter().enumerate() {
             if slot.is_some() {
                 continue;
             }
-            if let Some(expr) = defaults.get(&i) {
-                missing.push((i, expr.clone()));
+            // Wrapper-index probe is only meaningful when we have a
+            // real callee FuncId; built-in methods carry `None` and
+            // skip straight to the inline path.
+            let wrapper_id =
+                callee_id.and_then(|cid| self.module.default_wrapper_index.get(&(cid, i)).copied());
+            if let Some(wrapper_id) = wrapper_id {
+                missing.push((i, MissingFill::Wrapper(wrapper_id)));
+            } else if let Some(expr) = defaults.get(&i) {
+                missing.push((i, MissingFill::Inline(expr.clone())));
             }
         }
-        for (idx, expr) in missing {
-            let val = self.lower_expr(&expr);
+        for (idx, fill) in missing {
+            let val = match fill {
+                MissingFill::Wrapper(wrapper_id) => {
+                    // Zero-arg call to the synthesized wrapper. Result
+                    // type comes from the wrapper's IR signature so the
+                    // SSA value is correctly typed at the call site.
+                    //
+                    // Invariant: this `return_type` equals the
+                    // callee's `param_types[slot_idx]` — by
+                    // construction, `register_wrapper_stub` derives
+                    // the wrapper's return type from the same sema
+                    // type that produced the slot. Once
+                    // monomorphization extends to default wrappers,
+                    // that invariant must be re-established at
+                    // specialization time; if it ever drifts, it will
+                    // surface here as the SSA value carrying a
+                    // different type than the callee expects.
+                    let result_type = self.module.functions[wrapper_id.index()]
+                        .func()
+                        .return_type
+                        .clone();
+                    self.emit(
+                        Op::Call(wrapper_id, Vec::new(), Vec::new()),
+                        result_type,
+                        Some(call_span),
+                    )
+                }
+                MissingFill::Inline(expr) => self.lower_expr(&expr),
+            };
             slots[idx] = Some(val);
         }
 
@@ -677,6 +724,7 @@ impl<'a> LoweringContext<'a> {
 
         let site_desc = format!("free function `{func_name}`");
         self.assemble_call_args(
+            Some(func_id),
             total,
             positional,
             named,
@@ -709,11 +757,19 @@ impl<'a> LoweringContext<'a> {
         // Single MethodInfo lookup; clone out what we need so the
         // immutable borrow on `self.check` releases before
         // `assemble_call_args(&mut self)` runs.
-        let (total, param_names, defaults) = self
+        //
+        // Built-in methods (`Option.unwrap`, etc.) carry `func_id =
+        // None` because the Cranelift backend inlines them — passing
+        // `None` skips the wrapper-index probe entirely. Built-ins
+        // ship with no defaults today (`default_param_exprs` is always
+        // empty), so the missing-slot loop in `assemble_call_args`
+        // never iterates and the inline-vs-wrapper decision is moot.
+        let (callee_id, total, param_names, defaults) = self
             .check
             .method_info_by_name(type_name, method_name)
             .map(|info| {
                 (
+                    info.func_id,
                     info.params.len(),
                     info.param_names.clone(),
                     info.default_param_exprs.clone(),
@@ -729,6 +785,7 @@ impl<'a> LoweringContext<'a> {
 
         let site_desc = format!("method `{type_name}.{method_name}`");
         self.assemble_call_args(
+            callee_id,
             total,
             positional,
             &[],
@@ -1308,4 +1365,21 @@ impl<'a> LoweringContext<'a> {
         };
         self.emit(op, IrType::Bool, span)
     }
+}
+
+/// How to fill an empty argument slot during default materialization.
+/// Used by `assemble_call_args` to choose between the wrapper-call
+/// path and the legacy inline-default-expression path. See the
+/// default-materialization comment in `assemble_call_args` for the
+/// full design and the `default_wrappers` module for the wrapper
+/// synthesis pass.
+enum MissingFill {
+    /// A synthesized wrapper exists for this `(callee, slot_idx)` —
+    /// emit `Op::Call(wrapper_id, [], [])` to evaluate the default
+    /// once in the callee's module's scope.
+    Wrapper(FuncId),
+    /// No wrapper — fall back to inlining the AST default expression
+    /// at the caller's site. Used for pure-literal defaults (the
+    /// common case in single-file programs).
+    Inline(Expr),
 }

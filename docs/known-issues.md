@@ -146,26 +146,6 @@ Default-argument values work for inherent-impl methods as of 2026-04-24 (see [ph
 
 **Tripwire:** a test shape like `trait Bumpable { function bump(by: Int = 1) -> Int } ... x.bump()` on a trait-bound `x: T` fails at sema with "method takes 1 argument, got 0".  **Workaround:** declare the default at the `impl` site rather than the trait site.  **Target phase:** Phase 3 — pairs naturally with the bidirectional-inference rework since trait-method default lowering shares the placeholder-resolution machinery.
 
-### Default-expression visibility across module boundaries (Phase 2.6 tripwire)
-
-Default-argument expressions are lowered at the *caller's* call site (see [design-decisions.md: *Default-argument lowering strategy*](design-decisions.md#default-argument-lowering-strategy)).  Today every Phoenix program is single-module, so "caller's scope" and "callee's scope" coincide and visibility is a non-issue.  Phase 2.6 (module system + `public` / private) breaks this:
-
-```phoenix
-// models/user.phx
-function hashPassword(plaintext: String) -> String { ... }  // module-private
-public function createUser(name: String, hash: String = hashPassword("")) -> User { ... }
-
-// main.phx
-import models.user { createUser }
-function main() { createUser("Alice") }  // inlines hashPassword("") into main.phx's IR
-```
-
-Three failure modes once modules land: (1) privacy leak — `main.phx`'s compiled output references the private `hashPassword` symbol directly, forcing implicit re-export; (2) contract leak — renaming / changing `hashPassword` silently breaks every caller of `createUser`, yet the module author expected it to be safely private; (3) sema doesn't detect the shape today because defaults are type-checked in the callee's module with full access.
-
-**Planned fix:** Synthesize a private-wrapping helper.  When a public function's default references any private item, the compiler emits a hidden public wrapper (`__default_createUser_hash()`) in the callee's module that can see the private internals.  The caller's IR calls the wrapper, not the private symbol directly.  Preserves the current caller-side ABI; private symbols stay private at the binary level.  Small semantic shift — defaults referencing private state evaluate in the callee's scope rather than the caller's — accepted and to be documented at that time.  Alternatives (reject at sema; declare not-a-problem) rejected for restrictiveness / footgun reasons respectively.
-
-**File:** `phoenix-ir/src/lower_expr.rs` (`merge_call_args`) is where the inlining happens today; Phase 2.6 sema will gain the visibility-at-default-checking pass and the wrapper-synthesis IR pass.  **Tripwire:** none today — no `#[ignore]`d test, since the shape is unreachable from single-module source.  When modules land, add a test that a public function with a private-referencing default compiles (via the wrapper) and that the private symbol is *not* exported.  **Target phase:** Phase 2.6 — lands with the module-system work itself; cannot be deferred beyond it.
-
 ### Trait bounds don't propagate through nested generic calls
 
 `function outer<T: Drawable>(x: T) { return inner(x) }` where `inner<U: Drawable>(y: U) { ... }` is rejected by sema with "type `T` does not implement trait `Drawable`".  At the call site to `inner`, sema's trait-bound inference doesn't see that `T: Drawable` (known from the outer function's bound) satisfies `U: Drawable`.  The fix lives in bound-resolution: when inferring type args for a call whose formal has a trait bound, and the inferred concrete type is itself a type variable, consult the enclosing scope's bound environment before rejecting.

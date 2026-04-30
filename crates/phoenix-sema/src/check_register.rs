@@ -12,10 +12,70 @@ use crate::types::Type;
 use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
-    EnumDecl, FunctionDecl, ImplBlock, InlineTraitImpl, Param, StructDecl, TraitDecl,
-    TypeAliasDecl, TypeExpr, Visibility,
+    EnumDecl, Expr, FunctionDecl, ImplBlock, InlineTraitImpl, LiteralKind, Param, StructDecl,
+    TraitDecl, TypeAliasDecl, TypeExpr, UnaryOp, Visibility,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// True for default-argument expressions that can be safely inlined at
+/// every call site without privacy concerns: any `Literal(...)` (Int /
+/// Float / Bool — and `String`, whose contents are user-controlled but
+/// reference no symbols, so it's still privacy-safe) plus
+/// `Unary(Neg, Literal(Int|Float))`, which is how the parser models
+/// negative numeric literals (`-1`, `-3.14`) so they don't trigger
+/// needless wrapper synthesis.
+///
+/// Anything else (a call, an identifier, a struct literal, a binary
+/// op, an interpolated string, …) is conservatively treated as
+/// scope-dependent: it may reference symbols whose visibility differs
+/// between the callee's module and a foreign caller's module, so it
+/// must be lowered as a synthesized wrapper in the callee's scope. See
+/// the "Default-expression visibility across module boundaries"
+/// bug-closure entry in `docs/phases/phase-2.md` (§2.6) for the design.
+///
+/// Over-approximates: `Int = 1 + 2` would still be wrapped today even
+/// though the expression is closed. The wrapper-call cost is one
+/// indirection vs. an inlined two-instruction add — negligible at IR
+/// scale, and the simplicity of the rule prevents subtle leaks.
+///
+/// TODO(perf): once a const-eval / closed-form-expression pass exists,
+/// expand this to recognize any expression that evaluates to a constant
+/// without referencing user symbols (e.g. `1 + 2`, string concat of
+/// literals). Until then the conservative literal-only rule keeps the
+/// privacy invariant trivially auditable.
+fn is_pure_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Unary(u) if matches!(u.op, UnaryOp::Neg) => matches!(
+            &u.operand,
+            Expr::Literal(lit)
+                if matches!(lit.kind, LiteralKind::Int(_) | LiteralKind::Float(_))
+        ),
+        _ => false,
+    }
+}
+
+/// Compute the `default_needs_wrapper` slot set for a callee, gated on
+/// `is_generic`. Generic callees fall back to the inline-default path
+/// (returns an empty set) because wrapping their defaults would
+/// require per-specialization wrapper cloning — a deferred follow-on.
+/// Non-generic callees flag every slot whose default is not a pure
+/// literal. Shared by free-function and method registration so the
+/// two paths can't drift on the gate or the per-slot rule.
+fn compute_default_needs_wrapper(
+    default_param_exprs: &HashMap<usize, Expr>,
+    is_generic: bool,
+) -> HashSet<usize> {
+    if is_generic {
+        HashSet::new()
+    } else {
+        default_param_exprs
+            .iter()
+            .filter(|(_, e)| !is_pure_literal(e))
+            .map(|(i, _)| *i)
+            .collect()
+    }
+}
 
 impl Checker {
     /// Pre-registers built-in `Option<T>` and `Result<T, E>` enums along with
@@ -188,6 +248,18 @@ impl Checker {
                     func.name, qualified
                 )
             });
+        // Wrapper synthesis is gated on non-generic callees today —
+        // sema accepts non-trivial defaults on generic functions when
+        // the default's lowered type has no free type variables, but
+        // wrapping them would require a per-specialization clone
+        // (analogous to how struct-monomorphization clones methods on
+        // generic structs). Defer that to a follow-on. In the
+        // meantime, generic callees fall back to the inline-default
+        // path, which is privacy-safe within a module — the
+        // `<T: Trait>` bound style is the typical generic-default
+        // pattern and rarely references private helpers.
+        let default_needs_wrapper =
+            compute_default_needs_wrapper(&default_param_exprs, !func.type_params.is_empty());
         self.functions.insert(
             qualified,
             FunctionInfo {
@@ -198,6 +270,7 @@ impl Checker {
                 params,
                 param_names,
                 default_param_exprs,
+                default_needs_wrapper,
                 return_type,
                 visibility: func.visibility,
                 def_module: self.current_module.clone(),
@@ -725,6 +798,16 @@ impl Checker {
                 )
             });
             let has_self = func.params.first().is_some_and(|p| p.name == "self");
+            // Wrapper synthesis is non-generic-only today (see the
+            // matching gate in `register_function`). A method is
+            // generic if either its own type-params are non-empty or
+            // its receiver type is generic — both cases need
+            // per-specialization wrapper cloning, which is a
+            // follow-on. Until then, generic methods stay on the
+            // inline-default path.
+            let is_generic = !parent_type_params.is_empty() || !func.type_params.is_empty();
+            let default_needs_wrapper =
+                compute_default_needs_wrapper(&default_param_exprs, is_generic);
             methods_to_add.push((
                 func.name.clone(),
                 MethodInfo {
@@ -733,6 +816,7 @@ impl Checker {
                     params,
                     param_names,
                     default_param_exprs,
+                    default_needs_wrapper,
                     return_type,
                     type_params: func.type_params.clone(),
                     has_self,

@@ -80,6 +80,18 @@ pub struct FunctionInfo {
     /// `default_param_exprs.contains_key(&i)`; callers iterating
     /// defaults use `default_param_exprs.keys()`.
     pub default_param_exprs: HashMap<usize, Expr>,
+    /// Parameter indices whose default expression is *not* a pure
+    /// literal — these defaults are non-trivially scope-dependent and
+    /// must be lowered as a synthesized wrapper function in the
+    /// callee's module (so foreign callers can't see private symbols
+    /// the default references). See the "Default-expression visibility
+    /// across module boundaries" bug-closure entry in
+    /// `docs/phases/phase-2.md` (§2.6) for the design.
+    ///
+    /// Populated at registration time. Subset of
+    /// `default_param_exprs.keys()`. Empty when every default is a
+    /// bare literal (the common case).
+    pub default_needs_wrapper: HashSet<usize>,
     /// The resolved return type.
     pub return_type: Type,
     /// Module visibility (public or private). Default: private.
@@ -203,6 +215,11 @@ pub struct MethodInfo {
     /// `merge_method_call_args` and by the AST interpreter's
     /// `call_method`.  `self` is never defaulted and never appears here.
     pub default_param_exprs: HashMap<usize, Expr>,
+    /// Parameter indices whose default expression is not a pure literal
+    /// and therefore needs a synthesized wrapper function for cross-
+    /// module-safe inlining. Same shape as
+    /// [`FunctionInfo::default_needs_wrapper`].
+    pub default_needs_wrapper: HashSet<usize>,
     /// The method's return type.
     pub return_type: Type,
     /// The method's own generic type parameters in source order.
@@ -237,6 +254,7 @@ impl MethodInfo {
             params,
             param_names,
             default_param_exprs: HashMap::new(),
+            default_needs_wrapper: HashSet::new(),
             return_type,
             type_params: Vec::new(),
             has_self: true,

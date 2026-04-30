@@ -1969,3 +1969,501 @@ fn lower_modules_single_entry_uses_bare_keys() {
         ir_module.function_index.keys().collect::<Vec<_>>()
     );
 }
+
+/// Default-argument wrapper synthesis.
+///
+/// A function with a non-literal default expression must:
+/// 1. Get an entry in `default_wrapper_index` for that param slot.
+/// 2. Have a synthesized wrapper function appended past
+///    `synthesized_start`, named `__default_fn<FID>_<callee>_<idx>`.
+/// 3. Have any caller's omitted-arg slot rewritten to a zero-arg
+///    `Op::Call(wrapper_id, [], [])` instead of an inlined default
+///    expression.
+#[test]
+fn default_wrapper_synthesized_for_non_literal_default() {
+    let src = "function helper() -> Int { 42 }\n\
+               function f(x: Int = helper()) -> Int { x }\n\
+               function main() -> Int { f() }";
+    let module = lower_source(src);
+
+    // Sema's FuncId for `f` matches the IR's function_index key.
+    let f_id = *module
+        .function_index
+        .get("f")
+        .expect("`f` should be in function_index");
+
+    // (1) The wrapper index has an entry for (f, slot 0).
+    let wrapper_id = *module
+        .default_wrapper_index
+        .get(&(f_id, 0))
+        .expect("default_wrapper_index should contain (f_id, 0)");
+
+    // (2) The wrapper exists in the function table, named per the
+    //     `__default_fn{FID}_<callee>_<slot>` convention (the FID
+    //     prefix disambiguates against method-default wrappers), and
+    //     was appended past `synthesized_start` (no FuncId clash with
+    //     sema-pre-allocated ids).
+    let wrapper = module.functions[wrapper_id.index()].func();
+    assert_eq!(wrapper.name, format!("__default_fn{}_f_0", f_id.0));
+    assert!(wrapper_id.0 >= module.synthesized_start);
+    assert!(wrapper.param_types.is_empty());
+    assert_eq!(wrapper.return_type, IrType::I64);
+
+    // (3) `main`'s body calls `f` with one argument — the wrapper —
+    //     not an inlined `helper()` call. Inspect ops to confirm.
+    let main_id = *module
+        .function_index
+        .get("main")
+        .expect("`main` should be in function_index");
+    let main_fn = module.functions[main_id.index()].func();
+    let mut saw_wrapper_call = false;
+    let mut saw_f_call = false;
+    for block in &main_fn.blocks {
+        for instr in &block.instructions {
+            match &instr.op {
+                Op::Call(callee, _, args) if *callee == wrapper_id => {
+                    saw_wrapper_call = true;
+                    assert!(args.is_empty(), "wrapper call must take no args");
+                }
+                Op::Call(callee, _, args) if *callee == f_id => {
+                    saw_f_call = true;
+                    assert_eq!(
+                        args.len(),
+                        1,
+                        "f's call site must pass one arg (the wrapper result)"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_wrapper_call, "main's body must call the wrapper");
+    assert!(saw_f_call, "main's body must call f");
+}
+
+/// Pure-literal defaults must NOT trigger wrapper synthesis — the
+/// inline-default path is the legacy behavior and stays the default
+/// (cheaper, no extra function hop). Also verifies that the inlined
+/// path materializes the literal as an `IConst` directly at the call
+/// site (no `Op::Call` to a wrapper sneaks in).
+#[test]
+fn pure_literal_default_does_not_synthesize_wrapper() {
+    let src = "function f(x: Int = 1) -> Int { x }\n\
+               function main() -> Int { f() }";
+    let module = lower_source(src);
+    assert!(
+        module.default_wrapper_index.is_empty(),
+        "pure-literal defaults must not synthesize wrappers; got: {:?}",
+        module.default_wrapper_index
+    );
+    // Strong guard: no IR function at all is a `__default_*` wrapper.
+    // (`function_index` never gets wrappers regardless, so this checks
+    // the function table itself.)
+    assert!(
+        !module
+            .functions
+            .iter()
+            .any(|s| s.func().name.starts_with("__default_")),
+        "no `__default_*` IrFunction should be appended for literal-only defaults"
+    );
+    // Function-table size matches sema's pre-allocated callable count
+    // (no synthesized wrappers were appended). NOTE: this equality only
+    // holds because the fixture has no other source of synthesized
+    // functions (no closures, no monomorphized specializations). If
+    // the fixture is ever extended with a generic call site or a
+    // closure, switch to checking that no function past
+    // `synthesized_start` has a `__default_*` name rather than
+    // counting them.
+    assert_eq!(
+        module.functions.len() as u32,
+        module.synthesized_start,
+        "no functions should be appended past `synthesized_start` for literal-only defaults"
+    );
+
+    // `main` must call `f` with one arg, and that arg must come from
+    // an inlined `ConstI64 1` in `main` itself — not a Call to anything.
+    let f_id = *module.function_index.get("f").expect("f in function_index");
+    let main_id = *module
+        .function_index
+        .get("main")
+        .expect("main in function_index");
+    let main_fn = module.functions[main_id.index()].func();
+    let mut saw_const_one = false;
+    let mut saw_f_call_with_one_arg = false;
+    let mut other_calls = 0usize;
+    for block in &main_fn.blocks {
+        for instr in &block.instructions {
+            match &instr.op {
+                Op::ConstI64(1) => saw_const_one = true,
+                Op::Call(callee, _, args) if *callee == f_id => {
+                    saw_f_call_with_one_arg = args.len() == 1;
+                }
+                Op::Call(_, _, _) => other_calls += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_const_one,
+        "main must materialize the inlined default as `ConstI64 1`"
+    );
+    assert!(
+        saw_f_call_with_one_arg,
+        "main must call f with exactly one argument (the inlined default)"
+    );
+    assert_eq!(
+        other_calls, 0,
+        "no other Call ops should appear in main — the default must be inlined, not wrapper-called"
+    );
+}
+
+/// Built-in methods (`Option.unwrap`, `Option.unwrapOr`, …) carry
+/// `func_id = None` in `MethodInfo` because the Cranelift backend
+/// inlines them. The `assemble_call_args` wrapper-index probe is
+/// `callee_id.and_then(...)` so `None` correctly skips it. No built-in
+/// has a default today, but guard the lowering path — a regression
+/// that crashed `assemble_call_args` for `callee_id = None` would
+/// silently break every built-in call.
+#[test]
+fn builtin_method_call_lowers_without_wrapper_probe() {
+    let src = "function main() -> Int {\n\
+                   let x: Option<Int> = Some(5)\n\
+                   x.unwrapOr(0)\n\
+               }";
+    let module = lower_source(src);
+    assert!(
+        module.default_wrapper_index.is_empty(),
+        "built-in method calls should not synthesize wrappers; got: {:?}",
+        module.default_wrapper_index
+    );
+    assert_eq!(
+        module.functions.len() as u32,
+        module.synthesized_start,
+        "no functions should be appended past `synthesized_start` for a program \
+         that only calls built-in methods"
+    );
+}
+
+/// Chained defaults: `f(x = helper())` and `g(y = f())` both need
+/// wrapping. Wrapper `W_g` is synthesized in `g`'s scope and its body
+/// lowers `f()` — that call site must consult `default_wrapper_index`
+/// and emit `Op::Call(W_f, [], [])` instead of inlining `helper()`.
+/// This is the regression test for the wrapper-ordering bug fixed by
+/// splitting synthesis into a register-all-then-lower-all two-pass.
+#[test]
+fn chained_default_wrappers_call_each_other_not_inlined() {
+    let src = "function helper() -> Int { 42 }\n\
+               function f(x: Int = helper()) -> Int { x }\n\
+               function g(y: Int = f()) -> Int { y }\n\
+               function main() -> Int { g() }";
+    let module = lower_source(src);
+
+    let helper_id = *module.function_index.get("helper").unwrap();
+    let f_id = *module.function_index.get("f").unwrap();
+    let g_id = *module.function_index.get("g").unwrap();
+    let w_f = *module
+        .default_wrapper_index
+        .get(&(f_id, 0))
+        .expect("wrapper for f's default");
+    let w_g = *module
+        .default_wrapper_index
+        .get(&(g_id, 0))
+        .expect("wrapper for g's default");
+
+    // W_g's body lowers `f()` with one missing default. The wrapper
+    // index already contains `(f_id, 0) -> w_f` by the time W_g is
+    // lowered (Pass A registered every entry up front), so W_g must
+    // emit `Op::Call(w_f, [], [])` to fill the slot — not an inlined
+    // `helper()` call.
+    let w_g_fn = module.functions[w_g.index()].func();
+    let mut saw_wf_call = false;
+    let mut saw_helper_call = false;
+    let mut saw_f_call = false;
+    for block in &w_g_fn.blocks {
+        for instr in &block.instructions {
+            if let Op::Call(callee, _, args) = &instr.op {
+                if *callee == w_f && args.is_empty() {
+                    saw_wf_call = true;
+                } else if *callee == helper_id {
+                    saw_helper_call = true;
+                } else if *callee == f_id {
+                    saw_f_call = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_wf_call,
+        "W_g must call W_f (the wrapper for f's default), not inline helper()"
+    );
+    assert!(
+        !saw_helper_call,
+        "W_g must NOT directly call helper() — that would defeat the privacy guarantee"
+    );
+    assert!(
+        saw_f_call,
+        "W_g must still call f itself (the outer call wrapped by W_g)"
+    );
+}
+
+/// Method default referencing a free function generates a wrapper
+/// under the `__default_m{FID}_{Type}__{method}_{slot}` naming scheme,
+/// and a method-call site with a missing default routes through that
+/// wrapper.
+#[test]
+fn method_default_wrapper_synthesized() {
+    // Just declare; no call site needed to verify wrapper synthesis.
+    // (A method call site is exercised separately by the
+    // multi-module privacy test below.)
+    let src = "function helper() -> Int { 7 }\n\
+               struct Counter { Int n }\n\
+               impl Counter {\n\
+                   public function bump(self, by: Int = helper()) -> Int { self.n + by }\n\
+               }\n\
+               function main() {}";
+    let module = lower_source(src);
+
+    // Method FuncId comes from `method_index`; `bump` takes self at
+    // slot 0 in the IR-level signature but the user-visible default
+    // is at slot 0 of the `params` vector (self excluded), which is
+    // the slot key used in `default_wrapper_index`.
+    let bump_id = *module
+        .method_index
+        .get(&("Counter".to_string(), "bump".to_string()))
+        .expect("Counter.bump in method_index");
+    let wrapper_id = *module
+        .default_wrapper_index
+        .get(&(bump_id, 0))
+        .expect("wrapper for Counter.bump's `by` default");
+
+    let wrapper = module.functions[wrapper_id.index()].func();
+    assert_eq!(
+        wrapper.name,
+        format!("__default_m{}_Counter__bump_0", bump_id.0),
+        "method-default wrapper must use the `__default_m{{FID}}_{{Type}}__{{method}}_{{slot}}` naming"
+    );
+    assert!(wrapper.param_types.is_empty());
+    assert_eq!(wrapper.return_type, IrType::I64);
+
+    // Wrapper body resolves `helper` in the same scope where bump
+    // was declared, so it must contain a direct Call to helper.
+    let helper_id = *module.function_index.get("helper").unwrap();
+    let wrapper_calls_helper = wrapper
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|i| matches!(&i.op, Op::Call(target, _, _) if *target == helper_id));
+    assert!(
+        wrapper_calls_helper,
+        "wrapper body must call `helper` — the resolution that the wrapper preserves in the callee's scope"
+    );
+}
+
+/// Multi-module wrapper synthesis: when a non-entry module has a
+/// function whose default references a private helper in the same
+/// module, the wrapper is synthesized in that module's scope (so the
+/// private symbol resolves against `lib`'s function table) and the
+/// `default_wrapper_index` entry is keyed by the qualified callee
+/// FuncId. A call site within `lib` that omits the defaulted arg
+/// routes through the wrapper rather than inlining `_secret`, so
+/// `_secret` is never duplicated into a foreign caller's IR.
+#[test]
+fn multi_module_default_wrapper_routes_through_wrapper() {
+    // Entry is intentionally trivial — we exercise the multi-module
+    // lowering path (`lower_modules`) and verify wrapper synthesis
+    // works when the defaulted callee lives in a non-entry module.
+    let entry = make_module(ModulePath::entry(), "function main() {}", SourceId(0), true);
+    let lib = make_module(
+        ModulePath(vec!["lib".to_string()]),
+        "function _secret() -> Int { 99 }\n\
+         public function greet(x: Int = _secret()) -> Int { x }\n\
+         public function caller() -> Int { greet() }",
+        SourceId(1),
+        false,
+    );
+
+    let modules = vec![entry, lib];
+    let analysis = checker::check_modules(&modules);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "sema errors: {:?}",
+        analysis
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+
+    let ir_module = lower_modules(&modules, &analysis.module);
+
+    let greet_id = *ir_module
+        .function_index
+        .get("lib::greet")
+        .expect("lib::greet should be qualified in function_index");
+    let secret_id = *ir_module
+        .function_index
+        .get("lib::_secret")
+        .expect("lib::_secret should be in function_index (private but registered)");
+    let caller_id = *ir_module
+        .function_index
+        .get("lib::caller")
+        .expect("lib::caller should be in function_index");
+    let wrapper_id = *ir_module
+        .default_wrapper_index
+        .get(&(greet_id, 0))
+        .expect("wrapper for lib::greet's default must be indexed by greet's qualified FuncId");
+
+    // The wrapper itself must call `_secret` — its body lowers in
+    // `lib`'s scope, where `_secret` is visible.
+    let wrapper_fn = ir_module.functions[wrapper_id.index()].func();
+    let wrapper_calls_secret = wrapper_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|i| matches!(&i.op, Op::Call(target, _, _) if *target == secret_id));
+    assert!(
+        wrapper_calls_secret,
+        "wrapper body must call `lib::_secret` — that's where the private resolution lives"
+    );
+
+    // `caller`'s body calls `greet()` with no args; the missing slot
+    // must be filled by a call to the wrapper, not by inlining
+    // `_secret()` into caller's body. If wrapper synthesis ever
+    // regresses to the inline-default path, `caller` would directly
+    // call `_secret` — that's exactly what we're guarding against.
+    let caller_fn = ir_module.functions[caller_id.index()].func();
+    let mut saw_wrapper_call = false;
+    let mut caller_calls_secret = false;
+    for block in &caller_fn.blocks {
+        for instr in &block.instructions {
+            if let Op::Call(callee, _, args) = &instr.op {
+                if *callee == wrapper_id && args.is_empty() {
+                    saw_wrapper_call = true;
+                } else if *callee == secret_id {
+                    caller_calls_secret = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_wrapper_call,
+        "lib::caller must fill greet's missing default by calling the wrapper"
+    );
+    assert!(
+        !caller_calls_secret,
+        "lib::caller must not directly call `_secret` — wrapper synthesis exists to keep that resolution \
+         in lib's scope, so foreign callers (entry, future imports) never see the private symbol"
+    );
+
+    // Privacy property end-to-end: across the *entire* IR module
+    // (every function in `ir_module.functions`, not just `caller`),
+    // the only direct call to `_secret` lives inside the wrapper.
+    // This is the load-bearing guarantee of the wrapper-synthesis
+    // design — if any caller (in `lib`, in `entry`, or any future
+    // module) ever inlines `_secret` into its own body, this count
+    // increases and the test fails. Until cross-module call sites
+    // can be exercised from this harness, this all-functions sweep
+    // is the strongest privacy assertion available.
+    let direct_secret_calls: usize = ir_module
+        .functions
+        .iter()
+        .flat_map(|slot| slot.func().blocks.iter())
+        .flat_map(|b| &b.instructions)
+        .filter(|i| matches!(&i.op, Op::Call(target, _, _) if *target == secret_id))
+        .count();
+    assert_eq!(
+        direct_secret_calls, 1,
+        "expected exactly one direct call to `lib::_secret` across the whole IR module \
+         (the one inside the wrapper); found {direct_secret_calls}. \
+         Anything more means the inline-default path leaked the private symbol into a \
+         non-wrapper function."
+    );
+}
+
+/// A closure-valued default — `function f(cb: (Int) -> Int = function(x:
+/// Int) -> Int { x * 2 }) -> Int { cb(10) }` — exercises a corner of
+/// the wrapper synthesis path that pure-literal and free-function
+/// defaults don't: the wrapper body itself appends a *new* closure
+/// `IrFunction` to the module while lowering the default expression.
+/// `with_synthetic_function` deliberately does *not* snapshot
+/// `closure_counter` (so closure names stay globally unique across
+/// the wrapper-pass / user-pass boundary), and a regression that
+/// reset or shared the counter would surface here as either a name
+/// collision or an unreachable closure body.
+#[test]
+fn closure_default_wrapper_synthesizes_and_lowers_closure() {
+    let src = "function f(cb: (Int) -> Int = function(x: Int) -> Int { x * 2 }) -> Int { cb(10) }\n\
+               function main() -> Int { f() }";
+    let module = lower_source(src);
+
+    let f_id = *module
+        .function_index
+        .get("f")
+        .expect("`f` should be in function_index");
+    let wrapper_id = *module
+        .default_wrapper_index
+        .get(&(f_id, 0))
+        .expect("closure-valued default must synthesize a wrapper");
+
+    // The wrapper exists, lives past `synthesized_start`, and its body
+    // is non-empty — verifying the closure-allocation path inside the
+    // wrapper actually ran.
+    let wrapper = module.functions[wrapper_id.index()].func();
+    assert!(wrapper_id.0 >= module.synthesized_start);
+    assert_eq!(wrapper.name, format!("__default_fn{}_f_0", f_id.0));
+    assert!(
+        !wrapper.blocks.is_empty(),
+        "wrapper body must contain at least the entry block + closure-alloc + return"
+    );
+
+    // The wrapper body must contain an Op::ClosureAlloc — that's the
+    // signature of "the closure literal was lowered into the wrapper."
+    // If a future change ever short-circuits closure-default lowering
+    // (e.g. emitting a direct Call to the closure body instead of
+    // packaging it as a closure value), this assertion would fail.
+    let saw_closure_alloc = wrapper
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|i| matches!(&i.op, Op::ClosureAlloc(_, _)));
+    assert!(
+        saw_closure_alloc,
+        "wrapper body must contain an Op::ClosureAlloc — the closure literal must lower in the wrapper"
+    );
+
+    // The closure function itself must be appended past
+    // `synthesized_start` — like the wrapper, it's a synthesized
+    // callable. Closure names are unique because `closure_counter`
+    // is shared (not snapshotted by `with_synthetic_function`); a
+    // collision here would indicate the counter was reset on
+    // wrapper-pass entry.
+    let closure_fns: Vec<&str> = module
+        .functions
+        .iter()
+        .map(|s| s.func().name.as_str())
+        .filter(|n| n.starts_with("closure_") || n.starts_with("__closure"))
+        .collect();
+    assert!(
+        !closure_fns.is_empty(),
+        "the closure literal in the default must produce a synthesized closure function; \
+         got module functions: {:?}",
+        module
+            .functions
+            .iter()
+            .map(|s| s.func().name.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // `main` calls the wrapper, never the inner closure body directly.
+    let main_id = *module.function_index.get("main").unwrap();
+    let main_fn = module.functions[main_id.index()].func();
+    let saw_wrapper_call = main_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|i| matches!(&i.op, Op::Call(t, _, args) if *t == wrapper_id && args.is_empty()));
+    assert!(
+        saw_wrapper_call,
+        "main must fill f's missing default by calling the closure-valued wrapper"
+    );
+}

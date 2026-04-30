@@ -22,7 +22,7 @@ use phoenix_common::ids::FuncId;
 use phoenix_common::module_path::module_qualify;
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{FunctionDecl, InlineTraitImpl, Param};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl Checker {
     /// Consume the pre-allocated `FuncId`s for a rejected type's inline
@@ -153,6 +153,10 @@ impl Checker {
             params,
             param_names,
             default_param_exprs,
+            // Orphan methods are unreachable at the call-site level —
+            // their parent decl was rejected, so no caller resolves
+            // through them. An empty wrapper-need set is correct.
+            default_needs_wrapper: HashSet::new(),
             return_type,
             type_params: func.type_params.clone(),
             has_self,
