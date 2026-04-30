@@ -405,12 +405,14 @@ fn cmd_ir(path: &str) {
 }
 
 fn cmd_run(path: &str) {
-    // The AST interpreter is single-module today, so this path feeds it
-    // only the entry program. `cmd_run_ir` (and `cmd_build`) take the
-    // full multi-module slice via `lower_modules`; the asymmetry is
-    // intentional until the AST interpreter learns to walk imports.
-    let (program, check_result) = parse_and_check(path);
-    if let Err(err) = interpreter::run(&program, check_result.module.lambda_captures) {
+    // The AST interpreter goes through `interpreter::run_modules` so
+    // multi-file programs work end-to-end (sema's `module_scopes`
+    // translate cross-module name references). For single-file
+    // inputs this reduces to the same behavior as the previous
+    // single-program path — entry module qualifies to bare, every
+    // name resolves identically.
+    let (modules, mut analysis, _sm) = parse_resolve_check(path);
+    if let Err(err) = interpreter::run_modules(&modules, &mut analysis) {
         eprintln!("runtime error: {}", err);
         process::exit(1);
     }

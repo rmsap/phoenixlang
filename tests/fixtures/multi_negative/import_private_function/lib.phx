@@ -1,0 +1,1 @@
+function secretHelper() -> Int { 42 }

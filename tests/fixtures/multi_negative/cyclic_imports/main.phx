@@ -1,0 +1,3 @@
+import a { fromA }
+
+function main() { print(fromA()) }

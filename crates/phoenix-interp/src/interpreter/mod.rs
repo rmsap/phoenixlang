@@ -1,3 +1,7 @@
+mod multi_module;
+
+pub use multi_module::run_modules;
+
 use crate::env::Environment;
 use crate::value::Value;
 use phoenix_common::span::Span;
@@ -146,9 +150,29 @@ pub(crate) struct EnumDef {
 }
 
 /// Method definition.
+///
+/// `module` is the module that *declared* this method's host type.
+/// `Some(...)` causes [`Interpreter::call_method`] to push the
+/// declaring module onto the module stack before evaluating the body
+/// (so cross-module name lookups in defaults / body resolve through
+/// the callee's scope). `None` is the single-file path that leaves
+/// the stack empty.
 #[derive(Debug, Clone)]
 pub(crate) struct MethodDef {
     func: FunctionDecl,
+    module: Option<Rc<phoenix_common::module_path::ModulePath>>,
+}
+
+/// Free-function definition with its declaring module attached.
+///
+/// Bundling the function declaration with its `Option<Rc<ModulePath>>`
+/// in a single map value (rather than two parallel maps) makes
+/// "function added without module recorded" structurally impossible —
+/// every call site that has the decl also has the module hint.
+#[derive(Debug, Clone)]
+pub(crate) struct FunctionEntry {
+    pub(crate) decl: FunctionDecl,
+    pub(crate) module: Option<Rc<phoenix_common::module_path::ModulePath>>,
 }
 
 /// Maximum call depth before the interpreter aborts with a stack overflow error.
@@ -161,7 +185,7 @@ const MAX_CALL_DEPTH: usize = 50;
 /// enums, and methods.
 pub struct Interpreter {
     pub(crate) env: Environment,
-    pub(crate) functions: HashMap<String, FunctionDecl>,
+    pub(crate) functions: HashMap<String, FunctionEntry>,
     pub(crate) structs: HashMap<String, StructDef>,
     pub(crate) enums: HashMap<String, EnumDef>, // enum name -> def
     pub(crate) variant_to_enum: HashMap<String, String>, // variant name -> enum name
@@ -179,6 +203,24 @@ pub struct Interpreter {
     /// Captured variables for each lambda, populated by the semantic checker.
     /// Keyed by the lambda's source span.
     pub(crate) lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
+
+    /// Per-module visibility scopes (drained from sema's `Analysis`).
+    /// Used by [`Interpreter::qualify`] to translate user-source bare
+    /// names into qualified registry keys (mirrors what the IR layer
+    /// does via `LoweringContext::qualify`). Empty for single-file
+    /// inputs that go through [`run`] without sema metadata.
+    pub(crate) module_scopes:
+        HashMap<phoenix_common::module_path::ModulePath, HashMap<String, String>>,
+    /// Stack of `current_module` paths, pushed when entering a function
+    /// and popped on return. Top-of-stack is the module owning the
+    /// currently-executing body; lookups consult its scope. Stored
+    /// as `Rc<ModulePath>` so cross-module call hot-paths bump a
+    /// refcount rather than cloning an owned `Vec<String>`. The
+    /// declaring-module hint pushed at call time is read out of the
+    /// callee's [`FunctionEntry`] / [`MethodDef`] (rather than two
+    /// parallel maps), so an "added without module recorded" state
+    /// is structurally impossible.
+    pub(crate) module_stack: Vec<Rc<phoenix_common::module_path::ModulePath>>,
 }
 
 /// Control flow signal that must escape from an expression context
@@ -216,17 +258,33 @@ impl Interpreter {
             last_return_was_explicit: false,
             lambda_captures: HashMap::new(),
             output,
+            module_scopes: HashMap::new(),
+            module_stack: Vec::new(),
         }
     }
 
     /// Registers a slice of function declarations as methods on the given type.
-    fn register_methods(&mut self, type_name: &str, methods: &[FunctionDecl]) {
+    /// Each [`MethodDef`] carries an `Option<Rc<ModulePath>>` recording the
+    /// declaring module, so [`Self::call_method`] can push the right scope
+    /// when dispatching across modules.
+    fn register_methods(
+        &mut self,
+        type_name: &str,
+        methods: &[FunctionDecl],
+        module_path: Option<&Rc<phoenix_common::module_path::ModulePath>>,
+    ) {
         if methods.is_empty() {
             return;
         }
         let type_methods = self.methods.entry(type_name.to_string()).or_default();
         for func in methods {
-            type_methods.insert(func.name.clone(), MethodDef { func: func.clone() });
+            type_methods.insert(
+                func.name.clone(),
+                MethodDef {
+                    func: func.clone(),
+                    module: module_path.map(Rc::clone),
+                },
+            );
         }
     }
 
@@ -242,13 +300,11 @@ impl Interpreter {
         }
     }
 
-    /// Runs a complete Phoenix program by registering all declarations and then
-    /// invoking the `main()` function. Returns an error if no `main` is found.
-    ///
-    /// Before processing user declarations, the built-in `Option<T>` and
-    /// `Result<T, E>` enum definitions and variant mappings are pre-registered.
-    pub fn run_program(&mut self, program: &Program) -> Result<()> {
-        // Register built-in enum variants
+    /// Pre-register the built-in Option / Result enums and their
+    /// variant→enum mapping. Shared between [`Self::run_program`] and
+    /// [`Self::run_modules_inner`] so the two paths can't drift on
+    /// what counts as a builtin.
+    pub(crate) fn register_builtin_enums(&mut self) {
         self.variant_to_enum
             .insert("Some".to_string(), "Option".to_string());
         self.variant_to_enum
@@ -257,8 +313,6 @@ impl Interpreter {
             .insert("Ok".to_string(), "Result".to_string());
         self.variant_to_enum
             .insert("Err".to_string(), "Result".to_string());
-
-        // Register built-in enum definitions
         self.enums.insert(
             "Option".to_string(),
             EnumDef {
@@ -271,21 +325,36 @@ impl Interpreter {
                 variants: HashMap::from([("Ok".to_string(), 1), ("Err".to_string(), 1)]),
             },
         );
+    }
+
+    /// Runs a complete Phoenix program by registering all declarations and then
+    /// invoking the `main()` function. Returns an error if no `main` is found.
+    ///
+    /// Before processing user declarations, the built-in `Option<T>` and
+    /// `Result<T, E>` enum definitions and variant mappings are pre-registered.
+    pub fn run_program(&mut self, program: &Program) -> Result<()> {
+        self.register_builtin_enums();
 
         // Register all declarations
         for decl in &program.declarations {
             match decl {
                 Declaration::Function(func) => {
-                    self.functions.insert(func.name.clone(), func.clone());
+                    self.functions.insert(
+                        func.name.clone(),
+                        FunctionEntry {
+                            decl: func.clone(),
+                            module: None,
+                        },
+                    );
                 }
                 Declaration::Struct(s) => {
                     let field_names: Vec<String> =
                         s.fields.iter().map(|f| f.name.clone()).collect();
                     self.structs
                         .insert(s.name.clone(), StructDef { field_names });
-                    self.register_methods(&s.name, &s.methods);
+                    self.register_methods(&s.name, &s.methods, None);
                     for ti in &s.trait_impls {
-                        self.register_methods(&s.name, &ti.methods);
+                        self.register_methods(&s.name, &ti.methods, None);
                     }
                 }
                 Declaration::Enum(e) => {
@@ -295,13 +364,13 @@ impl Interpreter {
                         self.variant_to_enum.insert(v.name.clone(), e.name.clone());
                     }
                     self.enums.insert(e.name.clone(), EnumDef { variants });
-                    self.register_methods(&e.name, &e.methods);
+                    self.register_methods(&e.name, &e.methods, None);
                     for ti in &e.trait_impls {
-                        self.register_methods(&e.name, &ti.methods);
+                        self.register_methods(&e.name, &ti.methods, None);
                     }
                 }
                 Declaration::Impl(imp) => {
-                    self.register_methods(&imp.type_name, &imp.methods);
+                    self.register_methods(&imp.type_name, &imp.methods, None);
                 }
                 Declaration::Trait(_)
                 | Declaration::TypeAlias(_)
@@ -311,98 +380,128 @@ impl Interpreter {
             }
         }
 
-        let main_func = self.functions.get("main").cloned();
-        match main_func {
-            Some(func) => {
-                self.call_function(&func, vec![], vec![])?;
+        let main_entry = self.functions.get("main").cloned();
+        match main_entry {
+            Some(entry) => {
+                // Single-file path: no module stack, no scope to push.
+                self.call_function_in_module(&entry.decl, vec![], vec![], None)?;
                 Ok(())
             }
             None => error("no main() function found"),
         }
     }
 
-    /// Calls a user-defined function with the given arguments, managing scope
-    /// and call-depth tracking.  Supports named arguments and default parameter
-    /// values.
-    fn call_function(
+    /// Calls a user-defined function with the given arguments, managing
+    /// scope and call-depth tracking. `def_module` is the callee's
+    /// owning module — `Some(...)` causes the body to evaluate with
+    /// that module pushed on `module_stack` (so cross-module name
+    /// lookups and default-arg evaluation resolve through the
+    /// callee's scope), `None` is the single-file path that leaves
+    /// the stack empty.
+    ///
+    /// Supports named arguments and default parameter values.
+    ///
+    /// Cleanup discipline: this wrapper owns the `call_depth` and
+    /// `module_stack` lifecycle as a *single exit*. The body helper
+    /// [`Self::call_function_body`] is structured so every fallible
+    /// step (default-arg evaluation, missing-arg detection) runs
+    /// *before* `env.push_scope()`, so it can return `Err` without
+    /// any environment cleanup of its own.
+    fn call_function_in_module(
         &mut self,
         func: &FunctionDecl,
         args: Vec<Value>,
         named_args: Vec<(String, Value)>,
+        def_module: Option<Rc<phoenix_common::module_path::ModulePath>>,
     ) -> Result<Value> {
         self.call_depth += 1;
         if self.call_depth > MAX_CALL_DEPTH {
             self.call_depth -= 1;
             return error("stack overflow: maximum recursion depth exceeded");
         }
+        let pushed_module = def_module.is_some();
+        if let Some(mp) = def_module {
+            self.module_stack.push(mp);
+        }
 
+        let result = self.call_function_body(func, args, named_args);
+
+        if pushed_module {
+            self.module_stack.pop();
+        }
+        self.call_depth -= 1;
+        result
+    }
+
+    /// Inner body of [`Self::call_function_in_module`]. Resolves
+    /// arguments + defaults *before* pushing the env scope, runs the
+    /// body, then pops. Errors raised before `push_scope` need no
+    /// cleanup; errors raised after are routed through `pop_scope`
+    /// exactly once.
+    fn call_function_body(
+        &mut self,
+        func: &FunctionDecl,
+        args: Vec<Value>,
+        named_args: Vec<(String, Value)>,
+    ) -> Result<Value> {
         let non_self_params: Vec<&Param> =
             func.params.iter().filter(|p| p.name != "self").collect();
         let total_params = non_self_params.len();
 
-        // Build a value for each parameter, merging positional, named, and defaults
         let mut param_values: Vec<Option<Value>> = vec![None; total_params];
 
-        // Fill in positional args
         for (i, val) in args.into_iter().enumerate() {
             if i < total_params {
                 param_values[i] = Some(val);
             }
         }
 
-        // Fill in named args
         for (name, val) in named_args {
             if let Some(idx) = non_self_params.iter().position(|p| p.name == name) {
                 param_values[idx] = Some(val);
             }
         }
 
-        // Evaluate defaults in the *caller's* scope — before we push
-        // the callee's frame.  Defaults can only reference globals
-        // (sema rejects sibling-param / `self` references in pass 1),
-        // so either scope works semantically; evaluating pre-push
-        // keeps this function's cleanup path single-exit and avoids a
-        // scope/call-depth leak if a default's `eval_expr` errors.
+        // Evaluate defaults in the *callee's* module scope (the
+        // caller pushed it before invoking us). Cross-module defaults
+        // — e.g. a public function whose default-arg expression
+        // references a private same-module helper — resolve through
+        // the callee's scope rather than the caller's.
         for (i, param) in non_self_params.iter().enumerate() {
             if param_values[i].is_none()
                 && let Some(ref default_expr) = param.default_value
             {
-                match self.eval_expr(default_expr) {
-                    Ok(val) => param_values[i] = Some(val),
-                    Err(err) => {
-                        self.call_depth -= 1;
-                        return Err(err);
-                    }
-                }
+                param_values[i] = Some(self.eval_expr(default_expr)?);
+            }
+        }
+
+        // Verify every parameter has a value *before* pushing the
+        // env scope, so a missing-arg error needs no cleanup.
+        for (i, param) in non_self_params.iter().enumerate() {
+            if param_values[i].is_none() {
+                return error(format!(
+                    "function `{}`: missing argument for parameter `{}`",
+                    func.name, param.name
+                ));
             }
         }
 
         self.env.push_scope();
-
-        // Check that all params are covered
         for (i, param) in non_self_params.iter().enumerate() {
-            match param_values[i].take() {
-                Some(val) => self.env.define(param.name.clone(), val),
-                None => {
-                    self.env.pop_scope();
-                    self.call_depth -= 1;
-                    return error(format!(
-                        "function `{}`: missing argument for parameter `{}`",
-                        func.name, param.name
-                    ));
-                }
-            }
+            self.env.define(
+                param.name.clone(),
+                param_values[i].take().expect("checked above"),
+            );
         }
 
         let result = self.exec_block_implicit(&func.body);
         self.env.pop_scope();
-        self.call_depth -= 1;
 
         self.unwrap_call_result(result)
     }
 
-    /// Calls a method on a value by looking up the method in the method registry
-    /// and dispatching to `call_function` with `self` bound.
+    /// Calls a method on a value by looking up the method in the method
+    /// registry and binding `self` before evaluating the body.
     ///
     /// # `dyn Trait` dispatch — divergence from the IR interpreter
     ///
@@ -438,16 +537,56 @@ impl Interpreter {
             return error("stack overflow: maximum recursion depth exceeded");
         }
 
-        let method = self
+        // Resolve the method *before* pushing its module, so a
+        // missing-method error needs no stack cleanup. The method's
+        // `MethodDef::module` (populated by `register_methods` on the
+        // multi-module path) tells us which module's scope to push;
+        // single-file dispatch leaves it `None`.
+        let method = match self
             .methods
             .get(type_name)
             .and_then(|m| m.get(method_name))
             .cloned()
-            .ok_or_else(|| RuntimeError {
-                message: format!("no method `{}` on type `{}`", method_name, type_name),
-                try_return_value: None,
-            })?;
+        {
+            Some(m) => m,
+            None => {
+                self.call_depth -= 1;
+                return Err(RuntimeError {
+                    message: format!(
+                        "no method `{}` on type `{}`",
+                        method_name,
+                        phoenix_common::module_path::bare_name(type_name),
+                    ),
+                    try_return_value: None,
+                });
+            }
+        };
 
+        let pushed_module = method.module.is_some();
+        if let Some(ref mp) = method.module {
+            self.module_stack.push(Rc::clone(mp));
+        }
+
+        let result = self.call_method_body(&method, type_name, method_name, self_val, args);
+
+        if pushed_module {
+            self.module_stack.pop();
+        }
+        self.call_depth -= 1;
+        result
+    }
+
+    /// Inner body of [`Self::call_method`]. Same single-exit
+    /// discipline as [`Self::call_function_body`]: resolve everything
+    /// fallible before `env.push_scope()`, then push, run, pop.
+    fn call_method_body(
+        &mut self,
+        method: &MethodDef,
+        type_name: &str,
+        method_name: &str,
+        self_val: Value,
+        args: Vec<Value>,
+    ) -> Result<Value> {
         let non_self_params: Vec<&Param> = method
             .func
             .params
@@ -459,62 +598,54 @@ impl Interpreter {
         // "Too many" positional remains an error.  Under-fill is allowed
         // when every missing slot has a default.
         if args.len() > total_params {
-            self.call_depth -= 1;
             return error(format!(
                 "method `{}` on `{}` takes {} argument(s), got {}",
                 method_name,
-                type_name,
+                phoenix_common::module_path::bare_name(type_name),
                 total_params,
                 args.len()
             ));
         }
 
-        // Fill slots from positional; remaining slots must have defaults.
         let mut param_values: Vec<Option<Value>> = vec![None; total_params];
         for (i, val) in args.into_iter().enumerate() {
             param_values[i] = Some(val);
         }
 
-        // Evaluate defaults in the *caller's* scope — before we push
-        // the callee's frame.  Matches the IR caller-site semantics
-        // (each call evaluates each missing default fresh) and keeps
-        // cleanup single-exit: a default that errors out does not
-        // leak a pushed scope or a bumped call depth.
-        // See `docs/design-decisions.md` (*Default-argument lowering strategy*).
+        // Evaluate defaults in the *callee's* module scope (already
+        // pushed by `call_method`).
         for (i, param) in non_self_params.iter().enumerate() {
             if param_values[i].is_none()
                 && let Some(ref default_expr) = param.default_value
             {
-                match self.eval_expr(default_expr) {
-                    Ok(val) => param_values[i] = Some(val),
-                    Err(err) => {
-                        self.call_depth -= 1;
-                        return Err(err);
-                    }
-                }
+                param_values[i] = Some(self.eval_expr(default_expr)?);
             }
         }
 
-        // Now push the callee's scope, bind `self` and params.
+        // Verify every parameter has a value *before* pushing the
+        // env scope, so a missing-arg error needs no cleanup.
+        for (i, param) in non_self_params.iter().enumerate() {
+            if param_values[i].is_none() {
+                return error(format!(
+                    "method `{}` on `{}`: missing argument for parameter `{}`",
+                    method_name,
+                    phoenix_common::module_path::bare_name(type_name),
+                    param.name
+                ));
+            }
+        }
+
         self.env.push_scope();
         self.env.define("self".to_string(), self_val);
         for (i, param) in non_self_params.iter().enumerate() {
-            match param_values[i].take() {
-                Some(val) => self.env.define(param.name.clone(), val),
-                None => {
-                    self.env.pop_scope();
-                    self.call_depth -= 1;
-                    return error(format!(
-                        "method `{}` on `{}`: missing argument for parameter `{}`",
-                        method_name, type_name, param.name
-                    ));
-                }
-            }
+            self.env.define(
+                param.name.clone(),
+                param_values[i].take().expect("checked above"),
+            );
         }
 
         let result = self.exec_block_implicit(&method.func.body);
         self.env.pop_scope();
-        self.call_depth -= 1;
 
         self.unwrap_call_result(result)
     }
@@ -1018,15 +1149,37 @@ impl Interpreter {
             _ => {}
         }
 
-        let type_name = obj.type_name().to_string();
+        // Dispatch by the canonical key (qualified for cross-module
+        // user types) so the methods table — keyed under the qualified
+        // receiver — resolves. Display in error messages goes through
+        // `type_name()` which strips the prefix.
+        let type_key = obj.type_key().to_string();
         let args = self.eval_args(&mc.args)?;
-        self.call_method(&type_name, &mc.method, obj, args)
+        self.call_method(&type_key, &mc.method, obj, args)
     }
 
     /// Evaluates a struct constructor or enum variant constructor.
+    ///
+    /// Lookup keys differ deliberately between the two branches:
+    /// - **Structs** are resolved through `self.qualify(&sl.name)` so a
+    ///   bare user-source name (`User`) maps to the qualified registry
+    ///   key (`models::User`) it was registered under. The `Value::Struct`
+    ///   built here carries that *qualified* name so `obj.type_key()`
+    ///   later matches the methods table's key for cross-module dispatch.
+    /// - **Enum variants** are resolved by the bare variant name
+    ///   directly against `variant_to_enum`. Sema's
+    ///   `lookup_visible_enum_variant` is the gatekeeper that rejects
+    ///   ambiguous variant references (two visible enums sharing a
+    ///   variant name) before this code runs, so the bare-key probe is
+    ///   unambiguous at runtime. The constructed `Value::EnumVariant`
+    ///   carries the *qualified* enum name so cross-module method
+    ///   dispatch on the value resolves through the qualified key.
+    ///
+    /// Display in both cases goes through `bare_name`, so user-visible
+    /// output (`print(u)`) shows `User`, not `models::User`.
     fn eval_struct_or_variant(&mut self, sl: &StructLiteralExpr) -> Result<Value> {
-        // Check if it's a struct
-        if let Some(struct_def) = self.structs.get(&sl.name).cloned() {
+        let qualified = self.qualify(&sl.name);
+        if let Some(struct_def) = self.structs.get(&qualified).cloned() {
             if sl.args.len() != struct_def.field_names.len() {
                 return error(format!(
                     "struct `{}` takes {} field(s), got {}",
@@ -1040,10 +1193,9 @@ impl Interpreter {
                 let value = self.eval_expr(arg)?;
                 fields.insert(struct_def.field_names[i].clone(), value);
             }
-            return Ok(Value::Struct(sl.name.clone(), fields));
+            return Ok(Value::Struct(qualified, fields));
         }
 
-        // Check if it's an enum variant
         if let Some(enum_name) = self.variant_to_enum.get(&sl.name).cloned() {
             if let Some(enum_def) = self.enums.get(&enum_name)
                 && let Some(&expected) = enum_def.variants.get(&sl.name)
@@ -1212,9 +1364,21 @@ impl Interpreter {
         // Check for named function or variable holding a closure
         if let Expr::Ident(ident) = &call.callee {
             // Named function
-            if let Some(func) = self.functions.get(&ident.name).cloned() {
+            // Qualify through the current module's scope so a call
+            // to an imported function (`add` resolving to `lib::add`)
+            // hits the right entry. Single-file callers leave the
+            // module stack empty, so `qualify` falls back to the bare
+            // name and registry lookup is unchanged.
+            let qname = self.qualify(&ident.name);
+            if let Some(entry) = self.functions.get(&qname).cloned() {
                 let args = self.eval_args(&call.args)?;
-                return self.call_function(&func, args, named_args);
+                // Pull the def_module out of the entry so the callee's
+                // body (and its default-arg evaluations) run with the
+                // correct scope on the module stack — this is what
+                // lets a call to an imported `tagged` whose default
+                // is `defaultTag()` resolve `defaultTag` through
+                // `lib`'s scope rather than the caller's.
+                return self.call_function_in_module(&entry.decl, args, named_args, entry.module);
             }
 
             // Variable holding a closure
@@ -1359,15 +1523,25 @@ impl Interpreter {
     }
 }
 
-/// Interprets a Phoenix program by executing its `main()` function.
+/// Interprets a single-module Phoenix program by executing its `main()`
+/// function.
 ///
-/// This is the main entry point for the tree-walk interpreter. It registers
-/// all declarations (functions, structs, enums, traits, impls), then calls
-/// `main()`. Returns `Ok(())` on success, or a [`RuntimeError`] if execution
-/// fails (e.g., division by zero, stack overflow, undefined variable).
+/// **Library API for embedders without `phoenix-modules`.** The Phoenix
+/// driver (`cmd_run`) routes every program — including single-file
+/// inputs — through [`run_modules`] so it can supply sema's
+/// `module_scopes`. This entry point exists for embedders that lex,
+/// parse, and check a single `Program` directly without going through
+/// the resolver. Multi-file programs (`import` declarations referencing
+/// sibling files) require [`run_modules`].
+///
+/// Registers all declarations (functions, structs, enums, traits,
+/// impls), then calls `main()`. Returns `Ok(())` on success, or a
+/// [`RuntimeError`] if execution fails (e.g., division by zero, stack
+/// overflow, undefined variable).
 ///
 /// `lambda_captures` provides the captured variables for each lambda,
-/// as computed by the semantic checker. Pass an empty map if sema was skipped.
+/// as computed by the semantic checker. Pass an empty map if sema was
+/// skipped.
 ///
 /// # Examples
 ///
@@ -2484,5 +2658,84 @@ function main() {
 }"#,
         );
         assert_eq!(output, vec!["42"]);
+    }
+
+    /// Build a single-entry module slice from `source` and run it
+    /// through `run_modules`, capturing stdout.
+    fn run_modules_capturing(source: &str) -> Vec<String> {
+        use phoenix_modules::{ModulePath, ResolvedSourceModule};
+        use std::path::PathBuf;
+        let tokens = tokenize(source, SourceId(0));
+        let (program, parse_errors) = parser::parse(&tokens);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let module = ResolvedSourceModule {
+            module_path: ModulePath::entry(),
+            source_id: SourceId(0),
+            program,
+            is_entry: true,
+            file_path: PathBuf::from("<test>"),
+        };
+        let modules = [module];
+        let mut analysis = phoenix_sema::checker::check_modules(&modules);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "sema diagnostics: {:?}",
+            analysis.diagnostics
+        );
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        interpreter.lambda_captures = std::mem::take(&mut analysis.module.lambda_captures);
+        interpreter.module_scopes = std::mem::take(&mut analysis.module.module_scopes);
+        interpreter
+            .run_modules_inner(&modules)
+            .expect("runtime error");
+        let bytes = buffer.borrow();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Regression: a user enum that re-uses a builtin variant name
+    /// (`enum Foo { Some }`) used to panic in debug builds when run
+    /// through the multi-module path because `register_decl_in_module`
+    /// asserted that no variant ever shadowed an existing entry.
+    /// Sema accepts this program (only the *enum name* is checked
+    /// against builtin shadowing, not its variants), so the assert was
+    /// firing on legal code. The fix lets later registrations
+    /// overwrite (matching the pre-existing single-file behaviour);
+    /// this test routes the program through `run_modules` so a
+    /// regression that re-introduces the assert would re-trip here.
+    #[test]
+    fn run_modules_user_variant_shadows_builtin_does_not_panic() {
+        let output = run_modules_capturing("enum Foo { Some }\nfunction main() { print(1) }");
+        assert_eq!(output, vec!["1"]);
+    }
+
+    /// Pin actual variant-construction-and-dispatch through
+    /// `run_modules`: a non-shadowing user enum constructed and
+    /// pattern-matched in the entry module. A regression where
+    /// `register_decl_in_module` failed to populate `variant_to_enum`,
+    /// or where `Value::EnumVariant` carried a stale enum-name tag
+    /// that didn't match the registered key, would surface here as
+    /// "undefined variable `Bar`" or as a `match`-arm mismatch.
+    #[test]
+    fn run_modules_constructs_and_matches_user_enum_variant() {
+        let output = run_modules_capturing(
+            r#"
+enum Color { Red Green Blue }
+function main() {
+  let c: Color = Red
+  let label: String = match c {
+    Red -> "r"
+    Green -> "g"
+    Blue -> "b"
+  }
+  print(label)
+}"#,
+        );
+        assert_eq!(output, vec!["r"]);
     }
 }

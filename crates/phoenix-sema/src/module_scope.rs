@@ -211,14 +211,111 @@ impl Checker {
         }
     }
 
-    /// Resolve `local_name` in the current module's scope to its
-    /// qualified key in the global symbol tables. Returns `None` if
-    /// the name is not in scope.
+    /// Resolve a *bare* user-source name in the current module's
+    /// scope to its qualified key in the global symbol tables.
+    /// Returns `None` if the name is not in scope.
+    ///
+    /// Callers whose input may already be qualified (e.g. names
+    /// extracted from `Type::Named` post-Phase 2.6) should go
+    /// through [`Self::canonicalize_type_name`] instead — that
+    /// passes qualified names through without re-translating, which
+    /// `resolve_visible` would fail on (a key like `"lib::User"` is
+    /// not a local-name entry in any scope).
     pub(crate) fn resolve_visible(&self, local_name: &str) -> Option<&str> {
         let scope = self.module_scopes.get(&self.current_module)?;
         scope.visible_symbols.get(local_name).map(|s| s.as_str())
     }
 
+    /// Canonicalize a possibly-bare-or-qualified name to the key the
+    /// global symbol tables are indexed by. Used by `lookup_*` helpers
+    /// (and via [`Self::qualify_in_current`] by `Type::*` payload
+    /// construction) so call sites can pass either a bare AST name or
+    /// a qualified key extracted from `Type::Named` and get the same
+    /// answer.
+    ///
+    /// Bare names are translated through the current module's scope
+    /// (cross-module references resolve to the qualified key); names
+    /// classified as already qualified by [`QualifiedKind::classify`]
+    /// are returned verbatim — `resolve_visible` would fail on them
+    /// (a key like `"lib::User"` is not a local-name entry).
+    pub(crate) fn canonicalize_type_name<'a>(&'a self, name: &'a str) -> &'a str {
+        match QualifiedKind::classify(name) {
+            QualifiedKind::Qualified => name,
+            QualifiedKind::Bare => self.resolve_visible(name).unwrap_or(name),
+        }
+    }
+
+    /// Translate a bare user-source name into the canonical
+    /// `Type::Named` / `Type::Generic` / `Type::Dyn` payload string —
+    /// the owned-`String` sibling of [`Self::canonicalize_type_name`].
+    ///
+    /// Consults the current module's scope first so cross-module
+    /// references (`User` imported from `models`) produce the
+    /// `models::User` form that downstream comparisons (sema's own
+    /// type-equality checks, IR's `lower_type`, the Cranelift
+    /// backend's layout lookups) all expect. Falls back to the
+    /// bare name when the name is not in scope (e.g. type variables,
+    /// `Self`, built-ins not pre-loaded into the scope) — those
+    /// produce the same string they did before module-system
+    /// support so the single-file behavior is unchanged (the entry
+    /// module's own decls qualify-to-bare via `module_qualify`).
+    ///
+    /// Phase 2.6 invariant: every `Type::Named(name)` flowing through
+    /// sema, IR, and codegen carries a key that matches what
+    /// `register_function`/`register_struct`/etc. used as the
+    /// symbol-table key, so a single global table lookup hits.
+    pub(crate) fn qualify_in_current(&self, local_name: &str) -> String {
+        let canonical = self.canonicalize_type_name(local_name).to_string();
+        debug_assert!(
+            QualifiedKind::is_well_formed(&canonical),
+            "qualify_in_current produced a malformed Type::* payload `{}` \
+             — `QualifiedKind::classify` assumes payloads are either bare \
+             or `seg::seg[::seg…]`",
+            canonical,
+        );
+        canonical
+    }
+}
+
+/// Discriminator between bare and qualified names in sema string keys.
+///
+/// The module-path separator `::` is the only legal use of `::` in a
+/// sema name string — Phoenix identifiers do not contain `::`, so a
+/// substring probe is a sound predicate. If the lexer ever admits
+/// `::` inside identifiers, swap [`Self::classify`] for a typed marker
+/// (e.g. wrap qualified keys in a newtype); localizing both the
+/// classification and the well-formedness contract here makes that
+/// future change a one-site edit.
+pub(crate) enum QualifiedKind {
+    /// No `::` separator — a bare user-source name.
+    Bare,
+    /// Contains a `::` separator — a `seg::seg[::seg…]` key.
+    Qualified,
+}
+
+impl QualifiedKind {
+    /// Classify `name` as bare or qualified based on the presence of
+    /// the `::` separator.
+    pub(crate) fn classify(name: &str) -> Self {
+        if name.contains("::") {
+            QualifiedKind::Qualified
+        } else {
+            QualifiedKind::Bare
+        }
+    }
+
+    /// True when `name` is either bare (no `::`) or a well-formed
+    /// `seg::seg[::seg…]` qualified key — every `::`-separated segment
+    /// is non-empty. Pins the input contract for [`Self::classify`]
+    /// so a construction site that produces a malformed payload trips
+    /// a `debug_assert!` rather than silently breaking the bare-vs-
+    /// qualified split downstream.
+    pub(crate) fn is_well_formed(name: &str) -> bool {
+        !name.is_empty() && name.split("::").all(|seg| !seg.is_empty())
+    }
+}
+
+impl Checker {
     /// Look up a function by user-source name in the current module's scope.
     /// Returns `None` when the name is not in scope.
     pub(crate) fn lookup_function(
@@ -229,64 +326,55 @@ impl Checker {
         self.functions.get(qualified)
     }
 
-    /// Look up a struct by user-source name in the current module's scope.
-    pub(crate) fn lookup_struct(&self, local_name: &str) -> Option<&crate::checker::StructInfo> {
-        let qualified = self.resolve_visible(local_name)?;
-        self.structs.get(qualified)
+    /// Look up a struct by name. Accepts either a bare user-source
+    /// name (resolved through the current module's scope) or an
+    /// already-qualified key (e.g. extracted from `Type::Named`),
+    /// via `canonicalize_type_name`.
+    pub(crate) fn lookup_struct(&self, name: &str) -> Option<&crate::checker::StructInfo> {
+        self.structs.get(self.canonicalize_type_name(name))
     }
 
-    /// Look up an enum by user-source name in the current module's scope.
-    pub(crate) fn lookup_enum(&self, local_name: &str) -> Option<&crate::checker::EnumInfo> {
-        let qualified = self.resolve_visible(local_name)?;
-        self.enums.get(qualified)
+    /// Look up an enum by name. Accepts bare or qualified names —
+    /// see [`Self::lookup_struct`] for the canonicalization rules.
+    pub(crate) fn lookup_enum(&self, name: &str) -> Option<&crate::checker::EnumInfo> {
+        self.enums.get(self.canonicalize_type_name(name))
     }
 
-    /// Look up a trait by user-source name in the current module's scope.
-    pub(crate) fn lookup_trait(&self, local_name: &str) -> Option<&crate::checker::TraitInfo> {
-        let qualified = self.resolve_visible(local_name)?;
-        self.traits.get(qualified)
+    /// Look up a trait by name. Accepts bare or qualified names —
+    /// see [`Self::lookup_struct`] for the canonicalization rules.
+    pub(crate) fn lookup_trait(&self, name: &str) -> Option<&crate::checker::TraitInfo> {
+        self.traits.get(self.canonicalize_type_name(name))
     }
 
-    /// Look up a type alias by user-source name in the current module's scope.
-    pub(crate) fn lookup_type_alias(
-        &self,
-        local_name: &str,
-    ) -> Option<&crate::checker::TypeAliasInfo> {
-        let qualified = self.resolve_visible(local_name)?;
-        self.type_aliases.get(qualified)
+    /// Look up a type alias by name. Accepts bare or qualified names.
+    pub(crate) fn lookup_type_alias(&self, name: &str) -> Option<&crate::checker::TypeAliasInfo> {
+        self.type_aliases.get(self.canonicalize_type_name(name))
     }
 
-    /// Look up the methods table for a user-source receiver type name.
-    /// Resolves the type name through the current module's scope so the
-    /// methods registered under the receiver's *qualified* key (e.g.
-    /// `lib::User`) are reachable from a use-site that wrote the
-    /// receiver as `User`.
+    /// Look up the methods table for a receiver type name. Accepts a
+    /// bare user-source name (resolved through the current module's
+    /// scope) or an already-qualified key — methods are registered
+    /// under the receiver's qualified key (e.g. `lib::User`) and use
+    /// sites that wrote the receiver as `User` resolve through scope.
     ///
     /// Builtins like `Option` / `Result` are reachable here because
     /// `snapshot_builtin_names` walks the typed tables (`enums` for
     /// today's builtins) and adds those names to every module's scope.
-    /// The `assert!` in `snapshot_builtin_names` pins the invariant
-    /// that every method-table receiver also has a typed-table entry.
     pub(crate) fn lookup_methods(
         &self,
-        local_type_name: &str,
+        type_name: &str,
     ) -> Option<&HashMap<String, crate::checker::MethodInfo>> {
-        let qualified = self.resolve_visible(local_type_name)?;
-        self.methods.get(qualified)
+        self.methods.get(self.canonicalize_type_name(type_name))
     }
 
-    /// Returns true if the given user-source receiver type implements
-    /// the given user-source trait, resolving both names through the
-    /// current module's scope before probing `self.trait_impls`. An
-    /// unresolved type or trait cannot satisfy a bound, so a missing
-    /// scope entry returns `false` directly.
-    pub(crate) fn has_trait_impl(&self, local_type: &str, local_trait: &str) -> bool {
-        let Some(q_type) = self.resolve_visible(local_type) else {
-            return false;
-        };
-        let Some(q_trait) = self.resolve_visible(local_trait) else {
-            return false;
-        };
+    /// Returns true if the given receiver type implements the given
+    /// trait. Both inputs accept bare or qualified names; bare names
+    /// resolve through the current module's scope before probing
+    /// `self.trait_impls`. An unresolved type or trait cannot satisfy
+    /// a bound, so a missing scope entry returns `false` directly.
+    pub(crate) fn has_trait_impl(&self, type_name: &str, trait_name: &str) -> bool {
+        let q_type = self.canonicalize_type_name(type_name);
+        let q_trait = self.canonicalize_type_name(trait_name);
         self.trait_impls
             .contains(&(q_type.to_string(), q_trait.to_string()))
     }

@@ -1,0 +1,3 @@
+public function format(text: String) -> String {
+  "[POST] " + text
+}

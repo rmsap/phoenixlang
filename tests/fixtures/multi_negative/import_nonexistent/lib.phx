@@ -1,0 +1,1 @@
+public function realFunction() -> Int { 1 }

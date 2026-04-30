@@ -1,0 +1,9 @@
+import models.user { greet, User }
+import models.post { format }
+
+function main() {
+  print(greet("alice"))
+  print(format("hello world"))
+  let u: User = User("alice")
+  print(u.describe())
+}

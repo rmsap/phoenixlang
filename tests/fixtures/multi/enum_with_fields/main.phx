@@ -1,0 +1,13 @@
+import lib { Outcome }
+
+function describe(o: Outcome) -> String {
+  match o {
+    Win(score) -> "won " + toString(score)
+    Loss(reason) -> "lost: " + reason
+  }
+}
+
+function main() {
+  print(describe(Win(42)))
+  print(describe(Loss("forfeit")))
+}

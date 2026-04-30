@@ -1,0 +1,4 @@
+public enum Outcome {
+  Win(Int)
+  Loss(String)
+}

@@ -1,0 +1,19 @@
+public trait Drawable {
+  function draw(self) -> String
+}
+
+public struct Circle {
+  public Int radius
+
+  impl Drawable {
+    function draw(self) -> String { "circle" }
+  }
+}
+
+public struct Square {
+  public Int side
+
+  impl Drawable {
+    function draw(self) -> String { "square" }
+  }
+}

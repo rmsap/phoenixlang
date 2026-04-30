@@ -528,8 +528,11 @@ impl<'a> LoweringContext<'a> {
                     .struct_type_at(&call.span)
                     .map(|(_, sema_args)| self.lower_type_args(&sema_args))
                     .unwrap_or_default();
-                let result_type = IrType::StructRef(ident.name.clone(), type_args);
-                return self.emit(Op::StructAlloc(ident.name.clone(), args), result_type, span);
+                // Module-qualify so `IrType::StructRef` / `Op::StructAlloc`
+                // match `struct_layouts`'s keying.
+                let qname = self.qualify(&ident.name).into_owned();
+                let result_type = IrType::StructRef(qname.clone(), type_args);
+                return self.emit(Op::StructAlloc(qname, args), result_type, span);
             }
         }
 
@@ -1019,8 +1022,13 @@ impl<'a> LoweringContext<'a> {
             .struct_type_at(&sl.span)
             .map(|(_, sema_args)| self.lower_type_args(&sema_args))
             .unwrap_or_default();
-        let result_type = IrType::StructRef(sl.name.clone(), type_args);
-        self.emit(Op::StructAlloc(sl.name.clone(), args), result_type, span)
+        // Carry the module-qualified key so `IrType::StructRef` and
+        // `Op::StructAlloc` agree with `struct_layouts`'s keying
+        // (qualified post Phase 2.6). Single-file callers qualify to
+        // bare names, preserving existing IR snapshots.
+        let qname = self.qualify(&sl.name).into_owned();
+        let result_type = IrType::StructRef(qname.clone(), type_args);
+        self.emit(Op::StructAlloc(qname, args), result_type, span)
     }
 
     /// Coerce positional arguments of a struct constructor against the

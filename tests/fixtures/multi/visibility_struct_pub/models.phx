@@ -1,0 +1,4 @@
+public struct User {
+  public String name
+  public Int age
+}

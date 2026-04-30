@@ -105,8 +105,10 @@ impl Checker {
                 // so the right module's struct is resolved.
                 let struct_info = self.lookup_struct(type_name).cloned();
                 if let Some(info) = struct_info {
-                    // Verify the initializer type is compatible with the struct type
-                    let expected_type = Type::Named(type_name.clone());
+                    // Verify the initializer type is compatible with the struct type.
+                    // Use the qualified key so cross-module destructuring matches
+                    // the qualified `Type::Named` the initializer evaluates to.
+                    let expected_type = Type::Named(self.qualify_in_current(type_name));
                     if !init_type.is_error() && !self.types_compatible(&expected_type, &init_type) {
                         self.error(
                             format!(

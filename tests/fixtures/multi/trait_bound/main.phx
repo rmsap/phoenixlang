@@ -1,0 +1,10 @@
+import shapes { Drawable, Circle, Square }
+
+function render<T: Drawable>(s: T) -> String {
+  s.draw()
+}
+
+function main() {
+  print(render(Circle(3)))
+  print(render(Square(5)))
+}

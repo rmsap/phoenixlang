@@ -1,0 +1,6 @@
+import helpers { add }
+
+function main() {
+  let x: Int = add(1, 2)
+  print(x)
+}

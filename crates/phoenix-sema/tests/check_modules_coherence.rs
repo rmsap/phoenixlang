@@ -311,7 +311,9 @@ fn coherence_violating_impl_methods_do_not_pollute_target_methods_table() {
     // The rejected `shout` must not be callable on User: a specific
     // "no method `shout` on type `User`" diagnostic fires at the call
     // site, proving the method was *not* leaked into the surviving
-    // methods table.
+    // methods table. Type Display strips the `lib::` qualifier so
+    // diagnostics show the user-source name even though the canonical
+    // key is `lib::User`.
     assert!(
         analysis
             .diagnostics
@@ -376,6 +378,46 @@ fn user_function_named_some_coexists_with_option_variant() {
             .iter()
             .all(|d| !d.message.contains("`Some` is already defined")),
         "user `function Some` must not collide on the function-table key: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn variant_name_shared_by_two_imported_enums_is_diagnosed_as_ambiguous() {
+    // Two non-entry enums each declare a variant `Pending`. The entry
+    // imports both and references `Pending` at the use site. Sema
+    // must flag the ambiguity (and pick a deterministic fallback by
+    // alphabetical local-name tie-break) rather than silently
+    // resolving to whichever insertion order happens to win.
+    //
+    // This is the gatekeeper that lets the AST interpreter's
+    // `register_decl_in_module` use a single bare-keyed
+    // `variant_to_enum` map without runtime collision detection: when
+    // sema rejects ambiguous imports here, the driver exits before
+    // the interpreter sees the conflicting registrations.
+    let entry = entry_only(
+        "import a { Foo }\n\
+         import b { Bar }\n\
+         function make() -> Foo { Pending(1) }\n\
+         function main() {}",
+    );
+    let mod_a = non_entry(
+        "a",
+        "public enum Foo { Pending(Int) Active(Int) }",
+        SourceId(1),
+    );
+    let mod_b = non_entry(
+        "b",
+        "public enum Bar { Pending(Int) Closed(Int) }",
+        SourceId(2),
+    );
+    let analysis = check_modules(&[entry, mod_a, mod_b]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("variant `Pending` is ambiguous")),
+        "expected ambiguous-variant diagnostic when two imported enums share `Pending`, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -670,6 +712,8 @@ fn coherence_violating_trait_impl_for_imported_type_routes_through_orphan_path()
     );
     // The rejected `show` must not silently become callable on User —
     // pin via a specific "no method" diagnostic at the call site.
+    // Type Display strips the `lib::` qualifier so the diagnostic
+    // shows the user-source name.
     assert!(
         analysis
             .diagnostics

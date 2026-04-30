@@ -143,7 +143,15 @@ impl Checker {
                 let ty = Type::from_name(&named.name);
                 if let Type::Named(ref name) = ty {
                     if self.lookup_struct(name).is_some() || self.lookup_enum(name).is_some() {
-                        return ty;
+                        // Carry the *qualified* key so downstream
+                        // comparisons (sema's type-equality checks
+                        // against enum-variant Types, IR's
+                        // `lower_type`, codegen's layout lookups)
+                        // all see the same string the symbol tables
+                        // were keyed under. Single-file behavior is
+                        // unchanged because entry-module names
+                        // qualify to bare.
+                        return Type::Named(self.qualify_in_current(name));
                     }
                     if name == "Self" {
                         return ty;
@@ -216,7 +224,11 @@ impl Checker {
                     self.error(format!("unknown type `{}`", gt.name), gt.span);
                     return Type::Error;
                 }
-                Type::Generic(gt.name.clone(), type_args)
+                // Carry the qualified key — same rationale as the
+                // `TypeExpr::Named` arm above. Built-in generic
+                // types (`List`, `Map`) are returned earlier in this
+                // arm via the bare-name short-circuit.
+                Type::Generic(self.qualify_in_current(&gt.name), type_args)
             }
             TypeExpr::Dyn(dt) => {
                 let Some(trait_info) = self.lookup_trait(&dt.trait_name) else {
@@ -250,7 +262,12 @@ impl Checker {
                     );
                     return Type::Error;
                 }
-                Type::Dyn(dt.trait_name.clone())
+                // Carry the qualified trait name — IR's
+                // `dyn_vtables` keying composes against this string,
+                // and the receiver-type extraction in
+                // `lower_method_call` compares it to the receiver's
+                // dyn-trait Type.
+                Type::Dyn(self.qualify_in_current(&dt.trait_name))
             }
         }
     }

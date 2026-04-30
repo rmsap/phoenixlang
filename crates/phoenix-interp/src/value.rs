@@ -1,3 +1,4 @@
+use phoenix_common::module_path::bare_name;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -51,7 +52,9 @@ impl Value {
     /// Returns the human-readable type name for this value.
     ///
     /// For primitive types this returns a fixed string (`"Int"`, `"Float"`,
-    /// etc.). For structs and enum variants it returns the declared type name.
+    /// etc.). For structs and enum variants it returns the source-level
+    /// declared name (with any module prefix stripped). Use
+    /// [`Self::type_key`] when you need the canonical lookup key.
     pub fn type_name(&self) -> &str {
         match self {
             Value::Int(_) => "Int",
@@ -59,11 +62,29 @@ impl Value {
             Value::String(_) => "String",
             Value::Bool(_) => "Bool",
             Value::Void => "Void",
-            Value::Struct(name, _) => name,
-            Value::EnumVariant(enum_name, _, _) => enum_name,
+            Value::Struct(name, _) => bare_name(name),
+            Value::EnumVariant(enum_name, _, _) => bare_name(enum_name),
             Value::List(_) => "List",
             Value::Map(_) => "Map",
             Value::Closure { .. } => "<function>",
+        }
+    }
+
+    /// Returns the canonical type key for dispatch (qualified for
+    /// user-defined types declared in non-entry modules; bare for
+    /// builtins and entry-module types). Same as [`Self::type_name`]
+    /// for builtins; differs only when a user struct/enum value
+    /// carries a `module::Name` key.
+    ///
+    /// Invariant: `type_name(v)` is the bare-name suffix of
+    /// `type_key(v)` (i.e. `bare_name(type_key()) == type_name()`).
+    /// Use `type_key` for symbol-table lookup and `type_name` for
+    /// any user-facing rendering — never the other way around.
+    pub fn type_key(&self) -> &str {
+        match self {
+            Value::Struct(name, _) => name,
+            Value::EnumVariant(enum_name, _, _) => enum_name,
+            _ => self.type_name(),
         }
     }
 
@@ -106,7 +127,10 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{}", b),
             Value::Void => write!(f, "void"),
             Value::Struct(name, fields) => {
-                write!(f, "{}(", name)?;
+                // Strip the module prefix on the qualified key so user
+                // output shows the source-level name (`User`) rather
+                // than the canonical key (`models::User`).
+                write!(f, "{}(", bare_name(name))?;
                 write_comma_separated(f, fields.iter().map(|(k, v)| format!("{}: {}", k, v)))?;
                 write!(f, ")")
             }
@@ -170,5 +194,88 @@ impl PartialOrd for Value {
             (Value::String(a), Value::String(b)) => a.partial_cmp(b),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the documented invariant on [`Value::type_key`] /
+    /// [`Value::type_name`]: `bare_name(type_key()) == type_name()`.
+    /// The methods table is keyed by `type_key`; user-facing
+    /// diagnostics render via `type_name`. A regression that broke
+    /// the invariant would surface as a confusing dispatch failure
+    /// — the error message names a type that doesn't match the table
+    /// key the dispatcher actually probed.
+    ///
+    /// Covers the qualified user, bare user, and builtin shapes, so a
+    /// future change that adds a `Value` variant has to extend this
+    /// table to stay green.
+    #[test]
+    fn type_key_round_trips_through_bare_name_to_type_name() {
+        let cases: Vec<Value> = vec![
+            // Qualified user struct — the cross-module case Phase 2.6
+            // introduced; this is the load-bearing one.
+            Value::Struct("models::User".to_string(), BTreeMap::new()),
+            // Bare user struct (entry-module declaration; module_qualify
+            // is identity on entry, so the key is bare).
+            Value::Struct("Point".to_string(), BTreeMap::new()),
+            // Qualified user enum variant.
+            Value::EnumVariant(
+                "shapes::Outcome".to_string(),
+                "Win".to_string(),
+                vec![Value::Int(1)],
+            ),
+            // Bare user enum variant.
+            Value::EnumVariant("Color".to_string(), "Red".to_string(), vec![]),
+            // Builtins: `type_key` delegates to `type_name`, and the
+            // names contain no `::`, so `bare_name` is a no-op.
+            Value::Int(0),
+            Value::Float(0.0),
+            Value::String(String::new()),
+            Value::Bool(false),
+            Value::Void,
+            Value::List(vec![]),
+            Value::Map(vec![]),
+        ];
+
+        for v in &cases {
+            assert_eq!(
+                bare_name(v.type_key()),
+                v.type_name(),
+                "type_key/type_name invariant broken for {:?}: \
+                 type_key = {:?}, bare_name(type_key) = {:?}, type_name = {:?}",
+                v,
+                v.type_key(),
+                bare_name(v.type_key()),
+                v.type_name(),
+            );
+        }
+    }
+
+    /// Direct pin: a qualified `Value::Struct` exposes the qualified
+    /// key via `type_key` (so the methods table — keyed under
+    /// `models::User` post-Phase-2.6 — resolves) but the bare name
+    /// via `type_name` (so user-facing rendering shows `User`).
+    /// Pre-Phase-2.6 these two were the same; this asserts the
+    /// post-2.6 split holds rather than collapsing to either side.
+    #[test]
+    fn qualified_struct_type_key_and_type_name_split() {
+        let v = Value::Struct("models::User".to_string(), BTreeMap::new());
+        assert_eq!(v.type_key(), "models::User");
+        assert_eq!(v.type_name(), "User");
+    }
+
+    /// The same split for enum variants.
+    #[test]
+    fn qualified_enum_variant_type_key_and_type_name_split() {
+        let v = Value::EnumVariant(
+            "shapes::Outcome".to_string(),
+            "Win".to_string(),
+            vec![Value::Int(7)],
+        );
+        assert_eq!(v.type_key(), "shapes::Outcome");
+        assert_eq!(v.type_name(), "Outcome");
     }
 }

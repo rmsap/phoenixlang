@@ -1,0 +1,6 @@
+import lib { * }
+
+function main() {
+  print(double(7))
+  print(triple(4))
+}

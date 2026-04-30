@@ -1,3 +1,5 @@
+use phoenix_common::module_path::bare_name;
+
 /// The types in the Phoenix type system.
 ///
 /// This enum represents every type the compiler currently understands.
@@ -19,6 +21,9 @@ pub enum Type {
     /// The unit type, used for functions that do not return a value.
     Void,
     /// A named type that hasn't been resolved yet or is user-defined.
+    ///
+    /// Post-Phase 2.6 the payload is the canonical *qualified* key
+    /// (`lib::User`); `Display` strips the prefix for user-facing output.
     Named(std::string::String),
     /// A function type representing closures and first-class function values.
     ///
@@ -33,12 +38,19 @@ pub enum Type {
     ///
     /// The first element is the base type name and the second is the list of
     /// concrete type arguments supplied at the use site.
+    ///
+    /// Post-Phase 2.6 the base-name payload is the canonical *qualified* key
+    /// (`lib::Pair`); `Display` strips the prefix for user-facing output.
     Generic(std::string::String, Vec<Type>),
     /// A trait-object type (`dyn TraitName`).  Concrete values are carried
     /// behind a `(data_ptr, vtable_ptr)` pair at the IR/runtime level.
     /// The inner string is the trait name.  See `docs/design-decisions.md`
     /// for the "why explicit `dyn`" rationale — bare `TraitName` as a type
     /// remains an error; `dyn TraitName` is the runtime-dispatch opt-in.
+    ///
+    /// Post-Phase 2.6 the trait-name payload is the canonical *qualified*
+    /// key (`shapes::Drawable`); `Display` strips the prefix for
+    /// user-facing output.
     Dyn(std::string::String),
     /// Error type — used when type checking fails to avoid cascading errors.
     Error,
@@ -119,8 +131,13 @@ pub fn map_of(key_type: Type, value_type: Type) -> Type {
 /// Formats the type for user-facing messages.
 ///
 /// Built-in types are displayed by their canonical name (e.g. `"Int"`,
-/// `"Float"`).  [`Type::Named`] prints the stored name verbatim, and
-/// [`Type::Error`] is rendered as `"<error>"`.
+/// `"Float"`).  [`Type::Error`] is rendered as `"<error>"`.
+///
+/// User-defined type names (`Named` / `Generic` / `Dyn`) carry the
+/// canonical *qualified* key internally (`lib::User`) so symbol-table
+/// lookups across modules resolve unambiguously, but Display strips
+/// the module prefix so diagnostics and `print` output show the
+/// user-source name (`User`) the source actually wrote.
 impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -129,7 +146,7 @@ impl std::fmt::Display for Type {
             Type::String => write!(f, "String"),
             Type::Bool => write!(f, "Bool"),
             Type::Void => write!(f, "Void"),
-            Type::Named(name) => write!(f, "{}", name),
+            Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {
                 write!(f, "(")?;
                 for (i, p) in params.iter().enumerate() {
@@ -142,7 +159,7 @@ impl std::fmt::Display for Type {
             }
             Type::TypeVar(name) => write!(f, "{}", name),
             Type::Generic(name, args) => {
-                write!(f, "{}<", name)?;
+                write!(f, "{}<", bare_name(name))?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -151,7 +168,7 @@ impl std::fmt::Display for Type {
                 }
                 write!(f, ">")
             }
-            Type::Dyn(name) => write!(f, "dyn {}", name),
+            Type::Dyn(name) => write!(f, "dyn {}", bare_name(name)),
             Type::Error => write!(f, "<error>"),
         }
     }

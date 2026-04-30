@@ -194,3 +194,23 @@ Today this is harmless because `List<dyn Trait>` does not compile (see [`List<dy
 **File:** `phoenix-cranelift/src/translate/layout/type_layout.rs` (layout table + cross-crate-invariant comment); `phoenix-runtime/src/list_methods.rs` (consumer of the heuristic).
 **Planned fix:** decide and implement a dyn-vs-string discriminator before `List<dyn Trait>` lands.  A 1-byte type tag in the first pointer slot was considered during the 2026-04-20 audit and deferred (ABI-scope change; would re-litigate the [centralized Layout trait](design-decisions.md#centralized-layout-for-reference-types) decision).  A discriminator-at-the-list-level fix is lower-impact and currently preferred.
 **Target phase:** Phase 3 — lands with the bidirectional-inference fix for `List<dyn Trait>`.
+
+### Sema `Type::Named/Generic/Dyn` payload allocates on every construction
+
+Phase 2.6 made every `Type::Named` / `Type::Generic` / `Type::Dyn` payload carry the canonical *qualified* key (`lib::User`) so cross-module symbol-table lookups hit on a single global probe. The qualification path goes through `Checker::qualify_in_current` (`phoenix-sema/src/module_scope.rs`), which always returns an owned `String` — even in the common bare-equals-canonical case (entry-module decls and builtins, where the scope maps `name → name`). Sema runs construct many `Type::*` values per check pass, so the construction cost is a small but unmeasured per-call allocation that scales with type-annotation density.
+
+**Planned fix:** switch the payload type to `Cow<'static, str>` (cheap for builtins) or intern identifiers in a per-`Checker` arena keyed by the canonical string. Either change keeps the qualified-equals-bare fast path zero-alloc. The `canonicalize_type_name` helper already returns `&str` and is the natural sibling for the borrow case; the work is to update every `Type::*` consumer in sema/IR/codegen (a wide diff, but mechanical).
+
+**File:** `phoenix-sema/src/module_scope.rs` (`qualify_in_current`); `phoenix-sema/src/types.rs` (the `Type` enum); every consumer that pattern-matches on `Type::Named(name)` etc.
+**Recommendation:** measure before acting — the regression may not be load-bearing on real programs.
+**Target phase:** Phase 3 or later, demand-triggered by a sema-perf complaint.
+
+**Sibling site to fix in the same pass:** `phoenix-ir/src/lower.rs::LoweringContext::qualify` returns `Cow::Owned(qualified.to_string())` for the cross-module case — the borrowed `&str` from `resolve_visible` is bound to `&self` (via `self.check`), so a longer-lived `Cow<'a, str>` API would let the cross-module case stay zero-alloc too. That's a wider refactor (callers' lifetimes would have to thread `'a`), but worth doing alongside the sema-side change so both layers' allocation profiles improve in lockstep.
+
+### `drain_remaining_into` callback duplication in `resolved.rs`
+
+`build_enums` / `build_structs` / `build_traits` (`phoenix-sema/src/resolved.rs`) each call `drain_remaining_into` with a four-line closure that allocates the next `*Id`, inserts it into the matching `*_by_name` map, and pushes the info into the matching `*s` vec. The three closures are structurally identical — only the id-allocator (`next_enum_id` / `next_struct_id` / `next_trait_id`), the name map, and the vec differ.
+
+**Recommendation:** if a fourth user-table type lands (interfaces, type classes, …) factor `drain_remaining_into` to take an `(id_allocator, name_map, vec)` tuple so all four call sites collapse to one call. Three sites is below the abstraction threshold; document so the next maintainer sees the precedent.
+**File:** `phoenix-sema/src/resolved.rs` (`drain_remaining_into` + its three callers in `build_enums` / `build_structs` / `build_traits`).
+**Target phase:** when the fourth user-table type lands.

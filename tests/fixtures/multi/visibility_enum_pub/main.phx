@@ -1,0 +1,15 @@
+import palette { Color }
+
+function describe(c: Color) -> String {
+  match c {
+    Red -> "red"
+    Green -> "green"
+    Blue -> "blue"
+  }
+}
+
+function main() {
+  print(describe(Red))
+  print(describe(Green))
+  print(describe(Blue))
+}

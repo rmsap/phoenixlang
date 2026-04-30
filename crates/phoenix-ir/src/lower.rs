@@ -295,16 +295,41 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
-    /// Qualify a bare user-source name against the current module for
-    /// table lookups. Single source of truth for the IR layer's
-    /// mangling — mirrors `phoenix_common::module_path::module_qualify`
-    /// so sema and IR tables stay in lockstep.
+    /// Qualify a bare user-source name into the symbol-table key for
+    /// the current module. The lookup chain mirrors sema's:
     ///
-    /// Returns `Cow::Borrowed` for entry/builtin modules (the common
-    /// single-file case) so the per-call-site lookup in body lowering
-    /// stays allocation-free; falls back to an owned `String` only when
-    /// a real prefix has to be produced.
+    /// 1. Consult [`ResolvedModule::resolve_visible`] first — that
+    ///    map carries own-module decls, builtins, and imported items
+    ///    (each pointing at the correct qualified key, including
+    ///    `lib::add` for an `import lib { add }` in the entry).
+    /// 2. Fall back to a `module_qualify`-style prefix against the
+    ///    current module. The scope is populated by the time body
+    ///    lowering runs, so in steady state every user-source name
+    ///    hits step 1; this branch covers the bootstrap window
+    ///    before scopes exist (e.g. lowering of declaration headers
+    ///    that runs before `module_scopes` are drained from sema)
+    ///    and any internal compiler name that was never registered
+    ///    in scope. If you suspect this branch is firing for a
+    ///    user-source name in a callable body, that's a sign sema
+    ///    failed to register the name in the module's scope and the
+    ///    bug is upstream of `qualify`.
+    ///
+    /// Returns `Cow::Borrowed` whenever possible (entry / builtin /
+    /// scope-borrowed) so the per-call-site lookup in body lowering
+    /// stays allocation-free; falls back to an owned `String` only
+    /// when a real prefix has to be produced.
     pub(crate) fn qualify<'n>(&self, name: &'n str) -> Cow<'n, str> {
+        if let Some(qualified) = self.check.resolve_visible(&self.current_module, name) {
+            // Hot-path fast: when the scope maps `name → name` (the
+            // entry-module case for own decls and bare builtins),
+            // return `Cow::Borrowed` to keep the per-call-site
+            // lookup allocation-free. Cross-module lookups (where
+            // `qualified != name`) allocate exactly once.
+            if qualified == name {
+                return Cow::Borrowed(name);
+            }
+            return Cow::Owned(qualified.to_string());
+        }
         if self.current_module.is_entry() || self.current_module.is_builtin() {
             Cow::Borrowed(name)
         } else {

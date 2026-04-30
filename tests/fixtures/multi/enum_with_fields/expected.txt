@@ -1,0 +1,2 @@
+won 42
+lost: forfeit

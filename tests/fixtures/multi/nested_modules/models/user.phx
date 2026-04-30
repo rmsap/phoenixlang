@@ -1,0 +1,11 @@
+public function greet(name: String) -> String {
+  "Hi, " + name
+}
+
+public struct User {
+  public String name
+
+  public function describe(self) -> String {
+    "user: " + self.name
+  }
+}

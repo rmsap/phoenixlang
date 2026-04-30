@@ -233,10 +233,147 @@ fn non_entry_function_carries_def_module() {
     assert_eq!(info.visibility, Visibility::Public);
 }
 
-// NOTE: a corresponding `non_entry_struct_carries_def_module` test would
-// be tempting to add here, but `build_structs` in `resolved.rs` currently
-// iterates only the entry program's declarations, so non-entry-module
-// structs do not land in `Analysis::module.structs`. That aggregation is
-// part of the Phase 2.6 follow-up. The function-level test above covers
-// the def_module stamping path because `build_functions` already
-// aggregates cross-module via `checker.functions.drain()`.
+#[test]
+fn single_file_module_scopes_map_each_name_to_itself() {
+    // Pin the doc-claim on `ResolvedModule::module_scopes`: in a
+    // single-file program, the entry-keyed scope contains every
+    // user-defined name *and* every builtin as `name → name`. The IR's
+    // `qualify` fast path (which short-circuits to `Cow::Borrowed`
+    // when the scope-resolved key equals the input) relies on this.
+    // If a future change starts qualifying entry-module names against
+    // a non-empty prefix, the scope entries would diverge from the
+    // input and every IR call site would start allocating.
+    //
+    // We assert the invariant over *every* entry in the scope rather
+    // than a hard-coded literal list, so a new builtin (e.g. a future
+    // `Iterator`) is automatically covered without touching this test.
+    // The hard-coded `expected` set still pins the user-defined names
+    // and the today's builtins as a smoke check that the scope isn't
+    // empty for some pathological reason.
+    let entry = entry_only(
+        "struct User { String name }\n\
+         enum Color { Red Green Blue }\n\
+         function helper() -> Int { 1 }\n\
+         function main() {}",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        analysis.diagnostics,
+    );
+    let entry_scope = analysis
+        .module
+        .module_scopes
+        .get(&ModulePath::entry())
+        .expect("entry module scope must exist for a single-file program");
+
+    // Every entry maps to itself — covers user-defined names plus
+    // whatever builtins this build registered, today and tomorrow.
+    for (local, mapped) in entry_scope {
+        assert_eq!(
+            local, mapped,
+            "entry-module `{}` must map to itself in scope (got `{}`)",
+            local, mapped,
+        );
+    }
+
+    // Smoke check: the user-defined names and today's builtins must
+    // be present. If a future builtin is added, no edit is required
+    // here — the loop above already covers it.
+    for name in ["User", "Color", "helper", "main", "Option", "Result"] {
+        assert!(
+            entry_scope.contains_key(name),
+            "`{}` missing from entry scope (scope keys: {:?})",
+            name,
+            entry_scope.keys().collect::<Vec<_>>(),
+        );
+    }
+}
+
+#[test]
+fn non_entry_struct_carries_def_module() {
+    use phoenix_parser::ast::Visibility;
+    let entry = entry_only("function main() {}");
+    let other = non_entry(
+        "models",
+        "public struct User { public String name }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    let info = analysis
+        .module
+        .struct_info_by_name("models::User")
+        .expect("non-entry struct should be drained into Analysis::module.structs");
+    assert_eq!(info.def_module, ModulePath(vec!["models".to_string()]));
+    assert_eq!(info.visibility, Visibility::Public);
+}
+
+#[test]
+fn non_entry_drain_is_lexical_so_id_allocation_is_deterministic() {
+    // Pin the doc-claim on `drain_remaining_into`: non-entry structs
+    // are appended to `module.structs` in lexical order of their
+    // qualified key, so id allocation is deterministic across runs
+    // (HashMap iteration is not). Two non-entry modules `a` and `z`,
+    // each contributing one struct — `a::Foo` must come before
+    // `z::Bar` even though the dependency-ordering / parse-ordering
+    // of the modules tells us nothing about which would land first.
+    let entry = entry_only("function main() {}");
+    let mod_z = non_entry("z", "public struct Bar { public Int x }", SourceId(1));
+    let mod_a = non_entry("a", "public struct Foo { public Int x }", SourceId(2));
+    let analysis = check_modules(&[entry, mod_z, mod_a]);
+    let foo_id = analysis
+        .module
+        .struct_id("a::Foo")
+        .expect("a::Foo must be drained");
+    let bar_id = analysis
+        .module
+        .struct_id("z::Bar")
+        .expect("z::Bar must be drained");
+    assert!(
+        foo_id.index() < bar_id.index(),
+        "a::Foo (id {}) must precede z::Bar (id {}) in lexical drain order",
+        foo_id.index(),
+        bar_id.index(),
+    );
+}
+
+#[test]
+fn non_entry_drain_is_lexical_within_a_module_too() {
+    // The cross-module test above only pins inter-module ordering.
+    // Pin the *intra-module* contract too: two structs declared in
+    // the same non-entry module land in lexical order of their
+    // qualified key, regardless of AST source order. This is what
+    // `drain_remaining_into`'s `sort_by(|a, b| a.0.cmp(&b.0))` yields,
+    // and a future change that switches to AST-order drain (to
+    // preserve single-file allocation order) would re-order these
+    // two ids — tripping this assert before any downstream id-lookup
+    // call site silently consumes the new order.
+    let entry = entry_only("function main() {}");
+    // Source-order: `Zebra` declared *before* `Aardvark`. The lexical
+    // order of qualified keys (`models::Aardvark`, `models::Zebra`)
+    // is the opposite, so a regression that drained AST-order would
+    // give `Zebra` the lower id.
+    let other = non_entry(
+        "models",
+        "public struct Zebra { public Int x }\n\
+         public struct Aardvark { public Int x }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    let aardvark_id = analysis
+        .module
+        .struct_id("models::Aardvark")
+        .expect("models::Aardvark must be drained");
+    let zebra_id = analysis
+        .module
+        .struct_id("models::Zebra")
+        .expect("models::Zebra must be drained");
+    assert!(
+        aardvark_id.index() < zebra_id.index(),
+        "models::Aardvark (id {}) must precede models::Zebra (id {}) in lexical drain order, \
+         even though `Zebra` appears first in the source",
+        aardvark_id.index(),
+        zebra_id.index(),
+    );
+}

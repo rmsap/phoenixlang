@@ -167,7 +167,11 @@ impl Checker {
             return ty;
         }
         self.error(
-            format!("no method `{}` on type `{}`", mc.method, type_name),
+            format!(
+                "no method `{}` on type `{}`",
+                mc.method,
+                phoenix_common::module_path::bare_name(&type_name),
+            ),
             mc.span,
         );
         Type::Error
@@ -336,7 +340,10 @@ impl Checker {
                     .iter()
                     .map(|p| bindings.get(p).cloned().unwrap_or(Type::TypeVar(p.clone())))
                     .collect();
-                return Type::Generic(sl.name.clone(), result_args);
+                // Carry the qualified key so cross-module struct
+                // construction produces a Type that matches the
+                // qualified key the let-annotation resolves to.
+                return Type::Generic(self.qualify_in_current(&sl.name), result_args);
             } else {
                 for (i, arg) in sl.args.iter().enumerate() {
                     let arg_type = self.check_expr(arg);
@@ -355,7 +362,7 @@ impl Checker {
                     }
                 }
             }
-            return Type::Named(sl.name.clone());
+            return Type::Named(self.qualify_in_current(&sl.name));
         }
 
         // Check if it's an enum variant constructor
@@ -415,7 +422,10 @@ impl Checker {
                     .iter()
                     .map(|p| bindings.get(p).cloned().unwrap_or(Type::TypeVar(p.clone())))
                     .collect();
-                return Type::Generic(enum_name, result_args);
+                // Qualify so this Type matches what
+                // `resolve_type_expr` produces for the same enum at
+                // a parameter / let annotation site.
+                return Type::Generic(self.qualify_in_current(&enum_name), result_args);
             } else {
                 for (i, arg) in sl.args.iter().enumerate() {
                     let arg_type = self.check_expr(arg);
@@ -436,7 +446,7 @@ impl Checker {
                     }
                 }
             }
-            return Type::Named(enum_name);
+            return Type::Named(self.qualify_in_current(&enum_name));
         }
 
         self.error(format!("undefined type or variant `{}`", sl.name), sl.span);

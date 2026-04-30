@@ -1,0 +1,7 @@
+import models { User }
+
+function main() {
+  let u: User = User("alice", 30)
+  print(u.name)
+  print(u.age)
+}

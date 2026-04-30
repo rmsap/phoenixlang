@@ -1173,6 +1173,7 @@ version = "0.1.0"
 dependencies = [
  "phoenix-common",
  "phoenix-lexer",
+ "phoenix-modules",
  "phoenix-parser",
  "phoenix-sema",
 ]

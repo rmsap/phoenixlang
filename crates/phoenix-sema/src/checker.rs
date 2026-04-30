@@ -1077,15 +1077,22 @@ impl Checker {
                 // Pass 2: fresh scope, bind `self` and params, check body.
                 this.scopes.push();
 
-                // Build proper self type with TypeVar args for generic types
+                // Build proper self type with TypeVar args for generic types.
+                // Carry the qualified key so the receiver's `Type::Named` /
+                // `Type::Generic` matches what struct/enum lookups produce.
+                // Sema rejects `impl Int { ... }` (and the like) upstream,
+                // so `imp.type_name` always names a user-defined struct or
+                // enum here — its qualified key is never a builtin, and
+                // wrapping it in `Type::Named` is sufficient.
+                let qualified_self = this.qualify_in_current(&imp.type_name);
                 let self_type = if parent_type_params.is_empty() {
-                    Type::from_name(&imp.type_name)
+                    Type::Named(qualified_self)
                 } else {
                     let args: Vec<Type> = parent_type_params
                         .iter()
                         .map(|p| Type::TypeVar(p.clone()))
                         .collect();
-                    Type::Generic(imp.type_name.clone(), args)
+                    Type::Generic(qualified_self, args)
                 };
                 this.scopes.define(
                     "self".to_string(),

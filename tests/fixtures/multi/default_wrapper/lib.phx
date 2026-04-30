@@ -1,0 +1,5 @@
+function defaultTag() -> String { "[default]" }
+
+public function tagged(text: String, tag: String = defaultTag()) -> String {
+  tag + " " + text
+}

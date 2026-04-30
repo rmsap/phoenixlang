@@ -239,6 +239,24 @@ pub struct ResolvedModule {
     /// metadata; the AST interpreter uses it to populate closure
     /// environments at call time.
     pub lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
+
+    /// Per-module visibility scopes drained from the checker.
+    ///
+    /// Maps `module_path → local_name → qualified_global_key`. Built by
+    /// sema's `build_module_scopes_phase_a` (own decls + builtins) and
+    /// `build_module_scopes_phase_b` (imports). IR lowering consults
+    /// this at every call site whose callee comes from a different
+    /// module — a `foo()` call in module `lib` resolves through
+    /// `module_scopes[ModulePath::entry()].get("foo") = "lib::foo"`
+    /// (when `foo` is imported), then probes the symbol tables under
+    /// the qualified key.
+    ///
+    /// Single-file inputs ship with a single entry-keyed scope
+    /// containing every name as `name → name` (including builtins) —
+    /// the existing single-file IR lookups continue to qualify against
+    /// `current_module = entry`, hit the bare key, and never need to
+    /// touch this map. Cross-module lookups go through the scope.
+    pub module_scopes: HashMap<phoenix_common::module_path::ModulePath, HashMap<String, String>>,
 }
 
 /// The complete sema product returned by [`crate::checker::check`].
@@ -293,6 +311,30 @@ pub struct Analysis {
 }
 
 impl ResolvedModule {
+    /// Translate a user-source name into the qualified key in this
+    /// module's symbol tables, using `module_scopes[current_module]` to
+    /// resolve own-module declarations, builtins, and imported items.
+    ///
+    /// Returns the qualified key as a borrowed `&str` (no allocation
+    /// on the hot lookup path). Returns `None` if the name is not
+    /// in scope in `current_module` — the caller decides whether
+    /// that's a sema bug (in IR lowering: typically yes) or a benign
+    /// "no symbol with this name" outcome.
+    ///
+    /// Used by IR lowering's call-site / type-name resolution to
+    /// translate cross-module references (where bare-name probes
+    /// would miss the qualified key).
+    pub fn resolve_visible(
+        &self,
+        current_module: &phoenix_common::module_path::ModulePath,
+        local_name: &str,
+    ) -> Option<&str> {
+        self.module_scopes
+            .get(current_module)?
+            .get(local_name)
+            .map(|s| s.as_str())
+    }
+
     /// Look up a free function's id by source name.  `None` for
     /// names that are unknown or refer to a method.
     pub fn function_id(&self, name: &str) -> Option<FuncId> {
@@ -612,25 +654,17 @@ pub(crate) fn build_from_checker(program: &Program, mut checker: Checker) -> Ana
     build_structs(&mut rm, &mut checker, program);
     build_traits(&mut rm, &mut checker, program);
 
-    // The build_{enums,structs,traits} helpers iterate `program`
-    // (the entry program) and remove from `checker.{enums,structs,traits}`
-    // by bare name, so any leftover entries belong to non-entry modules
-    // and indicate "non-entry aggregation hasn't landed yet" rather
-    // than a registration bug. Pin that intent: leftovers must all be
-    // non-entry. If a future change adds non-entry aggregation here,
-    // these checks will either become trivially true (drained) or
-    // need to be removed deliberately.
+    // build_{enums,structs,traits} now drain every entry — the entry
+    // program's declarations first (in AST order, preserving
+    // single-file id allocation), then non-entry modules' entries in
+    // lexical-key order via `drain_remaining_into`. Pin the drain so
+    // a future regression that leaves entries behind shows up here
+    // before downstream id-lookup callers blow up with an opaque
+    // panic.
     debug_assert!(
-        checker.enums.values().all(|i| !i.def_module.is_entry()),
-        "build_enums left entry-module entries undrained — bare-name removal disagrees with qualified-key registration"
-    );
-    debug_assert!(
-        checker.structs.values().all(|i| !i.def_module.is_entry()),
-        "build_structs left entry-module entries undrained — bare-name removal disagrees with qualified-key registration"
-    );
-    debug_assert!(
-        checker.traits.values().all(|i| !i.def_module.is_entry()),
-        "build_traits left entry-module entries undrained — bare-name removal disagrees with qualified-key registration"
+        checker.enums.is_empty() && checker.structs.is_empty() && checker.traits.is_empty(),
+        "build_{{enums,structs,traits}} left entries undrained — \
+         registration produced an entry that no build pass claimed"
     );
 
     // ── Per-span maps onto ResolvedModule: move, don't clone.
@@ -638,6 +672,14 @@ pub(crate) fn build_from_checker(program: &Program, mut checker: Checker) -> Ana
     rm.call_type_args = std::mem::take(&mut checker.call_type_args);
     rm.var_annotation_types = std::mem::take(&mut checker.var_annotation_types);
     rm.lambda_captures = std::mem::take(&mut checker.lambda_captures);
+    // ── Module-scope handoff: flatten ModuleScope into a plain
+    // local→qualified HashMap so consumers (IR lowering today, the
+    // tree-walk interpreter once it gains multi-module support) don't
+    // need to depend on sema's internal `ModuleScope` type.
+    rm.module_scopes = std::mem::take(&mut checker.module_scopes)
+        .into_iter()
+        .map(|(mp, scope)| (mp, scope.visible_symbols))
+        .collect();
 
     assert_post_build_invariants(&rm);
 
@@ -673,6 +715,7 @@ fn empty_resolved_module() -> ResolvedModule {
         call_type_args: HashMap::new(),
         var_annotation_types: HashMap::new(),
         lambda_captures: HashMap::new(),
+        module_scopes: HashMap::new(),
     }
 }
 
@@ -805,7 +848,10 @@ fn build_user_and_builtin_methods(rm: &mut ResolvedModule, checker: &mut Checker
 
 /// Built-in `Option` then `Result` first (pinned to
 /// [`OPTION_ENUM_ID`] / [`RESULT_ENUM_ID`]), then user enums in AST
-/// order.
+/// order. Entry-module enums are placed via the entry program's
+/// declaration walk (preserves the existing single-file id-allocation
+/// order); enums from non-entry modules are drained afterward in
+/// lexical order of their qualified key (deterministic across runs).
 fn build_enums(rm: &mut ResolvedModule, checker: &mut Checker, program: &Program) {
     for (builtin, expected_id) in [("Option", OPTION_ENUM_ID), ("Result", RESULT_ENUM_ID)] {
         if let Some(info) = checker.enums.remove(builtin) {
@@ -833,9 +879,20 @@ fn build_enums(rm: &mut ResolvedModule, checker: &mut Checker, program: &Program
             rm.enums.push(info);
         }
     }
+    // Drain remaining (non-entry-module) enums in lexical order of
+    // their qualified key so IR / codegen see them in
+    // `rm.enum_by_name`. Lexical order keeps id allocation
+    // deterministic across runs.
+    drain_remaining_into(&mut checker.enums, |info, name| {
+        let id = next_enum_id(rm.enums.len());
+        rm.enum_by_name.insert(name, id);
+        rm.enums.push(info);
+    });
 }
 
-/// User-declared structs in AST order.
+/// User-declared structs. Entry-module structs first (in AST order,
+/// preserving single-file id allocation); non-entry modules' structs
+/// drained afterward in lexical-key order.
 fn build_structs(rm: &mut ResolvedModule, checker: &mut Checker, program: &Program) {
     for decl in &program.declarations {
         if let Declaration::Struct(s) = decl
@@ -847,9 +904,15 @@ fn build_structs(rm: &mut ResolvedModule, checker: &mut Checker, program: &Progr
             rm.structs.push(info);
         }
     }
+    drain_remaining_into(&mut checker.structs, |info, name| {
+        let id = next_struct_id(rm.structs.len());
+        rm.struct_by_name.insert(name, id);
+        rm.structs.push(info);
+    });
 }
 
-/// User-declared traits in AST order.
+/// User-declared traits. Entry-module traits first, then non-entry
+/// drained in lexical-key order.
 fn build_traits(rm: &mut ResolvedModule, checker: &mut Checker, program: &Program) {
     for decl in &program.declarations {
         if let Declaration::Trait(t) = decl
@@ -860,6 +923,24 @@ fn build_traits(rm: &mut ResolvedModule, checker: &mut Checker, program: &Progra
             rm.trait_by_name.insert(t.name.clone(), id);
             rm.traits.push(info);
         }
+    }
+    drain_remaining_into(&mut checker.traits, |info, name| {
+        let id = next_trait_id(rm.traits.len());
+        rm.trait_by_name.insert(name, id);
+        rm.traits.push(info);
+    });
+}
+
+/// Drain every remaining `(name, info)` pair from `table` in lexical
+/// name order, calling `place(info, name)` for each. Shared by the
+/// `build_enums` / `build_structs` / `build_traits` non-entry-drain
+/// passes so the iteration order (and thus id allocation) is
+/// consistent across the three.
+fn drain_remaining_into<T>(table: &mut HashMap<String, T>, mut place: impl FnMut(T, String)) {
+    let mut remaining: Vec<(String, T)> = std::mem::take(table).into_iter().collect();
+    remaining.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, info) in remaining {
+        place(info, name);
     }
 }
 
@@ -921,6 +1002,20 @@ fn assert_post_build_invariants(rm: &ResolvedModule) {
             .flat_map(|v| v.iter())
             .all(|t| !matches!(t, Type::Error)),
         "call_type_args contains Type::Error — would break monomorphization"
+    );
+
+    // module_scopes invariant: the entry module's scope must always
+    // exist after build so consumers (IR's `qualify`, the AST
+    // interpreter's multi-module path) can resolve at least the
+    // entry's own decls and builtins. A regression that drops the
+    // entry-keyed entry would surface downstream as "undefined name"
+    // diagnostics far from the cause; this assert catches it at the
+    // build boundary.
+    assert!(
+        rm.module_scopes
+            .contains_key(&phoenix_common::module_path::ModulePath::entry()),
+        "module_scopes missing entry-module scope — \
+         build_module_scopes_phase_a/_b dropped the entry's entry"
     );
 }
 

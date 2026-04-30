@@ -1,0 +1,7 @@
+import shapes { Circle }
+
+function main() {
+  let c: Circle = Circle(4)
+  print(c.area())
+  print(c.describe())
+}

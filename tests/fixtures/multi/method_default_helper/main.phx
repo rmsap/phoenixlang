@@ -1,0 +1,6 @@
+import lib { Greeter }
+
+function main() {
+  let g: Greeter = Greeter("alice")
+  print(g.greet())
+}

@@ -1,0 +1,3 @@
+import b { fromB }
+
+public function fromA() -> Int { fromB() }
