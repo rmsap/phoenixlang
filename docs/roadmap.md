@@ -12,8 +12,8 @@ This document outlines the path from the current implementation to a production-
 |-------|------|--------|-------------|
 | [1](phases/phase-1.md) | Core Language | ✅ Complete | Variables, functions, control flow, structs, enums, generics, traits, closures, collections, error handling, and all ergonomic features |
 | [2](phases/phase-2.md) | Compilation | In Progress | IR (complete), Cranelift native compilation (in progress), runtime library (GC), WebAssembly target, JS interop, module system and visibility |
-| [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, test framework, error message quality |
-| [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access, logging |
+| [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, error message quality |
+| [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access, logging, test framework |
 | [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability, frontend framework |
 | [6](phases/phase-6.md) | Ecosystem & Adoption | Planned | Documentation site, package registry, starter templates, community, 1.0 release |
 
@@ -44,11 +44,11 @@ CI pipeline, type registries exposed, and expression types annotated.
 
 **M3 — "Developer-ready"** (Phase 3)
 
-> Package manager, LSP, formatter, test framework. A developer can realistically start a project.
+> Package manager, LSP, formatter. A developer can realistically start a project. (The test framework lives in Phase 4 because it depends on annotations, async, HTTP, and the database layer.)
 
-**M4 — "Web-capable"** (Phases 4.1–4.8)
+**M4 — "Web-capable"** (Phases 4.1–4.9)
 
-> Tuples, Date/Time, Regex, iterators, type-safe config, async with background jobs, HTTP/WebSocket/SSE, struct update syntax, annotations, JSON, compile-time typed database queries (with schema-references-struct and auto-generated migrations), and error context chaining.
+> Tuples, Date/Time, Regex, iterators, type-safe config, async with background jobs, HTTP/WebSocket/SSE, struct update syntax, annotations, JSON, compile-time typed database queries (with schema-references-struct and auto-generated migrations), error context chaining, and the built-in test framework.
 
 **M5 — "Differentiated"** (Phase 5)
 
@@ -72,7 +72,7 @@ CI pipeline, type registries exposed, and expression types annotated.
 | 34 | Package manager | Compilation, modules | Medium | |
 | 35 | LSP + VS Code extension | Modules | High | |
 | 36 | Formatter | Parser | Small | |
-| 37 | Test framework | — | Medium | |
+| 37 | Test framework | Annotations, Async runtime, HTTP, Typed database queries | Medium | |
 | 38 | Tuple types | — | Medium | |
 | 39 | Date/Time types (`Instant`, `DateTime`, `Duration`) | — | Medium | |
 | 40 | Regular expressions (`Regex`) | — | Medium | |

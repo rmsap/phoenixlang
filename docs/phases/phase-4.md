@@ -4,6 +4,15 @@
 
 A batteries-included stdlib for web development. This is what makes Phoenix practical rather than theoretical. Each module should be small, well-documented, and opinionated (one way to do things).
 
+## Recommended order
+
+- **First:** [4.5 Annotations](#45-annotation-system) — keystone; small, no dependencies, and unblocks the rest of the stdlib (`@jsonName`/`@skip` for 4.6, `@config` for 4.2, schema hints for 4.7, `@test`/`@beforeEach`/`@afterEach` for 4.9).
+- **In parallel after 4.5:** 4.1 core types/collections, 4.6 JSON serialization, plus tooling work from [Phase 3](./phase-3.md) (3.1 package manager, 3.2 LSP gap-closing, 3.3 formatter).
+- **4.3 Async runtime:** resolve the open design decisions called out in 4.3 (`mut` aliasing across task boundaries; `defer` syntax) **before** designing `spawn` / `TaskGroup` APIs. Retrofitting `Send`-equivalent bounds after task APIs exist creates permanent coloring problems.
+- **After 4.3 lands:** 4.4 HTTP + typed routing, 4.2 environment/config, 4.8 logging.
+- **After 4.3 + 4.5 + 4.6 land:** 4.7 Database (schemas, typed queries, migrations).
+- **Last:** 4.9 Test Framework — its four dependencies (annotations, async, HTTP, database) are all satisfied by this point.
+
 ## 4.1 Core Types and Collections
 
 - `List<T>`, `Map<K, V>`, `Set<T>`
@@ -823,3 +832,240 @@ migrate "make_email_required" {
 - Structured logging: `log.info("user created", userId: id)`
 - Log levels: debug, info, warn, error
 - Configurable output (stdout, file, structured JSON)
+
+## 4.9 Test Framework
+
+> Lives in Phase 4 rather than Phase 3 because it depends on annotations (4.5), the async runtime (4.3), HTTP (4.4), and the database layer (4.7). See [Phase 3 §3.4](./phase-3.md#34-test-framework--moved-to-49) for the cross-reference placeholder.
+
+A built-in, batteries-included test framework. Tests are first-class — no external test runner, no registration boilerplate, no separate test DSL. The annotation system (4.5) provides the `@test` marker, and the compiler discovers and runs tests automatically.
+
+### Core: `@test` annotation and assertions
+
+```phoenix
+import math { sqrt }
+
+@test
+function testSqrtOfPerfectSquare() {
+    assertEq(sqrt(25.0), 5.0)
+}
+
+@test
+function testSqrtOfZero() {
+    assertEq(sqrt(0.0), 0.0)
+}
+
+@test
+function testNegativeSqrtReturnsError() {
+    let result: Result<Float, MathError> = sqrtChecked(-1.0)
+    assert(result.isErr())
+}
+```
+
+```bash
+# Run all tests in the project
+phoenix test
+
+# Run tests in a specific file
+phoenix test tests/math_test.phx
+
+# Run tests matching a name pattern
+phoenix test --filter "sqrt"
+
+# Run with verbose output (show passing tests too)
+phoenix test --verbose
+```
+
+**Test discovery:** The compiler scans all project files for functions annotated with `@test`. No registration, no test suites, no manifest. A function with `@test` is a test.
+
+**Assertions:**
+
+| Function | Purpose |
+|----------|---------|
+| `assert(Bool)` | Fails if the value is `false` |
+| `assertEq(T, T)` | Fails if the two values are not equal; prints both values on failure |
+| `assertNe(T, T)` | Fails if the two values are equal |
+| `assertErr(Result<T, E>)` | Fails if the result is `Ok` |
+| `assertOk(Result<T, E>)` | Fails if the result is `Err` |
+| `assertSome(Option<T>)` | Fails if the option is `None` |
+| `assertNone(Option<T>)` | Fails if the option is `Some` |
+| `fail(String)` | Unconditionally fails with a message |
+
+On failure, assertions print the source location, the expression that failed, and the actual values involved — no guessing what went wrong.
+
+### Async test support
+
+```phoenix
+@test
+async function testFetchUser() {
+    let user: Result<User, DbError> = await findUser(1)
+    assertOk(user)
+    assertEq(user.unwrap().name, "Alice")
+}
+```
+
+Async tests run within the async runtime. Each test gets its own task scope — if it spawns subtasks, they are cleaned up automatically when the test completes (structured concurrency applies to tests too).
+
+### Test lifecycle: setup and teardown
+
+```phoenix
+// Shared setup for a group of tests
+@beforeEach
+function setup() -> TestContext {
+    TestContext {
+        db: createTestDatabase(),
+        user: User("Alice", "alice@example.com", 30)
+    }
+}
+
+@afterEach
+function teardown(ctx: TestContext) {
+    ctx.db.drop()
+}
+
+// Tests that accept the context type receive the setup result
+@test
+function testInsertUser(ctx: TestContext) {
+    let result = ctx.db.insert(ctx.user)
+    assertOk(result)
+}
+
+@test
+function testDuplicateEmailFails(ctx: TestContext) {
+    ctx.db.insert(ctx.user).unwrap()
+    let duplicate = ctx.db.insert(ctx.user)
+    assertErr(duplicate)
+}
+```
+
+- `@beforeEach` runs before every test in the same file; its return value is passed to tests that declare a matching parameter
+- `@afterEach` runs after every test, receiving the same context (for cleanup)
+- Tests without a context parameter skip setup/teardown — they're standalone
+
+### HTTP testing utilities
+
+Test route handlers without starting a server or making real network requests.
+
+```phoenix
+import testing.http { TestClient }
+
+@test
+async function testGetUserReturns200() {
+    let client: TestClient = TestClient.fromRouter(app)
+
+    let response = await client.get("/api/users/1")
+    assertEq(response.status, 200)
+
+    let body: User = response.json<User>().unwrap()
+    assertEq(body.name, "Alice")
+}
+
+@test
+async function testMissingUserReturns404() {
+    let client: TestClient = TestClient.fromRouter(app)
+
+    let response = await client.get("/api/users/999")
+    assertEq(response.status, 404)
+}
+
+@test
+async function testCreateUser() {
+    let client: TestClient = TestClient.fromRouter(app)
+
+    let response = await client.post("/api/users", json: User("Bob", "bob@example.com", 25))
+    assertEq(response.status, 201)
+}
+```
+
+- `TestClient.fromRouter(router)` creates an in-memory client that dispatches requests through the router without TCP — fast and isolated
+- Supports all HTTP methods, headers, JSON bodies, and query parameters
+- WebSocket testing: `TestClient.ws("/ws/chat")` returns a `TestWebSocket` for send/receive assertions
+
+### Database test helpers
+
+```phoenix
+import testing.db { testTransaction }
+
+@test
+async function testUserQuery() {
+    // testTransaction wraps the test in a DB transaction that rolls back on completion
+    // — no test data leaks between tests, no cleanup needed
+    await testTransaction(db, async function(tx: Transaction) {
+        await tx.execute(INSERT INTO users (name, email, age) VALUES ($n, $e, $a),
+            n: "Alice", e: "alice@example.com", a: 30)
+
+        let users = await tx.query(SELECT name FROM users WHERE age >= 18)
+        assertEq(users.length(), 1)
+        assertEq(users.get(0).name, "Alice")
+    })
+    // Transaction is automatically rolled back — the users table is unchanged
+}
+```
+
+- `testTransaction()` wraps a test body in a database transaction that rolls back when the test completes — tests are isolated without manual cleanup
+- Works with the schema system (4.7) — the test database matches the declared schema
+
+### Snapshot testing
+
+Capture the output of a function and compare it against a saved reference. Useful for API responses, serialization output, error messages, and rendered HTML.
+
+```phoenix
+import testing.snapshot { assertSnapshot }
+
+@test
+function testUserSerialization() {
+    let user: User = User("Alice", "alice@example.com", 30)
+    let json: String = json.encode(user)
+
+    // First run: saves the snapshot to tests/snapshots/testUserSerialization.snap
+    // Subsequent runs: compares against the saved snapshot
+    assertSnapshot("user_json", json)
+}
+
+@test
+async function testApiResponse() {
+    let client: TestClient = TestClient.fromRouter(app)
+    let response = await client.get("/api/users/1")
+    assertSnapshot("getUserResponse", response.body)
+}
+```
+
+```bash
+# Update snapshots when output intentionally changes
+phoenix test --update-snapshots
+```
+
+- Snapshots are stored as plain text files in a `snapshots/` directory alongside the test file
+- `phoenix test` shows a diff when a snapshot doesn't match
+- `phoenix test --update-snapshots` accepts the new output and overwrites the snapshot file
+
+### Test execution model
+
+- **Parallel by default**: tests in different files run in parallel; tests within a file run sequentially (to respect `@beforeEach`/`@afterEach` ordering)
+- **Isolation**: each test gets its own scope — no shared mutable state between tests unless explicitly passed through context
+- **Fail-fast mode**: `phoenix test --fail-fast` stops after the first failure
+- **Filtering**: `phoenix test --filter "user"` runs only tests whose name contains "user"
+- **Output**: clean, minimal output by default (only failures); `--verbose` shows all tests; failure output includes source location, assertion expression, and actual/expected values
+- **Exit code**: `0` if all tests pass, `1` if any test fails — integrates with CI
+
+### Future integration with property-based testing
+
+When refinement types (5.2) are available, the test framework can generate random values that satisfy type constraints:
+
+```phoenix
+import testing.property { assertProperty }
+
+// The framework generates random PositiveInt values and checks the property holds for all of them
+@test
+function testSqrtIsPositive() {
+    assertProperty(function(n: PositiveInt) -> Bool {
+        sqrt(toFloat(n)) >= 0.0
+    })
+}
+```
+
+This is deferred until refinement types exist, but the `@test` annotation and assertion infrastructure are designed to support it.
+
+- **Why `@test` over `test` blocks:** Annotations are already planned (4.5) and provide a uniform metadata mechanism. A `test` keyword would add a new syntactic form for something that's just a function with metadata. Using `@test` means tests are regular functions — they can be async, accept parameters, return values, and use all normal language features.
+- **Why built-in over library:** A test runner that understands the compiler (annotation discovery, async runtime integration, type-aware assertions) provides a better experience than a third-party library. The compiler can give source-level failure messages, and `phoenix test` works with zero configuration.
+- **Complexity:** Medium — test discovery via annotations is straightforward once annotations exist. The bulk of the work is the test runner (parallel execution, output formatting, fail-fast), HTTP test client (in-memory request dispatch), and snapshot infrastructure (file management, diffing). Database test helpers depend on the database layer (4.7).
+- **Depends on:** Annotations (4.5) for `@test`/`@beforeEach`/`@afterEach`; Async runtime (4.3) for async tests; HTTP (4.4) for `TestClient`; Database (4.7) for `testTransaction`
