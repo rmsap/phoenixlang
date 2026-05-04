@@ -5,6 +5,14 @@ use serde::Serialize;
 /// Each source file loaded into the [`crate::source::SourceMap`] is assigned a
 /// distinct `SourceId`. The inner `usize` is the index into the source map's
 /// internal file list.
+///
+/// **Dense-iteration invariant:** ids are allocated in order starting at
+/// `0`, so for any given map every id in `0..source_map.len()` is a
+/// valid handle. [`crate::source::SourceMap::len`]'s doc relies on this
+/// — callers (e.g. the LSP's `build_source_id_to_url_from_map`) iterate
+/// raw indices to enumerate every file. Swapping the inner representation
+/// for anything other than a dense `usize` requires updating those
+/// callers in lock-step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct SourceId(pub usize);
 

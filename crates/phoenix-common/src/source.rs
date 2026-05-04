@@ -86,6 +86,21 @@ impl SourceMap {
         &self.files[id.0].name
     }
 
+    /// Number of source files registered. Source ids are dense and run
+    /// `0..len()`, so callers can iterate every file by id.
+    ///
+    /// This dense-iteration contract relies on [`SourceMap::add`] being
+    /// the only producer of [`SourceId`]s — `SourceId(usize)` itself is
+    /// `pub`, but no code outside this module constructs it directly.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// True iff no source files have been registered.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     /// Get the source text covered by `span`.
     ///
     /// The span's `source_id` determines which file is sliced, and
@@ -135,6 +150,33 @@ mod tests {
     }
 
     // --- Multiple source files ---
+
+    #[test]
+    fn len_and_dense_iteration_contract() {
+        // Pins the contract `len()`'s doc relies on: every id in
+        // `0..len()` is queryable, and `add` allocates them in order
+        // starting at 0. Callers (e.g. the LSP's
+        // `build_source_id_to_url_from_map`) iterate by raw `SourceId`
+        // index based on this invariant.
+        let mut map = SourceMap::new();
+        assert_eq!(map.len(), 0);
+        assert!(map.is_empty());
+        let id_a = map.add("a.phx", "alpha");
+        let id_b = map.add("b.phx", "beta");
+        let id_c = map.add("c.phx", "gamma");
+        assert_eq!(map.len(), 3);
+        assert!(!map.is_empty());
+        assert_eq!(id_a, SourceId(0));
+        assert_eq!(id_b, SourceId(1));
+        assert_eq!(id_c, SourceId(2));
+        // Every raw id in 0..len() resolves to a name and contents.
+        let names: Vec<&str> = (0..map.len()).map(|raw| map.name(SourceId(raw))).collect();
+        assert_eq!(names, vec!["a.phx", "b.phx", "c.phx"]);
+        let bodies: Vec<&str> = (0..map.len())
+            .map(|raw| map.contents(SourceId(raw)))
+            .collect();
+        assert_eq!(bodies, vec!["alpha", "beta", "gamma"]);
+    }
 
     #[test]
     fn multiple_source_files_get_distinct_ids() {

@@ -15,5 +15,9 @@ phoenix-common = { path = "../phoenix-common" }
 phoenix-lexer = { path = "../phoenix-lexer" }
 phoenix-parser = { path = "../phoenix-parser" }
 phoenix-sema = { path = "../phoenix-sema" }
+phoenix-modules = { path = "../phoenix-modules" }
 tower-lsp = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

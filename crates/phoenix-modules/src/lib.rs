@@ -175,6 +175,49 @@ pub fn resolve(
     entry_file: &Path,
     source_map: &mut SourceMap,
 ) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
+    resolve_with_overlay(entry_file, source_map, &HashMap::new())
+}
+
+/// Resolve the import graph rooted at `entry_file`, consulting an in-memory
+/// overlay before reading from disk.
+///
+/// `overlay` maps file paths to their in-memory contents. The resolver
+/// canonicalizes every key on entry — overlay paths must therefore name
+/// files that already exist on disk, since the BFS only ever asks about
+/// canonical paths. Keys that fail to canonicalize are dropped silently
+/// (the resolver will fall back to `std::fs::read_to_string` for the
+/// discovered file). When the resolver is about to read a discovered
+/// file, it probes the canonicalized overlay first; on a hit it uses
+/// the overlay contents and skips the disk read. On a miss it falls back
+/// to `std::fs::read_to_string` just as [`resolve`] does.
+///
+/// If two overlay keys canonicalize to the same path, exactly one of the
+/// colliding values is used; which one is unspecified (HashMap iteration
+/// order). Callers that hand in distinct files never hit this.
+///
+/// Contents are borrowed (`&str`): the resolver copies into the
+/// [`SourceMap`] only the contents of files it actually reads, so callers
+/// don't pay an unconditional `String` clone for buffers the BFS skips
+/// (e.g. an open scratch file that isn't part of this project).
+///
+/// This is the path the LSP uses so unsaved buffer contents flow through
+/// the resolver without writing them to disk.
+pub fn resolve_with_overlay(
+    entry_file: &Path,
+    source_map: &mut SourceMap,
+    overlay: &HashMap<PathBuf, &str>,
+) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
+    // Canonicalize every overlay key once on entry so the BFS below can
+    // do a direct lookup against the canonical paths it discovers
+    // (`entry_canon` for the entry, paths returned by `discover_import_file`
+    // for siblings — both already canonical). Keys whose files don't
+    // exist on disk are dropped: the BFS only ever asks about canonical
+    // paths, so a literal-match fallback is unreachable in practice.
+    let canonical_overlay: HashMap<PathBuf, &str> = overlay
+        .iter()
+        .filter_map(|(k, v)| k.canonicalize().ok().map(|c| (c, *v)))
+        .collect();
+
     let entry_canon = entry_file
         .canonicalize()
         .map_err(|e| ResolveError::EntryNotFound {
@@ -219,17 +262,23 @@ pub fn resolve(
         // Read + parse.  The entry file gets a different error variant from
         // imported files: an unreadable entry is fatal (we have no graph to
         // explore without it), but an unreadable sibling is accumulated.
-        let contents = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(e) if mp.is_entry() => {
-                return Err(ResolveError::EntryNotFound {
-                    path: file_path,
-                    error: e.to_string(),
-                });
-            }
-            Err(e) => {
-                read_failures.push((file_path.clone(), e.to_string()));
-                continue;
+        // Editor overlays short-circuit the disk read: an open buffer's
+        // contents take precedence over what is on disk.
+        let contents = if let Some(buf) = canonical_overlay.get(&file_path) {
+            buf.to_string()
+        } else {
+            match std::fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(e) if mp.is_entry() => {
+                    return Err(ResolveError::EntryNotFound {
+                        path: file_path,
+                        error: e.to_string(),
+                    });
+                }
+                Err(e) => {
+                    read_failures.push((file_path.clone(), e.to_string()));
+                    continue;
+                }
             }
         };
         // Entry's display name reproduces the caller-supplied path so
@@ -702,6 +751,47 @@ mod tests {
     }
 
     #[test]
+    fn malformed_source_files_paths_are_canonical() {
+        // Pins the invariant that downstream consumers (the LSP's
+        // edited-buffer dedup in `compute_resolve_error_outcome`) rely
+        // on: every entry in `MalformedSourceFiles::files` carries the
+        // canonical path of the file, not whatever path the resolver's
+        // BFS happened to start with. Without this, the LSP's `p == ec`
+        // dedup silently misses and parse diagnostics are duplicated in
+        // the editor.
+        let td = TempDir::new().unwrap();
+        let broken = write_file(td.path(), "broken.phx", "this is not valid @@@\n");
+        let entry = write_file(
+            td.path(),
+            "main.phx",
+            "import broken { foo }\nfunction main() {}\n",
+        );
+        let broken_canon = broken.canonicalize().unwrap();
+        match modules_for(&entry) {
+            Err(ResolveError::MalformedSourceFiles { files }) => {
+                assert!(
+                    files.iter().any(|(p, _)| p == &broken_canon),
+                    "expected the canonical path {:?} in MalformedSourceFiles; got {:?}",
+                    broken_canon,
+                    files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+                );
+                // And every entry must already be canonical.
+                for (p, _) in &files {
+                    let canon = p
+                        .canonicalize()
+                        .expect("path in malformed list should exist on disk");
+                    assert_eq!(
+                        p, &canon,
+                        "MalformedSourceFiles paths must be canonical (not {:?})",
+                        p
+                    );
+                }
+            }
+            other => panic!("expected MalformedSourceFiles, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn malformed_files_are_accumulated() {
         // Two siblings each have a parse error.  Both should appear in
         // the returned `files` vector — bailing on the first would have
@@ -898,6 +988,145 @@ mod tests {
             }
             other => panic!("expected MalformedSourceFiles, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn overlay_shadows_disk_contents() {
+        // An entry on disk says one thing; an overlay supplies different
+        // contents for the same canonical path. Resolution must use the
+        // overlay version.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(td.path(), "main.phx", "function main() {}\n");
+        let entry_canon = entry.canonicalize().unwrap();
+
+        let mut overlay = HashMap::new();
+        overlay.insert(entry_canon, "import sib { greet }\nfunction main() {}\n");
+        write_file(td.path(), "sib.phx", "public function greet() {}\n");
+
+        let mut sm = SourceMap::new();
+        let out = resolve_with_overlay(&entry, &mut sm, &overlay).unwrap();
+        // The overlay introduced an import the on-disk file lacks; the
+        // resolver should have followed it.
+        assert!(
+            out.iter()
+                .any(|m| m.module_path == ModulePath(vec!["sib".into()])),
+            "expected overlay-introduced import to be followed, got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn overlay_with_non_canonical_key_is_canonicalized_and_matches() {
+        // `resolve_with_overlay` canonicalizes overlay keys on entry, so
+        // a key with `..` segments that resolves to the same file on
+        // disk *does* match. Pins the convenience contract callers rely
+        // on so the LSP doesn't have to mirror the canonicalize dance
+        // for every overlay entry.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(td.path(), "main.phx", "function main() {}\n");
+        let canon = entry.canonicalize().unwrap();
+        // Construct a non-canonical equivalent path: <td>/dummy/../main.phx.
+        // The intermediate directory must exist on disk for
+        // `canonicalize` to resolve the `..` segment.
+        std::fs::create_dir(canon.parent().unwrap().join("dummy")).unwrap();
+        let non_canon = canon
+            .parent()
+            .unwrap()
+            .join("dummy")
+            .join("..")
+            .join("main.phx");
+        // Sanity: this path is not equal as PathBuf to the canonical form.
+        assert_ne!(non_canon, canon);
+
+        let mut overlay = HashMap::new();
+        overlay.insert(non_canon, "import sib { greet }\nfunction main() {}\n");
+        write_file(td.path(), "sib.phx", "public function greet() {}\n");
+
+        let mut sm = SourceMap::new();
+        let out = resolve_with_overlay(&entry, &mut sm, &overlay).unwrap();
+        // The overlay key canonicalizes to the same path as the entry,
+        // so its contents win and the resolver follows the new
+        // `import sib`.
+        assert!(
+            out.iter()
+                .any(|m| m.module_path == ModulePath(vec!["sib".into()])),
+            "canonicalized overlay key should be matched; got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn overlay_for_imported_module_used_over_disk() {
+        // An imported sibling exists on disk but is shadowed by an overlay
+        // entry that points the importer at different exports. The overlay
+        // contents should win.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "sib.phx", "public function onDisk() {}\n");
+        let sib_canon = td.path().join("sib.phx").canonicalize().unwrap();
+        let entry = write_file(
+            td.path(),
+            "main.phx",
+            "import sib { fromOverlay }\nfunction main() {}\n",
+        );
+
+        let mut overlay = HashMap::new();
+        overlay.insert(sib_canon, "public function fromOverlay() {}\n");
+
+        let mut sm = SourceMap::new();
+        // Without the overlay, sema would reject `fromOverlay` because it
+        // isn't declared in the on-disk version. The resolver itself only
+        // proves overlay use indirectly — by parsing the contents and
+        // returning them; assert no parse / resolve error here.
+        let out = resolve_with_overlay(&entry, &mut sm, &overlay).unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn overlay_key_collision_picks_one_arbitrarily() {
+        // Two distinct overlay keys canonicalize to the same on-disk
+        // path. The doc promises that exactly one of the colliding
+        // values is used; which one is unspecified (HashMap iteration
+        // order). Pin the contract so a future change can't silently
+        // flip to "neither wins" / fall back to disk: exactly one
+        // payload must make it through, and the resolver must not read
+        // the on-disk contents.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(td.path(), "main.phx", "function main() {}\n");
+        let canon = entry.canonicalize().unwrap();
+        // Build a second path that canonicalizes to the same file.
+        std::fs::create_dir(canon.parent().unwrap().join("dummy")).unwrap();
+        let alt = canon
+            .parent()
+            .unwrap()
+            .join("dummy")
+            .join("..")
+            .join("main.phx");
+        assert_ne!(alt, canon);
+        write_file(
+            td.path(),
+            "from_canon.phx",
+            "public function viaCanon() {}\n",
+        );
+        write_file(td.path(), "from_alt.phx", "public function viaAlt() {}\n");
+
+        let mut overlay = HashMap::new();
+        overlay.insert(
+            canon.clone(),
+            "import from_canon { viaCanon }\nfunction main() {}\n",
+        );
+        overlay.insert(alt, "import from_alt { viaAlt }\nfunction main() {}\n");
+
+        let mut sm = SourceMap::new();
+        let out = resolve_with_overlay(&entry, &mut sm, &overlay).unwrap();
+        let module_paths: Vec<_> = out.iter().map(|m| m.module_path.dotted()).collect();
+        let saw_canon = module_paths.iter().any(|p| p == "from_canon");
+        let saw_alt = module_paths.iter().any(|p| p == "from_alt");
+        assert!(
+            saw_canon ^ saw_alt,
+            "exactly one colliding overlay payload should win (last-iterated); \
+             got modules={:?}",
+            module_paths,
+        );
     }
 
     #[test]

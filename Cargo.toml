@@ -41,3 +41,6 @@ target-lexicon = "0.13"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# Test scratch directories (used by phoenix-modules and phoenix-lsp tests)
+tempfile = "3"
