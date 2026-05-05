@@ -600,6 +600,25 @@ impl IrFunction {
         self.values.next_value_id().0
     }
 
+    /// The entry block (`blocks[0]` by Phoenix-IR convention).
+    ///
+    /// Function parameters are bound as the parameters of this block,
+    /// so backends emitting per-function setup (shadow-stack frame
+    /// push, parameter rooting, etc.) anchor on this method rather
+    /// than re-encoding the `blocks[0]` invariant at every site.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the function has no blocks. Every IR function created
+    /// via [`Self::new`] gets at least one entry block during lowering;
+    /// this should be unreachable in production paths.
+    pub fn entry_block(&self) -> &BasicBlock {
+        self.blocks.first().expect(
+            "IrFunction::entry_block: function has no blocks; \
+             entry-block convention violated",
+        )
+    }
+
     /// Creates a new basic block and returns its [`BlockId`].
     /// The block is appended to `self.blocks` with an empty body and
     /// a [`Terminator::None`] placeholder.

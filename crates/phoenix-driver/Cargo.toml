@@ -29,3 +29,9 @@ toml = { workspace = true }
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+
+# Linux-only: needed to set RLIMIT_AS in the child process before exec, so
+# the alloc-bounded-memory test can prove the GC actually collects (the
+# child OOMs if it leaks instead of sweeping unrooted allocations).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

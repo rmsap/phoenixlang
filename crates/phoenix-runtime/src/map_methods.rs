@@ -295,7 +295,12 @@ pub unsafe extern "C" fn phx_map_contains(map: *const u8, key_ptr: *const u8, ke
 ///
 /// # Safety
 ///
-/// `map` must point to a valid map header.
+/// - `map` must point to a valid map header.
+/// - `map` must be rooted by the caller's shadow-stack frame for the
+///   duration of this call. See the *Rooting contract* in the
+///   `list_methods` module header — the same shape applies:
+///   `phx_list_alloc` can trigger an auto-collect that would sweep
+///   an unrooted input.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_map_keys(map: *const u8) -> *mut u8 {
     let (length, ks, vs) = unsafe { map_header(map) };
@@ -318,7 +323,9 @@ pub unsafe extern "C" fn phx_map_keys(map: *const u8) -> *mut u8 {
 ///
 /// # Safety
 ///
-/// `map` must point to a valid map header.
+/// - `map` must point to a valid map header.
+/// - `map` must be rooted by the caller's shadow-stack frame for the
+///   duration of this call. See [`phx_map_keys`] for the rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_map_values(map: *const u8) -> *mut u8 {
     let (length, ks, vs) = unsafe { map_header(map) };

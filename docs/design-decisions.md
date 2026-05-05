@@ -48,9 +48,11 @@ Currently `else if` is parsed as `else { if ... }` (nested). This works but comp
 
 ### `defer` for resource cleanup
 
-For a web-focused language, explicit resource cleanup with `defer conn.close()` (Go-style) is often more readable than implicit drop semantics, especially in async contexts.
+**Status: decision locked 2026-05-04 (implementation pending).**
 
-**Recommendation:** Revisit after Phase 4.3 (Async Runtime).
+Resolved in Phase 2.3 as the implied commitment of the GC strategy decision. **Decision: Go-style statement-level `defer expr;`.** See [G. Scope-bound cleanup syntax](#g-scope-bound-cleanup-syntax-go-style-statement-level-defer) under GC subordinate decisions for the full rationale and the alternatives rejected (block-binding `using`/`with` syntax was considered and declined).
+
+The decision is locked but the lexer/parser/sema/IR/codegen plumbing is still pending — implementation status is tracked as an open exit-criterion in [phase-2.md](phases/phase-2.md#exit-criteria-for-declaring-phase-23-complete).
 
 ### Lambda parameter inference at call sites
 
@@ -424,6 +426,88 @@ Without WASM and concurrency in the picture this would be a much closer call —
 **Alternatives considered:**
 - **Reference counting (with cycle collector).** Rejected despite real wins (simpler implementation, deterministic destruction enabling `Drop`, no pause-time tuning): forces an awkward WASM story (ship own RC on linear memory, or abandon deterministic destruction on WASM), and needs atomic refcounts under concurrency in Phase 4.3.
 - **Hybrid (RC + cycle collector, or nursery + tracing old gen).** Rejected: doubles implementation cost for a pre-1.0 language without a correspondingly decisive win. Revisitable later if the simple tracing GC hits real limits.
+- **Boehm conservative GC (`bdwgc`).** Considered for the baseline. Rejected: conservative scanning forces the rest of the runtime to live with false-retention (any stack/register word that happens to look like a heap pointer pins the object), forces foreign-code linkage (C library) at the exact moment we want to keep the runtime crate self-contained for future WASM-GC port, and brings none of the benefits of a precise collector that we already have the type information to build (`IrType::is_ref_type()` already classifies every SSA value).
+
+### GC implementation: subordinate decisions
+
+Sub-decisions made under the `### GC strategy` umbrella above, settled at the start of Phase 2.3. Decided 2026-05-04.
+
+#### A. Root-finding: precise via shadow stack
+
+A per-thread linked list of frames; each frame is a small array of root-pointer slots, pushed at function entry, popped at exit, written at every IR op that produces a ref-typed SSA value.
+
+**Why not Cranelift user-stack-maps.** They exist (Cranelift 0.66+) but the API churns and the metadata is finite-lifetime: Phase 2.4 (WASM GC) replaces native root-finding entirely with WASM GC's typed references. Spending real effort on stack-map plumbing for code we'll throw away is a bad trade.
+
+**Why not conservative.** Conservative scanning would force `i64`/heap-pointer disambiguation (NaN-boxing or low-bit tagging across the whole ABI). That's a much bigger change than precise tracking — and Phoenix already knows which `ValueId`s are references via `IrType::is_ref_type()` (`crates/phoenix-ir/src/types.rs`) and `FuncState.type_map` (`crates/phoenix-cranelift/src/translate/mod.rs`). The information is there; we just emit it.
+
+**Cost accepted.** ~10–20% per-call overhead on ref-heavy code (one extra store per ref-typed assignment). Acceptable for a baseline.
+
+#### B. Heap layout: segregated free lists by size class, single arena
+
+**Original target.** Size classes 16/32/64/128/256/512/1024 bytes; large objects allocated individually. Mark-and-sweep returns blocks to the appropriate size class's free list. **No compaction** (compaction needs a moving GC + write barriers, both out of scope per "baseline only").
+
+Bump-only without compaction fragments badly. Free-list with size classes is the standard mark-sweep baseline (Boehm, Go pre-1.5). Predictable, no relocation pressure on our missing write barriers.
+
+**Adopted baseline (2026-05-04).** First cut uses Rust's global allocator + a `HashSet<*mut ObjectHeader>` registry — every allocation is registered, sweep walks the registry and frees unreachable headers via `dealloc`. Segregated free lists deferred to Phase 2.7 as a perf-tuning target; the global-allocator path is correctness-equivalent and avoids reimplementing arena management before we have a perf signal pointing at it.
+
+#### C. Object header: 8-byte per-object header
+
+```
+[ header: u64 ][ payload... ]
+  bits  [0]      mark bit
+  bits  [1..8]   7-bit type tag (Unknown, String, List, Map, Closure, Struct, Enum, Dyn)
+  bits  [8..32]  reserved (forwarding pointer for future moving GC)
+  bits  [32..64] payload size or trace-table index
+```
+
+The original design split bits 1..4 into a size-class field; that field is unused in the first cut (Decision B's adopted baseline does not maintain size classes), so bits 1..8 are all available to the type tag. Reinstating size classes when Phase 2.7 lands the segregated allocator means narrowing the tag back to 4 bits, which still fits today's 8 variants with **8 spare codepoints** — no ABI break. Anyone adding to `TypeTag` should treat that 16-variant ceiling as a hard budget; past it, either the size-class plan changes or the header redesigns.
+
+Trace metadata lives in a side table indexed by type-tag for built-ins and by `StructInfo` / `EnumInfo` index for user types — keeps per-allocation IR small. Forwarding-pointer bits are reserved now so a future moving GC doesn't break ABI.
+
+The `phx_alloc` C-ABI signature gains a `type_tag: u32` argument; the *Rust-side* `GcHeap` trait dispatches once inside that function.
+
+#### D. Safepoint placement: at allocation calls only
+
+Single-threaded. GC fires only when `phx_alloc` (and `phx_list_alloc`, `phx_map_alloc`, etc.) decide to collect (threshold-based — start at 1 MB allocated since last collection). Loop back-edges and function entry are deferred to Phase 4.3 when concurrency forces preemptive safepoints.
+
+No Phoenix program today can run an allocation-free hot loop (string/list/map ops all allocate), so the "GC starves under hot non-allocating loop" pathology is theoretical until 4.3.
+
+#### E. Allocator abstraction: `GcHeap` Rust trait, single impl in 2.3
+
+`trait GcHeap { fn alloc(&mut self, size, type_tag) -> *mut u8; fn collect(&mut self, roots: &[*mut u8]); }` in `phoenix-runtime/src/gc/mod.rs`. Phase 2.3 ships `MarkSweepHeap` only. Phase 2.4 plugs in a WASM-GC-backed impl behind the same trait — port becomes mechanical instead of a rewrite.
+
+The C-ABI symbol (`phx_alloc`) does not change shape between impls — trait dispatch happens once, inside that C function.
+
+#### F. Strings join the GC heap; no interning in 2.3
+
+Every `leak_string()` call site in `phoenix-runtime/src/string_methods.rs` and the conversion functions in `lib.rs` switches to GC-allocated strings. The String type-tag's trace function is a no-op (strings hold no refs internally).
+
+Without this, "no leaks under valgrind" cannot pass — strings are the dominant allocator in any non-trivial Phoenix program (every `+`, `toString`, `trim`, `replace`). Interning is a separate optimization, deferred to Phase 2.7+ benchmarks.
+
+#### G. Scope-bound cleanup syntax: Go-style statement-level `defer`
+
+`defer expr;` schedules `expr` to run at end of the enclosing block in reverse (LIFO) order, on every exit path including early `return` and panic. It's a statement, not a block — no new indentation level, no required protocol trait.
+
+**Rejected: `using x = expr { ... }` block-binding (Java/Python/C# style).** Block-binding implies a `Closeable` / `Drop`-style trait that user types must implement. That's a non-trivial language design decision (auto-derive? multiple cleanup methods? interaction with traits?) we don't want to commit to early. `defer` sidesteps the trait commitment by letting the user write the cleanup expression themselves.
+
+**Rationale for shipping plumbing in 2.3 even though no stdlib type uses it yet.** The GC decision *creates* this requirement (no deterministic destruction). Bundling the syntax decision with the GC context now is cheaper than reopening it later — and the IR/codegen plumbing for `defer` interacts with the function-exit emission for `phx_gc_pop_frame`, so it's natural to land them together (defers run *before* `pop_frame`).
+
+#### H. FFI-boundary no-panic policy
+
+Every `extern "C"` symbol in `phoenix-runtime` (panic strategy: `unwind`) must terminate via `runtime_abort` / `process::exit` rather than `panic!` / `assert!` / `expect`. Unwinding across the C ABI is undefined behavior; a panic that originates inside an `extern "C"` runtime helper would unwind through Cranelift-emitted compiled code that never compiled in unwinding support.
+
+This invariant is load-bearing for any helper that brackets work between `phx_gc_push_frame` and `phx_gc_pop_frame`: a panic between the two would (a) trigger the UB above and (b) leak the frame. New helpers that need to push/pop a frame around a multi-step operation must therefore audit every function called between the push and the pop and confirm none of them panic. The current audit list, all routed through `runtime_abort`:
+
+- `phx_gc_alloc` / `phx_string_alloc` / `phx_alloc` — `runtime_abort` on layout failure, `handle_alloc_error` on OOM (which itself aborts).
+- `phx_gc_set_root` / `phx_gc_pop_frame` — `runtime_abort` on bad indices / mismatch.
+- `phx_gc_shutdown` — `lock_heap()` (`runtime_abort` on poison), `mem::replace`, then `Drop for MarkSweepHeap` which `runtime_abort`s on layout failure during dealloc. No `panic!`/`expect`/`assert!` reachable.
+- `to_phx_string_from_str` — wraps `phx_string_alloc`, no panicking branch.
+- `phx_list_alloc` — `runtime_abort` on negative inputs and on mul/add overflow.
+- `phx_list_push_raw` — `runtime_abort` on length overflow.
+
+The audit list above is intended to stay panic-free in its entirety: there is no "documented as unreachable" carve-out. If a future helper genuinely needs to surface failure to the caller, the response is to switch its declaration to `extern "C-unwind"` (and audit every Cranelift call site) — *not* to silently allow the panic. A `Drop`-guard approach is insufficient because the unwind-across-FFI is the deeper hazard than the leaked frame.
+
+`runtime_abort` itself uses `eprintln!`, which allocates via Rust's global allocator. A nested OOM during the abort path falls through to Rust's panic-in-print handler, which itself aborts — so the FFI-no-panic invariant survives even in the most pathological case. The cost is one indirection past the documented exit; mentioning it here so future readers don't audit `runtime_abort` thinking it leaks an unwind path.
 
 ### Diagnostic builder pattern
 

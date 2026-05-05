@@ -333,6 +333,8 @@ mod tests {
             current_capture_types: Vec::new(),
             enum_payload_types: HashMap::new(),
             block_map: HashMap::new(),
+            gc_frame: None,
+            next_var_index: 0,
         }
     }
 
@@ -507,6 +509,8 @@ mod tests {
                 .map(|(v, variant, fields)| (v, (variant, fields)))
                 .collect(),
             block_map: HashMap::new(),
+            gc_frame: None,
+            next_var_index: 0,
         }
     }
 

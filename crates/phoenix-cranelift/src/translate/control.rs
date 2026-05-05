@@ -5,27 +5,36 @@ use cranelift_codegen::ir::types as cl;
 use cranelift_codegen::ir::{self, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
+use crate::context::CompileContext;
 use crate::error::CompileError;
 use phoenix_ir::module::IrFunction;
 use phoenix_ir::terminator::Terminator;
 
+use super::gc_roots;
 use super::{FuncState, get_val, get_val1};
 
 /// Translate a Phoenix terminator into Cranelift control flow instructions.
 pub(super) fn translate_terminator(
     builder: &mut FunctionBuilder,
+    ctx: &mut CompileContext,
     term: &Terminator,
     state: &FuncState,
     _func: &IrFunction,
 ) -> Result<(), CompileError> {
     match term {
         Terminator::Return(val) => {
-            if let Some(vid) = val {
-                let vals = get_val(state, *vid)?;
-                builder.ins().return_(&vals);
+            // Compute the return values *before* popping the frame, so
+            // that any ref-typed return value remains rooted while we
+            // emit the pop_frame call.
+            let return_vals: Vec<Value> = if let Some(vid) = val {
+                get_val(state, *vid)?
             } else {
-                builder.ins().return_(&[]);
+                Vec::new()
+            };
+            if let Some(frame) = state.gc_frame.as_ref() {
+                gc_roots::emit_frame_pop(builder, ctx, frame);
             }
+            builder.ins().return_(&return_vals);
         }
         Terminator::Jump { target, args } => {
             let cl_target = state.block_map[target];

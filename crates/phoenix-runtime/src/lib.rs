@@ -4,15 +4,51 @@
 //! linked into every native Phoenix binary.  It provides the built-in
 //! functions that compiled code calls via `extern` declarations.
 //!
-//! All memory allocated by runtime functions is currently leaked.
-//! A garbage collector or explicit free mechanism will be added in
-//! Phase 2.3.  Until then, compiled binaries are not suitable for
-//! long-running processes.
+//! Heap allocations are managed by a tracing mark-and-sweep GC.
+//! Compiled code allocates via [`phx_alloc`] (or the typed
+//! variants [`gc::phx_gc_alloc`] / `phx_string_alloc`) and is responsible
+//! for maintaining the shadow stack via [`gc::phx_gc_push_frame`] /
+//! [`gc::phx_gc_set_root`] / [`gc::phx_gc_pop_frame`] so the collector
+//! can find live roots.  See `docs/design-decisions.md#gc-implementation`
+//! for the full rationale.
 #![warn(missing_docs)]
+
+/// Garbage collector: mark-and-sweep heap, shadow stack, and the C-ABI
+/// hooks (`phx_gc_alloc`, `phx_gc_push_frame`, ...) called by compiled code.
+pub mod gc;
 
 mod list_methods;
 mod map_methods;
 mod string_methods;
+
+/// Internal re-exports for the crate's integration tests. **Not**
+/// stable Rust API: these symbols already exist on the C ABI side
+/// (via `#[unsafe(no_mangle)] pub extern "C"`), and the only reason
+/// to route them through Rust paths is so `tests/` can drive them
+/// without declaring its own `extern "C"` block. External consumers
+/// must continue to link against the C symbols.
+///
+/// `#[doc(hidden)]` keeps the module out of rustdoc; the `__test_support`
+/// name (double underscore) keeps it out of the casual import surface
+/// and signals "internal" to anyone tempted to depend on it. If a
+/// symbol here ever becomes public Rust API, give it its own top-level
+/// `pub use` with a real docstring.
+#[doc(hidden)]
+pub mod __test_support {
+    pub use crate::list_methods::{
+        phx_list_alloc, phx_list_drop, phx_list_get_raw, phx_list_length, phx_list_take,
+        phx_str_split,
+    };
+    pub use crate::phx_str_concat;
+
+    /// Test-only wrapper around the private `to_phx_string_from_str`.
+    /// Kept here (rather than promoting the helper to crate-public)
+    /// so the GC-managed string constructor stays out of the steady-
+    /// state Rust API surface.
+    pub fn to_phx_string_from_str(s: &str) -> crate::PhxFatPtr {
+        crate::to_phx_string_from_str(s)
+    }
+}
 
 /// Return the list header size in bytes.
 ///
@@ -104,13 +140,46 @@ fn format_panic_message(bytes: &[u8]) -> String {
     format!("runtime error: {msg}")
 }
 
+/// Abort the process from inside an `extern "C"` function.
+///
+/// **Why:** the workspace's default panic strategy is `unwind`, and
+/// unwinding across an `extern "C"` boundary is undefined behavior.
+/// Any condition reachable from compiled-Phoenix code that we want to
+/// fail loudly on must terminate via `process::exit` rather than
+/// `panic!`/`expect`/`assert!`. Mirrors the [`phx_panic`] convention so
+/// runtime aborts share a "runtime error: ..." prefix.
+#[cold]
+#[inline(never)]
+pub(crate) fn runtime_abort(msg: &str) -> ! {
+    eprintln!("runtime error: {msg}");
+    process::exit(1);
+}
+
 // ── String operations ───────────────────────────────────────────────
 
 /// Concatenate two strings, returning a new heap-allocated (ptr, len).
 ///
 /// # Safety
 ///
-/// Both `(p1, l1)` and `(p2, l2)` must be valid UTF-8 byte slices.
+/// - Both `(p1, l1)` and `(p2, l2)` must be valid UTF-8 byte slices.
+/// - **`p1` and `p2` must be rooted by the caller's shadow-stack frame
+///   for the duration of this call.** [`phx_string_alloc`] below can
+///   trigger an auto-collect; the input bytes are read by the
+///   subsequent `copy_nonoverlapping`, so an unrooted GC-managed input
+///   would be swept between the alloc and the copy and the copy would
+///   read freed memory. Cranelift-emitted callers root ref-typed
+///   parameters automatically; a hand-written Rust caller passing
+///   GC-managed strings must push a frame first.
+///
+/// # Behavior change in Phase 2.3
+///
+/// Pre-2.3 used `l1 + l2` and relied on `usize` wrapping: if the sum
+/// wrapped to 0 (`l1 == usize::MAX`, `l2 == 1`) the empty-string fast
+/// path returned a valid result on bogus input. Post-2.3 detects the
+/// overflow with `checked_add` and `runtime_abort`s. No real caller can
+/// trip this — `usize::MAX`-byte strings are unrepresentable in any
+/// process's address space — but the input shape is no longer silently
+/// rounded.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_concat(
     p1: *const u8,
@@ -118,46 +187,44 @@ pub unsafe extern "C" fn phx_str_concat(
     p2: *const u8,
     l2: usize,
 ) -> PhxFatPtr {
-    let s1 = unsafe { slice::from_raw_parts(p1, l1) };
-    let s2 = unsafe { slice::from_raw_parts(p2, l2) };
-    if l1 + l2 == 0 {
-        // Return a valid (non-dangling) empty string pointer.
-        // Vec::with_capacity(0) doesn't allocate, so as_ptr() would dangle.
-        //
-        // NOTE: This returns a pointer into the binary's .rodata section.
-        // When a GC is added (Phase 2.3), this pointer must NOT be freed
-        // or reallocated. The GC will need to distinguish static pointers
-        // from heap pointers (e.g., via a heap range check or tag bit).
-        return PhxFatPtr {
-            ptr: b"".as_ptr(),
-            len: 0,
-        };
+    // Sum the lengths up front so an overflowing pair aborts before
+    // we touch the inputs. Lengths above `isize::MAX` (but not
+    // overflowing the sum) are caught one layer down by
+    // `Layout::from_size_align` inside `phx_string_alloc`, which
+    // routes the same way through `runtime_abort`.
+    let Some(total) = l1.checked_add(l2) else {
+        runtime_abort("string concat length overflow");
+    };
+    if total == 0 {
+        return empty_phx_str();
     }
-    let mut buf = Vec::with_capacity(l1 + l2);
-    buf.extend_from_slice(s1);
-    buf.extend_from_slice(s2);
-    let len = buf.len();
-    let ptr = buf.as_ptr();
-    std::mem::forget(buf);
-    PhxFatPtr { ptr, len }
+    let dest = phx_string_alloc(total);
+    unsafe {
+        std::ptr::copy_nonoverlapping(p1, dest, l1);
+        std::ptr::copy_nonoverlapping(p2, dest.add(l1), l2);
+    }
+    PhxFatPtr {
+        ptr: dest,
+        len: total,
+    }
 }
 
 /// Convert an integer to a heap-allocated string.
 #[unsafe(no_mangle)]
 pub extern "C" fn phx_i64_to_str(val: i64) -> PhxFatPtr {
-    leak_string(val.to_string())
+    to_phx_string_from_str(&val.to_string())
 }
 
 /// Convert a float to a heap-allocated string.
 #[unsafe(no_mangle)]
 pub extern "C" fn phx_f64_to_str(val: f64) -> PhxFatPtr {
-    leak_string(format_f64(val))
+    to_phx_string_from_str(&format_f64(val))
 }
 
 /// Convert a bool to a heap-allocated string.
 #[unsafe(no_mangle)]
 pub extern "C" fn phx_bool_to_str(val: i8) -> PhxFatPtr {
-    leak_string(if val != 0 { "true" } else { "false" }.to_string())
+    to_phx_string_from_str(if val != 0 { "true" } else { "false" })
 }
 
 // ── String comparison ───────────────────────────────────────────────
@@ -189,29 +256,46 @@ str_cmp_fn!(phx_str_ge, >=);
 
 // ── Heap allocation ─────────────────────────────────────────────────
 
-/// Allocate `size` bytes on the heap.  Returns a pointer.
-/// No GC — memory is leaked until Phase 2.3.
+/// Allocate `size` bytes on the heap, registering the result with the GC.
 ///
-/// # Safety
+/// Returns a pointer to the **payload**; the GC's 8-byte object header
+/// sits immediately before it.  Payload memory is zeroed.  The returned
+/// pointer is owned by the GC; do not call `free` on it.  It stays
+/// valid until a collection cycle in which no shadow-stack frame holds
+/// a reference to it.
 ///
-/// The caller must ensure `size` is a valid allocation size.
+/// The allocation is registered with the [`TypeTag::Unknown`](gc::TypeTag)
+/// tag, meaning the GC will conservatively scan its payload for interior
+/// pointers during the mark phase.  Use [`phx_string_alloc`] for string
+/// data (whose payload should not be scanned), or [`gc::phx_gc_alloc`]
+/// directly to specify a different tag.
+///
+/// # Semantic change in Phase 2.3
+///
+/// Pre-2.3, `phx_alloc` returned `malloc`-backed memory that lived
+/// until the process exited.  Post-2.3, the returned pointer is GC-
+/// managed: once `phx_gc_enable` runs (the generated C `main` calls
+/// it before `phx_main`), an allocation that no shadow-stack frame
+/// roots will be reclaimed at the next collection.  Any non-codegen
+/// caller (an FFI consumer, a Rust runtime helper, an external test
+/// linker) that previously relied on the leak-everything semantics
+/// must now either push a shadow-stack frame for the lifetime of the
+/// returned pointer, or call `gc::phx_gc_disable()` to opt back into
+/// leak-only behavior.
 #[unsafe(no_mangle)]
 pub extern "C" fn phx_alloc(size: usize) -> *mut u8 {
-    // Zero-size allocations are UB for the global allocator.
-    // Bump to 8 so we always get a valid pointer.
-    let actual_size = if size == 0 { 8 } else { size };
-    let layout =
-        std::alloc::Layout::from_size_align(actual_size, 8).expect("invalid allocation size");
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        eprintln!("runtime error: out of memory");
-        process::exit(1);
-    }
-    debug_assert!(
-        (ptr as usize).is_multiple_of(8),
-        "phx_alloc returned unaligned pointer"
-    );
-    ptr
+    gc::phx_gc_alloc(size, gc::TypeTag::Unknown as u32)
+}
+
+/// Allocate `size` bytes for raw string data.
+///
+/// Like [`phx_alloc`], but tagged so the GC skips the interior scan
+/// (UTF-8 bytes never look like valid heap pointers — scanning them
+/// would just waste cycles and risk false retention from coincidental
+/// byte patterns).
+#[unsafe(no_mangle)]
+pub extern "C" fn phx_string_alloc(size: usize) -> *mut u8 {
+    gc::phx_gc_alloc(size, gc::TypeTag::String as u32)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -222,12 +306,12 @@ pub extern "C" fn phx_alloc(size: usize) -> *mut u8 {
 ///
 /// # Ownership
 ///
-/// The pointed-to byte data is heap-allocated and **intentionally leaked**
-/// (see [`leak_string`]).  There is currently no mechanism to free it.
-/// A garbage collector will reclaim these allocations in Phase 2.3.
+/// The pointed-to byte data is allocated on the GC heap (see
+/// [`to_phx_string_from_str`]).  The collector reclaims it once no
+/// shadow-stack frame holds a reference.
 #[repr(C)]
 pub struct PhxFatPtr {
-    /// Pointer to the UTF-8 byte data (heap-allocated, leaked).
+    /// Pointer to the UTF-8 byte data on the GC heap.
     pub ptr: *const u8,
     /// Length in bytes.
     pub len: usize,
@@ -247,16 +331,45 @@ fn format_f64(val: f64) -> String {
     }
 }
 
-/// Convert a `String` into a [`PhxFatPtr`] by leaking its allocation.
+/// Convert a `&str` into a [`PhxFatPtr`] backed by GC memory.
 ///
-/// The string's backing memory is deliberately not freed — a GC will
-/// reclaim it in Phase 2.3.  Until then, every call to this function
-/// leaks `s.len()` bytes.
-pub(crate) fn leak_string(s: String) -> PhxFatPtr {
+/// Allocates a GC-managed buffer (tagged [`gc::TypeTag::String`] so its
+/// contents are never scanned for interior pointers), copies the bytes
+/// into it, and returns a fat pointer to the GC payload.
+///
+/// Empty inputs short-circuit to a process-static pointer (`b""`) — every
+/// hot path that produces an empty string (concat with `""`, `trim` on
+/// whitespace-only, `replace` with full overlap, `substring` with
+/// `start == end`) thus avoids an allocator round-trip and a sweep slot.
+pub(crate) fn to_phx_string_from_str(s: &str) -> PhxFatPtr {
     let len = s.len();
-    let ptr = s.as_ptr();
-    std::mem::forget(s);
-    PhxFatPtr { ptr, len }
+    if len == 0 {
+        return empty_phx_str();
+    }
+    let dest = phx_string_alloc(len);
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), dest, len);
+    }
+    PhxFatPtr { ptr: dest, len }
+}
+
+/// Cheap zero-length [`PhxFatPtr`] backed by a `.rodata` byte.
+///
+/// The GC's `header_for_payload` doesn't recognize this pointer (it isn't
+/// in the heap registry) so it's silently skipped during mark — exactly
+/// what we want for a process-lifetime constant.  Read-only consumers
+/// don't dereference past `len = 0` so the static is never observed.
+pub(crate) fn empty_phx_str() -> PhxFatPtr {
+    // Why this is safe to leave un-rooted: `b"".as_ptr()` returns a
+    // pointer into the binary's `.rodata` section, which is never
+    // registered in the heap header set — the conservative scan asks
+    // `header_for_payload`, which returns None, so no false-positive
+    // retention. With `len == 0`, no consumer ever dereferences the
+    // pointer either.
+    PhxFatPtr {
+        ptr: b"".as_ptr(),
+        len: 0,
+    }
 }
 
 /// Reconstruct a byte slice from a raw pointer and length.

@@ -1,6 +1,8 @@
 //! List runtime functions for compiled Phoenix programs.
 //!
-//! A Phoenix list is a heap-allocated object with the layout:
+//! A Phoenix list is the *payload* of a GC allocation. The layout below
+//! is in payload-relative offsets; an 8-byte `gc::ObjectHeader` sits at
+//! `list_ptr - 8` and is owned by the GC (callers never reach for it).
 //!
 //! ```text
 //! offset 0:  i64  length       (number of elements)
@@ -9,11 +11,35 @@
 //! offset 24: u8[] data         (element storage, length * elem_size bytes)
 //! ```
 //!
-//! All memory is intentionally leaked (no GC yet).
+//! Memory is reclaimed by the tracing GC; see `crate::gc`.
+//!
+//! ## Rooting contract for list-returning helpers
+//!
+//! Every helper here that returns a fresh list ([`phx_list_push_raw`],
+//! [`phx_list_take`], [`phx_list_drop`]) shares the same shape:
+//!
+//! 1. Read the input list's header to size the new allocation.
+//! 2. Call [`phx_list_alloc`] for the new list — this can trigger an
+//!    auto-collect.
+//! 3. Copy bytes from the input list's payload into the new list.
+//!
+//! Step 2 walks the shadow stack. **The input list must be rooted by
+//! the caller's frame**, otherwise the sweep at step 2 frees it and
+//! the copy at step 3 reads freed memory. Cranelift-emitted callers
+//! root ref-typed parameters automatically; hand-written Rust callers
+//! must push a frame first. The per-function `# Safety` blocks below
+//! reference this contract by name (*"list must be rooted by the
+//! caller's shadow-stack frame"*); this comment is the single
+//! explanation of *why* every helper carries that requirement.
+//!
+//! `phx_str_split` is a special case: it pushes its own frame around
+//! the loop because the freshly-allocated `list` is not rooted by any
+//! caller frame at the moment the loop body re-enters the allocator.
 
 use std::slice;
 
-use crate::phx_alloc;
+use crate::gc::{phx_gc_pop_frame, phx_gc_push_frame, phx_gc_set_root};
+use crate::{phx_alloc, runtime_abort};
 
 /// Header size in bytes (length + capacity + elem_size).
 pub(crate) const HEADER_SIZE: usize = 24;
@@ -108,28 +134,30 @@ pub(crate) unsafe fn elements_equal(
 ///
 /// Returns a pointer to the list header. The data region is zeroed.
 ///
-/// # Panics
-///
-/// Panics if `elem_size` or `count` is negative, or if the total allocation
-/// size overflows.
+/// Aborts via `runtime_abort` (not `panic!`) on negative inputs or size
+/// overflow — this is an `extern "C"` symbol and the workspace's panic
+/// strategy is `unwind`, so panicking would be UB across the FFI
+/// boundary. See `docs/design-decisions.md#h-ffi-boundary-no-panic-policy`.
 #[unsafe(no_mangle)]
 pub extern "C" fn phx_list_alloc(elem_size: i64, count: i64) -> *mut u8 {
-    assert!(
-        elem_size >= 0,
-        "phx_list_alloc: elem_size must be non-negative, got {elem_size}"
-    );
-    assert!(
-        count >= 0,
-        "phx_list_alloc: count must be non-negative, got {count}"
-    );
+    if elem_size < 0 {
+        runtime_abort(&format!(
+            "phx_list_alloc: elem_size must be non-negative, got {elem_size}"
+        ));
+    }
+    if count < 0 {
+        runtime_abort(&format!(
+            "phx_list_alloc: count must be non-negative, got {count}"
+        ));
+    }
     let es = elem_size as usize;
     let cnt = count as usize;
-    let data_size = es
-        .checked_mul(cnt)
-        .expect("phx_list_alloc: allocation size overflow");
-    let total = HEADER_SIZE
-        .checked_add(data_size)
-        .expect("phx_list_alloc: allocation size overflow");
+    let Some(data_size) = es.checked_mul(cnt) else {
+        runtime_abort("phx_list_alloc: allocation size overflow");
+    };
+    let Some(total) = HEADER_SIZE.checked_add(data_size) else {
+        runtime_abort("phx_list_alloc: allocation size overflow");
+    };
     let ptr = phx_alloc(total);
     unsafe {
         // length = count
@@ -183,6 +211,15 @@ pub unsafe extern "C" fn phx_list_get_raw(list: *const u8, index: i64) -> *const
 ///
 /// - `list` must point to a valid list header.
 /// - `elem_ptr` must point to `elem_size` valid bytes.
+/// - `list` must be rooted by the caller's shadow-stack frame for the
+///   duration of this call. See the *Rooting contract* in the module
+///   header for the rationale.
+/// - Element bytes are copied verbatim. If elements are fat pointers
+///   (16-byte string fat pointers today), the pointed-to GC objects
+///   become reachable through the *returned* list's roots and must
+///   stay reachable from there until the caller drops its rooting.
+///   `elem_ptr` itself does not need to be rooted — its bytes are
+///   captured by value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_list_push_raw(
     list: *const u8,
@@ -201,7 +238,9 @@ pub unsafe extern "C" fn phx_list_push_raw(
         );
         stored_es
     };
-    let new_len = old_len + 1;
+    let Some(new_len) = old_len.checked_add(1) else {
+        runtime_abort("phx_list_push_raw: length overflow");
+    };
     let new_list = phx_list_alloc(es as i64, new_len as i64);
     // Copy old data.
     let old_data = unsafe { list.add(HEADER_SIZE) };
@@ -267,7 +306,10 @@ pub unsafe extern "C" fn phx_list_contains(
 ///
 /// # Safety
 ///
-/// `list` must point to a valid list header.
+/// - `list` must point to a valid list header.
+/// - `list` must be rooted by the caller's shadow-stack frame for the
+///   duration of this call. See the *Rooting contract* in the module
+///   header for the rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_list_take(list: *const u8, n: i64) -> *mut u8 {
     let (length, es) = unsafe { list_header(list) };
@@ -288,7 +330,10 @@ pub unsafe extern "C" fn phx_list_take(list: *const u8, n: i64) -> *mut u8 {
 ///
 /// # Safety
 ///
-/// `list` must point to a valid list header.
+/// - `list` must point to a valid list header.
+/// - `list` must be rooted by the caller's shadow-stack frame for the
+///   duration of this call. See the *Rooting contract* in the module
+///   header for the rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_list_drop(list: *const u8, n: i64) -> *mut u8 {
     let (length, es) = unsafe { list_header(list) };
@@ -310,7 +355,14 @@ pub unsafe extern "C" fn phx_list_drop(list: *const u8, n: i64) -> *mut u8 {
 ///
 /// # Safety
 ///
-/// Both `(ptr, len)` and `(sep_ptr, sep_len)` must be valid UTF-8 byte slices.
+/// - Both `(ptr, len)` and `(sep_ptr, sep_len)` must be valid UTF-8 byte slices.
+/// - `(ptr, len)` and `(sep_ptr, sep_len)` must be rooted by the
+///   caller's shadow-stack frame for the duration of this call. The
+///   per-iter `to_phx_string_from_str` re-enters the allocator and
+///   would sweep unrooted GC-managed inputs — this function pushes
+///   its own frame internally to root the *output* list, but the
+///   *inputs* are still the caller's responsibility. See the
+///   *Rooting contract* in the module header.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_split(
     ptr: *const u8,
@@ -322,17 +374,32 @@ pub unsafe extern "C" fn phx_str_split(
     let sep = unsafe { std::str::from_utf8_unchecked(slice::from_raw_parts(sep_ptr, sep_len)) };
     let parts: Vec<&str> = s.split(sep).collect();
     let count = parts.len();
-    // elem_size = 16 (two i64s: ptr + len)
+    // elem_size = 16 (two i64s: ptr + len).
+    //
+    // Push a one-slot shadow-stack frame so the freshly-allocated `list`
+    // is rooted before we re-enter the allocator inside the loop:
+    // `to_phx_string_from_str` can cross the auto-collect threshold and
+    // would otherwise sweep `list` (no caller frame holds it yet) before
+    // the next store completes. The body between `push_frame` and the
+    // matching `pop_frame` is bound by the FFI no-panic policy — see
+    // [docs/design-decisions.md § H. FFI-boundary no-panic policy](../../../docs/design-decisions.md#h-ffi-boundary-no-panic-policy).
+    // Every call below routes through `runtime_abort` rather than
+    // panicking, so a frame leak on the unwind path is impossible.
+    let frame = phx_gc_push_frame(1);
     let list = phx_list_alloc(16, count as i64);
+    unsafe { phx_gc_set_root(frame, 0, list) };
     let data = unsafe { list.add(HEADER_SIZE) };
     for (i, part) in parts.iter().enumerate() {
-        let leaked = crate::leak_string(part.to_string());
+        // Skip the `String` round-trip: copy directly from the input
+        // slice into a freshly allocated GC string.
+        let part_ptr = crate::to_phx_string_from_str(part);
         let dest = unsafe { data.add(i * 16) };
         unsafe {
-            *(dest as *mut i64) = leaked.ptr as i64;
-            *((dest as *mut i64).add(1)) = leaked.len as i64;
+            *(dest as *mut i64) = part_ptr.ptr as i64;
+            *((dest as *mut i64).add(1)) = part_ptr.len as i64;
         }
     }
+    unsafe { phx_gc_pop_frame(frame) };
     list
 }
 

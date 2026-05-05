@@ -98,6 +98,19 @@ pub struct RuntimeFunctions {
     pub map_keys: FuncId,
     /// `phx_map_values(map_ptr) -> list_ptr`.
     pub map_values: FuncId,
+    // ── GC functions ────────────────────────────────────────────────
+    /// `phx_gc_push_frame(n_roots: i64) -> frame_ptr`.
+    pub gc_push_frame: FuncId,
+    /// `phx_gc_pop_frame(frame_ptr)`.
+    pub gc_pop_frame: FuncId,
+    /// `phx_gc_set_root(frame_ptr, idx: i64, ptr)`.
+    pub gc_set_root: FuncId,
+    /// `phx_gc_enable()` — flip on threshold-based auto-collection.
+    pub gc_enable: FuncId,
+    /// `phx_gc_shutdown()` — free every tracked allocation; called from
+    /// the generated C `main` after `phx_main` returns so compiled
+    /// binaries terminate leak-clean.
+    pub gc_shutdown: FuncId,
 }
 
 impl RuntimeFunctions {
@@ -216,6 +229,12 @@ impl RuntimeFunctions {
             )?,
             map_keys: declare_func(module, "phx_map_keys", &[I64], &[I64], call_conv)?,
             map_values: declare_func(module, "phx_map_values", &[I64], &[I64], call_conv)?,
+            // GC functions.
+            gc_push_frame: declare_func(module, "phx_gc_push_frame", &[I64], &[I64], call_conv)?,
+            gc_pop_frame: declare_func(module, "phx_gc_pop_frame", &[I64], &[], call_conv)?,
+            gc_set_root: declare_func(module, "phx_gc_set_root", &[I64, I64, I64], &[], call_conv)?,
+            gc_enable: declare_func(module, "phx_gc_enable", &[], &[], call_conv)?,
+            gc_shutdown: declare_func(module, "phx_gc_shutdown", &[], &[], call_conv)?,
         })
     }
 }

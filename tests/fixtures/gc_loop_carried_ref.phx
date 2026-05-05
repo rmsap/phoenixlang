@@ -1,0 +1,22 @@
+// Exercises non-entry-block parameter rooting: a ref-typed value is
+// carried across the loop back-edge as a block parameter (not a
+// fresh-each-iteration instruction result). The Cranelift backend's
+// `emit_block_param_roots` non-entry branch must root the loop-header
+// block's String parameter on every iteration, otherwise the
+// accumulated string would be swept once the auto-collect threshold
+// trips and the next concat would read freed memory.
+//
+// `acc` accumulates "x" once per iteration. After 50000 iterations
+// the final string is 50000 bytes long. Each concat produces a fresh
+// allocation that becomes the new `acc`, so the loop allocates well
+// past the 1-MB auto-collect threshold and the GC fires many times
+// while `acc` is the only live root chain.
+function main() {
+  let mut acc: String = ""
+  let mut i: Int = 0
+  while (i < 50000) {
+    acc = acc + "x"
+    i = i + 1
+  }
+  print(acc.length())
+}

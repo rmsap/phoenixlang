@@ -13,7 +13,36 @@
 
 use std::slice;
 
-use crate::{PhxFatPtr, leak_string};
+use crate::{PhxFatPtr, to_phx_string_from_str};
+
+// Why all string-producing methods route through `to_phx_string_from_str`
+// (and not a `to_phx_string(String)` variant): the helper takes `&str`
+// and copies bytes into a fresh GC allocation, with an empty-string
+// fast path. Methods like `to_lowercase`/`to_uppercase`/`replace` build
+// their result as an owned `String` first; passing `&owned` makes the
+// GC-vs-owned distinction explicit at every call site rather than
+// hiding it behind two near-identical conversion fns. The owned `String`
+// is dropped normally once the call returns.
+//
+// ## Rooting contract for the input pointer
+//
+// `to_phx_string_from_str` allocates, which can trigger a GC cycle.
+// Each transform here falls into one of two shapes:
+//
+// - **Owned-result shape** (`to_lower`, `to_upper`, `replace`,
+//   `substring`): the transform materializes an owned Rust `String`
+//   *before* the alloc. The owned bytes live on the Rust heap, so a
+//   sweep mid-alloc cannot affect the result. **No caller-side
+//   rooting required** for these.
+// - **Borrowed-slice shape** (`trim`): the transform produces a
+//   sub-slice of the input and the alloc reads from that slice. **The
+//   input pointer must be rooted by the caller's shadow-stack frame
+//   for the duration of the call** — a sweep mid-alloc would free the
+//   input and the subsequent copy would read freed memory.
+//
+// The per-function `# Safety` blocks below state which shape they
+// follow; this comment is the single explanation of *why* the two
+// shapes differ.
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -96,33 +125,43 @@ pub unsafe extern "C" fn phx_str_ends_with(
 ///
 /// # Safety
 ///
-/// `ptr` must point to `len` valid UTF-8 bytes.
+/// - `ptr` must point to `len` valid UTF-8 bytes.
+/// - **Borrowed-slice shape — input must be rooted.** `s.trim()`
+///   returns a sub-slice of the input that is read by the subsequent
+///   alloc-and-copy; an unrooted GC-managed input would be swept
+///   between alloc and copy. See the *Rooting contract* in the module
+///   header for the rationale. Cranelift-emitted callers root
+///   ref-typed parameters automatically.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_trim(ptr: *const u8, len: usize) -> PhxFatPtr {
     let s = unsafe { utf8_str(ptr, len) };
-    leak_string(s.trim().to_string())
+    to_phx_string_from_str(s.trim())
 }
 
 /// Convert a string to lowercase, returning a new heap-allocated string.
 ///
 /// # Safety
 ///
-/// `ptr` must point to `len` valid UTF-8 bytes.
+/// - `ptr` must point to `len` valid UTF-8 bytes.
+/// - Owned-result shape — no caller-side rooting required (see the
+///   *Rooting contract* in the module header).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_to_lower(ptr: *const u8, len: usize) -> PhxFatPtr {
     let s = unsafe { utf8_str(ptr, len) };
-    leak_string(s.to_lowercase())
+    to_phx_string_from_str(&s.to_lowercase())
 }
 
 /// Convert a string to uppercase, returning a new heap-allocated string.
 ///
 /// # Safety
 ///
-/// `ptr` must point to `len` valid UTF-8 bytes.
+/// - `ptr` must point to `len` valid UTF-8 bytes.
+/// - Owned-result shape — no caller-side rooting required (see the
+///   *Rooting contract* in the module header).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_to_upper(ptr: *const u8, len: usize) -> PhxFatPtr {
     let s = unsafe { utf8_str(ptr, len) };
-    leak_string(s.to_uppercase())
+    to_phx_string_from_str(&s.to_uppercase())
 }
 
 /// Return the Unicode scalar value index of the first occurrence of
@@ -153,7 +192,9 @@ pub unsafe extern "C" fn phx_str_index_of(
 ///
 /// # Safety
 ///
-/// All three `(ptr, len)` pairs must be valid UTF-8 byte slices.
+/// - All three `(ptr, len)` pairs must be valid UTF-8 byte slices.
+/// - Owned-result shape — no caller-side rooting required (see the
+///   *Rooting contract* in the module header).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_replace(
     p1: *const u8,
@@ -166,7 +207,7 @@ pub unsafe extern "C" fn phx_str_replace(
     let s = unsafe { utf8_str(p1, l1) };
     let old = unsafe { utf8_str(p2, l2) };
     let replacement = unsafe { utf8_str(p3, l3) };
-    leak_string(s.replace(old, replacement))
+    to_phx_string_from_str(&s.replace(old, replacement))
 }
 
 /// Extract a substring from char index `start` to `end` (exclusive),
@@ -174,7 +215,9 @@ pub unsafe extern "C" fn phx_str_replace(
 ///
 /// # Safety
 ///
-/// `ptr` must point to `len` valid UTF-8 bytes.
+/// - `ptr` must point to `len` valid UTF-8 bytes.
+/// - Owned-result shape — no caller-side rooting required (see the
+///   *Rooting contract* in the module header).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_str_substring(
     ptr: *const u8,
@@ -188,7 +231,8 @@ pub unsafe extern "C" fn phx_str_substring(
     let start_u = (start.max(0) as usize).min(char_len);
     let end_u = (end.max(0) as usize).min(char_len);
     let end_u = end_u.max(start_u);
-    leak_string(chars[start_u..end_u].iter().collect())
+    let collected: String = chars[start_u..end_u].iter().collect();
+    to_phx_string_from_str(&collected)
 }
 
 #[cfg(test)]

@@ -1,0 +1,20 @@
+// Allocation-heavy loop. Exercises the GC: each iteration allocates a
+// list and a string, neither of which escape. With a working GC the
+// process terminates with bounded memory; without one it would OOM.
+//
+// `n` is sized so the cumulative allocation comfortably exceeds the
+// 1-MB auto-collect threshold (each iter allocates ~80 bytes; 100k
+// iterations ≈ 8 MB), so the threshold-driven sweep path runs many
+// times during the test rather than not at all.
+function main() {
+  let n: Int = 100000
+  let mut total: Int = 0
+  let mut i: Int = 0
+  while (i < n) {
+    let small: List<Int> = [i, i + 1, i + 2]
+    let label: String = "iter " + toString(i)
+    total = total + small.length()
+    i = i + 1
+  }
+  print(total)
+}

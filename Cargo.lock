@@ -1151,6 +1151,7 @@ version = "0.1.0"
 dependencies = [
  "cargo-husky",
  "clap",
+ "libc",
  "notify",
  "phoenix-codegen",
  "phoenix-common",

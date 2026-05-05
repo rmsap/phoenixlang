@@ -101,11 +101,12 @@ fn generate_c_main(ctx: &mut CompileContext, ir_module: &IrModule) -> Result<(),
     builder.switch_to_block(block);
     builder.seal_block(block);
 
-    // Call phx_main().
-    let func_ref = ctx
-        .module
-        .declare_func_in_func(phx_main_cl_id, builder.func);
-    builder.ins().call(func_ref, &[]);
+    // Enable threshold-driven GC, run phx_main, then free everything
+    // still tracked. See `phx_gc_enable` / `phx_gc_shutdown` for the
+    // rationale of each call.
+    translate::call_runtime(&mut builder, ctx, ctx.runtime.gc_enable, &[]);
+    translate::call_runtime(&mut builder, ctx, phx_main_cl_id, &[]);
+    translate::call_runtime(&mut builder, ctx, ctx.runtime.gc_shutdown, &[]);
 
     // Return 0.
     let zero = builder.ins().iconst(cl::I32, 0);

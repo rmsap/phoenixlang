@@ -1,6 +1,6 @@
 # Phase 2: Compilation
 
-**Status: 2.2 + 2.6 complete; 2.3 active**
+**Status: 2.2 + 2.6 complete; 2.3 active.** See [§2.3](#23-runtime-and-memory-management) for the live status of the active phase — the section header is the single source of truth.
 
 Move from interpretation to native code generation. This is what makes Phoenix a real language rather than a scripting tool.
 
@@ -71,23 +71,52 @@ When every box above is ticked, Phase 2.2 closes and Phase 2.6 (modules and visi
 
 ## 2.3 Runtime and Memory Management
 
-**Status: active (since 2026-04-30, when 2.6 closed).**
+**Status: active (since 2026-04-30). GC core landed 2026-05-04. Per-decision implementation status — including `defer` and the deferred perf fixes — lives in [Design decisions locked in this phase](#design-decisions-locked-in-this-phase) below; that is the single source of truth, not this status line.**
 
-A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix-runtime/) crate (static library linked into compiled binaries). It currently provides `print` (all value types + strings), `toString`, string comparison and concatenation, all string methods, heap allocation (`phx_alloc` via `malloc`, no GC), panic/abort, `List<T>` data structures (alloc, get, push, contains, take, drop), `String.split` (returns `List<String>`), and `Map<K, V>` data structures (alloc, get, set, remove, contains, keys, values). This section covers extending it into a full runtime.
+A minimal runtime already exists as the [`phoenix-runtime`](../../crates/phoenix-runtime/) crate (static library linked into compiled binaries). It currently provides `print` (all value types + strings), `toString`, string comparison and concatenation, all string methods, heap allocation (`phx_alloc`, now backed by the tracing GC — see below), panic/abort, `List<T>` data structures (alloc, get, push, contains, take, drop), `String.split` (returns `List<String>`), and `Map<K, V>` data structures (alloc, get, set, remove, contains, keys, values). This phase replaces the leak-everything allocator with a working tracing GC, closes the two perf bugs that were deferred here, and lands the `defer` syntax that the GC decision implied.
 
-- Garbage collector — **tracing GC, mark-and-sweep baseline** (decided 2026-04-19; see [GC strategy](../design-decisions.md#gc-strategy)). Leave room to evolve to generational later without ABI changes. Implied commitment: `defer` / `using` / `with` syntax becomes required since tracing GC has no deterministic-destruction story for resource cleanup (see [`defer` for resource cleanup](../design-decisions.md#defer-for-resource-cleanup), still open on syntax).
-- String implementation (UTF-8, immutable by default) — basic ops already in `phoenix-runtime`
+- Garbage collector — **tracing GC, mark-and-sweep baseline** (decided 2026-04-19; see [GC strategy](../design-decisions.md#gc-strategy)). Leave room to evolve to generational later without ABI changes. Implementation sub-decisions A–G are pinned in [GC implementation: subordinate decisions](../design-decisions.md#gc-implementation-subordinate-decisions).
+- `defer` syntax — Go-style statement-level `defer expr;`, runs LIFO at end of enclosing scope on every exit path (return, panic, fall-through). Decision in [§G of subordinate decisions](../design-decisions.md#g-scope-bound-cleanup-syntax-go-style-statement-level-defer); implementation status pinned in the [Decision G entry](#design-decisions-locked-in-this-phase) below.
+- String implementation (UTF-8, immutable by default) — basic ops already in `phoenix-runtime`. **All string allocations move onto the GC heap in this phase** (every `leak_string()` site goes away).
 - Panic/abort handler — already in `phoenix-runtime`
 - Built-in function implementations (`print`, `toString`) — already in `phoenix-runtime`
-- Collection runtime support (List, Map data structures with dynamic resizing) — **basic implementation complete** (`list_methods.rs`, `map_methods.rs`); map lookup is currently O(n) linear scan — hash-based implementation planned
-- Builtin method implementations (String.*, List.*, Map.*, Option.*, Result.*) — **complete** in compiled mode; closure-based list methods (map, filter, reduce, etc.) are compiled inline as Cranelift loops (`list_methods_closure.rs` for single-loop methods — map, filter, find, any, all, reduce; `list_methods_complex.rs` for nested-loop methods — flatMap, sortBy)
+- Collection runtime support (List, Map data structures with dynamic resizing) — **basic implementation complete** (`list_methods.rs`, `map_methods.rs`); map lookup is replaced with hash-based implementation in this phase (see bugs below).
+- Builtin method implementations (String.*, List.*, Map.*, Option.*, Result.*) — **complete** in compiled mode; closure-based list methods (map, filter, reduce, etc.) are compiled inline as Cranelift loops (`list_methods_closure.rs` for single-loop methods — map, filter, find, any, all, reduce; `list_methods_complex.rs` for nested-loop methods — flatMap, sortBy).
+
+### Design decisions locked in this phase
+
+These are sub-decisions of the parent `### GC strategy` decision — they pin the GC ABI and runtime layout and must land before 2.3 wraps. See [design-decisions.md](../design-decisions.md#gc-implementation-subordinate-decisions):
+
+- **[A. Root-finding: precise via shadow stack](../design-decisions.md#a-root-finding-precise-via-shadow-stack)** — `phx_gc_push_frame` / `phx_gc_pop_frame` / `phx_gc_set_root`, emitted by Cranelift on function entry/exit and at every ref-typed SSA assignment. **✅ Implemented 2026-05-04** in `crates/phoenix-cranelift/src/translate/gc_roots.rs` and `crates/phoenix-runtime/src/gc/shadow_stack.rs`.
+- **[B. Heap layout](../design-decisions.md#b-heap-layout-segregated-free-lists-by-size-class-single-arena)** — single global allocator + per-allocation registry tracked by `MarkSweepHeap`. **✅ Implemented 2026-05-04** in `crates/phoenix-runtime/src/gc/heap.rs`. Baseline is Rust's global allocator with a `HashSet` registry (see the *Adopted baseline* note in the design-decisions entry); segregated free lists are tracked as a Phase 2.7 perf-tuning target.
+- **[C. Object header: 8-byte per-object header](../design-decisions.md#c-object-header-8-byte-per-object-header)** — mark bit + type tag + reserved forwarding-pointer slot + payload size. **✅ Implemented 2026-05-04** in `crates/phoenix-runtime/src/gc/mod.rs::ObjectHeader`.
+- **[D. Safepoint placement: at allocation calls only](../design-decisions.md#d-safepoint-placement-at-allocation-calls-only)** — threshold-based (1 MB since last collection). **✅ Implemented 2026-05-04**; gated behind `phx_gc_enable()` which the Cranelift-generated C `main` calls before `phx_main`.
+- **[E. `GcHeap` Rust trait abstraction](../design-decisions.md#e-allocator-abstraction-gcheap-rust-trait-single-impl-in-23)** — single `MarkSweepHeap` impl in 2.3. **✅ Implemented 2026-05-04**.
+- **[F. Strings join the GC heap](../design-decisions.md#f-strings-join-the-gc-heap-no-interning-in-23)** — every `leak_string()` call site migrates. **✅ Implemented 2026-05-04**: `phx_str_concat`, `phx_i64_to_str`, `phx_f64_to_str`, `phx_bool_to_str`, and every `phx_str_*` transform in `string_methods.rs` now go through `phx_string_alloc` (tagged `TypeTag::String` so the GC skips the interior scan).
+- **[G. `defer` syntax: Go-style statement-level](../design-decisions.md#g-scope-bound-cleanup-syntax-go-style-statement-level-defer)** — **🟡 Decided, not yet implemented (deferred to a follow-up session).** The decision is locked; lexer → parser → sema → IR → 3 backends plumbing remains. The GC-side coupling (defers fire before `phx_gc_pop_frame`) is already in place via the structure of `translate_terminator` — the `defer` work plugs in alongside, not on top.
 
 ### Bugs to be closed in this phase
 
 See [known-issues.md](../known-issues.md):
 
-- **[O(n) map key lookup](../known-issues.md#on-map-key-lookup)** — replace the flat-array linear scan with a hash-based implementation.
-- **[O(n²) `List.sortBy` insertion sort](../known-issues.md#on²-listsortby-insertion-sort)** — replace with merge sort. Both backends currently share the O(n²) algorithm; the fix lands in the runtime and the Cranelift inline codegen together.
+- **[Memory leaks (no GC yet)](../known-issues.md#memory-leaks-no-gc-yet--largely-resolved-2026-05-04-final-valgrind-gate-pending)** — root driver. **🟡 Largely resolved 2026-05-04 (final valgrind gate pending)**: the GC tracks every allocation, collects unreachable objects when triggered, and respects the shadow stack as a precise root set (proven by the integration tests in `crates/phoenix-runtime/tests/gc_collects.rs`). Process-exit cleanup is wired through `phx_gc_shutdown`, called from the generated C `main` after `phx_main` returns — it replaces the singleton heap with a fresh empty one, letting the old heap's `Drop` impl deallocate every tracked header. Closes fully when the valgrind gate below is ticked; the framing here matches the corresponding [known-issues.md entry](../known-issues.md#memory-leaks-no-gc-yet--largely-resolved-2026-05-04-final-valgrind-gate-pending).
+- **[O(n) map key lookup](../known-issues.md#on-map-key-lookup)** — **🟡 Deferred.** Hash-table rewrite still pending; replacing the flat array touches both the runtime and the Cranelift map-literal codegen and is queued behind defer + sortBy.
+- **[O(n²) `List.sortBy` insertion sort](../known-issues.md#on²-listsortby-insertion-sort)** — **🟡 Deferred.** Merge-sort replacement still pending; same shape (runtime + Cranelift inline codegen rewrite).
+
+### Exit criteria for declaring Phase 2.3 complete
+
+Mirror of [§2.2's exit criteria](#exit-criteria-for-declaring-phase-22-complete) and [§2.6's exit criteria](#exit-criteria-for-declaring-phase-26-complete) — minimum gates only. Performance benchmarks and tuning targets land in Phase 2.7 (see [Performance benchmarks](#performance-benchmarks)) and do not block 2.3 close.
+
+- [x] **GC subordinate decisions A–F implemented (2026-05-04).** Shadow stack, mark-sweep heap, object header, threshold-triggered safepoints, `GcHeap` trait, GC-managed strings — all landed and exercised by `crates/phoenix-runtime/tests/gc_collects.rs`.
+- [ ] **Decision G (`defer` syntax) implementation.** Status pinned in the [Decision G entry above](#design-decisions-locked-in-this-phase) (single source of truth). Concrete gate: lexer → parser → sema → IR → 3 backends; `tests/fixtures/defer_basic.phx` registered in the matrix; LIFO order observable via stdout; defers fire on early-return path.
+- [x] **GC has regression tests.** `crates/phoenix-runtime/tests/gc_collects.rs` and the `tests/fixtures/gc_*.phx` matrix entries cover the precise-roots invariants and the threshold-driven auto-collect path.
+- [ ] **Map and sortBy regression tests** — pending the perf fixes themselves.
+- [ ] **No `known-issues.md` entry targeted at Phase 2.3.** The "Memory leaks (no GC yet)" entry is functionally closed; the map-lookup and sortBy entries remain open and target this phase.
+- [x] **Workspace test/clippy/fmt clean (post-GC).** `cargo test --workspace` green as of 2026-05-04.
+- [ ] **Three-backend roundtrip matrix on memory-stress fixtures.** `alloc_loop.phx`, `gc_keeps_alive.phx`, `gc_loop_carried_ref.phx`, and `defer_basic.phx` all pass `phoenix run`, `phoenix run-ir`, `phoenix build`+execute with byte-identical stdout.
+- [ ] **No leaks under valgrind on `alloc_loop.phx` compiled binary.** Zero "definitely lost" bytes after a 1M-iteration alloc loop. The "still reachable" pool may include the GC arena itself but must be bounded. When this box ticks, the [known-issues.md "Memory leaks (no GC yet)"](../known-issues.md#memory-leaks-no-gc-yet--largely-resolved-2026-05-04-final-valgrind-gate-pending) entry should be deleted. **Linux-only gate** (matches the `RLIMIT_AS` regression test in `crates/phoenix-driver/tests/gc_bounded_memory.rs`, which is also `#[cfg(target_os = "linux")]`); CI is expected to run Linux for this gate. macOS and Windows runners exercise the rest of the matrix but skip this and the bounded-memory test silently — re-running `cargo test --workspace` on Linux is required before declaring 2.3 closed.
+
+When every box above is ticked, Phase 2.3 closes and Phase 2.4 (WebAssembly target) becomes the active phase.
 
 ## 2.4 WebAssembly Target
 
@@ -262,6 +291,9 @@ Phase 2.3 (GC + runtime) is the next active phase.
 - Add a benchmark suite (e.g. `criterion`) early in Phase 2 to measure IR lowering and codegen performance
 - Track compile times for representative Phoenix programs across changes
 - Establish baseline metrics before optimization work begins
+- **GC perf follow-ups carried over from 2.3:**
+  - **Segregated free lists by size class** (`docs/design-decisions.md#b-heap-layout-segregated-free-lists-by-size-class-single-arena`). 2.3 ships the registry-on-global-allocator baseline; 2.7 plugs the size-class arena in behind the same `GcHeap` trait once the alloc throughput bench in `phoenix-bench/benches/allocation.rs` shows it would help.
+  - **Thread typed allocators through `TypeTag`.** The runtime declares `TypeTag::{List, Map, Closure, Struct, Enum, Dyn}` but the only allocators that pass a non-`Unknown` tag today are the string allocators (`TypeTag::String`). Migrating `phx_list_alloc`, `phx_map_alloc`, the closure-env allocator, and struct/enum allocators to thread their concrete tag through means the GC can swap in trace tables (subordinate decision C) instead of conservatively scanning every payload. See the TODO in `crates/phoenix-runtime/src/gc/mod.rs` on `TypeTag` for the migration path. Conservative scan keeps it correct in the meantime.
 - **Why:** Phase 2 introduces compilation where performance becomes user-visible. Without benchmarks, regressions go unnoticed and optimization work has no measurable target.
 - **Complexity:** Low — `criterion` integrates directly with Cargo; start with a handful of representative programs.
 - **Depends on:** IR (2.1)

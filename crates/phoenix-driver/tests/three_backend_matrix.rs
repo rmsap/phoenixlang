@@ -147,6 +147,27 @@ backend_matrix_test!(
     "closures_ambiguous_captures.phx"
 );
 backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx");
+// GC stress fixtures.
+//
+// **Limit of this gate:** the matrix only checks stdout equality across
+// the three backends. A regression that swept `keep` (in `gc_keeps_alive`)
+// or `acc` (in `gc_loop_carried_ref`) mid-loop would either crash the
+// compiled binary or print garbage — caught here by exit status or an
+// `unwrap` failure on `from_utf8`. But a regression that *didn't* crash
+// and that produced the right number anyway (e.g. a sweep that left the
+// payload bytes intact because the allocator hadn't reused them yet)
+// would slip through.
+//
+// `alloc_loop.phx` has its own dedicated address-space-limited regression
+// in `crates/phoenix-driver/tests/gc_bounded_memory.rs`; the other two
+// rely on the matrix here. Future hardening: run the matrix under
+// `MALLOC_PERTURB_=255` (Linux) or equivalent so use-after-free reads
+// produce visibly wrong bytes; or build a sibling bounded-memory test
+// per fixture. Tracked as a Phase 2.7 follow-up rather than a 2.3 gate
+// because both options are infrastructure work, not GC correctness work.
+backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
+backend_matrix_test!(matrix_gc_keeps_alive, "gc_keeps_alive.phx");
+backend_matrix_test!(matrix_gc_loop_carried_ref, "gc_loop_carried_ref.phx");
 
 /// Regression marker for closures returned from generic functions at
 /// *cross-width* instantiations (Int + String). Currently fails in

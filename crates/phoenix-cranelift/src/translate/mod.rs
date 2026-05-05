@@ -17,7 +17,9 @@ mod dyn_trait;
 mod enum_combinators;
 mod enum_helpers;
 mod enum_type_inference;
+mod gc_roots;
 mod helpers;
+pub(crate) use helpers::call_runtime;
 // `layout` is `pub(crate)` so `abi.rs` can name `TypeLayout` when building
 // function signatures. No other crate-level consumers — within `translate`,
 // submodules reach it via `super::layout`.
@@ -76,6 +78,35 @@ pub(crate) struct FuncState {
     pub enum_payload_types: HashMap<ValueId, (u32, Vec<IrType>)>,
     /// Mapping from Phoenix `BlockId` to Cranelift block.
     pub block_map: HashMap<PhxBlockId, ir::Block>,
+    /// Shadow-stack frame info for this function. `None` if the function
+    /// has no ref-typed values (no shadow-stack overhead).
+    pub gc_frame: Option<gc_roots::GcFrameInfo>,
+    /// Counter for `cranelift_frontend::Variable` indices owned by this
+    /// function. Use [`FuncState::next_variable`] to obtain a fresh
+    /// `Variable` rather than calling `Variable::from_u32` directly —
+    /// otherwise two passes that both start at 0 will silently clash.
+    pub next_var_index: u32,
+}
+
+impl FuncState {
+    /// Allocate a fresh `cranelift_frontend::Variable` index for this
+    /// function. The single source of truth for `Variable` issuance —
+    /// every Cranelift `Variable` used during translation must come
+    /// through here so distinct passes (today: `gc_roots`; tomorrow:
+    /// `defer`, exception unwinding, ...) can't overlap their indices.
+    pub fn next_variable(&mut self) -> cranelift_frontend::Variable {
+        let v = cranelift_frontend::Variable::from_u32(self.next_var_index);
+        // Practically unreachable (>2³² Variables in one function would
+        // require an absurd IR), but the assert is cheap and protects
+        // against a future regression that overflows silently.
+        debug_assert_ne!(
+            self.next_var_index,
+            u32::MAX,
+            "FuncState::next_variable: u32 index space exhausted",
+        );
+        self.next_var_index += 1;
+        v
+    }
 }
 
 /// Translate all functions in the IR module and define them in the Cranelift module.
@@ -118,6 +149,8 @@ fn translate_function(
         current_capture_types: func.capture_types.clone(),
         enum_payload_types: HashMap::new(),
         block_map: HashMap::new(),
+        gc_frame: None,
+        next_var_index: 0,
     };
 
     // Create Cranelift blocks for each Phoenix basic block.
@@ -141,10 +174,42 @@ fn translate_function(
         }
     }
 
-    // Translate each block.
-    for block in &func.blocks {
+    // Translate each block. The entry block is identified via
+    // `IrFunction::entry_block()` (which encapsulates the
+    // "`blocks[0]` is the entry block" convention) — comparing block
+    // IDs against that means a future change to the convention only
+    // needs to update one method.
+    let entry_block_id = func.entry_block().id;
+    for block in func.blocks.iter() {
         let cl_block = state.block_map[&block.id];
         builder.switch_to_block(cl_block);
+
+        if block.id == entry_block_id {
+            // Entry block: plan the shadow-stack frame (one slot per
+            // ref-typed ValueId across the whole function), push it,
+            // then root every ref-typed function parameter (which lives
+            // in entry-block params).
+            let slots = gc_roots::plan_frame(func);
+            let frame = gc_roots::emit_frame_setup(&mut builder, ctx, slots, &mut state);
+            gc_roots::emit_block_param_roots(
+                &mut builder,
+                ctx,
+                frame.as_ref(),
+                block,
+                &state.value_map,
+            );
+            state.gc_frame = frame;
+        } else {
+            // Non-entry block: root any ref-typed block parameters
+            // received from predecessors.
+            gc_roots::emit_block_param_roots(
+                &mut builder,
+                ctx,
+                state.gc_frame.as_ref(),
+                block,
+                &state.value_map,
+            );
+        }
 
         // Translate instructions.
         for inst in &block.instructions {
@@ -162,6 +227,18 @@ fn translate_function(
 
             if let Some(vid) = result_vid {
                 state.type_map.insert(vid, result_type.clone());
+                // Set GC root if this value is tracked. Take the first
+                // Cranelift value (slot 0); for fat-pointer types
+                // (StringRef, DynRef) that's the heap pointer.
+                if let Some(&first) = result_vals.first() {
+                    gc_roots::maybe_set_root(
+                        &mut builder,
+                        ctx,
+                        state.gc_frame.as_ref(),
+                        vid,
+                        first,
+                    );
+                }
                 state.value_map.insert(vid, result_vals);
                 // Move alloca slot info from the VOID_SENTINEL temp key to the
                 // actual result ValueId.  VOID_SENTINEL is used as a temporary
@@ -210,7 +287,7 @@ fn translate_function(
         propagate_enum_payload_types(&block.terminator, func, &mut state);
 
         // Translate terminator.
-        control::translate_terminator(&mut builder, &block.terminator, &state, func)?;
+        control::translate_terminator(&mut builder, ctx, &block.terminator, &state, func)?;
     }
 
     // Seal all blocks (all predecessors are known after full translation).
@@ -397,5 +474,84 @@ fn translate_op(
 
         // Miscellaneous
         Op::Copy(v) => get_val(state, *v),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Direct construction of a `cranelift_frontend::Variable` is
+    /// reserved for [`super::FuncState::next_variable`]. Every other
+    /// call site must go through that helper so distinct passes
+    /// (today: `gc_roots`; tomorrow: `defer`, exception unwinding, ...)
+    /// can't overlap on the same index.
+    ///
+    /// The needle is built via `concat!` so the literal byte sequence
+    /// never appears in this test source — any match in `src/translate`
+    /// is therefore a real production hit, no `#[cfg(test)]` stripping
+    /// required.
+    ///
+    /// Before counting, single-line comments (`//`, `///`, `//!`) are
+    /// stripped so that a future contributor who mentions the literal
+    /// `Variable::from_u32(` in a doc comment or explanatory note
+    /// doesn't trip a false positive. Block comments (`/* … */`) are
+    /// not stripped — the convention in this crate is line-comment
+    /// only. If a block comment ever needs to contain the literal,
+    /// extend the filter rather than rewrite the comment to dodge it.
+    #[test]
+    fn variable_construction_only_in_funcstate() {
+        use std::path::Path;
+
+        const NEEDLE: &str = concat!("Variable", "::", "from_u32", "(");
+
+        // Drop everything from the first `//` on each line so the count
+        // reflects code-only occurrences. A real `//` inside a string
+        // literal would also be dropped, but no string literal in
+        // `src/translate` contains the needle today, and the test's
+        // failure mode (false positive → unrelated test failure) is
+        // strictly less harmful than a false negative (silent rule
+        // violation).
+        fn strip_line_comments(src: &str) -> String {
+            src.lines()
+                .map(|line| match line.find("//") {
+                    Some(idx) => &line[..idx],
+                    None => line,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let translate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/translate");
+        let mod_rs = translate_dir.join("mod.rs");
+
+        let mod_src = std::fs::read_to_string(&mod_rs).expect("translate/mod.rs unreadable");
+        let mod_code = strip_line_comments(&mod_src);
+        let count = mod_code.matches(NEEDLE).count();
+        assert_eq!(
+            count, 1,
+            "exactly one direct Variable construction permitted in \
+             translate/mod.rs (inside FuncState::next_variable); saw {count}",
+        );
+
+        let entries = std::fs::read_dir(&translate_dir).expect("translate dir unreadable");
+        for entry in entries {
+            let path = entry.expect("dir entry unreadable").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+            let code = strip_line_comments(&src);
+            assert!(
+                !code.contains(NEEDLE),
+                "{}: direct Variable construction is reserved for \
+                 FuncState::next_variable — call state.next_variable() \
+                 instead. Otherwise two passes will silently clash on \
+                 the same Variable index.",
+                path.display(),
+            );
+        }
     }
 }

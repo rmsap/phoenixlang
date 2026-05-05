@@ -1,0 +1,26 @@
+// End-to-end check that Cranelift's shadow-stack rooting keeps a
+// long-lived reference alive across many GC cycles.
+//
+// `keep` is a list whose contents are read AFTER 200k iterations of
+// throwaway allocations. Without `phx_gc_set_root` emission in the
+// Cranelift backend, `keep` would be unreachable from any GC root once
+// the allocator threshold trips and the next iteration's collect
+// would sweep it — the subsequent `keep.length()` read would either
+// crash or print garbage. With the shadow stack working, every GC
+// cycle marks `keep` via the entry-block frame and it survives.
+//
+// Three-backend agreement (`phoenix run` / `run-ir` / `build`) keeps
+// us honest: the interpreter and IR runner produce 5 trivially, so
+// the compiled binary diverging is the regression signal.
+function main() {
+  let keep: List<Int> = [10, 20, 30, 40, 50]
+  let mut i: Int = 0
+  while (i < 200000) {
+    let trash_list: List<Int> = [i, i + 1, i + 2]
+    let trash_str: String = "trash " + toString(i)
+    // Use both bindings so the optimizer can't elide the allocations:
+    // their lengths feed back into the loop counter as a no-op.
+    i = i + 1 + (trash_list.length() - 3) + (trash_str.length() - trash_str.length())
+  }
+  print(keep.length())
+}

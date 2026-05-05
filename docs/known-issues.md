@@ -6,9 +6,13 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
-### Memory leaks (no GC yet)
+### Memory leaks (no GC yet) — largely resolved 2026-05-04 (final valgrind gate pending)
 
-Compiled binaries leak all heap allocations — no garbage collector is implemented. Short-lived CLI programs are fine (OS reclaims memory on exit); long-running processes (servers, daemons) are not. See [GC strategy](design-decisions.md#gc-strategy) for the open design question and planned phase.
+A tracing mark-and-sweep GC landed in Phase 2.3. Compiled binaries now allocate via `phx_gc_alloc` (and the unchanged `phx_alloc` C-ABI symbol that wraps it), the Cranelift backend emits shadow-stack push/set/pop around every function so the GC has precise stack roots, and the heap collects on a 1-MB-since-last-collection threshold once the C `main` calls `phx_gc_enable`. Strings and all `phx_str_*` transforms are GC-managed (no more `mem::forget`).
+
+Process-exit cleanup is wired through `phx_gc_shutdown`, called from the generated C `main` after `phx_main` returns: it replaces the singleton `MarkSweepHeap` with a fresh empty one and lets the old heap's `Drop` impl deallocate every tracked header. The static `OnceLock<Mutex<MarkSweepHeap>>` itself is never freed (it's a process-lifetime singleton), but its inner state holds no live allocations after shutdown.
+
+**Why this entry is still open:** the design is expected to be valgrind-clean on the `alloc_loop.phx` fixture, but the formal valgrind gate has not yet been run in CI. Tracked as the **"No leaks under valgrind on `alloc_loop.phx` compiled binary"** checkbox in [phase-2.md §2.3 exit criteria](phases/phase-2.md#exit-criteria-for-declaring-phase-23-complete) — that document is the source of truth for the close-out condition; this entry will be removed entirely once the box is ticked.
 
 ---
 
@@ -45,10 +49,13 @@ When a generic function `f<T>(...)` defines a closure whose body or captures ref
 
 **Planned fix.** Extend monomorphization to clone closure functions per substitution of their enclosing generic, mirroring how struct-mono clones methods on generic structs. The substitution machinery itself already reaches `IrFunction.capture_types` and the `Op::ClosureLoadCapture` result-type slot via `for_each_type_mut` — pinned by tests in `crates/phoenix-ir/src/monomorphize/tests.rs::for_each_type_mut_substitutes_capture_types_*`. The remaining work is in the cloning machinery (`crates/phoenix-ir/src/monomorphize/function_mono.rs::clone_and_substitute_bodies`): when a generic template body contains an `Op::ClosureAlloc(closure_fid, ...)`, the specialization needs its own clone of `closure_fid` registered, with TypeVars substituted, and the `Op::ClosureAlloc` rewritten to point at the clone.
 
+**Downstream silent skip in GC root emission.** `phoenix-cranelift/src/translate/gc_roots.rs::is_tracked_ref` returns `false` for `IrType::TypeVar` and generic-placeholder types so the codegen doesn't ICE on the residual placeholders this gap leaves behind. The 1-slot Int/Bool instantiations covered by today's matrix never produce a placeholder ref-typed value that outlives a collection cycle, so the silent skip is harmless *now*. **Risk if the gap widens:** any future codegen path that produces a placeholder ref type whose underlying allocation crosses an auto-collect threshold will see a use-after-free with no test coverage. The branch is documented as a tripwire — when this entry's planned fix lands and the cross-width fixture re-enables, the `is_tracked_ref` early return becomes unreachable and should be replaced with a `debug_assert!(!ty.is_type_var() && !ty.is_generic_placeholder())`.
+
 **Tracked in:**
 - `tests/fixtures/closures_over_generic.phx` — passing fixture covering single-instantiation cases that work today.
 - `tests/fixtures/closures_over_generic_cross_width.phx` — `#[ignore]`d regression marker for the cross-width case.
 - `crates/phoenix-driver/tests/three_backend_matrix.rs::matrix_closures_over_generic_cross_width`.
+- `crates/phoenix-cranelift/src/translate/gc_roots.rs::is_tracked_ref` — the silent-skip tripwire described above.
 
 **Target phase:** Phase 3. The Phase 2.6 module-system fixture set landed without tripping this gap.
 
