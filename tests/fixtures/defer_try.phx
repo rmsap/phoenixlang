@@ -1,0 +1,30 @@
+// Pins that defers fire on the `?` (try) early-return path. Both
+// the AST interp and the IR-driven backends must run the defer
+// before the function returns the `Err` from `?`.
+//
+// On the AST side, `?` raises a `RuntimeError` whose
+// `try_return_value` is unwrapped before `run_defers` runs (in
+// `with_defer_frame`). On the IR side, `lower_try` calls
+// `lower_defers_for_exit` before the early-return `Terminator::Return`.
+//
+// Expected stdout:
+//   cleanup
+//   failed
+function may_fail(ok: Bool) -> Result<Int, String> {
+  if ok { Ok(1) } else { Err("nope") }
+}
+
+function go(ok: Bool) -> Result<Int, String> {
+  defer print("cleanup")
+  let x = may_fail(ok)?
+  Ok(x + 1)
+}
+
+function main() {
+  let r = go(false)
+  if r.isErr() {
+    print("failed")
+  } else {
+    print("ok")
+  }
+}

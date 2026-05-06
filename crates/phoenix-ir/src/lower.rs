@@ -278,6 +278,24 @@ pub(crate) struct LoweringContext<'a> {
     pub(crate) loop_stack: Vec<LoopContext>,
     /// Counter for generating unique closure function names.
     pub(crate) closure_counter: u32,
+    /// Pending defer expressions for the current function in source
+    /// order. Lowered (in reverse) immediately before every emitted
+    /// `Terminator::Return` so all exit paths fire defers LIFO. Reset
+    /// per-function in `lower_function`. Phase 2.3 decision G; lazy-
+    /// capture semantics — free variables are looked up at exit time.
+    pub(crate) pending_defers: Vec<phoenix_parser::ast::Expr>,
+    /// Snapshot of `var_scopes.len()` taken in
+    /// [`Self::lower_function_body_block`] immediately after the
+    /// function body's outermost scope is pushed. Used by
+    /// [`Self::lower_defers_for_exit`] to hide inner scopes (loop
+    /// bodies, if-arms, match arms) while a defer is being lowered:
+    /// without that, an inner-scope `let` that shadows a top-level
+    /// binding would intercept the defer's free-variable lookup at
+    /// any `return`/`?` exit reached from the inner scope (the AST
+    /// interpreter pops inner scopes before firing defers, so it has
+    /// no equivalent footgun). Saved/restored across nested
+    /// function-body lowerings (e.g. lambdas).
+    pub(crate) defer_outer_scope_depth: usize,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -292,6 +310,8 @@ impl<'a> LoweringContext<'a> {
             var_scopes: Vec::new(),
             loop_stack: Vec::new(),
             closure_counter: 0,
+            pending_defers: Vec::new(),
+            defer_outer_scope_depth: 0,
         }
     }
 

@@ -90,6 +90,7 @@ impl<'a> LoweringContext<'a> {
         self.current_func_id = Some(func_id);
         self.var_scopes.clear();
         self.loop_stack.clear();
+        self.pending_defers.clear();
         self.push_scope();
 
         // Create the entry block.
@@ -109,8 +110,12 @@ impl<'a> LoweringContext<'a> {
             self.define_var(name.clone(), VarBinding::Direct(param_val, ty.clone()));
         }
 
-        // Lower the body block.
-        let result = self.lower_block_implicit(body);
+        // Lower the body block as a function-exit boundary: defers
+        // are emitted *before* the body scope is popped so deferred
+        // expressions can resolve free variables defined inside the
+        // body. (Plain `lower_block_implicit` pops the scope first,
+        // which would leave deferred references dangling.)
+        let result = self.lower_function_body_block(body);
 
         // If the function returns non-void and we have a result, return it.
         // Otherwise return void.
@@ -139,6 +144,12 @@ impl<'a> LoweringContext<'a> {
                     // functions that use implicit return would leave
                     // the call site expecting two slots and getting
                     // one, failing Cranelift verification.
+                    //
+                    // Defers have already been lowered for this
+                    // fall-through path by `lower_function_body_block`
+                    // above. Early-exit paths (`Statement::Return`,
+                    // `lower_try`) emit their own defers before their
+                    // own terminators and don't reach this branch.
                     let val = self.coerce_value_to_expected(val, &return_type, body.span);
                     self.terminate(Terminator::Return(Some(val)));
                 } else {
@@ -165,29 +176,91 @@ impl<'a> LoweringContext<'a> {
         self.pop_scope();
     }
 
+    /// Lower a function-exit-boundary block (top-level function body
+    /// or lambda body).
+    ///
+    /// Same iteration as [`lower_block_implicit`] with one extra
+    /// step: when the body falls through (no explicit `return`
+    /// terminated it), pending defers are lowered *before* the
+    /// body's scope is popped, so deferred expressions can still
+    /// resolve free variables declared inside the body.
+    ///
+    /// Not appropriate for `if`-arms, `match`-arms, or loop bodies —
+    /// those do not exit a function frame, so their defers (if any)
+    /// must remain attached to the enclosing function's
+    /// `pending_defers` and fire at *that* function's exit.
+    ///
+    /// **Scope responsibility.** The caller (`lower_function_body` for
+    /// free functions / methods, `lower_lambda` for closures) is
+    /// expected to have already pushed the *parameter* scope and
+    /// bound parameters / captures into it. This method then pushes a
+    /// second scope on top of the parameter scope as the body's
+    /// outermost-let scope, snapshots the post-push depth as the
+    /// defer-masking boundary, lowers, and pops only its own scope.
+    /// `defer_outer_scope_depth` therefore points just above both
+    /// scopes, so [`lower_defers_for_exit`]'s `split_off` masks
+    /// inner-block scopes (if-arms, loop bodies) without disturbing
+    /// either the body or the parameter scope.
+    pub(crate) fn lower_function_body_block(&mut self, block: &Block) -> Option<ValueId> {
+        self.push_scope();
+        // Snapshot the scope depth at the function/lambda body's
+        // outermost level. `lower_defers_for_exit` consults this to
+        // hide inner scopes during defer expression lowering — see
+        // its doc-comment for why. Saved/restored across nested
+        // function-body invocations (lambdas inside this body).
+        let saved_defer_depth = self.defer_outer_scope_depth;
+        self.defer_outer_scope_depth = self.var_scopes.len();
+
+        let result = self.lower_implicit_block_body(block);
+
+        // Fall-through exit: lower defers BEFORE pop_scope. Skipped
+        // when the block is already terminated (an explicit `return`
+        // already emitted defers via the `Statement::Return` arm of
+        // `lower_stmt`).
+        if !self.current_block_is_terminated() {
+            self.lower_defers_for_exit();
+        }
+
+        self.defer_outer_scope_depth = saved_defer_depth;
+        self.pop_scope();
+        result
+    }
+
+    /// `true` if the current block already carries a terminator (i.e.
+    /// the lowering has emitted a `Return`/`Branch`/`Jump`/`Unreachable`
+    /// for it). Used by [`lower_function_body_block`] and
+    /// [`lower_implicit_block_body`] to decide whether to keep
+    /// emitting into the current block or break.
+    fn current_block_is_terminated(&self) -> bool {
+        let bb = self.current_block();
+        !matches!(self.current_func().block(bb).terminator, Terminator::None)
+    }
+
     /// Lower a block of statements with implicit return semantics.
     /// If the last statement is a bare expression, its value is returned.
     pub(crate) fn lower_block_implicit(&mut self, block: &Block) -> Option<ValueId> {
         self.push_scope();
-        let mut result = None;
+        let result = self.lower_implicit_block_body(block);
+        self.pop_scope();
+        result
+    }
 
+    /// Shared statement loop for [`lower_block_implicit`] and
+    /// [`lower_function_body_block`]: the caller owns scope push/pop
+    /// (and the function-body variant injects defer lowering between
+    /// the loop and `pop_scope`). Stops early if the current block
+    /// gains a terminator. The last statement, if a bare expression,
+    /// is returned as the implicit-return value.
+    fn lower_implicit_block_body(&mut self, block: &Block) -> Option<ValueId> {
+        let mut result = None;
         for (i, stmt) in block.statements.iter().enumerate() {
             let is_last = i == block.statements.len() - 1;
 
-            // Check if the current block already has a terminator.
-            let has_terminator = {
-                let bb = self.current_block();
-                !matches!(
-                    self.current_func_mut().block(bb).terminator,
-                    Terminator::None
-                )
-            };
-            if has_terminator {
+            if self.current_block_is_terminated() {
                 break;
             }
 
             if is_last && let Statement::Expression(expr_stmt) = stmt {
-                // Last expression — its value is the implicit return.
                 let val = self.lower_expr(&expr_stmt.expr);
                 result = Some(val);
                 continue;
@@ -195,8 +268,6 @@ impl<'a> LoweringContext<'a> {
 
             self.lower_stmt(stmt);
         }
-
-        self.pop_scope();
         result
     }
 
@@ -217,8 +288,10 @@ impl<'a> LoweringContext<'a> {
                     // single-slot at call sites that expect two.
                     let expected = self.current_func().return_type.clone();
                     let val = self.coerce_expr_to_expected(val, val_expr.span(), &expected, r.span);
+                    self.lower_defers_for_exit();
                     self.terminate(Terminator::Return(Some(val)));
                 } else {
+                    self.lower_defers_for_exit();
                     self.terminate(Terminator::Return(None));
                 }
             }
@@ -244,7 +317,90 @@ impl<'a> LoweringContext<'a> {
                     });
                 }
             }
+            // `defer expr` — append the expression to the current
+            // function's pending-defers list. It is lowered (in reverse
+            // order) at every `Return` exit path. Lazy capture
+            // semantics: free variables resolve at exit, not at the
+            // defer point. See Phase 2.3 decision G.
+            Statement::Defer(d) => {
+                self.pending_defers.push(d.expr.clone());
+            }
         }
+    }
+
+    /// Lower every defer registered so far in this function, LIFO.
+    ///
+    /// Called by every `Return` exit path before emitting
+    /// `Terminator::Return` — the explicit `return` statement, the
+    /// fall-through return at the end of a function/lambda body, and
+    /// the `?` (try) early-return in `lower_try`. Each defer's result
+    /// is dropped (defer is a statement, not an expression). The
+    /// pending list is left intact so other exit paths in the same
+    /// function emit the same defers.
+    ///
+    /// **Sema preconditions** ([`Checker::check_defer_placement`] in
+    /// the sema crate):
+    /// - Every `Statement::Defer` lives at the function/lambda body's
+    ///   outermost statement level. So a deferred expression's free
+    ///   variables can only refer to function parameters or the
+    ///   body's outermost-level lets (no inner-scope bindings).
+    /// - The deferred expression contains neither `return` nor `?`
+    ///   (try). Both lower to `Terminator::Return`; allowing them
+    ///   would mid-defer terminate the block the caller's own
+    ///   `Terminator::Return` is about to land on.
+    ///
+    /// Combined, those preconditions guarantee `lower_expr` here
+    /// neither terminates the current block nor mutates
+    /// `self.pending_defers` (the take-and-restore below is just to
+    /// release the borrow for the `&mut self` recursion).
+    ///
+    /// **Scope masking.** Inner scopes (loop bodies, if-arms, match
+    /// arms) that happen to be on the scope stack at this exit point
+    /// can SHADOW outer bindings — `lookup_var` searches innermost
+    /// first — so we temporarily detach them with [`Vec::split_off`]
+    /// before lowering each defer expression and reattach them after.
+    /// Without this masking, a deferred `print(x)` at a `return` or
+    /// `?` reached from inside a `let x = ...` block would resolve
+    /// to the inner-shadowed `x`, diverging from the AST interp
+    /// (which pops inner scopes before firing defers).
+    ///
+    /// **IR-size caveat.** Each call lowers every pending defer at
+    /// the call site, so a function with N exit paths and a defer
+    /// that itself constructs a lambda emits N copies of the
+    /// lambda's lowered function. The all-arms-return shape (e.g.
+    /// `if c { return 1 } else { return 2 }`) additionally emits a
+    /// dead copy on the unreachable post-merge block — both arms
+    /// terminate, so [`lower_function_body_block`]'s fall-through
+    /// path runs `lower_defers_for_exit` again into a block no
+    /// control flow reaches. DCE'd by Cranelift / the C backend, so
+    /// it's an emit-time waste rather than a runtime concern.
+    /// Currently acceptable (most defers are small calls); a future
+    /// optimisation could share the defer's lowered code across
+    /// exits via a join block. Tracked alongside the rest of Phase
+    /// 2.7's IR-size work.
+    pub(crate) fn lower_defers_for_exit(&mut self) {
+        if self.pending_defers.is_empty() {
+            return;
+        }
+
+        // Hide inner scopes for the duration of defer lowering so
+        // free-variable lookups in the defer expression resolve
+        // against the function's outermost scopes only. See the
+        // **Scope masking** section above.
+        let depth = self.defer_outer_scope_depth;
+        let inner_scopes = self.var_scopes.split_off(depth);
+
+        // Take rather than clone — sema preconditions guarantee no
+        // defer expression lowers to anything that mutates
+        // `pending_defers`, and `take` avoids an AST deep-clone of
+        // every pending defer on every exit path.
+        let defers = std::mem::take(&mut self.pending_defers);
+        for expr in defers.iter().rev() {
+            self.lower_expr(expr);
+        }
+        self.pending_defers = defers;
+
+        self.var_scopes.extend(inner_scopes);
     }
 
     /// Lower a variable declaration.

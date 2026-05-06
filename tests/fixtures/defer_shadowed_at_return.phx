@@ -1,0 +1,31 @@
+// Pins that a `defer` at the function's outermost level resolves
+// its free variables against the OUTER scope, even when the
+// `return` (or `?`) exit it fires from is inside an inner block
+// that shadows one of those variables.
+//
+// `lookup_var` on the IR side searches innermost-first, so without
+// scope masking in `lower_defers_for_exit` the deferred `print(x)`
+// at the inner-scope `return x` would resolve to the inner `x`
+// (= 99), diverging from the AST interpreter (which pops inner
+// scopes before firing defers and so always sees the outer `x`).
+//
+// Expected stdout:
+//   1
+//   99
+//
+// Line 1: defer fires before the inner-scope return surfaces; it
+// must observe the outer `x` (= 1). Line 2: `f()` returned the
+// inner-scope value (= 99), printed by main.
+function f() -> Int {
+  let x: Int = 1
+  defer print(x)
+  if true {
+    let x: Int = 99
+    return x
+  }
+  return 0
+}
+
+function main() {
+  print(f())
+}

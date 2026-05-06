@@ -221,6 +221,14 @@ pub struct Interpreter {
     /// parallel maps), so an "added without module recorded" state
     /// is structurally impossible.
     pub(crate) module_stack: Vec<Rc<phoenix_common::module_path::ModulePath>>,
+
+    /// Pending defer expressions, one frame per active function call
+    /// (push on call entry, pop and run in reverse on call exit). The
+    /// inner `Vec<Expr>` records each `defer expr` in source order, so
+    /// popping back-to-front gives Go-style LIFO semantics. Free
+    /// variables are looked up at exit time (lazy semantics) — see
+    /// Phase 2.3 design-decisions.md decision G for the tradeoff.
+    pub(crate) defer_stack: Vec<Vec<phoenix_parser::ast::Expr>>,
 }
 
 /// Control flow signal that must escape from an expression context
@@ -260,7 +268,92 @@ impl Interpreter {
             output,
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),
+            defer_stack: Vec::new(),
         }
+    }
+
+    /// Run every pending defer in the current function's frame in reverse
+    /// (LIFO) order. Each defer's result value is discarded.
+    ///
+    /// **Error policy (Go-style):** an error in one defer does not stop
+    /// later defers from running — every registered defer fires exactly
+    /// once, and the *first* error encountered is propagated after the
+    /// sequence completes. Subsequent errors are dropped on the floor.
+    fn run_defers(&mut self) -> Result<()> {
+        let Some(defers) = self.defer_stack.last_mut() else {
+            return Ok(());
+        };
+        // Drain so the same frame can't accidentally re-enter and run defers twice.
+        let drained = std::mem::take(defers);
+        let mut first_err: Option<RuntimeError> = None;
+        for expr in drained.into_iter().rev() {
+            if let Err(e) = self.eval_expr(&expr)
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Push a defer frame, run `body`, run any registered defers, then
+    /// pop the frame — returning the body's value if both succeeded,
+    /// the body's error if it failed (defers still ran for their side
+    /// effects), or the defers' first error if the body succeeded.
+    ///
+    /// Centralises the defer lifecycle for `call_function_body`,
+    /// `call_method_body`, and `call_closure` so they can't drift on
+    /// push/pop ordering. Callers still own env and call_depth setup
+    /// (which differs between functions, methods, and closures).
+    fn with_defer_frame(&mut self, body: &Block) -> Result<Value> {
+        // Snapshot env scope depth so we can assert the body left it
+        // balanced before defers fire — see the assert below.
+        let entry_scope_depth = self.env.scope_depth();
+        self.defer_stack.push(Vec::new());
+
+        // Phase 1 — run the body and unwrap its result. The unwrap
+        // runs *before* defers so the `?`-induced early-return
+        // error→value translation lands first; defers then fire
+        // while the body's locals are still in scope (callers pop
+        // the env after `with_defer_frame` returns).
+        let exec_result = self.exec_block_implicit(body);
+        let body_outcome = self.unwrap_call_result(exec_result);
+
+        // Defers' free-variable lookups depend on the env still
+        // matching the function's scope chain at this point — the
+        // body's inner-block push/pops must have netted to zero, and
+        // the caller's function scope must still be alive (callers
+        // pop it AFTER `with_defer_frame` returns). A regression
+        // here (an inner `pop_scope` without the matching push, or a
+        // future caller forgetting to push the function scope at all)
+        // would silently shift defer lookups to the wrong scope
+        // chain. Cheap assert; only meaningful in debug builds.
+        debug_assert_eq!(
+            self.env.scope_depth(),
+            entry_scope_depth,
+            "body must restore env scope depth before defers run; otherwise \
+             deferred free-variable lookups resolve against the wrong scope chain",
+        );
+
+        // Phase 2 — run defers. `last_return_was_explicit` is global
+        // state read by `eval_branch_block` / match-arm code to
+        // decide whether a `StmtResult::Return` was explicit, so any
+        // function call inside a defer can clobber it. Snapshot and
+        // restore around `run_defers` so defer side effects don't
+        // leak into the caller's view of *this* call's return shape.
+        let saved_return_flag = self.last_return_was_explicit;
+        let defer_outcome = self.run_defers();
+        self.last_return_was_explicit = saved_return_flag;
+
+        self.defer_stack.pop();
+
+        // Body error wins over defer error — the body's diagnosis
+        // ran first and is more useful. Defer errors surface only
+        // when the body succeeded.
+        body_outcome.and_then(|v| defer_outcome.map(|()| v))
     }
 
     /// Registers a slice of function declarations as methods on the given type.
@@ -494,10 +587,9 @@ impl Interpreter {
             );
         }
 
-        let result = self.exec_block_implicit(&func.body);
+        let value = self.with_defer_frame(&func.body);
         self.env.pop_scope();
-
-        self.unwrap_call_result(result)
+        value
     }
 
     /// Calls a method on a value by looking up the method in the method
@@ -644,10 +736,9 @@ impl Interpreter {
             );
         }
 
-        let result = self.exec_block_implicit(&method.func.body);
+        let value = self.with_defer_frame(&method.func.body);
         self.env.pop_scope();
-
-        self.unwrap_call_result(result)
+        value
     }
 
     /// Executes a block without implicit return.
@@ -753,6 +844,27 @@ impl Interpreter {
             Statement::For(f) => self.exec_for(f),
             Statement::Break(_) => Ok(StmtResult::Break),
             Statement::Continue(_) => Ok(StmtResult::LoopContinue),
+            Statement::Defer(d) => {
+                // Phoenix's grammar admits `Statement::Defer` only inside
+                // a `parse_block`, and `parse_block` is only reachable
+                // from a function/method/lambda body or a nested control
+                // construct (`if`/`match`/loop) inside such a body. So
+                // every `Defer` reaching `exec_stmt` is dynamically
+                // executed within an active function call, and every
+                // entry path (`call_function_body`, `call_method_body`,
+                // `call_closure`) pushes a defer frame via
+                // `with_defer_frame` before running the body.
+                //
+                // The `expect` is therefore a load-bearing assertion: if
+                // it ever fires, a future entry path forgot to push a
+                // frame (silent dropped defer would be the alternative
+                // failure mode).
+                self.defer_stack
+                    .last_mut()
+                    .expect("defer statement evaluated outside a function frame")
+                    .push(d.expr.clone());
+                Ok(StmtResult::Continue)
+            }
         }
     }
 
@@ -1510,13 +1622,17 @@ impl Interpreter {
                     closure_env.define(name.clone(), value);
                 }
 
-                // Swap in the closure environment, execute, then restore
+                // Swap in the closure environment, execute, then restore.
+                // Closures get their own defer frame (matching the IR side,
+                // where each closure is lowered as its own function with a
+                // fresh `pending_defers`), so a `defer` inside a closure
+                // body fires when the closure returns — not at the
+                // enclosing function's exit.
                 let saved = std::mem::replace(&mut self.env, closure_env);
-                let result = self.exec_block_implicit(&body);
+                let value = self.with_defer_frame(&body);
                 self.env = saved;
                 self.call_depth -= 1;
-
-                self.unwrap_call_result(result)
+                value
             }
             _ => error(format!("cannot call value of type {}", callee.type_name())),
         }
@@ -1725,6 +1841,252 @@ mod tests {
     fn run_division_by_zero() {
         let result = run_source("function main() { print(1 / 0) }");
         assert!(result.is_err());
+    }
+
+    /// Pins the Go-style defer error policy in `run_defers`:
+    /// when one defer errors, every later (LIFO-ordered) defer still
+    /// runs, and the *first* error encountered is the one propagated.
+    ///
+    /// Layout: `defer print("ran second")` is registered first, then
+    /// `defer 1 / 0`. LIFO evaluation runs the divide-by-zero defer
+    /// first (errors), then `print("ran second")` (succeeds, observed
+    /// in stdout), and the function returns the divide-by-zero error.
+    #[test]
+    fn defer_error_propagation_first_error_wins_other_defers_run() {
+        let source = "function main() {\n  defer print(\"ran second\")\n  defer 1 / 0\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        let result = interpreter.run_program(&program);
+        drop(interpreter);
+
+        let bytes = buffer.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = output.lines().map(String::from).collect();
+        assert_eq!(lines, vec!["ran second"], "later defer must still run");
+
+        let err = result.expect_err("first defer should have errored");
+        assert!(
+            err.message.contains("division by zero"),
+            "expected first-encountered error, got: {}",
+            err.message,
+        );
+    }
+
+    /// Pins that defers fire on a runtime body error (not just on
+    /// fall-through or explicit return). The body errors with division
+    /// by zero *after* the defer is registered, so the defer must
+    /// still run and the body's error must surface to the caller.
+    #[test]
+    fn defer_fires_on_body_runtime_error() {
+        let source =
+            "function main() {\n  defer print(\"ran on body error\")\n  let _: Int = 1 / 0\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        let result = interpreter.run_program(&program);
+        drop(interpreter);
+
+        let bytes = buffer.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = output.lines().map(String::from).collect();
+        assert_eq!(
+            lines,
+            vec!["ran on body error"],
+            "defer must still fire on body runtime error",
+        );
+
+        let err = result.expect_err("body should have errored");
+        assert!(
+            err.message.contains("division by zero"),
+            "body error must surface, got: {}",
+            err.message,
+        );
+    }
+
+    /// Sibling of `defer_error_propagation_first_error_wins_other_defers_run`
+    /// covering the symmetric layout: the *source-order-first* defer
+    /// errors (so it runs LAST in LIFO), and the source-order-second
+    /// defer succeeds (running FIRST in LIFO). Pins that the
+    /// "first error encountered during draining" rule isn't quietly
+    /// "first error in source order" — the propagated error must be
+    /// the divide-by-zero from the LIFO-second defer, observed *after*
+    /// the print from the LIFO-first defer hits stdout.
+    #[test]
+    fn defer_error_propagation_source_order_first_defer_errors_last() {
+        let source = "function main() {\n  defer 1 / 0\n  defer print(\"ran first\")\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        let result = interpreter.run_program(&program);
+        drop(interpreter);
+
+        let bytes = buffer.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = output.lines().map(String::from).collect();
+        assert_eq!(
+            lines,
+            vec!["ran first"],
+            "LIFO-first defer must still run before the erroring defer",
+        );
+
+        let err = result.expect_err("source-order-first defer should have errored");
+        assert!(
+            err.message.contains("division by zero"),
+            "expected divide-by-zero from the LIFO-last defer, got: {}",
+            err.message,
+        );
+    }
+
+    /// Pins error propagation across nested defer frames: a defer
+    /// inside a closure errors → the closure call returns that error
+    /// → the enclosing function's body sees a body error → the
+    /// enclosing function's own defer still fires → body-error wins
+    /// over defer-error, so the caller sees the closure's
+    /// divide-by-zero. Stdout pins that the outer defer ran (proving
+    /// the closure's error was treated as a body error in main, not
+    /// silently swallowed by defer-error precedence).
+    #[test]
+    fn defer_error_inside_closure_propagates_through_outer_defer_frame() {
+        let source = "function main() {\n  defer print(\"outer ran\")\n  let f = function() { defer 1 / 0 }\n  f()\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        let result = interpreter.run_program(&program);
+        drop(interpreter);
+
+        let bytes = buffer.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = output.lines().map(String::from).collect();
+        assert_eq!(
+            lines,
+            vec!["outer ran"],
+            "outer defer must fire after the closure's defer error became a body error",
+        );
+
+        let err = result.expect_err("closure defer error should have surfaced");
+        assert!(
+            err.message.contains("division by zero"),
+            "closure's defer error must propagate through main's defer frame, got: {}",
+            err.message,
+        );
+    }
+
+    /// Pins the precedence rule in `with_defer_frame`: when the body
+    /// errors *and* a defer also errors, the body's error is what the
+    /// caller sees (defer errors are silently dropped). Distinguish
+    /// the two using disjoint error messages — body raises division
+    /// by zero, defer raises a list out-of-bounds — so the assert can
+    /// confirm which one propagated.
+    #[test]
+    fn body_error_wins_over_defer_error() {
+        let source = "function main() {\n  let nums: List<Int> = [1, 2, 3]\n  defer nums.get(-1)\n  let _: Int = 1 / 0\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let mut interpreter = Interpreter::new();
+        let err = interpreter
+            .run_program(&program)
+            .expect_err("body and defer both error; expected an error");
+
+        assert!(
+            err.message.contains("division by zero"),
+            "body error must win over defer error, got: {}",
+            err.message,
+        );
+        assert!(
+            !err.message.contains("out of bounds"),
+            "defer error must not surface when body errored, got: {}",
+            err.message,
+        );
+    }
+
+    /// Pins that defers fire on a value-less explicit `return` in a
+    /// void function. The IR side has a separate `r.value.is_none()`
+    /// arm in `lower_stmt::Statement::Return` that calls
+    /// `lower_defers_for_exit` before `Terminator::Return(None)`; the
+    /// AST interp routes through `unwrap_call_result` returning
+    /// `Value::Void`. Either path regressing would skip the defer.
+    #[test]
+    fn defer_fires_on_void_explicit_return() {
+        let source = "function main() {\n  defer print(\"cleanup\")\n  return\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        interpreter
+            .run_program(&program)
+            .expect("void return should succeed");
+        drop(interpreter);
+
+        let bytes = buffer.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = output.lines().map(String::from).collect();
+        assert_eq!(
+            lines,
+            vec!["cleanup"],
+            "defer must fire before a value-less explicit return",
+        );
+    }
+
+    /// Pins lazy-capture re-entrancy: a defer's free-variable lookup
+    /// must observe the value of the variable at function exit, even
+    /// when an intermediate user-function call (which has its own
+    /// independent defer frame) mutates that variable. This is the
+    /// nested-frame counterpart to `defer_lazy_capture.phx` (which
+    /// only mutates inside `main`); the test pins that pushing/popping
+    /// a defer frame for the helper call doesn't somehow snapshot
+    /// `main`'s deferred expressions.
+    ///
+    /// Layout: main has `let mut x = 1; defer print(x); helper(); print(x)`.
+    /// `helper` itself has a defer (its own frame, observed via stdout
+    /// to confirm both frames fired). After `helper` returns, main
+    /// reassigns `x = 99` and falls through. The deferred `print(x)`
+    /// in main observes `99`, not `1`.
+    #[test]
+    fn defer_lazy_capture_across_nested_function_call() {
+        let source = "function helper() {\n  defer print(\"helper defer\")\n  print(\"helper body\")\n}\nfunction main() {\n  let mut x: Int = 1\n  defer print(x)\n  helper()\n  x = 99\n  print(x)\n}";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        interpreter
+            .run_program(&program)
+            .expect("program should succeed");
+        drop(interpreter);
+
+        let bytes = buffer.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = output.lines().map(String::from).collect();
+        assert_eq!(
+            lines,
+            vec!["helper body", "helper defer", "99", "99"],
+            "helper's defer fires when helper returns; main's defer fires \
+             at main's exit and observes the post-mutation value of `x`",
+        );
     }
 
     #[test]

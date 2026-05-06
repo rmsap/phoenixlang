@@ -79,6 +79,11 @@ pub enum TokenKind {
     ///
     /// Appears as `import a.b { Foo as Bar }`.
     As,
+    /// The `defer` keyword, scheduling an expression to run at the
+    /// enclosing function's exit (LIFO order, on every exit path).
+    /// Phase 2.3 cleanup-syntax decision G; see
+    /// `docs/design-decisions.md#g-scope-bound-cleanup-syntax-go-style-statement-level-defer`.
+    Defer,
 
     // ── Gen keywords ────────────────────────────────────────
     /// The `endpoint` keyword, introducing an endpoint declaration.

@@ -174,6 +174,10 @@ pub enum Statement {
     Break(Span),
     /// A `continue` statement that skips to the next loop iteration.
     Continue(Span),
+    /// A `defer` statement scheduling an expression to run at the
+    /// enclosing function's exit (LIFO over multiple defers; runs on
+    /// every exit path: explicit `return`, fall-through, or panic).
+    Defer(DeferStmt),
 }
 
 /// The binding target of a variable declaration.
@@ -250,6 +254,24 @@ pub struct ReturnStmt {
     /// The value to return, or `None` for a bare `return`.
     pub value: Option<Expr>,
     /// Source span covering the return statement.
+    pub span: Span,
+}
+
+/// A `defer` statement: `defer expr;`
+///
+/// `expr` is evaluated at the enclosing function's exit (LIFO when
+/// multiple defers are registered) on every exit path. Free variables
+/// in `expr` are resolved **lazily at exit time**, not snapshotted at
+/// the defer point — assignments to those variables after the `defer`
+/// statement *do* change what the deferred expression sees. (This is
+/// the opposite of Go, which evaluates call-expression arguments
+/// eagerly at the defer point. Phase 2.3 chose lazy capture as the
+/// baseline; see `docs/phases/phase-2.md` decision G.)
+#[derive(Debug, Clone, Serialize)]
+pub struct DeferStmt {
+    /// The expression to evaluate at function exit.
+    pub expr: Expr,
+    /// Source span covering the entire `defer expr` statement.
     pub span: Span,
 }
 

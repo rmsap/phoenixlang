@@ -1,0 +1,20 @@
+// Pins that `defer` works inside a method (`call_method_body`
+// path on the AST interp side; same lower_function_body path on
+// the IR side as a free function). Defer fires before the method
+// returns, so "done" prints before main prints the returned value.
+//
+// Expected stdout:
+//   done
+//   42
+struct Counter {
+  Int value
+
+  function show(self) -> Int {
+    defer print("done")
+    self.value
+  }
+}
+
+function main() {
+  print(Counter(42).show())
+}

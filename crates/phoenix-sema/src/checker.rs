@@ -983,6 +983,7 @@ impl Checker {
             }
 
             this.check_block(&func.body);
+            this.check_defer_placement(&func.body);
             this.validate_implicit_return(func, &return_type);
             this.scopes.pop();
             this.current_return_type = None;
@@ -1115,6 +1116,7 @@ impl Checker {
                 }
 
                 this.check_block(&func.body);
+                this.check_defer_placement(&func.body);
                 this.validate_implicit_return(func, &return_type);
                 this.scopes.pop();
                 this.current_return_type = None;
@@ -1247,18 +1249,31 @@ impl Checker {
         }
     }
 
-    /// Returns `true` if a statement contains (or is) an explicit `return`.
+    /// Returns `true` if a statement is or syntactically contains an
+    /// explicit `return` reachable through statement-level recursion
+    /// or through an `if`-expression. Used by `validate_implicit_return`
+    /// to decide whether a function with no implicit-return value
+    /// nonetheless reaches a `return`.
     ///
-    /// Recurses into `if`/`else` and loop bodies so that returns nested inside
-    /// control flow are detected.  This is a conservative check -- it does not
-    /// prove that *all* paths return, only that *at least one* return exists.
+    /// This walker is intentionally narrow: it does not dive into call
+    /// arguments, match arms, try operands, etc. — only statement
+    /// containers (`while`/`for` bodies, `if`-arm blocks) and the
+    /// `Expr::If` shape. Widening it to detect `return`s buried in
+    /// arbitrary expressions would change the set of programs accepted
+    /// by `validate_implicit_return`. The defer-reject walkers in
+    /// `crate::defer` use the deeper [`crate::expr_walk`] traversal.
     fn contains_return(stmt: &Statement) -> bool {
         match stmt {
             Statement::Return(_) => true,
-            Statement::Expression(es) => Self::expr_contains_return(&es.expr),
-            Statement::VarDecl(vd) => Self::expr_contains_return(&vd.initializer),
+            Statement::Expression(es) => Self::expr_contains_return_shallow(&es.expr),
+            Statement::VarDecl(vd) => Self::expr_contains_return_shallow(&vd.initializer),
             Statement::While(w) => {
-                Self::expr_contains_return(&w.condition)
+                // The condition itself can be an `if`-expression that
+                // returns from one of its arms (e.g.
+                // `while (if cond { return 1; true } else { false }) { ... }`).
+                // Preserved across the rename to `_shallow` for parity
+                // with pre-Phase-2.3 acceptance.
+                Self::expr_contains_return_shallow(&w.condition)
                     || w.body.statements.iter().any(Self::contains_return)
                     || w.else_block
                         .as_ref()
@@ -1271,22 +1286,25 @@ impl Checker {
                         .is_some_and(|b| b.statements.iter().any(Self::contains_return))
             }
             Statement::Break(_) | Statement::Continue(_) => false,
+            // `return` inside a `defer` expression is rejected by
+            // `check_stmt`. A slipped-through case would still fire at
+            // the enclosing function's exit, after the function has
+            // already needed to produce its return value, so it cannot
+            // satisfy the must-return obligation either way.
+            Statement::Defer(_) => false,
         }
     }
 
-    /// Returns `true` if an expression contains an explicit `return`.
-    ///
-    /// Only constructs that can embed statements (currently `if` expressions)
-    /// need to recurse; other expressions cannot contain a `return` statement.
-    fn expr_contains_return(expr: &Expr) -> bool {
+    /// Narrow expression-level walker for [`Self::contains_return`]:
+    /// only `Expr::If` recurses (its arms can hold statements that
+    /// hold a `return`); every other expression is a leaf.
+    fn expr_contains_return_shallow(expr: &Expr) -> bool {
         match expr {
             Expr::If(if_expr) => Self::if_expr_contains_return(if_expr),
             _ => false,
         }
     }
 
-    /// Returns `true` if any branch of an `if`/`else if`/`else` chain
-    /// contains an explicit `return`.
     fn if_expr_contains_return(if_expr: &IfExpr) -> bool {
         if if_expr
             .then_block

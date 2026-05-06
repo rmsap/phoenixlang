@@ -386,6 +386,11 @@ impl Checker {
                 lambda.span,
             );
         }
+        // Each lambda has its own outermost level (and its own defer
+        // frame on both interpreters), so its body gets its own
+        // placement check — defers nested deeper than the lambda body's
+        // top level are rejected here, just like for a free function.
+        self.check_defer_placement(&lambda.body);
         self.scopes.pop();
         self.current_return_type = prev_return;
 

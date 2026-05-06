@@ -1,0 +1,13 @@
+// Pins that defers fire before an explicit `return`. Expected stdout:
+//   defer fired
+//   42
+// The `defer` registers print before the early `return n`; the deferred
+// call must run before control leaves `compute`.
+function compute(n: Int) -> Int {
+  defer print("defer fired")
+  return n
+}
+
+function main() {
+  print(compute(42))
+}

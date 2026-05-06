@@ -166,6 +166,22 @@ backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx");
 // per fixture. Tracked as a Phase 2.7 follow-up rather than a 2.3 gate
 // because both options are infrastructure work, not GC correctness work.
 backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
+backend_matrix_test!(matrix_defer_basic, "defer_basic.phx");
+backend_matrix_test!(matrix_defer_explicit_return, "defer_explicit_return.phx");
+backend_matrix_test!(matrix_defer_lazy_capture, "defer_lazy_capture.phx");
+backend_matrix_test!(matrix_defer_method, "defer_method.phx");
+backend_matrix_test!(matrix_defer_heap, "defer_heap.phx");
+backend_matrix_test!(matrix_defer_closure, "defer_closure.phx");
+backend_matrix_test!(matrix_defer_try, "defer_try.phx");
+backend_matrix_test!(matrix_defer_multiple_returns, "defer_multiple_returns.phx");
+backend_matrix_test!(
+    matrix_defer_shadowed_at_return,
+    "defer_shadowed_at_return.phx"
+);
+backend_matrix_test!(
+    matrix_defer_nested_function_frames,
+    "defer_nested_function_frames.phx"
+);
 backend_matrix_test!(matrix_gc_keeps_alive, "gc_keeps_alive.phx");
 backend_matrix_test!(matrix_gc_loop_carried_ref, "gc_loop_carried_ref.phx");
 

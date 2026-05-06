@@ -1,0 +1,25 @@
+// Pins that a single `defer` fires on every `return` exit path. The
+// IR side calls `lower_defers_for_exit` at each `Terminator::Return`,
+// so a function with two explicit returns must emit the defer twice
+// (once per return path). A regression that emitted defers only on
+// the fall-through path (or only on the first return) would print
+// "cleanup" zero times instead of once.
+//
+// Expected stdout:
+//   cleanup
+//   1
+//   cleanup
+//   2
+function choose(c: Bool) -> Int {
+  defer print("cleanup")
+  if c {
+    return 1
+  } else {
+    return 2
+  }
+}
+
+function main() {
+  print(choose(true))
+  print(choose(false))
+}

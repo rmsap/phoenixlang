@@ -1,5 +1,6 @@
 use crate::ast::{
-    ExprStmt, ForSource, ForStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget, WhileStmt,
+    DeferStmt, ExprStmt, ForSource, ForStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget,
+    WhileStmt,
 };
 use crate::parser::Parser;
 use phoenix_lexer::token::TokenKind;
@@ -28,8 +29,21 @@ impl<'src> Parser<'src> {
                 self.eat(TokenKind::Newline);
                 Some(Statement::Continue(span))
             }
+            // `defer expr` — schedules `expr` to run at the enclosing
+            // function's exit, LIFO across multiple defers.
+            TokenKind::Defer => self.parse_defer_stmt().map(Statement::Defer),
             _ => self.parse_expr_stmt().map(Statement::Expression),
         }
+    }
+
+    /// Parses `defer expr` (newline or `}` terminator).
+    fn parse_defer_stmt(&mut self) -> Option<DeferStmt> {
+        let start = self.peek().span;
+        self.expect(TokenKind::Defer)?;
+        let expr = self.parse_expr()?;
+        let span = start.merge(expr.span());
+        self.eat(TokenKind::Newline);
+        Some(DeferStmt { expr, span })
     }
 
     /// Parses a `let` variable declaration.

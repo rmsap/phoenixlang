@@ -1,0 +1,37 @@
+// Pins that defer frames are independent across function calls:
+// a callee's defers fire when the callee returns, NOT at the
+// caller's exit, and each call to the same callee starts with a
+// fresh defer frame.
+//
+// On the AST interp side this is enforced by `with_defer_frame`
+// pushing/popping the per-call frame in `defer_stack`. On the IR
+// side, `pending_defers` is per-`LoweringContext`-function and is
+// cleared in `lower_function_body` (and saved/restored across
+// lambda lowering); each compiled function's defer block runs at
+// its own `Terminator::Return`.
+//
+// Expected stdout:
+//   helper body 1
+//   helper defer 1
+//   helper body 2
+//   helper defer 2
+//   main body
+//   main defer 2
+//   main defer 1
+//
+// `helper` runs twice; each call's defer fires immediately after
+// that call's body, before control returns to main. main's two
+// defers fire LIFO at main's fall-through exit, AFTER both
+// helper calls have already cleaned up.
+function helper(n: Int) {
+  print("helper body " + toString(n))
+  defer print("helper defer " + toString(n))
+}
+
+function main() {
+  defer print("main defer 1")
+  defer print("main defer 2")
+  helper(1)
+  helper(2)
+  print("main body")
+}

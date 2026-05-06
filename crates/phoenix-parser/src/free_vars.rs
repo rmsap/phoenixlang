@@ -74,6 +74,7 @@ fn walk_stmt(stmt: &Statement, free: &mut HashSet<String>, local: &mut HashSet<S
             }
         }
         Statement::Break(_) | Statement::Continue(_) => {}
+        Statement::Defer(d) => walk_expr(&d.expr, free, local),
     }
 }
 

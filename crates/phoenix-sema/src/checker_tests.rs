@@ -28,6 +28,28 @@ fn assert_has_error(source: &str, expected_msg: &str) {
     );
 }
 
+/// Assert that the checker emits *exactly* `expected_count` diagnostics
+/// whose message contains `expected_msg`. Stronger than [`assert_has_error`]
+/// when the test name implies a specific count of violations — e.g.
+/// "exactly one nested defer" — and the walker accidentally flagging the
+/// surrounding legal construct would otherwise pass silently.
+fn assert_error_count_for_message(source: &str, expected_msg: &str, expected_count: usize) {
+    let errors = check_source(source);
+    let matching: Vec<&Diagnostic> = errors
+        .iter()
+        .filter(|e| e.message.contains(expected_msg))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        expected_count,
+        "expected {} errors containing '{}', got {} matches in {:?}",
+        expected_count,
+        expected_msg,
+        matching.len(),
+        errors,
+    );
+}
+
 #[test]
 fn valid_simple_program() {
     assert_no_errors("function main() { let x: Int = 42\n print(x) }");
@@ -3942,5 +3964,396 @@ fn dyn_reassignment_with_non_implementor_is_rejected() {
              }",
         ),
         "type mismatch",
+    );
+}
+
+/// `defer` of an expression that references an unbound name still
+/// produces the standard undefined-variable diagnostic; the defer
+/// statement does not silently swallow lookup errors.
+#[test]
+fn defer_reports_unbound_name_in_expression() {
+    assert_has_error(
+        "function main() { defer print(missing) }",
+        "undefined variable `missing`",
+    );
+}
+
+/// `return` inside a `defer` expression is rejected at sema. The
+/// runtime semantics ("return from a function that's already
+/// exiting") are unclear, and on the IR side the embedded return
+/// would terminate the current block before the caller's own
+/// `Terminator::Return` lands.
+#[test]
+fn defer_with_inner_return_is_rejected() {
+    assert_has_error(
+        "function f(c: Bool) -> Int {
+             defer if c { return 1 } else { 0 }
+             2
+         }",
+        "`return` is not allowed inside a `defer` expression",
+    );
+}
+
+/// A function whose only "return-like" construct lives inside a
+/// `defer` expression must still trip the must-return-a-value
+/// diagnostic. The defer body runs at exit and does not satisfy
+/// the function's return obligation.
+///
+/// This test specifically uses a deferred expression whose *type*
+/// would otherwise be a candidate for the implicit return (`42` is
+/// an `Int`, matching the declared return type). The diagnostic
+/// must still fire because `defer` discards its expression's value
+/// — the deferred expression is never the implicit-return value.
+#[test]
+fn defer_does_not_satisfy_return_obligation() {
+    assert_has_error(
+        "function f() -> Int { defer 42 }",
+        "does not return a value",
+    );
+}
+
+/// A `defer` inside another `defer`'s expression is rejected: it
+/// sits inside an `if`-arm block, which is not the function's
+/// outermost statement level.
+#[test]
+fn defer_inside_defer_if_arm_is_rejected() {
+    assert_has_error(
+        "function f(c: Bool) {
+             defer if c { defer print(\"inner\") } else { 0 }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// Sibling check: a `defer` inside a `match`-arm block of a
+/// deferred expression is also rejected.
+#[test]
+fn defer_inside_defer_match_arm_is_rejected() {
+    assert_has_error(
+        "function f(n: Int) {
+             defer match n {
+                 0 -> { defer print(\"zero\") }
+                 _ -> { 0 }
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// A `defer` reachable through a function-call argument's `if`-arm —
+/// previously slipped past the narrow nested-defer check (which only
+/// recursed through `if`/`match`). The placement-rule walker
+/// recurses through every expression type.
+#[test]
+fn defer_inside_call_arg_in_defer_is_rejected() {
+    // Exactly one violation expected — only the inner `defer print(...)`
+    // is illegal. The outer `defer take(...)` lives at the function's
+    // outermost statement level and must NOT also be flagged.
+    assert_error_count_for_message(
+        "function take(n: Int) {}
+         function f(c: Bool) {
+             defer take(if c {
+                 defer print(\"inner\")
+                 1
+             } else { 0 })
+         }",
+        "`defer` must appear at the function's outermost statement level",
+        1,
+    );
+}
+
+/// `defer` inside an `if`-block at the function's top level (not
+/// inside another defer) is also rejected. The IR side has no
+/// active flag for defers — an untaken branch's defer would still
+/// fire on later exits. Restricting `defer` to the outermost block
+/// avoids the divergence.
+#[test]
+fn defer_inside_top_level_if_is_rejected() {
+    assert_has_error(
+        "function f(c: Bool) {
+             if c {
+                 defer print(\"only sometimes\")
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// `defer` inside a loop body is rejected. AST interp would
+/// register N times per N iterations; IR side would register once.
+/// The static/dynamic split is a known divergence — we reject at
+/// sema rather than letting users hit it silently.
+#[test]
+fn defer_inside_loop_body_is_rejected() {
+    assert_has_error(
+        "function f() {
+             for i in 0..3 {
+                 defer print(\"each\")
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// A `defer` inside a *lambda* body is fine — the lambda has its
+/// own outermost level (and its own defer frame on both
+/// interpreters). Pins that the rule does not over-trigger across
+/// the lambda boundary.
+#[test]
+fn defer_inside_lambda_inside_defer_is_allowed() {
+    let src = "function main() {
+        defer (function() { defer print(\"inner\") })()
+    }";
+    assert_no_errors(src);
+}
+
+/// A `defer` deep inside a lambda body — even one level of nesting
+/// inside the lambda itself — is rejected, by the lambda's own
+/// placement check.
+#[test]
+fn defer_nested_inside_lambda_body_is_rejected() {
+    assert_has_error(
+        "function main() {
+             let f = function(c: Bool) {
+                 if c { defer print(\"hi\") }
+             }
+             f(true)
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// `?` (try) inside a `defer` expression is rejected. `?` lowers to
+/// a `Terminator::Return` of the operand on the error path, which
+/// would (a) bypass earlier-source-order defers in LIFO and (b)
+/// surface a `Result`/`Option` to the caller in place of the
+/// function's intended return.
+#[test]
+fn defer_with_inner_try_is_rejected() {
+    assert_has_error(
+        "function get() -> Result<Int, String> { Ok(1) }
+         function f() -> Result<Int, String> {
+             defer get()?
+             Ok(42)
+         }",
+        "`?` (try) is not allowed inside a `defer` expression",
+    );
+}
+
+/// `defer` inside a `while`-loop body is rejected by the placement
+/// rule (sibling to `defer_inside_loop_body_is_rejected`, which
+/// covers `for`). Both walker arms share the same `walk_stmt`
+/// recursion; this test pins parity.
+#[test]
+fn defer_inside_while_loop_body_is_rejected() {
+    assert_has_error(
+        "function f() {
+             let mut i: Int = 0
+             while i < 3 {
+                 defer print(\"each\")
+                 i = i + 1
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// `defer` inside a `while` loop's `else` arm is rejected. The
+/// `else` arm runs at most once when the condition is false on
+/// entry — but the placement rule still applies because the IR
+/// side has no active flag for defers attached to inner blocks.
+#[test]
+fn defer_inside_while_else_arm_is_rejected() {
+    assert_has_error(
+        "function f() {
+             while false {
+                 print(\"never\")
+             } else {
+                 defer print(\"else arm\")
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// `defer` inside a `for` loop's `else` arm is rejected (parity
+/// with the `while`-else case above).
+#[test]
+fn defer_inside_for_else_arm_is_rejected() {
+    assert_has_error(
+        "function f() {
+             for _i in 0..0 {
+                 print(\"never\")
+             } else {
+                 defer print(\"else arm\")
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// A `defer` reachable through a `?` (try) operand at the top level
+/// of another `defer`'s expression is also rejected — the placement
+/// walker recurses through `Expr::Try` like every other expression
+/// shape, and the inner `defer` is a nested defer regardless of how
+/// it's embedded.
+#[test]
+fn defer_inside_try_operand_in_defer_is_rejected() {
+    assert_has_error(
+        "function inner() -> Result<Int, String> { Ok(1) }
+         function f() -> Result<Int, String> {
+             defer inner()
+             let x = (if true {
+                 defer print(\"inner\")
+                 inner()
+             } else {
+                 inner()
+             })?
+             Ok(x)
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// A function whose only return-shaped construct lives at the top
+/// level alongside a `defer` should still satisfy
+/// `validate_implicit_return`. Pinned because `Self::contains_return`
+/// returns `false` for `Statement::Defer(_)`; a `return` *next to* a
+/// `defer` (not inside it) must still count.
+#[test]
+fn defer_does_not_mask_sibling_return_for_implicit_return_check() {
+    assert_no_errors(
+        "function f(c: Bool) -> Int {
+             defer print(\"cleanup\")
+             if c { return 1 } else { return 2 }
+         }",
+    );
+}
+
+/// `defer` inside a top-level `match`-arm block (not nested in
+/// another defer) is rejected by the placement rule. Sibling to
+/// `defer_inside_top_level_if_is_rejected`; covers the `match`
+/// branch of the same walker that already covers `if`/`while`/`for`.
+#[test]
+fn defer_inside_top_level_match_arm_is_rejected() {
+    assert_has_error(
+        "function f(n: Int) {
+             match n {
+                 0 -> { defer print(\"zero arm\") }
+                 _ -> { 0 }
+             }
+         }",
+        "`defer` must appear at the function's outermost statement level",
+    );
+}
+
+/// A nested defer whose deferred expression *also* contains a
+/// `return` should produce exactly one diagnostic — the placement
+/// violation. The return-inside-defer check is gated on top-level
+/// placement so it does not pile a second redundant error onto the
+/// same defer.
+#[test]
+fn nested_defer_with_return_in_expr_emits_only_placement_error() {
+    let src = "function f(c: Bool) -> Int {
+                 if c {
+                     defer if c { return 1 } else { 0 }
+                 }
+                 0
+             }";
+    assert_error_count_for_message(
+        src,
+        "`defer` must appear at the function's outermost statement level",
+        1,
+    );
+    assert_error_count_for_message(
+        src,
+        "`return` is not allowed inside a `defer` expression",
+        0,
+    );
+}
+
+/// Sibling check for the `?` (try) variant: a nested defer whose
+/// expression contains `?` produces only the placement error.
+#[test]
+fn nested_defer_with_try_in_expr_emits_only_placement_error() {
+    let src = "function inner() -> Result<Int, String> { Ok(1) }
+               function f(c: Bool) -> Result<Int, String> {
+                   if c {
+                       defer inner()?
+                   }
+                   Ok(0)
+               }";
+    assert_error_count_for_message(
+        src,
+        "`defer` must appear at the function's outermost statement level",
+        1,
+    );
+    assert_error_count_for_message(
+        src,
+        "`?` (try) is not allowed inside a `defer` expression",
+        0,
+    );
+}
+
+/// A top-level `defer` whose expression contains a *nested* (illegally-
+/// placed) `defer`, where the nested defer's own expression contains a
+/// `return`, must NOT have the `return`-not-allowed error attributed to
+/// the outer top-level defer. The `return` belongs to the nested defer
+/// (which is itself flagged for placement); attributing it to the
+/// outer defer would produce a misleading second diagnostic pointing
+/// at code that's fine in isolation.
+///
+/// Expected: exactly one placement error (against the nested defer)
+/// and zero return-not-allowed errors (since the only `return` lives
+/// inside the nested defer's expression, not directly inside the
+/// outer top-level defer's).
+#[test]
+fn outer_defer_does_not_inherit_inner_defers_return_violation() {
+    let src = "function f(c: Bool) -> Int {
+                   defer if c {
+                       defer if c { return 1 } else { 0 }
+                       0
+                   } else {
+                       0
+                   }
+                   42
+               }";
+    assert_error_count_for_message(
+        src,
+        "`defer` must appear at the function's outermost statement level",
+        1,
+    );
+    assert_error_count_for_message(
+        src,
+        "`return` is not allowed inside a `defer` expression",
+        0,
+    );
+}
+
+/// Sibling check: a top-level `defer` whose expression contains a
+/// nested (illegally-placed) `defer` whose own expression contains a
+/// `?` operator must not have the `?`-not-allowed error attributed to
+/// the outer top-level defer.
+#[test]
+fn outer_defer_does_not_inherit_inner_defers_try_violation() {
+    let src = "function inner() -> Result<Int, String> { Ok(1) }
+               function f(c: Bool) -> Result<Int, String> {
+                   defer if c {
+                       defer inner()?
+                       inner()
+                   } else {
+                       inner()
+                   }
+                   Ok(42)
+               }";
+    assert_error_count_for_message(
+        src,
+        "`defer` must appear at the function's outermost statement level",
+        1,
+    );
+    assert_error_count_for_message(
+        src,
+        "`?` (try) is not allowed inside a `defer` expression",
+        0,
     );
 }

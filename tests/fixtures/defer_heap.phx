@@ -1,0 +1,20 @@
+// Pins that defers fire *before* `phx_gc_pop_frame`, so a deferred
+// expression can still allocate on the GC heap. The string concat
+// inside the defer goes through `phx_string_alloc`; if defers were
+// (mis-)ordered after the frame pop, the new allocation's roots
+// would be unreachable and the printed value could be garbage.
+//
+// Lazy-capture semantics are covered separately by
+// `defer_lazy_capture.phx`; this fixture deliberately keeps `prefix`
+// immutable so a regression here is unambiguously about the
+// allocate-in-defer-before-pop-frame ordering, not about which
+// version of `prefix` the deferred expression observes.
+//
+// Expected stdout:
+//   working
+//   result: all done
+function main() {
+  let prefix: String = "result: "
+  defer print(prefix + "all done")
+  print("working")
+}

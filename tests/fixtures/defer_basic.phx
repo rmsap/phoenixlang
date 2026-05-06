@@ -1,0 +1,16 @@
+// Pins LIFO defer ordering. The expected stdout is:
+//   start
+//   middle
+//   defer 3
+//   defer 2
+//   defer 1
+// Each `defer print(...)` registers the call to fire at function exit;
+// the prints inside main run inline. After fall-through return, the
+// three defers fire in reverse-source-order (LIFO).
+function main() {
+  print("start")
+  defer print("defer 1")
+  defer print("defer 2")
+  print("middle")
+  defer print("defer 3")
+}

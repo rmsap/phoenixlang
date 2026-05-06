@@ -97,6 +97,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Import => "'import'",
         TokenKind::Public => "'public'",
         TokenKind::As => "'as'",
+        TokenKind::Defer => "'defer'",
     }
 }
 

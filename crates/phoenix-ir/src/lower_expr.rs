@@ -1151,10 +1151,15 @@ impl<'a> LoweringContext<'a> {
         let func_id = self.module.push_concrete(closure_func);
 
         // Save current function state and lower the lambda body.
+        // `pending_defers` is saved/restored so a `defer` inside the
+        // lambda body attaches to the lambda's own exit, not the
+        // enclosing function's. (Mirrors the AST interpreter, which
+        // pushes a fresh `defer_stack` frame in `call_closure`.)
         let saved_func_id = self.current_func_id;
         let saved_block = self.current_block;
         let saved_scopes = std::mem::take(&mut self.var_scopes);
         let saved_loops = std::mem::take(&mut self.loop_stack);
+        let saved_defers = std::mem::take(&mut self.pending_defers);
 
         self.current_func_id = Some(func_id);
         self.push_scope();
@@ -1195,8 +1200,10 @@ impl<'a> LoweringContext<'a> {
             self.define_var(cap.name.clone(), VarBinding::Direct(cap_vid, cap_ty));
         }
 
-        // Lower the body.
-        let body_result = self.lower_block_implicit(&lambda.body);
+        // Lower the body as a function-exit boundary so any
+        // pending defers fire before the body scope is popped (and
+        // before the lambda's `Terminator::Return`).
+        let body_result = self.lower_function_body_block(&lambda.body);
         if self.block_needs_terminator() {
             if let Some(val) = body_result {
                 // Implicit-return coercion — same contract as the
@@ -1219,10 +1226,18 @@ impl<'a> LoweringContext<'a> {
         self.pop_scope();
 
         // Restore parent function state.
+        //
+        // `pending_defers` overwrite (not append) is intentional: at
+        // this point `self.pending_defers` holds the lambda's own
+        // defers (still populated because `lower_defers_for_exit` does
+        // a take-and-restore on each emit, not a drain). Those defers
+        // were already lowered into the lambda's IR on every exit
+        // path; dropping them on assignment is correct.
         self.current_func_id = saved_func_id;
         self.current_block = saved_block;
         self.var_scopes = saved_scopes;
         self.loop_stack = saved_loops;
+        self.pending_defers = saved_defers;
 
         // Emit the closure allocation in the parent function.
         self.emit(Op::ClosureAlloc(func_id, capture_vals), result_type, span)
@@ -1346,6 +1361,13 @@ impl<'a> LoweringContext<'a> {
         });
 
         self.switch_to_block(early_return_block);
+        // `?` is a function-exit path, just like an explicit `return`:
+        // emit any pending defers (LIFO) before the terminator so a
+        // function that mixes a `defer` with a later `?` still fires
+        // its defers on the error path. Sema rejects `?` *inside* a
+        // deferred expression, so this lowering only ever runs while
+        // `pending_defers` represents the enclosing function's list.
+        self.lower_defers_for_exit();
         self.terminate(Terminator::Return(Some(operand)));
 
         // Merge: receive the unwrapped value via block parameter so that

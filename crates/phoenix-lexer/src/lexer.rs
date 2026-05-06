@@ -330,6 +330,7 @@ impl<'src> Lexer<'src> {
             "import" => TokenKind::Import,
             "public" => TokenKind::Public,
             "as" => TokenKind::As,
+            "defer" => TokenKind::Defer,
             "endpoint" => TokenKind::Endpoint,
             "body" => TokenKind::Body,
             "response" => TokenKind::Response,

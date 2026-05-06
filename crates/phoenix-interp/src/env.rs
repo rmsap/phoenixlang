@@ -53,6 +53,15 @@ impl Environment {
         self.scopes.pop();
     }
 
+    /// Number of currently-active scopes. Used by debug-only assertions
+    /// that need to verify a block's push/pop balance (e.g.
+    /// `Interpreter::with_defer_frame` snapshots this on entry to
+    /// confirm body execution leaves the env at the depth defers will
+    /// fire from).
+    pub fn scope_depth(&self) -> usize {
+        self.scopes.len()
+    }
+
     /// Defines (or redefines) a variable in the **current** (innermost) scope,
     /// wrapping the value in a fresh [`ValueCell`].
     pub fn define(&mut self, name: String, value: Value) {

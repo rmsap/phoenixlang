@@ -30,6 +30,22 @@ impl Checker {
                     self.error("`continue` outside of loop".to_string(), *span);
                 }
             }
+            // `defer expr` — the result of `expr` is always discarded;
+            // we only type-check that `expr` itself is well-formed.
+            // Free variables in `expr` are resolved lazily at function
+            // exit (not snapshotted at the defer point).
+            //
+            // The `return` / `?` rejection and the placement rule
+            // (defer must be at the function/lambda body's outermost
+            // statement level) are both enforced by
+            // [`Self::check_defer_placement`], which runs once per
+            // function/lambda body and only emits the inner
+            // `return`/`?` diagnostics for top-level defers — so a
+            // nested defer that *also* contains `return`/`?` produces
+            // a single placement error, not two.
+            Statement::Defer(d) => {
+                self.check_expr(&d.expr);
+            }
         }
     }
 

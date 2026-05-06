@@ -1,0 +1,28 @@
+// Pins lazy-capture semantics for `defer`.
+//
+// Phoenix's `defer` resolves free variables at function exit, not
+// at the defer point — assignments after the `defer` statement
+// *do* change what the deferred expression sees. This is the
+// opposite of Go (which evaluates call-expression arguments
+// eagerly at the defer point). See `docs/phases/phase-2.md`
+// decision G.
+//
+// Expected stdout:
+//   1
+//   2
+//   2
+//
+// The first line prints `x` inline at the defer point (`1`). The
+// second line prints `x` inline after the assignment (`2`). The
+// third line is the deferred `print(x)` firing at function exit:
+// under lazy-capture it observes `2`. If a regression switches to
+// eager-capture, the trailing line would be `1`, which is distinct
+// from the second `2` and disambiguates "deferred print didn't
+// run" from "deferred print captured eagerly".
+function main() {
+  let mut x: Int = 1
+  print(x)
+  defer print(x)
+  x = 2
+  print(x)
+}

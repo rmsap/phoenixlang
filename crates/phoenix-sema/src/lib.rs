@@ -21,6 +21,8 @@ mod check_types;
 pub mod checker;
 #[cfg(test)]
 mod checker_tests;
+mod defer;
+mod expr_walk;
 mod field_privacy;
 mod id_alloc;
 mod impl_classify;

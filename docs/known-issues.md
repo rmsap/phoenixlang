@@ -14,6 +14,18 @@ Process-exit cleanup is wired through `phx_gc_shutdown`, called from the generat
 
 **Why this entry is still open:** the design is expected to be valgrind-clean on the `alloc_loop.phx` fixture, but the formal valgrind gate has not yet been run in CI. Tracked as the **"No leaks under valgrind on `alloc_loop.phx` compiled binary"** checkbox in [phase-2.md §2.3 exit criteria](phases/phase-2.md#exit-criteria-for-declaring-phase-23-complete) — that document is the source of truth for the close-out condition; this entry will be removed entirely once the box is ticked.
 
+### `defer` does not fire on hardware-trap body errors in compiled binaries
+
+The AST interpreter fires defers on *any* body error (recoverable `RuntimeError`s such as divide-by-zero or list-out-of-bounds); the IR-driven backends (Cranelift, C codegen) only fire defers on recoverable function-exit paths (fall-through, explicit `return`, `?` early-return) and **not** on hardware traps such as integer division by zero — those raise SIGFPE and abort before any deferred work runs. This is a real divergence between backends.
+
+Recoverable function-exit paths match across all three backends. The behavior split is specifically: "body code raises a CPU-level trap → AST interp runs defers and propagates the error, compiled binaries abort the process before defers run."
+
+**Why this is a limitation, not an Interp bug to "fix":** matching the AST interp's behavior on the IR side would require either replacing CPU-trap arithmetic with branch-on-zero-then-runtime-call (giving up the trap-based shortcut) or installing a SIGFPE handler that walks shadow-stack frames to invoke pending defers. Both have nontrivial cost outside the recoverable-error happy path. Since `defer` is the cleanup primitive for resources (file handles, locks, sockets) introduced in Phase 4 — and resource-cleanup code typically does not need to run when the process is already crashing on a hardware trap — this divergence is acceptable for now.
+
+**Scope note:** the placement-rule restriction in sema (defer must appear at the function/lambda body's outermost statement level) means a deferred expression cannot raise a hardware trap from a position the program's control flow could not reach without one. So the only case that exercises this divergence is "body code raises a hardware trap, registered defer never runs in compiled mode". Tests covering recoverable error paths (the `defer_try.phx` fixture) match across all three backends.
+
+**Target phase:** None — no fix planned. Revisit if defers ever become load-bearing for cleanup that must run on hard panic (e.g. unwinding-style destructors).
+
 ---
 
 ## Bugs

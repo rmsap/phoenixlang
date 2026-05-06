@@ -1,0 +1,22 @@
+// Pins that `defer` inside a closure body fires when the closure
+// returns, not when the enclosing function exits. The IR side
+// saves/restores `pending_defers` around lambda lowering and the
+// AST interp pushes a fresh `defer_stack` frame in `call_closure`;
+// this fixture covers both.
+//
+// Expected stdout:
+//   before call
+//   in closure
+//   closure defer
+//   after call
+//   outer defer
+function main() {
+  defer print("outer defer")
+  let f = function() {
+    print("in closure")
+    defer print("closure defer")
+  }
+  print("before call")
+  f()
+  print("after call")
+}
