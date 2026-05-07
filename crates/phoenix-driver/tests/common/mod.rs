@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod compiled_fixtures;
+
 use phoenix_common::span::SourceId;
 use phoenix_interp::interpreter;
 use phoenix_lexer::lexer::tokenize;

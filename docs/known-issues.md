@@ -6,14 +6,6 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
-### Memory leaks (no GC yet) — largely resolved 2026-05-04 (final valgrind gate pending)
-
-A tracing mark-and-sweep GC landed in Phase 2.3. Compiled binaries now allocate via `phx_gc_alloc` (and the unchanged `phx_alloc` C-ABI symbol that wraps it), the Cranelift backend emits shadow-stack push/set/pop around every function so the GC has precise stack roots, and the heap collects on a 1-MB-since-last-collection threshold once the C `main` calls `phx_gc_enable`. Strings and all `phx_str_*` transforms are GC-managed (no more `mem::forget`).
-
-Process-exit cleanup is wired through `phx_gc_shutdown`, called from the generated C `main` after `phx_main` returns: it replaces the singleton `MarkSweepHeap` with a fresh empty one and lets the old heap's `Drop` impl deallocate every tracked header. The static `OnceLock<Mutex<MarkSweepHeap>>` itself is never freed (it's a process-lifetime singleton), but its inner state holds no live allocations after shutdown.
-
-**Why this entry is still open:** the design is expected to be valgrind-clean on the `alloc_loop.phx` fixture, but the formal valgrind gate has not yet been run in CI. Tracked as the **"No leaks under valgrind on `alloc_loop.phx` compiled binary"** checkbox in [phase-2.md §2.3 exit criteria](phases/phase-2.md#exit-criteria-for-declaring-phase-23-complete) — that document is the source of truth for the close-out condition; this entry will be removed entirely once the box is ticked.
-
 ### `defer` does not fire on hardware-trap body errors in compiled binaries
 
 The AST interpreter fires defers on *any* body error (recoverable `RuntimeError`s such as divide-by-zero or list-out-of-bounds); the IR-driven backends (Cranelift, C codegen) only fire defers on recoverable function-exit paths (fall-through, explicit `return`, `?` early-return) and **not** on hardware traps such as integer division by zero — those raise SIGFPE and abort before any deferred work runs. This is a real divergence between backends.

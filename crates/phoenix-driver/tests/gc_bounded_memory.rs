@@ -27,58 +27,12 @@
 
 #![cfg(target_os = "linux")]
 
+mod common;
+
+use common::compiled_fixtures::build_fixture;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::Command;
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn phoenix_bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_phoenix"));
-    cmd.current_dir(workspace_root());
-    cmd
-}
-
-struct TempBin(PathBuf);
-
-impl Drop for TempBin {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-fn build_fixture(fixture: &str) -> TempBin {
-    let path = format!("tests/fixtures/{fixture}");
-    let bin_name = format!(
-        "phoenix_gc_mem_{}_{}",
-        std::process::id(),
-        fixture.trim_end_matches(".phx")
-    );
-    let bin = TempBin(std::env::temp_dir().join(&bin_name));
-    let _ = std::fs::remove_file(&bin.0);
-
-    let build = phoenix_bin()
-        .args(["build", &path, "-o"])
-        .arg(&bin.0)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `phoenix build {path}`: {e}"));
-    if !build.status.success() {
-        panic!(
-            "`phoenix build {path}` exited non-zero\n  stdout: {}\n  stderr: {}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
-    }
-    bin
-}
 
 /// 64 MB virtual-address-space cap. A typical Linux x86_64 Rust
 /// binary maps roughly 30–50 MB of virtual address space at steady
@@ -128,7 +82,7 @@ fn rlimit_bytes() -> u64 {
 /// (with disambiguated failure-mode reporting), and assert stdout
 /// equals `expected_stdout` after trimming.
 fn run_under_rlimit(fixture: &str, expected_stdout: &str) {
-    let bin = build_fixture(fixture);
+    let bin = build_fixture(fixture, "phoenix_gc_mem");
     let limit_bytes = rlimit_bytes();
 
     let mut cmd = Command::new(&bin.0);
