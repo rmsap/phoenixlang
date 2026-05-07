@@ -326,32 +326,41 @@ Phase 2.3 shipped a tracing GC, an open-addressing hash table for maps, and bott
 
 ### Scope
 
+#### Phoenix-only benchmarks (the core deliverable)
+
 - **Allocation throughput bench** — new `crates/phoenix-bench/benches/allocation.rs`. `phx_gc_alloc(size, tag)` in a tight loop, varying object size (16 / 64 / 256 / 1024 bytes) and tag (`Unknown` for conservative scan vs `String` for skip-scan). Drives the heap through repeated grow→sweep cycles so the bench reflects steady-state, not first-allocation cost.
-- **GC pause distribution bench** — same file, separate function. Force `phx_gc_collect()` at controlled intervals while a known number of objects are rooted. Sample wall-clock per collection and report P50 / P95 / P99 across 1k / 10k / 100k live-object scenarios.
+- **GC pause distribution bench** — same file, separate function. Force `phx_gc_collect()` at controlled intervals while a known number of objects are rooted. Sample wall-clock per collection and report P50 / P95 / P99 / max across 1k / 10k / 100k live-object scenarios.
 - **Collections bench** — new `crates/phoenix-bench/benches/collections.rs`. `Map.get` / `Map.set` / `Map.remove` at sizes 10 / 100 / 1k / 10k (must be flat — bench confirms hash table); `List.sortBy` at sizes 100 / 1k / 10k (must grow `n log n`, not `n²` — bench confirms the merge-sort shape).
 - **End-to-end compiled-program throughput** — extend `pipeline.rs` (or add `compiled_programs.rs`) to time the *compiled binary's* runtime on the existing `medium` / `medium_large` / `large` fixtures, not just the compile pipeline. Catches cumulative regressions that span IR + runtime + codegen.
-- **GC perf follow-ups carried over from 2.3** — these land *after* the benches are in place and reading meaningfully:
-  - **Segregated free lists by size class** ([decision B](../design-decisions.md#b-heap-layout-segregated-free-lists-by-size-class-single-arena)). 2.3 ships the registry-on-global-allocator baseline; 2.7 plugs the size-class arena in behind the same `GcHeap` trait *if and only if* the allocation bench shows it would help.
-  - **Thread typed allocators through `TypeTag`.** The runtime declares `TypeTag::{List, Map, Closure, Struct, Enum, Dyn}` but the only allocators that pass a non-`Unknown` tag today are the string allocators (`TypeTag::String`). Migrating `phx_list_alloc`, `phx_map_alloc`, the closure-env allocator, and struct/enum allocators to thread their concrete tag through means the GC can swap in trace tables (subordinate decision C) instead of conservatively scanning every payload. See the TODO in `crates/phoenix-runtime/src/gc/mod.rs` on `TypeTag` for the migration path. Conservative scan keeps it correct in the meantime; pause-distribution numbers are the gate for whether this lands.
 
-### Design decisions to lock in this phase
+#### Cross-language comparison (Phoenix vs Go) — informational only
 
-These pin the bench harness's contract before benches start producing numbers other code might rely on. Each must land before 2.7 wraps; tracked in [design-decisions.md](../design-decisions.md). The proposed positions are starting points — settle each one explicitly before it ships.
+One comparator (Go 1.22+); paired Phoenix and Go programs in `bench-corpus/<workload>/{phoenix,go}/`; off-CI runner; results published to `docs/perf/phoenix-vs-go.md`. Refresh cadence: per-phase close (2.7, 2.4, 2.5 each refresh once). **Not a regression gate** — Phoenix-vs-Phoenix numbers stay the gating signal. Cross-language numbers are positioning awareness — they tell us where the absolute-perf gap is, not whether a PR should land.
 
-- **Baseline storage strategy.** Three options, each with real tradeoffs:
-  - *Manual snapshot in `docs/perf-baselines/phase-2.3.md`* — committed numbers; drifts unless someone re-runs and re-commits; phase-2.md already references this path.
-  - *Criterion `--save-baseline` / `--baseline`* — files in `target/criterion/`; works but stores numbers per-CI-host so cross-host comparison is meaningless without normalization.
-  - *External service ([bencher.dev](https://bencher.dev) or similar)* — durable, comparable, requires account + CI integration.
+- **Workloads:**
+  - `sort_ints` — sort 100k random integers via `List.sortBy` (Phoenix) / `slices.Sort` (Go)
+  - `hash_map_churn` — 100k inserts followed by 100k lookups, half hits / half misses
+  - `alloc_walk_struct` — allocate 1M small structs, walk them once, drop. Exercises the GC, not just the allocator
+  - `fib_recursive` — `fib(35)` recursive (no allocation; pure dispatch + arithmetic — isolates inlining / call overhead)
+- **Not benchmarked yet** (out of Phoenix's current capability): HTTP servers, JSON parse/serialize, concurrent workloads. These are Phoenix's actual differentiators per the web-framework pitch — but we can't compare them until Phase 4 stdlib lands. The comparison page must document this gap so a reader doesn't conclude "Phoenix is just slower than Go" from compute-only workloads.
+- **Why Go specifically.** Closest comparison Phoenix has: GC'd, compiled, statically typed, web-server-friendly. JVM has 25+ years of GC tuning ahead of us; .NET is comparable but less commonly the comp Phoenix users would be coming from; Rust has no GC; TypeScript/Node has a totally different perf model. One comparison that's most predictive of "would a user choose Phoenix over X" — adding more multiplies workload-authoring effort for diminishing positioning value. Decision E (below) explicitly forecloses adding a second language.
 
-  Proposed: manual snapshot for the first cut so numbers are visible in the repo and PR diffs catch obvious regressions; revisit if drift becomes a real problem. Decision must explicitly name the snapshot file, the format (criterion's text dump? CSV? markdown table?), and the refresh cadence.
-- **CI gating policy.** Whether benches run in CI, and if so, whether regressions block merges:
-  - *Informational only* — devs read the trend; no merge gating. Lowest CI cost (~0 if not run on PR), zero flake risk, but regressions can land unnoticed for weeks.
-  - *Post-merge on `main`* — runs after merge; alerts but doesn't block. Middle ground.
-  - *Per-PR gating with N% slack* — fails CI if the new number is >N% slower than baseline. Catches regressions immediately but flakes when the runner has noisy neighbors.
+#### GC perf follow-ups carried over from 2.3 (conditional)
 
-  Proposed: post-merge on `main`. Calibration risk for per-PR gating is too high before we know how stable the numbers are; informational-only is too easy to ignore.
-- **Calibration and runner constraints.** Pause-time numbers are sensitive to glibc allocator behavior, NUMA, kernel page-fault costs. Decide upfront: pinned CPU, isolated runner, minimum-N-run aggregate, criterion sample-size override? Document the chosen recipe so a future "the numbers got worse" investigation can rule out runner drift.
-- **What aggregate to publish.** P50 / P95 / P99 / max for pause times; mean / median / stddev for throughput. Pick once and stick — switching aggregates mid-phase makes historical comparisons useless.
+These land *if and only if* the benches above show they would help. If the numbers say no, the decision flips to "intentionally not pursued" with cited bench output.
+
+- **Segregated free lists by size class** ([decision B in the GC subordinate decisions](../design-decisions.md#b-heap-layout-segregated-free-lists-by-size-class-single-arena)). 2.3 ships the registry-on-global-allocator baseline; 2.7 plugs the size-class arena in behind the same `GcHeap` trait *if and only if* the allocation bench shows it would help.
+- **Thread typed allocators through `TypeTag`.** The runtime declares `TypeTag::{List, Map, Closure, Struct, Enum, Dyn}` but the only allocators that pass a non-`Unknown` tag today are the string allocators (`TypeTag::String`). Migrating `phx_list_alloc`, `phx_map_alloc`, the closure-env allocator, and struct/enum allocators to thread their concrete tag through means the GC can swap in trace tables (GC subordinate decision C) instead of conservatively scanning every payload. See the TODO in `crates/phoenix-runtime/src/gc/mod.rs` on `TypeTag` for the migration path. Conservative scan keeps it correct in the meantime; pause-distribution numbers are the gate for whether this lands.
+
+### Design decisions locked in this phase
+
+These pin the bench harness's contract before benches start producing numbers other code might rely on. Full rationale and rejected alternatives live in [design-decisions.md](../design-decisions.md#phase-27-benchmarking); the bullets below are the locked positions.
+
+- **[A. Baseline storage strategy: manual snapshot in `docs/perf-baselines/`](../design-decisions.md#a-baseline-storage-strategy-manual-snapshot-in-docsperf-baselines)** — per-bench markdown table (`bench / parameters / mean / median / stddev / sample-size`), refreshed at phase close. Source files reference the baseline path so a maintainer who cuts a regression knows where to look. Rejected criterion's `--save-baseline` (per-CI-host so cross-host comparison is meaningless) and external services like bencher.dev (third-party dependency on accounts and out-of-repo state). **Decided 2026-05-04**.
+- **[B. CI gating policy: post-merge on `main`, alerts but doesn't block](../design-decisions.md#b-ci-gating-policy-post-merge-on-main)** — per-PR gating with N% slack flakes too easily before we know how stable the numbers are; informational-only is too easy to ignore. Implementation: GitHub Actions workflow on `push: main` that runs `cargo bench`, parses criterion output, compares to the committed baseline, and opens an issue if any number regresses by more than 20%. **Decided 2026-05-04**.
+- **[C. Calibration and runner constraints](../design-decisions.md#c-calibration-and-runner-constraints)** — pinned CPU governor (`performance`) when the runner permits; minimum 5-run aggregate per bench; criterion default sample size unless variance is unworkable; runner spec documented in the baseline file's header so readers can flag environmental drift; single-threaded runs only in 2.7 (multi-thread comes with Phase 4.3). **Decided 2026-05-04**.
+- **[D. Aggregate choice](../design-decisions.md#d-aggregate-choice)** — throughput benchmarks: mean / median / stddev (criterion's defaults). Pause-time benchmarks: P50 / P95 / P99 / max (need the tail to catch worst-case GC stalls). Pick once and stick. **Decided 2026-05-04**.
+- **[E. Cross-language comparison scope: Go 1.22+ only, informational, off-CI](../design-decisions.md#e-cross-language-comparison-scope-go-122-only)** — locked at one comparator, the four workloads listed above, off-CI runner, results published to `docs/perf/phoenix-vs-go.md`. Refresh cadence: per-phase-close. Explicitly forecloses adding a second comparator (Java / .NET / TypeScript / Rust were considered and declined) so a future contributor doesn't quietly add another language. **Decided 2026-05-04**.
 
 ### Exit criteria for declaring Phase 2.7 complete
 
@@ -361,7 +370,9 @@ Mirror of [§2.2's exit criteria](#exit-criteria-for-declaring-phase-22-complete
 - [ ] **GC pause distribution bench landed.** Same file or sibling; produces P50 / P95 / P99 for 1k / 10k / 100k live-object scenarios. First-run numbers committed.
 - [ ] **Collections bench landed.** `crates/phoenix-bench/benches/collections.rs` exists. Map operations show flat-time curves across the size buckets (within 2× across 10 → 10k); sortBy shows `n log n` shape (10× → 100× input grows runtime ~30×, not ~100×). First-run numbers committed.
 - [ ] **End-to-end compiled-binary timing.** The `medium` / `medium_large` / `large` fixtures have a "compile + execute" timing variant alongside the existing "compile only" variant. First-run numbers committed.
-- [ ] **Baseline storage decision documented and applied.** A `docs/perf-baselines/` (or chosen alternative) file exists, formatted per the decision, populated with the first-run numbers, and referenced from the bench source files so a maintainer who cuts a regression knows where to look.
+- [ ] **Cross-language comparison published.** `bench-corpus/` exists with paired Phoenix and Go programs for the four workloads (`sort_ints`, `hash_map_churn`, `alloc_walk_struct`, `fib_recursive`); a runner produces `docs/perf/phoenix-vs-go.md` with the absolute numbers and ratio per workload. The page documents the "what's not benchmarked yet (HTTP / JSON / concurrency)" gap so readers don't over-extrapolate. Per [decision E](#design-decisions-locked-in-this-phase): off-CI, informational, not a regression gate.
+- [ ] **All five subordinate decisions (A–E) implemented.** Each carries an `✅ Implemented YYYY-MM-DD` marker in its `docs/design-decisions.md` entry once the corresponding harness piece lands.
+- [ ] **Baseline storage decision documented and applied.** A `docs/perf-baselines/` (or chosen alternative) file exists, formatted per [decision A](#design-decisions-locked-in-this-phase), populated with the first-run numbers, and referenced from the bench source files so a maintainer who cuts a regression knows where to look.
 - [ ] **CI integration matches the gating decision.** If the decision is post-merge-on-`main`, the workflow runs the benches there; if informational-only, the absence is documented. Either way, a reader can answer "do these benches run automatically?" by reading one place.
 - [ ] **Workspace test/clippy/fmt clean.** `cargo test --workspace` green; `cargo clippy --workspace --tests` zero warnings; `cargo fmt --all -- --check` clean. (Bench code is `dev-dependencies` — clippy still applies.)
 - [ ] **Each Phase-2.3 perf follow-up resolved one way or the other.** For both *segregated free lists* and *typed-allocator threading via `TypeTag`*: either the rewrite landed (with before/after numbers from the bench) or the decision is explicitly flipped to "not pursued; baseline numbers showed the rewrite would not have helped" with the relevant bench output cited. No unresolved "queued behind benches" items survive 2.7's close.

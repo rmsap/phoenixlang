@@ -602,3 +602,71 @@ Default visibility for methods is private, matching every other declaration form
 
 **Follow-ups (not in scope here):**
 - Revisit the deferred *"explicit `public`/private on `impl` blocks"* decision in light of this rule. The natural extension — *"an inherent `impl` block has no visibility of its own; each method's visibility stands alone"* — looks correct, but the decision lives in its own entry once 2.6's surface settles.
+
+### Phase 2.7 benchmarking
+
+Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract that bench output (and any decision driven off that output) depends on; settling them before any bench code lands keeps the harness's assumptions reviewable and prevents the first numbers from shipping with implicit policy choices baked in. Decisions confirmed with the user 2026-05-04 during plan mode; phase-level scope and exit criteria live in [phase-2.md §2.7](phases/phase-2.md#27-benchmark-suite).
+
+#### A. Baseline storage strategy: manual snapshot in `docs/perf-baselines/`
+
+**Decided:** 2026-05-04
+**Rationale:** committed numbers are visible in the repo and PR diffs catch obvious regressions. Cost is low (markdown table per phase) and the format stays human-readable.
+
+**Format:** per-bench markdown table with columns `bench / parameters / mean / median / stddev / sample-size`. Refreshed at phase close and on intentional perf-affecting changes. Source files reference the baseline path so a maintainer who cuts a regression knows where to look.
+
+**Alternatives considered:**
+- *Criterion `--save-baseline` / `--baseline`* — files in `target/criterion/`, never committed; per-CI-host so cross-host comparison is meaningless without normalization. Useful for local before/after on a single machine but not for the cross-PR detection problem we have.
+- *External service (bencher.dev or similar)* — durable and comparable but adds a third-party dependency on accounts, API tokens, and out-of-repo state. Revisit if the manual snapshot becomes a maintenance pain.
+
+#### B. CI gating policy: post-merge on `main`
+
+**Decided:** 2026-05-04
+**Rationale:** middle ground between the two extremes. Per-PR gating with N% slack flakes too easily before we know how stable the numbers are. Informational-only is too easy to ignore — regressions can land unnoticed for weeks.
+
+**Implementation:** GitHub Actions workflow on `push: main` that runs `cargo bench`, parses criterion output, compares to the committed baseline, and opens an issue if any number regresses by more than 20%. Cross-language Go comparisons (decision E) are explicitly excluded from this CI loop — they run off-CI per phase-close.
+
+**Alternatives considered:**
+- *Informational only* — devs read the trend; no automated alerting. Lowest CI cost (~0 if not run on PR), zero flake risk, but regressions survive too long unnoticed.
+- *Per-PR gating with N% slack* — fails CI if the new number is >N% slower than baseline. Catches regressions immediately but flakes when the runner has noisy neighbors. Reopen if post-merge gating ends up being too late.
+
+#### C. Calibration and runner constraints
+
+**Decided:** 2026-05-04
+**Rationale:** pause-time numbers in particular are sensitive to glibc allocator behavior, NUMA, kernel page-fault costs. Without controls the numbers flake; documenting the recipe means a future "the numbers got worse" investigation can rule out runner drift before chasing a real regression.
+
+**Recipe:**
+- Pinned CPU governor (`performance`) when the runner permits.
+- Minimum 5-run aggregate per bench, criterion default sample size unless variance is unworkable.
+- Document the runner spec (CPU model, kernel version, glibc version, criterion version) in the baseline file's header.
+- Single-threaded runs only in 2.7. Multi-threaded benches arrive with Phase 4.3 (async runtime) and need separate calibration.
+
+**Fallback if the recipe still flakes in practice:** drop CI gating to informational-only (decision B) until the runner is fixed, rather than tolerate noisy alerts.
+
+#### D. Aggregate choice
+
+**Decided:** 2026-05-04
+**Rationale:** different bench shapes need different summary stats. Switching aggregates mid-phase makes historical comparisons useless, so pick once and stick.
+
+- **Throughput benchmarks** (allocation, collections, end-to-end compiled binary): mean / median / stddev — criterion's defaults; well-understood and adequate for steady-state work.
+- **Pause-time benchmarks** (GC collection latency): P50 / P95 / P99 / max — need the tail to catch worst-case stalls; mean alone hides them.
+
+#### E. Cross-language comparison scope: Go 1.22+ only
+
+**Decided:** 2026-05-04
+**Rationale:** Go is the closest comparison Phoenix has — GC'd, compiled, statically typed, web-server-friendly. Adding a second comparator multiplies workload-authoring effort for diminishing positioning value. Pick the one comparison that's most predictive of "would a user choose Phoenix over X" and stop there.
+
+**Locked scope:**
+- One comparator: Go 1.22+.
+- Four workloads, each with paired Phoenix and Go implementations in `bench-corpus/<name>/{phoenix,go}/`: `sort_ints`, `hash_map_churn`, `alloc_walk_struct`, `fib_recursive`.
+- Off-CI runner. Results published to `docs/perf/phoenix-vs-go.md`.
+- **Informational only — not a regression gate.** Phoenix-vs-Phoenix numbers (decision B) stay the gating signal. Cross-language numbers are positioning awareness.
+- Refresh cadence: per-phase close (2.7, 2.4, 2.5 each refresh once).
+- The comparison page must document the "not benchmarked yet" gap (HTTP / JSON / concurrency — Phoenix's actual differentiators per the web-framework pitch — can't be compared until Phase 4 stdlib lands) so readers don't over-extrapolate from compute-only workloads.
+
+**Alternatives considered (and explicitly rejected, so a future contributor doesn't quietly add another):**
+- *JVM (Java / Kotlin)* — 25+ years of GC tuning ahead of us. Comparison would be more punishing than informative at this stage; revisit when Phoenix's GC has had real tuning passes.
+- *.NET (C#)* — comparable in maturity to Go but less commonly the comp Phoenix users would be coming from. Dropped on positioning grounds, not technical.
+- *Rust* — has no GC; the comparison would isolate to compute kernels and miss everything Phoenix's runtime does. Wrong axis for what we want to measure.
+- *TypeScript / Node* — closer to Phoenix's UX pitch, but a totally different perf model (JIT) and different problem domain (browser-leaning). Different question, different bench.
+
+**Why this entry is in design-decisions.md and not just phase-2.md.** A future contributor skimming the bench code and adding a Java workload "to be thorough" would trip the foreclosure here. The decision is durable across phases, not just a 2.7 implementation choice.
