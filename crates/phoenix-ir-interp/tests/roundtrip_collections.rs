@@ -113,6 +113,34 @@ function main() {
     );
 }
 
+#[test]
+fn list_sort_by_comparator_error_propagates() {
+    // Comparator does an out-of-bounds list access on its first call,
+    // raising a runtime error inside the merge body. The Phase 2.2
+    // insertion sort propagated comparator errors via a manual
+    // `sort_err: Option<_>` bag; the new code delegates to
+    // `phoenix_common::algorithms::merge_sort_by`, which
+    // `?`-propagates instead. This test pins that both paths surface
+    // the same error to the caller.
+    let src = r#"
+function main() {
+    let oob: List<Int> = []
+    let xs: List<Int> = [3, 1, 4, 1, 5]
+    let sorted: List<Int> = xs.sortBy(function(a: Int, b: Int) -> Int {
+        let _ = oob.get(0)
+        return a - b
+    })
+    print(sorted)
+}
+"#;
+    let ir_err = common::ir_run_result(src).unwrap_err();
+    assert!(
+        ir_err.message.contains("out of bounds"),
+        "expected IR runtime error to mention 'out of bounds', got: {}",
+        ir_err.message
+    );
+}
+
 // ── Map operations ──────────────────────────────────────────────────
 
 #[test]

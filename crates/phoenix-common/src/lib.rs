@@ -5,6 +5,10 @@
 //! source files.
 #![warn(missing_docs)]
 
+/// Generic algorithm helpers shared across the AST and IR
+/// interpreters (currently `merge_sort_by`, used by `List.sortBy` in
+/// both interpreters).
+pub mod algorithms;
 /// Error and warning diagnostics produced by the compiler pipeline.
 pub mod diagnostics;
 /// Stable post-sema identifiers (`FuncId`, `StructId`, `EnumId`,

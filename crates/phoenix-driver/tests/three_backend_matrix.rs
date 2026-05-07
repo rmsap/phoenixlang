@@ -169,6 +169,17 @@ backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
 backend_matrix_test!(matrix_defer_basic, "defer_basic.phx");
 backend_matrix_test!(matrix_defer_explicit_return, "defer_explicit_return.phx");
 backend_matrix_test!(matrix_map_hash_many_keys, "map_hash_many_keys.phx");
+backend_matrix_test!(matrix_list_sortby_merge, "list_sortby_merge.phx");
+backend_matrix_test!(
+    matrix_list_sortby_alloc_comparator,
+    "list_sortby_alloc_comparator.phx"
+);
+backend_matrix_test!(
+    matrix_list_sortby_edge_lengths,
+    "list_sortby_edge_lengths.phx"
+);
+backend_matrix_test!(matrix_list_sortby_strings, "list_sortby_strings.phx");
+backend_matrix_test!(matrix_list_sortby_stable, "list_sortby_stable.phx");
 backend_matrix_test!(matrix_defer_lazy_capture, "defer_lazy_capture.phx");
 backend_matrix_test!(matrix_defer_method, "defer_method.phx");
 backend_matrix_test!(matrix_defer_heap, "defer_heap.phx");

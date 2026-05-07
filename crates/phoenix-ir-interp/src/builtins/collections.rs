@@ -294,47 +294,23 @@ pub(super) fn builtin_map(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
     }
 }
 
-/// Sort using insertion sort (same approach as AST interpreter) since the
-/// comparator calls a closure which requires `&mut self`.
+/// Sort via bottom-up iterative merge sort using a closure comparator.
+/// The algorithm itself lives in
+/// [`phoenix_common::algorithms::merge_sort_by`]; this function
+/// supplies the comparator that calls back into the IR interpreter's
+/// closure dispatch. Stable. **O(n log n)** worst case.
 fn sort_by_closure(
     interp: &mut IrInterpreter<'_>,
-    mut items: Vec<IrValue>,
+    items: Vec<IrValue>,
     closure: IrValue,
 ) -> Result<IrValue> {
-    let mut sort_err: Option<crate::error::IrRuntimeError> = None;
-    let len = items.len();
-    for i in 1..len {
-        let mut j = i;
-        while j > 0 {
-            let cmp_val =
-                interp.call_closure(&closure, vec![items[j - 1].clone(), items[j].clone()]);
-            match cmp_val {
-                Ok(IrValue::Int(c)) => {
-                    if c > 0 {
-                        items.swap(j - 1, j);
-                        j -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                Ok(_) => {
-                    sort_err = Some(crate::error::IrRuntimeError {
-                        message: "sortBy callback must return Int".to_string(),
-                    });
-                    break;
-                }
-                Err(e) => {
-                    sort_err = Some(e);
-                    break;
-                }
-            }
+    let sorted = phoenix_common::algorithms::merge_sort_by(items, |a, b| {
+        match interp.call_closure(&closure, vec![a.clone(), b.clone()])? {
+            IrValue::Int(c) => Ok(c),
+            _ => Err(crate::error::IrRuntimeError {
+                message: "sortBy callback must return Int".to_string(),
+            }),
         }
-        if sort_err.is_some() {
-            break;
-        }
-    }
-    if let Some(e) = sort_err {
-        return Err(e);
-    }
-    Ok(IrValue::new_list(items))
+    })?;
+    Ok(IrValue::new_list(sorted))
 }

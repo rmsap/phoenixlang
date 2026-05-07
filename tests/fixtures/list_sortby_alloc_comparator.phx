@@ -1,0 +1,50 @@
+// Regression for the GC-rooting contract on `List.sortBy`'s
+// intermediate buffers. The merge sort allocates two GC-managed lists
+// internally (`copy` and `aux` in
+// `phoenix-cranelift/src/translate/list_methods_complex.rs`) — neither
+// is bound to an IR `ValueId`, so the function-level shadow-stack
+// frame in `gc_roots.rs` doesn't root them. `translate_list_sortby`
+// must push its own 2-slot shadow-stack frame and call
+// `phx_gc_set_root` on both buffers, otherwise the next allocation
+// triggered by the comparator will sweep them mid-sort.
+//
+// This fixture forces that path: the comparator allocates a small
+// list per call, and the input is sized so that cumulative comparator
+// allocations during the sort comfortably cross the 1 MB
+// auto-collect threshold (`DEFAULT_COLLECTION_THRESHOLD` in
+// `phoenix-runtime/src/gc/mod.rs`). With the fix in place all three
+// backends print the same sorted-prefix fingerprint; without it, the
+// compiled binary would either crash or print garbage values once
+// `copy` / `aux` got reclaimed.
+//
+// The AST and IR interpreters don't run the GC, so they pass
+// trivially — the matrix-divergence signal here is the compiled
+// binary regressing.
+function main() {
+  // Build a 2000-element reverse-sorted list.  log2(2000) ≈ 11, so
+  // bottom-up merge sort runs ~22000 comparator calls.  Each call
+  // allocates a 5-element list (~24-byte header + 5*8-byte payload
+  // ≈ 64 bytes total per call), giving roughly 1.4 MB of unrooted
+  // allocation across the sort — past threshold by a comfortable
+  // margin.
+  let mut xs: List<Int> = []
+  let mut i: Int = 2000
+  while i > 0 {
+    xs = xs.push(i)
+    i = i - 1
+  }
+  let sorted: List<Int> = xs.sortBy(function(a: Int, b: Int) -> Int {
+    // Per-call allocation.  Reading the length feeds it back into the
+    // expression so the optimizer can't elide it; the `+ length() - 5`
+    // trick is a no-op for sort order but forces the allocation to
+    // be observed.
+    let trash: List<Int> = [a, b, a + b, a - b, a * b]
+    a - b + (trash.length() - 5)
+  })
+  // Fingerprint: first / middle / last + length.  The expected sorted
+  // output is [1, 2, ..., 2000].
+  print(sorted.get(0))
+  print(sorted.get(1000))
+  print(sorted.get(1999))
+  print(sorted.length())
+}

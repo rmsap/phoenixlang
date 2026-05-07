@@ -62,19 +62,6 @@ When a generic function `f<T>(...)` defines a closure whose body or captures ref
 
 **Target phase:** Phase 3. The Phase 2.6 module-system fixture set landed without tripping this gap.
 
-### O(n²) `List.sortBy` insertion sort
-
-`List.sortBy` uses O(n²) insertion sort in both backends.  In the interpreter,
-the comparator closure requires `&mut self` on the interpreter, preventing use
-of `slice::sort_by`.  In the Cranelift compiler, the comparator closure must be
-called through block-based control flow, and inline insertion sort maps
-naturally to nested loops.  Both backends use the same algorithm for
-consistency.  Acceptable for small lists but a performance hazard for large ones.
-
-**Planned fix:** Merge sort implementation.
-**Tracked in:** `list_methods_complex.rs` `translate_list_sortby` doc comment.
-**Target phase:** Phase 2.3 (Runtime and Memory Management).
-
 ---
 
 ## Code Quality

@@ -558,50 +558,22 @@ impl Interpreter {
         }
     }
 
-    /// Sorts a list using a closure-based comparator via insertion sort.
-    ///
-    /// Insertion sort is used instead of `slice::sort_by` because the
-    /// comparator calls a Phoenix closure, which requires `&mut self`.
-    fn sort_by_closure(&mut self, mut items: Vec<Value>, closure: Value) -> Result<Value> {
-        let mut sort_err: Option<RuntimeError> = None;
-        let len = items.len();
-        for i in 1..len {
-            let mut j = i;
-            while j > 0 {
-                let cmp_val = self.call_closure(
-                    closure.clone(),
-                    vec![items[j - 1].clone(), items[j].clone()],
-                );
-                match cmp_val {
-                    Ok(Value::Int(c)) => {
-                        if c > 0 {
-                            items.swap(j - 1, j);
-                            j -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Ok(_) => {
-                        sort_err = Some(RuntimeError {
-                            message: "sortBy callback must return Int".to_string(),
-                            try_return_value: None,
-                        });
-                        break;
-                    }
-                    Err(e) => {
-                        sort_err = Some(e);
-                        break;
-                    }
-                }
+    /// Sorts a list using a closure-based comparator via bottom-up
+    /// iterative merge sort. The algorithm itself lives in
+    /// [`phoenix_common::algorithms::merge_sort_by`]; this method
+    /// supplies the comparator that calls back into the closure
+    /// dispatch path. Stable. **O(n log n)** worst case.
+    fn sort_by_closure(&mut self, items: Vec<Value>, closure: Value) -> Result<Value> {
+        let sorted = phoenix_common::algorithms::merge_sort_by(items, |a, b| {
+            match self.call_closure(closure.clone(), vec![a.clone(), b.clone()])? {
+                Value::Int(c) => Ok(c),
+                _ => Err(RuntimeError {
+                    message: "sortBy callback must return Int".to_string(),
+                    try_return_value: None,
+                }),
             }
-            if sort_err.is_some() {
-                break;
-            }
-        }
-        if let Some(e) = sort_err {
-            return Err(e);
-        }
-        Ok(Value::List(items))
+        })?;
+        Ok(Value::List(sorted))
     }
 }
 
@@ -1476,6 +1448,31 @@ function main() {
 "#,
         );
         assert_eq!(out, vec!["[42]"]);
+    }
+
+    #[test]
+    fn list_sort_by_comparator_error_propagates() {
+        // Comparator does an out-of-bounds list access on its first
+        // call, which raises a runtime error. The Phase 2.2 insertion
+        // sort propagated the error via a manual `sort_err: Option<_>`
+        // bag; the new merge sort delegates to `merge_sort_by`, which
+        // `?`-propagates instead. This test pins that the two paths
+        // are equivalent — the error still reaches the caller, just
+        // via the shared helper now.
+        run_program_expect_error(
+            r#"
+function main() {
+    let oob: List<Int> = []
+    let xs: List<Int> = [3, 1, 4, 1, 5]
+    let sorted: List<Int> = xs.sortBy(function(a: Int, b: Int) -> Int {
+        let _ = oob.get(0)
+        a - b
+    })
+    print(sorted)
+}
+"#,
+            "out of bounds",
+        );
     }
 
     // ════════════════════════════════════════════════════════════════════

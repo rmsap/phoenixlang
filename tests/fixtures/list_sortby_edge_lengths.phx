@@ -1,0 +1,37 @@
+// Edge cases for `List.sortBy`: lengths 0, 1, 2, and 3.  Each is a
+// distinct path through the Cranelift CFG in
+// `translate_list_sortby`:
+//
+//   • `len = 0` and `len = 1` take the trivial-length fast path
+//     (`needs_sort = len > 1` is false), skipping aux allocation.
+//   • `len = 2` is the smallest input that enters the merge loop;
+//     it exercises the `take_b` → `drain_i` flow when the pair is
+//     out of order.
+//   • `len = 3` has a tail run of length 1 in the first width pass,
+//     so one of the inner iterations sees a single-run tail with no
+//     pair to merge — drain_i copies it verbatim into aux.
+function main() {
+  // Length 0.
+  let empty: List<Int> = []
+  let e_sorted: List<Int> = empty.sortBy(function(a: Int, b: Int) -> Int { a - b })
+  print(e_sorted.length())
+
+  // Length 1.
+  let single: List<Int> = [42]
+  let s_sorted: List<Int> = single.sortBy(function(a: Int, b: Int) -> Int { a - b })
+  print(s_sorted.length())
+  print(s_sorted.get(0))
+
+  // Length 2 — out-of-order pair.
+  let pair: List<Int> = [7, 3]
+  let p_sorted: List<Int> = pair.sortBy(function(a: Int, b: Int) -> Int { a - b })
+  print(p_sorted.get(0))
+  print(p_sorted.get(1))
+
+  // Length 3 — tail run of length 1.
+  let triple: List<Int> = [3, 1, 2]
+  let t_sorted: List<Int> = triple.sortBy(function(a: Int, b: Int) -> Int { a - b })
+  print(t_sorted.get(0))
+  print(t_sorted.get(1))
+  print(t_sorted.get(2))
+}

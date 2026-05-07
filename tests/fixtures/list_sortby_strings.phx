@@ -1,0 +1,25 @@
+// `List.sortBy` over ref-typed elements.  Strings are fat pointers
+// (a 2-slot Cranelift representation), so every element load/store
+// inside the merge body must move both slots — a slot-count
+// regression in `load_list_element` / `store_list_element` would
+// crash or print garbage even though the Int fixture stays green.
+//
+// Sort by string length so we don't depend on whether `String`
+// supports `<` / `>` operators.  Stability matters: equal-length
+// strings must keep their input order.
+function main() {
+  // Lengths: banana=6, fig=3, apple=5, kiwi=4, elderberry=10, grape=5.
+  // Sort by length: fig(3), kiwi(4), apple(5), grape(5), banana(6),
+  // elderberry(10).  Stability keeps `apple` before `grape` because
+  // they have equal length and `apple` came first in the input.
+  let words: List<String> = ["banana", "fig", "apple", "kiwi", "elderberry", "grape"]
+  let sorted: List<String> = words.sortBy(function(a: String, b: String) -> Int {
+    a.length() - b.length()
+  })
+  print(sorted.get(0))
+  print(sorted.get(1))
+  print(sorted.get(2))
+  print(sorted.get(3))
+  print(sorted.get(4))
+  print(sorted.get(5))
+}

@@ -1,0 +1,19 @@
+// Exercises List.sortBy on a 50-element reverse-sorted input.
+// Insertion sort would do ~1250 comparisons (O(n²)); merge sort does
+// ~280 (n log n). Functional check: the result must be sorted ascending.
+function main() {
+  let mut xs: List<Int> = []
+  let mut i: Int = 50
+  while (i > 0) {
+    xs = xs.push(i)
+    i = i - 1
+  }
+  // xs is now [50, 49, ..., 1]
+  let sorted: List<Int> = xs.sortBy(function(a: Int, b: Int) -> Int { a - b })
+  // Print first, middle, last to fingerprint the result without
+  // dumping all 50 numbers.
+  print(sorted.get(0))
+  print(sorted.get(25))
+  print(sorted.get(49))
+  print(sorted.length())
+}
