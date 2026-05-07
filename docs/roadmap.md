@@ -2,7 +2,7 @@
 
 This document outlines the path from the current implementation to a production-ready full-stack web language.
 
-**Current state (updated 2026-04-15):** 2,000+ tests across 61,000+ LOC (12 crates). Phoenix Gen Phases 1–3 and 5 fully complete with TypeScript, Python, Go, and OpenAPI code generation, VS Code extension with full LSP (hover, autocomplete, go-to-definition, find-references, rename), watch mode, and `where` constraint validation. Phase 1 is fully complete. Phase 2.1 (IR) is complete — the `phoenix-ir` crate implements SSA-style IR lowering and `phoenix-ir-interp` provides a round-trip verification interpreter. Phase 2.2 (Cranelift native compilation) covers value types, strings, structs, enums, pattern matching, closures, all string methods, `List<T>` with all functional methods, `Map<K, V>` with all methods, and `Option<T>`/`Result<T, E>` with all combinators. `#![warn(missing_docs)]` enforced on all crates. All tests pass, clippy is clean, formatting is clean, CI is green. **Next up: garbage collection, then WebAssembly target.**
+**Current state (updated 2026-05-07):** 2,900+ tests across 14 crates. Phoenix Gen Phases 1–3 and 5 fully complete with TypeScript, Python, Go, and OpenAPI code generation, VS Code extension with full LSP (hover, autocomplete, go-to-definition, find-references, rename), watch mode, and `where` constraint validation. Phase 1 is fully complete. Phase 2.1 (IR) is complete — the `phoenix-ir` crate implements SSA-style IR lowering and `phoenix-ir-interp` provides a round-trip verification interpreter. Phase 2.2 (Cranelift native compilation) covers value types, strings, structs, enums, pattern matching, closures, all string methods, `List<T>` with all functional methods, `Map<K, V>` with all methods, and `Option<T>`/`Result<T, E>` with all combinators. Phase 2.6 (modules and visibility) is complete — multi-file projects with `import`, `public`/private, and lazy import-driven discovery. Phase 2.3 (runtime and memory management) is complete — tracing mark-and-sweep GC with precise stack roots, GC-managed strings, valgrind-verified leak-clean compiled binaries, `defer` syntax across all three backends, open-addressing hash maps, and bottom-up merge sort for `List.sortBy`. `#![warn(missing_docs)]` enforced on all crates. All tests pass, clippy is clean, formatting is clean, CI is green. **Active phase: 2.7 (benchmark suite) — measured GC and codegen baseline before the WebAssembly target lands a second `GcHeap` impl behind the same trait.**
 
 ---
 
@@ -11,7 +11,7 @@ This document outlines the path from the current implementation to a production-
 | Phase | Name | Status | Description |
 |-------|------|--------|-------------|
 | [1](phases/phase-1.md) | Core Language | ✅ Complete | Variables, functions, control flow, structs, enums, generics, traits, closures, collections, error handling, and all ergonomic features |
-| [2](phases/phase-2.md) | Compilation | In Progress | IR (complete), Cranelift native compilation (in progress), runtime library (GC), WebAssembly target, JS interop, module system and visibility |
+| [2](phases/phase-2.md) | Compilation | In Progress | IR (complete), Cranelift native compilation (complete), modules and visibility (complete), runtime + GC + `defer` (complete), benchmark suite (active), WebAssembly target, JS interop |
 | [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, error message quality |
 | [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access, logging, test framework |
 | [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability, frontend framework |
@@ -65,9 +65,11 @@ CI pipeline, type registries exposed, and expression types annotated.
 | # | Feature | Depends On | Effort | Status |
 |---|---------|-----------|--------|--------|
 | 1–29 | Phase 1 (all items) | — | — | ✅ Done |
-| 30 | IR + Cranelift compilation | — | High | 🔧 In Progress |
-| 31 | WebAssembly target | Cranelift | Medium | |
-| 32 | Module system and visibility (`public`/private) | Semantic analysis | High | |
+| 30 | IR + Cranelift compilation | — | High | ✅ Done |
+| 30a | Tracing GC + `defer` + runtime | Cranelift | High | ✅ Done |
+| 30b | Benchmark suite (GC + codegen baseline) | GC, Cranelift | Medium | 🔧 In Progress |
+| 31 | WebAssembly target | Cranelift, GC, Bench | Medium | |
+| 32 | Module system and visibility (`public`/private) | Semantic analysis | High | ✅ Done |
 | 33 | JavaScript interop | WASM, Package manager | High | |
 | 34 | Package manager | Compilation, modules | Medium | |
 | 35 | LSP + VS Code extension | Modules | High | |

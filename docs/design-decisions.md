@@ -48,11 +48,9 @@ Currently `else if` is parsed as `else { if ... }` (nested). This works but comp
 
 ### `defer` for resource cleanup
 
-**Status: decision locked 2026-05-04 (implementation pending).**
+**Status: decision locked 2026-05-04, implemented 2026-05-06.**
 
-Resolved in Phase 2.3 as the implied commitment of the GC strategy decision. **Decision: Go-style statement-level `defer expr;`.** See [G. Scope-bound cleanup syntax](#g-scope-bound-cleanup-syntax-go-style-statement-level-defer) under GC subordinate decisions for the full rationale and the alternatives rejected (block-binding `using`/`with` syntax was considered and declined).
-
-The decision is locked but the lexer/parser/sema/IR/codegen plumbing is still pending — implementation status is tracked as an open exit-criterion in [phase-2.md](phases/phase-2.md#exit-criteria-for-declaring-phase-23-complete).
+Resolved in Phase 2.3 as the implied commitment of the GC strategy decision. **Decision: Go-style statement-level `defer expr;`.** See [G. Scope-bound cleanup syntax](#g-scope-bound-cleanup-syntax-go-style-statement-level-defer) under GC subordinate decisions for the full rationale and the alternatives rejected (block-binding `using`/`with` syntax was considered and declined). Implementation landed across the lexer, parser, sema (placement check + return/`?` rejection inside the deferred expression), AST interpreter, IR lowering, and all three backends — see the [Decision G entry in phase-2.md](phases/phase-2.md#design-decisions-locked-in-this-phase) for the per-backend contract and the ten matrix fixtures pinning each exit path.
 
 ### Lambda parameter inference at call sites
 
@@ -233,7 +231,7 @@ Traits in Phoenix are statically dispatched only today — every trait use must 
 | Multi-bound trait objects (`dyn Foo + Bar`) | Phase 3 | Requires deciding whether bounds must be object-safe individually or only in combination, and whether the vtable is merged-method or multi-pointer. |
 | Supertraits (`trait Sub: Super { ... }`) | Phase 3 | Affects trait-declaration syntax, `dyn Sub → dyn Super` coercion, and vtable layout. Sema doesn't model supertrait relations today. |
 | `where Self: Sized` method carve-outs | Phase 3+ | Rust's mechanism for "mostly object-safe" traits. Open whether Phoenix needs it or users should split the trait. |
-| Drop slot / custom destructor in vtable | Phase 2.3 | Ties to [GC strategy](#gc-strategy). Pure tracing GC obviates the need; `defer` / `using` semantics may change this. |
+| Drop slot / custom destructor in vtable | **✅ Resolved 2026-05-06 (not needed)** | Phase 2.3 shipped a pure tracing GC and Go-style statement-level `defer`. Tracing GC reclaims unreachable objects without per-type destruction, and `defer` covers user-driven cleanup at scope exit — neither requires a vtable drop slot. Revisit only if a future feature (e.g., FFI handle wrappers requiring deterministic finalization) reintroduces the need. |
 | Heterogeneous list literals (`[Circle(1), Square(2)]` typed `List<dyn Drawable>`) | Phase 3 | Blocked on bidirectional type inference in list-literal checking. The previously suggested `push()` workaround does not work today (sema rejects `let xs: List<dyn Trait> = []` because the empty literal types as `List<T>`). See [known-issues.md](known-issues.md#listdyn-trait-literal-initialization-in-compiled-mode). |
 | `<T: Trait>` method calls in compiled mode | **✅ Implemented 2026-04-21** | Resolved in function-monomorphization: `Op::BuiltinCall(".method", ...)` emitted at IR lowering (with empty type-name prefix because sema's receiver is `TypeVar`) is rewritten to a direct `Op::Call` after substitution, using `method_index[(substituted_type, method)]`. See `phoenix-ir/src/monomorphize.rs::resolve_trait_bound_builtin_calls`. |
 | `dyn Trait` over generic user-defined structs | **✅ Implemented 2026-04-21** | Lands as part of the struct-monomorphization pass — the `dyn_vtables` rekey from `(bare_name, trait)` to `(mangled_name, trait)` runs during struct-mono's rewrite phase, and method FuncIds in the vtable entries are re-resolved through the specialized `method_index`. Two instantiations of the same generic struct implementing the same trait no longer collide. |

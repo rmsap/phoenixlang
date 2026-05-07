@@ -3,7 +3,7 @@
 **A strict, statically typed programming language for full-stack web development.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-2%2C800%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-2%2C900%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Phoenix combines functional and object-oriented programming with a clean, familiar syntax and a focus on safe concurrency, async-first design, and developer productivity. Programs run on a tree-walk interpreter (`phoenix run`) or compile to native binaries via Cranelift (`phoenix build`), and API schemas can be code-generated to TypeScript, Python, Go, or OpenAPI.
@@ -295,7 +295,7 @@ Phoenix is implemented in Rust as a Cargo workspace of 14 crates, each represent
 
 ## Roadmap & Vision
 
-Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), and Phase 2.6 (module system and visibility) are complete. Phase 2.3 (garbage collection and runtime) is the active work, with a WebAssembly backend and JavaScript interop sequenced after it. Planned beyond that: async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language.
+Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), Phase 2.6 (module system and visibility), and Phase 2.3 (tracing GC, runtime, and `defer` syntax) are complete. Phase 2.7 (benchmark suite) is the active work — sequenced ahead of Phase 2.4 (WebAssembly target) so the native GC has a measured baseline before a second `GcHeap` impl arrives. JavaScript interop, async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
 
 See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features.
 
