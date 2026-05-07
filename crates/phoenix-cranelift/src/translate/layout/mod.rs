@@ -5,9 +5,10 @@
 //! - [`TypeLayout`] (in [`type_layout`]) — single source of truth for how
 //!   each `IrType` maps onto Cranelift slots and memory (slot count,
 //!   Cranelift-type expansion, load / store codegen).
-//! - Container-header sizes (in [`containers`]) — `LIST_HEADER`,
-//!   `MAP_HEADER`, and [`elem_size_bytes`] — constants that must match
-//!   `phoenix-runtime`.
+//! - Container-header sizes (in [`containers`]) — `LIST_HEADER` and
+//!   [`elem_size_bytes`] — constants that must match `phoenix-runtime`.
+//!   The map header has no codegen consumer (every map op is a runtime
+//!   call), so it isn't mirrored here.
 //!
 //! Adding a new reference type is a single match-arm edit in
 //! [`TypeLayout::of`]. Load and store are data-driven loops over
@@ -16,7 +17,7 @@
 mod containers;
 mod type_layout;
 
-pub(super) use containers::{LIST_HEADER, MAP_HEADER, elem_size_bytes};
+pub(super) use containers::{LIST_HEADER, elem_size_bytes};
 pub(crate) use type_layout::TypeLayout;
 
 /// Size of a single value slot in bytes. All IR values are stored in

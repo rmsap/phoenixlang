@@ -39,6 +39,10 @@ pub mod __test_support {
         phx_list_alloc, phx_list_drop, phx_list_get_raw, phx_list_length, phx_list_take,
         phx_str_split,
     };
+    pub use crate::map_methods::{
+        phx_map_alloc, phx_map_from_pairs, phx_map_get_raw, phx_map_length, phx_map_remove_raw,
+        phx_map_set_raw,
+    };
     pub use crate::phx_str_concat;
 
     /// Test-only wrapper around the private `to_phx_string_from_str`.
@@ -60,8 +64,10 @@ pub fn list_header_size() -> usize {
 
 /// Return the map header size in bytes.
 ///
-/// Exposed so the compiler crate can assert at test time that its
-/// `MAP_HEADER` constant matches the runtime's layout.
+/// Retained as a public helper for any future consumer that needs to
+/// peek at the map header offset; the cranelift codegen no longer
+/// indexes past the header (every map op is a runtime call) so it
+/// does not mirror this constant.
 pub fn map_header_size() -> usize {
     map_methods::HEADER_SIZE
 }

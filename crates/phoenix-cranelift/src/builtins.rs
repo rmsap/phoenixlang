@@ -82,8 +82,13 @@ pub struct RuntimeFunctions {
     /// `phx_list_drop(list_ptr, n) -> new_list_ptr`.
     pub list_drop: FuncId,
     // ── Map runtime functions ───────────────────────────────────────
-    /// `phx_map_alloc(key_size, val_size, count) -> map_ptr`.
-    pub map_alloc: FuncId,
+    /// `phx_map_from_pairs(key_size, val_size, n_pairs, pair_data) -> map_ptr`.
+    /// Used by the map-literal lowering: codegen writes each pair into a
+    /// stack buffer and the runtime hash-builds the table in one pass.
+    /// Replaces the previous `phx_map_alloc`-then-write-pairs path; the
+    /// runtime keeps `phx_map_alloc` as an internal helper for `set` /
+    /// `remove`, but compiled code no longer needs to call it directly.
+    pub map_from_pairs: FuncId,
     /// `phx_map_length(map_ptr) -> i64`.
     pub map_length: FuncId,
     /// `phx_map_get_raw(map_ptr, key_ptr, key_size) -> val_ptr_or_null`.
@@ -197,7 +202,13 @@ impl RuntimeFunctions {
             list_take: declare_func(module, "phx_list_take", &[I64, I64], &[I64], call_conv)?,
             list_drop: declare_func(module, "phx_list_drop", &[I64, I64], &[I64], call_conv)?,
             // Map functions.
-            map_alloc: declare_func(module, "phx_map_alloc", &[I64, I64, I64], &[I64], call_conv)?,
+            map_from_pairs: declare_func(
+                module,
+                "phx_map_from_pairs",
+                &[I64, I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
             map_length: declare_func(module, "phx_map_length", &[I64], &[I64], call_conv)?,
             map_get_raw: declare_func(
                 module,

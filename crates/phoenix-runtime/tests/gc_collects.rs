@@ -660,3 +660,117 @@ fn cross_thread_collect_aborts() {
         String::from_utf8_lossy(&output.stdout),
     );
 }
+
+#[test]
+fn map_set_on_placeholder_survives_collect_inside_recovery() {
+    // Regression for the empty-placeholder recovery branch in
+    // `phx_map_set_raw`. Pre-fix, the branch allocated a `fresh` map
+    // and recursed back into `phx_map_set_raw`; the recursive call's
+    // internal allocation could trigger an auto-collect that swept
+    // `fresh` (held only in a Rust local, not on the shadow stack)
+    // before its body was read. Post-fix, the branch allocates the
+    // result map *once* and writes the pair directly — no second
+    // alloc, no UAF window. With the threshold tiny, a collect
+    // *would* fire mid-recovery if a second alloc were still there.
+    let _g = gc_test_lock().lock().unwrap();
+    phx_gc_collect();
+
+    set_collection_threshold(32);
+    phx_gc_enable();
+
+    // Empty placeholder map (ks = vs = 0 — the shape generic-type
+    // resolution emits before the type parameters bind).
+    let placeholder = phoenix_runtime::__test_support::phx_map_alloc(0, 0, 0);
+
+    let key: i64 = 7;
+    let val: i64 = 42;
+    let map = unsafe {
+        phoenix_runtime::__test_support::phx_map_set_raw(
+            placeholder,
+            &key as *const i64 as *const u8,
+            &val as *const i64 as *const u8,
+            8,
+            8,
+        )
+    };
+    assert_eq!(
+        unsafe { phoenix_runtime::__test_support::phx_map_length(map) },
+        1,
+        "recovery-branch result must report length 1",
+    );
+    let got = unsafe {
+        phoenix_runtime::__test_support::phx_map_get_raw(map, &key as *const i64 as *const u8, 8)
+    };
+    assert!(!got.is_null(), "key 7 should be present in the result map");
+    assert_eq!(
+        unsafe { *(got as *const i64) },
+        val,
+        "value at key 7 must survive the recovery branch under GC pressure",
+    );
+
+    phx_gc_disable();
+    set_collection_threshold(DEFAULT_COLLECTION_THRESHOLD);
+    phx_gc_collect();
+}
+
+#[test]
+fn map_from_pairs_survives_collect_during_build() {
+    // Regression guard for `phx_map_from_pairs`: the function performs
+    // exactly one allocation (via `phx_map_alloc`) and then writes
+    // every pair into that map. A future regression that inserts a
+    // *second* allocation between the alloc and the writes (or during
+    // duplicate-key handling) would leave the result map unrooted —
+    // an auto-collect would sweep it before the body was populated.
+    //
+    // We drive a 50-pair build with the GC threshold set tiny, so the
+    // initial `phx_map_alloc` is itself enough to trigger a collect.
+    // If the result map were unrooted across a second alloc we'd see
+    // a UAF or wrong length here.
+    let _g = gc_test_lock().lock().unwrap();
+    phx_gc_collect();
+
+    set_collection_threshold(32);
+    phx_gc_enable();
+
+    const N: i64 = 50;
+    // Build the pair buffer in a non-GC Vec, matching how Cranelift's
+    // stack buffer feeds this entry point.
+    let mut pair_data = Vec::<i64>::with_capacity((N * 2) as usize);
+    for i in 0..N {
+        pair_data.push(i * 13 + 1);
+        pair_data.push(i * 100);
+    }
+    let map = unsafe {
+        phoenix_runtime::__test_support::phx_map_from_pairs(
+            8,
+            8,
+            N,
+            pair_data.as_ptr() as *const u8,
+        )
+    };
+    assert_eq!(
+        unsafe { phoenix_runtime::__test_support::phx_map_length(map) },
+        N,
+        "from_pairs result must report length {N}",
+    );
+    for i in 0..N {
+        let key = i * 13 + 1;
+        let got = unsafe {
+            phoenix_runtime::__test_support::phx_map_get_raw(
+                map,
+                &key as *const i64 as *const u8,
+                8,
+            )
+        };
+        assert!(!got.is_null(), "key {key} should be present after build");
+        assert_eq!(
+            unsafe { *(got as *const i64) },
+            i * 100,
+            "value at key {key} must survive build under GC pressure",
+        );
+    }
+
+    phx_gc_disable();
+    set_collection_threshold(DEFAULT_COLLECTION_THRESHOLD);
+    phx_gc_collect();
+}

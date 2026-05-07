@@ -750,6 +750,32 @@ impl Interpreter {
         self.exec_block_inner(block, false)
     }
 
+    /// Run `body` with a fresh lexical scope pushed, popping it on every
+    /// exit path (including `Err`-returning bodies).
+    ///
+    /// The interpreter's `try`-style escape — explicit `return` inside an
+    /// expression context — propagates as `Err(try_return_value: ...)`.
+    /// Any caller that pushed a scope before invoking such a body has to
+    /// pop the scope on the error path too. If they don't, the leftover
+    /// scope rides up to the next `with_defer_frame` call, where the
+    /// `debug_assert_eq!(self.env.scope_depth(), entry_scope_depth)`
+    /// guard fires with the message *"body must restore env scope depth
+    /// before defers run"* — that's the symptom you'll see in a stack
+    /// trace. Funneling all push/pop pairs through this helper makes
+    /// that hard to get wrong.
+    ///
+    /// Note: a panic inside `body` still leaks the scope (no
+    /// `catch_unwind` here). The interpreter treats panics as
+    /// unrecoverable today, so this is intentional — but if a future
+    /// change starts catching panics in callers, this helper needs an
+    /// RAII guard to stay correct.
+    fn with_scope<R>(&mut self, body: impl FnOnce(&mut Self) -> Result<R>) -> Result<R> {
+        self.env.push_scope();
+        let outcome = body(self);
+        self.env.pop_scope();
+        outcome
+    }
+
     /// Executes a block with implicit return enabled (for function/closure bodies).
     ///
     /// When `implicit_return` is `true` and the last statement is a bare
@@ -888,11 +914,13 @@ impl Interpreter {
     }
 
     /// Executes a loop's else-block if the loop did not `break`.
+    ///
+    /// Routed through [`Self::with_scope`] so an explicit `return`
+    /// inside the else block (which propagates as
+    /// `Err(try_return_value: ...)`) doesn't skip `pop_scope`.
     fn exec_loop_else(&mut self, broke: bool, else_block: &Option<Block>) -> Result<StmtResult> {
         if !broke && let Some(ref block) = *else_block {
-            self.env.push_scope();
-            let result = self.exec_block(block)?;
-            self.env.pop_scope();
+            let result = self.with_scope(|interp| interp.exec_block(block))?;
             if let StmtResult::Return(_) = result {
                 return Ok(result);
             }
@@ -971,9 +999,7 @@ impl Interpreter {
             if !condition.is_truthy() {
                 break;
             }
-            self.env.push_scope();
-            let result = self.exec_block(&w.body)?;
-            self.env.pop_scope();
+            let result = self.with_scope(|interp| interp.exec_block(&w.body))?;
             match result {
                 StmtResult::Break => {
                     broke = true;
@@ -1008,10 +1034,10 @@ impl Interpreter {
 
         let mut broke = false;
         for item in items {
-            self.env.push_scope();
-            self.env.define(f.var_name.clone(), item);
-            let result = self.exec_block(&f.body)?;
-            self.env.pop_scope();
+            let result = self.with_scope(|interp| {
+                interp.env.define(f.var_name.clone(), item);
+                interp.exec_block(&f.body)
+            })?;
             match result {
                 StmtResult::Break => {
                     broke = true;
@@ -1155,41 +1181,41 @@ impl Interpreter {
 
         for arm in &m.arms {
             if let Some(bindings) = self.match_pattern(&arm.pattern, &subject) {
-                self.env.push_scope();
-                for (name, value) in bindings {
-                    self.env.define(name, value);
-                }
-                let result = match &arm.body {
-                    MatchBody::Expr(e) => self.eval_expr(e)?,
-                    MatchBody::Block(b) => {
-                        match self.exec_block_implicit(b)? {
+                return self.with_scope(|interp| {
+                    for (name, value) in bindings {
+                        interp.env.define(name, value);
+                    }
+                    match &arm.body {
+                        MatchBody::Expr(e) => interp.eval_expr(e),
+                        MatchBody::Block(b) => match interp.exec_block_implicit(b)? {
                             StmtResult::Return(v) => {
-                                if self.last_return_was_explicit {
+                                if interp.last_return_was_explicit {
                                     // Explicit `return` — propagate as a
                                     // function return via try_return_value.
-                                    self.env.pop_scope();
-                                    return Err(RuntimeError {
+                                    // `with_scope` still pops on this Err
+                                    // path, so we don't pop here.
+                                    Err(RuntimeError {
                                         message: String::new(),
                                         try_return_value: Some(v),
-                                    });
+                                    })
+                                } else {
+                                    // Implicit return (last expression value)
+                                    Ok(v)
                                 }
-                                // Implicit return (last expression value)
-                                v
                             }
                             StmtResult::Break => {
-                                self.pending_control_flow = Some(PendingControlFlow::Break);
-                                Value::Void
+                                interp.pending_control_flow = Some(PendingControlFlow::Break);
+                                Ok(Value::Void)
                             }
                             StmtResult::LoopContinue => {
-                                self.pending_control_flow = Some(PendingControlFlow::LoopContinue);
-                                Value::Void
+                                interp.pending_control_flow =
+                                    Some(PendingControlFlow::LoopContinue);
+                                Ok(Value::Void)
                             }
-                            StmtResult::Continue => Value::Void,
-                        }
+                            StmtResult::Continue => Ok(Value::Void),
+                        },
                     }
-                };
-                self.env.pop_scope();
-                return Ok(result);
+                });
             }
         }
 
@@ -2968,7 +2994,7 @@ function main() {
     }
 
     #[test]
-    fn run_if_expr_else_if_chain_picks_middle() {
+    fn run_if_expr_else_if_chain_chooses_middle() {
         let output = run_capturing_source(
             r#"
 function main() {
@@ -3099,5 +3125,108 @@ function main() {
 }"#,
         );
         assert_eq!(output, vec!["r"]);
+    }
+
+    /// Regression for the scope-leak triggered when an explicit `return`
+    /// inside an `if`-arm of a `for` body propagates as
+    /// `Err(try_return_value: ...)`. Pre-fix, `?` propagated the error
+    /// past `pop_scope`, so the iteration scope leaked up to the
+    /// function frame and tripped the function-level scope-depth
+    /// invariant. The function should return `1` (first matching item)
+    /// without panicking.
+    #[test]
+    fn for_body_explicit_return_does_not_leak_iteration_scope() {
+        let output = run_capturing_source(
+            r#"
+function find_first_even(xs: List<Int>) -> Int {
+  for x in xs {
+    if x % 2 == 0 {
+      return x
+    }
+  }
+  return -1
+}
+function main() {
+  print(find_first_even([1, 3, 4, 5, 6]))
+}"#,
+        );
+        assert_eq!(output, vec!["4"]);
+    }
+
+    /// Same shape as above but in a `while` loop.
+    #[test]
+    fn while_body_explicit_return_does_not_leak_iteration_scope() {
+        let output = run_capturing_source(
+            r#"
+function first_above(limit: Int) -> Int {
+  let mut i: Int = 0
+  while i < 100 {
+    if i > limit {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+function main() {
+  print(first_above(7))
+}"#,
+        );
+        assert_eq!(output, vec!["8"]);
+    }
+
+    /// Same shape but inside a `match` arm with a block body. Pre-fix,
+    /// the bare `?` on `exec_block_implicit` skipped the arm-binding
+    /// scope's `pop_scope`.
+    #[test]
+    fn match_arm_block_explicit_return_does_not_leak_arm_scope() {
+        let output = run_capturing_source(
+            r#"
+enum Outcome { Hit(Int) Miss }
+function classify(o: Outcome) -> Int {
+  match o {
+    Hit(n) -> { return n * 2 }
+    Miss -> { return 0 }
+  }
+}
+function main() {
+  print(classify(Hit(5)))
+  print(classify(Miss))
+}"#,
+        );
+        assert_eq!(output, vec!["10", "0"]);
+    }
+
+    /// `for`/`while` `else` blocks were the last `push_scope`-with-`?`
+    /// site on the same shape: `exec_loop_else` pushed a scope, called
+    /// `exec_block(...)?`, then popped. If a `return` propagated as
+    /// `Err(try_return_value: ...)` (e.g. through a `match` arm in the
+    /// else-block body), the `?` skipped `pop_scope`. Post-fix it goes
+    /// through `with_scope`.
+    #[test]
+    fn loop_else_explicit_return_does_not_leak_else_scope() {
+        let output = run_capturing_source(
+            r#"
+enum Tag {
+  A
+  B
+}
+function choose(t: Tag) -> Int {
+  for x in [1, 2, 3] {
+    if x > 100 { break }
+  } else {
+    match t {
+      A -> { return 11 }
+      B -> { return 22 }
+    }
+  }
+  return -1
+}
+function main() {
+  print(choose(A))
+  print(choose(B))
+}"#,
+        );
+        assert_eq!(output, vec!["11", "22"]);
     }
 }

@@ -55,6 +55,15 @@ pub(crate) const HEADER_SIZE: usize = 24;
 /// and `TypeLayout::of` must be updated.
 pub(crate) const STRING_FAT_POINTER_SIZE: usize = 16;
 
+/// A length field on a string fat pointer larger than this is treated
+/// as a sign that the 16 bytes are not actually a string fat pointer
+/// (e.g. a non-string 16-byte type or a wild value). Both
+/// [`elements_equal`] and [`crate::map_methods::hash_key`] consult this
+/// before dereferencing the embedded pointer; they must agree on the
+/// threshold or a malformed input would hash one way and compare
+/// another, breaking the hash-table invariant.
+pub(crate) const MAX_REASONABLE_STRING_LEN: usize = 1 << 30;
+
 /// Read the length and elem_size from a list header.
 ///
 /// # Safety
@@ -106,8 +115,7 @@ pub(crate) unsafe fn elements_equal(
         // Guard: if length looks unreasonably large (> 1 GiB), the data
         // is almost certainly not a string fat pointer.  Fall back to
         // byte-wise comparison to avoid dereferencing a wild pointer.
-        const MAX_REASONABLE_LEN: usize = 1 << 30;
-        if a_len > MAX_REASONABLE_LEN || b_len > MAX_REASONABLE_LEN {
+        if a_len > MAX_REASONABLE_STRING_LEN || b_len > MAX_REASONABLE_STRING_LEN {
             let a_bytes = unsafe { slice::from_raw_parts(a, size) };
             let b_bytes = unsafe { slice::from_raw_parts(b, size) };
             return a_bytes == b_bytes;

@@ -1,0 +1,41 @@
+// Inserts 100 keys, then exercises three reads: a length probe, a
+// sparse Option-combinator lookup (every tenth key), and a full
+// insertion-order iteration via m.keys(). With the linear-scan
+// implementation the inserts alone were O(n²); with the hash table
+// they're O(n). The 100 inserts cross every resize threshold
+// (8 → 16 → 32 → 64 → 128 → 256 buckets), so the rehash path is
+// exercised. The position-weighted iteration catches a regression
+// where the parallel insertion-order array desynchronizes from the
+// bucket layout across rehashes.
+//
+// Expected stdout (compared byte-for-byte across the three backends):
+//   100
+//   3150         // 7 * (0+10+20+...+90) = 7 * 450
+//   328350      // Σ i² for i=0..99 = 99*100*199 / 6
+function main() {
+  let mut m: Map<Int, Int> = {}
+  let mut i: Int = 0
+  while (i < 100) {
+    m = m.set(i, i * 7)
+    i = i + 1
+  }
+  print(m.length())
+  // Look up every 10th key and sum the values via Option combinators.
+  let mut sum: Int = 0
+  let mut j: Int = 0
+  while (j < 100) {
+    sum = sum + m.get(j).unwrapOr(0)
+    j = j + 10
+  }
+  print(sum)
+  // Position-weighted iteration over m.keys(): catches a regression
+  // where the parallel insertion-order array desynchronizes from the
+  // bucket layout across rehashes. Σ i*i for i=0..99 = 328350.
+  let mut weighted: Int = 0
+  let mut pos: Int = 0
+  for k in m.keys() {
+    weighted = weighted + k * pos
+    pos = pos + 1
+  }
+  print(weighted)
+}

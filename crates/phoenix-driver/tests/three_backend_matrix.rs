@@ -168,6 +168,7 @@ backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx");
 backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
 backend_matrix_test!(matrix_defer_basic, "defer_basic.phx");
 backend_matrix_test!(matrix_defer_explicit_return, "defer_explicit_return.phx");
+backend_matrix_test!(matrix_map_hash_many_keys, "map_hash_many_keys.phx");
 backend_matrix_test!(matrix_defer_lazy_capture, "defer_lazy_capture.phx");
 backend_matrix_test!(matrix_defer_method, "defer_method.phx");
 backend_matrix_test!(matrix_defer_heap, "defer_heap.phx");

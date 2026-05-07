@@ -6,7 +6,7 @@
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl;
-use cranelift_codegen::ir::{InstBuilder, Value};
+use cranelift_codegen::ir::{self, InstBuilder, Value};
 use cranelift_frontend::FunctionBuilder;
 
 use crate::context::CompileContext;
@@ -18,7 +18,7 @@ use phoenix_ir::types::IrType;
 
 use super::enum_helpers::{build_option_none, build_option_some};
 use super::helpers::call_runtime;
-use super::layout::{MAP_HEADER, SLOT_SIZE, TypeLayout, elem_size_bytes};
+use super::layout::{SLOT_SIZE, TypeLayout, elem_size_bytes};
 use super::list_methods::store_to_temp;
 use super::{FuncState, get_val, get_val1};
 use phoenix_ir::instruction::Op;
@@ -201,8 +201,16 @@ pub(super) fn translate_map_method(
 
 /// Translate a `MapAlloc` operation.
 ///
-/// Calls `phx_map_alloc(key_size, val_size, count)`, then stores each
-/// key-value pair into the data region.
+/// Map literals lower to a single `phx_map_from_pairs` runtime call:
+/// codegen materializes a stack-allocated `(key_0, val_0, key_1, val_1, …)`
+/// buffer and hands the whole thing to the runtime, which hash-builds
+/// the table in one pass. This avoids the O(n) per-insert overhead of
+/// driving the literal through `phx_map_set_raw`, and keeps every
+/// hash-layout decision (capacity, probing, tags) inside the runtime.
+///
+/// Empty literals (`{}`) skip the buffer entirely and call
+/// `phx_map_from_pairs(ks, vs, 0, 0)` — the runtime's `# Safety` doc
+/// explicitly carves out null `pair_data` when `n_pairs == 0`.
 pub(super) fn translate_map_alloc(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
@@ -226,29 +234,59 @@ pub(super) fn translate_map_alloc(
     let ks_val = builder.ins().iconst(cl::I64, ks);
     let vs_val = builder.ins().iconst(cl::I64, vs);
     let count_val = builder.ins().iconst(cl::I64, count);
+
+    // Materialize the pair buffer when there's anything to write, or a
+    // null pointer for empty literals (the runtime's `n_pairs == 0`
+    // carve-out makes the buffer unnecessary in that case).
+    let buf_addr = if entries.is_empty() {
+        builder.ins().iconst(POINTER_TYPE, 0)
+    } else {
+        // Stack buffer big enough for `(key, val) * n_pairs`. The
+        // buffer's lifetime is the current function call; the runtime
+        // copies bytes out before returning.
+        let key_layout = TypeLayout::of(key_ty);
+        let val_layout = TypeLayout::of(val_ty);
+        let key_slots = key_layout.slots();
+        let val_slots = val_layout.slots();
+        let pair_slots = key_slots + val_slots;
+        let total_slots = pair_slots * entries.len();
+        let buf_bytes_usize = total_slots * SLOT_SIZE;
+        let buf_bytes: u32 = buf_bytes_usize.try_into().map_err(|_| {
+            CompileError::new(format!(
+                "MapAlloc: stack buffer size {buf_bytes_usize} bytes exceeds u32"
+            ))
+        })?;
+        // Request 8-byte alignment explicitly so per-pair scalar reads
+        // in the runtime (e.g. `*(ptr as *const i64)` for string fat
+        // pointers) stay aligned regardless of how Cranelift would
+        // otherwise derive it from `buf_bytes`. SLOT_SIZE is 8, so the
+        // natural per-slot alignment is the same — making it explicit
+        // just pins the contract.
+        let buf_slot = builder.create_sized_stack_slot(ir::StackSlotData::new(
+            ir::StackSlotKind::ExplicitSlot,
+            buf_bytes,
+            3, // log2(8) — 8-byte alignment
+        ));
+        let addr = builder.ins().stack_addr(POINTER_TYPE, buf_slot, 0);
+
+        for (i, (k_vid, v_vid)) in entries.iter().enumerate() {
+            let k_vals = get_val(state, *k_vid)?;
+            let key_slot_idx = i * pair_slots;
+            key_layout.store(builder, addr, key_slot_idx, &k_vals);
+
+            let v_vals = get_val(state, *v_vid)?;
+            let val_slot_idx = key_slot_idx + key_slots;
+            val_layout.store(builder, addr, val_slot_idx, &v_vals);
+        }
+        addr
+    };
+
     let map_ptr = call_runtime(
         builder,
         ctx,
-        ctx.runtime.map_alloc,
-        &[ks_val, vs_val, count_val],
+        ctx.runtime.map_from_pairs,
+        &[ks_val, vs_val, count_val, buf_addr],
     );
-    let ptr = map_ptr[0];
 
-    let key_layout = TypeLayout::of(key_ty);
-    let val_layout = TypeLayout::of(val_ty);
-    let key_slots = key_layout.slots();
-    let val_slots = val_layout.slots();
-
-    // Store each key-value pair.
-    for (i, (k_vid, v_vid)) in entries.iter().enumerate() {
-        let k_vals = get_val(state, *k_vid)?;
-        let key_slot = MAP_HEADER as usize / SLOT_SIZE + i * (key_slots + val_slots);
-        key_layout.store(builder, ptr, key_slot, &k_vals);
-
-        let v_vals = get_val(state, *v_vid)?;
-        let val_slot = key_slot + key_slots;
-        val_layout.store(builder, ptr, val_slot, &v_vals);
-    }
-
-    Ok(vec![ptr])
+    Ok(vec![map_ptr[0]])
 }

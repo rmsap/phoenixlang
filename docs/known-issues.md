@@ -38,15 +38,6 @@ When an integer or float literal is out of range, the parser emits a diagnostic 
 
 **Target phase:** None — no fix planned. Acceptable as-is; revisit if it causes real-world confusion, at which point add an `ErrorLiteral` AST variant.
 
-### O(n) map key lookup
-
-`Map<K, V>` key lookup, insertion, removal, and contains operations use a
-linear scan over a flat array.  Building an n-entry map is O(n²).
-
-**Planned fix:** Hash-based implementation.
-**Tracked in:** `phoenix-runtime/src/map_methods.rs` module header.
-**Target phase:** Phase 2.3 (Runtime and Memory Management).
-
 ### Closure functions inside generic templates are not cloned per specialization
 
 When a generic function `f<T>(...)` defines a closure whose body or captures reference `T`, the closure function is pushed to `IrModule.functions` as a single concrete entry at lowering time. Monomorphization specializes `f<T>` per concrete type substitution but does **not** clone the closure function — the same `FuncId` is shared by every `f<T1>` / `f<T2>` / ... specialization. Pass D (`erase_type_vars_in_non_templates`) then erases the closure body's residual TypeVars to the `__generic` placeholder.
@@ -87,6 +78,18 @@ consistency.  Acceptable for small lists but a performance hazard for large ones
 ---
 
 ## Code Quality
+
+### Map copy-on-write blits the full table body regardless of load factor
+
+`phx_map_set_raw` and `phx_map_remove_raw` produce the new map by allocating a same-shape table and calling `copy_map_same_layout`, which `memcpy`s the entire body — `tags + order_array + pairs` — in one pass. The copy size is `total_size(capacity) - HEADER_SIZE`, which scales with `capacity * (key_size + val_size)` rather than `length * (key_size + val_size)`. For sparsely-populated tables (e.g. capacity 256 carrying 50 entries with 24-byte pair size, ~6 KB body) every set/remove copies the full 6 KB, where the pre-rewrite linear-scan implementation would have copied ~1.2 KB worth of populated pairs.
+
+This is a deliberate trade for the open-addressing rewrite (the body is contiguous bytes, so one `memcpy` beats per-pair iteration), but insert-heavy or churn-heavy workloads on lightly-loaded tables pay a memory-bandwidth cost the old implementation did not. The current load-factor floor (70 %) means the worst case is bounded — capacity is at most ~1.43× length right after a grow — but tombstone accumulation between grows can stretch the gap further, since tombstones occupy bucket slots without contributing to length. See also [`phx_map_remove_raw` doc comment](../crates/phoenix-runtime/src/map_methods.rs) for the tombstone-carry-forward note.
+
+**Planned fix.** Tombstone-aware rebuild: when `tombstones / capacity` exceeds a threshold (e.g. 25 %), `phx_map_set_raw` / `phx_map_remove_raw` rehash into a fresh table of the same capacity rather than blitting the body. The rebuild visits only `length` occupied entries, so it both costs less per call *and* clears tombstones — closing the lengthening-probe-chain failure mode that the current `remove_raw` doc flags as the trigger for this work. Same machinery as `rehash_into`; the only new logic is a threshold check.
+
+**File:** `crates/phoenix-runtime/src/map_methods.rs` (`copy_map_same_layout`, `phx_map_set_raw`, `phx_map_remove_raw`).
+**Tracked in:** `phx_map_remove_raw` doc comment (tombstone-carry-forward note pre-stages this entry).
+**Target phase:** demand-triggered — revisit if a churn-heavy benchmark or user complaint exposes the regression in practice. Phoenix's immutable-map model means most COW intermediates are quickly reclaimed by the GC, so the wasted body-copy is short-lived.
 
 ### Excessive cloning (~216 sites)
 

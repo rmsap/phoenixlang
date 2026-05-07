@@ -1,8 +1,10 @@
-//! List and map container-header sizes, plus element sizing.
+//! List container-header size and element sizing.
 //!
-//! The `LIST_HEADER` and `MAP_HEADER` constants must match their
-//! counterparts in `phoenix-runtime` — the `layout_constants_match_runtime`
-//! test below pins this. A mismatch would cause silent memory corruption.
+//! `LIST_HEADER` is referenced by codegen and pinned against
+//! `phoenix_runtime::list_header_size()` in the test below — a mismatch
+//! would cause silent memory corruption. The map header has no codegen
+//! caller (every map op is a runtime call), so the runtime owns its
+//! header-size invariant.
 
 use phoenix_ir::types::IrType;
 
@@ -10,9 +12,6 @@ use super::TypeLayout;
 
 /// List header size in bytes (length + capacity + elem_size).
 pub(in crate::translate) const LIST_HEADER: i32 = 24;
-
-/// Map header size in bytes (length + capacity + key_size + val_size).
-pub(in crate::translate) const MAP_HEADER: i32 = 32;
 
 /// Compute the element size in bytes for a list/map element type.
 ///
@@ -47,19 +46,18 @@ mod tests {
         assert_eq!(elem_size_bytes(&IrType::Void), 0);
     }
 
-    /// Verify that the compiler's header constants match the runtime's.
-    /// A mismatch would cause silent memory corruption at runtime.
+    /// Verify that the compiler's `LIST_HEADER` constant matches the
+    /// runtime's. A mismatch would cause silent memory corruption at
+    /// runtime. The map header used to be mirrored here too, but
+    /// codegen no longer indexes past it (every map op is a runtime
+    /// call), so the runtime owns that invariant and pins it in its
+    /// own tests.
     #[test]
-    fn layout_constants_match_runtime() {
+    fn list_header_matches_runtime() {
         assert_eq!(
             LIST_HEADER as usize,
             phoenix_runtime::list_header_size(),
             "LIST_HEADER mismatch between compiler and runtime"
-        );
-        assert_eq!(
-            MAP_HEADER as usize,
-            phoenix_runtime::map_header_size(),
-            "MAP_HEADER mismatch between compiler and runtime"
         );
     }
 }
