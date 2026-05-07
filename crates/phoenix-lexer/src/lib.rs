@@ -11,5 +11,5 @@ pub mod lexer;
 /// Token types and the `Token` struct.
 pub mod token;
 
-pub use lexer::{Lexer, tokenize};
+pub use lexer::{KEYWORDS, Lexer, tokenize};
 pub use token::{Token, TokenKind};

@@ -138,24 +138,7 @@ fn cross_file_rename_emits_workspace_edit_for_both_files() {
 
 #[test]
 fn completion_includes_module_keywords() {
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add("test.phx", "function main() {}");
-    let analysis = checker::check(&parser::parse(&tokenize("function main() {}", source_id)).0);
-    let mut source_id_to_url = HashMap::new();
-    let uri = test_uri();
-    source_id_to_url.insert(source_id, uri.clone());
-    let mut source_id_to_module = HashMap::new();
-    source_id_to_module.insert(source_id, ModulePath::entry());
-    let state = DocumentState {
-        source: "function main() {}".to_string(),
-        source_map: Arc::new(source_map),
-        source_id,
-        current_module: ModulePath::entry(),
-        check_result: Arc::new(analysis),
-        source_id_to_url: Arc::new(source_id_to_url),
-        source_id_to_module: Arc::new(source_id_to_module),
-        canonical_path: None,
-    };
+    let state = keyword_only_state();
     let items = completion_items_for(&state);
     let labels: HashSet<String> = items.iter().map(|i| i.label.clone()).collect();
     assert!(labels.contains("import"));
@@ -468,5 +451,64 @@ fn completion_excludes_unimported_function_from_other_module() {
         !labels.contains("helper"),
         "unimported function from other module must not appear in completion; got: {:?}",
         labels
+    );
+}
+
+/// Build a minimal entry-module `DocumentState` used by tests that
+/// only care about keyword completion (no cross-module setup).
+fn keyword_only_state() -> DocumentState {
+    let source = "function main() {}";
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add("test.phx", source);
+    let analysis = checker::check(&parser::parse(&tokenize(source, source_id)).0);
+    let mut source_id_to_url = HashMap::new();
+    source_id_to_url.insert(source_id, test_uri());
+    let mut source_id_to_module = HashMap::new();
+    source_id_to_module.insert(source_id, ModulePath::entry());
+    DocumentState {
+        source: source.to_string(),
+        source_map: Arc::new(source_map),
+        source_id,
+        current_module: ModulePath::entry(),
+        check_result: Arc::new(analysis),
+        source_id_to_url: Arc::new(source_id_to_url),
+        source_id_to_module: Arc::new(source_id_to_module),
+        canonical_path: None,
+    }
+}
+
+/// **Drift detection.** Pins the LSP's keyword-completion list against
+/// `phoenix_lexer::KEYWORDS`, the canonical lowercase user-facing
+/// keyword set. If a future maintainer adds a keyword to the lexer
+/// without the LSP's keyword loop picking it up — exactly the gap that
+/// this catch-up sweep closed for `defer`, `dyn`, `omit`, `partial`,
+/// `pick` — this test fails immediately rather than the regression
+/// surviving into a release.
+///
+/// Asserts a **superset** rather than strict equality so the LSP can
+/// add contextual / non-lexer keywords (e.g. snippet labels) without
+/// breaking the test. The reverse direction — that the LSP doesn't
+/// surface stale tokens removed from the lexer — would be useful but
+/// requires tracking removed-keyword history; the existing pattern of
+/// hand-editing the source on removal already catches that.
+#[test]
+fn lsp_keyword_completion_covers_every_lexer_keyword() {
+    let state = keyword_only_state();
+    let items = completion_items_for(&state);
+    let lsp_keyword_labels: HashSet<&str> = items
+        .iter()
+        .filter(|i| i.kind == Some(CompletionItemKind::KEYWORD))
+        .map(|i| i.label.as_str())
+        .collect();
+    let missing: Vec<&&str> = phoenix_lexer::KEYWORDS
+        .iter()
+        .filter(|kw| !lsp_keyword_labels.contains(*kw as &str))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "LSP keyword completion is missing entries from `phoenix_lexer::KEYWORDS`: {missing:?}. \
+         Either the lexer's `KEYWORDS` const got out of sync with the LSP's keyword loop in \
+         `completion_items_for`, or someone bypassed the loop. The LSP should pull from \
+         `phoenix_lexer::KEYWORDS` directly so this drift is impossible.",
     );
 }

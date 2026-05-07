@@ -1,6 +1,22 @@
 use crate::token::{Token, TokenKind};
 use phoenix_common::span::{SourceId, Span};
 
+/// Canonical list of Phoenix's lowercase user-facing keywords —
+/// single source of truth for downstream consumers (notably LSP
+/// keyword completion) so additions can't drift out of sync.
+///
+/// Excludes HTTP verbs (`GET`/`POST`/...) and primitive type names
+/// (`Int`/`Float`/...) — the lexer recognizes them specially, but
+/// they aren't general-purpose keywords. Pinned against
+/// `Lexer::lex_ident_or_keyword` by
+/// `tests::keywords_const_matches_lexer_recognition`.
+pub const KEYWORDS: &[&str] = &[
+    "as", "body", "break", "continue", "defer", "dyn", "else", "endpoint", "enum", "error",
+    "false", "for", "function", "if", "impl", "import", "in", "let", "match", "mut", "omit",
+    "partial", "pick", "public", "query", "response", "return", "schema", "self", "struct",
+    "trait", "true", "type", "where", "while",
+];
+
 /// A lazy, pull-based lexer for Phoenix source code.
 ///
 /// The lexer operates on a borrowed `&str` slice and produces [`Token`]s one
@@ -673,6 +689,30 @@ mod tests {
     fn token_kinds(source: &str) -> Vec<TokenKind> {
         let tokens = tokenize(source, SourceId(0));
         tokens.into_iter().map(|t| t.kind).collect()
+    }
+
+    /// Pin every entry in [`KEYWORDS`] against the lexer's keyword
+    /// recognition: each listed string must lex to a token whose kind
+    /// is **not** `Ident`. If a future maintainer adds a keyword to
+    /// the recognition match without updating `KEYWORDS`, downstream
+    /// consumers (notably the LSP's keyword-completion list) silently
+    /// fall behind. This test makes that drift a hard failure.
+    ///
+    /// The reverse direction (every recognized keyword is in
+    /// `KEYWORDS`) is intentionally NOT enforced — HTTP verbs and
+    /// primitive type names are recognized specially but excluded
+    /// from `KEYWORDS` by design (see the const's doc comment).
+    #[test]
+    fn keywords_const_matches_lexer_recognition() {
+        for kw in KEYWORDS {
+            let kinds = token_kinds(kw);
+            assert!(
+                kinds.first().is_some_and(|k| !matches!(k, Ident)),
+                "KEYWORDS contains {kw:?} but the lexer recognizes it as `Ident` \
+                 — either remove it from KEYWORDS or add it to the keyword \
+                 match in `Lexer::lex_ident`",
+            );
+        }
     }
 
     #[test]

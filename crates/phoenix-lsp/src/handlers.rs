@@ -89,11 +89,12 @@ pub(crate) fn completion_items_for(state: &DocumentState) -> Vec<CompletionItem>
         }
     }
 
-    for kw in &[
-        "function", "struct", "enum", "endpoint", "trait", "impl", "type", "let", "mut", "if",
-        "else", "while", "for", "in", "match", "return", "break", "continue", "body", "response",
-        "error", "query", "where", "schema", "true", "false", "self", "import", "public", "as",
-    ] {
+    // Keyword completions are sourced from `phoenix_lexer::KEYWORDS`,
+    // the canonical lowercase user-facing keyword set, so a new keyword
+    // landing in the lexer can't drift out of sync with editor
+    // autocomplete. Pinned by
+    // `tests::lsp_keyword_completion_covers_every_lexer_keyword`.
+    for kw in phoenix_lexer::KEYWORDS {
         items.push(CompletionItem {
             label: kw.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
