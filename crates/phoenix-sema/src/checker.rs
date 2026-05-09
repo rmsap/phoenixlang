@@ -971,7 +971,7 @@ impl Checker {
 
             // Pass 2: fresh scope, bind params, check body.
             this.scopes.push();
-            for (param, ty) in non_self.into_iter().zip(param_types.into_iter()) {
+            for (param, ty) in non_self.into_iter().zip(param_types) {
                 this.scopes.define(
                     param.name.clone(),
                     VarInfo {
@@ -1104,7 +1104,7 @@ impl Checker {
                     },
                 );
 
-                for (param, ty) in non_self.into_iter().zip(param_types.into_iter()) {
+                for (param, ty) in non_self.into_iter().zip(param_types) {
                     this.scopes.define(
                         param.name.clone(),
                         VarInfo {
