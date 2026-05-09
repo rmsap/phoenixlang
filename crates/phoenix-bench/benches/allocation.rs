@@ -33,7 +33,8 @@
 //! close (see `docs/phases/phase-2.md` baseline-storage task).
 //!
 //! FIXME(phase-2.7-close): create `docs/perf-baselines/` and remove
-//! this marker.
+//! this marker. Sibling marker in `collections.rs` must be removed in
+//! the same change — `grep -rn "phase-2.7-close"` finds both.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,10 +42,12 @@ use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use phoenix_bench::{PauseStats, sample_counts_meet_threshold, summarize_pauses};
+use phoenix_bench::{
+    GcStateGuard, PauseStats, RootedFrameGuard, sample_counts_meet_threshold, summarize_pauses,
+};
 use phoenix_runtime::gc::{
-    DEFAULT_COLLECTION_THRESHOLD, TypeTag, phx_gc_alloc, phx_gc_collect, phx_gc_disable,
-    phx_gc_enable, phx_gc_pop_frame, phx_gc_push_frame, phx_gc_set_root, set_collection_threshold,
+    TypeTag, phx_gc_alloc, phx_gc_collect, phx_gc_disable, phx_gc_enable, phx_gc_push_frame,
+    phx_gc_set_root, set_collection_threshold,
 };
 use serde::Serialize;
 
@@ -75,21 +78,6 @@ const ALLOC_BENCH_THRESHOLD: usize = 64 * 1024;
 /// baseline.
 const MIN_SIDECAR_SAMPLES: usize = 30;
 
-/// RAII guard that restores the global GC to its standard state
-/// (auto-collect off, default threshold, empty heap) when dropped.
-/// Used by `bench_alloc_throughput` so a panic mid-iteration can't
-/// leak the bench's tuned threshold or auto-collect flag into any
-/// later bench group running in the same process.
-struct AllocBenchGuard;
-
-impl Drop for AllocBenchGuard {
-    fn drop(&mut self) {
-        phx_gc_disable();
-        phx_gc_collect();
-        set_collection_threshold(DEFAULT_COLLECTION_THRESHOLD);
-    }
-}
-
 fn bench_alloc_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("alloc_throughput");
 
@@ -98,7 +86,7 @@ fn bench_alloc_throughput(c: &mut Criterion) {
     // setup added between here and the bench loop) still restores the
     // standard threshold + auto-collect flag for any later bench
     // group sharing the process.
-    let _guard = AllocBenchGuard;
+    let _guard = GcStateGuard;
     set_collection_threshold(ALLOC_BENCH_THRESHOLD);
     phx_gc_enable();
 
@@ -139,28 +127,6 @@ fn pause_object_size(i: usize) -> usize {
     SIZES[i % SIZES.len()]
 }
 
-/// RAII pop of a shadow-stack frame plus a final `phx_gc_collect()` so a
-/// panic inside `iter_custom` can't leak a 100k-object rooted set into a
-/// later bench group sharing the process. Symmetric to
-/// [`AllocBenchGuard`].
-///
-/// The frame field is typed as `*mut u8` rather than `*mut Frame`
-/// because the `phoenix_runtime::gc::shadow_stack` module is
-/// `pub(crate)` — the `Frame` struct itself is `pub` within the
-/// module, but the module's visibility makes the type unnameable from
-/// outside the runtime crate. The cast round-trips through the
-/// raw-pointer representation, which is well-defined.
-struct PauseScenarioGuard {
-    frame: *mut u8,
-}
-
-impl Drop for PauseScenarioGuard {
-    fn drop(&mut self) {
-        unsafe { phx_gc_pop_frame(self.frame as *mut _) };
-        phx_gc_collect();
-    }
-}
-
 fn bench_pause_distribution(c: &mut Criterion) {
     phx_gc_disable();
     phx_gc_collect();
@@ -170,9 +136,7 @@ fn bench_pause_distribution(c: &mut Criterion) {
 
     for &n_rooted in PAUSE_SCENARIOS {
         let frame = phx_gc_push_frame(n_rooted);
-        let _guard = PauseScenarioGuard {
-            frame: frame as *mut u8,
-        };
+        let _guard = RootedFrameGuard::new(frame as *mut u8);
         for i in 0..n_rooted {
             let p = phx_gc_alloc(pause_object_size(i), TypeTag::Unknown as u32);
             unsafe { phx_gc_set_root(frame, i, p) };
@@ -332,7 +296,7 @@ fn write_pause_sidecar(summaries: &[ScenarioSummary]) {
 criterion_group!(throughput, bench_alloc_throughput);
 criterion_group!(pause, bench_pause_distribution);
 // Order matters: `throughput` lowers the global collection threshold
-// and enables auto-collect, then its `AllocBenchGuard` restores the
+// and enables auto-collect, then its `GcStateGuard` restores the
 // defaults at end-of-function. `pause` then runs against a clean
 // global state. Reordering or interleaving these groups would have
 // `pause` observe `throughput`'s tuned threshold.

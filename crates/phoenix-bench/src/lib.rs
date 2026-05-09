@@ -33,6 +33,10 @@
 #![warn(missing_docs)]
 
 use phoenix_common::span::SourceId;
+use phoenix_runtime::gc::{
+    DEFAULT_COLLECTION_THRESHOLD, phx_gc_collect, phx_gc_disable, phx_gc_pop_frame,
+    set_collection_threshold,
+};
 
 /// Source ID used for all benchmark fixtures (no real file backing).
 pub const BENCH_SOURCE_ID: SourceId = SourceId(0);
@@ -222,6 +226,50 @@ pub fn sample_counts_meet_threshold(
         .into_iter()
         .min()
         .is_some_and(|m| m >= min_required)
+}
+
+/// RAII guard that restores the global GC to its standard idle state
+/// (auto-collect off, default collection threshold, empty heap) when
+/// dropped. Hoist before mutating GC state so a panic in setup or
+/// inside a bench iteration still resets globals for any later bench
+/// group sharing the process.
+pub struct GcStateGuard;
+
+impl Drop for GcStateGuard {
+    fn drop(&mut self) {
+        phx_gc_disable();
+        phx_gc_collect();
+        set_collection_threshold(DEFAULT_COLLECTION_THRESHOLD);
+    }
+}
+
+/// RAII pop of a shadow-stack frame plus a final `phx_gc_collect()` so
+/// a panic mid-bench can't leak a rooted set into a later scenario.
+///
+/// The frame field is typed as `*mut u8` rather than `*mut Frame`
+/// because the `phoenix_runtime::gc::shadow_stack` module is
+/// `pub(crate)` — the `Frame` struct itself is `pub` within the
+/// module, but the module's visibility makes the type unnameable from
+/// outside the runtime crate. The cast round-trips through the
+/// raw-pointer representation, which is well-defined.
+pub struct RootedFrameGuard {
+    frame: *mut u8,
+}
+
+impl RootedFrameGuard {
+    /// Wrap a frame pointer returned by `phx_gc_push_frame`. The
+    /// pointer is stored as `*mut u8` for the visibility reason above;
+    /// callers pass it through as-is from the runtime API.
+    pub fn new(frame: *mut u8) -> Self {
+        Self { frame }
+    }
+}
+
+impl Drop for RootedFrameGuard {
+    fn drop(&mut self) {
+        unsafe { phx_gc_pop_frame(self.frame as *mut _) };
+        phx_gc_collect();
+    }
 }
 
 /// Assert that a fixture source parses successfully but fails type checking.

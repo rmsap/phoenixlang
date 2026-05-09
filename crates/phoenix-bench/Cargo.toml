@@ -15,10 +15,10 @@ phoenix-interp = { path = "../phoenix-interp" }
 phoenix-ir = { path = "../phoenix-ir" }
 phoenix-ir-interp = { path = "../phoenix-ir-interp" }
 phoenix-cranelift = { path = "../phoenix-cranelift" }
+phoenix-runtime = { path = "../phoenix-runtime" }
 
 [dev-dependencies]
 criterion.workspace = true
-phoenix-runtime = { path = "../phoenix-runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -28,4 +28,8 @@ harness = false
 
 [[bench]]
 name = "allocation"
+harness = false
+
+[[bench]]
+name = "collections"
 harness = false
