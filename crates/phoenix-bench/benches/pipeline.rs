@@ -4,6 +4,16 @@
 //! code generation, IR interpretation, and tree-walk interpretation across
 //! fixture programs of increasing complexity.
 //!
+//! Sibling bench: `allocation` — `phx_gc_alloc` throughput and GC pause
+//! distribution.
+//!
+//! Baseline numbers will be committed to
+//! `docs/perf-baselines/pipeline.md` at phase-2 close (see
+//! `docs/phases/phase-2.md` baseline-storage task).
+//!
+//! FIXME(phase-2.7-close): create `docs/perf-baselines/` and remove
+//! this marker.
+//!
 //! # Running
 //!
 //! ```sh

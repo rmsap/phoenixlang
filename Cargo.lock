@@ -1103,7 +1103,10 @@ dependencies = [
  "phoenix-ir-interp",
  "phoenix-lexer",
  "phoenix-parser",
+ "phoenix-runtime",
  "phoenix-sema",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

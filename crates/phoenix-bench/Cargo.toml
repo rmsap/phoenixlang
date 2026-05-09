@@ -18,7 +18,14 @@ phoenix-cranelift = { path = "../phoenix-cranelift" }
 
 [dev-dependencies]
 criterion.workspace = true
+phoenix-runtime = { path = "../phoenix-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "pipeline"
+harness = false
+
+[[bench]]
+name = "allocation"
 harness = false
