@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use phoenix_cranelift::link_executable;
+
 use phoenix_common::span::SourceId;
 use phoenix_lexer::lexer::tokenize;
 use phoenix_parser::parser;
@@ -122,16 +124,12 @@ pub fn three_way_roundtrip(source: &str) {
     );
 }
 
-/// Find the directory containing the Phoenix runtime static library.
-pub fn runtime_dir() -> String {
-    phoenix_cranelift::find_runtime_lib()
-        .expect("could not find runtime lib — build it first with `cargo build -p phoenix-runtime`")
-}
-
 /// Compile object bytes to a linked executable and return (obj_path, exe_path).
 ///
-/// Shared by [`compile_and_run`] and [`expect_panic`] to avoid duplicating
-/// the linking logic (temp file creation, linker flags, platform libs).
+/// Shared by [`compile_and_run`] and [`expect_panic`]; defers all linker
+/// flag and platform-library handling to [`link_executable`] so the
+/// driver, the benches, and the integration tests use the same code
+/// path.
 fn link_binary(obj_bytes: &[u8], prefix: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join("phoenix_cranelift_tests");
     std::fs::create_dir_all(&dir).unwrap();
@@ -141,23 +139,7 @@ fn link_binary(obj_bytes: &[u8], prefix: &str) -> (PathBuf, PathBuf) {
     let exe_path = dir.join(format!("{prefix}_{id}_{n}"));
     std::fs::write(&obj_path, obj_bytes).unwrap();
 
-    let rt_dir = runtime_dir();
-    let mut cmd = Command::new("cc");
-    cmd.arg("-o")
-        .arg(exe_path.to_str().unwrap())
-        .arg(obj_path.to_str().unwrap())
-        .arg(format!("-L{rt_dir}"))
-        .arg("-lphoenix_runtime");
-
-    // Platform-specific system libraries.
-    if cfg!(target_os = "linux") {
-        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
-    } else if cfg!(target_os = "macos") {
-        cmd.arg("-lpthread").arg("-lm");
-    }
-
-    let status = cmd.status().expect("could not run linker 'cc'");
-    assert!(status.success(), "linking failed: {status}");
+    link_executable(&obj_path, &exe_path).expect("link_executable failed");
     (obj_path, exe_path)
 }
 

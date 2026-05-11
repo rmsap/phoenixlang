@@ -1,11 +1,24 @@
 //! Benchmarks for each stage of the Phoenix compiler pipeline.
 //!
 //! Measures lex, parse, semantic analysis, IR lowering, Cranelift native
-//! code generation, IR interpretation, and tree-walk interpretation across
-//! fixture programs of increasing complexity.
+//! code generation, IR interpretation, tree-walk interpretation, and
+//! end-to-end compile-and-run wall-clock across fixture programs of
+//! increasing complexity. The `compile_and_run` group is the only one
+//! that times the *compiled binary's* runtime — every other group
+//! stops at IR or earlier, so a regression that shows up only after
+//! Cranelift codegen + linking + execution would slip past them. See
+//! `phoenix_bench::compile_and_link` / `phoenix_bench::time_run` for
+//! the harness and [`COMPILE_AND_RUN_FIXTURES`] for the gating rules.
 //!
-//! Sibling bench: `allocation` — `phx_gc_alloc` throughput and GC pause
-//! distribution.
+//! **`compile_and_run` resolution caveat.** Subprocess spawn and the
+//! harness's 1 ms poll cap together impose a measurement floor of a
+//! few milliseconds. Treat <5% changes in this group as noise — it is
+//! designed to catch cumulative regressions across codegen + runtime
+//! + execution, not sub-ms tuning wins.
+//!
+//! Sibling benches: `allocation` (`phx_gc_alloc` throughput + GC
+//! pause distribution); `collections` (Map ops + `List.sortBy`
+//! algorithmic shape).
 //!
 //! Baseline numbers will be committed to
 //! `docs/perf-baselines/pipeline.md` at phase-2 close (see
@@ -40,8 +53,42 @@
 //!
 //! Criterion will report percentage changes and flag regressions.
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use phoenix_bench::{BENCH_SOURCE_ID, EMPTY, LARGE, MEDIUM, MEDIUM_LARGE, SMALL};
+use std::sync::LazyLock;
+use std::time::Duration;
+
+use criterion::measurement::WallTime;
+use criterion::{BatchSize, BenchmarkGroup, Criterion, black_box, criterion_group, criterion_main};
+use phoenix_bench::{
+    BENCH_SOURCE_ID, EMPTY, LARGE, MEDIUM, MEDIUM_LARGE, SMALL, compile_and_link, probe_native,
+    time_run,
+};
+
+/// Snapshot of the strict-mode env var, taken once so the gate is
+/// stable across an entire `cargo bench` run. `=="1"` (not `.is_ok()`)
+/// to avoid the `=0` / `=""` footgun.
+static STRICT_COMPILE_AND_RUN: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("PHOENIX_BENCH_REQUIRE_COMPILE_AND_RUN").as_deref() == Ok("1"));
+
+/// Fixtures that run end-to-end today. `empty` / `small` are excluded
+/// because subprocess spawn dwarfs their sub-ms wall-clock.
+const COMPILE_AND_RUN_FIXTURES: &[&str] = &["medium"];
+
+/// Fixtures auto-enabled once the matching Cranelift codegen gap
+/// closes. Listed up front so the bench doesn't pay the full compile
+/// pipeline only to see the same failure each run. Mirrors the
+/// `#[ignore]`d `*_native` tests in `tests/fixture_validity.rs`;
+/// move entries to [`COMPILE_AND_RUN_FIXTURES`] when lifting the
+/// `#[ignore]`.
+const KNOWN_BLOCKED_FIXTURES: &[(&str, &str)] = &[
+    (
+        "medium_large",
+        "phoenix-cranelift: print() of list<i64> not yet lowered",
+    ),
+    (
+        "large",
+        "phoenix-cranelift: string methods used by describe() not yet lowered",
+    ),
+];
 
 fn bench_pipeline(c: &mut Criterion) {
     for (name, source) in [
@@ -164,8 +211,70 @@ fn bench_pipeline(c: &mut Criterion) {
             });
         }
 
+        register_compile_and_run(&mut group, name, source);
+
         group.finish();
     }
+}
+
+/// Register the `compile_and_run` bench for `name`/`source` when every
+/// precondition holds; otherwise emit a skip on stderr (and panic in
+/// strict mode for everything except deliberate exclusions).
+///
+/// Times only the spawn + run + teardown of the linked binary;
+/// compile + link is amortized at setup via `compile_and_link`'s
+/// per-process cache. Gating order: KNOWN_BLOCKED → not-in-fixtures →
+/// compile_and_link → probe_native. The intentional-exclusion skip
+/// is the only one that doesn't honor strict mode — fixtures excluded
+/// for "subprocess spawn dominates" are a deliberate design choice,
+/// not an unmet codegen gap.
+fn register_compile_and_run(group: &mut BenchmarkGroup<'_, WallTime>, name: &str, source: &str) {
+    // Skip for an unmet condition: honors strict mode.
+    let skip = |reason: String| {
+        if *STRICT_COMPILE_AND_RUN {
+            panic!("PHOENIX_BENCH_REQUIRE_COMPILE_AND_RUN=1 set: {reason}");
+        }
+        eprintln!("{reason}");
+    };
+
+    if let Some((_, reason)) = KNOWN_BLOCKED_FIXTURES.iter().find(|(n, _)| *n == name) {
+        skip(format!(
+            "skipping {name}/compile_and_run: known-blocked ({reason}) — \
+             move into COMPILE_AND_RUN_FIXTURES when the gap closes"
+        ));
+        return;
+    }
+    if !COMPILE_AND_RUN_FIXTURES.contains(&name) {
+        // Deliberate design exclusion — never escalate under strict mode.
+        eprintln!(
+            "skipping {name}/compile_and_run: subprocess-spawn floor dominates sub-ms \
+             fixtures (intentional, not a blocked codegen gap)"
+        );
+        return;
+    }
+
+    let exe = match compile_and_link(name, source) {
+        Ok(exe) => exe,
+        Err(e) => {
+            skip(format!("skipping {name}/compile_and_run: {e}"));
+            return;
+        }
+    };
+    if !probe_native(&exe) {
+        skip(format!(
+            "skipping {name}/compile_and_run: linked binary exited non-zero on probe"
+        ));
+        return;
+    }
+    group.bench_function("compile_and_run", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                total += time_run(black_box(&exe));
+            }
+            total
+        });
+    });
 }
 
 criterion_group!(benches, bench_pipeline);

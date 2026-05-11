@@ -205,51 +205,15 @@ function main() {
 /// exit code and prints a runtime error.
 #[test]
 fn division_by_zero_panics() {
-    let source = r#"
+    common::expect_panic(
+        r#"
 function main() {
     let x: Int = 0
     print(10 / x)
 }
-"#;
-    let obj_bytes = common::compile_to_obj(source);
-
-    let dir = std::env::temp_dir().join("phoenix_cranelift_tests");
-    std::fs::create_dir_all(&dir).unwrap();
-    let obj_path = dir.join("divzero_test.o");
-    let exe_path = dir.join("divzero_test");
-
-    std::fs::write(&obj_path, &obj_bytes).unwrap();
-
-    // Link.
-    let status = std::process::Command::new("cc")
-        .arg("-o")
-        .arg(exe_path.to_str().unwrap())
-        .arg(obj_path.to_str().unwrap())
-        .arg(format!("-L{}", common::runtime_dir()))
-        .arg("-lphoenix_runtime")
-        .arg("-lpthread")
-        .arg("-ldl")
-        .arg("-lm")
-        .status()
-        .unwrap();
-    assert!(status.success(), "linking failed");
-
-    // Run — should exit with non-zero.
-    let output = std::process::Command::new(exe_path.to_str().unwrap())
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "expected non-zero exit for division by zero"
+"#,
+        "division by zero",
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("division by zero"),
-        "expected 'division by zero' in stderr, got: {stderr}"
-    );
-
-    let _ = std::fs::remove_file(&obj_path);
-    let _ = std::fs::remove_file(&exe_path);
 }
 
 /// Test deeply nested control flow: if inside while.

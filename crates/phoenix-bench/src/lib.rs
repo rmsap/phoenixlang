@@ -6,6 +6,22 @@
 //! also contains integration tests that verify each fixture produces the
 //! expected output.
 //!
+//! # Prerequisites
+//!
+//! The `pipeline` bench's `compile_and_run` group and the
+//! `*_native` validity tests both link a real binary, so they need a
+//! working host toolchain:
+//!
+//!   - A C compiler on `$PATH` (any `cc`-shim — gcc or clang).
+//!   - The Phoenix runtime static library on a search path. The
+//!     simplest path is `cargo build -p phoenix-runtime` before
+//!     running `cargo bench`; alternatively set
+//!     `$PHOENIX_RUNTIME_LIB` to the directory containing it.
+//!
+//! On a host where `cc` is unavailable, the `compile_and_run` group
+//! intentionally panics — a broken CI runner should fail visibly
+//! rather than silently producing zero end-to-end measurements.
+//!
 //! # Running benchmarks
 //!
 //! ```sh
@@ -37,6 +53,9 @@ use phoenix_runtime::gc::{
     DEFAULT_COLLECTION_THRESHOLD, phx_gc_collect, phx_gc_disable, phx_gc_pop_frame,
     set_collection_threshold,
 };
+
+mod harness;
+pub use harness::{CompileLinkError, compile_and_link, probe_native, run_native, time_run};
 
 /// Source ID used for all benchmark fixtures (no real file backing).
 pub const BENCH_SOURCE_ID: SourceId = SourceId(0);
@@ -74,7 +93,10 @@ pub const TYPE_ERROR: &str = include_str!("../benches/fixtures/type_error.phx");
 
 /// Lex → parse → sema, panicking on errors.  Returns the checked program and
 /// sema result so callers can feed them to an interpreter or IR lowering.
-fn check_fixture(name: &str, source: &str) -> (phoenix_parser::Program, phoenix_sema::Analysis) {
+pub(crate) fn check_fixture(
+    name: &str,
+    source: &str,
+) -> (phoenix_parser::Program, phoenix_sema::Analysis) {
     let tokens = phoenix_lexer::tokenize(source, BENCH_SOURCE_ID);
     let (program, parse_diags) = phoenix_parser::parse(&tokens);
     assert!(

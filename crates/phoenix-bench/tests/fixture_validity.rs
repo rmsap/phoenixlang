@@ -7,9 +7,53 @@
 //! ```
 
 use phoenix_bench::{
-    EMPTY, LARGE, MEDIUM, MEDIUM_LARGE, PARSE_ERROR, SMALL, TYPE_ERROR, assert_parse_error,
-    assert_type_error, compile, run_ir, run_tree_walk,
+    CompileLinkError, EMPTY, LARGE, MEDIUM, MEDIUM_LARGE, PARSE_ERROR, SMALL, TYPE_ERROR,
+    assert_parse_error, assert_type_error, compile, compile_and_link, run_ir, run_native,
+    run_tree_walk,
 };
+
+/// Native-binary output must match both interpreters and be non-empty.
+/// IR-interp is a third witness so a regression in two backends that
+/// agrees on the same wrong answer still surfaces; the non-empty
+/// checks defend against `[] == [] == []` passing vacuously.
+///
+/// Complements (does not replace) the IR-only and tree-walk-only
+/// fixture tests below — those stay as the canonical reference for
+/// each fixture's expected output.
+///
+/// Runtime lib missing is a visible-skip environmental condition;
+/// `PHOENIX_REQUIRE_RUNTIME_LIB=1` turns the skip into a hard fail.
+fn assert_native_matches_interps(name: &str, source: &str) {
+    let exe = match compile_and_link(name, source) {
+        Ok(p) => p,
+        Err(CompileLinkError::RuntimeLibMissing) => {
+            if std::env::var("PHOENIX_REQUIRE_RUNTIME_LIB").as_deref() == Ok("1") {
+                panic!(
+                    "PHOENIX_REQUIRE_RUNTIME_LIB=1 set but the runtime static library \
+                     is not on any search path — run `cargo build -p phoenix-runtime` \
+                     or set $PHOENIX_RUNTIME_LIB"
+                );
+            }
+            eprintln!(
+                "warning: skipping {name}_fixture_native — runtime lib not built \
+                 (set PHOENIX_REQUIRE_RUNTIME_LIB=1 to fail instead; \
+                 `cargo build -p phoenix-runtime` to fix)"
+            );
+            return;
+        }
+        Err(e) => panic!("{name} compile/link failed: {e}"),
+    };
+    let native = run_native(&exe);
+    let ir = run_ir(name, source);
+    let tree_walk = run_tree_walk(name, source);
+    assert!(!native.is_empty(), "{name} native output was empty");
+    assert!(!ir.is_empty(), "{name} IR-interp output was empty");
+    assert!(!tree_walk.is_empty(), "{name} tree-walk output was empty");
+    assert!(
+        native == tree_walk && tree_walk == ir,
+        "{name}: backends diverged\n  native:    {native:?}\n  IR:        {ir:?}\n  tree-walk: {tree_walk:?}",
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Compilation (IR well-formedness)
@@ -191,4 +235,35 @@ fn large_fixture_ir_interp() {
         "45",
     ];
     assert_eq!(output, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Native compile-and-run tests. Same `compile_and_link` + `run_native`
+// path the `compile_and_run` bench group exercises — catches
+// codegen / linker / runtime regressions the interpreter tests miss.
+// The tree-walk fixture tests above stay as the canonical expected
+// output; equality is checked transitively through
+// `assert_native_matches_interps`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn medium_fixture_native() {
+    assert_native_matches_interps("medium", MEDIUM);
+}
+
+// `medium_large` and `large` are blocked on outstanding Cranelift
+// codegen gaps. Drop the matching `#[ignore]` once the capability
+// lands; the pipeline bench's `COMPILE_AND_RUN_FIXTURES` will
+// auto-enable the matching `compile_and_run` group at the same time.
+
+#[test]
+#[ignore = "blocked on phoenix-cranelift: print() of list<i64> not yet lowered"]
+fn medium_large_fixture_native() {
+    assert_native_matches_interps("medium_large", MEDIUM_LARGE);
+}
+
+#[test]
+#[ignore = "blocked on phoenix-cranelift: string methods used by describe() not yet lowered"]
+fn large_fixture_native() {
+    assert_native_matches_interps("large", LARGE);
 }

@@ -5,6 +5,7 @@
 //! with the system linker and Phoenix runtime library.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -38,15 +39,15 @@ pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
     };
 
     // Determine output path.
-    let out_path = match output {
-        Some(p) => p.to_string(),
+    let out_path: PathBuf = match output {
+        Some(p) => PathBuf::from(p),
         None => {
             // Strip .phx extension from input path.
-            let stem = std::path::Path::new(path)
+            let stem = Path::new(path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("a.out");
-            stem.to_string()
+            PathBuf::from(stem)
         }
     };
 
@@ -55,7 +56,7 @@ pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
 
 /// Write an object file to a unique temp path, link it with the runtime,
 /// and produce an executable.
-fn link_object(obj_bytes: &[u8], out_path: &str) {
+fn link_object(obj_bytes: &[u8], out_path: &Path) {
     // Use PID + counter for unique temp paths to avoid collisions when
     // multiple `phoenix build` invocations run concurrently.
     let pid = std::process::id();
@@ -67,7 +68,7 @@ fn link_object(obj_bytes: &[u8], out_path: &str) {
     });
     let obj_path = tmp_dir.join(format!(
         "{}.o",
-        std::path::Path::new(out_path)
+        out_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("out")
@@ -77,59 +78,25 @@ fn link_object(obj_bytes: &[u8], out_path: &str) {
         process::exit(1);
     });
 
-    // Find the runtime library.
-    let runtime_dir = match phoenix_cranelift::find_runtime_lib() {
-        Some(dir) => dir,
-        None => {
-            eprintln!(
-                "error: could not find {}\n\
-                 Set $PHOENIX_RUNTIME_LIB to the directory containing it,\n\
-                 or reinstall Phoenix with the install script.",
-                phoenix_cranelift::RUNTIME_LIB_NAME,
-            );
-            process::exit(1);
-        }
-    };
-
-    // Build platform-appropriate linker arguments.
-    let mut cmd = std::process::Command::new("cc");
-    cmd.arg("-o")
-        .arg(out_path)
-        .arg(obj_path.to_str().unwrap_or(""))
-        .arg(format!("-L{runtime_dir}"))
-        .arg("-lphoenix_runtime");
-
-    // Platform-specific system libraries.
-    if cfg!(target_os = "linux") {
-        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
-    } else if cfg!(target_os = "macos") {
-        cmd.arg("-lpthread").arg("-lm");
-    }
-
-    let status = cmd.status();
-
-    match status {
-        Ok(s) if s.success() => {
-            // Clean up temp directory on success.
+    match phoenix_cranelift::link_executable(&obj_path, out_path) {
+        Ok(()) => {
             let _ = fs::remove_dir_all(&tmp_dir);
-            eprintln!("Compiled to {out_path}");
-        }
-        Ok(s) => {
-            eprintln!(
-                "error: linker exited with {} (object file kept at {})",
-                s,
-                obj_path.display()
-            );
-            process::exit(1);
+            eprintln!("Compiled to {}", out_path.display());
         }
         Err(err) => {
-            eprintln!(
-                "error: could not run linker 'cc': {}\n\
-                 Make sure a C compiler is installed (e.g. gcc or clang).\n\
-                 Object file kept at {}.",
+            // Only the linker-was-actually-invoked variants benefit from
+            // a "kept the obj file" hint — for the others the user just
+            // needs to fix their environment.
+            let keep_hint = matches!(
                 err,
-                obj_path.display()
+                phoenix_cranelift::LinkError::LinkerFailed(_)
+                    | phoenix_cranelift::LinkError::SpawnLinker(_)
             );
+            if keep_hint {
+                eprintln!("error: {err} (object file kept at {})", obj_path.display());
+            } else {
+                eprintln!("error: {err}");
+            }
             process::exit(1);
         }
     }

@@ -43,7 +43,7 @@ mod translate;
 mod types;
 
 pub use error::CompileError;
-pub use link::{RUNTIME_LIB_NAME, find_runtime_lib};
+pub use link::{LinkError, RUNTIME_LIB_NAME, find_runtime_lib, link_executable};
 
 use context::CompileContext;
 use phoenix_ir::module::IrModule;
