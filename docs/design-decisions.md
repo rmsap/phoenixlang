@@ -654,6 +654,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### E. Cross-language comparison scope: Go 1.22+ only
 
 **Decided:** 2026-05-04
+✅ **Implemented 2026-05-11**: `bench-corpus/` ships the four locked workloads with paired Phoenix and Go programs, a `run.sh` runner gated on hyperfine + Go 1.22+, and a published comparison page at [`docs/perf/phoenix-vs-go.md`](perf/phoenix-vs-go.md). Refresh cadence: per-phase close (decision E).
 **Rationale:** Go is the closest comparison Phoenix has — GC'd, compiled, statically typed, web-server-friendly. Adding a second comparator multiplies workload-authoring effort for diminishing positioning value. Pick the one comparison that's most predictive of "would a user choose Phoenix over X" and stop there.
 
 **Locked scope:**

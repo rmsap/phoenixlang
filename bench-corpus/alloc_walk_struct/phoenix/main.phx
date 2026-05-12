@@ -1,0 +1,35 @@
+// alloc_walk_struct workload: allocate 1M small Points, sum a field,
+// let each drop unrooted as the next iteration's binding overwrites it.
+//
+// **Deviation from the phase-2.md §2.7 scope wording.** The doc says
+// "allocate 1M small structs, walk them once, drop" — implying all
+// 1M alive concurrently. Phoenix's only ordered container today
+// (immutable `List<T>`) builds in O(n²), so building a 1M-element
+// list would dwarf the alloc workload itself. Instead the bench
+// allocates one Point per iteration, reads both fields, then lets
+// auto-collect reclaim it before the next allocation — exercising
+// the alloc fast-path and the GC's sweep cadence together. The
+// 1M-alive variant is a candidate for re-introduction once the
+// stdlib gains a constant-build list or a transient mutable phase.
+//
+// Output: Σ (i + (i + 1)) = Σ (2i + 1) for i = 0..n-1
+//   = n*(n-1) + n = n²; for n = 1_000_000 that's 10¹² = 1,000,000,000,000.
+//   Matches the Go counterpart byte-for-byte; verified against
+//   expected.txt by run.sh.
+
+struct Point {
+    Int x
+    Int y
+}
+
+function main() {
+    let n: Int = 1000000
+    let mut acc: Int = 0
+    let mut i: Int = 0
+    while i < n {
+        let p: Point = Point(i, i + 1)
+        acc = acc + p.x + p.y
+        i = i + 1
+    }
+    print(acc)
+}

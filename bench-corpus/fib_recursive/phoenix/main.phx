@@ -1,0 +1,19 @@
+// fib_recursive workload: naive recursive Fibonacci.
+//
+// Isolates call-dispatch + arithmetic cost; no allocation, no GC
+// pressure. The recursive structure means the same function is
+// invoked ~2.7e7 times for fib(35), so per-call overhead dominates
+// the absolute wall-clock.
+//
+// Expected output: 9227465 (fib(35)).
+function fib(n: Int) -> Int {
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+function main() {
+    print(fib(35))
+}

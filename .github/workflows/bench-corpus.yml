@@ -1,0 +1,75 @@
+# Cross-language (Phoenix vs Go) comparison refresh.
+#
+# Per [Phase 2.7 design decision E](../../docs/design-decisions.md#e-cross-language-comparison-scope-go-122-only):
+# informational only, not a regression gate (Phoenix-vs-Phoenix in
+# `bench.yml` remains the gating signal). Refresh cadence: per-phase
+# close (2.7, then 2.4, then 2.5 — three or four runs over the whole
+# phase). That's why this is `workflow_dispatch` only — there's no
+# value in running it on every push, and the runtime (~30 min) makes
+# it a poor fit for PR CI.
+#
+# Output flow: this job regenerates `docs/perf/phoenix-vs-go.md` and
+# uploads it as an artifact. A maintainer downloads the artifact,
+# diffs against the committed version, and commits the new file by
+# hand. The workflow intentionally does NOT push back to the repo
+# — shared-tenant GHA runners are noisy enough that each refresh
+# deserves a human "does this smell right" check before publishing.
+
+name: bench-corpus
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: refresh phoenix-vs-go.md
+    runs-on: ubuntu-latest
+    # The slow workloads dominate: hash_map_churn alone is ~12 min on
+    # the original laptop (1 warmup + 5 timed runs at ~115s each) and
+    # GitHub-hosted runners are typically slower than a modern laptop
+    # for CPU-bound work. 60 min leaves headroom for build + Go runs +
+    # potential noisy-neighbor slowdowns.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Decision E requires 1.22+. Pinning to a specific patch
+          # would tie the published Go column to one toolchain version
+          # forever; "1.22.x" tracks the latest patch and the rendered
+          # markdown records the exact version used per refresh.
+          go-version: '1.22'
+
+      # `apt install` rather than `cargo install hyperfine` — the
+      # cargo build of hyperfine pulls hundreds of crates and takes
+      # several minutes; the apt package is the same tool and lands
+      # in seconds. The rendered doc only cares about hyperfine's
+      # timing output, not its version.
+      - name: Install hyperfine
+        run: sudo apt-get update && sudo apt-get install -y hyperfine
+
+      - name: Refresh cross-language comparison
+        run: bash bench-corpus/run.sh
+
+      # The full set of inputs a maintainer needs to verify the refresh
+      # before committing: the rendered markdown, plus the script's
+      # stdout (build + timing log) for forensics if a workload looks
+      # off. The hyperfine JSONs live in a tmpdir that the script
+      # cleans up on exit, so they're not available here — re-running
+      # locally is the path to recover those.
+      - name: Upload refreshed doc
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phoenix-vs-go
+          path: docs/perf/phoenix-vs-go.md
+          if-no-files-found: error
