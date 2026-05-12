@@ -27,14 +27,12 @@
 //!
 //! # Baseline
 //!
-//! Baseline numbers will be committed to
-//! `docs/perf-baselines/allocation.md` (alloc throughput) and
-//! `docs/perf-baselines/pause.md` (pause distribution) at phase-2
-//! close (see `docs/phases/phase-2.md` baseline-storage task).
-//!
-//! FIXME(phase-2.7-close): create `docs/perf-baselines/` and remove
-//! this marker. Sibling marker in `collections.rs` must be removed in
-//! the same change — `grep -rn "phase-2.7-close"` finds both.
+//! Committed numbers live in `docs/perf-baselines/allocation.md`
+//! (alloc throughput) and `docs/perf-baselines/pause.md` (pause
+//! distribution). Refresh via
+//! `cargo run -p phoenix-bench-diff --release -- update`; the
+//! post-merge `.github/workflows/bench.yml` diff fires on every push
+//! to `main`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

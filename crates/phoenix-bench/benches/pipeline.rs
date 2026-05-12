@@ -20,12 +20,11 @@
 //! pause distribution); `collections` (Map ops + `List.sortBy`
 //! algorithmic shape).
 //!
-//! Baseline numbers will be committed to
-//! `docs/perf-baselines/pipeline.md` at phase-2 close (see
-//! `docs/phases/phase-2.md` baseline-storage task).
-//!
-//! FIXME(phase-2.7-close): create `docs/perf-baselines/` and remove
-//! this marker.
+//! Committed baseline numbers live in
+//! `docs/perf-baselines/pipeline.md`. Refresh via
+//! `cargo run -p phoenix-bench-diff --release -- update`; the
+//! post-merge `.github/workflows/bench.yml` diff fires on every push
+//! to `main`.
 //!
 //! # Running
 //!

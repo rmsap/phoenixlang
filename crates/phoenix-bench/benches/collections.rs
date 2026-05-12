@@ -34,13 +34,10 @@
 //!
 //! # Baseline
 //!
-//! Baseline numbers will be committed to
-//! `docs/perf-baselines/collections.md` at phase-2 close (see
-//! `docs/phases/phase-2.md` baseline-storage task).
-//!
-//! FIXME(phase-2.7-close): create `docs/perf-baselines/` and remove
-//! this marker. Sibling marker in `allocation.rs` must be removed in
-//! the same change — `grep -rn "phase-2.7-close"` finds both.
+//! Committed numbers live in `docs/perf-baselines/collections.md`.
+//! Refresh via `cargo run -p phoenix-bench-diff --release -- update`;
+//! the post-merge `.github/workflows/bench.yml` diff fires on every
+//! push to `main`.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use phoenix_bench::{GcStateGuard, RootedFrameGuard};

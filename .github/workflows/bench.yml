@@ -1,0 +1,220 @@
+# Post-merge regression detector for Phoenix.
+#
+# Per [Phase 2.7 design decision B](../../docs/design-decisions.md#b-ci-gating-policy-post-merge-on-main):
+# runs on `push: main` only — never on PRs. Compares the latest bench
+# numbers against `docs/perf-baselines/` via `phoenix-bench-diff` and
+# opens an issue if any bench regressed by more than 20%.
+#
+# Noise-floor gate: enforcement is OFF by default. See
+# `docs/perf-baselines/README.md` for the canonical procedure for
+# flipping it on (and why there's no auto-counter).
+#
+# Runner: ubuntu-latest. The committed baseline header documents the
+# runner spec it was captured on; cross-runner drift is the most
+# likely false-positive source until decision C's CPU-governor pin is
+# in place on the CI host.
+
+name: bench
+
+on:
+  push:
+    branches: [main]
+  # Manual trigger so maintainers can run a refresh without pushing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  bench:
+    name: bench + diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Manually flip to "1" after the noise floor is established
+      # (see comment at top of file). Until then, the workflow records
+      # numbers and prints the diff but does not open issues.
+      BENCH_ENFORCE: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The runtime is built explicitly so `compile_and_run` benches
+      # can link against `libphoenix_runtime.a` via `cc`.
+      - name: Build runtime
+        run: cargo build -p phoenix-runtime --release
+
+      # Pre-build the diff binary *before* `cargo bench`. The diff tool
+      # is a few hundred lines and compiles in seconds; the bench suite
+      # is the long step. Running this first means a diff-tool compile
+      # error surfaces immediately on its own step, instead of after
+      # ~25 minutes of bench wall-clock — and the failure label on the
+      # dashboard distinguishes "tool broken" from "bench suite broken".
+      - name: Build diff tool
+        run: cargo build -p phoenix-bench-diff --release
+
+      # `cargo bench -p phoenix-bench` is invoked from the workspace
+      # root so the pause sidecar lands at the workspace-relative path
+      # `target/criterion-pause/pause.json` — this is the path the
+      # diff step (and `phoenix-bench-diff`'s default) expects. If this
+      # step ever moves to a subdirectory or uses `--manifest-path`,
+      # update the `--pause-sidecar` argument below to match.
+      # `tee` so criterion's human-readable summary is both visible
+      # live in the action log and preserved as an artifact — when a
+      # regression issue is filed weeks later, the captured stdout is
+      # the only on-disk record of what the runner actually printed
+      # (the JSON files under `target/criterion/` carry the numbers
+      # but not the per-iteration progress lines).
+      - name: Run benchmarks
+        run: |
+          set -o pipefail
+          cargo bench -p phoenix-bench 2>&1 | tee bench-stdout.log
+
+      # `phoenix-bench-diff diff` exits 0 (clean), 1 (regression) or 2
+      # (tool error: missing criterion output, baseline unreadable,
+      # malformed pause sidecar). `continue-on-error: true` keeps the
+      # step green for exit 1 so a detected regression doesn't paint
+      # the job red — downstream steps gate on `diff_exit` instead of
+      # the step outcome. Real tool failures (exit code 2 / panic) are
+      # surfaced by the "Fail on tool error" step below.
+      #
+      # stdout (the diff summary that lands in regression issues) and
+      # stderr (contract-drift warnings, missing-row warnings) are
+      # captured to separate files so the issue body stays clean.
+      - name: Diff against committed baselines
+        id: diff
+        continue-on-error: true
+        run: |
+          set +e
+          ./target/release/phoenix-bench-diff diff \
+            --baseline docs/perf-baselines \
+            --criterion target/criterion \
+            --pause-sidecar target/criterion-pause/pause.json \
+            > bench-diff.txt 2> bench-diff.stderr.txt
+          rc=$?
+          set -e
+          echo "diff_exit=${rc}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload diff artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-diff
+          path: |
+            bench-diff.txt
+            bench-diff.stderr.txt
+            bench-stdout.log
+
+      # Preserve the raw criterion + sidecar output so a regression
+      # reported weeks later can be re-diffed locally against a fixed
+      # baseline without re-running the full bench suite.
+      - name: Upload raw bench output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-raw
+          path: |
+            target/criterion/**/new/estimates.json
+            target/criterion/**/new/sample.json
+            target/criterion-pause/pause.json
+          if-no-files-found: warn
+
+      # Issue creation is gated on:
+      #   1. BENCH_ENFORCE == "1"           (noise-floor period over)
+      #   2. diff_exit == "1"               (regression detected; not
+      #      a crash before diff ran — see "Diff" step comment)
+      # Both are required so a noisy runner during noise-floor
+      # observation can't drown maintainers in issues, and so a
+      # compile-error doesn't file an empty regression issue.
+      #
+      # The `bench-regression` label is created idempotently here so
+      # the first enforcement run doesn't fail when the label doesn't
+      # exist yet — `gh label create --force` updates if present,
+      # creates otherwise.
+      #
+      # If an open regression issue already exists on `main`, the new
+      # findings are appended as a comment rather than opening a
+      # duplicate — a persistent regression should stack on one
+      # thread, not spam the tracker. (The workflow only runs on
+      # `push: main`, so there is no per-branch axis to dedupe on;
+      # the issue is always the single open issue against `main`.)
+      #
+      # The de-dupe key is `label == bench-regression` AND the exact
+      # auto-created title (`in:title` + quoted phrase). Both are
+      # required: the label alone would match anything a maintainer
+      # tagged `bench-regression` by hand (including unrelated triage
+      # issues), and the title alone would re-match if the label is
+      # later removed during triage.
+      #
+      # A previously-closed regression issue (the human fixed it and
+      # closed it) is NOT picked up here — the `--state open` filter
+      # excludes it. A fresh regression after a fix files a new
+      # issue, which is the intended behavior so the close/reopen
+      # signal stays clean.
+      #
+      # The body is built as a file (rather than `--body "..."`) and
+      # uses a `~~~` fence so bench output that happens to contain
+      # triple backticks can't escape the markdown code block.
+      - name: Open or update regression issue
+        if: env.BENCH_ENFORCE == '1' && steps.diff.outputs.diff_exit == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `gh label create --force` is the upsert path on newer gh
+          # versions, but older runners reject `--force` outright. Fall
+          # back to `gh label edit` so the workflow is robust across
+          # the GitHub-hosted runner's gh-version churn.
+          gh label create bench-regression \
+            --color B60205 \
+            --description "Post-merge bench diff above the 20% threshold" \
+            2>/dev/null \
+          || gh label edit bench-regression \
+            --color B60205 \
+            --description "Post-merge bench diff above the 20% threshold"
+          existing=$(gh issue list \
+            --label bench-regression \
+            --state open \
+            --search '"Bench regression detected on main" in:title' \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            header="Regression also present on ${{ github.sha }}."
+          else
+            header="First seen on ${{ github.sha }}."
+          fi
+          {
+            echo "$header"
+            echo
+            echo '~~~'
+            cat bench-diff.txt
+            echo '~~~'
+          } > body.md
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create \
+              --title "Bench regression detected on main" \
+              --body-file body.md \
+              --label bench-regression
+          fi
+
+      # When enforcement is off we still surface the diff in the
+      # action log so maintainers can scan it manually.
+      - name: Print diff (noise-floor mode)
+        if: env.BENCH_ENFORCE != '1'
+        run: cat bench-diff.txt
+
+      # The diff step swallows its exit code via `continue-on-error`
+      # so subsequent issue-filing logic can run, but a tool error
+      # (exit code 2: missing criterion output, baseline unreadable)
+      # would otherwise leave CI green. Re-surface it here so a
+      # broken bench setup is visible at a glance.
+      - name: Fail on tool error
+        if: steps.diff.outputs.diff_exit != '0' && steps.diff.outputs.diff_exit != '1'
+        run: |
+          echo "phoenix-bench-diff exited with code ${{ steps.diff.outputs.diff_exit }} — see bench-diff artifact"
+          exit 1

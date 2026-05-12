@@ -608,6 +608,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### A. Baseline storage strategy: manual snapshot in `docs/perf-baselines/`
 
 **Decided:** 2026-05-04
+**Implemented:** 2026-05-11 — `docs/perf-baselines/{allocation,collections,pause,pipeline}.md` populated; `phoenix-bench-diff update` writes; `phoenix-bench-diff diff` reads.
 **Rationale:** committed numbers are visible in the repo and PR diffs catch obvious regressions. Cost is low (markdown table per phase) and the format stays human-readable.
 
 **Format:** per-bench markdown table with columns `bench / parameters / mean / median / stddev / sample-size`. Refreshed at phase close and on intentional perf-affecting changes. Source files reference the baseline path so a maintainer who cuts a regression knows where to look.
@@ -619,9 +620,10 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### B. CI gating policy: post-merge on `main`
 
 **Decided:** 2026-05-04
+**Implemented:** 2026-05-11 — [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) runs `cargo bench` + `phoenix-bench-diff diff` on `push: main`; opens an issue tagged `bench-regression` when any bench exceeds the 20% threshold. Enforcement gated behind `BENCH_ENFORCE=1` until the noise floor is established (see `docs/perf-baselines/README.md`).
 **Rationale:** middle ground between the two extremes. Per-PR gating with N% slack flakes too easily before we know how stable the numbers are. Informational-only is too easy to ignore — regressions can land unnoticed for weeks.
 
-**Implementation:** GitHub Actions workflow on `push: main` that runs `cargo bench`, parses criterion output, compares to the committed baseline, and opens an issue if any number regresses by more than 20%. Cross-language Go comparisons (decision E) are explicitly excluded from this CI loop — they run off-CI per phase-close.
+**Original design:** GitHub Actions workflow on `push: main` that runs `cargo bench`, parses criterion output, compares to the committed baseline, and opens an issue if any number regresses by more than 20%. Cross-language Go comparisons (decision E) are explicitly excluded from this CI loop — they run off-CI per phase-close. See the `**Implemented:**` line above for the as-built pointers.
 
 **Alternatives considered:**
 - *Informational only* — devs read the trend; no automated alerting. Lowest CI cost (~0 if not run on PR), zero flake risk, but regressions survive too long unnoticed.
@@ -643,6 +645,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### D. Aggregate choice
 
 **Decided:** 2026-05-04
+**Implemented:** 2026-05-11 — throughput benches in `allocation.rs` / `collections.rs` / `pipeline.rs` report criterion defaults; `gc_pause` group emits P50/P95/P99/max via the JSON sidecar consumed by `phoenix-bench-diff`.
 **Rationale:** different bench shapes need different summary stats. Switching aggregates mid-phase makes historical comparisons useless, so pick once and stick.
 
 - **Throughput benchmarks** (allocation, collections, end-to-end compiled binary): mean / median / stddev — criterion's defaults; well-understood and adequate for steady-state work.

@@ -1,0 +1,20 @@
+[package]
+name = "phoenix-bench-diff"
+description = "Bench regression detector: diffs criterion output against committed baselines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "phoenix_bench_diff"
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoenix-bench-diff"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
