@@ -46,7 +46,10 @@ jobs:
           # Decision E requires 1.22+. Pinning to a specific patch
           # would tie the published Go column to one toolchain version
           # forever; "1.22.x" tracks the latest patch and the rendered
-          # markdown records the exact version used per refresh.
+          # markdown records the exact version used per refresh. The
+          # toolchain-mismatch banner that `bench-corpus/run.sh` renders
+          # when the local Go version drifts off `go1.22.x` carries the
+          # durable "this isn't a regression" call-out.
           go-version: '1.22'
 
       # `apt install` rather than `cargo install hyperfine` — the
