@@ -5,11 +5,12 @@
 //! functions that compiled code calls via `extern` declarations.
 //!
 //! Heap allocations are managed by a tracing mark-and-sweep GC.
-//! Compiled code allocates via [`phx_alloc`] (or the typed
-//! variants [`gc::phx_gc_alloc`] / `phx_string_alloc`) and is responsible
-//! for maintaining the shadow stack via [`gc::phx_gc_push_frame`] /
+//! Compiled code allocates via the typed entry point
+//! [`gc::phx_gc_alloc`] (or the tag-fixed shims [`phx_string_alloc`],
+//! `phx_list_alloc`, `phx_map_alloc`) and is responsible for
+//! maintaining the shadow stack via [`gc::phx_gc_push_frame`] /
 //! [`gc::phx_gc_set_root`] / [`gc::phx_gc_pop_frame`] so the collector
-//! can find live roots.  See `docs/design-decisions.md#gc-implementation`
+//! can find live roots. See `docs/design-decisions.md#gc-implementation`
 //! for the full rationale.
 #![warn(missing_docs)]
 
@@ -262,40 +263,16 @@ str_cmp_fn!(phx_str_ge, >=);
 
 // ── Heap allocation ─────────────────────────────────────────────────
 
-/// Allocate `size` bytes on the heap, registering the result with the GC.
-///
-/// Returns a pointer to the **payload**; the GC's 8-byte object header
-/// sits immediately before it.  Payload memory is zeroed.  The returned
-/// pointer is owned by the GC; do not call `free` on it.  It stays
-/// valid until a collection cycle in which no shadow-stack frame holds
-/// a reference to it.
-///
-/// The allocation is registered with the [`TypeTag::Unknown`](gc::TypeTag)
-/// tag, meaning the GC will conservatively scan its payload for interior
-/// pointers during the mark phase.  Use [`phx_string_alloc`] for string
-/// data (whose payload should not be scanned), or [`gc::phx_gc_alloc`]
-/// directly to specify a different tag.
-///
-/// # Semantic change in Phase 2.3
-///
-/// Pre-2.3, `phx_alloc` returned `malloc`-backed memory that lived
-/// until the process exited.  Post-2.3, the returned pointer is GC-
-/// managed: once `phx_gc_enable` runs (the generated C `main` calls
-/// it before `phx_main`), an allocation that no shadow-stack frame
-/// roots will be reclaimed at the next collection.  Any non-codegen
-/// caller (an FFI consumer, a Rust runtime helper, an external test
-/// linker) that previously relied on the leak-everything semantics
-/// must now either push a shadow-stack frame for the lifetime of the
-/// returned pointer, or call `gc::phx_gc_disable()` to opt back into
-/// leak-only behavior.
-#[unsafe(no_mangle)]
-pub extern "C" fn phx_alloc(size: usize) -> *mut u8 {
+/// Test helper: allocates with the conservative-scan tag.
+#[cfg(test)]
+fn phx_alloc_unknown(size: usize) -> *mut u8 {
     gc::phx_gc_alloc(size, gc::TypeTag::Unknown as u32)
 }
 
 /// Allocate `size` bytes for raw string data.
 ///
-/// Like [`phx_alloc`], but tagged so the GC skips the interior scan
+/// Tag-fixed shim around [`gc::phx_gc_alloc`] with
+/// [`TypeTag::String`](gc::TypeTag), so the GC skips the interior scan
 /// (UTF-8 bytes never look like valid heap pointers — scanning them
 /// would just waste cycles and risk false retention from coincidental
 /// byte patterns).
@@ -674,20 +651,71 @@ mod tests {
 
     // ── Allocation ─────────────────────────────────────────────────
 
-    /// phx_alloc(0) must not trigger UB.
+    /// Zero-byte allocations must not trigger UB.
     #[test]
     fn alloc_zero_size() {
-        let ptr = phx_alloc(0);
+        let ptr = phx_alloc_unknown(0);
         assert!(!ptr.is_null());
     }
 
     #[test]
     fn alloc_normal() {
-        let ptr = phx_alloc(64);
+        let ptr = phx_alloc_unknown(64);
         assert!(!ptr.is_null());
         // Verify memory is zeroed.
         let slice = unsafe { slice::from_raw_parts(ptr, 64) };
         assert!(slice.iter().all(|&b| b == 0));
+    }
+
+    /// Read the GC object-header tag for a payload returned by one of
+    /// the typed allocators. The header sits at `payload - HEADER_SIZE`.
+    unsafe fn tag_at_payload(payload: *mut u8) -> gc::TypeTag {
+        let header = unsafe { payload.sub(gc::HEADER_SIZE) as *const gc::ObjectHeader };
+        unsafe { (*header).tag() }
+    }
+
+    /// `phx_string_alloc` zeroes its payload, returns a non-null pointer,
+    /// and tags the allocation `String` (so the GC skips interior scan).
+    #[test]
+    fn string_alloc_returns_zeroed_payload() {
+        let ptr = phx_string_alloc(32);
+        assert!(!ptr.is_null());
+        let slice = unsafe { slice::from_raw_parts(ptr, 32) };
+        assert!(slice.iter().all(|&b| b == 0));
+        assert_eq!(unsafe { tag_at_payload(ptr) }, gc::TypeTag::String);
+    }
+
+    /// `phx_list_alloc` returns a `List`-tagged buffer with the header
+    /// populated (length, capacity, elem_size).
+    #[test]
+    fn list_alloc_initializes_header() {
+        let ptr = crate::list_methods::phx_list_alloc(8, 4);
+        assert!(!ptr.is_null());
+        unsafe {
+            assert_eq!(*(ptr as *const i64), 4); // length
+            assert_eq!(*(ptr as *const i64).add(1), 4); // capacity
+            assert_eq!(*(ptr as *const i64).add(2), 8); // elem_size
+        }
+        assert_eq!(unsafe { tag_at_payload(ptr) }, gc::TypeTag::List);
+    }
+
+    /// `phx_map_alloc` returns a `Map`-tagged buffer with the header
+    /// populated. All tag bytes start zeroed (`TAG_EMPTY`), so length
+    /// starts at zero regardless of capacity. The exact capacity is
+    /// `buckets_for(count)` (floored at `MIN_BUCKETS`); the assertion
+    /// only requires it to be ≥ the caller-supplied count to avoid
+    /// coupling to `MIN_BUCKETS`.
+    #[test]
+    fn map_alloc_initializes_header() {
+        let ptr = crate::map_methods::phx_map_alloc(8, 8, 4);
+        assert!(!ptr.is_null());
+        unsafe {
+            assert_eq!(*(ptr as *const i64), 0); // length
+            assert!(*(ptr as *const i64).add(1) >= 4); // capacity ≥ count
+            assert_eq!(*(ptr as *const i64).add(2), 8); // key_size
+            assert_eq!(*(ptr as *const i64).add(3), 8); // val_size
+        }
+        assert_eq!(unsafe { tag_at_payload(ptr) }, gc::TypeTag::Map);
     }
 
     // ── Print functions ───────────────────────────────────────────

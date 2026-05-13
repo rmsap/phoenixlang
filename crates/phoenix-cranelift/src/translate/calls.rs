@@ -4,10 +4,10 @@
 //! allocation).  Builtin method calls are dispatched to domain-specific
 //! modules: `list_methods`, `map_methods`, `option_methods`, `result_methods`.
 
-use cranelift_codegen::ir::types as cl;
 use cranelift_codegen::ir::{InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_module::Module;
+// Trait-only import: `declare_func_in_func` is a `Module` trait method.
+use cranelift_module::Module as _;
 
 use crate::context::CompileContext;
 use crate::error::CompileError;
@@ -16,7 +16,7 @@ use phoenix_ir::instruction::{Op, ValueId};
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::call_runtime;
+use super::helpers::{call_runtime, emit_gc_alloc};
 use super::layout::{SLOT_SIZE, TypeLayout};
 use super::{FuncState, get_val, get_val1};
 
@@ -45,13 +45,8 @@ pub(super) fn translate_closure_alloc(
             .collect::<Result<Vec<_>, CompileError>>()?;
     // 1 slot for the fn-ptr at slot 0, then captures laid out back-to-back.
     let num_slots = 1 + TypeLayout::cumulative_slots(&capture_types);
-    let size = (num_slots * SLOT_SIZE) as i64;
-    let alloc_ref = ctx
-        .module
-        .declare_func_in_func(ctx.runtime.alloc, builder.func);
-    let size_val = builder.ins().iconst(cl::I64, size);
-    let call = builder.ins().call(alloc_ref, &[size_val]);
-    let ptr = builder.inst_results(call)[0];
+    let size = num_slots * SLOT_SIZE;
+    let ptr = emit_gc_alloc(builder, ctx, size, crate::type_tag::CLOSURE);
 
     // Store function pointer at slot 0.
     let cl_func_id = ctx.func_ids[target_fid];

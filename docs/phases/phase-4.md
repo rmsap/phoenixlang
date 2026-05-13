@@ -13,6 +13,12 @@ A batteries-included stdlib for web development. This is what makes Phoenix prac
 - **After 4.3 + 4.5 + 4.6 land:** 4.7 Database (schemas, typed queries, migrations).
 - **Last:** 4.9 Test Framework — its four dependencies (annotations, async, HTTP, database) are all satisfied by this point.
 
+## Inputs from prior phases
+
+Open follow-ups whose reopen trigger lands in Phase 4. Anyone scheduling Phase 4 work should treat these as scope candidates, not just memory.
+
+- **Segregated-free-list allocator reopen — candidate trigger, not a firm one.** Phase 2.7 PR 6 deferred the size-class arena (per [GC subordinate decision B](../design-decisions.md#b-heap-layout-segregated-free-lists-by-size-class-single-arena)) on the grounds that no current workload is alloc-throughput-dominated. 4.4 (HTTP server / typed router) and 4.6 (JSON encode/decode) are the most likely workloads to make the alloc fast path hot enough to revisit, but **that's a hypothesis, not a measurement** — the prior 50 % attribution against `compile_and_run/medium` is a back-of-envelope from an unsaved `perf record` run (see decision B). Before scoping any rewrite, rerun `perf record` against the actual handler workload and confirm `phx_gc_alloc` + GC bookkeeping is genuinely the dominant cost.
+
 ## 4.1 Core Types and Collections
 
 - `List<T>`, `Map<K, V>`, `Set<T>`

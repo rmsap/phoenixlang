@@ -31,6 +31,24 @@ pub(crate) fn call_runtime(
     builder.inst_results(call).to_vec()
 }
 
+/// Emit a typed GC allocation. Centralises the `phx_gc_alloc(size, tag) -> ptr`
+/// ABI: size is `I64`, tag is `I32` (encoding a `u32` per the runtime), the
+/// returned pointer is `I64`.
+pub(crate) fn emit_gc_alloc(
+    builder: &mut FunctionBuilder,
+    ctx: &mut CompileContext,
+    size_bytes: usize,
+    tag: u32,
+) -> Value {
+    let alloc_ref = ctx
+        .module
+        .declare_func_in_func(ctx.runtime.gc_alloc, builder.func);
+    let size_val = builder.ins().iconst(cl::I64, size_bytes as i64);
+    let tag_val = builder.ins().iconst(cl::I32, i64::from(tag));
+    let call = builder.ins().call(alloc_ref, &[size_val, tag_val]);
+    builder.inst_results(call)[0]
+}
+
 /// Emit a string comparison call to a runtime function.
 pub(crate) fn emit_str_cmp(
     builder: &mut FunctionBuilder,

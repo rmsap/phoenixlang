@@ -11,7 +11,7 @@ use phoenix_ir::instruction::Op;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
-use super::helpers::emit_str_cmp;
+use super::helpers::{emit_gc_alloc, emit_str_cmp};
 use super::layout::{SLOT_SIZE, TypeLayout};
 use super::{FuncState, get_val, get_val1};
 
@@ -63,13 +63,8 @@ pub(super) fn translate_struct(
                 .iter()
                 .map(|(_, ty)| TypeLayout::of(ty).slots())
                 .sum();
-            let size = (total_slots * SLOT_SIZE) as i64;
-            let alloc_ref = ctx
-                .module
-                .declare_func_in_func(ctx.runtime.alloc, builder.func);
-            let size_val = builder.ins().iconst(cl::I64, size);
-            let call = builder.ins().call(alloc_ref, &[size_val]);
-            let ptr = builder.inst_results(call)[0];
+            let size = total_slots * SLOT_SIZE;
+            let ptr = emit_gc_alloc(builder, ctx, size, crate::type_tag::STRUCT);
             let mut slot = 0usize;
             for (i, fid) in fields.iter().enumerate() {
                 let field_vals = get_val(state, *fid)?;
@@ -168,13 +163,8 @@ pub(super) fn translate_enum(
             if actual_slots > max_payload_slots {
                 max_payload_slots = actual_slots;
             }
-            let size = ((1 + max_payload_slots) * SLOT_SIZE) as i64;
-            let alloc_ref = ctx
-                .module
-                .declare_func_in_func(ctx.runtime.alloc, builder.func);
-            let size_val = builder.ins().iconst(cl::I64, size);
-            let call = builder.ins().call(alloc_ref, &[size_val]);
-            let ptr = builder.inst_results(call)[0];
+            let size = (1 + max_payload_slots) * SLOT_SIZE;
+            let ptr = emit_gc_alloc(builder, ctx, size, crate::type_tag::ENUM);
             let disc = builder.ins().iconst(cl::I64, *variant_idx as i64);
             builder.ins().store(MemFlags::new(), disc, ptr, 0);
             let variant_types = &layout[*variant_idx as usize].1;

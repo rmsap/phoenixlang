@@ -43,8 +43,9 @@
 
 use std::slice;
 
+use crate::gc::{TypeTag, phx_gc_alloc};
 use crate::list_methods::{MAX_REASONABLE_STRING_LEN, STRING_FAT_POINTER_SIZE};
-use crate::{phx_alloc, runtime_abort};
+use crate::runtime_abort;
 
 /// Header size in bytes (length + capacity + key_size + val_size).
 pub(crate) const HEADER_SIZE: usize = 32;
@@ -291,8 +292,8 @@ unsafe fn probe(
 /// occupied entries without rehashing.
 ///
 /// `length` starts at 0; `capacity` is `buckets_for(count)`. All tags
-/// are `EMPTY` (the underlying [`phx_alloc`] zeros the whole region and
-/// `TAG_EMPTY == 0`). The pairs region is also zeroed by the
+/// are `EMPTY` (the underlying [`phx_gc_alloc`] zeros the whole region
+/// and `TAG_EMPTY == 0`). The pairs region is also zeroed by the
 /// allocator, but its bytes are *not meaningful* for unoccupied
 /// buckets — readers must consult the tag array first.
 ///
@@ -324,14 +325,17 @@ pub extern "C" fn phx_map_alloc(key_size: i64, val_size: i64, count: i64) -> *mu
     let cnt = count as usize;
     let capacity = buckets_for(cnt);
     let total = total_size(capacity, ks, vs);
-    let ptr = phx_alloc(total);
+    // Tag is informational until trace tables (GC subordinate
+    // decision C — see `TypeTag` in `crate::gc` for migration status)
+    // replace the conservative interior scan with per-tag mark fns.
+    let ptr = phx_gc_alloc(total, TypeTag::Map as u32);
     unsafe {
         *(ptr as *mut i64) = 0;
         *((ptr as *mut i64).add(1)) = capacity as i64;
         *((ptr as *mut i64).add(2)) = key_size;
         *((ptr as *mut i64).add(3)) = val_size;
     }
-    // Tags are already zeroed by phx_alloc, so all buckets start EMPTY.
+    // Tags are already zeroed by phx_gc_alloc, so all buckets start EMPTY.
     ptr
 }
 
@@ -350,7 +354,7 @@ pub extern "C" fn phx_map_alloc(key_size: i64, val_size: i64, count: i64) -> *mu
 /// maps. Critical because the only allocation here is the `phx_map_alloc`
 /// at the top — looping through `phx_map_set_raw` would allocate n+1
 /// maps and leave each previous `current` unrooted across the next
-/// `phx_alloc` (auto-collect would reclaim it as garbage).
+/// `phx_gc_alloc` (auto-collect would reclaim it as garbage).
 ///
 /// # Safety
 ///
@@ -598,7 +602,7 @@ unsafe fn rehash_into(src: *const u8, new_capacity: usize) -> *mut u8 {
 ///
 /// - `map` must point to a valid map.
 /// - `map` must be rooted by the caller's shadow-stack frame for the
-///   duration of this call. The internal `phx_alloc` (via
+///   duration of this call. The internal `phx_gc_alloc` (via
 ///   `phx_map_alloc_internal` / `rehash_into`) can trigger an
 ///   auto-collect that would sweep an unrooted input before
 ///   `copy_map_same_layout` reads from it. See the *Rooting contract*
@@ -608,7 +612,7 @@ unsafe fn rehash_into(src: *const u8, new_capacity: usize) -> *mut u8 {
 ///   16-byte string fat pointer (or any other reference into a
 ///   GC-managed allocation), the *pointed-to* heap object must also be
 ///   rooted by the caller for the duration of this call** — the same
-///   internal `phx_alloc` that endangers `map` would sweep an unrooted
+///   internal `phx_gc_alloc` that endangers `map` would sweep an unrooted
 ///   string before its bytes are read by `copy_nonoverlapping`. The
 ///   fat-pointer bytes themselves are captured by value (no rooting
 ///   needed for `key_ptr`/`val_ptr` as locations).
@@ -648,7 +652,7 @@ pub unsafe extern "C" fn phx_map_set_raw(
     // empty and discardable, and the caller's sizes are by definition
     // authoritative.
     //
-    // The single allocation here is critical — any second `phx_alloc`
+    // The single allocation here is critical — any second `phx_gc_alloc`
     // between `phx_map_alloc_internal` returning and the body fully
     // written would put `new_map` at risk of being swept (it's held
     // only in a Rust local, not on the shadow stack), so we never
@@ -713,7 +717,7 @@ pub unsafe extern "C" fn phx_map_set_raw(
 /// or grow) skip the recomputation; (2) the header's `length` field is
 /// written to the supplied value, letting the caller commit the final
 /// length up-front rather than fixing it up after the body is
-/// populated. Tags region is still zeroed by `phx_alloc`, so all
+/// populated. Tags region is still zeroed by `phx_gc_alloc`, so all
 /// buckets start `EMPTY` regardless of the `length` value.
 ///
 /// Used by `set_raw`, `remove_raw`, and `rehash_into` after they've
@@ -722,7 +726,7 @@ pub unsafe extern "C" fn phx_map_set_raw(
 /// invariants, and the header `length` write trusts the caller.
 fn phx_map_alloc_internal(capacity: usize, ks: usize, vs: usize, length: usize) -> *mut u8 {
     let total = total_size(capacity, ks, vs);
-    let ptr = phx_alloc(total);
+    let ptr = phx_gc_alloc(total, TypeTag::Map as u32);
     unsafe {
         *(ptr as *mut i64) = length as i64;
         *((ptr as *mut i64).add(1)) = capacity as i64;
@@ -760,7 +764,7 @@ fn phx_map_alloc_internal(capacity: usize, ks: usize, vs: usize, length: usize) 
 ///
 /// - `map` must point to a valid map.
 /// - `map` must be rooted by the caller's shadow-stack frame for the
-///   duration of this call. The internal `phx_alloc` (via
+///   duration of this call. The internal `phx_gc_alloc` (via
 ///   `phx_map_alloc_internal`) can trigger an auto-collect that would
 ///   sweep an unrooted input before `copy_map_same_layout` reads from
 ///   it. See the *Rooting contract* in the `list_methods` module

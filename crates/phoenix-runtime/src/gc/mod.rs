@@ -44,12 +44,16 @@ fn lock_heap() -> MutexGuard<'static, MarkSweepHeap> {
 /// for interior pointers. `String` is special-cased: its payload is
 /// raw UTF-8 bytes, never pointers, so the scan is skipped.
 ///
-/// The typed variants `List` / `Map` / `Closure` / `Struct` / `Enum` /
-/// `Dyn` are declared but not yet applied at allocation sites; the
-/// migration is tracked as the **"Thread typed allocators through
-/// `TypeTag`"** bullet under
-/// [`docs/phases/phase-2.md` § Performance benchmarks](../../../../docs/phases/phase-2.md#performance-benchmarks).
-/// The conservative `Unknown` scan keeps the GC correct in the meantime.
+/// The typed variants `List` / `Map` / `Closure` / `Struct` / `Enum`
+/// are threaded through their respective allocation sites as of
+/// phase 2.7 see `crates/phoenix-runtime/src/{list,map}_methods.rs`
+/// and `crates/phoenix-cranelift/src/translate/{data,calls,enum_helpers}.rs`).
+/// Conservative interior scanning still runs on those payloads; trace
+/// tables (GC subordinate decision C — replace the scan with a
+/// per-tag mark function) are queued behind a pause-distribution
+/// regression signal that the bench has not yet shown.
+/// `Dyn` remains declared-but-unused — no codegen site is emitting
+/// `dyn Trait` allocations through a tag-aware path today.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TypeTag {

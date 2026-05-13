@@ -38,8 +38,8 @@
 
 use std::slice;
 
-use crate::gc::{phx_gc_pop_frame, phx_gc_push_frame, phx_gc_set_root};
-use crate::{phx_alloc, runtime_abort};
+use crate::gc::{TypeTag, phx_gc_alloc, phx_gc_pop_frame, phx_gc_push_frame, phx_gc_set_root};
+use crate::runtime_abort;
 
 /// Header size in bytes (length + capacity + elem_size).
 pub(crate) const HEADER_SIZE: usize = 24;
@@ -166,7 +166,10 @@ pub extern "C" fn phx_list_alloc(elem_size: i64, count: i64) -> *mut u8 {
     let Some(total) = HEADER_SIZE.checked_add(data_size) else {
         runtime_abort("phx_list_alloc: allocation size overflow");
     };
-    let ptr = phx_alloc(total);
+    // Tag is informational until trace tables (GC subordinate
+    // decision C — see `TypeTag` in `crate::gc` for migration status)
+    // replace the conservative interior scan with per-tag mark fns.
+    let ptr = phx_gc_alloc(total, TypeTag::List as u32);
     unsafe {
         // length = count
         *(ptr as *mut i64) = count;

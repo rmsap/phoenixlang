@@ -40,6 +40,7 @@ macro_rules! ice {
 /// Runtime library discovery for linking.
 pub mod link;
 mod translate;
+mod type_tag;
 mod types;
 
 pub use error::CompileError;

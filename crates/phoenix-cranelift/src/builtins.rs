@@ -3,7 +3,7 @@
 //! Each runtime function is declared as an imported function in the
 //! Cranelift module so compiled code can call it.
 
-use cranelift_codegen::ir::types::{F64, I8, I64};
+use cranelift_codegen::ir::types::{F64, I8, I32, I64};
 use cranelift_codegen::ir::{AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
 use cranelift_module::{FuncId, Linkage, Module};
@@ -42,8 +42,13 @@ pub struct RuntimeFunctions {
     pub str_le: FuncId,
     /// `phx_str_ge`.
     pub str_ge: FuncId,
-    /// `phx_alloc(size) -> ptr`.
-    pub alloc: FuncId,
+    /// `phx_gc_alloc(size, tag) -> ptr`. Typed allocation; the tag is
+    /// one of the constants in [`crate::type_tag`]. Used by every
+    /// codegen-emitted allocation (struct, enum, closure-env). The
+    /// runtime's own typed callers (`phx_list_alloc`, `phx_map_alloc`,
+    /// `phx_string_alloc`) also bottom out in `phx_gc_alloc` with their
+    /// corresponding tag.
+    pub gc_alloc: FuncId,
     /// `phx_str_length(ptr, len) -> i64`.
     pub str_length: FuncId,
     /// `phx_str_contains(p1, l1, p2, l2) -> i8`.
@@ -143,7 +148,7 @@ impl RuntimeFunctions {
             str_gt: declare_str_cmp(module, "phx_str_gt", call_conv)?,
             str_le: declare_str_cmp(module, "phx_str_le", call_conv)?,
             str_ge: declare_str_cmp(module, "phx_str_ge", call_conv)?,
-            alloc: declare_func(module, "phx_alloc", &[I64], &[I64], call_conv)?,
+            gc_alloc: declare_func(module, "phx_gc_alloc", &[I64, I32], &[I64], call_conv)?,
             str_length: declare_func(module, "phx_str_length", &[I64, I64], &[I64], call_conv)?,
             // contains/startsWith/endsWith share the same signature as str_cmp.
             str_contains: declare_str_cmp(module, "phx_str_contains", call_conv)?,

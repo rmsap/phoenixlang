@@ -24,6 +24,6 @@ pub(crate) use type_layout::TypeLayout;
 /// 8-byte-aligned slots: scalars occupy 1 slot, `StringRef` fat pointers
 /// occupy 2 slots.
 ///
-/// This constant must match the alignment used by `phx_alloc` in the runtime
-/// (which allocates with 8-byte alignment).
+/// This constant must match the alignment used by `phx_gc_alloc` in the
+/// runtime (which allocates with 8-byte alignment).
 pub(super) const SLOT_SIZE: usize = 8;

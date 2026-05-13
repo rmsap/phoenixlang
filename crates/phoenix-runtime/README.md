@@ -9,7 +9,7 @@ The runtime provides the C-ABI symbols that compiled code calls via `extern` dec
 In normal use you don't depend on this crate directly — the `phoenix build` driver locates the prebuilt static library and links it into your binary. Compiled Phoenix code emits calls like:
 
 ```text
-phx_alloc, phx_string_alloc, phx_gc_alloc
+phx_gc_alloc, phx_string_alloc
 phx_gc_push_frame, phx_gc_set_root, phx_gc_pop_frame
 phx_str_concat, phx_list_alloc, phx_map_alloc, ...
 ```

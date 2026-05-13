@@ -448,6 +448,12 @@ Bump-only without compaction fragments badly. Free-list with size classes is the
 
 **Adopted baseline (2026-05-04).** First cut uses Rust's global allocator + a `HashSet<*mut ObjectHeader>` registry — every allocation is registered, sweep walks the registry and frees unreachable headers via `dealloc`. Segregated free lists deferred to Phase 2.7 as a perf-tuning target; the global-allocator path is correctness-equivalent and avoids reimplementing arena management before we have a perf signal pointing at it.
 
+**Evaluated 2026-05-12 (PR 6 of phase 2.7) — deferred again.** `docs/perf-baselines/allocation.md` shows `phx_gc_alloc` running at ~60–130 ns per call (vs. plain `malloc`'s ~10–30 ns), so the global-allocator + registry path does carry overhead — but no program in either the `compile_and_run` group of `docs/perf-baselines/pipeline.md` or the `bench-corpus` workloads at `docs/perf/phoenix-vs-go.md` has alloc throughput as its dominant cost. `compile_and_run/medium` at 1.23 ms could shed ~15 % wall-clock from a 30 % faster allocator; nothing else benefits more than single-digit %. (Math: a quick `perf record -F 4000` against the compiled binary produced from the `medium` fixture at [`crates/phoenix-bench/benches/fixtures/medium.phx`](../crates/phoenix-bench/benches/fixtures/medium.phx) — the executed-binary phase of the `compile_and_run/medium` bench in [`crates/phoenix-bench/benches/pipeline.rs`](../crates/phoenix-bench/benches/pipeline.rs) — attributes roughly half of wall-clock to `phx_gc_alloc` + GC bookkeeping at the chosen sample size. Small Phoenix programs allocate per-statement for intermediate values, so a 30 % allocator speedup translates to ~30 % × 50 % ≈ 15 % wall-clock. Back-of-envelope only; the `perf` output itself is **not captured in the repo**, and the real lift would need a refreshed `compile_and_run` baseline if size classes ever land. Anyone reopening this entry should rerun `perf record` against that same fixture before relying on the 50 % attribution.) The cross-language gap that actually motivated PR 6's expansion (1900× / 6900× ratios on `sort_ints` / `hash_map_churn`) is dominated by O(n²) immutable-container builds (decision F in [§Phase 2.7 benchmarking](#phase-27-benchmarking)), which the size-class arena does not address.
+
+**Reopens when:** an alloc-throughput-dominated workload lands in the corpus — most likely once Phase 4's HTTP / JSON stdlib pieces ship and a real request-handler workload starts running through the alloc fast path on every request. Until then, the current `phx_gc_alloc` cost is acceptable.
+
+**Out-of-scope changes preserved.** Phase 2.3's 8-spare-codepoint reservation in the object header (decision C below) still holds, so reinstating size classes later doesn't break ABI. The `GcHeap` trait abstraction (decision E below) means the swap-in stays behind a single Rust interface.
+
 #### C. Object header: 8-byte per-object header
 
 ```
@@ -458,15 +464,17 @@ Bump-only without compaction fragments badly. Free-list with size classes is the
   bits  [32..64] payload size or trace-table index
 ```
 
-The original design split bits 1..4 into a size-class field; that field is unused in the first cut (Decision B's adopted baseline does not maintain size classes), so bits 1..8 are all available to the type tag. Reinstating size classes when Phase 2.7 lands the segregated allocator means narrowing the tag back to 4 bits, which still fits today's 8 variants with **8 spare codepoints** — no ABI break. Anyone adding to `TypeTag` should treat that 16-variant ceiling as a hard budget; past it, either the size-class plan changes or the header redesigns.
+The original design split bits 1..4 into a size-class field; that field is unused in the first cut (Decision B's adopted baseline does not maintain size classes), so bits 1..8 are all available to the type tag. Phase 2.7 evaluated the segregated allocator and deferred it (see decision B above); if a future reopen reinstates size classes the tag narrows back to 4 bits, which still fits today's 8 variants with **8 spare codepoints** — no ABI break. Anyone adding to `TypeTag` should treat that 16-variant ceiling as a hard budget; past it, either the size-class plan changes or the header redesigns.
 
 Trace metadata lives in a side table indexed by type-tag for built-ins and by `StructInfo` / `EnumInfo` index for user types — keeps per-allocation IR small. Forwarding-pointer bits are reserved now so a future moving GC doesn't break ABI.
 
-The `phx_alloc` C-ABI signature gains a `type_tag: u32` argument; the *Rust-side* `GcHeap` trait dispatches once inside that function.
+The typed C-ABI allocator is `phx_gc_alloc(size: usize, type_tag: u32) -> *mut u8`; the *Rust-side* `GcHeap` trait dispatches once inside that function.
+
+**2026-05-12 update (PR 6 of phase 2.7).** The earlier untyped `phx_alloc(size) -> *mut u8` shim was retired in this PR — every codegen-emitted allocation now calls `phx_gc_alloc` directly with the appropriate `TypeTag`, and the typed runtime helpers (`phx_list_alloc`, `phx_map_alloc`, `phx_string_alloc`) bottom out there too. Any downstream test linker or FFI consumer that previously resolved `phx_alloc` must now call `phx_gc_alloc` with an explicit tag (`TypeTag::Unknown as u32` reproduces the prior conservative-scan behavior).
 
 #### D. Safepoint placement: at allocation calls only
 
-Single-threaded. GC fires only when `phx_alloc` (and `phx_list_alloc`, `phx_map_alloc`, etc.) decide to collect (threshold-based — start at 1 MB allocated since last collection). Loop back-edges and function entry are deferred to Phase 4.3 when concurrency forces preemptive safepoints.
+Single-threaded. GC fires only when `phx_gc_alloc` (and the typed helpers `phx_list_alloc`, `phx_map_alloc`, `phx_string_alloc` that bottom out in it) decide to collect (threshold-based — start at 1 MB allocated since last collection). Loop back-edges and function entry are deferred to Phase 4.3 when concurrency forces preemptive safepoints.
 
 No Phoenix program today can run an allocation-free hot loop (string/list/map ops all allocate), so the "GC starves under hot non-allocating loop" pathology is theoretical until 4.3.
 
@@ -474,7 +482,7 @@ No Phoenix program today can run an allocation-free hot loop (string/list/map op
 
 `trait GcHeap { fn alloc(&mut self, size, type_tag) -> *mut u8; fn collect(&mut self, roots: &[*mut u8]); }` in `phoenix-runtime/src/gc/mod.rs`. Phase 2.3 ships `MarkSweepHeap` only. Phase 2.4 plugs in a WASM-GC-backed impl behind the same trait — port becomes mechanical instead of a rewrite.
 
-The C-ABI symbol (`phx_alloc`) does not change shape between impls — trait dispatch happens once, inside that C function.
+The C-ABI symbol `phx_gc_alloc` does not change shape between impls — trait dispatch happens once, inside that C function.
 
 #### F. Strings join the GC heap; no interning in 2.3
 
@@ -496,7 +504,7 @@ Every `extern "C"` symbol in `phoenix-runtime` (panic strategy: `unwind`) must t
 
 This invariant is load-bearing for any helper that brackets work between `phx_gc_push_frame` and `phx_gc_pop_frame`: a panic between the two would (a) trigger the UB above and (b) leak the frame. New helpers that need to push/pop a frame around a multi-step operation must therefore audit every function called between the push and the pop and confirm none of them panic. The current audit list, all routed through `runtime_abort`:
 
-- `phx_gc_alloc` / `phx_string_alloc` / `phx_alloc` — `runtime_abort` on layout failure, `handle_alloc_error` on OOM (which itself aborts).
+- `phx_gc_alloc` / `phx_string_alloc` — `runtime_abort` on layout failure, `handle_alloc_error` on OOM (which itself aborts).
 - `phx_gc_set_root` / `phx_gc_pop_frame` — `runtime_abort` on bad indices / mismatch.
 - `phx_gc_shutdown` — `lock_heap()` (`runtime_abort` on poison), `mem::replace`, then `Drop for MarkSweepHeap` which `runtime_abort`s on layout failure during dealloc. No `panic!`/`expect`/`assert!` reachable.
 - `to_phx_string_from_str` — wraps `phx_string_alloc`, no panicking branch.
@@ -608,7 +616,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### A. Baseline storage strategy: manual snapshot in `docs/perf-baselines/`
 
 **Decided:** 2026-05-04
-**Implemented:** 2026-05-11 — `docs/perf-baselines/{allocation,collections,pause,pipeline}.md` populated; `phoenix-bench-diff update` writes; `phoenix-bench-diff diff` reads.
+✅ **Implemented 2026-05-11**: `docs/perf-baselines/{allocation,collections,pause,pipeline}.md` populated; `phoenix-bench-diff update` writes; `phoenix-bench-diff diff` reads.
 **Rationale:** committed numbers are visible in the repo and PR diffs catch obvious regressions. Cost is low (markdown table per phase) and the format stays human-readable.
 
 **Format:** per-bench markdown table with columns `bench / parameters / mean / median / stddev / sample-size`. Refreshed at phase close and on intentional perf-affecting changes. Source files reference the baseline path so a maintainer who cuts a regression knows where to look.
@@ -620,7 +628,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### B. CI gating policy: post-merge on `main`
 
 **Decided:** 2026-05-04
-**Implemented:** 2026-05-11 — [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) runs `cargo bench` + `phoenix-bench-diff diff` on `push: main`; opens an issue tagged `bench-regression` when any bench exceeds the 20% threshold. Enforcement gated behind `BENCH_ENFORCE=1` until the noise floor is established (see `docs/perf-baselines/README.md`).
+✅ **Implemented 2026-05-11**: [`.github/workflows/bench.yml`](../.github/workflows/bench.yml) runs `cargo bench` + `phoenix-bench-diff diff` on `push: main`; opens an issue tagged `bench-regression` when any bench exceeds the 20% threshold. Enforcement gated behind `BENCH_ENFORCE=1` until the noise floor is established (see `docs/perf-baselines/README.md`).
 **Rationale:** middle ground between the two extremes. Per-PR gating with N% slack flakes too easily before we know how stable the numbers are. Informational-only is too easy to ignore — regressions can land unnoticed for weeks.
 
 **Original design:** GitHub Actions workflow on `push: main` that runs `cargo bench`, parses criterion output, compares to the committed baseline, and opens an issue if any number regresses by more than 20%. Cross-language Go comparisons (decision E) are explicitly excluded from this CI loop — they run off-CI per phase-close. See the `**Implemented:**` line above for the as-built pointers.
@@ -632,6 +640,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### C. Calibration and runner constraints
 
 **Decided:** 2026-05-04
+✅ **Implemented 2026-05-11**: recipe applied across the harness. The 5-run minimum is enforced by criterion's default sample size in `crates/phoenix-bench/benches/{allocation,collections,pipeline}.rs` and explicitly by `--runs 5 --warmup 1` in [`bench-corpus/run.sh`](../bench-corpus/run.sh) (decision E). The runner spec is rendered into each baseline file's `README.md`-referenced header and into [`docs/perf/phoenix-vs-go.md`](perf/phoenix-vs-go.md). Single-threaded scope is implicit in 2.7 (no multi-threaded benches exist). CPU-governor pin is **not applied** under WSL2 (no `cpufreq` exposure) or GitHub-hosted runners (shared-tenant VMs); the residual variance is documented per-page (`pause.md`, `phoenix-vs-go.md`) as the cost of decision B's deferred dedicated-runner work.
 **Rationale:** pause-time numbers in particular are sensitive to glibc allocator behavior, NUMA, kernel page-fault costs. Without controls the numbers flake; documenting the recipe means a future "the numbers got worse" investigation can rule out runner drift before chasing a real regression.
 
 **Recipe:**
@@ -645,7 +654,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 #### D. Aggregate choice
 
 **Decided:** 2026-05-04
-**Implemented:** 2026-05-11 — throughput benches in `allocation.rs` / `collections.rs` / `pipeline.rs` report criterion defaults; `gc_pause` group emits P50/P95/P99/max via the JSON sidecar consumed by `phoenix-bench-diff`.
+✅ **Implemented 2026-05-11**: throughput benches in `allocation.rs` / `collections.rs` / `pipeline.rs` report criterion defaults; `gc_pause` group emits P50/P95/P99/max via the JSON sidecar consumed by `phoenix-bench-diff`.
 **Rationale:** different bench shapes need different summary stats. Switching aggregates mid-phase makes historical comparisons useless, so pick once and stick.
 
 - **Throughput benchmarks** (allocation, collections, end-to-end compiled binary): mean / median / stddev — criterion's defaults; well-understood and adequate for steady-state work.
@@ -672,3 +681,73 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 - *TypeScript / Node* — closer to Phoenix's UX pitch, but a totally different perf model (JIT) and different problem domain (browser-leaning). Different question, different bench.
 
 **Why this entry is in design-decisions.md and not just phase-2.md.** A future contributor skimming the bench code and adding a Java workload "to be thorough" would trip the foreclosure here. The decision is durable across phases, not just a 2.7 implementation choice.
+
+#### F. Mutable-builder API for `List` / `Map`: explicit types, not implicit linearity
+
+**Decided:** 2026-05-12 (during PR 6 scoping; triggered by `phoenix-vs-go.md` showing 1900× / 6900× ratios on `sort_ints` / `hash_map_churn` against Go, dominated by O(n²) immutable-container build cost).
+
+**Decision:** add `ListBuilder<T>` and `MapBuilder<K, V>` as new builtin generic types. Construction via `List.builder()` / `Map.builder()`; in-place mutation via `.push(v)` / `.set(k, v)`; hand-off to the immutable container via `.freeze()` reusing the underlying buffer (O(1) freeze). Both builders are heap-allocated, GC-tracked, and carry their own `TypeTag` for typed-allocator threading.
+
+**Rationale.** Three options were on the table:
+
+1. **Explicit builder types** — the choice above.
+2. **Closure-based `List.build(|b| { ... })`** — single builtin taking a closure that receives a transient handle. Cleaner call site, no risk of using a builder after freeze, but every build pays a lambda allocation and codegen for the handle's lifetime is trickier.
+3. **Implicit / compiler-detected linearity** — no new API; the compiler proves a binding is the only reference and lowers `xs = xs.push(v)` to in-place mutation. Considered and rejected (see decision G).
+
+Picked (1) over (2) because explicit builder values can be passed across function boundaries (helpers that take a `ListBuilder<T>` and add items), stashed in structs for staged construction, and composed with the rest of the type system. (2) keeps the builder lifetime locked inside one closure, which solves the common case but forecloses any helper-function decomposition.
+
+Picked (1) over (3) for the reasons in **G** below: predictable perf > implicit free-with-caveats; tactical fix for a Phase 2.7 bench gap shouldn't commit the language to a linearity story.
+
+**Surface area:**
+
+```phoenix
+let b: ListBuilder<Int> = List.builder()
+for i in 0..n {
+    b.push(i)              // O(1)
+}
+let xs: List<Int> = b.freeze()   // O(1); b is unusable after this
+
+let mb: MapBuilder<Int, Int> = Map.builder()
+for i in 0..n {
+    mb.set(i, i * 7)       // amortized O(1)
+}
+let m: Map<Int, Int> = mb.freeze()
+```
+
+**Use-after-freeze:** runtime-checked at the start of every builder method. The first call after `.freeze()` aborts via `runtime_abort` (FFI-safe — see GC subordinate decision H). Compile-time enforcement (linearity) is decision G's deferred work; the runtime check is the placeholder.
+
+**Why not just keep persistent containers and add Clojure-style transients dynamically?** Transients in Clojure are dynamically-checked (calling a transient method on a non-transient is a runtime error). Phoenix is statically typed, so the static version of the same idea is two distinct types — `List<T>` and `ListBuilder<T>` — which is what's adopted here.
+
+**Forward compatibility with G.** If Phoenix eventually grows ownership / linearity (decision G), the builder types become natural linear values: `.freeze()` is the consumption point. The runtime use-after-freeze check becomes a static error. No API rewrite required.
+
+#### G. Linearity / ownership types: deferred to Phase 4+
+
+**Decided:** 2026-05-12 (paired with decision F).
+
+**Decision:** Phoenix does *not* adopt a linearity, affine-ownership, or uniqueness-types story in Phase 2. The question is reopened at Phase 4 (stdlib) or later, when there's enough perf-and-API data to evaluate it against alternatives.
+
+**Rationale.** Linearity would solve more than just the bench-published O(n²) container-build problem — it would also cover deterministic resource cleanup (files, sockets, locks), concurrency safety (Phase 4.3), and pipeline-style intermediate-allocation elimination (`xs.map(f).filter(g)`). Real wins. But it's a substantial language-design decision with cascading consequences, and doing it as a tactical fix for one bench gap is the wrong forcing function.
+
+Concretely, adopting linearity now would require resolving:
+
+- **Closure capture semantics.** A closure capturing a linear value must itself be linear; what does that mean for `function(x: Linear<T>) -> ...`? How does it interact with Phoenix's current first-class-closure story?
+- **Generic / polymorphism interaction.** Generic code over "linear or not" needs multiplicity polymorphism (Haskell's solution) or a `Copy`-style opt-in marker (Rust's). Either way, more surface in the type system.
+- **GC × linearity boundary.** When does the collector scan into a linear value's interior? Does freezing change its trace treatment? Phoenix's tracing GC is single-generation today; linear values that hold GC refs are a real design question.
+- **Defer / exception interaction.** `defer`-scheduled blocks running on early exit need to know whether a linear value is consumed or still owned. Pattern match arms that take different code paths similarly.
+- **Existing stdlib rewrite.** Every function that takes `List<T>` becomes a decision: borrow, consume, require a fresh allocation? Existing Phoenix code may compile against the borrow signature, the consume signature, neither, or only with explicit `.clone()` insertions.
+
+Each of these is a quarter-to-half of design + implementation work. Total ~1–2 quarters of senior engineering before any user-facing benefit lands. Not a Phase 2.7 scope.
+
+**What's decided now:**
+
+- Phase 2.7 ships **decision F** (explicit builders) as the tactical fix for the bench-published gap.
+- Phase 3 and Phase 4 should accumulate observations about *where else* the immutability-without-linearity cost surfaces (pipeline-style code, struct updates, append-heavy patterns in web handlers) so the eventual decision is informed by the full picture, not just one bench workload.
+- A "linearity / ownership" design exploration is the natural opening of Phase 4 (stdlib pass) or a dedicated Phase between 3 and 4. The exploration should evaluate at least: full linear (Clean / Linear Haskell), affine + borrow (Rust), uniqueness annotations as optimizer hints only (Clean's softer mode), and explicit-only solutions (status quo + decision F).
+
+**Alternatives considered (and the reason for not picking them now):**
+
+- *Full linearity now (Rust-style).* Wrong phase fit — too much language design for too narrow a Phase 2.7 motivation. The "fight the borrow checker" UX would also undermine Phoenix's "easy to use" pitch unless carefully scoped.
+- *Uniqueness annotations as optimizer hints only.* Clean's softer model — user writes `unique List<T>`, compiler exploits it for in-place mutation but doesn't otherwise change the type system. Real candidate for Phase 4+. Not picked now because the implementation work is similar to full linearity and the same "do this well or not at all" applies.
+- *Escape analysis in the compiler.* Compiler-only, no user-facing type-system change. Limited reach (only catches the proof-easy cases) but worth keeping on the table for Phase 3 (optimizer). Doesn't subsume decision F because users want explicit control over the builder pattern, not "hope the analysis fires."
+
+**Why this entry is in design-decisions.md and not just phase-2.md.** A future contributor proposing "let's just add linearity to fix problem X" needs to find the prior deliberation. Same logic as decision E: the decision is durable across phases, not just a 2.7 implementation choice.

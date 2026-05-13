@@ -18,13 +18,13 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_module::Module;
 
 use crate::context::CompileContext;
 use crate::error::CompileError;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
+use super::helpers::emit_gc_alloc;
 use super::layout::{SLOT_SIZE, TypeLayout};
 
 /// Look up the variant index for a named variant within an enum layout.
@@ -85,13 +85,8 @@ pub(super) fn build_enum_variant(
     // Ensure we allocate enough for the actual payload (may exceed generic layout).
     let actual_slots = payload_ty.map(|t| TypeLayout::of(t).slots()).unwrap_or(0);
     let slots = max_slots.max(actual_slots);
-    let size = ((1 + slots) * SLOT_SIZE) as i64;
-    let alloc_ref = ctx
-        .module
-        .declare_func_in_func(ctx.runtime.alloc, builder.func);
-    let size_val = builder.ins().iconst(cl::I64, size);
-    let call = builder.ins().call(alloc_ref, &[size_val]);
-    let ptr = builder.inst_results(call)[0];
+    let size = (1 + slots) * SLOT_SIZE;
+    let ptr = emit_gc_alloc(builder, ctx, size, crate::type_tag::ENUM);
     let disc = builder.ins().iconst(cl::I64, disc_idx as i64);
     builder.ins().store(MemFlags::new(), disc, ptr, 0);
     if let Some(ty) = payload_ty {
