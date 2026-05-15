@@ -223,3 +223,88 @@ Phase 2.6 made every `Type::Named` / `Type::Generic` / `Type::Dyn` payload carry
 **Recommendation:** if a fourth user-table type lands (interfaces, type classes, …) factor `drain_remaining_into` to take an `(id_allocator, name_map, vec)` tuple so all four call sites collapse to one call. Three sites is below the abstraction threshold; document so the next maintainer sees the precedent.
 **File:** `phoenix-sema/src/resolved.rs` (`drain_remaining_into` + its three callers in `build_enums` / `build_structs` / `build_traits`).
 **Target phase:** when the fourth user-table type lands.
+
+---
+
+## Deferred Performance Optimizations
+
+These were surveyed at Phase 2.7 close (2026-05-13) after [`docs/perf/phoenix-vs-go.md`](perf/phoenix-vs-go.md) settled at 1.7× / 5.4× / 3.6× / 26.8× across the four cross-language workloads. The 1900× / 6979× pre-builder ratios on `sort_ints` / `hash_map_churn` are gone (Phase 2.7 decision F); the remaining gap is no longer dominated by stdlib design. Each item below is a real optimization opportunity sequenced **behind a concrete workload that demands it** — speculative perf work without a forcing function ages poorly and competes with structural work like Phase 2.4 (WASM). See the [Phase 2.7 closeout discussion in `docs/phases/phase-2.md`](phases/phase-2.md#-phase-27-closed-2026-05-13) for the framing that produced this list.
+
+### Escape analysis in Cranelift codegen
+
+The published `alloc_walk_struct` ratio (26.8× Go) is dominated by Phoenix heap-allocating every `Point(i, i + 1)` through `phx_gc_alloc` while Go's escape analysis stack-allocates the equivalent `Point{X, Y}` composite literal. The Phoenix `Point` never escapes its iteration scope — auto-collect reclaims it before the next iteration's binding — but the runtime still pays the alloc + GC-registry-insert + eventual sweep on every iteration.
+
+**Estimated win:** ~10× drop on `alloc_walk_struct` (rough — same magnitude as the gap between Go's stack-alloc fast path and any tracing-GC heap alloc). Other workloads with short-lived structs benefit proportionally; pipeline code (`xs.map(f).filter(g)`) materializing intermediate small lists also benefits, though less than struct allocations.
+
+**Planned fix:** add an analysis pass over IR that proves a value's lifetime is bounded by its declaring scope and never escapes via return / capture / aliased reference. Eligible allocations are emitted as Cranelift `StackSlot`s instead of `phx_gc_alloc` calls. The proof side is non-trivial — closures and `defer` complicate "never escapes" — and a partial implementation that misses cases is acceptable (the missed cases keep heap-allocating as today).
+
+**Why deferred:** A real optimizer pass is a Phase 3 topic; doing it now means writing a non-trivial analysis against four compute-only workloads. Phase 4 (stdlib pass) will surface request-handler workloads with much richer struct-allocation patterns, which is what should drive the analysis design.
+
+**File:** new analysis pass in `phoenix-ir`; emission change in `phoenix-cranelift/src/translate/data.rs` (struct-alloc site).
+**Target phase:** Phase 3.
+
+### Trace tables for typed GC mark phase
+
+PR 6 of Phase 2.7 threaded typed `TypeTag` values through every allocation site (`phx_list_alloc`, `phx_map_alloc`, closure-env, struct, enum). The substrate is in place; the mark phase in `crates/phoenix-runtime/src/gc/heap.rs` still does conservative interior scanning — every 8-byte word in a payload is checked against the header registry regardless of type. With typed allocations, the mark phase could dispatch on `TypeTag` to a per-tag trace function that knows the exact pointer offsets (e.g. `TypeTag::Closure` → fn-ptr at slot 0, captures at slots 1..N) and avoid the wasted scan over scalar bytes.
+
+**Estimated win:** Pause-time P99 drop proportional to the scalar-byte fraction of live payload. For `Closure` and `Struct` with mostly i64 fields, that's most of the payload — 5-10× P99 reduction is a reasonable upper bound, with the actual win depending on live-set shape.
+
+**Planned fix:** add a `mark_payload_for_tag(header, work)` dispatch in `MarkSweepHeap::mark_phase` keyed on `TypeTag`. Per-tag trace tables for `List` / `Map` / `Closure` are straightforward (fixed header layout). `Struct` / `Enum` need a side table keyed by `StructInfo` / `EnumInfo` indices populated at codegen time — that side table is the chunkier piece of work.
+
+**Blocker for `ListBuilder` / `MapBuilder` (Phase 2.7 decision F).** The builder runtime currently tags its handle as `TypeTag::Closure` as a placeholder (no dedicated `TypeTag::ListBuilder` / `TypeTag::MapBuilder` variant exists yet) — see the `TODO(tag)` blocks in `crates/phoenix-runtime/src/{list,map}_builder_methods.rs`. While the mark phase is conservative the tag is harmless, but the moment a precise `TypeTag::Closure` trace function lands (fn-ptr at slot 0, captures at slots 1..N), it would fail to walk the builder handle's interior `data_ptr` field (offset 32 for `ListBuilder`, offset 40 for `MapBuilder`) and the builder's buffer would become unreachable from the mark phase. **Resolution must land together with new `TypeTag::ListBuilder` / `TypeTag::MapBuilder` variants and matching trace functions**, *or* the builder modules must be updated first to use a different (still-conservative-friendly) tag. The dedicated tags are the cleaner fix because they also let the precise trace function know there's exactly one interior pointer (no scan over the scalar header fields).
+
+**Why deferred:** PR 6's pause-bench refresh showed no current pause-distribution signal that demands trace tables. They're correctly queued behind a real signal per GC subordinate decision C — see the resolution note in `docs/perf-baselines/pause.md`. Reopens when a workload makes pause time the bottleneck (Phase 4.3 async runtime is the obvious candidate).
+
+**File:** `crates/phoenix-runtime/src/gc/heap.rs` (mark phase); side-table registration in `crates/phoenix-cranelift/src/builtins.rs` (or a new sibling module); `TypeTag` enum extension in `crates/phoenix-runtime/src/gc/mod.rs` for the builder variants.
+**Target phase:** demand-triggered by pause-bench signal, most likely Phase 4.3.
+
+### Closure-call inlining at hot call sites
+
+Phoenix closures cross a heap-allocated environment object + indirect call (`Op::CallIndirect`). Pipeline code that chains map/filter/reduce on every element (`xs.map(f).filter(g).reduce(h)`) pays this overhead per element per stage. For tight loops the closure-call cost can be a multiple of the per-element work.
+
+**Estimated win:** 2-5× on pipeline-heavy code where the closure body is small. Negligible on closures that do real per-element work (string ops, allocations, etc.).
+
+**Planned fix:** in codegen, recognize the pattern `xs.method(literal_closure)` (closure created at the call site, never escapes, only used by the immediate builtin) and inline the closure body into the builtin's generated loop. Substantial codegen change — the inliner has to track closure-captured variables and route them through Cranelift values rather than the heap env.
+
+**Why deferred:** No workload in the current corpus is pipeline-dominated. Phase 4 stdlib code (request middleware chains, JSON decode → transform → response) will be the natural forcing function.
+
+**File:** `crates/phoenix-cranelift/src/translate/list_methods_closure.rs` (existing inline-closure logic); extend to recognize the literal-closure-at-call-site pattern.
+**Target phase:** Phase 4 (stdlib pass).
+
+### Specialized monomorphic `Map<Int, *>` representation
+
+The general `Map<K, V>` open-addressing table allocates a parallel insertion-order array and runs FNV-1a per key. For workloads keyed by sequential or dense integer keys, both are overkill: a `Vec<V>` indexed directly by key gives O(1) lookup with zero hashing and no probe chains. The current `hash_map_churn` workload's 3.6× ratio against Go would compress further with this specialization (Go's `map[int]int` is general too, but the constant factor differs).
+
+**Estimated win:** 2-3× on integer-keyed workloads; zero on workloads with string or non-dense keys.
+
+**Planned fix:** in sema / monomorphization, detect `Map<Int, T>` and emit a specialized `IntMap<T>` IR type backed by a direct-indexed `Vec<V>` (with a sparse-fallback path for sparse keys). The fallback heuristic is the design question — a static "sparse means fall back to general Map" branch decided at allocation time, or a dynamic densify-when-load-factor-drops policy.
+
+**Why deferred:** Niche. The cross-language workload's `hash_map_churn` is the only place this would surface today, and it's already at 3.6× post-builders. Wait for a real workload that's both integer-keyed AND map-heavy enough to matter.
+
+**File:** new IR type variant in `phoenix-ir/src/types.rs`; new runtime module; sema specialization in `check_builtins_map.rs`.
+**Target phase:** demand-triggered by a specific workload.
+
+### Builder construction requires a let-annotation
+
+Phase 2.7 decision F's `List.builder()` / `Map.builder()` constructors take no arguments from which to pin `T` / `K` / `V`. Sema types the call as `ListBuilder<TypeVar("T")>` / `MapBuilder<TypeVar("K"), TypeVar("V")>`; without a `let`-annotation to unify the typevars, sema's ambiguity check rejects the program before codegen ever sees the expression. The two no-annotation fixture tests in `crates/phoenix-bench/tests/fixture_validity.rs` (`list_builder_no_annotation_is_sema_error`, `map_builder_no_annotation_is_sema_error`) pin this contract.
+
+The contract is load-bearing for codegen sizing. If a future change loosens it (e.g. flow-sensitive inference that pins `T` from later `.push(x)` calls), two codegen sites need to be revisited together:
+
+1. **`lower_var_decl` `current_target_type` plumbing** (`crates/phoenix-ir/src/lower_expr.rs`) only fires when there is a let-annotation, because the annotation is the carrier of concrete `T` / `K` / `V` types at the point of the constructor call. Without the annotation, the alloc would size off `GENERIC_PLACEHOLDER` (which silently happens to agree only for 8-byte-wide elements — string keys/values, with 16-byte fat-pointer payloads, would silently miscompile).
+2. **`lower_assignment` LHS-slot plumbing** covers the reassignment case (`b = List.builder()`) via the slot's declared type, but the *initial* slot is created from the inferred initializer type. A TypeVar-typed slot would still propagate `GENERIC_PLACEHOLDER` through to the alloc.
+
+**Resolution path if the rule is loosened:** either propagate the inferred-after-the-fact type back through the constructor call before lowering, or require codegen to fail loudly on `IrType::ListBuilderRef(_)` whose element type is still a typevar / placeholder at alloc-emission time.
+
+**File:** `crates/phoenix-ir/src/lower_expr.rs` (`builder_alloc_result_type`, `lower_var_decl`, `lower_assignment`); pinned by `crates/phoenix-bench/tests/fixture_validity.rs` (`list_builder_no_annotation_is_sema_error`, `map_builder_no_annotation_is_sema_error`).
+**Target phase:** revisit only if inference is extended to pin builder type parameters retroactively.
+
+### Size-class arena for `phx_gc_alloc`
+
+Already documented as deferred in [GC subordinate decision B](design-decisions.md#b-heap-layout-segregated-free-lists-by-size-class-single-arena). The current `phx_gc_alloc` runs ~60-130 ns per call vs. plain `malloc`'s ~10-30 ns; a size-class arena would close most of that gap. PR 6's evaluation determined no current workload is alloc-throughput-dominated, so the arena would not have meaningfully changed published numbers.
+
+**Why deferred:** No workload in the corpus has alloc throughput as its dominant cost. Phase 4 (HTTP / JSON handlers) is the most likely forcing function — request paths that allocate per-request in tight loops would feel this.
+
+**Reopens when:** a workload shows `phx_gc_alloc` as >15% of program wall-clock in profiling.
+
+**File:** `crates/phoenix-runtime/src/gc/heap.rs` (the `MarkSweepHeap` impl behind the `GcHeap` trait — same trait, different impl).
+**Target phase:** Phase 4 (stdlib HTTP / JSON workloads) or whenever the alloc-throughput signal surfaces, whichever comes first.

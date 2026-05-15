@@ -130,4 +130,47 @@ impl Checker {
             }
         }
     }
+
+    /// Type-checks built-in `ListBuilder<T>` method calls.
+    /// The builder is a transient mutable accumulator
+    /// constructed via `List.builder()` and consumed via `.freeze()`.
+    ///
+    /// Use-after-freeze is **runtime-checked** rather than enforced
+    /// statically — static enforcement is decision G's deferred
+    /// linearity story. The sema-level type after `.freeze()` is
+    /// `List<T>`; nothing stops the user from also calling
+    /// `b.push(...)` on the consumed builder afterwards, which the
+    /// runtime will abort.
+    pub(crate) fn check_list_builder_method(
+        &mut self,
+        mc: &MethodCallExpr,
+        elem_type: Type,
+    ) -> Option<Type> {
+        match mc.method.as_str() {
+            "push" => {
+                if self.expect_arg_count(mc, 1) {
+                    self.check_method_arg(mc, 0, &elem_type);
+                }
+                // `push` mutates in place and returns nothing — the
+                // user-visible API is "method that updates the
+                // builder", not "method that returns a new builder".
+                // Returning `Void` here is what lets the bench-corpus
+                // pattern `for i in 0..n { b.push(i) }` type-check
+                // without forcing the user to write
+                // `_ = b.push(i)`.
+                Some(Type::Void)
+            }
+            "freeze" => {
+                self.expect_arg_count(mc, 0);
+                Some(crate::types::list_of(elem_type))
+            }
+            _ => {
+                self.error(
+                    format!("no method `{}` on type `ListBuilder`", mc.method),
+                    mc.span,
+                );
+                Some(Type::Error)
+            }
+        }
+    }
 }

@@ -405,7 +405,24 @@ impl<'a> LoweringContext<'a> {
 
     /// Lower a variable declaration.
     fn lower_var_decl(&mut self, v: &VarDecl) {
+        // Make the let-binding's annotation visible to nested lowering
+        // (e.g. `Map.builder()` / `List.builder()` carve-out, which
+        // sema types as `MapBuilder<TypeVar(K), TypeVar(V)>` regardless
+        // of the surrounding annotation — the annotation here is the
+        // only carrier of the concrete K/V types at this point).
+        // `mem::replace` swaps in the new hint and hands back the
+        // previous one in a single move; the restore at the end of
+        // the body keeps nested initializers (RHS of inner lets,
+        // assignments, lambda bodies) from observing this binding's
+        // annotation.
+        let new_target = self
+            .check
+            .var_annotation_types
+            .get(&v.span)
+            .map(|t| crate::lower::lower_type(t, self.check));
+        let prev_target = std::mem::replace(&mut self.current_target_type, new_target);
         let init_val = self.lower_expr(&v.initializer);
+        self.current_target_type = prev_target;
 
         match &v.target {
             VarDeclTarget::Simple(name) => {

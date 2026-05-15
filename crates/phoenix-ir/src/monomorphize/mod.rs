@@ -214,6 +214,11 @@ pub(crate) fn substitute(ty: &IrType, subst: &HashMap<String, IrType>) -> IrType
             Box::new(substitute(k, subst)),
             Box::new(substitute(v, subst)),
         ),
+        IrType::ListBuilderRef(inner) => IrType::ListBuilderRef(Box::new(substitute(inner, subst))),
+        IrType::MapBuilderRef(k, v) => IrType::MapBuilderRef(
+            Box::new(substitute(k, subst)),
+            Box::new(substitute(v, subst)),
+        ),
         IrType::ClosureRef {
             param_types,
             return_type,
@@ -322,6 +327,8 @@ pub(crate) fn mangle_type(ty: &IrType) -> String {
         IrType::DynRef(name) => format!("d_{name}"),
         IrType::ListRef(inner) => format!("L_{}_E", mangle_type(inner)),
         IrType::MapRef(k, v) => format!("M_{}_{}_E", mangle_type(k), mangle_type(v)),
+        IrType::ListBuilderRef(inner) => format!("Lb_{}_E", mangle_type(inner)),
+        IrType::MapBuilderRef(k, v) => format!("Mb_{}_{}_E", mangle_type(k), mangle_type(v)),
         IrType::ClosureRef {
             param_types,
             return_type,
@@ -451,6 +458,8 @@ pub(super) fn contains_type_var(ty: &IrType) -> bool {
         IrType::TypeVar(_) => true,
         IrType::ListRef(inner) => contains_type_var(inner),
         IrType::MapRef(k, v) => contains_type_var(k) || contains_type_var(v),
+        IrType::ListBuilderRef(inner) => contains_type_var(inner),
+        IrType::MapBuilderRef(k, v) => contains_type_var(k) || contains_type_var(v),
         IrType::ClosureRef {
             param_types,
             return_type,
@@ -474,6 +483,8 @@ pub(super) fn contains_dyn_ref(ty: &IrType) -> bool {
         IrType::DynRef(_) => true,
         IrType::ListRef(inner) => contains_dyn_ref(inner),
         IrType::MapRef(k, v) => contains_dyn_ref(k) || contains_dyn_ref(v),
+        IrType::ListBuilderRef(inner) => contains_dyn_ref(inner),
+        IrType::MapBuilderRef(k, v) => contains_dyn_ref(k) || contains_dyn_ref(v),
         IrType::ClosureRef {
             param_types,
             return_type,

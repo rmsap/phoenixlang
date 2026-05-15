@@ -686,7 +686,7 @@ Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract th
 
 **Decided:** 2026-05-12 (during PR 6 scoping; triggered by `phoenix-vs-go.md` showing 1900× / 6900× ratios on `sort_ints` / `hash_map_churn` against Go, dominated by O(n²) immutable-container build cost).
 
-**Decision:** add `ListBuilder<T>` and `MapBuilder<K, V>` as new builtin generic types. Construction via `List.builder()` / `Map.builder()`; in-place mutation via `.push(v)` / `.set(k, v)`; hand-off to the immutable container via `.freeze()` reusing the underlying buffer (O(1) freeze). Both builders are heap-allocated, GC-tracked, and carry their own `TypeTag` for typed-allocator threading.
+**Decision:** add `ListBuilder<T>` and `MapBuilder<K, V>` as new builtin generic types. Construction via `List.builder()` / `Map.builder()`; in-place mutation via `.push(v)` / `.set(k, v)`; hand-off to the immutable container via `.freeze()`. Total build cost across `n` mutations + one freeze is O(n) — `n` amortized-O(1) mutations + an O(n) finalize. The freeze step's concrete cost shape is an implementation detail covered in the status block below; the user-visible contract is the O(n) total, which is what unblocks the `sort_ints` / `hash_map_churn` bench cells from their prior O(n²) shape. Both builders are heap-allocated, GC-tracked, and carry their own `TypeTag` for typed-allocator threading.
 
 **Rationale.** Three options were on the table:
 
@@ -703,15 +703,15 @@ Picked (1) over (3) for the reasons in **G** below: predictable perf > implicit 
 ```phoenix
 let b: ListBuilder<Int> = List.builder()
 for i in 0..n {
-    b.push(i)              // O(1)
+    b.push(i)              // amortized O(1) (2× grow on overflow)
 }
-let xs: List<Int> = b.freeze()   // O(1); b is unusable after this
+let xs: List<Int> = b.freeze()   // O(n) memcpy; b is unusable after this
 
 let mb: MapBuilder<Int, Int> = Map.builder()
 for i in 0..n {
-    mb.set(i, i * 7)       // amortized O(1)
+    mb.set(i, i * 7)       // amortized O(1); duplicate keys deduped at freeze
 }
-let m: Map<Int, Int> = mb.freeze()
+let m: Map<Int, Int> = mb.freeze()   // O(n) hash build via phx_map_from_pairs
 ```
 
 **Use-after-freeze:** runtime-checked at the start of every builder method. The first call after `.freeze()` aborts via `runtime_abort` (FFI-safe — see GC subordinate decision H). Compile-time enforcement (linearity) is decision G's deferred work; the runtime check is the placeholder.
@@ -719,6 +719,8 @@ let m: Map<Int, Int> = mb.freeze()
 **Why not just keep persistent containers and add Clojure-style transients dynamically?** Transients in Clojure are dynamically-checked (calling a transient method on a non-transient is a runtime error). Phoenix is statically typed, so the static version of the same idea is two distinct types — `List<T>` and `ListBuilder<T>` — which is what's adopted here.
 
 **Forward compatibility with G.** If Phoenix eventually grows ownership / linearity (decision G), the builder types become natural linear values: `.freeze()` is the consumption point. The runtime use-after-freeze check becomes a static error. No API rewrite required.
+
+**Status: ✅ Implemented 2026-05-13** (PR 7 of phase 2.7). `ListBuilder<T>` / `MapBuilder<K, V>` live in `crates/phoenix-runtime/src/{list,map}_builder_methods.rs` with Cranelift codegen in `crates/phoenix-cranelift/src/translate/{list,map}_builder_methods.rs`; sema recognizes `List.builder()` / `Map.builder()` via `check_builtin_static_method` and the new `IrType::{ListBuilder,MapBuilder}Ref` variants thread through monomorphization and the type layout. Native-backend integration tests in `crates/phoenix-bench/tests/fixture_validity.rs` (`list_builder_native`, `map_builder_native`). Tree-walk + IR-interp don't yet evaluate builders — known limitation; programs using builders run under `phoenix build`, not `phoenix run` / `phoenix run-ir`. Bench-corpus `sort_ints` + `hash_map_churn` rewritten to use the builders; the published `docs/perf/phoenix-vs-go.md` ratios fell from 1900× → 5.4× and 6979× → 3.6×. Freeze is **O(n) memcpy** (not the O(1) pointer-swap the original decision text described); the build-phase win comes from `.push()` / `.set()` being O(1) amortized.
 
 #### G. Linearity / ownership types: deferred to Phase 4+
 

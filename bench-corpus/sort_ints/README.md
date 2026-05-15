@@ -23,9 +23,19 @@ This is Knuth's MMIX-style LCG, modified to wrap on 2³¹−1 so the result stay
 
 First, middle, and last elements of the sorted list, plus the length.
 
-## Phoenix-specific gap call-out
+## Build phase
 
-Phoenix's `List<T>` is immutable. Every `xs.push(v)` allocates a fresh list and copies the previous body, so building the 100k-element input is **O(n²)** in Phoenix — and dominates the workload's wall-clock. The sort itself is O(n log n) and matches Go's complexity, but the comparison ratio published in [`docs/perf/phoenix-vs-go.md`](../../docs/perf/phoenix-vs-go.md) reflects "Phoenix's full build + sort" against "Go's full build + sort". A constant-build list (or a transient mutable phase) is a stdlib gap; revisit this workload when that lands.
+Phoenix's `List<T>` is immutable — `xs.push(v)` allocates a fresh list and copies the previous body, so a 100k-element build via repeated `push` is O(n²). Phase 2.7 decision F (PR 7) ships `ListBuilder<T>` as the transient-mutable accumulator: `List.builder()` → `.push()` (O(1) amortized) → `.freeze()` (O(n) memcpy into a fresh `List<T>`). Total build cost is O(n).
+
+The Phoenix program uses the builder pattern explicitly:
+
+```phoenix
+let b: ListBuilder<Int> = List.builder()
+for i in 0..n { b.push(lcg_next(...)) }
+let xs: List<Int> = b.freeze()
+```
+
+The sort itself is O(n log n) and matches Go's complexity. With the builder in place, the published ratio in [`docs/perf/phoenix-vs-go.md`](../../docs/perf/phoenix-vs-go.md) reflects "Phoenix's build + sort" against "Go's build + sort" with neither side stacked by an immutability tax.
 
 ## Invariants for refactors
 

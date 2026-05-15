@@ -213,18 +213,28 @@ EOF
   # aborts the whole renderer.
   echo "_Published: ${DATE}_  ·  Phoenix commit: \`$PHOENIX_COMMIT\`  ·  CPU: $CPU_MODEL  ·  Kernel: $KERNEL  ·  Go: \`$GO_VERSION\`_"
   echo
-  # Toolchain mismatch caveat: decision E pins the canonical Go column
-  # at 1.22.x. A local refresh on a newer toolchain still publishes,
-  # but the reader needs to know the next CI refresh will repin.
-  # Strict match — `go1.22` exactly or `go1.22.<anything>`. The bare
-  # `go1.22*` prefix would also match a hypothetical `go1.220`.
-  if [[ "$GO_VERSION" != "go1.22" && "$GO_VERSION" != go1.22.* ]]; then
-    echo "> **Toolchain note.** This snapshot was rendered on \`$GO_VERSION\`; per [decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only) the canonical pin is **Go 1.22.x**. The next CI refresh from [\`bench-corpus.yml\`](../../.github/workflows/bench-corpus.yml) will repin the rendered \`Go:\` header to \`go1.22.x\`; the change isn't a regression."
-    echo
-  fi
   # Backticks inside this `{ ... } > $OUT_PATH` block must be
   # `\``-escaped — inside `""` bash treats `…` as command substitution.
   echo "Per [Phase 2.7 design decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only), this page is **informational only** — Phoenix-vs-Phoenix numbers (see [\`docs/perf-baselines/\`](../perf-baselines/)) remain the gating signal for regressions. Refresh cadence: per-phase close (2.7, 2.4, 2.5 each once). Refreshed by [\`bench-corpus/run.sh\`](../../bench-corpus/run.sh)."
+  echo
+  # --- Snapshot caveats ---------------------------------------------------
+  # All render-time deviations (Go version, host machine, CPU governor)
+  # collected in one block so a reader can size up "is this snapshot
+  # apples-to-apples with the previous one" without scrolling. Decision
+  # E pins the canonical Go column at 1.22.x; strict match — `go1.22`
+  # exactly or `go1.22.<anything>` (the bare `go1.22*` prefix would
+  # also match a hypothetical `go1.220`).
+  echo "## Snapshot caveats"
+  echo
+  echo "Render-time conditions that affect how this snapshot compares against earlier ones or against absolute targets. Distinct from the language-level [Known asymmetries](#known-asymmetries-in-the-existing-workloads) below."
+  echo
+  if [[ "$GO_VERSION" != "go1.22" && "$GO_VERSION" != go1.22.* ]]; then
+    echo "- **Go version drift.** Rendered on \`$GO_VERSION\`; per [decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only) the canonical pin is **Go 1.22.x**. The next CI refresh from [\`bench-corpus.yml\`](../../.github/workflows/bench-corpus.yml) will repin; the version drift isn't a regression."
+  else
+    echo "- **Go version.** \`$GO_VERSION\` — matches the [decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only) canonical pin."
+  fi
+  echo "- **Host machine drift across snapshots.** The renderer captures CPU / kernel / Phoenix commit in the header but not hostname (a GHA-runner identifier would be noise). When the Phoenix column moves between two snapshots, check the header to confirm the underlying machine is the same before reading the delta as a Phoenix-side regression or win — see decision C for the dedicated-runner work that closes this."
+  echo "- **No CPU-governor pin.** Neither WSL2 (local refreshes) nor GitHub-hosted shared-tenant VMs (CI refreshes via [\`bench-corpus.yml\`](../../.github/workflows/bench-corpus.yml)) expose \`cpufreq\` reliably; expect ±10-20 % drift across refreshes until a dedicated runner is wired up (decision C). The Phoenix/Go ratio is more stable than the absolute numbers because both columns absorb runner noise symmetrically."
   echo
   echo "## Workload results"
   echo
@@ -255,11 +265,10 @@ EOF
   echo
   echo "## Known asymmetries in the existing workloads"
   echo
-  echo "The numbers above stack a few language-level asymmetries on the Phoenix column. Calling them out explicitly so a reader has the right frame:"
+  echo "Language-design choices that bias the Phoenix column. Distinct from render-time deviations (see [Snapshot caveats](#snapshot-caveats) above) — these would persist across machine / Go-version changes."
   echo
-  echo "- **\`sort_ints\` and \`hash_map_churn\` build phases are O(n²) in Phoenix.** \`List<T>\` and \`Map<K, V>\` are both immutable — every \`push\` / \`set\` allocates a fresh container and copies the previous body. Go's \`append\` / \`map[K]=v\` are amortized O(1). At n=100k the build phase dominates, so the published ratio largely measures \"Phoenix's immutable-container build\" against \"Go's mutable-container build\", not the sort or lookup itself."
+  echo "- **\`sort_ints\` and \`hash_map_churn\` use \`ListBuilder<T>\` / \`MapBuilder<K, V>\`** (Phase 2.7 decision F). Both workloads build their input via the transient-mutable accumulator — O(n) build + one O(n) freeze — instead of the prior O(n²) repeated-immutable-allocation shape. Pre-builder numbers (the same workloads on \`main\` before decision F landed) had Phoenix at 1900× / 6900× slower than Go on these two cells; the current ratios reflect comparable algorithmic work on both sides. Linearity / move-semantics for a future \`xs = xs.push(v)\` style is decision G and deferred to Phase 4+."
   echo "- **\`alloc_walk_struct\` doesn't measure \"1M alive concurrently\".** Phoenix has no efficient bulk-container, so each iteration's \`Point\` becomes unrooted as the next overwrites it; auto-collect reclaims periodically. The Go counterpart uses the same per-iter pattern (composite literal in a tight loop) but Go's escape analysis may stack-allocate, biasing the comparison against Phoenix. Both deviations from the literal phase-2 scope are documented per workload in [\`bench-corpus/<workload>/README.md\`](../../bench-corpus/)."
-  echo "- **No CPU-governor pin on the runner.** GitHub-hosted shared-tenant VMs (CI refreshes via [\`bench-corpus.yml\`](../../.github/workflows/bench-corpus.yml)) expose \`cpufreq\` reliably; expect ±10-20% drift across refreshes until a dedicated runner is wired up (decision C). The Phoenix/Go ratio is more stable than the absolute numbers because both columns absorb runner noise symmetrically."
   echo
   echo "## Reproducing locally"
   echo

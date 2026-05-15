@@ -15,6 +15,19 @@ impl Checker {
     /// methods for `List`, `String`, `Map`, `Option`, and `Result`, or looking
     /// up user-defined methods and trait-bounded methods.
     pub(crate) fn check_method_call(&mut self, mc: &MethodCallExpr) -> Type {
+        // Recognize `List.builder()` /
+        // `Map.builder()` before evaluating the object expression.
+        // The parser models `Type.method(...)` as a method call with
+        // `object: Ident("Type")`; evaluating the object first would
+        // hit the "undefined variable `Type`" path. The carve-out
+        // itself (in `check_builtin_static_method`) skips when the
+        // receiver name shadows a local binding, so a user
+        // `let List = some_value` then `List.builder()` falls through
+        // to the normal value-receiver path instead of being silently
+        // hijacked into the builtin.
+        if let Some(ty) = self.check_builtin_static_method(mc) {
+            return ty;
+        }
         let obj_type = self.check_expr(&mc.object);
         if obj_type.is_error() {
             return Type::Error;
@@ -71,6 +84,31 @@ impl Checker {
                     .cloned()
                     .unwrap_or(Type::TypeVar("E".to_string()));
                 self.check_result_method(mc, ok_type, err_type)
+            }
+            "ListBuilder" => {
+                let elem_type = bindings
+                    .get("T")
+                    .cloned()
+                    .or_else(|| {
+                        if let Type::Generic(_, ref args) = obj_type {
+                            args.first().cloned()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(Type::TypeVar("T".to_string()));
+                self.check_list_builder_method(mc, elem_type)
+            }
+            "MapBuilder" => {
+                let key_type = bindings
+                    .get("K")
+                    .cloned()
+                    .unwrap_or(Type::TypeVar("K".to_string()));
+                let val_type = bindings
+                    .get("V")
+                    .cloned()
+                    .unwrap_or(Type::TypeVar("V".to_string()));
+                self.check_map_builder_method(mc, key_type, val_type)
             }
             _ => None,
         };
@@ -451,6 +489,60 @@ impl Checker {
 
         self.error(format!("undefined type or variant `{}`", sl.name), sl.span);
         Type::Error
+    }
+
+    /// Recognize the static-method shape `TypeName.method(args)` for
+    /// builtin types. Today only the builder
+    /// constructors fire here (`List.builder()`, `Map.builder()`);
+    /// future static methods on builtins land in the same dispatch.
+    /// Returns `None` if the receiver isn't an `Ident` of a
+    /// recognized builtin type name — callers fall through to the
+    /// normal value-receiver path. (Phoenix's parser models
+    /// `Type.method(...)` as a `MethodCallExpr` with
+    /// `object: Ident("Type")`; this is *not* a `FieldAccess` call.)
+    fn check_builtin_static_method(&mut self, mc: &MethodCallExpr) -> Option<Type> {
+        let type_ident = match &mc.object {
+            Expr::Ident(i) => i,
+            _ => return None,
+        };
+        // Only intercept names registered in the shared builtin-static-
+        // method table (`BUILTIN_STATIC_METHOD_TYPES`). The same table
+        // gates the IR-lowering carve-out in `lower_method_call` so the
+        // two sides can't diverge on which receivers get hijacked.
+        if !crate::types::is_builtin_static_method_type(&type_ident.name) {
+            return None;
+        }
+        // If the user shadowed the builtin name with a local
+        // (`let List = some_value`), defer to that binding — the value
+        // receiver path will report a sensible "no method on type X"
+        // error if `.builder()` doesn't fit, instead of silently
+        // routing to the builtin and surprising the user.
+        if self.scopes.lookup(&type_ident.name).is_some() {
+            return None;
+        }
+        match (type_ident.name.as_str(), mc.method.as_str()) {
+            ("List", "builder") => {
+                if !mc.args.is_empty() {
+                    self.error("List.builder() takes no arguments".to_string(), mc.span);
+                }
+                // Returns `ListBuilder<TypeVar("T"))`; the let-binding's
+                // explicit annotation (e.g. `ListBuilder<Int>`) pins
+                // `T` via the standard let-unification path.
+                Some(crate::types::list_builder_of(Type::TypeVar(
+                    "T".to_string(),
+                )))
+            }
+            ("Map", "builder") => {
+                if !mc.args.is_empty() {
+                    self.error("Map.builder() takes no arguments".to_string(), mc.span);
+                }
+                Some(crate::types::map_builder_of(
+                    Type::TypeVar("K".to_string()),
+                    Type::TypeVar("V".to_string()),
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// Type-checks a function call expression, resolving the callee and

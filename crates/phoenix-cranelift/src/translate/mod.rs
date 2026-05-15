@@ -24,9 +24,11 @@ pub(crate) use helpers::call_runtime;
 // function signatures. No other crate-level consumers — within `translate`,
 // submodules reach it via `super::layout`.
 pub(crate) mod layout;
+mod list_builder_methods;
 mod list_methods;
 mod list_methods_closure;
 mod list_methods_complex;
+mod map_builder_methods;
 mod map_methods;
 mod mutable;
 mod option_methods;

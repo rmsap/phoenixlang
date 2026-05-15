@@ -216,6 +216,28 @@ fn translate_builtin(
             state,
             result_type,
         ),
+        // ListBuilder methods (Phase 2.7 decision F).
+        _ if name.starts_with("ListBuilder.") => {
+            super::list_builder_methods::translate_list_builder_method(
+                builder,
+                ctx,
+                name.strip_prefix("ListBuilder.").unwrap(),
+                args,
+                state,
+                result_type,
+            )
+        }
+        // MapBuilder methods (Phase 2.7 decision F).
+        _ if name.starts_with("MapBuilder.") => {
+            super::map_builder_methods::translate_map_builder_method(
+                builder,
+                ctx,
+                name.strip_prefix("MapBuilder.").unwrap(),
+                args,
+                state,
+                result_type,
+            )
+        }
         _ => Err(CompileError::new(format!(
             "builtin '{name}' not yet supported in compiled mode"
         ))),

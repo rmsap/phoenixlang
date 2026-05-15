@@ -801,7 +801,19 @@ impl<'a> LoweringContext<'a> {
 
     /// Lower a variable assignment.
     fn lower_assignment(&mut self, assign: &AssignmentExpr) -> ValueId {
+        // Pin the LHS slot's IR type as the target-type hint for the
+        // RHS lowering. Matches the let-binding annotation path in
+        // `lower_var_decl`: lets the `List.builder()` /
+        // `Map.builder()` carve-out size its alloc correctly when
+        // the constructor appears on the RHS of a reassignment
+        // (`b = List.builder()`), where sema would otherwise leave
+        // the result type as `ListBuilder<TypeVar(T)>`.
+        let prev_target = self.current_target_type.take();
+        if let Some(VarBinding::Mutable(_, ty)) = self.lookup_var(&assign.name).cloned() {
+            self.current_target_type = Some(ty);
+        }
         let val = self.lower_expr(&assign.value);
+        self.current_target_type = prev_target;
 
         if let Some(binding) = self.lookup_var(&assign.name).cloned()
             && let VarBinding::Mutable(slot, ty) = binding
@@ -908,6 +920,61 @@ impl<'a> LoweringContext<'a> {
     /// defaults — at monomorphization time for the trait-bounded
     /// branch, since the concrete impl is not known here.
     fn lower_method_call(&mut self, mc: &MethodCallExpr) -> ValueId {
+        // Phase 2.7 decision F: recognize `List.builder()` /
+        // `Map.builder()` *before* evaluating the receiver. Phoenix's
+        // parser models `Type.method(...)` as a `MethodCallExpr`
+        // whose `object` is `Ident("Type")`; lowering the object
+        // first would hit the `lower_ident` "unknown identifier
+        // `List`" branch and crash. Sema's
+        // `check_builtin_static_method` does the same shaped
+        // intercept on the type side; this mirrors it for IR.
+        //
+        // Two stay-in-sync invariants with
+        // `check_builtin_static_method` (`phoenix-sema/src/check_expr_call.rs`):
+        //
+        // 1. Receiver shape: both currently accept only a literal
+        //    `Ident`. If sema starts accepting a broader receiver
+        //    shape (parenthesized, qualified, etc.), the program
+        //    will type-check but crash during IR lowering with
+        //    "unknown identifier `List`".
+        // 2. Shadowing escape hatch: if the user shadows the builtin
+        //    name with a local (`let List = some_value`), sema falls
+        //    through to the value-receiver path so the local's
+        //    methods dispatch normally. The `lookup_var` check below
+        //    mirrors that — without it, a user with a local `List`
+        //    that has its own `.builder()` method would type-check
+        //    against the user method but be silently re-routed at
+        //    codegen to the runtime builder constructor.
+        //
+        // The set of recognized receiver names ("List", "Map") is
+        // shared via `phoenix_sema::types::is_builtin_static_method_type`
+        // — single source of truth so the two sides cannot drift on
+        // which names are intercepted.
+        if let Expr::Ident(type_ident) = &mc.object
+            && phoenix_sema::types::is_builtin_static_method_type(&type_ident.name)
+            && self.lookup_var(&type_ident.name).is_none()
+        {
+            match (type_ident.name.as_str(), mc.method.as_str()) {
+                ("List", "builder") => {
+                    let result_type = self.builder_alloc_result_type(&mc.span, "ListBuilder");
+                    return self.emit(
+                        Op::BuiltinCall("ListBuilder.alloc".to_string(), Vec::new()),
+                        result_type,
+                        Some(mc.span),
+                    );
+                }
+                ("Map", "builder") => {
+                    let result_type = self.builder_alloc_result_type(&mc.span, "MapBuilder");
+                    return self.emit(
+                        Op::BuiltinCall("MapBuilder.alloc".to_string(), Vec::new()),
+                        result_type,
+                        Some(mc.span),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         let obj = self.lower_expr(&mc.object);
         let mut args: Vec<ValueId> = mc.args.iter().map(|a| self.lower_expr(a)).collect();
         let span = Some(mc.span);
@@ -966,6 +1033,78 @@ impl<'a> LoweringContext<'a> {
         let builtin_name = format!("{type_name}.{}", mc.method);
         let result_type = self.expr_type(&mc.span);
         self.emit(Op::BuiltinCall(builtin_name, args), result_type, span)
+    }
+
+    /// Pick the IR result type for a `List.builder()` / `Map.builder()`
+    /// alloc call.
+    ///
+    /// Sema types the constructor expression as `ListBuilder<TypeVar(T)>`
+    /// / `MapBuilder<TypeVar(K), TypeVar(V)>` (the constructor takes no
+    /// args from which to infer the parameters). Lowering that through
+    /// `self.expr_type` and letting monomorphization erase the type
+    /// variables would leave the runtime alloc with
+    /// `GENERIC_PLACEHOLDER`-sized fields, which silently miscompiles a
+    /// `String`-keyed builder (key fat pointer is 16 bytes but a
+    /// placeholder reports 8). When the enclosing context publishes a
+    /// matching builder target type — set by `lower_var_decl` from the
+    /// let-annotation or by `lower_assignment` from the LHS slot — use
+    /// it. The hint pins the concrete K/V at this single point and
+    /// lets the runtime layout match the eventual `.set()` / `.push()`
+    /// argument widths.
+    fn builder_alloc_result_type(&self, call_span: &Span, expected_kind: &str) -> IrType {
+        // Local helper for the debug_assert below: returns `true` if a
+        // ListBuilder/MapBuilder type still carries an unresolved
+        // typevar element (i.e. sema didn't pin `T` / `K` / `V`).
+        fn contains_unresolved_typevar(ty: &IrType) -> bool {
+            match ty {
+                IrType::ListBuilderRef(t) => matches!(t.as_ref(), IrType::TypeVar(_)),
+                IrType::MapBuilderRef(k, v) => {
+                    matches!(k.as_ref(), IrType::TypeVar(_))
+                        || matches!(v.as_ref(), IrType::TypeVar(_))
+                }
+                _ => false,
+            }
+        }
+
+        if let Some(target) = &self.current_target_type {
+            let shape_matches = matches!(
+                (expected_kind, target),
+                ("ListBuilder", IrType::ListBuilderRef(_))
+                    | ("MapBuilder", IrType::MapBuilderRef(_, _))
+            );
+            if shape_matches {
+                return target.clone();
+            }
+        }
+        // Fallback: take whatever sema typed the constructor as. By
+        // contract sema rejects unannotated `let b = List.builder()`
+        // (pinned by `list_builder_no_annotation_is_sema_error` /
+        // `map_builder_no_annotation_is_sema_error`; rationale in
+        // `docs/known-issues.md` § "Builder construction requires a
+        // let-annotation"). So if we reach here, the path is one of:
+        // (a) the target hint was published but didn't match
+        // `expected_kind`'s shape — e.g. a type-coercion site between
+        // List and ListBuilder (today impossible, but the match is
+        // structural so a future variant could trip it); (b) the
+        // builder call appears in a context that doesn't set a hint
+        // at all (chained subexpression like `foo(List.builder())`)
+        // and sema has typed it via parameter inference. In both
+        // cases the eventual cranelift codegen (`builder_elem_type`
+        // in `list_builder_methods.rs` / `builder_kv_types` in
+        // `map_builder_methods.rs`) double-checks against
+        // `is_generic_placeholder` and falls back to argument types
+        // for the first `.push()` / `.set()` call.
+        let fallback = self.expr_type(call_span);
+        debug_assert!(
+            !contains_unresolved_typevar(&fallback),
+            "{expected_kind} constructor fell through builder_alloc_result_type with an \
+             unresolved typevar — sema should have rejected the no-annotation case (see \
+             docs/known-issues.md § \"Builder construction requires a let-annotation\"). \
+             If sema is loosened, the cranelift placeholder-fallback in \
+             {{list,map}}_builder_methods's builder_elem_type / builder_kv_types must be \
+             revisited."
+        );
+        fallback
     }
 
     /// User-method branch of [`Self::lower_method_call`].
@@ -1160,6 +1299,15 @@ impl<'a> LoweringContext<'a> {
         let saved_scopes = std::mem::take(&mut self.var_scopes);
         let saved_loops = std::mem::take(&mut self.loop_stack);
         let saved_defers = std::mem::take(&mut self.pending_defers);
+        // The let-binding / assignment target-type hint belongs to the
+        // *enclosing* function — a lambda body's own `let` /
+        // assignment lowering sets its own hint via `mem::replace`,
+        // and any `List.builder()` directly in the lambda body must
+        // not inherit the outer `let xs: ListBuilder<X> = function()
+        // { ... }()` target. Without this take/restore a constructor
+        // call appearing at the top of the lambda body would size its
+        // alloc using the outer let's annotation.
+        let saved_target_type = self.current_target_type.take();
 
         self.current_func_id = Some(func_id);
         self.push_scope();
@@ -1238,6 +1386,7 @@ impl<'a> LoweringContext<'a> {
         self.var_scopes = saved_scopes;
         self.loop_stack = saved_loops;
         self.pending_defers = saved_defers;
+        self.current_target_type = saved_target_type;
 
         // Emit the closure allocation in the parent function.
         self.emit(Op::ClosureAlloc(func_id, capture_vals), result_type, span)

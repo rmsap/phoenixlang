@@ -2,11 +2,17 @@
      edits will be overwritten on the next refresh. -->
 # Phoenix vs Go — cross-language comparison
 
-_Published: 2026-05-12_  ·  Phoenix commit: `14c4f87`  ·  CPU: AMD Ryzen 7 7735HS with Radeon Graphics  ·  Kernel: Linux 6.6.114.1-microsoft-standard-WSL2 x86_64  ·  Go: `go1.23.0`_
-
-> **Toolchain note.** This snapshot was rendered locally on Go 1.23.0; per [decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only) the canonical pin is **Go 1.22.x**. The next CI refresh from [`bench-corpus.yml`](../../.github/workflows/bench-corpus.yml) will repin the rendered `Go:` header to `go1.22.x`; the change isn't a regression.
+_Published: 2026-05-13_  ·  Phoenix commit: `8b37818`  ·  CPU: AMD Ryzen 7 7735HS with Radeon Graphics  ·  Kernel: Linux 6.6.114.1-microsoft-standard-WSL2 x86_64  ·  Go: `go1.23.0`_
 
 Per [Phase 2.7 design decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only), this page is **informational only** — Phoenix-vs-Phoenix numbers (see [`docs/perf-baselines/`](../perf-baselines/)) remain the gating signal for regressions. Refresh cadence: per-phase close (2.7, 2.4, 2.5 each once). Refreshed by [`bench-corpus/run.sh`](../../bench-corpus/run.sh).
+
+## Snapshot caveats
+
+Render-time conditions that affect how this snapshot compares against earlier ones or against absolute targets. Distinct from the language-level [Known asymmetries](#known-asymmetries-in-the-existing-workloads) below.
+
+- **Go version drift.** Rendered on `go1.23.0`; per [decision E](../design-decisions.md#e-cross-language-comparison-scope-go-122-only) the canonical pin is **Go 1.22.x**. The next CI refresh from [`bench-corpus.yml`](../../.github/workflows/bench-corpus.yml) will repin; the version drift isn't a regression.
+- **Host machine drift across snapshots.** The renderer captures CPU / kernel / Phoenix commit in the header but not hostname (a GHA-runner identifier would be noise). When the Phoenix column moves between two snapshots, check the header to confirm the underlying machine is the same before reading the delta as a Phoenix-side regression or win — the prior 2026-05-12 snapshot ran on a different host, which is what shifted `fib_recursive` from 1.1× to 1.7× and `alloc_walk_struct` from 46.3× to 26.8× without any Phoenix-side change. See decision C for the dedicated-runner work that closes this.
+- **No CPU-governor pin.** Neither WSL2 (local refreshes) nor GitHub-hosted shared-tenant VMs (CI refreshes via [`bench-corpus.yml`](../../.github/workflows/bench-corpus.yml)) expose `cpufreq` reliably; expect ±10-20 % drift across refreshes until a dedicated runner is wired up (decision C). The Phoenix/Go ratio is more stable than the absolute numbers because both columns absorb runner noise symmetrically.
 
 ## Workload results
 
@@ -14,10 +20,10 @@ Each row: hyperfine mean ± stddev over 1 warmup + 5 timed runs (decision C mini
 
 | workload | Phoenix | Go | Phoenix / Go |
 |---|---|---|---|
-| fib_recursive | 86.65 ms ± 5.42 ms | 76.01 ms ± 4.86 ms | 1.1x |
-| sort_ints | 17.727 s ± 1.994 s | 9.18 ms ± 765.8 µs | 1931.1x |
-| hash_map_churn | 115.854 s ± 7.230 s | 16.60 ms ± 1.07 ms | 6979.2x |
-| alloc_walk_struct | 109.97 ms ± 35.70 ms | 2.37 ms ± 195.5 µs | 46.3x |
+| fib_recursive | 68.45 ms ± 10.03 ms | 41.45 ms ± 1.75 ms | 1.7x |
+| sort_ints | 48.14 ms ± 654.2 µs | 8.99 ms ± 479.3 µs | 5.4x |
+| hash_map_churn | 55.60 ms ± 2.21 ms | 15.56 ms ± 2.62 ms | 3.6x |
+| alloc_walk_struct | 60.57 ms ± 2.26 ms | 2.26 ms ± 332.5 µs | 26.8x |
 
 ## What's not benchmarked yet
 
@@ -32,11 +38,10 @@ Each of these will get added to the corpus as the corresponding Phoenix stdlib c
 
 ## Known asymmetries in the existing workloads
 
-The numbers above stack a few language-level asymmetries on the Phoenix column. Calling them out explicitly so a reader has the right frame:
+Language-design choices that bias the Phoenix column. Distinct from render-time deviations (see [Snapshot caveats](#snapshot-caveats) above) — these would persist across machine / Go-version changes.
 
-- **`sort_ints` and `hash_map_churn` build phases are O(n²) in Phoenix.** `List<T>` and `Map<K, V>` are both immutable — every `push` / `set` allocates a fresh container and copies the previous body. Go's `append` / `map[K]=v` are amortized O(1). At n=100k the build phase dominates, so the published ratio largely measures "Phoenix's immutable-container build" against "Go's mutable-container build", not the sort or lookup itself.
+- **`sort_ints` and `hash_map_churn` use `ListBuilder<T>` / `MapBuilder<K, V>`** (Phase 2.7 decision F). Both workloads build their input via the transient-mutable accumulator — O(n) build + one O(n) freeze — instead of the prior O(n²) repeated-immutable-allocation shape. Pre-builder numbers (the same workloads on `main` before decision F landed) had Phoenix at 1900× / 6900× slower than Go on these two cells; the current ratios reflect comparable algorithmic work on both sides. Linearity / move-semantics for a future `xs = xs.push(v)` style is decision G and deferred to Phase 4+.
 - **`alloc_walk_struct` doesn't measure "1M alive concurrently".** Phoenix has no efficient bulk-container, so each iteration's `Point` becomes unrooted as the next overwrites it; auto-collect reclaims periodically. The Go counterpart uses the same per-iter pattern (composite literal in a tight loop) but Go's escape analysis may stack-allocate, biasing the comparison against Phoenix. Both deviations from the literal phase-2 scope are documented per workload in [`bench-corpus/<workload>/README.md`](../../bench-corpus/).
-- **No CPU-governor pin on the runner.** Neither WSL2 (local refreshes) nor GitHub-hosted shared-tenant VMs (CI refreshes via [`bench-corpus.yml`](../../.github/workflows/bench-corpus.yml)) expose `cpufreq` reliably; expect ±10-20% drift across refreshes until a dedicated runner is wired up (decision C). The Phoenix/Go ratio is more stable than the absolute numbers because both columns absorb runner noise symmetrically.
 
 ## Reproducing locally
 

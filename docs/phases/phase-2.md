@@ -383,3 +383,16 @@ When every box above is ticked, Phase 2.7 closes and Phase 2.4 (WebAssembly targ
 
 - **Complexity:** Low for the bench-and-baseline scaffolding (~250 LOC across two new bench files plus storage glue); medium for the size-class-arena follow-up if benches say it should land; medium-to-high for typed-allocator-tagging because it touches every allocator call site. The phase's *minimum* scope is just the scaffolding and the decisions; the follow-ups are conditional.
 - **Depends on:** Phase 2.3 (closed) — benches measure GC and collection behavior, both of which only make sense post-GC.
+
+### ✅ Phase 2.7 closed (2026-05-13)
+
+Benchmark suite shipped end-to-end. Implementation scope: allocation throughput + GC pause distribution + Map/sort_by collections + end-to-end compile-and-run criterion benches; `docs/perf-baselines/` snapshot + `phoenix-bench-diff` regression tool + post-merge `bench.yml` workflow with `BENCH_ENFORCE` noise-floor gate; four-workload Phoenix-vs-Go cross-language corpus + hyperfine-driven `bench-corpus/run.sh` + published [`docs/perf/phoenix-vs-go.md`](../perf/phoenix-vs-go.md). The two Phase-2.3 perf follow-ups landed: typed-allocator threading via `TypeTag` is done end-to-end (codegen + runtime); segregated free lists are explicitly deferred per the cited bench output.
+
+Two scope additions were made during the phase, both Phoenix-language-level rather than benchmark-tooling:
+
+- **Decision F (`ListBuilder` / `MapBuilder`)** — added in response to the published cross-language ratios showing Phoenix at 1900× / 6900× slower than Go on `sort_ints` / `hash_map_churn`, dominated by O(n²) immutable-container builds. The builders are transient-mutable accumulators that freeze to immutable `List<T>` / `Map<K, V>`; total build cost drops to O(n). After the rewrite, the published ratios fell to **5.4×** / **3.6×** — a ~350× / ~1900× reduction. Use-after-freeze is runtime-checked (static enforcement is decision G).
+- **Decision G (linearity / ownership types: deferred to Phase 4+)** — the linearity story that would let `xs = xs.push(v)` become in-place automatically is real but out of scope for Phase 2; the design exploration is queued for Phase 4 (stdlib pass) or a dedicated phase between 3 and 4. The deferral note exists so a future contributor proposing "add linearity to fix problem X" finds the prior deliberation.
+
+Verified by the workspace test suite plus the targeted integration tests in `crates/phoenix-bench/tests/fixture_validity.rs` (native builder fixtures alongside the existing tree-walk + IR-interp coverage), the bench-suite smoke-runs (`cargo bench --bench {allocation,collections,pipeline} -- --test`), and a full `bench-corpus/run.sh` execution against `go1.23.0` on the dev machine.
+
+Phase 2.4 (WebAssembly target) becomes the next active phase, with the typed-allocator-threaded substrate from PR 6 ready for the WASM `GcHeap` impl to plug into.

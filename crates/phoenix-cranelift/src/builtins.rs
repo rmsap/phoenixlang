@@ -49,6 +49,19 @@ pub struct RuntimeFunctions {
     /// `phx_string_alloc`) also bottom out in `phx_gc_alloc` with their
     /// corresponding tag.
     pub gc_alloc: FuncId,
+    // ── ListBuilder / MapBuilder runtime (Phase 2.7 decision F) ─────
+    /// `phx_list_builder_alloc(elem_size) -> handle_ptr`.
+    pub list_builder_alloc: FuncId,
+    /// `phx_list_builder_push(handle, elem_ptr, elem_size)`.
+    pub list_builder_push: FuncId,
+    /// `phx_list_builder_freeze(handle) -> list_ptr`.
+    pub list_builder_freeze: FuncId,
+    /// `phx_map_builder_alloc(key_size, val_size) -> handle_ptr`.
+    pub map_builder_alloc: FuncId,
+    /// `phx_map_builder_set(handle, key_ptr, val_ptr, key_size, val_size)`.
+    pub map_builder_set: FuncId,
+    /// `phx_map_builder_freeze(handle) -> map_ptr`.
+    pub map_builder_freeze: FuncId,
     /// `phx_str_length(ptr, len) -> i64`.
     pub str_length: FuncId,
     /// `phx_str_contains(p1, l1, p2, l2) -> i8`.
@@ -149,6 +162,48 @@ impl RuntimeFunctions {
             str_le: declare_str_cmp(module, "phx_str_le", call_conv)?,
             str_ge: declare_str_cmp(module, "phx_str_ge", call_conv)?,
             gc_alloc: declare_func(module, "phx_gc_alloc", &[I64, I32], &[I64], call_conv)?,
+            list_builder_alloc: declare_func(
+                module,
+                "phx_list_builder_alloc",
+                &[I64],
+                &[I64],
+                call_conv,
+            )?,
+            list_builder_push: declare_func(
+                module,
+                "phx_list_builder_push",
+                &[I64, I64, I64],
+                &[],
+                call_conv,
+            )?,
+            list_builder_freeze: declare_func(
+                module,
+                "phx_list_builder_freeze",
+                &[I64],
+                &[I64],
+                call_conv,
+            )?,
+            map_builder_alloc: declare_func(
+                module,
+                "phx_map_builder_alloc",
+                &[I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            map_builder_set: declare_func(
+                module,
+                "phx_map_builder_set",
+                &[I64, I64, I64, I64, I64],
+                &[],
+                call_conv,
+            )?,
+            map_builder_freeze: declare_func(
+                module,
+                "phx_map_builder_freeze",
+                &[I64],
+                &[I64],
+                call_conv,
+            )?,
             str_length: declare_func(module, "phx_str_length", &[I64, I64], &[I64], call_conv)?,
             // contains/startsWith/endsWith share the same signature as str_cmp.
             str_contains: declare_str_cmp(module, "phx_str_contains", call_conv)?,

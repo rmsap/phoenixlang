@@ -96,6 +96,14 @@ pub enum IrType {
     ListRef(Box<IrType>),
     /// Heap-allocated `Map<K, V>`.
     MapRef(Box<IrType>, Box<IrType>),
+    /// Heap-allocated `ListBuilder<T>` — transient mutable accumulator
+    /// (Phase 2.7 decision F). Same single-pointer ABI as `ListRef`
+    /// (the runtime handle is a single pointer; the buffer lives in
+    /// a separate allocation reachable only through the handle).
+    ListBuilderRef(Box<IrType>),
+    /// Heap-allocated `MapBuilder<K, V>` — same role as
+    /// `ListBuilderRef` for maps.
+    MapBuilderRef(Box<IrType>, Box<IrType>),
     /// Heap-allocated closure object (code pointer + captured environment).
     ClosureRef {
         /// Parameter types of the closure.
@@ -137,6 +145,8 @@ impl IrType {
             | IrType::DynRef(_)
             | IrType::ListRef(_)
             | IrType::MapRef(_, _)
+            | IrType::ListBuilderRef(_)
+            | IrType::MapBuilderRef(_, _)
             | IrType::ClosureRef { .. } => false,
             IrType::TypeVar(name) => unreachable!(
                 "IrType::is_value_type on TypeVar({name}) — monomorphization \
@@ -180,6 +190,12 @@ impl IrType {
             IrType::ListRef(inner) => IrType::ListRef(Box::new(inner.erase_type_vars())),
             IrType::MapRef(k, v) => {
                 IrType::MapRef(Box::new(k.erase_type_vars()), Box::new(v.erase_type_vars()))
+            }
+            IrType::ListBuilderRef(inner) => {
+                IrType::ListBuilderRef(Box::new(inner.erase_type_vars()))
+            }
+            IrType::MapBuilderRef(k, v) => {
+                IrType::MapBuilderRef(Box::new(k.erase_type_vars()), Box::new(v.erase_type_vars()))
             }
             IrType::ClosureRef {
                 param_types,
@@ -244,6 +260,8 @@ impl fmt::Display for IrType {
             }
             IrType::ListRef(elem) => write!(f, "list<{elem}>"),
             IrType::MapRef(k, v) => write!(f, "map<{k}, {v}>"),
+            IrType::ListBuilderRef(elem) => write!(f, "list_builder<{elem}>"),
+            IrType::MapBuilderRef(k, v) => write!(f, "map_builder<{k}, {v}>"),
             IrType::ClosureRef {
                 param_types,
                 return_type,

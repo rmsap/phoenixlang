@@ -1,28 +1,36 @@
 // hash_map_churn workload: 100k inserts, then 200k consecutive
 // lookups (first half hit, second half miss).
 //
-// Inserts keys 0..100000 with value (key * 7) — every cross of the
-// open-addressing table's 70% load-factor resize threshold is
-// exercised. Then probes every key in 0..200000 once: 0..99999 all
-// hit, 100000..199999 all miss. Sum the values (misses contribute
-// 0 via unwrapOr); print the final table length + the sum.
+// Build phase: inserts go through a `MapBuilder<Int, Int>` (`.set()`
+// amortized O(1) append; dedup happens in `.freeze()` via
+// `phx_map_from_pairs`) so the build phase is O(n) overall. See
+// `README.md` for the build-phase rationale and the prior
+// repeated-immutable-allocation shape. Builder grow cadence is the
+// 2× capacity doubling in `phx_map_builder_set`, **not** the frozen
+// map's load-factor resize.
 //
-// Phoenix's Map is immutable: each `m.set(k, v)` allocates a fresh
-// table and copies the previous body. The build phase is therefore
-// O(n²) — same trade-off as sort_ints's List.push. Go's `map[K]V`
-// is mutable + amortized O(1) per insert, so the build comparison is
-// stacked against Phoenix until the stdlib gains a copy-on-write
-// builder or a transient mutable phase. The published comparison
-// page calls this out.
+// Frozen-map shape: `.freeze()` does a one-shot hash build, so the
+// post-freeze `Map<Int, Int>` lands at the size that the
+// open-addressing table's 70 % load-factor threshold would pick for
+// 100 000 entries. The resize *cadence* (8 → 16 → … → 262144 buckets
+// per `phoenix-runtime::map_methods::buckets_for`) is a `Map<K, V>`
+// property — it's what the workload exercises in the lookup phase,
+// not what the builder pays during the build.
+//
+// Inserts keys 0..100000 with value (key * 7). Then probes every key
+// in 0..200000 once: 0..99999 all hit, 100000..199999 all miss. Sum
+// the values (misses contribute 0 via unwrapOr); print the final
+// table length + the sum.
 
 function main() {
     let n: Int = 100000
-    let mut m: Map<Int, Int> = {}
+    let mb: MapBuilder<Int, Int> = Map.builder()
     let mut i: Int = 0
     while i < n {
-        m = m.set(i, i * 7)
+        mb.set(i, i * 7)
         i = i + 1
     }
+    let m: Map<Int, Int> = mb.freeze()
     print(m.length())
 
     let mut sum: Int = 0
@@ -31,6 +39,6 @@ function main() {
         sum = sum + m.get(j).unwrapOr(0)
         j = j + 1
     }
-    // Σ k*7 for k=0..99999 = 7 * (n-1) * n / 2.
+    // Σ k*7 for k=0..99999 = 7 * (n-1) * n / 2 = 34_999_650_000.
     print(sum)
 }

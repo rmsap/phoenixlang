@@ -14,13 +14,26 @@
 
 ## What this workload isolates
 
-- Hash function quality (poor hashing → long probe chains → quadratic-ish growth).
-- Resize / rehash cadence: 100k inserts cross every Phoenix resize threshold (8 → 16 → … → 262144 buckets per `phoenix-runtime::map_methods::buckets_for`).
+- Hash function quality (poor hashing → long probe chains → quadratic-ish growth) — exercised by the 200k lookups against the 100k-entry table.
 - Lookup hit + miss paths separately: half the probes terminate `Vacant`, half `Found`.
 
-## Phoenix-specific gap call-out
+## Build phase (builder side)
 
-Phoenix's `Map<K, V>` is immutable. Every `m.set(k, v)` allocates a fresh table and copies the previous body, so building the 100k-entry map is **O(n²)** in Phoenix and is the dominant wall-clock cost. Go's `map[K]V` is mutable + amortized O(1) per insert. The comparison ratio in the published page therefore reflects build + read together; a transient mutable-build path is a stdlib gap.
+Phoenix's `Map<K, V>` is immutable — every `m.set(k, v)` allocates a fresh table and copies the previous body. Phase 2.7 decision F (PR 7) ships `MapBuilder<K, V>` as the transient-mutable accumulator: `Map.builder()` → `.set()` (append a `(key, value)` pair, O(1) amortized via 2× capacity doubling in `phx_map_builder_set`) → `.freeze()` (one O(n) hash build via `phx_map_from_pairs`, last-wins dedup on duplicate keys).
+
+The Phoenix program uses the builder pattern:
+
+```phoenix
+let mb: MapBuilder<Int, Int> = Map.builder()
+for i in 0..n { mb.set(i, i * 7) }
+let m: Map<Int, Int> = mb.freeze()
+```
+
+Total build cost is O(n). With the builder in place, the comparison ratio in [`docs/perf/phoenix-vs-go.md`](../../docs/perf/phoenix-vs-go.md) reflects comparable algorithmic work on both sides; Go's `map[K]V` insert is amortized O(1) but the Phoenix `.set() → .freeze()` total is also O(n).
+
+## Frozen map's resize behavior (lookup side)
+
+Independent of the builder: once `.freeze()` lands the map in its final form, the post-freeze `Map<Int, Int>` sits at the size the open-addressing table's 70 % load-factor threshold picks for 100k entries. The bucket-count progression (8 → 16 → … → 262144 buckets per `phoenix-runtime::map_methods::buckets_for`) is what the lookup phase exercises across the 200k probes — half hitting the final-size table, half missing through to `Vacant`. The build phase does **not** cross every threshold incrementally any more — the freeze step is a one-shot hash build at the final size.
 
 ## Invariants for refactors
 

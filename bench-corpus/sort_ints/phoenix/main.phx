@@ -1,48 +1,41 @@
 // sort_ints workload: sort 100k pseudo-random integers via List.sortBy.
 //
-// Input is built via an embedded linear-congruential generator (LCG)
-// seeded at 1; the same constants (a=1664525, c=1013904223, m=2^31-1)
-// are used in the Go counterpart so both programs sort the *same*
-// sequence. The 1664525 / 1013904223 pair is from Numerical Recipes
-// (originally specified for m=2^32); the modulus is shrunk to the
-// Mersenne prime 2^31-1 so the result fits in a signed Int without
-// touching the sign bit. Full-period guarantees of the original
-// constants don't carry over, but determinism + matched-across-langs
-// is all this bench requires.
+// Input is built into a `ListBuilder<Int>` (`.push()` amortized O(1),
+// `.freeze()` O(n) memcpy) so the build phase is O(n) overall. See
+// `README.md` for the build-phase rationale and the prior
+// repeated-immutable-allocation shape.
 //
-// Phoenix's List is immutable: each `xs.push(v)` allocates a fresh
-// list and copies the previous body. At 100k pushes the build phase
-// is O(n²) — measured here as roughly two-thirds of the total wall-
-// clock. The Go version uses an in-place slice append so its build
-// phase is O(n). The published comparison page calls out this gap
-// (until Phoenix's stdlib gains a faster list-builder, the sort_ints
-// number reflects "Phoenix's full list-build + sort" against "Go's
-// list-build + sort").
+// Input is built via an embedded linear-congruential generator (LCG)
+// seeded at 1; the same constants (a=1664525, c=1013904223,
+// m=2^31-1) are used in the Go counterpart so both programs sort the
+// *same* sequence. The 1664525 / 1013904223 pair is from Numerical
+// Recipes (originally specified for m=2^32); the modulus is shrunk
+// to the Mersenne prime 2^31-1 so the result fits in a signed Int
+// without touching the sign bit. Full-period guarantees of the
+// original constants don't carry over, but determinism +
+// matched-across-langs is all this bench requires.
 //
 // Output: first / middle / last elements of the sorted list, plus
-// the length. Fingerprints correctness across both implementations
-// without dumping 100k numbers.
+// the length. Byte-for-byte equal to the Go counterpart.
 
 function lcg_next(state: Int) -> Int {
-    // (a * state + c) mod (2^31 - 1). The Mersenne-prime modulus
-    // keeps the result in [0, 2^31 - 2] so it never touches Phoenix's
-    // signed Int sign bit; the intermediate product fits in i64.
     (state * 1664525 + 1013904223) % 2147483647
 }
 
 function main() {
     let n: Int = 100000
-    let mut xs: List<Int> = []
+    let b: ListBuilder<Int> = List.builder()
     let mut s: Int = 1
     let mut i: Int = 0
     while i < n {
         s = lcg_next(s)
-        xs = xs.push(s)
+        b.push(s)
         i = i + 1
     }
-    // `a - b` is safe from wraparound: LCG output is bounded by 2^31-2,
-    // so the difference fits in Int. A workload with larger keys would
-    // need a sign-only comparator.
+    let xs: List<Int> = b.freeze()
+    // `a - b` is safe from wraparound: LCG output is bounded by
+    // 2^31-2, so the difference fits in Int. A workload with larger
+    // keys would need a sign-only comparator.
     let sorted: List<Int> = xs.sortBy(function(a: Int, b: Int) -> Int { a - b })
     print(sorted.get(0))
     print(sorted.get(50000))

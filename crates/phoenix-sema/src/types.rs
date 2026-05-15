@@ -128,6 +128,38 @@ pub fn map_of(key_type: Type, value_type: Type) -> Type {
     Type::Generic("Map".to_string(), vec![key_type, value_type])
 }
 
+/// Shorthand for constructing `ListBuilder<T>`. Phase-2.7 decision F:
+/// transient mutable accumulator that `.freeze()`s to an immutable
+/// `List<T>` in O(1). The element type matches what `freeze()` produces.
+pub fn list_builder_of(element_type: Type) -> Type {
+    Type::Generic("ListBuilder".to_string(), vec![element_type])
+}
+
+/// Shorthand for constructing `MapBuilder<K, V>`. Same role as
+/// [`list_builder_of`] for maps.
+pub fn map_builder_of(key_type: Type, value_type: Type) -> Type {
+    Type::Generic("MapBuilder".to_string(), vec![key_type, value_type])
+}
+
+/// Builtin type names that expose static-method constructors (`.builder()`
+/// today; future static methods on builtins land here too). Centralized
+/// so the sema-side dispatch in `check_builtin_static_method`
+/// (`crates/phoenix-sema/src/check_expr_call.rs`) and the IR-lowering
+/// carve-out in `lower_method_call`
+/// (`crates/phoenix-ir/src/lower_expr.rs`) consult one source of truth.
+/// If the two sides ever diverge on which receiver names get the
+/// static-method intercept, a program could type-check against the
+/// builtin and then crash during IR lowering with "unknown identifier
+/// `<Name>`".
+pub const BUILTIN_STATIC_METHOD_TYPES: &[&str] = &["List", "Map"];
+
+/// `true` when `name` is a builtin type that hosts static-method
+/// constructors (currently `List.builder()` / `Map.builder()`). See
+/// [`BUILTIN_STATIC_METHOD_TYPES`].
+pub fn is_builtin_static_method_type(name: &str) -> bool {
+    BUILTIN_STATIC_METHOD_TYPES.contains(&name)
+}
+
 /// Formats the type for user-facing messages.
 ///
 /// Built-in types are displayed by their canonical name (e.g. `"Int"`,

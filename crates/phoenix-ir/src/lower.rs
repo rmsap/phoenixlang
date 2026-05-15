@@ -200,6 +200,24 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
                     .unwrap_or(IrType::Void);
                 IrType::MapRef(Box::new(key), Box::new(val))
             }
+            "ListBuilder" => {
+                let elem = args
+                    .first()
+                    .map(|t| lower_type(t, check_result))
+                    .unwrap_or(IrType::Void);
+                IrType::ListBuilderRef(Box::new(elem))
+            }
+            "MapBuilder" => {
+                let key = args
+                    .first()
+                    .map(|t| lower_type(t, check_result))
+                    .unwrap_or(IrType::Void);
+                let val = args
+                    .get(1)
+                    .map(|t| lower_type(t, check_result))
+                    .unwrap_or(IrType::Void);
+                IrType::MapBuilderRef(Box::new(key), Box::new(val))
+            }
             crate::types::OPTION_ENUM | crate::types::RESULT_ENUM => {
                 // Option and Result are enums at the IR level.  Carry the
                 // concrete type args so payload-type inference in the
@@ -296,6 +314,28 @@ pub(crate) struct LoweringContext<'a> {
     /// no equivalent footgun). Saved/restored across nested
     /// function-body lowerings (e.g. lambdas).
     pub(crate) defer_outer_scope_depth: usize,
+    /// IR type the value of the current initializer / RHS will land in,
+    /// if known. Set by [`crate::lower_stmt::LoweringContext::lower_var_decl`]
+    /// from the let-binding annotation, by
+    /// [`crate::lower_expr::LoweringContext::lower_assignment`] from the
+    /// LHS slot's declared type, and saved/restored across nested
+    /// lowering (inner lets, assignments, lambda bodies) so it never
+    /// observes a stale enclosing value.
+    ///
+    /// Today only consulted by the `List.builder()` / `Map.builder()`
+    /// carve-out in `lower_method_call`. Sema types the constructor
+    /// expression as `ListBuilder<TypeVar(T)>` /
+    /// `MapBuilder<TypeVar(K), TypeVar(V)>` regardless of the
+    /// surrounding context — the constructor takes no args from which
+    /// to pin `T` / `K` / `V`. After monomorphization the type vars
+    /// erase to the `GENERIC_PLACEHOLDER` (8-byte default), which
+    /// silently miscompiles a `String`-keyed builder (key fat pointer
+    /// is 16 bytes). This hint carries the concrete IR type down to
+    /// the alloc emission so the runtime layout matches the eventual
+    /// `.set()` / `.push()` argument widths — for both `let
+    /// b: ListBuilder<String> = List.builder()` (annotation source)
+    /// and `b = List.builder()` reassignment (slot-type source).
+    pub(crate) current_target_type: Option<IrType>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -312,6 +352,7 @@ impl<'a> LoweringContext<'a> {
             closure_counter: 0,
             pending_defers: Vec::new(),
             defer_outer_scope_depth: 0,
+            current_target_type: None,
         }
     }
 

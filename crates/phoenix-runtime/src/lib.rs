@@ -18,7 +18,9 @@
 /// hooks (`phx_gc_alloc`, `phx_gc_push_frame`, ...) called by compiled code.
 pub mod gc;
 
+mod list_builder_methods;
 mod list_methods;
+mod map_builder_methods;
 mod map_methods;
 mod string_methods;
 
@@ -155,10 +157,21 @@ fn format_panic_message(bytes: &[u8]) -> String {
 /// fail loudly on must terminate via `process::exit` rather than
 /// `panic!`/`expect`/`assert!`. Mirrors the [`phx_panic`] convention so
 /// runtime aborts share a "runtime error: ..." prefix.
+///
+/// Under `cfg(test)` the function panics instead of exiting. Rationale:
+/// in the runtime crate's own unit tests there is no real
+/// extern-C boundary being crossed — the caller is Rust calling Rust
+/// directly, so a panic unwinds cleanly to the test harness. This lets
+/// `#[should_panic(expected = "...")]` tests assert the abort path
+/// runs and carries the right message, without spawning a subprocess
+/// or splitting the runtime API into a Result-returning shadow.
 #[cold]
 #[inline(never)]
 pub(crate) fn runtime_abort(msg: &str) -> ! {
     eprintln!("runtime error: {msg}");
+    #[cfg(test)]
+    panic!("runtime error: {msg}");
+    #[cfg(not(test))]
     process::exit(1);
 }
 

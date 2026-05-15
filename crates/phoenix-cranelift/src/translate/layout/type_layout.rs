@@ -88,10 +88,16 @@ impl TypeLayout {
                 slots: 2,
             },
             // All other reference types are opaque heap pointers.
+            // `ListBuilderRef` / `MapBuilderRef` ABIs match `ListRef`
+            // / `MapRef` (single pointer to the GC-tracked handle);
+            // the buffer they internally point at is a runtime
+            // detail not visible at the Phoenix type level.
             IrType::StructRef(_, _)
             | IrType::EnumRef(_, _)
             | IrType::ListRef(_)
             | IrType::MapRef(_, _)
+            | IrType::ListBuilderRef(_)
+            | IrType::MapBuilderRef(_, _)
             | IrType::ClosureRef { .. } => Self {
                 cl_types: CL_POINTER,
                 slots: 1,
@@ -209,6 +215,8 @@ mod tests {
             IrType::ListRef(Box::new(IrType::I64)),
             IrType::ListRef(Box::new(IrType::StringRef)),
             IrType::MapRef(Box::new(IrType::I64), Box::new(IrType::I64)),
+            IrType::ListBuilderRef(Box::new(IrType::I64)),
+            IrType::MapBuilderRef(Box::new(IrType::I64), Box::new(IrType::I64)),
             IrType::ClosureRef {
                 param_types: vec![],
                 return_type: Box::new(IrType::Void),
@@ -274,6 +282,8 @@ mod tests {
             IrType::EnumRef("Y".into(), Vec::new()),
             IrType::ListRef(Box::new(IrType::I64)),
             IrType::MapRef(Box::new(IrType::I64), Box::new(IrType::I64)),
+            IrType::ListBuilderRef(Box::new(IrType::I64)),
+            IrType::MapBuilderRef(Box::new(IrType::I64), Box::new(IrType::I64)),
             IrType::ClosureRef {
                 param_types: vec![],
                 return_type: Box::new(IrType::Void),

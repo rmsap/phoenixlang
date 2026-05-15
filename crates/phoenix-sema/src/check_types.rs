@@ -189,8 +189,43 @@ impl Checker {
                     }
                     return Self::substitute(&alias_info.target, &bindings);
                 }
-                // Built-in generic types
-                if gt.name == "List" || gt.name == "Map" {
+                // Built-in generic types. `ListBuilder` and `MapBuilder`
+                // transient-mutable
+                // accumulator types; they share the registration path
+                // with `List` / `Map` because they're builtins with
+                // no struct/enum decl to look up.
+                //
+                // Arity is checked here for the two new builder types
+                // because they were added without going through the
+                // struct/enum table — the arity check below for
+                // user-defined types would never see them. `List` /
+                // `Map` retain their pre-existing "accept any arity"
+                // behavior to avoid changing how their existing
+                // not-yet-resolved generic-arg shapes are reported.
+                let builder_arity = match gt.name.as_str() {
+                    "ListBuilder" => Some(1),
+                    "MapBuilder" => Some(2),
+                    _ => None,
+                };
+                if let Some(expected) = builder_arity
+                    && type_args.len() != expected
+                {
+                    self.error(
+                        format!(
+                            "type `{}` expects {} type argument(s), got {}",
+                            gt.name,
+                            expected,
+                            type_args.len()
+                        ),
+                        gt.span,
+                    );
+                    return Type::Error;
+                }
+                if gt.name == "List"
+                    || gt.name == "Map"
+                    || gt.name == "ListBuilder"
+                    || gt.name == "MapBuilder"
+                {
                     return Type::Generic(gt.name.clone(), type_args);
                 }
                 // Verify the base type exists and type argument count matches
@@ -426,11 +461,11 @@ impl Checker {
             Type::Generic(name, args) => {
                 let mut bindings = HashMap::new();
                 // Built-in generic types
-                if name == "List" {
+                if name == "List" || name == "ListBuilder" {
                     if !args.is_empty() {
                         bindings.insert("T".to_string(), args[0].clone());
                     }
-                } else if name == "Map" {
+                } else if name == "Map" || name == "MapBuilder" {
                     if !args.is_empty() {
                         bindings.insert("K".to_string(), args[0].clone());
                     }
