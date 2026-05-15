@@ -1,11 +1,13 @@
-//! Compilation via Cranelift.
+//! Compilation via Cranelift (native) / `wasm-encoder` (WASM).
 //!
 //! Implements the `phoenix build` subcommand: parses the source, type-checks,
-//! lowers to IR, translates to Cranelift, emits an object (native) or
-//! WebAssembly (wasm32-*) artifact, and links it with the system linker
-//! plus the Phoenix runtime library for native targets. The WASM targets
-//! emit their artifact directly with no linker step; their codegen lands
-//! in Phase 2.4 — until then they error early at compile time.
+//! lowers to IR, translates to the per-target backend, and emits an object
+//! (native) or WebAssembly (wasm32-*) artifact, linking with the system
+//! linker plus the Phoenix runtime library for native targets. The WASM
+//! targets emit their artifact directly with no linker step. As of Phase
+//! 2.4 PR 2, `wasm32-linear` is wired through to `phoenix-cranelift`'s
+//! `wasm-encoder`-based pipeline; `wasm32-gc` still errors at `compile`
+//! until its codegen lands in Phase 2.4 PR 5+.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,9 +84,9 @@ pub(crate) fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&st
     };
 
     // Native: write the object to a temp path and invoke the system linker.
-    // WASM: write the module directly. (Unreachable today — wasm targets
-    // error at `compile` until phase 2.4 completes — but the dispatch is in place so the
-    // change is a localized addition rather than a control-flow edit.)
+    // WASM: write the module directly. Reachable for `Wasm32Linear` as of
+    // Phase 2.4 PR 2; `Wasm32Gc` still errors at `compile` and never gets
+    // here.
     if target.is_wasm() {
         if let Err(err) = fs::write(&out_path, &artifact_bytes) {
             eprintln!(

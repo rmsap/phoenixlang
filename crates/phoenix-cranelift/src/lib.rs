@@ -1,10 +1,21 @@
-//! Cranelift-based code generation for the Phoenix compiler.
+//! Phoenix compiler code-generation backends.
 //!
 //! Translates a Phoenix [`IrModule`] into either a native object file
-//! (`.o`) that can be linked with the Phoenix runtime library to produce
-//! an executable, or — once Phase 2.4 lands — a WebAssembly module.
-//! The choice is selected by [`Target`]; see `docs/design-decisions.md`
-//! §Phase 2.4 WebAssembly compilation for the per-target contract.
+//! (`.o`) — via Cranelift, linked with the Phoenix runtime library to
+//! produce an executable — or a WebAssembly module — via the Bytecode
+//! Alliance's `wasm-encoder` (see `docs/design-decisions.md` §Phase 2.4
+//! decision A0). The choice is selected by [`Target`]; see
+//! `docs/design-decisions.md` §Phase 2.4 WebAssembly compilation for
+//! the per-target contract.
+//!
+//! Crate name caveat: `phoenix-cranelift` predates the wasm-encoder
+//! addition. The name is no longer fully descriptive (the WASM backend
+//! is not Cranelift-based), but renaming mid-phase would ripple through
+//! every `use phoenix_cranelift::*;` call site for no functional
+//! benefit, so it stays as-is for Phase 2.4. A rename to
+//! `phoenix-codegen` is a plausible cleanup once the WASM GC variant
+//! (PR 5+) and the four-backend matrix settle, but no ticket is open
+//! for it today.
 //!
 //! # Usage
 //!
@@ -47,6 +58,7 @@ mod target;
 mod translate;
 mod type_tag;
 mod types;
+mod wasm;
 
 pub use error::CompileError;
 pub use link::{LinkError, RUNTIME_LIB_NAME, find_runtime_lib, link_executable};
@@ -74,13 +86,13 @@ use cranelift_module::{Linkage, Module};
 pub fn compile(ir_module: &IrModule, target: Target) -> Result<Vec<u8>, CompileError> {
     match target {
         Target::Native => compile_native(ir_module),
-        Target::Wasm32Linear | Target::Wasm32Gc => Err(CompileError::new(format!(
-            "target `{}` is not yet implemented; \
-             WASM codegen lands in Phase 2.4 (see \
+        Target::Wasm32Linear => wasm::compile_wasm_linear(ir_module),
+        Target::Wasm32Gc => Err(CompileError::new(
+            "target `wasm32-gc` is not yet implemented; \
+             the WASM GC variant lands in Phase 2.4 PR 5+ (see \
              docs/design-decisions.md §Phase 2.4 WebAssembly compilation \
              for the per-target PR sequence)",
-            target.as_cli()
-        ))),
+        )),
     }
 }
 

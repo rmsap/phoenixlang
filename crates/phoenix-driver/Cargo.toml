@@ -30,6 +30,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+tempfile = { workspace = true }
 
 # Linux-only: needed to set RLIMIT_AS in the child process before exec, so
 # the alloc-bounded-memory test can prove the GC actually collects (the

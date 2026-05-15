@@ -39,6 +39,34 @@ cranelift-module = "0.116"
 cranelift-object = "0.116"
 target-lexicon = "0.13"
 
+# WebAssembly code generation. Cranelift does not emit `wasm32` as a
+# target ISA (its `wasm32` support is *input*-side: it consumes WASM
+# modules for wasmtime). The reverse direction goes through the
+# Bytecode Alliance's `wasm-encoder` (binary writer), `wasmparser`
+# (validation), and `wasmprinter` (disassembly for tests) — all
+# shipped alongside wasmtime and version-locked together. The three
+# crates ship at one synchronized release per wasmtime cut and a patch
+# mismatch between them is a known-bad pattern, so the `=` requirement
+# operator pins all three direct deps to the exact same revision so
+# they advance together; bumping any one without the others (or
+# loosening to a caret/tilde requirement that would let them drift
+# independently) has bitten downstream projects in the past. To bump:
+# change all three versions in this block together, then
+# `cargo update -p` each so the lockfile picks up the matched set.
+#
+# Note: this lockstep applies only to the three *direct* deps below.
+# Cranelift transitively brings its own (older) `wasm-encoder` and
+# `wasmparser` for its input-side WASM parsing (currently 0.244.x at
+# the time of writing), so `cargo tree` will show two copies of each
+# crate in the build graph. That duplication is benign — Cranelift's
+# copies are used only on the consumer side and never share types
+# with our emitter pipeline — but it does mean bumping the workspace
+# triple here does *not* update Cranelift's transitive pair. See
+# `docs/design-decisions.md` §Phase 2.4 decision A0.
+wasm-encoder = "=0.248.0"
+wasmparser = "=0.248.0"
+wasmprinter = "=0.248.0"
+
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 

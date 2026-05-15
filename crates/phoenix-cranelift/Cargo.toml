@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-cranelift"
-description = "Cranelift-based native code generation for the Phoenix compiler"
+description = "Phoenix compiler code-generation backends (native via Cranelift, WebAssembly via wasm-encoder)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,10 @@ cranelift-frontend = { workspace = true }
 cranelift-module = { workspace = true }
 cranelift-object = { workspace = true }
 target-lexicon = { workspace = true }
+# WASM emission pipeline; the lockstep rationale lives in the
+# workspace `Cargo.toml`. `src/wasm/mod.rs` is the entry point.
+wasm-encoder = { workspace = true }
+wasmparser = { workspace = true }
 
 [dev-dependencies]
 phoenix-common = { path = "../phoenix-common" }
@@ -23,3 +27,7 @@ phoenix-interp = { path = "../phoenix-interp" }
 phoenix-ir-interp = { path = "../phoenix-ir-interp" }
 phoenix-runtime = { path = "../phoenix-runtime" }
 insta = { workspace = true }
+# WAT disassembly for integration-test assertions; same version
+# lockstep as `wasm-encoder` / `wasmparser` (see workspace `Cargo.toml`).
+wasmprinter = { workspace = true }
+tempfile = { workspace = true }
