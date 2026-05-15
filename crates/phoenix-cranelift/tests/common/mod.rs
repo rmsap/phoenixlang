@@ -55,7 +55,8 @@ pub fn compile_to_obj(source: &str) -> Vec<u8> {
     let module = phoenix_ir::lower(&program, &result.module);
     let errors = phoenix_ir::verify::verify(&module);
     assert!(errors.is_empty(), "IR verification errors: {:?}", errors);
-    phoenix_cranelift::compile(&module).expect("compilation failed")
+    phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native)
+        .expect("compilation failed")
 }
 
 /// Run source through the IR interpreter and capture print() output.

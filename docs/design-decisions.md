@@ -829,3 +829,67 @@ Phoenix's "easy to use, web-framework-friendly GC'd lang" pitch argues hardest f
 1. Survey real-world Phoenix code patterns to see which of the three pillars (mutation perf, resource discipline, concurrency safety) is the dominant pain point. The bench corpus weights (1); HTTP / JSON / async stdlib will reveal whether (2) and (3) are too.
 2. Evaluate runtime COW seriously alongside the type-system approaches. The decision-F builders + Swift-style COW + targeted inference is a credible "no annotations" path that decision G's original framing didn't fully explore.
 3. Not commit to whole-program inference as a standalone solution. The silent-failure shape is hostile to "easy to use" — either it's paired with a runtime safety net (COW) or the user-visible failure mode needs a different story than "your code got slow, no error, no diff."
+
+### Phase 2.4 WebAssembly compilation
+
+Subordinate decisions for the Phase 2.4 WASM backend. Each pins a scope contract before any code lands so the bench refresh, the matrix expansion, and the host-import shape don't drift mid-phase. Decisions confirmed with the user 2026-05-15 during plan mode; phase-level scope summary and exit criteria live in [phase-2.md §2.4](phases/phase-2.md#24-webassembly-target) (matching the location pattern used by §2.2 / §2.3 / §2.6 / §2.7).
+
+#### A. Dual backends in this phase: WASM GC primary, linear-memory fallback
+
+**Decided:** 2026-05-15
+**Rationale:** the [GC strategy decision](#gc-strategy) named WASM GC as the deciding factor for picking tracing GC, and [decision E (`GcHeap` trait abstraction)](#e-allocator-abstraction-gcheap-rust-trait-single-impl-in-23) was deliberately built single-impl in 2.3 so 2.4 could plug a second impl in behind it without touching the trait shape. Both backends ship together because (1) [phase-2.md §2.4](phases/phase-2.md#24-webassembly-target) explicitly frames linear-memory as the fallback, (2) running both verifies the abstraction holds, and (3) the runtimes-without-WASM-GC fallback path is small once the wasm32 codegen exists — most of the work overlaps.
+
+**WASM GC variant:**
+- WASM-managed struct/array refs back the heap; shadow-stack emission ([decision A](#a-root-finding-precise-via-shadow-stack)) is *replaced* by WASM GC's typed references, not ported. The "Phase 2.4 (WASM GC) replaces native root-finding entirely" clause in decision A is the explicit anticipation of this work.
+- New `WasmGcHeap` impl of `GcHeap`. `alloc` returns an opaque managed ref; `collect` is a no-op (host VM handles it).
+- Per-`TypeTag` mapping declares one WASM struct/array type at module emit time. Phoenix `StructRef(name)` → one WASM struct per Phoenix struct. The PR 5 design entry (added when it lands) pins the per-`IrType` → WASM type mapping.
+
+**Linear-memory variant:**
+- Existing `MarkSweepHeap` + shadow stack ports onto wasm32 with a no-std-compatible global allocator (recommend `dlmalloc`; `wee_alloc` is unmaintained).
+- Shadow stack survives as today's linked-list-on-heap; the per-thread TLS counter degrades to a single static under single-threaded wasm32.
+- `phx_gc_shutdown` runs on `proc_exit` so the leak-clean contract from the §2.3 valgrind gate stays valid for the WASM port (no valgrind equivalent under wasmtime, but registry-empty-at-exit can be asserted via a runtime hook).
+
+**Alternatives considered:**
+- *WASM GC only, defer linear-memory.* Rejected: phase-2.md §2.4 explicitly commits to "linear-memory WASM remains a fallback option for runtimes without WASM GC support." Shipping only WASM GC retracts that commitment without a new decision.
+- *Linear-memory only, defer WASM GC.* Rejected: contradicts the [GC strategy decision](#gc-strategy) framing that picked tracing GC *for WASM alignment*. Doing wasm32 without WASM GC strands the alignment benefit one phase further out.
+
+#### B. Exit-criteria runtime: wasmtime CLI
+
+**Decided:** 2026-05-15
+**Rationale:** wasmtime is the simplest CI integration (subprocess, same shape as `phoenix build && ./out`) and supports WASM GC as of 18.0 (Jan 2024). The four-and-then-five-backend matrix becomes one more column on `phoenix-driver/tests/three_backend_matrix.rs`. Browser execution is real positioning value but slots into Phase 2.5 (JS interop), not 2.4 — getting WASM modules to run on *something* is the 2.4 gate.
+
+- Linux CI gate: `phoenix build --target wasm32-{linear,gc} <file>` then `wasmtime <out.wasm>` and assert stdout byte-equality with native.
+- Skip-with-warning pattern mirrors the §2.3 valgrind gate: `PHOENIX_REQUIRE_WASMTIME=1` turns the skip into a hard failure so a misconfigured CI runner can't silently bypass the gate.
+- Browser execution is *not* gated in 2.4. Phase 2.5 (JS interop) is the natural slot.
+
+**Alternatives considered:**
+- *Node.js with V8 WASM GC.* Rejected for 2.4: needs Node ≥21 and `--experimental-wasm-gc`; more browser-like but the CI dependency is awkward. Reopens in Phase 2.5 when JS interop work justifies the Node footprint.
+- *Both wasmtime CI + browser docs.* Considered. Documenting the browser execution path is fine, but adding a browser test rig to the 2.4 matrix doubles CI complexity for no exit-criteria signal that wasmtime doesn't already give.
+
+#### C. Host-import surface: WASI preview1 only
+
+**Decided:** 2026-05-15
+**Rationale:** `fd_write` to stdout and `proc_exit` for panic/exit are the *only* host imports a 2.4 compiled WASM module needs. Phoenix-defined custom imports (e.g. `phoenix.print_i64`) are the natural Phase 2.5 territory — once JS interop is on the table, a richer import surface lets browsers / Node hosts skip WASI shims. Locking 2.4 to standard WASI keeps the import schema portable across every WASI-aware runtime (wasmtime, Node `@bjorn3/browser_wasi_shim`, browser polyfills) for free.
+
+- `phx_print_i64` / `phx_print_f64` / `phx_print_bool` / `phx_print_str` format the value into a stack buffer and route through `wasi_snapshot_preview1.fd_write` on fd 1.
+- `phx_panic` writes the message via `fd_write` on fd 2 then calls `wasi_snapshot_preview1.proc_exit(1)`.
+- Phoenix-defined imports are out of scope. The Phase 2.5 design block opens with WASI as the established floor and adds richer imports on top.
+
+**Alternatives considered:**
+- *Phoenix-defined custom imports (no WASI).* Rejected for 2.4: smaller binaries are real, but every host has to implement Phoenix's import schema before any WASM module runs. WASI shifts that cost to existing tooling.
+- *WASI + Phoenix-specific extras (hybrid).* Considered. The "extras" set is empty for 2.4 (timing for benches sits naturally inside the bench harness, not the runtime). Reopens whenever Phase 2.5's JS interop work pulls a real Phoenix-specific import in.
+
+#### D. Phase-close bench refresh scope: WASM vs native Phoenix only
+
+**Decided:** 2026-05-15
+**Rationale:** Phase 2.4 is structural (codegen + runtime abstraction), not perf-focused. The actionable datum from the close-refresh is "how much slower is `wasm32-{linear,gc}` than `native`?" — that signal drives every Phase 2.5 / Phase 4 decision about whether browser-served Phoenix workloads need a different optimization story than native. Comparing Go-as-WASM via tinygo would add a column readers misread (tinygo is not Go — different GC, different reflection, different syscall surface; a "Phoenix is slower than Go in WASM" comparison would be misleading).
+
+- New `docs/perf/phoenix-wasm-vs-native.md` (or new columns in [`docs/perf/phoenix-vs-go.md`](perf/phoenix-vs-go.md) — file layout to be settled in PR 7) reports the four locked corpus workloads (`sort_ints`, `hash_map_churn`, `alloc_walk_struct`, `fib_recursive`) across `native` / `wasm32-linear` / `wasm32-gc`.
+- Refresh cadence aligns with the [Phase 2.7 decision E (cross-language comparison)](#e-cross-language-comparison-scope-go-122-only) per-phase-close commitment — 2.4 close refreshes once.
+- Adding tinygo or Go-as-WASM to the bench harness is explicitly out of scope. Future contributors proposing it should re-litigate this decision here.
+
+**Alternatives considered:**
+- *Full matrix (native Phoenix + WASM Phoenix + native Go + Go-via-tinygo-WASM).* Rejected: tinygo's semantic divergence from canonical Go would make the comparison misleading without a long footnote that readers skip.
+- *Skip the refresh this phase.* Rejected: contradicts decision E's per-phase-close commitment. WASM-vs-native is the actionable cell; we have to publish it.
+
+Exit criteria for declaring Phase 2.4 complete live in [phase-2.md §2.4](phases/phase-2.md#exit-criteria-for-declaring-phase-24-complete), alongside every other phase's gates.

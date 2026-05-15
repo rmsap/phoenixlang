@@ -243,7 +243,7 @@ fn no_main_function_error() {
     let (program, _) = phoenix_parser::parser::parse(&tokens);
     let result = phoenix_sema::checker::check(&program);
     let module = phoenix_ir::lower(&program, &result.module);
-    let err = phoenix_cranelift::compile(&module);
+    let err = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(err.is_err());
     assert!(err.unwrap_err().message.contains("no main function"));
 }

@@ -1,23 +1,46 @@
-//! Native compilation via Cranelift.
+//! Compilation via Cranelift.
 //!
 //! Implements the `phoenix build` subcommand: parses the source, type-checks,
-//! lowers to IR, translates to Cranelift, emits an object file, and links
-//! with the system linker and Phoenix runtime library.
+//! lowers to IR, translates to Cranelift, emits an object (native) or
+//! WebAssembly (wasm32-*) artifact, and links it with the system linker
+//! plus the Phoenix runtime library for native targets. The WASM targets
+//! emit their artifact directly with no linker step; their codegen lands
+//! in Phase 2.4 — until then they error early at compile time.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use phoenix_cranelift::Target;
+
 /// Monotonic counter for unique temp file names across threads.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Compile a Phoenix program to a native executable.
+/// Compile a Phoenix program to an executable artifact.
 ///
 /// Runs the full pipeline: parse → type-check → IR lower → verify →
-/// Cranelift compile → link.  On success, writes the executable to
-/// `output` (or the input filename without `.phx`).
-pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
+/// Cranelift compile → link (native only).  On success, writes the
+/// artifact to `output` (or the input filename without `.phx`).
+///
+/// `target_str` is the user-supplied `--target` value or `None` for
+/// the default (native). Unknown values produce a single
+/// "unknown target" diagnostic listing every accepted spelling.
+pub(crate) fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
+    let target = match target_str {
+        Some(s) => match Target::from_cli(s) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "error: unknown --target `{s}`; expected one of: {}",
+                    Target::all_cli_names().join(", "),
+                );
+                process::exit(1);
+            }
+        },
+        None => Target::default(),
+    };
+
     let (modules, check_result, _sm) = super::parse_resolve_check(path);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
@@ -29,8 +52,8 @@ pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
         process::exit(1);
     }
 
-    // Compile IR to object file bytes.
-    let obj_bytes = match phoenix_cranelift::compile(&ir_module) {
+    // Compile IR to target-appropriate bytes.
+    let artifact_bytes = match phoenix_cranelift::compile(&ir_module, target) {
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!("error: {}", err);
@@ -38,7 +61,10 @@ pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
         }
     };
 
-    // Determine output path.
+    // Determine output path. For WASM targets without an explicit
+    // --output, append `.wasm` so the artifact has the extension that
+    // every WASM consumer (wasmtime, browsers, Node loaders) expects.
+    // Explicit --output is taken verbatim — caller's choice wins.
     let out_path: PathBuf = match output {
         Some(p) => PathBuf::from(p),
         None => {
@@ -47,11 +73,30 @@ pub(crate) fn cmd_build(path: &str, output: Option<&str>) {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("a.out");
-            PathBuf::from(stem)
+            if target.is_wasm() {
+                PathBuf::from(format!("{stem}.wasm"))
+            } else {
+                PathBuf::from(stem)
+            }
         }
     };
 
-    link_object(&obj_bytes, &out_path);
+    // Native: write the object to a temp path and invoke the system linker.
+    // WASM: write the module directly. (Unreachable today — wasm targets
+    // error at `compile` until phase 2.4 completes — but the dispatch is in place so the
+    // change is a localized addition rather than a control-flow edit.)
+    if target.is_wasm() {
+        if let Err(err) = fs::write(&out_path, &artifact_bytes) {
+            eprintln!(
+                "error: could not write WASM module to {}: {err}",
+                out_path.display()
+            );
+            process::exit(1);
+        }
+        eprintln!("Compiled to {}", out_path.display());
+    } else {
+        link_object(&artifact_bytes, &out_path);
+    }
 }
 
 /// Write an object file to a unique temp path, link it with the runtime,

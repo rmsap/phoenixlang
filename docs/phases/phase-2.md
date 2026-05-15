@@ -143,11 +143,48 @@ Phase 2.7 (Benchmark Suite) is the next active phase — sequenced ahead of 2.4 
 
 ## 2.4 WebAssembly Target
 
-- Add WASM output via Cranelift's `wasm32` support
-- Slim runtime for the browser
-- Bridge to browser APIs via imports (DOM manipulation, fetch, etc.)
-- Shared types between backend and frontend targets
-- **Target the WASM GC proposal** (standardized, shipping in all major browsers). The [tracing GC decision](../design-decisions.md#gc-strategy) was made in part to align with WASM GC — Phoenix's object model maps onto WASM GC's struct/reference types cleanly, so the browser VM does the collection and binaries stay small. Linear-memory WASM remains a fallback option for runtimes without WASM GC support.
+**Status: active (since 2026-05-13, when 2.7 closed).** Subordinate scope decisions A–D and their rationale live in [design-decisions.md §Phase 2.4 WebAssembly compilation](../design-decisions.md#phase-24-webassembly-compilation); exit criteria for declaring 2.4 complete live at the bottom of this section (mirror of §2.7's exit-criteria block).
+
+Add a second `phoenix build` target that emits WebAssembly. Primary target: the WASM GC proposal (standardized, shipping in all major browsers as of 2024 — Chrome 119 / Firefox 120 / Safari 18.2 / Node 21 / wasmtime 18). Linear-memory WASM ships as the fallback for runtimes without WASM GC support, behind the same `GcHeap` trait abstraction that [§2.3 decision E](../design-decisions.md#e-allocator-abstraction-gcheap-rust-trait-single-impl-in-23) was built to enable. The exit-criteria runtime is `wasmtime` CLI; the host-import surface is WASI preview1 only (Phoenix-defined imports are Phase 2.5).
+
+- `--target` flag on `phoenix build` (variants: `native` (default), `wasm32-linear`, `wasm32-gc`).
+- Cranelift's `wasm32` backend emits the codegen for both variants.
+- New `WasmLinearMarkSweepHeap` (linear-memory port of `MarkSweepHeap`, backed by a no-std-friendly global allocator like `dlmalloc`) and `WasmGcHeap` (no-op collector backed by WASM GC managed refs) impls of the existing `GcHeap` trait.
+- WASI preview1 host imports (`fd_write` for stdout, `proc_exit` for panic/exit) replace native `phx_print_*` / `phx_panic` on wasm32 targets.
+- Shadow-stack emission is reused as-is for `wasm32-linear`; for `wasm32-gc` it's bypassed entirely per [§2.3 decision A](../design-decisions.md#a-root-finding-precise-via-shadow-stack)'s explicit Phase 2.4 contract ("WASM GC's typed references replace native root-finding entirely").
+
+The expanded back-bridge work (DOM access, fetch, browser API imports, `extern js` declarations, npm-package resolution) is **Phase 2.5 (JavaScript interop)**, not 2.4. 2.4 ships compilation only — a WASM module that runs under wasmtime is the gate, not a WASM module that runs in a browser.
+
+### PR sequence
+
+The phase ships in 7 PRs. Sequencing constraint: PR 1 unblocks everything; PR 2 unblocks PR 3 (linear-memory port can't proceed without wasm32 codegen + WASI imports); PR 4 (linear-memory matrix) closes before PR 5 (WASM GC) starts so the matrix stays coherent at every commit; PR 5 locks the WASM GC type-mapping design decision before code lands.
+
+1. **PR 1** — Backend abstraction + `--target` plumbing. `Target` enum, CLI flag, signature threading. Default `Native`; no behavior change for native builds.
+2. **PR 2** — Cranelift wasm32 ISA + WASI host imports. `phoenix build --target wasm32-linear hello.phx` produces a `.wasm` that prints under wasmtime.
+3. **PR 3** — Linear-memory `MarkSweepHeap` port (dlmalloc, single-threaded TLS adaptation, `phx_gc_shutdown` via `proc_exit`).
+4. **PR 4** — Four-backend matrix (add `wasm32-linear` to `three_backend_matrix.rs`). Exit gate for the linear-memory variant.
+5. **PR 5** — WASM GC type-mapping design decision (added to [design-decisions.md §Phase 2.4](../design-decisions.md#phase-24-webassembly-compilation)) + `WasmGcHeap` skeleton + initial codegen (parallel `translate/wasm_gc/` module tree). Shadow-stack emission suppressed.
+6. **PR 6** — WASM GC across the matrix (five backends). Exit gate for the WASM GC variant.
+7. **PR 7** — Phase close: refresh `docs/perf/phoenix-vs-go.md` (or new `phoenix-wasm-vs-native.md`) with WASM-vs-native numbers across the four corpus workloads; tick every exit-criteria box below.
+
+### Exit criteria for declaring Phase 2.4 complete
+
+Per-decision rationale lives in [design-decisions.md §Phase 2.4 WebAssembly compilation](../design-decisions.md#phase-24-webassembly-compilation).
+
+- [ ] **All Phase-2.4 design decisions implemented.** Sub-decisions A–D in [design-decisions.md §Phase 2.4](../design-decisions.md#phase-24-webassembly-compilation) each carry a `✅ Implemented YYYY-MM-DD` marker when complete. Any further design decisions surfaced during the phase (e.g. the WASM-GC type-mapping decision pinned in PR 5) land in the same section with the same marker convention.
+- [ ] **Backend abstraction landed (PR 1).** `Target` enum + `--target` CLI flag + signature plumbing through `phoenix_cranelift::compile`. Default = `Native`; native fixtures still produce byte-identical binaries.
+- [ ] **`phoenix build --target wasm32-linear <file>` produces a `.wasm` that runs under `wasmtime` with byte-identical stdout** to `phoenix run` / `phoenix run-ir` / native `phoenix build`. Linear-memory `MarkSweepHeap` is feature-gated for wasm32 and `dlmalloc` (or equivalent no-std-friendly allocator) is the global allocator on that target.
+- [ ] **`phoenix build --target wasm32-gc <file>` ditto under `wasmtime --wasm-features=gc`.** Shadow-stack emission is suppressed for this variant; verified by piping the emitted `.wasm` through `wasm-tools print` (the codegen output is binary `.wasm`, not WAT) and grepping the resulting WAT for absence of `phx_gc_push_frame` / `phx_gc_set_root` / `phx_gc_pop_frame`. `wasm-tools` is the established Bytecode Alliance disassembler shipped alongside wasmtime, so the CI dependency is already implied by [decision B](../design-decisions.md#b-exit-criteria-runtime-wasmtime-cli).
+- [ ] **Four-backend matrix on every fixture** (after PR 4, adding `wasm32-linear` to `crates/phoenix-driver/tests/three_backend_matrix.rs`). One `#[test]` per fixture so a divergence names the offender.
+- [ ] **Five-backend matrix on every fixture** (after PR 6, adding `wasm32-gc`). Multi-module matrix (`multi_module_matrix.rs`) gets the same treatment.
+- [ ] **WASI imports (`fd_write`, `proc_exit`) are the only host surface.** No Phoenix-defined custom imports yet; that's Phase 2.5.
+- [ ] **Linear-memory leak-clean at exit.** A `wasmtime`-side replacement for the §2.3 valgrind gate: a fixture allocates across the 1 MB threshold, runs `phx_gc_shutdown` on exit, and the runtime asserts registry-empty before `proc_exit`. Hard-failure under `PHOENIX_REQUIRE_WASMTIME=1`.
+- [ ] **Phase-close bench refresh** publishes `wasm32-linear` and `wasm32-gc` numbers vs `native` on the four corpus workloads (per [decision D](../design-decisions.md#d-phase-close-bench-refresh-scope-wasm-vs-native-phoenix-only)).
+- [ ] **No `known-issues.md` entry targeted at Phase 2.4.** Outstanding follow-ups re-targeted to Phase 3 / 4 / opportunistic.
+- [ ] **Workspace test/clippy/fmt clean.** `cargo test --workspace` green; `cargo clippy --workspace --tests -- -D warnings` zero warnings; `cargo fmt --all -- --check` clean.
+- [ ] **CI integration matches the gating shape.** Linux `bench.yml` (or a sibling `wasm.yml`) runs both new targets under `PHOENIX_REQUIRE_WASMTIME=1`.
+
+When every box above is ticked, Phase 2.4 closes and Phase 2.5 (JavaScript interop) becomes the active phase.
 
 ## 2.5 JavaScript Interop
 

@@ -92,7 +92,7 @@ fn closure_with_unknown_capture_type_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail when a closure capture has unknown type"
@@ -143,7 +143,7 @@ fn unsupported_string_method_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail for unsupported string method 'nonexistent'"
@@ -189,7 +189,7 @@ fn unsupported_list_method_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail for unsupported list method 'nonexistent'"
@@ -235,7 +235,7 @@ fn unsupported_map_method_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail for unsupported map method 'nonexistent'"
@@ -281,7 +281,7 @@ fn unsupported_option_method_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail for unsupported option method 'nonexistent'"
@@ -327,7 +327,7 @@ fn unsupported_result_method_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail for unsupported result method 'nonexistent'"
@@ -384,7 +384,7 @@ fn option_okor_unknown_payload_type_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "compile should fail when Option payload type cannot be inferred for okOr"
@@ -448,7 +448,7 @@ fn option_okor_placeholder_arg_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "placeholder-arg Option must still error — Strategy 0 should reject the sentinel"
@@ -506,7 +506,7 @@ fn result_map_err_placeholder_args_returns_error() {
     module.push_concrete(main_fn);
     module.function_index.insert("main".to_string(), main_fid);
 
-    let result = phoenix_cranelift::compile(&module);
+    let result = phoenix_cranelift::compile(&module, phoenix_cranelift::Target::Native);
     assert!(
         result.is_err(),
         "placeholder-arg Result must still error — Strategy 0 should reject the sentinels"

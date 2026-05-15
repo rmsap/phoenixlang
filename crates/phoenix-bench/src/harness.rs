@@ -214,7 +214,7 @@ pub fn compile_and_link(name: &str, source: &str) -> Result<PathBuf, CompileLink
         )));
     }
 
-    let obj_bytes = phoenix_cranelift::compile(&ir_module)
+    let obj_bytes = phoenix_cranelift::compile(&ir_module, phoenix_cranelift::Target::Native)
         .map_err(|e| CompileLinkError::CraneliftCompile(format!("{e}")))?;
 
     let stem = format!("{name}-{key:016x}");

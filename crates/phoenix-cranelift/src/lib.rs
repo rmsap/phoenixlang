@@ -1,12 +1,16 @@
-//! Cranelift-based native code generation for the Phoenix compiler.
+//! Cranelift-based code generation for the Phoenix compiler.
 //!
-//! Translates a Phoenix [`IrModule`] into a native object file (`.o`) that
-//! can be linked with the Phoenix runtime library to produce an executable.
+//! Translates a Phoenix [`IrModule`] into either a native object file
+//! (`.o`) that can be linked with the Phoenix runtime library to produce
+//! an executable, or — once Phase 2.4 lands — a WebAssembly module.
+//! The choice is selected by [`Target`]; see `docs/design-decisions.md`
+//! §Phase 2.4 WebAssembly compilation for the per-target contract.
 //!
 //! # Usage
 //!
 //! ```ignore
-//! let obj_bytes = phoenix_cranelift::compile(&ir_module)?;
+//! use phoenix_cranelift::Target;
+//! let obj_bytes = phoenix_cranelift::compile(&ir_module, Target::Native)?;
 //! std::fs::write("output.o", &obj_bytes)?;
 //! // Then link: cc -o output output.o -lphoenix_runtime -L<runtime_dir>
 //! ```
@@ -39,12 +43,14 @@ macro_rules! ice {
 
 /// Runtime library discovery for linking.
 pub mod link;
+mod target;
 mod translate;
 mod type_tag;
 mod types;
 
 pub use error::CompileError;
 pub use link::{LinkError, RUNTIME_LIB_NAME, find_runtime_lib, link_executable};
+pub use target::Target;
 
 use context::CompileContext;
 use phoenix_ir::module::IrModule;
@@ -56,11 +62,29 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 
-/// Compile a Phoenix IR module to a native object file.
+/// Compile a Phoenix IR module to a target-appropriate artifact.
 ///
-/// Returns the raw bytes of an ELF object file (`.o`).  The object exports
-/// a `main` function (the C entry point) which calls the Phoenix `main`.
-pub fn compile(ir_module: &IrModule) -> Result<Vec<u8>, CompileError> {
+/// For [`Target::Native`] this returns the raw bytes of an ELF / Mach-O
+/// object file (`.o`) whose exported `main` calls the Phoenix `phx_main`.
+/// For the WASM variants this returns the raw bytes of a `.wasm` module
+/// once their codegen lands in Phase 2.4;
+/// until then they return a "not yet implemented"
+/// [`CompileError`] so the abstraction is callable but the gate is
+/// loud.
+pub fn compile(ir_module: &IrModule, target: Target) -> Result<Vec<u8>, CompileError> {
+    match target {
+        Target::Native => compile_native(ir_module),
+        Target::Wasm32Linear | Target::Wasm32Gc => Err(CompileError::new(format!(
+            "target `{}` is not yet implemented; \
+             WASM codegen lands in Phase 2.4 (see \
+             docs/design-decisions.md §Phase 2.4 WebAssembly compilation \
+             for the per-target PR sequence)",
+            target.as_cli()
+        ))),
+    }
+}
+
+fn compile_native(ir_module: &IrModule) -> Result<Vec<u8>, CompileError> {
     let mut ctx = CompileContext::new(ir_module)?;
 
     // Translate all Phoenix IR functions to Cranelift IR.

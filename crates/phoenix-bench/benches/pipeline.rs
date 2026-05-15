@@ -143,11 +143,15 @@ fn bench_pipeline(c: &mut Criterion) {
         // Stage 5: Cranelift native code generation.
         // Like the IR interpreter bench, probe support at setup time and
         // skip fixtures the Cranelift backend doesn't yet handle.
-        let cranelift_ok = phoenix_cranelift::compile(&ir_module).is_ok();
+        let cranelift_ok =
+            phoenix_cranelift::compile(&ir_module, phoenix_cranelift::Target::Native).is_ok();
         if cranelift_ok {
             group.bench_function("cranelift_compile", |b| {
                 b.iter(|| {
-                    let _ = phoenix_cranelift::compile(black_box(&ir_module));
+                    let _ = phoenix_cranelift::compile(
+                        black_box(&ir_module),
+                        phoenix_cranelift::Target::Native,
+                    );
                 });
             });
         }
@@ -205,7 +209,7 @@ fn bench_pipeline(c: &mut Criterion) {
                     let (program, _) = phoenix_parser::parse(&tokens);
                     let check_result = phoenix_sema::check(&program);
                     let ir_module = phoenix_ir::lower(&program, &check_result.module);
-                    phoenix_cranelift::compile(&ir_module)
+                    phoenix_cranelift::compile(&ir_module, phoenix_cranelift::Target::Native)
                 });
             });
         }

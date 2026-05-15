@@ -83,6 +83,12 @@ enum Commands {
         /// Output executable path (default: input filename without extension)
         #[arg(long, short)]
         output: Option<String>,
+        /// Compilation target: `native` (default), `wasm32-linear`, or
+        /// `wasm32-gc`. The WASM variants land incrementally during
+        /// Phase 2.4 — see `docs/design-decisions.md` §Phase 2.4
+        /// WebAssembly compilation for the per-target PR sequence.
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Generate typed code from a Phoenix schema file
     Gen {
@@ -129,7 +135,11 @@ fn run() {
         Commands::Ir { file } => cmd_ir(&file),
         Commands::Run { file } => cmd_run(&file),
         Commands::RunIr { file } => cmd_run_ir(&file),
-        Commands::Build { file, output } => build::cmd_build(&file, output.as_deref()),
+        Commands::Build {
+            file,
+            output,
+            target,
+        } => build::cmd_build(&file, output.as_deref(), target.as_deref()),
         Commands::Gen {
             file,
             target,
