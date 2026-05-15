@@ -751,5 +751,81 @@ Each of these is a quarter-to-half of design + implementation work. Total ~1–2
 - *Full linearity now (Rust-style).* Wrong phase fit — too much language design for too narrow a Phase 2.7 motivation. The "fight the borrow checker" UX would also undermine Phoenix's "easy to use" pitch unless carefully scoped.
 - *Uniqueness annotations as optimizer hints only.* Clean's softer model — user writes `unique List<T>`, compiler exploits it for in-place mutation but doesn't otherwise change the type system. Real candidate for Phase 4+. Not picked now because the implementation work is similar to full linearity and the same "do this well or not at all" applies.
 - *Escape analysis in the compiler.* Compiler-only, no user-facing type-system change. Limited reach (only catches the proof-easy cases) but worth keeping on the table for Phase 3 (optimizer). Doesn't subsume decision F because users want explicit control over the builder pattern, not "hope the analysis fires."
+- *Swift-style runtime COW (refcount + isUniquelyReferenced check).* See the "Design space explored" addendum below — added 2026-05-13 after the option was explored. Genuinely strong candidate for Phoenix's pitch; tracked there so the alternatives list stays scannable.
 
 **Why this entry is in design-decisions.md and not just phase-2.md.** A future contributor proposing "let's just add linearity to fix problem X" needs to find the prior deliberation. Same logic as decision E: the decision is durable across phases, not just a 2.7 implementation choice.
+
+##### Design space explored (2026-05-13 follow-up)
+
+After Phase 2.7 closed, additional thought was put into the design space. Pinning the additional context here so the Phase-4+ reopen doesn't relitigate the same paths from scratch.
+
+**Terminology — three closely-related framings of "no aliasing."**
+
+- **Linear types** (Linear Haskell `-XLinearTypes`, Idris 2 quantitative types): a value must be used **exactly once**. Use-count constraint; no duplication, no silent drop.
+- **Affine types** (Rust ownership): a value is used **at most once**. Drops allowed, duplication isn't. Rust's `move` is affine.
+- **Uniqueness types** (Clean): the value is **the only reference** at this moment. Aliasing constraint, looked at from the other direction.
+
+All three encode the same invariant from different angles; all three license the same in-place-mutation optimization. The terminological distinction matters less than the choice of *enforcement mechanism* (type system vs runtime check vs inference).
+
+**What linearity would buy Phoenix — three pillars, not just mutation perf.**
+
+1. **In-place mutation without aliasing risk.** The decision-F motivation. Generalizes beyond `xs.push(v)` loops — record updates, pipeline-style `.map(f).filter(g)` intermediate materialization, append-heavy web handlers all benefit.
+2. **Deterministic resource cleanup.** If a value must be consumed exactly once and the "consume" operation is `.close()` on a file / socket / lock, the type system enforces "close exactly once" as a static property. Phoenix's `defer` does this dynamically (best-effort; doesn't fire on hardware traps — see `docs/known-issues.md`). Linearity makes resource discipline a *type-system property* instead of a discipline.
+3. **Concurrency safety.** No aliases → safe to move across threads → no data races. Rust's `Send` / `Sync` traits are the canonical form. For Phase 4.3 async runtime this is load-bearing: request handlers owning their state are trivially parallelizable.
+
+The Phase-4+ evaluation should weight all three, not just (1). The bench gap that produced decisions F and G is one piece of evidence; resource discipline and concurrency safety are the others. Reopening on (1) alone misses the point.
+
+**Cost of linearity (what makes the "do well or not at all" framing real).** Every linear value's "exactly-once" constraint propagates through every API. A function taking a linear value consumes it; passing through a logger or assertion is a type error unless borrowing is introduced. Closures capturing linear values are themselves linear. Generics need *multiplicity polymorphism* (Linear Haskell) or a `Copy`-style opt-in marker (Rust). Rust's reputation for difficulty comes mostly from making this propagation visible everywhere.
+
+**Fourth alternative: Swift-style runtime COW (copy-on-write with `isUniquelyReferenced`).** Not in the original decision-G alternatives list; surfaced 2026-05-13 and worth tracking explicitly.
+
+- Every container carries a refcount. Every mutation runs `isKnownUniquelyReferenced(&self)` — a one-cycle branch. If refcount == 1, mutate in place; if > 1, copy first, then mutate the copy.
+- No compile-time analysis. No user-facing annotations. No type-system burden. Works across function boundaries trivially because the refcount comes with the object, not the binding.
+- Cost: a refcount field on each container + ~1 ns per mutation for the branch, paid whether or not the value is actually shared. Failure mode is observable ("shared instance triggered copy" is profileable), not user-confusing.
+- Implementation cost in Phoenix is non-trivial because we already have a tracing GC. Refcounting on top means either (a) per-type refcount fields just for `List` / `Map` / future builders, or (b) full hybrid refcounted + cycle-detecting collector. (a) is the cheaper path — only add refcounts to types where the perf delta matters.
+- Trade-off vs decision F's explicit builders: COW gives the perf win to *all* user code (not just code that reaches for the builder), at the cost of an always-on per-mutation branch. Decision F's builders are zero-cost where used, zero-coverage where the user doesn't reach for them.
+
+**Inference vs explicit annotation tradeoffs.** Pure compile-time inference of uniqueness (Go-style escape analysis pushed further) was discussed and has known limits:
+
+- **Local inference** within one function is cheap and reliable. Doesn't help for cross-function flows.
+- **Closed-world whole-program inference** (MLton-style) is tractable in principle — call graph + fixed-point iteration over per-function uniqueness facts — but with caveats:
+  - Hard cases: function values / closures (call site doesn't statically know which body executes), `dyn Trait` dispatch (receiver opaque), generics with multi-call-site dispatch (per-uniqueness-flavor monomorphization or conservative fallback).
+  - **The hostile cases land exactly on Phoenix's pitched patterns** — `dyn Handler` / `dyn Middleware` trait-object pipelines are the design surface Phoenix encourages, and they're the surface inference can't see through.
+  - Compile-time cost is super-linear in worst case. MLton compile times (tens of seconds for medium programs) are the reference; not blocking for batch builds, bad for hot-reload dev iteration.
+  - Incremental compilation gets harder: per-function changes invalidate transitive caller uniqueness facts.
+  - **The silent-failure problem doesn't go away — it moves.** Instead of "adding a `log()` call broke local inference," you get "adding a `dyn Handler` somewhere in the request pipeline silently broke uniqueness inference for body-building code three modules over." The blast radius shifts; the failure shape (perf collapse with no error and no visible code diff) stays.
+- **Techniques to reduce inference cost** — known, not free:
+  - *Modular summary analysis* (each function emits a boundary summary; callers use the summary). Conservative but composes well. State of the art is well-understood.
+  - *Datalog-based incremental analysis* (Soufflé, Doop). Best incremental story; substantial infrastructure cost (a Datalog engine in the compiler).
+  - *Fine-grained dependency tracking* (Rust borrow-check, GHC type inference style). Works but the dep graph through call sites is dense.
+  - *Profile-guided / tiered* (LLVM LTO + PGO style). Skip inference at iteration time; run at release-build time. Trade: dev iteration fast, release builds slow, debug/release behavioral drift can hide bugs.
+
+**Synthesis worth exploring at the Phase-4+ reopen: tiered dev-COW / release-inference.** Combines runtime COW and whole-program inference into a tiered design.
+
+- **Dev build:** No uniqueness inference. Swift-style runtime COW handles correctness; mutations pay the ~1 ns refcount-check overhead. Compile time stays fast (no whole-program analysis). Perf is predictable — "good enough for hot-reload."
+- **Release build:** Run whole-program uniqueness inference. Where it proves uniqueness statically, the refcount check is removed and mutation lowers to in-place. Where it can't prove (dyn-trait dispatch, higher-order calls), the COW fallback stays. Analysis cost is paid only when shipping.
+
+Gives:
+- Fast dev iteration (no whole-program analysis).
+- Predictable perf in dev (COW handles it; no silent slowdowns).
+- Excellent perf in release (inference reduces COW overhead where provable; the hostile-to-inference patterns fall back to COW, which still gets the answer right with a small constant cost).
+- No type-system burden on users (no `unique` annotations, no `&mut`).
+
+Costs:
+- Two compilation paths (release-mode bugs may not reproduce in dev — known LLVM-style hazard).
+- Runtime-COW infrastructure has to exist regardless.
+- Whole-program-inference infrastructure has to exist for release builds (with the incremental-build cost issues above).
+
+**For the Phase-4+ reopen, the three positions worth distinguishing are:**
+
+1. **Full Rust-style affine ownership + borrow checker.** Maximum guarantees, maximum learning curve. Wrong for Phoenix's "easy to use" pitch unless carefully scoped.
+2. **Hybrid: conservative whole-program inference where it's cheap + explicit annotations on hostile boundaries** (dyn-trait, pipeline closures, generics). The "Rust but with inference doing more of the work" position.
+3. **Tiered dev-COW / release-inference** (the synthesis above). Zero user-facing complexity; the trade-off is implementation infrastructure cost (refcount layer + whole-program-inference pipeline).
+
+Phoenix's "easy to use, web-framework-friendly GC'd lang" pitch argues hardest for (3). The bench gap that triggered F and G is real but it's one piece of evidence; resource discipline (Phase 4 stdlib opens files / sockets / DB connections) and concurrency safety (Phase 4.3 async) are the other two pillars to weight in the reopen.
+
+**Where this lands as forward guidance.** None of this changes decision G's deferral — Phase 2.7 still ships decision F as the tactical fix. The Phase-4+ reopen should:
+
+1. Survey real-world Phoenix code patterns to see which of the three pillars (mutation perf, resource discipline, concurrency safety) is the dominant pain point. The bench corpus weights (1); HTTP / JSON / async stdlib will reveal whether (2) and (3) are too.
+2. Evaluate runtime COW seriously alongside the type-system approaches. The decision-F builders + Swift-style COW + targeted inference is a credible "no annotations" path that decision G's original framing didn't fully explore.
+3. Not commit to whole-program inference as a standalone solution. The silent-failure shape is hostile to "easy to use" — either it's paired with a runtime safety net (COW) or the user-visible failure mode needs a different story than "your code got slow, no error, no diff."

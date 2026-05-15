@@ -3,7 +3,7 @@
 **A strict, statically typed programming language for full-stack web development.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-2%2C900%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-3%2C000%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Phoenix combines functional and object-oriented programming with a clean, familiar syntax and a focus on safe concurrency, async-first design, and developer productivity. Programs run on a tree-walk interpreter (`phoenix run`) or compile to native binaries via Cranelift (`phoenix build`), and API schemas can be code-generated to TypeScript, Python, Go, or OpenAPI.
@@ -235,6 +235,7 @@ See **[docs/phoenix-gen.md](docs/phoenix-gen.md)** for the full guide, or [`test
 **Collections & Errors**
 - `List<T>` literals with `map`, `filter`, `reduce`, `find`, `any`, `all`, `flatMap`, `sortBy`, `first`, `last`, `contains`, `take`, `drop`
 - `Map<K, V>` literals with `get`, `set`, `contains`, `remove`, `keys`, `values`
+- `ListBuilder<T>` / `MapBuilder<K, V>` — transient-mutable accumulators (`List.builder()` / `Map.builder()` → `.push()` / `.set()` → `.freeze()`) for O(n) bulk construction; runtime-checked use-after-freeze
 - Built-in `Option<T>` and `Result<T, E>` with full combinator sets (`map`, `andThen`, `orElse`, `mapErr`, `filter`, `okOr`, `unwrapOrElse`, …)
 - `?` operator for error propagation
 - Rich `String` method suite with ordering comparisons
@@ -272,7 +273,7 @@ A [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.
 
 ## Architecture
 
-Phoenix is implemented in Rust as a Cargo workspace of 14 crates, each representing one stage of the compiler pipeline or an independent tool.
+Phoenix is implemented in Rust as a Cargo workspace of 15 crates, each representing one stage of the compiler pipeline or an independent tool.
 
 | Crate | Purpose |
 |-------|---------|
@@ -290,12 +291,13 @@ Phoenix is implemented in Rust as a Cargo workspace of 14 crates, each represent
 | `phoenix-lsp` | Language Server Protocol server |
 | `phoenix-driver` | CLI binary |
 | `phoenix-bench` | Benchmarks for the compiler pipeline (Criterion) |
+| `phoenix-bench-diff` | Post-merge regression detector: diffs criterion output against committed `docs/perf-baselines/` |
 
 ---
 
 ## Roadmap & Vision
 
-Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), Phase 2.6 (module system and visibility), and Phase 2.3 (tracing GC, runtime, and `defer` syntax) are complete. Phase 2.7 (benchmark suite) is the active work — sequenced ahead of Phase 2.4 (WebAssembly target) so the native GC has a measured baseline before a second `GcHeap` impl arrives. JavaScript interop, async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
+Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), Phase 2.6 (module system and visibility), Phase 2.3 (tracing GC, runtime, and `defer` syntax), and Phase 2.7 (benchmark suite + `ListBuilder` / `MapBuilder` transient-mutable accumulators) are complete. Phase 2.4 (WebAssembly target) is the active work — the typed-allocator threading from 2.7 sets up a second `GcHeap` impl to plug in behind the existing trait. JavaScript interop, async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
 
 See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features.
 

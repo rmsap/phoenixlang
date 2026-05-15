@@ -1,6 +1,6 @@
 # Phase 2: Compilation
 
-**Status: 2.1 + 2.2 + 2.3 + 2.6 complete; 2.7 (Benchmark Suite) active.** See [§2.7](#27-benchmark-suite) — its section header is the source of truth for active-phase status; [§2.3](#23-runtime-and-memory-management) holds the most recently closed-out writeup. **Sequencing note:** 2.7 lands before 2.4 (WebAssembly target) so the native GC has a measured baseline before a second `GcHeap` impl arrives behind the same trait — without it, "the WASM GC is X% faster/slower than native" is unverifiable, and the size-class-arena and typed-allocator follow-ups carried over from 2.3 have no quantitative gate.
+**Status: 2.1 + 2.2 + 2.3 + 2.6 + 2.7 complete; 2.4 (WebAssembly Target) active.** See [§2.4](#24-webassembly-target) for the active phase's scope; [§2.7](#27-benchmark-suite) holds the most recently closed-out writeup (with the `### ✅ Phase 2.7 closed (2026-05-13)` subsection at the end). The 2.7 closeout shipped the benchmark suite + `phoenix-bench-diff` regression detector + cross-language Phoenix-vs-Go corpus, threaded typed `TypeTag` values through every codegen and runtime allocation site, and added `ListBuilder<T>` / `MapBuilder<K, V>` transient-mutable accumulators (decision F) which cut the published `sort_ints` / `hash_map_churn` ratios from 1900× / 6979× to 5.4× / 3.6× against Go.
 
 Move from interpretation to native code generation. This is what makes Phoenix a real language rather than a scripting tool.
 

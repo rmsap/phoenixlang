@@ -38,6 +38,7 @@ The current `SymbolKind` taxonomy (Function / Struct / Enum / Field / Method / E
 - **Imports** — sema doesn't emit `symbol_references` for the names inside `import lib { foo }` or for the module path `lib`. Goto-def at the import site should jump to the source declaration; goto-def on the module path should jump to the source file.
 - **Traits as standalone symbols** — add a `SymbolKind::Trait` so goto-def on a trait name in `dyn Trait`, `impl Trait for Type`, and `<T: Trait>` bound positions resolves.
 - **Type aliases** — `Analysis::type_aliases` is populated but the LSP doesn't surface aliases in completion or expose goto-def on the alias name.
+- **Builtin generic types** — `List`, `Map`, `Option`, `Result`, `ListBuilder`, `MapBuilder` (the Phase 2.7 decision F additions) are not surfaced in completion or hover today. The LSP's completion sources are user-defined symbols + lexer keywords; builtins are hardcoded in `phoenix-sema::check_types::resolve_type_expr` and have no entries in `module_scopes` / `struct_by_name` / `enum_by_name`. Add them so type annotations like `let xs: List<…>` autocomplete, so `b.` on a `ListBuilder<T>` receiver suggests `push` / `freeze`, and so hovering on a builtin type-name token in static-method-call position (e.g. `List` in `List.builder()`) shows the type's kind.
 
 ### Standard LSP features beyond the core
 
