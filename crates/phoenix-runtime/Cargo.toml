@@ -8,4 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+# - staticlib: native `cc -lphoenix_runtime` produces `libphoenix_runtime.a`
+#   linked with Cranelift-emitted objects into the final native binary.
+# - rlib: lets other workspace crates (tests, benches) call into the
+#   runtime as a normal Rust library without going through the C ABI.
+# - cdylib: on wasm32 targets, produces `phoenix_runtime.wasm` (a
+#   complete WebAssembly module, not a relocatable .o archive) for the
+#   wasm32 backend's embed-and-merge step (see `docs/design-decisions.md`
+#   §Phase 2.4 decision F) to splice into the user program's
+#   wasm-encoder output. Cargo doesn't support per-target `[lib]`
+#   tables today, so cdylib is in the unconditional list; on native
+#   targets it also produces unused `.so` / `.dylib` / `.dll`
+#   alongside the `.a`.
+crate-type = ["staticlib", "rlib", "cdylib"]

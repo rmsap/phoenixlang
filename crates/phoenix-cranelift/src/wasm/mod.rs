@@ -8,97 +8,136 @@
 //! instruction set directly. See
 //! `docs/design-decisions.md` §Phase 2.4 decision A0 for the rationale.
 //!
-//! # Scope
+//! # Scope (Phase 2.4 PR 3a)
 //!
-//! PR 2 of Phase 2.4 lands the *scaffolding*: WASM module structure,
-//! WASI preview1 host imports (`fd_write`, `proc_exit`), per-module
-//! emit of a small synthesized runtime (`phx_print_i64` and friends),
-//! IR → WASM function translation, and a `_start` entry that calls
-//! Phoenix's `main`. The translator's IR-op coverage is intentionally
-//! narrow: enough to compile `tests/fixtures/hello.phx`
-//! (`function main() { let x: Int = 42; print(x) }`) end-to-end through
-//! `wasmtime`. Other IR ops produce a clean
-//! [`CompileError`] pointing at the PR 3 follow-up that extends
-//! coverage alongside the linear-memory `MarkSweepHeap` port.
+//! PR 2 shipped the WASM emission scaffolding plus three hand-synthesized
+//! print helpers (`phx_print_i64` / `phx_print_str` / `phx_print_bool`)
+//! that called WASI `fd_write` directly. PR 3a replaces those helpers
+//! with the *real* `phoenix-runtime` crate compiled to a wasm32-wasip1
+//! cdylib and merged into the user-program module via embed-and-merge
+//! ([decision F](`docs/design-decisions.md`)). The real runtime brings
+//! the GC, every `phx_str_*` / `phx_list_*` / `phx_map_*` /
+//! `phx_gc_*` symbol, and the shadow-stack helpers — laying the
+//! foundation for PR 3b's full IR-op coverage. PR 3a itself keeps the
+//! translator's user-side surface unchanged: hello.phx still works,
+//! and nothing more.
 //!
-//! # Memory layout (linear-memory variant, PR 2)
+//! # Memory layout
 //!
-//! - `[0, bool_literals_end)` — fixed-position bool literals
-//!   (`"true\n"`, `"false\n"`). Reserved only when at least one
-//!   `print(bool)` call appears in the module; absent for fixtures
-//!   like hello.phx that print only integers.
-//! - `[bool_literals_end, data_end)` — general string-constant area,
-//!   advanced by `ModuleBuilder::reserve_data`. PR 2 doesn't append
-//!   anything here yet; PR 3's `Op::ConstString` lands the first
-//!   entries.
-//! - `[SCRATCH_BASE, SCRATCH_BASE + 64)` — per-call scratch. Used by
-//!   the synthesized `phx_print_*` helpers to stage an iovec, an
-//!   `nwritten` cell, and a 32-byte itoa buffer before invoking WASI
-//!   `fd_write`. Single-threaded model: each `phx_print_*` call
-//!   consumes and releases the scratch within its own body, so
-//!   sequential `print` calls don't interfere.
+//! The merged module's linear memory is shared between the runtime
+//! and any user-emitted data segments.
 //!
-//! Both regions live in the first 64 KiB page; PR 3 makes the page
-//! count dynamic when the GC needs a heap.
+//! - `[0, runtime_data_end)` — runtime data segments (Rust's static
+//!   initializers: panic messages, format strings, allocator state).
+//!   Offsets are baked into the runtime's compiled image.
+//! - `[runtime_data_end, data_cursor)` — user-emitted data segments
+//!   from `Op::ConstString` (PR 3b's deliverable). PR 3a doesn't
+//!   write here.
+//! - Shadow-stack region — sized and placed by the runtime's compiled
+//!   image (rustc's `wasm32-wasip1` lowering reserves a region between
+//!   `__data_end` and `__heap_base` with `__stack_pointer` initialized
+//!   to the high address and growing downward). The merge preserves
+//!   whatever layout the runtime baked in; user code never touches
+//!   this region directly.
+//! - `[__heap_base, memory_end)` — heap for the runtime allocator.
+//!
+//! Minimum memory size is `max(17, runtime_min_pages)` 64-KiB pages.
+//! 17 pages (~1 MB) gives the GC enough room for current fixtures;
+//! the runtime floor is whatever its compiled image declared.
 //!
 //! # File layout
 //!
 //! - [`module_builder`] — `ModuleBuilder`, the per-section assembler
-//!   driving the declare/emit pipeline.
+//!   driving the merge / declare / emit pipeline.
 //! - [`type_interner`] — `TypeInterner`, the WASM type-section
-//!   deduplicator.
-//! - [`helper_usage`] — `HelperUsage`, the pre-scan that decides which
-//!   synthesized print helpers a module needs.
-//! - [`runtime`] — bodies for the synthesized `phx_print_*` helpers.
+//!   deduplicator. Runtime function-signature types also flow through
+//!   it (cheap dedup is always safe), so the type section stays
+//!   minimal even when runtime and user signatures coincide.
+//! - [`runtime_discovery`] — `find_runtime_wasm_or_diagnostic`, the
+//!   search for the compiled `phoenix_runtime.wasm` artifact.
+//! - [`runtime_merge`] — `merge_runtime`, the wasmparser → wasm-encoder
+//!   embed-and-merge step using `wasm_encoder::reencode::Reencode`.
 //! - [`translate`] — Phoenix IR → WASM function-body translation.
+//!
+//! # PR 3b heap_base bump
+//!
+//! Today the runtime's compiled image bakes `__heap_base` at "end of
+//! the runtime's data section." PR 3a doesn't emit any user data, so
+//! that's fine. When PR 3b starts appending user data segments above
+//! the runtime's, the bytes will land in the heap region — the
+//! allocator will overwrite them on first allocation. PR 3b therefore
+//! needs to *rewrite* the `__heap_base` global initializer (or the
+//! global's only writer in the runtime's `_initialize`-equivalent
+//! path) to the new post-user-data offset. Surfacing this here so the
+//! constraint is visible when PR 3b lands rather than discovered as a
+//! corruption bug.
 
 use phoenix_ir::module::IrModule;
 
 use crate::error::CompileError;
 
-mod helper_usage;
 mod module_builder;
-mod runtime;
+mod runtime_discovery;
+mod runtime_merge;
 mod translate;
 mod type_interner;
 
-use helper_usage::HelperUsage;
 use module_builder::ModuleBuilder;
-
-/// Top of the first 64 KiB page, minus 64 bytes of scratch. The
-/// scratch sits at the high end of memory in PR 2 so the data section
-/// (string constants, growing from offset 0) and the scratch never
-/// overlap — even when PR 3 starts emitting non-trivial string data.
-/// Aligned to 8 bytes so the embedded iovec / nwritten / itoa-buffer
-/// fields stay naturally aligned.
-pub(super) const SCRATCH_BASE: u32 = 65472;
 
 /// Compile a Phoenix IR module to a linear-memory WebAssembly module.
 ///
 /// Returns the raw bytes of a `.wasm` module that:
-/// - Imports `wasi_snapshot_preview1.fd_write` and
-///   `wasi_snapshot_preview1.proc_exit`.
-/// - Defines and exports a single linear memory (`memory`).
-/// - Synthesizes only the per-module runtime helpers the IR actually
-///   needs (`phx_print_i64`, `phx_print_bool`, `phx_print_str`).
+/// - Merges the pre-compiled `phoenix_runtime.wasm` (located via
+///   `runtime_discovery::find_runtime_wasm_or_diagnostic`) into the
+///   output, contributing every `phx_*` runtime symbol plus the WASI
+///   imports it needs.
 /// - Translates each concrete Phoenix function into a WASM function.
-/// - Exports a WASI-compatible `_start` that calls Phoenix's `main`.
+/// - Exports a WASI-compatible `_start` that wires
+///   `phx_gc_enable` → user `main` → `phx_gc_shutdown`.
+/// - Exports `memory` so WASI hosts can read the iovec staging area.
 ///
 /// The output is well-formed enough to load under `wasmtime` and pass
 /// `wasmparser` validation; the integration test in
 /// `crates/phoenix-cranelift/tests/compile_wasm_linear.rs` exercises
 /// both.
 pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, CompileError> {
-    let helpers = HelperUsage::scan(ir_module);
+    // Locate the pre-built runtime. The `RuntimeWasmNotFound → CompileError`
+    // conversion (impl in `runtime_discovery`) tags the error with
+    // `CompileErrorKind::RuntimeWasmNotFound` so integration tests can
+    // branch on it without grepping the message text. The diagnostic
+    // itself carries the canonical "how do I fix this?" hint
+    // (`cargo build -p phoenix-runtime --target wasm32-wasip1`).
+    let runtime_path = runtime_discovery::find_runtime_wasm_or_diagnostic()?;
+    let runtime_bytes = std::fs::read(&runtime_path).map_err(|e| {
+        CompileError::new(format!(
+            "wasm32-linear: could not read runtime at {}: {e}",
+            runtime_path
+        ))
+    })?;
+
     let mut builder = ModuleBuilder::new();
-    builder.declare_imports();
+
+    // Merge first: every `phx_*` runtime symbol must resolve to a
+    // merged-module function index before the user-side translator
+    // (which looks up names like `phx_print_i64`) runs.
+    let outcome = runtime_merge::merge_runtime(&mut builder, &runtime_bytes)?;
+    builder.finalize_merge(
+        outcome.phx_funcs,
+        outcome.runtime_min_pages,
+        outcome.runtime_max_pages,
+    );
+
+    // Memory is declared after merge so the page floor can absorb the
+    // runtime's required minimum. The user-side data section (PR 3b)
+    // will start above the runtime's data, which the merge tracked
+    // via `data_cursor`.
     builder.declare_memory();
-    builder.declare_runtime_helpers(helpers);
+
     builder.declare_phoenix_functions(ir_module)?;
     builder.declare_start();
     builder.emit_exports();
-    builder.emit_runtime_bodies(helpers);
     builder.emit_phoenix_bodies(ir_module)?;
-    builder.emit_start_body();
+    builder.emit_start_body()?;
+
     Ok(builder.finish())
 }

@@ -931,4 +931,66 @@ Cranelift's `cranelift-wasm` crate exists, but it goes the *other direction*: it
 - *Full matrix (native Phoenix + WASM Phoenix + native Go + Go-via-tinygo-WASM).* Rejected: tinygo's semantic divergence from canonical Go would make the comparison misleading without a long footnote that readers skip.
 - *Skip the refresh this phase.* Rejected: contradicts decision E's per-phase-close commitment. WASM-vs-native is the actionable cell; we have to publish it.
 
-Exit criteria for declaring Phase 2.4 complete live in [phase-2.md §2.4](phases/phase-2.md#exit-criteria-for-declaring-phase-24-complete), alongside every other phase's gates.
+#### E. Target triple: `wasm32-wasip1`
+
+**Decided:** 2026-05-15 (during PR 3 scope review).
+
+**Rationale:** `wasm32-wasip1` (the renamed `wasm32-wasi`, WASI preview 1) gives us the full Rust standard library, a default global allocator (wasi-libc-provided), and working stdio routed through WASI for free. The existing `phoenix-runtime` Rust source compiles essentially unchanged. The target also matches our host-import surface ([decision C](#c-host-import-surface-wasi-preview1-only)), so we don't ship a runtime built for one ABI and emit user code expecting another.
+
+- `phoenix build --target wasm32-linear` compiles user-emitted modules and the runtime against `wasm32-wasip1`.
+- `phoenix-runtime` builds via `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` once per environment; phoenix-cranelift discovers the artifact at codegen time ([decision F](#f-runtime-delivery-embed-and-merge)).
+- `std` features used by `phoenix-runtime` (`HashSet`, `Mutex`, `OnceLock`, `thread_local!`, `eprintln!`, `process::exit`) all work on `wasm32-wasip1` without feature gates.
+
+**Alternatives considered:**
+- *`wasm32-unknown-unknown`.* Bare-metal target. No std, no allocator, no I/O. We'd hand-roll `dlmalloc` integration, feature-gate every `std::*` use in `phoenix-runtime`, and route panic/print through a Phoenix-defined extern surface. Rejected: nothing's asking for this target, and it'd retract the WASI preview1 commitment in decision C.
+
+#### F. Runtime delivery: embed-and-merge
+
+**Decided:** 2026-05-15 (during PR 3 scope review).
+
+**Rationale:** On native, Cranelift emits a `.o` referencing `phx_*` symbols and `cc -lphoenix_runtime` resolves them at link time. WASM has no equivalent of `cc` + `libphoenix_runtime.a`, so we choose how the runtime's compiled wasm32 bytes get into the user-program `.wasm` module. **Embed-and-merge** keeps the pipeline pure-Rust and matches the wasm-encoder shape we already use:
+
+1. `phoenix-runtime` is compiled once to a complete `.wasm` module via `cargo build --target wasm32-wasip1 --release`.
+2. `phoenix-cranelift` discovers the resulting `phoenix_runtime.wasm` (env var `PHOENIX_RUNTIME_WASM` → search `target/wasm32-wasip1/{release,debug}/`).
+3. At codegen time, `wasmparser` walks the runtime module; phoenix-cranelift splices its functions, data segments, and globals into the wasm-encoder output, fixing up function / type / memory / global indices to live in one flat index space with the user code.
+4. The user's Phoenix `main` calls into runtime symbols (`phx_gc_alloc`, `phx_print_i64`, `phx_gc_push_frame`, etc.) by their post-merge function index — the same shape PR 2 used for the imported WASI functions, just sourced from the runtime module rather than the WASI host.
+
+**Pros:** pure-Rust pipeline; no external linker dep; merge logic is bounded (~few hundred LOC) and reused for PR 5's WASM GC variant; future-proof against runtime growth (any Rust the runtime crate adds just compiles to more WASM functions that get merged through the same path).
+
+**Cons:** index fix-up is fiddly (every function call, every global reference, every memory access has to be rewritten); the merge logic is its own surface to maintain; debug info is dropped on the floor in the first cut.
+
+**Alternatives considered:**
+- *`wasm-ld` (LLVM linker).* Compile both `phoenix-runtime` and our wasm-encoder output as relocatable wasm32 objects, link via `wasm-ld`. Native-shape. Rejected: adds LLD as a build-time dependency on every dev / CI machine; the wasm-encoder side gets significantly more complex (linking metadata sections, relocations); we lose direct control over the final module's section layout — which matters for PR 5's WASM GC custom type-section ordering.
+- *Pre-bake runtime bytes via `include_bytes!`.* Variant of embed-and-merge — the runtime `.wasm` builds at workspace-build time and embeds directly into `phoenix-cranelift`. Rejected for PR 3 in favor of the runtime-discovery shape that mirrors native's `find_runtime_lib`; revisit if the manual `cargo build -p phoenix-runtime --target wasm32-wasip1` step proves persistently annoying.
+
+**Memory-layout coordination.** The runtime allocator wants ownership of linear memory above its data section. The merged runtime brings its own iovec staging in its data section, so the wasm32-linear backend has no separate per-call scratch region. The layout invariants the merge pipeline maintains:
+
+- The merged module declares an initial memory of `max(MIN_INITIAL_PAGES, runtime_min_pages)` 64-KiB pages (currently `MIN_INITIAL_PAGES = 17`, ~1 MB) so the GC has somewhere to allocate. The runtime's own page floor wins when it's larger. A runtime-declared `maximum` (sandbox cap) is propagated through verbatim; if the runtime's cap is lower than our floor we drop the cap (and emit a warning) rather than emit an invalid `minimum > maximum` memory type.
+- The runtime's data segments are merged at their compiled-in offsets (de-conflicted by virtue of the runtime owning `[0, runtime_data_end)`).
+- `__heap_base` global is initialized by the runtime's compiled image to the post-runtime-data offset; the runtime allocator reads it on first allocation.
+- PR 3a emits no *user* data. PR 3b will: when it starts appending user data segments above the runtime's, the bytes would land in the heap region unless `__heap_base` is bumped to the new post-user-data offset. PR 3b is therefore responsible for rewriting the `__heap_base` global initializer (the surface for this is `module_builder::globals` + the merge's `global_remap`). Surfacing the constraint here so it's visible when PR 3b lands rather than discovered as a corruption bug.
+
+#### G. Control-flow translation: loop+switch dispatch, relooper deferred
+
+**Decided:** 2026-05-15 (during PR 3 scope review).
+
+**Rationale:** WASM has no general `goto` — only structured `block` / `loop` / `if` with branch-out-to-enclosing-label. Phoenix's IR is a basic-block CFG. The translation has two practical shapes; we pick the simpler one for PR 3b and reopen if benchmarks demand the tighter one.
+
+**Chosen: loop+switch dispatch** (the "irreducible-CFG fallback" pattern used by LLVM's wasm backend when relooper fails):
+
+- Each function body is wrapped in `(loop $L)`.
+- Each basic block gets a contiguous integer ID.
+- A function-local i32 holds "next block ID."
+- The loop body opens with `br_table` dispatching on that local to a labeled `block` per basic block.
+- Each basic block's terminator sets the next-ID local and `br`s back to `$L` (or returns).
+
+Correctness is unconditional — any CFG, including loops with multiple entry points, lowers cleanly. Output quality is "fine, not great" — extra `br_table`s and locals that Wasmtime / V8's optimizers mostly clean up at JIT time.
+
+**Deferred: relooper / Stackifier.** The published algorithm that reconstructs structured control flow (LLVM's `WebAssemblyCFGStackify.cpp`, ~1.5k LOC) produces tighter output but is a project unto itself. Phase 2.4 doesn't gate on output quality; the [phase-close bench refresh (decision D)](#d-phase-close-bench-refresh-scope-wasm-vs-native-phoenix-only) is the right place to discover whether control-flow overhead is a real signal in WASM-vs-native, and a relooper PR can land in Phase 2.5+ if it is.
+
+**Tripwire for revisiting:** if the phase-close `wasm32-linear` numbers on `fib_recursive` or `sort_ints` are >3× slower than native specifically because of the `br_table` dispatch (verified via wasmtime profiling), the relooper pass becomes a real follow-up. Otherwise the deferral holds indefinitely.
+
+**Alternatives considered:**
+- *Relooper up front.* Rejected per the scope argument above: ~1.5k LOC of intricate algorithm on top of everything else PR 3b is doing.
+- *Stackifier (LLVM's successor).* Same reasoning, plus the algorithm is even more complex.
+- *Cranelift IR's loop analysis as a substrate.* Rejected: would tie the WASM emitter to Cranelift's pass infrastructure, undoing decision A0's separation.

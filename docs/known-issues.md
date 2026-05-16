@@ -216,6 +216,17 @@ Phase 2.6 made every `Type::Named` / `Type::Generic` / `Type::Dyn` payload carry
 **Recommendation:** add a unit test in `phoenix-modules` that constructs a synthetic `EscapesRoot` resolver input directly (bypassing the grammar) and asserts the rendered diagnostic. Cheap to write today, mechanical to do; the alternative is discovering the regression at the moment a grammar change first makes it reachable.
 **Target phase:** opportunistic — pair with whichever change first makes a root-escaping import expressible (symlinked `mod.phx`, relative-path grammar, or a `phoenix-modules` API consumer outside the parser).
 
+### Runtime-discovery helpers return `Option<String>` rather than `Option<PathBuf>`
+
+Both runtime-discovery helpers — native's `find_runtime_lib` (`phoenix-cranelift/src/link.rs`) and wasm32-linear's `find_runtime_wasm_or_diagnostic` / `find_runtime_wasm_with` (`phoenix-cranelift/src/wasm/runtime_discovery.rs`) — return `Option<String>` for the resolved artifact path. `String` is lossy for non-UTF-8 filesystem paths (legal on Linux/BSD; Phoenix users with a non-UTF-8 build directory would see the artifact silently skipped). `PathBuf` would preserve every path byte exactly.
+
+Held back so the two helpers stay symmetric — fixing only the WASM side would leave native using `String` and create a confusing asymmetry between the two paths.
+
+**Recommendation:** flip both helpers to `Option<PathBuf>` in one pass, audit downstream `&str`-shaped consumers (the diagnostic-formatting sites already wrap in `format!(..., path)`, which works for `PathBuf` via `Display`), and update the `Option<String>`-returning unit-test helpers in lockstep.
+
+**File:** `crates/phoenix-cranelift/src/link.rs` (`find_runtime_lib`); `crates/phoenix-cranelift/src/wasm/runtime_discovery.rs` (`find_runtime_wasm_with`, `find_runtime_wasm_or_diagnostic`).
+**Target phase:** opportunistic — pair with whichever change next touches the runtime-discovery surface (a search-path extension, a manifest-driven override, etc.). Cheap to do then; speculative to do in isolation.
+
 ### `drain_remaining_into` callback duplication in `resolved.rs`
 
 `build_enums` / `build_structs` / `build_traits` (`phoenix-sema/src/resolved.rs`) each call `drain_remaining_into` with a four-line closure that allocates the next `*Id`, inserts it into the matching `*_by_name` map, and pushes the info into the matching `*s` vec. The three closures are structurally identical — only the id-allocator (`next_enum_id` / `next_struct_id` / `next_trait_id`), the name map, and the vec differ.

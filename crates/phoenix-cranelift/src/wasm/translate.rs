@@ -72,6 +72,31 @@ pub(super) fn wasm_return_valtypes(ty: &IrType) -> Result<Vec<ValType>, CompileE
     }
 }
 
+/// Translate a `wasmparser::ValType` into the corresponding
+/// `wasm_encoder::ValType`. Used by the runtime-merge step
+/// (`super::runtime_merge`) when re-encoding type-section entries
+/// from the pre-compiled `phoenix_runtime.wasm`. Rejects ref types
+/// the runtime shouldn't be producing on wasm32-wasip1 today.
+pub(super) fn wasm_valtype_from_parser(ty: wasmparser::ValType) -> Result<ValType, CompileError> {
+    match ty {
+        wasmparser::ValType::I32 => Ok(ValType::I32),
+        wasmparser::ValType::I64 => Ok(ValType::I64),
+        wasmparser::ValType::F32 => Ok(ValType::F32),
+        wasmparser::ValType::F64 => Ok(ValType::F64),
+        wasmparser::ValType::V128 => Ok(ValType::V128),
+        wasmparser::ValType::Ref(ref_ty) => {
+            // Reference types (funcref, externref, the WASM-GC heap
+            // types) are not expected from a wasm32-wasip1 cdylib. If
+            // a future Rust toolchain emits them (closures backed by
+            // ref-types?), the diagnostic points at this site.
+            Err(CompileError::new(format!(
+                "wasm32-linear: runtime exposes ref-typed value (`{ref_ty:?}`); \
+                 not handled by the embed-and-merge step yet"
+            )))
+        }
+    }
+}
+
 /// Translate a concrete Phoenix function body into a complete WASM
 /// [`Function`] (locals + body instructions).
 pub(super) fn translate_function(
@@ -342,33 +367,19 @@ fn translate_builtin_call(
     let arg_ir_ty = binding.ir_type.clone();
     match arg_ir_ty {
         IrType::I64 => {
-            let idx = b.print_i64_idx.ok_or_else(|| {
-                CompileError::new(
-                    "wasm32-linear: internal — `print(int)` translated but \
-                     phx_print_i64 was not declared (pre-scan vs. translation \
-                     disagree about helper usage)"
-                        .to_string(),
-                )
-            })?;
+            let idx = b.require_phx_func("phx_print_i64")?;
             ctx.emit(Instruction::LocalGet(arg_local));
             ctx.emit(Instruction::Call(idx));
         }
         IrType::Bool => {
-            let idx = b.print_bool_idx.ok_or_else(|| {
-                CompileError::new(
-                    "wasm32-linear: internal — `print(bool)` translated but \
-                     phx_print_bool was not declared (pre-scan vs. translation \
-                     disagree about helper usage)"
-                        .to_string(),
-                )
-            })?;
+            let idx = b.require_phx_func("phx_print_bool")?;
             ctx.emit(Instruction::LocalGet(arg_local));
             ctx.emit(Instruction::Call(idx));
         }
         other => {
             return Err(CompileError::new(format!(
                 "wasm32-linear: `print` on argument of IR type `{other:?}` \
-                 not yet supported (Phase 2.4 PR 3+)"
+                 not yet supported (Phase 2.4 PR 3b — see docs/design-decisions.md §Phase 2.4)"
             )));
         }
     }

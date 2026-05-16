@@ -60,7 +60,7 @@ mod type_tag;
 mod types;
 mod wasm;
 
-pub use error::CompileError;
+pub use error::{CompileError, CompileErrorKind};
 pub use link::{LinkError, RUNTIME_LIB_NAME, find_runtime_lib, link_executable};
 pub use target::Target;
 

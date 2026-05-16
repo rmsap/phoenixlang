@@ -63,7 +63,15 @@ target-lexicon = "0.13"
 # with our emitter pipeline — but it does mean bumping the workspace
 # triple here does *not* update Cranelift's transitive pair. See
 # `docs/design-decisions.md` §Phase 2.4 decision A0.
-wasm-encoder = "=0.248.0"
+# `wasm-encoder`'s `wasmparser` feature exposes `wasm_encoder::reencode`,
+# which the embed-and-merge step ([decision F](docs/design-decisions.md))
+# uses to copy pre-compiled `phoenix_runtime.wasm` function bodies into
+# the user-program module while remapping every index reference. Without
+# this feature the `Reencode` trait is unreachable and we'd have to
+# hand-roll the wasmparser::Operator → wasm_encoder::Instruction
+# translator for every instruction — pure busywork given the canonical
+# helper exists. Docs: <https://docs.rs/wasm-encoder/0.248.0/wasm_encoder/reencode/>.
+wasm-encoder = { version = "=0.248.0", features = ["wasmparser"] }
 wasmparser = "=0.248.0"
 wasmprinter = "=0.248.0"
 

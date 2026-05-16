@@ -23,10 +23,17 @@
 //! per-helper level, which the matrix couldn't isolate cleanly.
 
 use std::process::{Command, Stdio};
+use std::sync::Once;
 
 use phoenix_common::span::SourceId;
-use phoenix_cranelift::Target;
+use phoenix_cranelift::{CompileErrorKind, Target};
 use phoenix_ir::module::IrModule;
+
+/// Print the "phoenix_runtime.wasm not built" warning at most once
+/// per test process. A test binary with N skipped fixtures otherwise
+/// emits N copies of the same instructions to stderr, which buries
+/// any genuinely useful test failures.
+static MISSING_RUNTIME_WARNING: Once = Once::new();
 
 /// Lower a Phoenix source string to an `IrModule`, panicking on any
 /// front-end failure. Shared by the success-path `compile_to_wasm`
@@ -51,14 +58,172 @@ fn lower_to_ir(source: &str) -> IrModule {
     ir_module
 }
 
-/// Compile a Phoenix source string to a `wasm32-linear` `.wasm` byte
-/// vector via the same pipeline `phoenix build --target wasm32-linear`
-/// uses. Panics with a contextual message on any compile error so
-/// failures point at the right backend stage.
-fn compile_to_wasm(source: &str) -> Vec<u8> {
+/// Compile `source` via the wasm32-linear backend and pass the bytes
+/// to `body`. When the runtime artifact is missing, prints a one-time
+/// warning and skips `body` entirely (the calling `#[test]` returns
+/// success without running the body) — same skip-or-fail-loud shape
+/// as the native runtime-lib gate (`PHOENIX_REQUIRE_RUNTIME_LIB`),
+/// here gated by `PHOENIX_REQUIRE_RUNTIME_WASM=1`. Branching on
+/// [`CompileErrorKind::RuntimeWasmNotFound`] (rather than substring-
+/// matching the diagnostic) keeps the skip gate stable across copy-
+/// edits to the error message text. Any other compile error panics
+/// with a contextual message so failures point at the right backend
+/// stage.
+///
+/// Single chokepoint for the compile-and-skip pattern: every
+/// integration test routes through this helper so the skip plumbing
+/// doesn't drift across call sites.
+fn compile_or_skip(source: &str, label: &str, body: impl FnOnce(&[u8])) {
     let ir_module = lower_to_ir(source);
-    phoenix_cranelift::compile(&ir_module, Target::Wasm32Linear)
-        .unwrap_or_else(|e| panic!("wasm32-linear compile failed: {e}"))
+    let bytes = match phoenix_cranelift::compile(&ir_module, Target::Wasm32Linear) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => {
+            if std::env::var("PHOENIX_REQUIRE_RUNTIME_WASM").as_deref() == Ok("1") {
+                panic!(
+                    "PHOENIX_REQUIRE_RUNTIME_WASM=1 set but phoenix_runtime.wasm \
+                     is not on any search path — run `cargo build -p phoenix-runtime \
+                     --target wasm32-wasip1 --release` first"
+                );
+            }
+            // Per-test trace, plus a one-shot full instructions line so
+            // a 10-test skip storm doesn't bury the rest of stderr.
+            eprintln!("warning: skipping {label} — phoenix_runtime.wasm not built");
+            MISSING_RUNTIME_WARNING.call_once(|| {
+                eprintln!(
+                    "         (set PHOENIX_REQUIRE_RUNTIME_WASM=1 to fail instead; \
+                     `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` \
+                     to fix)"
+                );
+            });
+            return;
+        }
+        Err(e) => panic!("wasm32-linear compile failed: {e}"),
+    };
+    body(&bytes);
+}
+
+/// Spill `bytes` into a self-cleaning temp `.wasm` file and hand its
+/// path to `body`. Centralizing this keeps every "compile, write,
+/// invoke wasmtime" test path from re-deriving the same scrap of
+/// I/O plumbing — and ensures every site uses a self-deleting
+/// `NamedTempFile` rather than leaving `/tmp` debris.
+fn with_temp_wasm(label: &str, bytes: &[u8], body: impl FnOnce(&std::path::Path)) {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!("phx-wasm-{label}-"))
+        .suffix(".wasm")
+        .tempfile()
+        .expect("create temp .wasm");
+    file.write_all(bytes).expect("write temp .wasm");
+    file.as_file().sync_all().expect("flush temp .wasm");
+    body(file.path());
+}
+
+/// Truncate a WAT dump for use inside assertion messages. Keeping
+/// every "first 4 KiB of WAT" sentinel uniform across call sites so a
+/// future bump only needs to touch one constant.
+fn wat_excerpt(wat: &str) -> &str {
+    &wat[..wat.len().min(4096)]
+}
+
+/// Collect the function-index targets of every `Call` operator inside
+/// the body of the function exported under `export_name`, in the
+/// order they appear. Returns an `Err` with a specific message if
+/// the export, its function index, or its body can't be located, or
+/// if any wasmparser step fails — so a regression in the test helper
+/// surfaces as "couldn't find the export" rather than collapsing into
+/// a count mismatch the caller has to diagnose. Used to verify
+/// structural commitments of `_start` (call count *and* uniqueness of
+/// targets, so a regression that doubles a call shows up even when
+/// the resulting count still falls in the expected band) independently
+/// of the runtime's `name` custom section (which release builds strip).
+fn call_targets_in_export(bytes: &[u8], export_name: &str) -> Result<Vec<u32>, String> {
+    use wasmparser::{Operator, Parser, Payload};
+
+    let mut target_func_idx: Option<u32> = None;
+    let mut import_func_count: u32 = 0;
+    let mut bodies: Vec<wasmparser::FunctionBody<'_>> = Vec::new();
+
+    let parse_payload = |label: &str, e: wasmparser::BinaryReaderError| -> String {
+        format!("wasmparser failed while reading {label} for `{export_name}`: {e}")
+    };
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| parse_payload("payload header", e))?;
+        match payload {
+            Payload::ImportSection(rdr) => {
+                for group in rdr {
+                    let group = group.map_err(|e| parse_payload("import section", e))?;
+                    match group {
+                        wasmparser::Imports::Single(_, imp) => {
+                            if matches!(imp.ty, wasmparser::TypeRef::Func(_)) {
+                                import_func_count += 1;
+                            }
+                        }
+                        wasmparser::Imports::Compact1 { items, .. } => {
+                            for item in items {
+                                let item = item.map_err(|e| parse_payload("import items", e))?;
+                                if matches!(item.ty, wasmparser::TypeRef::Func(_)) {
+                                    import_func_count += 1;
+                                }
+                            }
+                        }
+                        wasmparser::Imports::Compact2 { ty, names, .. } => {
+                            if matches!(ty, wasmparser::TypeRef::Func(_)) {
+                                for name in names {
+                                    name.map_err(|e| parse_payload("import names", e))?;
+                                    import_func_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Payload::ExportSection(rdr) => {
+                for export in rdr {
+                    let export = export.map_err(|e| parse_payload("export section", e))?;
+                    if export.name == export_name
+                        && matches!(export.kind, wasmparser::ExternalKind::Func)
+                    {
+                        target_func_idx = Some(export.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => bodies.push(body),
+            _ => {}
+        }
+    }
+
+    let target = target_func_idx
+        .ok_or_else(|| format!("module has no function export named `{export_name}`"))?;
+    if target < import_func_count {
+        return Err(format!(
+            "export `{export_name}` resolves to imported function {target} \
+             (no local body exists; this helper only counts locally-defined Call ops)"
+        ));
+    }
+    let local_idx = (target - import_func_count) as usize;
+    let body = bodies.get(local_idx).ok_or_else(|| {
+        format!(
+            "export `{export_name}` points at local function {local_idx} but the \
+             code section has only {} bodies",
+            bodies.len()
+        )
+    })?;
+
+    let mut reader = body
+        .get_operators_reader()
+        .map_err(|e| parse_payload("function-body operators", e))?;
+    let mut targets = Vec::new();
+    while !reader.eof() {
+        if let Operator::Call { function_index } = reader
+            .read()
+            .map_err(|e| parse_payload("function-body operator", e))?
+        {
+            targets.push(function_index);
+        }
+    }
+    Ok(targets)
 }
 
 /// Run the AST interpreter on `source` and return its stdout. Used
@@ -135,29 +300,22 @@ fn run_with_wasmtime(wasm_path: &std::path::Path, label: &str) -> Option<String>
 /// than leaving `/tmp` debris that a future test or developer would
 /// have to track down.
 fn assert_wasm_matches_interp(source: &str, label: &str) {
-    let bytes = compile_to_wasm(source);
-    wasmparser::validate(&bytes)
-        .unwrap_or_else(|e| panic!("wasmparser rejected the module for {label}: {e}"));
+    compile_or_skip(source, label, |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module for {label}: {e}"));
 
-    let mut file = tempfile::Builder::new()
-        .prefix(&format!("phx-wasm-{label}-"))
-        .suffix(".wasm")
-        .tempfile()
-        .expect("create temp .wasm");
-    use std::io::Write;
-    file.write_all(&bytes).expect("write temp .wasm");
-    file.as_file().sync_all().expect("flush temp .wasm");
-
-    let Some(actual) = run_with_wasmtime(file.path(), label) else {
-        return; // skipped — warning already printed
-    };
-
-    let expected = run_ast_interp(source);
-    assert_eq!(
-        actual, expected,
-        "wasmtime stdout disagrees with AST interp for {label}\n\
-         expected: {expected:?}\nactual:   {actual:?}"
-    );
+        with_temp_wasm(label, bytes, |path| {
+            let Some(actual) = run_with_wasmtime(path, label) else {
+                return; // skipped — warning already printed
+            };
+            let expected = run_ast_interp(source);
+            assert_eq!(
+                actual, expected,
+                "wasmtime stdout disagrees with AST interp for {label}\n\
+                 expected: {expected:?}\nactual:   {actual:?}"
+            );
+        });
+    });
 }
 
 /// Hello-world fixture, pulled directly from `tests/fixtures/hello.phx`
@@ -172,46 +330,58 @@ const HELLO_SOURCE: &str = include_str!(concat!(
 
 #[test]
 fn hello_world_emits_valid_wasm_module() {
-    let bytes = compile_to_wasm(HELLO_SOURCE);
+    compile_or_skip(
+        HELLO_SOURCE,
+        "hello_world_emits_valid_wasm_module",
+        |bytes| {
+            // Tier 1: structural validation. Any failure here is an emitter
+            // bug — fix the wasm-encoder usage, not the test.
+            wasmparser::validate(bytes).unwrap_or_else(|e| {
+                panic!(
+                    "wasmparser rejected the emitted module: {e}\n\
+                 (the binary should be a valid WebAssembly module; check \
+                 section ordering, function-index space, and import vs \
+                 local function-index handoff in `src/wasm/mod.rs`)"
+                )
+            });
 
-    // Tier 1: structural validation. Any failure here is an emitter
-    // bug — fix the wasm-encoder usage, not the test.
-    wasmparser::validate(&bytes).unwrap_or_else(|e| {
-        panic!(
-            "wasmparser rejected the emitted module: {e}\n\
-             (the binary should be a valid WebAssembly module; check \
-             section ordering, function-index space, and import vs \
-             local function-index handoff in `src/wasm/mod.rs`)"
-        )
-    });
+            // Sanity: bytes start with the WASM magic + MVP version. Catches
+            // truncated / empty emission before deeper assertions.
+            assert!(
+                bytes.len() >= 8,
+                "wasm output too small ({} bytes) to even contain the header",
+                bytes.len()
+            );
+            assert_eq!(&bytes[..4], b"\0asm", "wrong wasm magic");
 
-    // Sanity: bytes start with the WASM magic + MVP version. Catches
-    // truncated / empty emission before deeper assertions.
-    assert!(
-        bytes.len() >= 8,
-        "wasm output too small ({} bytes) to even contain the header",
-        bytes.len()
+            // Disassemble to WAT to make later assertions human-readable —
+            // also a regression check that wasmprinter accepts our output.
+            let wat = wasmprinter::print_bytes(bytes)
+                .unwrap_or_else(|e| panic!("wasmprinter failed: {e}"));
+            hello_world_check_body(bytes, &wat);
+        },
     );
-    assert_eq!(&bytes[..4], b"\0asm", "wrong wasm magic");
+}
 
-    // Disassemble to WAT to make later assertions human-readable —
-    // also a regression check that wasmprinter accepts our output.
-    let wat =
-        wasmprinter::print_bytes(&bytes).unwrap_or_else(|e| panic!("wasmprinter failed: {e}"));
-
-    // Spot-check the WAT for the structural commitments listed in
-    // `src/wasm/mod.rs`'s top-level docs. Loose substring checks are
-    // intentional — exact WAT formatting can shift with wasmprinter
-    // versions, but these features have to be present for the module
-    // to be functionally correct.
+/// Body of `hello_world_emits_valid_wasm_module`, factored out so the
+/// closure passed to `compile_or_skip` stays focused on flow control.
+fn hello_world_check_body(bytes: &[u8], wat: &str) {
+    // Spot-check the WAT for PR 3a's structural commitments. The
+    // merged module contains both our user-side scaffolding (the
+    // `_start` entry, the exported memory) and the merged
+    // `phoenix-runtime` (WASI imports it needs, every `phx_*`
+    // function). Loose substring checks are intentional — exact WAT
+    // formatting can shift with wasmprinter versions — but these
+    // features have to be present for the module to be functionally
+    // correct.
     let expectations: &[(&str, &str)] = &[
         (
             "(import \"wasi_snapshot_preview1\" \"fd_write\"",
-            "PR 2 must import WASI fd_write",
+            "merged runtime must import WASI fd_write (stdio path)",
         ),
         (
             "(import \"wasi_snapshot_preview1\" \"proc_exit\"",
-            "PR 2 must import WASI proc_exit (now wired for fd_write errno)",
+            "merged runtime must import WASI proc_exit (panic exit path)",
         ),
         (
             "(export \"_start\"",
@@ -219,31 +389,122 @@ fn hello_world_emits_valid_wasm_module() {
         ),
         (
             "(export \"memory\"",
-            "memory must be exported so WASI hosts can read iovec staging area",
+            "memory must be exported so WASI hosts can read it",
         ),
         ("(memory ", "module must declare a memory section"),
     ];
     for (needle, reason) in expectations {
         assert!(
             wat.contains(needle),
-            "emitted WAT missing `{needle}` — {reason}\nfull WAT:\n{wat}"
+            "emitted WAT missing `{needle}` — {reason}\n\
+             (first 4 KiB of WAT shown for diagnostic;\n\
+             search the full WAT to confirm the section's absence)\n\
+             {}",
+            wat_excerpt(wat),
         );
     }
 
-    // hello.phx only `print(int)`s — no `print(bool)`, so the
-    // `phx_print_bool` helper and its `"true\n"` / `"false\n"`
-    // literals must be absent. A regression that always emits the
-    // bool data segments (e.g. collapsing the `usage.print_bool`
-    // guard in `module_builder::declare_runtime_helpers` or
-    // `emit_runtime_bodies`) would silently bloat every module; this
-    // assertion is the only PR-2-level guard for the
-    // `HelperUsage::scan` omit-when-unused branch. (The bool-print
-    // test below covers the present-when-needed branch.)
+    // Positive merge assertion. The WASI-import / `_start` / memory
+    // expectations above don't actually prove the merge ran — a
+    // regression where `merge_runtime` early-returned but the user-side
+    // scaffolding still declared the WASI imports would pass them all.
+    // PR 3a user code emits zero data segments and zero globals (hello.phx
+    // has no string constants); the runtime contributes both. Asserting
+    // their presence is a strict superset of "merge ran" without depending
+    // on the runtime's `name` custom section (which `--release` may strip).
     assert!(
-        !wat.contains("(data "),
-        "hello.phx prints no booleans, so no data segments should \
-         be emitted, but the WAT contains a `(data` section:\n{wat}"
+        wat.contains("(data "),
+        "emitted WAT contains no `(data ` section — the runtime \
+         embed-and-merge step did not contribute any data segments, \
+         which means `merge_runtime` was skipped or `merge_data` \
+         silently dropped its input. PR 3a user code emits no data \
+         segments, so this section can only come from the runtime.\n\
+         (first 4 KiB of WAT shown for diagnostic:)\n{}",
+        wat_excerpt(wat),
     );
+    assert!(
+        wat.contains("(global "),
+        "emitted WAT contains no `(global ` section — the merged \
+         runtime must contribute at least `__stack_pointer`. \
+         A missing global section means `merge_runtime` skipped the \
+         global section or `merge_global` is broken.\n\
+         (first 4 KiB of WAT shown for diagnostic:)\n{}",
+        wat_excerpt(wat),
+    );
+
+    // GC lifecycle assertion. `_start` must call `phx_gc_enable`
+    // before `main` and `phx_gc_shutdown` after — a regression in
+    // `emit_start_body` that drops either call would otherwise pass
+    // every assertion above (the symbols still merge, the module
+    // still validates) and only manifest as a runtime leak or
+    // uninitialized-allocator trap. The release runtime strips the
+    // `name` section so we can't reach this through WAT substring
+    // matching; instead, walk the binary directly: locate `_start`
+    // by export and decode its body's `Call` targets.
+    //
+    // We check two structural commitments separately:
+    //
+    // 1. Call count is 3 or 4. 3 = no static ctors (common
+    //    wasm32-wasip1 cdylib shape: `phx_gc_enable` / `phx_main` /
+    //    `phx_gc_shutdown`); 4 = runtime exports `_initialize` or
+    //    `__wasm_call_ctors`, in which case `emit_start_body` calls
+    //    that first. The merged module doesn't re-export `_initialize`,
+    //    so we accept either count rather than trying to re-derive.
+    //
+    // 2. *All call targets are distinct.* This catches regressions
+    //    where `emit_start_body` accidentally doubles a call
+    //    (e.g. emitting `phx_gc_enable` twice) — that would still
+    //    land a count in {3,4} but is a real bug. Every site in
+    //    `emit_start_body` calls a different runtime function, so
+    //    distinct targets is a tight invariant.
+    let call_targets = call_targets_in_export(bytes, "_start").unwrap_or_else(|e| {
+        panic!("collecting calls in `_start` failed: {e}");
+    });
+    let call_count = call_targets.len();
+    assert!(
+        call_count == 3 || call_count == 4,
+        "the `_start` function must contain 3 `Call` instructions \
+         (phx_gc_enable / phx_main / phx_gc_shutdown) or 4 \
+         (with `_initialize` / `__wasm_call_ctors` first); got {call_count} \
+         (targets={call_targets:?}). \
+         A different count means `emit_start_body` was changed \
+         (or the GC wiring was dropped) without updating this \
+         assertion. See `module_builder::emit_start_body`."
+    );
+    let mut sorted = call_targets.clone();
+    sorted.sort_unstable();
+    let len_before = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        len_before,
+        "the `_start` function has duplicate `Call` targets ({call_targets:?}); \
+         every step in `emit_start_body` calls a distinct runtime function, \
+         so a duplicate means a call site was inadvertently emitted twice. \
+         See `module_builder::emit_start_body`."
+    );
+
+    // Behavioral check folded in: hello.phx is
+    // `function main() { let x: Int = 42; print(x) }`, so the WASI
+    // stdout must contain "42". Pinning the exact substring guards
+    // against the case where the AST interp and the WASM backend
+    // agree on a *wrong* output (e.g. both print "0" because some
+    // shared lowering bug zeroes the literal — `assert_wasm_matches_interp`
+    // wouldn't catch that). Runs as the wasmtime tier of this test
+    // rather than a separate fixture so we don't re-compile hello.phx
+    // twice.
+    with_temp_wasm("hello-42", bytes, |path| {
+        if let Some(stdout) = run_with_wasmtime(path, "hello_world_emits_valid_wasm_module") {
+            assert!(
+                stdout.contains("42"),
+                "wasmtime stdout does not contain `42` for hello.phx \
+                 (expected `print(42)` to route through merged `phx_print_i64`); \
+                 stdout was: {stdout:?}"
+            );
+        }
+        // (None = wasmtime not available; the skip path is already
+        // logged by `run_with_wasmtime`.)
+    });
 }
 
 #[test]
@@ -283,23 +544,20 @@ fn zero_int_runs_under_wasmtime() {
 
 /// Empty `main` — no IR ops, no prints — should still produce a
 /// well-formed module that wasmtime accepts and runs to a clean
-/// exit. Exercises the all-helpers-disabled branch of
-/// [`HelperUsage::scan`] end-to-end: `phx_print_*` declarations
-/// are skipped, the data section is empty, and only `_start` +
-/// `main` end up in the code section. A regression here would
-/// indicate the runtime-helper plumbing is inadvertently required
-/// even when no `print` call appears.
+/// exit. With PR 3a the `_start` body still runs `phx_gc_enable` →
+/// user `main` → `phx_gc_shutdown` regardless of whether `main`
+/// has any prints, so this fixture pins the "no-op main" path
+/// through the GC lifecycle.
 #[test]
 fn empty_main_runs_under_wasmtime() {
     let src = "function main() {}\n";
     assert_wasm_matches_interp(src, "empty_main");
 }
 
-/// `print(bool)` exercises the `phx_print_bool` helper, the
-/// associated `"true\n"` / `"false\n"` data segments, and the
-/// `HelperUsage` pre-scan's bool branch (which gates whether those
-/// segments are emitted at all). Both arms in one fixture keeps the
-/// data-section layout under coverage.
+/// `print(bool)` routes through the merged runtime's `phx_print_bool`
+/// (and its `"true\n"` / `"false\n"` static strings, which live in
+/// the runtime's data segments). Both arms in one fixture keeps both
+/// boolean values covered.
 #[test]
 fn bool_print_runs_under_wasmtime() {
     let src = "function main() {\n  print(true)\n  print(false)\n}\n";
