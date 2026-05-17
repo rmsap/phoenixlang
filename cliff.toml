@@ -1,0 +1,60 @@
+# git-cliff configuration. Generates CHANGELOG sections from
+# Conventional Commits since the previous `v*` tag. Run locally with
+# `git cliff --latest --prepend CHANGELOG.md` or via release.yml on
+# tag push.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to the Phoenix language will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/).
+"""
+
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\\n") | first | upper_first }}\
+{% if commit.breaking %} **[breaking]**{% endif %}\
+{% endfor %}
+{% endfor %}
+"""
+
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+
+# Map commit prefixes to Keep-a-Changelog sections. The trailing `.*`
+# fallback bucket catches non-conventional commits so nothing is silently
+# dropped while the convention is being adopted.
+commit_parsers = [
+  { message = "^feat",      group = "Added" },
+  { message = "^fix",       group = "Fixed" },
+  { message = "^perf",      group = "Changed" },
+  { message = "^refactor",  group = "Changed" },
+  { message = "^revert",    group = "Changed" },
+  { message = "^docs",      group = "Documentation" },
+  { message = "^test",      skip = true },
+  { message = "^chore",     skip = true },
+  { message = "^ci",        skip = true },
+  { message = "^build",     skip = true },
+  { message = "^style",     skip = true },
+  { message = ".*",         group = "Changed" },
+]
+
+# Treat `!` after the type (e.g. `feat!: drop X`) and `BREAKING CHANGE:`
+# footers as breaking.
+protect_breaking_commits = false
