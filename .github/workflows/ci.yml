@@ -10,6 +10,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -24,5 +25,6 @@ jobs:
       - run: cargo test -p phoenix-lsp
       - run: cargo test -p phoenix-runtime
       - run: cargo build -p phoenix-runtime
+      - run: cargo build -p phoenix-runtime --target wasm32-wasip1 --release
       - run: cargo test -p phoenix-driver
       - run: cargo test -p phoenix-cranelift
