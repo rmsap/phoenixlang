@@ -27,7 +27,10 @@ use std::sync::Once;
 
 use phoenix_common::span::SourceId;
 use phoenix_cranelift::{CompileErrorKind, Target};
-use phoenix_ir::module::IrModule;
+use phoenix_ir::instruction::{FuncId, Op};
+use phoenix_ir::module::{IrFunction, IrModule};
+use phoenix_ir::terminator::Terminator;
+use phoenix_ir::types::IrType;
 
 /// Print the "phoenix_runtime.wasm not built" warning at most once
 /// per test process. A test binary with N skipped fixtures otherwise
@@ -75,7 +78,18 @@ fn lower_to_ir(source: &str) -> IrModule {
 /// doesn't drift across call sites.
 fn compile_or_skip(source: &str, label: &str, body: impl FnOnce(&[u8])) {
     let ir_module = lower_to_ir(source);
-    let bytes = match phoenix_cranelift::compile(&ir_module, Target::Wasm32Linear) {
+    compile_ir_or_skip(&ir_module, label, body);
+}
+
+/// Same skip-or-compile contract as [`compile_or_skip`] but takes a
+/// pre-built [`IrModule`] rather than lowering from source. Used by
+/// tests that hand-construct IR shapes the source front-end can't
+/// produce today (e.g. the parallel-copy back-edge fixture, which
+/// requires a `Jump` passing block params in shuffled order — Phoenix's
+/// `let mut` / `while` lowers via `Op::Alloca` and never emits this
+/// shape from source).
+fn compile_ir_or_skip(ir_module: &IrModule, label: &str, body: impl FnOnce(&[u8])) {
+    let bytes = match phoenix_cranelift::compile(ir_module, Target::Wasm32Linear) {
         Ok(bytes) => bytes,
         Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => {
             if std::env::var("PHOENIX_REQUIRE_RUNTIME_WASM").as_deref() == Ok("1") {
@@ -328,6 +342,16 @@ const HELLO_SOURCE: &str = include_str!(concat!(
     "/../../tests/fixtures/hello.phx"
 ));
 
+/// Fibonacci fixture, pulled directly from `tests/fixtures/fibonacci.phx`.
+/// PR 3b's headline gain — exercises `Int` arith (`isub`, `iadd`),
+/// comparison (`ile`), multi-block control flow via the loop+switch
+/// dispatcher (decision G), and direct user-function recursion
+/// (`Op::Call`). All four pieces compose for `fib(10) == 55` to print.
+const FIBONACCI_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/fibonacci.phx"
+));
+
 #[test]
 fn hello_world_emits_valid_wasm_module() {
     compile_or_skip(
@@ -512,25 +536,28 @@ fn hello_world_runs_under_wasmtime() {
     assert_wasm_matches_interp(HELLO_SOURCE, "hello_world");
 }
 
-// Negative-integer coverage of `phx_print_i64`'s `is_negative` branch
-// is deferred to PR 3. Phoenix lowers `-123` to `INeg(ConstI64(123))`,
-// and PR 2's translator-op surface is intentionally narrow enough to
-// reject `INeg` — there's no source-level expression of a negative
-// integer that doesn't route through arithmetic. Once PR 3 lifts
-// `INeg`, add these tests here so the sign-store path and the
-// `i64::MIN` two's-complement wrap documented in `runtime.rs` get
-// end-to-end coverage:
-//
-//   - `negative_int_runs_under_wasmtime` — fixture `print(-123)`,
-//     exercises the sign-write branch and the magnitude-negation
-//     `0 - mag` step.
-//   - `i64_min_runs_under_wasmtime` — fixture `print(-9223372036854775808)`,
-//     exercises the `i64::MIN` two's-complement-wrap path where
-//     `0 - mag` overflows back to `i64::MIN` and the `I64DivU` /
-//     `I64RemU` loop reads the bit pattern as 2^63.
-//
-// Both targets are unreachable from a PR-2 source-level fixture; PR 3
-// is the natural home because lifting `INeg` is on its critical path.
+/// Fibonacci end-to-end: PR 3b's headline test. Pins the loop+switch
+/// dispatcher (multi-block control flow), `Int` arith / comparison,
+/// and direct user-function recursion all working together. The fixture
+/// prints `fib(0)`, `fib(1)`, `fib(5)`, `fib(10)` — covers both the
+/// base-case branch (returns `n` directly) and the recursive branch
+/// (two recursive calls + `iadd`).
+#[test]
+fn fibonacci_runs_under_wasmtime() {
+    assert_wasm_matches_interp(FIBONACCI_SOURCE, "fibonacci");
+}
+
+/// Negative integer: `-123` lowers to `INeg(ConstI64(123))`. PR 3b
+/// adds `Op::INeg` (emitted as `0 - x` because WASM MVP has no
+/// `i64.neg`), so this fixture now reaches `phx_print_i64`'s
+/// `is_negative` branch — exercising both the magnitude-negation step
+/// and the sign-store path inside the runtime's itoa loop. PR 2
+/// couldn't express this from any source-level fixture.
+#[test]
+fn negative_int_runs_under_wasmtime() {
+    let src = "function main() {\n  print(0 - 123)\n}\n";
+    assert_wasm_matches_interp(src, "negative_int");
+}
 
 /// Zero is the do-while edge of the itoa loop: the magnitude is 0
 /// on entry, but the loop body still has to emit a single `'0'`
@@ -564,6 +591,209 @@ fn bool_print_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "bool_print");
 }
 
+/// Bool-producing comparison: integer-compare ops (`Op::IEq` and
+/// friends) land their `i32 0/1` result in a `Bool` binding, which
+/// then routes through `phx_print_bool`. `bool_print_runs_under_wasmtime`
+/// only exercises bool *literals* — without this fixture, a regression
+/// that miscompiled `IEq` (e.g. wrong WASM op, or stored to an `i64`
+/// local) would still let `print(true)` pass cleanly. The two cases
+/// (true and false) cover both `i64.eq` outcomes.
+#[test]
+fn bool_from_int_cmp_runs_under_wasmtime() {
+    let src = "function main() {\n  print(1 == 1)\n  print(1 == 2)\n}\n";
+    assert_wasm_matches_interp(src, "bool_from_int_cmp");
+}
+
+/// If-as-expression: both arms compute a value and jump to a merge
+/// block, where the merged value is bound via a block parameter. This
+/// exercises the **Jump-with-args** path in `emit_block_param_copies`
+/// that fibonacci's branch-then-return shape never reaches — both
+/// arms of the conditional terminate with `Jump merge(value)` rather
+/// than `Return`, so the dispatcher copies the SSA-value local into
+/// the merge block's param local before re-entering the dispatch.
+///
+/// Phoenix lowers `let mut` / `while` mutable state through
+/// `Op::Alloca` rather than block-param threading (deferred to PR 3c
+/// alongside the rest of the heap-aware op surface), so loop-shaped
+/// back-edges with SSA params can't be expressed at source level
+/// here. The if-as-expression shape is the simplest source-level
+/// fixture that produces a `Jump { args: [..] }` IR terminator and
+/// thus locks down the param-copy path against regression.
+#[test]
+fn if_as_expression_runs_under_wasmtime() {
+    let src = "function abs2(x: Int) -> Int {\n  \
+        if x > 0 { x * 2 } else { 0 - x }\n\
+        }\n\
+        function main() {\n  \
+        print(abs2(5))\n  \
+        print(abs2(0 - 3))\n\
+        }\n";
+    assert_wasm_matches_interp(src, "if_as_expression");
+}
+
+/// Build an IR module whose `main` function exercises the parallel-
+/// copy semantics of `emit_block_param_copies` (translate.rs). The
+/// shape is a 3-iteration loop whose back-edge passes the loop
+/// header's own block params in *shuffled* order — every iteration
+/// swaps `x` and `y` while incrementing `i`. After the loop exits, we
+/// print `x` then `y`.
+///
+/// ```text
+/// entry: c0=0, a=10, b=20; jump loop(c0, a, b)
+/// loop (i, x, y):
+///   print(i)
+///   cond = i < 3
+///   if cond { body } else { exit }
+/// body:
+///   i' = i + 1
+///   jump loop(i', y, x)        ;; SHUFFLED — x↔y on every iter
+/// exit:
+///   print(x); print(y); return
+/// ```
+///
+/// Expected stdout with the correct parallel-copy semantics:
+/// `0 1 2 3 20 10`. A naive sequential copy (set in declaration order
+/// while reading from sources) would clobber `x` before reading it on
+/// the swap, collapsing `y` to whatever the prior `x` held — yielding
+/// `0 1 2 3 20 20` instead. The two diverge on the *first* swap, so a
+/// regression surfaces immediately rather than depending on iteration
+/// depth.
+///
+/// Phoenix's source surface lowers `let mut` / `while` mutable state
+/// through `Op::Alloca` (deferred to PR 3c) rather than block-param
+/// threading, so this Jump-with-shuffled-args shape is unreachable
+/// from any source-level fixture today. Hand-building the IR is the
+/// only way to pin the parallel-copy path before PR 3c lands.
+fn build_shuffled_back_edge_ir() -> IrModule {
+    let mut module = IrModule::new();
+    let mut f = IrFunction::new(
+        FuncId(0), // overwritten by push_concrete
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+
+    let entry = f.create_block();
+    let loop_blk = f.create_block();
+    let body = f.create_block();
+    let exit_blk = f.create_block();
+
+    // `loop` block parameters: (i, x, y). The back-edge from `body`
+    // will pass [i+1, y, x] — the swap is what exercises the
+    // parallel-copy path, since `y_local` and `x_local` are both in
+    // the dest-locals set and read as sources at the same time.
+    let i = f.add_block_param(loop_blk, IrType::I64);
+    let x = f.add_block_param(loop_blk, IrType::I64);
+    let y = f.add_block_param(loop_blk, IrType::I64);
+
+    // entry: jump loop(0, 10, 20)
+    let c0 = f.emit_value(entry, Op::ConstI64(0), IrType::I64, None);
+    let a = f.emit_value(entry, Op::ConstI64(10), IrType::I64, None);
+    let b = f.emit_value(entry, Op::ConstI64(20), IrType::I64, None);
+    f.set_terminator(
+        entry,
+        Terminator::Jump {
+            target: loop_blk,
+            args: vec![c0, a, b],
+        },
+    );
+
+    // loop: print(i); cond = i < 3; branch
+    f.emit(
+        loop_blk,
+        Op::BuiltinCall("print".to_string(), vec![i]),
+        IrType::Void,
+        None,
+    );
+    let three = f.emit_value(loop_blk, Op::ConstI64(3), IrType::I64, None);
+    let cond = f.emit_value(loop_blk, Op::ILt(i, three), IrType::Bool, None);
+    f.set_terminator(
+        loop_blk,
+        Terminator::Branch {
+            condition: cond,
+            true_block: body,
+            true_args: vec![],
+            false_block: exit_blk,
+            false_args: vec![],
+        },
+    );
+
+    // body: i' = i + 1; jump loop(i', y, x)  -- the SHUFFLE
+    let one = f.emit_value(body, Op::ConstI64(1), IrType::I64, None);
+    let i_plus = f.emit_value(body, Op::IAdd(i, one), IrType::I64, None);
+    f.set_terminator(
+        body,
+        Terminator::Jump {
+            target: loop_blk,
+            args: vec![i_plus, y, x],
+        },
+    );
+
+    // exit: print(x); print(y); return
+    f.emit(
+        exit_blk,
+        Op::BuiltinCall("print".to_string(), vec![x]),
+        IrType::Void,
+        None,
+    );
+    f.emit(
+        exit_blk,
+        Op::BuiltinCall("print".to_string(), vec![y]),
+        IrType::Void,
+        None,
+    );
+    f.set_terminator(exit_blk, Terminator::Return(None));
+
+    module.push_concrete(f);
+    module
+}
+
+/// Parallel-copy semantics regression test. Constructs an IR module
+/// with a loop whose back-edge passes block params in shuffled order
+/// (see [`build_shuffled_back_edge_ir`] for the precise shape and the
+/// expected-vs-buggy stdout difference). A naive sequential
+/// `local.get src; local.set dest` per-pair lowering would clobber
+/// one of the swap targets — this test would then print
+/// `0 1 2 3 20 20` instead of `0 1 2 3 20 10`.
+///
+/// IR is hand-built because no source-level Phoenix construct produces
+/// a `Jump { args: [..] }` with shuffled block-param order today
+/// (mutable loop state lives on `Op::Alloca`, deferred to PR 3c).
+#[test]
+fn parallel_copy_back_edge_swap_runs_under_wasmtime() {
+    let ir_module = build_shuffled_back_edge_ir();
+    let verify_errors = phoenix_ir::verify::verify(&ir_module);
+    assert!(
+        verify_errors.is_empty(),
+        "hand-built IR fixture failed verification: {verify_errors:?}"
+    );
+
+    compile_ir_or_skip(&ir_module, "parallel_copy_back_edge_swap", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected parallel-copy fixture: {e}"));
+
+        with_temp_wasm("parallel_copy_back_edge_swap", bytes, |path| {
+            let Some(actual) = run_with_wasmtime(path, "parallel_copy_back_edge_swap") else {
+                return;
+            };
+            // Iterations print i=0,1,2,3 (the print fires *before* the
+            // i<3 check, so i=3 is printed too on the last iteration).
+            // Then exit prints x then y. After 3 swaps (one per back-
+            // edge), x and y are swapped from their initial (10, 20)
+            // ordering: x=20, y=10.
+            let expected = "0\n1\n2\n3\n20\n10\n";
+            assert_eq!(
+                actual, expected,
+                "parallel-copy regression: a naive sequential copy would \
+                 produce `0 1 2 3 20 20` (y clobbered to match x). \
+                 expected: {expected:?}\nactual:   {actual:?}"
+            );
+        });
+    });
+}
+
 /// Run the backend on `source` and return the error message. Panics
 /// if compilation unexpectedly succeeds — the caller passes IR the
 /// backend is expected to reject. Locks the error-message shape so
@@ -595,51 +825,79 @@ fn rejects_module_without_main() {
 }
 
 #[test]
-fn rejects_multi_block_control_flow() {
-    // An `if` introduces a second basic block. PR 2's translator only
-    // visits block 0; PR 3 lifts this.
-    let src = "function main() {\n  if true {\n    let x: Int = 1\n    print(x)\n  }\n}\n";
-    let err = expect_wasm_compile_error(src);
-    assert!(
-        err.contains("multi-block control flow"),
-        "expected multi-block-control-flow error, got: {err}"
-    );
+fn accepts_multi_block_control_flow_with_branch() {
+    // PR 3b adds multi-block control flow via the loop+switch
+    // dispatcher (decision G). An `if` introduces a Branch terminator
+    // and two non-entry blocks; codegen must accept it. Before PR 3b
+    // this was `rejects_multi_block_control_flow`; the inversion pins
+    // the lifted restriction so a future regression resurfaces here
+    // rather than only surfacing at execution time. Routing through
+    // `assert_wasm_matches_interp` (rather than just asserting compile
+    // success) additionally locks down the dispatcher's *behavior* in
+    // this minimal "single-arm if, no merge" shape — a regression that
+    // emitted structurally-valid WASM but jumped to the wrong block
+    // would still pass a compile-only check.
+    //
+    // The condition is `n > 0` (computed at runtime) rather than a
+    // literal `true`. A future IR-builder pass that constant-folded
+    // `if true { ... }` to a single straight-line block would
+    // otherwise silently drain this test of multi-block coverage —
+    // pinning a non-constant predicate makes that regression visible
+    // here rather than in some downstream perf test.
+    let src = "function main() {\n  \
+        let n: Int = 1\n  \
+        if n > 0 {\n    \
+        print(n)\n  \
+        }\n\
+        }\n";
+    assert_wasm_matches_interp(src, "accepts_multi_block_control_flow_with_branch");
 }
 
 #[test]
 fn rejects_unsupported_ir_op() {
-    // Arithmetic is not in PR 2's op surface. The error must point at
-    // PR 3 so a future regression in the deferred-error wording is
-    // visible.
-    let src = "function main() {\n  let a: Int = 1\n  let b: Int = 2\n  let c: Int = a + b\n  print(c)\n}\n";
+    // Float arithmetic is not in PR 3b's op surface — only `Int`
+    // arith (`IAdd` / `ISub` / `IMul` / `IDiv` / `IMod` / `INeg`)
+    // and comparisons land here; `FAdd` / `ConstF64` / friends defer
+    // to PR 3c alongside the rest of the wider numeric surface. The
+    // diagnostic must cite the PR-3 follow-up so a regression in the
+    // deferred-error wording is visible.
+    let src = "function main() {\n  let a: Float = 1.5\n  let b: Float = 2.5\n  let c: Float = a + b\n  print(c)\n}\n";
     let err = expect_wasm_compile_error(src);
+    // Pin the *path* — `IR op` only appears in the per-op rejection
+    // arm of `translate_instruction`, so this rules out a spurious
+    // type-rep rejection (`IR type \`F64\``) firing first and masking
+    // a regression in the op-coverage check.
     assert!(
-        err.contains("not yet supported"),
-        "expected `not yet supported` op error, got: {err}"
+        err.contains("IR op") && err.contains("not yet supported"),
+        "expected `IR op ... not yet supported` op error, got: {err}"
     );
     assert!(
-        err.contains("Phase 2.4 PR 3"),
+        err.contains("PR 3"),
         "expected error to cite the PR 3 follow-up, got: {err}"
     );
 }
 
 #[test]
 fn rejects_unrepresentable_param_type() {
-    // A `String` parameter lowers to `IrType::StringRef`, which has
-    // no single-slot WASM ValType — PR 2's translator rejects it at
-    // entry-block parameter binding time. PR 3 lifts this once the
-    // fat-pointer (ptr, len) representation lands. The fixture keeps
-    // `main` minimal and never calls `greet`, so the only path that
-    // can fire is the param-rejection one — a previous shape that
-    // called `greet("hello")` would fail at `Op::ConstString` /
+    // A `List<Int>` parameter has no WASM value representation in
+    // PR 3b — collection types land in PR 3c with shadow-stack root
+    // emission and the `phx_list_alloc`-based ABI. The fixture keeps
+    // `main` minimal and never calls `sink`, so the only path that
+    // can fire is the param-rejection one: a previous shape that
+    // called `sink([1,2,3])` would fail at `Op::ListAlloc` /
     // `Op::Call` before hitting the param check, masking regressions
-    // in the path we actually want to lock down.
+    // in the param-rejection path we want to lock down.
     let src = "function main() {}\n\
-               function greet(msg: String) {\n  print(true)\n}\n";
+               function sink(xs: List<Int>) {\n  print(true)\n}\n";
     let err = expect_wasm_compile_error(src);
+    // Pin both the type (so a regression that swapped `ListRef` for
+    // a different fallthrough type would surface) and the path
+    // (`value representation` only comes from `wasm_valtypes_for`'s
+    // `unsupported(...)`, ruling out an op-side rejection that
+    // happened to mention `not yet supported` for unrelated reasons).
     assert!(
-        err.contains("StringRef"),
-        "expected `StringRef` in unsupported-param-type error, got: {err}"
+        err.contains("IR type `ListRef") && err.contains("value representation"),
+        "expected `IR type \\`ListRef ...\\` ... value representation` error, got: {err}"
     );
 }
 
@@ -660,21 +918,25 @@ fn rejects_main_with_params() {
 
 #[test]
 fn rejects_unrepresentable_return_type() {
-    // `function greet() -> String { ... }` lowers to an IR function
-    // whose `return_type` is `IrType::StringRef`, which has no single-
-    // slot WASM `ValType` — `wasm_return_valtypes` rejects it during
-    // signature construction in `declare_phoenix_functions`. Pinning
-    // this branch separately from the param-side rejection in
+    // `function returns_list() -> List<Int> { ... }` lowers to an IR
+    // function whose `return_type` is `IrType::ListRef`, which has no
+    // PR 3b WASM value representation. Pinning this branch separately
+    // from the param-side rejection in
     // `rejects_unrepresentable_param_type` covers both halves of
-    // `wasm_valtype_for`'s value-representation gate; without this,
+    // `wasm_valtypes_for`'s value-representation gate; without this,
     // a regression on the return path would only surface once a
-    // String-returning function was actually called from `main`.
+    // list-returning function was actually called from `main`.
     let src = "function main() {}\n\
-               function greet() -> String {\n  return \"hi\"\n}\n";
+               function returns_list() -> List<Int> {\n  return [1, 2, 3]\n}\n";
     let err = expect_wasm_compile_error(src);
+    // Same shape as `rejects_unrepresentable_param_type`'s tightened
+    // assertion: pin `ListRef` and the `value representation` path so
+    // a future regression that moved the rejection elsewhere (e.g.
+    // an op-side check firing first) doesn't pass silently.
     assert!(
-        err.contains("StringRef"),
-        "expected `StringRef` in unsupported-return-type error, got: {err}"
+        err.contains("IR type `ListRef") && err.contains("value representation"),
+        "expected `IR type \\`ListRef ...\\` ... value representation` error \
+         on return-position list, got: {err}"
     );
 }
 

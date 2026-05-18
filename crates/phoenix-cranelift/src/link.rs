@@ -175,12 +175,19 @@ pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), LinkError
     let platform_args = platform_link_args()?;
     let runtime_dir = find_runtime_lib().ok_or(LinkError::RuntimeLibNotFound)?;
 
+    // Pass the static archive by full path. `-lphoenix_runtime` would
+    // pick the companion cdylib (`.so` / `.dylib`) cargo now emits
+    // alongside the archive (see `phoenix-runtime/Cargo.toml` for the
+    // `crate-type = ["cdylib"]` rationale), which would then need an
+    // `LD_LIBRARY_PATH` nothing sets. Full path works on Linux and
+    // macOS; `-l:libphoenix_runtime.a` would also work but is
+    // GNU-ld-only.
+    let runtime_archive = std::path::PathBuf::from(&runtime_dir).join(RUNTIME_LIB_NAME);
     let status = std::process::Command::new("cc")
         .arg("-o")
         .arg(exe_path)
         .arg(obj_path)
-        .arg(format!("-L{runtime_dir}"))
-        .arg("-lphoenix_runtime")
+        .arg(&runtime_archive)
         .args(platform_args)
         .status()
         .map_err(LinkError::SpawnLinker)?;

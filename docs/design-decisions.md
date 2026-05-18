@@ -973,16 +973,18 @@ Cranelift's `cranelift-wasm` crate exists, but it goes the *other direction*: it
 #### G. Control-flow translation: loop+switch dispatch, relooper deferred
 
 **Decided:** 2026-05-15 (during PR 3 scope review).
+**Implemented:** ✅ PR 3b. `wasm/translate.rs::translate_multi_block` emits the loop+switch dispatcher described below; `wasm/translate.rs::translate_terminator` routes `Jump` / `Branch` through it. The fibonacci.phx round-trip test (`fibonacci_runs_under_wasmtime`) pins correctness against the AST interpreter.
 
 **Rationale:** WASM has no general `goto` — only structured `block` / `loop` / `if` with branch-out-to-enclosing-label. Phoenix's IR is a basic-block CFG. The translation has two practical shapes; we pick the simpler one for PR 3b and reopen if benchmarks demand the tighter one.
 
 **Chosen: loop+switch dispatch** (the "irreducible-CFG fallback" pattern used by LLVM's wasm backend when relooper fails):
 
 - Each function body is wrapped in `(loop $L)`.
-- Each basic block gets a contiguous integer ID.
-- A function-local i32 holds "next block ID."
-- The loop body opens with `br_table` dispatching on that local to a labeled `block` per basic block.
-- Each basic block's terminator sets the next-ID local and `br`s back to `$L` (or returns).
+- Each basic block gets a contiguous integer ID (matching its [`BlockId`]).
+- A function-local i32 holds "next block ID" — default-initialized to 0 (= entry block) so no explicit init instruction is needed.
+- The loop body opens with `br_table` dispatching on that local to a labeled `block` per basic block. Nesting is deepest-first (`$bb_0` innermost), so `br_table 0 1 … N-1 0` matches block-ID-to-label-depth.
+- Each basic block's terminator sets the next-ID local and `br <depth_to_loop>`s back to `$L` (or emits `return` for `Terminator::Return`).
+- Block parameters get fresh WASM locals at dispatcher-construction time; `Jump` / `Branch` terminators copy SSA-value locals into the target block's param locals before re-entering the dispatch.
 
 Correctness is unconditional — any CFG, including loops with multiple entry points, lowers cleanly. Output quality is "fine, not great" — extra `br_table`s and locals that Wasmtime / V8's optimizers mostly clean up at JIT time.
 

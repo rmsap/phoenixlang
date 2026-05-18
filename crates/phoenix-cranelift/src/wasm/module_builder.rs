@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 
+use phoenix_ir::instruction::FuncId;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
@@ -32,7 +33,7 @@ use super::type_interner::TypeInterner;
 
 /// Page-count floor for the merged module's linear memory. 17 pages
 /// (~1 MB) gives the GC enough room for the modest fixtures we currently
-/// target; PR 3b extends this if a fixture pushes past it. The
+/// target; PR 3c extends this if a fixture pushes past it. The
 /// `declare_memory` call below uses `max(MIN_INITIAL_PAGES,
 /// runtime_min_pages)` so the runtime's own floor wins when it's larger.
 const MIN_INITIAL_PAGES: u64 = 17;
@@ -76,7 +77,7 @@ pub(super) struct ModuleBuilder {
     /// [`Self::emit_start_body`] (the WASI entry).
     code: wasm_encoder::CodeSection,
     /// Active data segments. Runtime data segments are merged in
-    /// during the merge phase; PR 3b will append user-emitted
+    /// during the merge phase; PR 3c will append user-emitted
     /// `Op::ConstString` segments after the runtime's.
     data: wasm_encoder::DataSection,
 
@@ -93,6 +94,15 @@ pub(super) struct ModuleBuilder {
     /// `_start` calls this on entry. `None` until
     /// [`Self::declare_phoenix_functions`] finds a function named `main`.
     phx_main_idx: Option<u32>,
+
+    /// Phoenix [`FuncId`] → merged-module WASM function index. Used by
+    /// the IR translator to resolve direct `Op::Call(func_id, ..., ..)`
+    /// to a concrete WASM `call` target. Populated by
+    /// [`Self::declare_phoenix_functions`] as each concrete Phoenix
+    /// function is appended to the function section, before any body is
+    /// emitted, so calls can target functions that have not yet had
+    /// their body lowered (mutual recursion).
+    phx_user_funcs: HashMap<FuncId, u32>,
 
     /// Runtime export name → merged WASM function index. Populated by
     /// [`Self::finalize_merge`] at the end of the merge phase. Queried
@@ -111,16 +121,16 @@ pub(super) struct ModuleBuilder {
     /// which is the wasm32-wasip1 default.
     runtime_max_pages: Option<u64>,
 
-    /// Running byte offset where the next *user* data segment is
-    /// appended. `Some(N)` is the high-water mark of runtime data
-    /// segments observed so far (PR 3b's user-data appender uses this
-    /// to know where the free region starts). `None` means at least
-    /// one runtime data segment had an offset expression the merge
-    /// couldn't statically decode (e.g. a globals reference) — PR 3b
-    /// must refuse to append in that case, since user data could
-    /// collide with the unknown-position segment. PR 3a doesn't emit
-    /// user data (hello.phx has none), so this field is write-only
-    /// today; the contract exists for PR 3b's appender.
+    /// Running byte offset where the next *user* data segment would
+    /// be appended. `Some(N)` is the high-water mark of runtime data
+    /// segments observed so far (PR 3c's user-data appender will use
+    /// this to know where the free region starts). `None` means at
+    /// least one runtime data segment had an offset expression the
+    /// merge couldn't statically decode (e.g. a globals reference) —
+    /// PR 3c's appender must refuse in that case, since user data
+    /// could collide with the unknown-position segment. PR 3a / 3b
+    /// don't emit user data, so this field is write-only today; the
+    /// contract exists for PR 3c's appender.
     data_cursor: Option<u32>,
 }
 
@@ -140,6 +150,7 @@ impl ModuleBuilder {
             import_func_count: 0,
             start_idx: None,
             phx_main_idx: None,
+            phx_user_funcs: HashMap::new(),
             phx_func_lookup: HashMap::new(),
             // 0 rather than 1: the merge always overwrites this with the
             // runtime's declared minimum (every wasm32-wasip1 cdylib has a
@@ -324,13 +335,13 @@ impl ModuleBuilder {
                     .map_err(|e| reencode_err("data segment offset expression", e))?;
                 self.data
                     .active(merged_mem, &offset, data.data.iter().copied());
-                // PR 3b's user-data appender relies on `data_cursor`
-                // being either `Some(high-water mark)` or `None`
-                // (unknown — refuse to append). Anything opaque
-                // (non-`i32.const` offset, or >4 GiB segment length)
-                // poisons the cursor irreversibly, because we can no
-                // longer prove a user-data append wouldn't collide
-                // with the unknown-position segment.
+                // PR 3c's eventual user-data appender will rely on
+                // `data_cursor` being either `Some(high-water mark)`
+                // or `None` (unknown — must refuse to append). Anything
+                // opaque (non-`i32.const` offset, or >4 GiB segment
+                // length) poisons the cursor irreversibly, because we
+                // can no longer prove a user-data append wouldn't
+                // collide with the unknown-position segment.
                 match (baked_offset, u32::try_from(data.data.len())) {
                     (Some(start), Ok(seg_len)) => {
                         let seg_end = start.saturating_add(seg_len);
@@ -476,20 +487,60 @@ impl ModuleBuilder {
                 }
             }
 
-            let params: Vec<wasm_encoder::ValType> = func
-                .param_types
-                .iter()
-                .map(translate::wasm_valtype_for)
-                .collect::<Result<_, _>>()?;
-            let returns: Vec<wasm_encoder::ValType> =
-                translate::wasm_return_valtypes(&func.return_type)?;
+            // See `translate::flatten_param_types` for the multi-slot
+            // expansion (`StringRef` → `[i32, i32]`, etc.).
+            let params = translate::flatten_param_types(&func.param_types)?;
+            let returns = translate::wasm_return_valtypes(&func.return_type)?;
             let sig = self.types.intern(&params, &returns);
             let wasm_idx = self.add_local_function(sig);
+            // `IrModule::push_concrete` assigns a fresh `FuncId` per
+            // function, so the map is duplicate-free by IR-builder
+            // construction. A future refactor that reuses `FuncId`s
+            // (e.g. for trampolines) would silently overwrite the prior
+            // mapping, miscompiling `Op::Call` to the wrong target —
+            // catch that at codegen time rather than as a confusing
+            // wrong-stdout test failure.
+            let prev = self.phx_user_funcs.insert(func.id, wasm_idx);
+            debug_assert!(
+                prev.is_none(),
+                "wasm32-linear: duplicate FuncId {:?} declared (was {:?}, now {}) \
+                 — IR builder invariant violated (internal compiler bug)",
+                func.id,
+                prev,
+                wasm_idx,
+            );
             if func.name == "main" {
                 self.phx_main_idx = Some(wasm_idx);
             }
         }
         Ok(())
+    }
+
+    /// Look up the merged WASM function index for a Phoenix user
+    /// function ([`FuncId`]). Used by the IR translator to emit a
+    /// `call <idx>` for `Op::Call(func_id, ..., ..)`. Returns `None`
+    /// for unknown ids — but the IR verifier rejects calls to
+    /// undeclared functions before codegen, so reaching `None` here
+    /// indicates an internal compiler bug (sema → IR → codegen drift).
+    /// Most call sites should prefer [`Self::require_phx_user_func`],
+    /// which folds the missing-id case into a uniform diagnostic.
+    pub(super) fn get_phx_user_func(&self, id: FuncId) -> Option<u32> {
+        self.phx_user_funcs.get(&id).copied()
+    }
+
+    /// Like [`Self::get_phx_user_func`] but produces the uniform
+    /// internal-compiler-bug diagnostic on miss. Used by `Op::Call`
+    /// translation today; PR 3c's `Op::CallIndirect` and closure-target
+    /// resolution will route through here too so the phrasing stays in
+    /// one place.
+    pub(super) fn require_phx_user_func(&self, id: FuncId) -> Result<u32, CompileError> {
+        self.get_phx_user_func(id).ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-linear: `Op::Call({id:?}, ..)` references an unknown \
+                 user function (internal compiler bug — IR verifier should \
+                 have caught this before codegen)"
+            ))
+        })
     }
 
     fn validate_main_shape(func: &phoenix_ir::module::IrFunction) -> Result<(), CompileError> {
@@ -647,7 +698,8 @@ pub(super) fn reencode_err(
 /// build of `phoenix-runtime` produces today); `None` for any other
 /// const expression shape (globals references, more complex i64/f32/f64
 /// math, etc.). Used to advance `data_cursor` past runtime data
-/// segments so PR 3b's user-data appender starts at the right offset.
+/// segments so PR 3c's eventual user-data appender can start at the
+/// right offset.
 ///
 /// Sign-bit-set values (i.e. `i32` interpreted as negative) are
 /// reinterpreted bitwise as `u32` — that's the wasm semantics for an
@@ -656,7 +708,7 @@ pub(super) fn reencode_err(
 /// is at the 2 GiB mark, well past any sane runtime image size), but
 /// reinterpreting honestly is more robust than silently treating "sign
 /// bit set" as "unknown" — returning `None` here would poison the
-/// merger's `data_cursor` (PR 3b's appender then refuses to append),
+/// merger's `data_cursor` (PR 3c's appender would then refuse to append),
 /// which is correct in principle but unhelpfully cautious in practice
 /// for a sign-extended offset that does decode cleanly.
 fn const_i32_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
