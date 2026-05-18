@@ -1104,7 +1104,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "phoenix-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "phoenix-common",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-bench-diff"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-codegen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "phoenix-common",
@@ -1143,14 +1143,14 @@ dependencies = [
 
 [[package]]
 name = "phoenix-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "phoenix-cranelift"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cargo-husky",
  "clap",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-interp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phoenix-common",
  "phoenix-lexer",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-ir"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "phoenix-common",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-ir-interp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "phoenix-common",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-lexer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "phoenix-common",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-lsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phoenix-common",
  "phoenix-lexer",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-modules"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "phoenix-common",
  "phoenix-lexer",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "phoenix-common",
@@ -1279,11 +1279,11 @@ dependencies = [
 
 [[package]]
 name = "phoenix-runtime"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "phoenix-sema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "phoenix-common",

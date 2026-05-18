@@ -93,30 +93,77 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Generate release notes for this tag
         id: notes
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --latest --strip all
+        run: |
+          {
+            echo 'content<<CLIFF_EOF'
+            git-cliff --config cliff.toml --latest --strip all
+            echo 'CLIFF_EOF'
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Prepend latest section to CHANGELOG.md on main
+      - name: Prepend CHANGELOG and bump extension version on main
         run: |
           git fetch origin main
           git checkout main
           git-cliff --config cliff.toml --latest --prepend CHANGELOG.md
-          if git diff --quiet CHANGELOG.md; then
-            echo "No changelog changes"
+          VERSION="${GITHUB_REF_NAME#v}"
+          (cd editors/vscode && npm version "$VERSION" --no-git-tag-version --allow-same-version)
+          if git diff --quiet CHANGELOG.md editors/vscode/package.json editors/vscode/package-lock.json; then
+            echo "No release changes"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          git commit -m "chore(release): update CHANGELOG for ${{ github.ref_name }}"
+          git add CHANGELOG.md editors/vscode/package.json editors/vscode/package-lock.json
+          git commit -m "chore(release): update CHANGELOG and bump extension version for ${{ github.ref_name }}"
           git push origin main
 
+  vscode-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install dependencies
+        working-directory: editors/vscode
+        run: npm ci
+
+      - name: Sync extension version to tag
+        working-directory: editors/vscode
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Compile extension
+        working-directory: editors/vscode
+        run: npm run compile
+
+      - name: Package .vsix
+        working-directory: editors/vscode
+        run: npx --yes @vscode/vsce package --out "phoenixlang-${GITHUB_REF_NAME}.vsix"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: vscode-extension
+          path: editors/vscode/phoenixlang-*.vsix
+
   release:
-    needs: [build, changelog]
+    needs: [build, changelog, vscode-extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
