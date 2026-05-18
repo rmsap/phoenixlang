@@ -3,6 +3,70 @@
 All notable changes to the Phoenix language will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
+## [0.2.0] - 2026-05-18
+
+
+### Changed
+
+- Add VS Code Extension link to README and phoenix-gen doc
+- Implement IR lowering
+- Implement IR interpreter for testing
+- Initial Cranelift implementation
+- Update docs with frontend framework plan
+- Implement builtin String method support in compiler
+- Implement compilation for remaining builtin functions
+- Fix error in CI: libphoenix_runtime.a must exist before cranelift tests run
+- Add husky pre-commit hook to confirm formatting and clippy and pre-push hook to verify tests pass
+- Implement benchmarking
+- Refactor if from statement to expression
+- Update README, Phoenix Gen documentation, and vision
+- Update documentation and make design decisions
+- Create a centralized Layout trait for reference types
+- Add Result.ok() and Result.err() to Cranelift
+- Implement generic monomorphization
+- Fix bug where Option.okOr() type was not inferred correctly
+- Initial dynamic dispatch implementation
+- Implement proper compilation for generic structs
+- Fix compilation issues for static traits
+- Fix bugs with default arguments and implement <T: Trait> → dyn Trait coercion
+- Implement compilation for default argument values on inherent-impl method calls
+- Implement ResolvedModule to cleanly separate sema -> IR handoff
+- Close out phase 2
+- Add 2.6 exit criteria
+- Implement foundation for diagnostic builder refactor
+- Fix closure capture type ambiguity, complete generic-template stub typed split and ValueID allocator typed split
+- Module-system foundation: Implement keywords in lexer, add visibility to parser, update documentation, create module crate with module path resolution and error variants
+- Set up driver to handle multi-module resolution
+- Implement per-module name mangling and scoped lookup
+- Implement module name mangling in IR lowering
+- Fix leak of private default expressions across modules
+- Complete cross-module type resolution
+- Documentation to close out phase 2.6
+- Update LSP to support multi-module
+- Update documentation to reflect phase changes
+- Initial garbage collector implementation
+- Implement defer syntax
+- Fix hash map O(n) lookup
+- Implement merge sort for List.sortBy
+- Implement valgrind integration test to confirm no leaks, close phase 2.3
+- Update documentation for phase 2.7
+- Update LSP to parse all keywords correctly
+- Update documentation
+- Fix CI failure
+- Fix CI again
+- Add READMEs for external crates
+- Update benchmarking to include allocation
+- Implement collections benchmark criterion
+- Implement benchmark harness
+- Add CI for benchmarking and library to compare benchmark diffs
+- Implement Go corpus for benchmarking
+- Initial Phoenix vs. Go comparison
+- Implemenent type threading through allocation
+- Implement ListBuilder and MapBuilder
+- Documentation updates
+- Implement backend abstraction and wire target into driver
+- Implement wasm-encoder to emit WASM; update documentation to reflect pivot due to Cranelift misunderstanding
+- Implement compilation for phoenix-runtime to wasm32-wasip1
 
 ## [0.1.0] - 2026-04-11
 
