@@ -996,3 +996,51 @@ Correctness is unconditional — any CFG, including loops with multiple entry po
 - *Relooper up front.* Rejected per the scope argument above: ~1.5k LOC of intricate algorithm on top of everything else PR 3b is doing.
 - *Stackifier (LLVM's successor).* Same reasoning, plus the algorithm is even more complex.
 - *Cranelift IR's loop analysis as a substrate.* Rejected: would tie the WASM emitter to Cranelift's pass infrastructure, undoing decision A0's separation.
+
+#### H. String-literal materialization: data-section borrowed pointers
+
+**Decided:** 2026-05-15 (during PR 3c scope review).
+**Implemented:** 2026-05-18 (PR 3c).
+
+**Context.** PR 3b's first attempt at `Op::ConstString` placed string bytes in a user data segment above the runtime's data section. The runtime's allocator clobbered those bytes because its compiled `__heap_base` (the offset where dlmalloc starts serving free memory) sits at the end of the runtime's own data section, with no exported global to override. PR 3b deferred strings to PR 3c with two candidate fixes; this decision picks between them.
+
+**Investigation findings (PR 3c scope review).** Direct inspection of `phoenix_runtime.wasm` (the merged-source artifact) confirmed:
+- The only export is `memory`; **no `__heap_base` global is exposed.** Rustc bakes `__heap_base` into the allocator's init code as an i32 constant, not as a wasm global. There is no merge-time hook to bump it.
+- The single declared global is `__stack_pointer` (mutable i32, initialized to `1048576`). The runtime's stack grows down from offset 1048576; the rest of the first 1 MB `[0, 1048576)` is the stack region. Runtime data segments start at 1048576 and grow upward.
+
+**Chosen: option (e), data-section borrowed pointers.**
+
+- String literals are placed in user data segments at offsets `[16, ~1024)` (well below the stack's typical excursion for current fixtures). Offset 0 is reserved as a NULL sentinel — we don't write there.
+- `Op::ConstString("s")` emits `(i32.const offset, i32.const len)` — a 2-slot WASM fat pointer that points *directly* at the data section. No `phx_string_alloc` call, no memcpy, no shadow-stack rooting.
+- The runtime's `phx_print_str` / `phx_str_concat` / `phx_str_eq` / etc. treat their fat-pointer arguments as **borrowed slices** — they `slice::from_raw_parts(ptr, len)` and read the bytes without writing or freeing. A data-section pointer works identically to a heap-allocated `phx_string_alloc` pointer for these inputs.
+- Runtime ops that **produce** new strings (`phx_str_concat`, `phx_i64_to_str`, etc.) still heap-allocate via `phx_string_alloc`. Those results need shadow-stack rooting (PR 3c's other deliverable); literal-string fat pointers don't, because the data section is permanent.
+
+**Pros:**
+- Simplest implementation — single `reserve_user_data` call per `Op::ConstString`, no codegen indirection.
+- Zero per-use overhead for literals (no alloc, no memcpy).
+- No shadow-stack rooting for literals — the GC doesn't track them, which matches reality (they live in the data section forever).
+- Heterogeneous-origin fat pointers (data-section + heap-allocated) compose uniformly through the runtime's `phx_str_*` surface.
+
+**Cons:**
+- **Bounded stack-collision risk.** The runtime's stack grows down from offset 1048576. Programs with deep enough recursion could push the stack pointer below the data section, overwriting literal bytes. For the current fixture set this is *believed* safe — none of the fixtures recurse deeply enough to plausibly threaten offset 16 — but the safety margin is not measured anywhere; we infer it from the shallow call shapes (`fibonacci.phx`'s recursion is at most ~10 deep and each frame is dozens of bytes, leaving an order-of-magnitude headroom). The tripwire today is a runtime crash with corrupted string output. Documented in `wasm/translate.rs` at the `Op::ConstString` lowering site.
+  - **Concrete follow-up trigger.** During PR 4's four-backend matrix run, instrument the wasm32-linear `_start` shim to read `__stack_pointer` at end-of-program and log its low-water mark. If any fixture's low-water mark drops below `STACK_REGION_BASE / 2` (consumes more than half of the stack region) — or below `USER_DATA_LIMIT` at any point — file a Phase 2.5 follow-up to either (a) bump `STACK_SAFETY_MARGIN`, (b) split user data and stack into disjoint memory ranges via a runtime-coordinated `__heap_base` rewrite, or (c) revisit option (c) "runtime alloc + memcpy" from the alternatives list. The numeric values for `STACK_REGION_BASE`, `USER_DATA_LIMIT`, and `STACK_SAFETY_MARGIN` are defined in `crates/phoenix-cranelift/src/wasm/module_builder.rs` — that's the single source of truth; this doc references them by name so they don't drift if the margin is retuned. Until the trigger fires, the heuristic margin stands.
+- Heterogeneous lifetimes for string fat pointers. Mostly invisible at the IR-translator level (every runtime op accepts both), but a future pass that *frees* data based on inspecting the fat pointer's lifetime would need to distinguish.
+- String literals waste no heap space; that's a feature, but it also means `phx_gc_shutdown`'s leak-detection won't report literals — which is correct but worth noting.
+
+**Alternatives considered:**
+
+- **Option (c), runtime alloc + memcpy.** For each `Op::ConstString` site, call `phx_string_alloc(len)` then memcpy bytes from a source region into the heap. Strings live on the GC heap with shadow-stack rooting — a single ownership model. Rejected: still needs the source bytes in low-offset data segments (so the stack-collision concern doesn't go away), pays an alloc + memcpy per use, and the uniformity benefit is moot because runtime ops already treat fat pointers uniformly via borrowed slices.
+- **Option (b), bump `__heap_base` at merge time.** Impossible — the runtime exports no `__heap_base` global. Rustc bakes it as a constant.
+- **Option (d), module-init via `_initialize`.** Allocate every string at module load, store fat pointers in WASM globals consulted at each use site. Rejected: globals would hold GC-managed pointers but the runtime has no `phx_gc_register_global_root` API for permanent roots, so the strings would be reclaimed at the first collection. Adding such an API is a runtime change outside PR 3c's scope.
+
+##### PhxFatPtr layout contract (sub-decision under H)
+
+The wasm32-linear backend's *sret* call sequences hand-roll `i32.load` instructions at offsets `0` (ptr) and `4` (len) to read `PhxFatPtr` out of caller-allocated stack space — see `translate_to_string_builtin` in `crates/phoenix-cranelift/src/wasm/translate.rs`. Those offsets become wrong if the struct grows, reorders, or drops `#[repr(C)]`, and the resulting bug would be a silent miscompile (wasmtime would happily execute and produce garbage strings).
+
+To make any layout change a build break instead, `crates/phoenix-runtime/src/lib.rs` pins three invariants in a `const _: () = { ... };` block immediately after the `PhxFatPtr` declaration:
+
+1. `offset_of!(PhxFatPtr, ptr) == 0` — ptr at offset 0.
+2. `offset_of!(PhxFatPtr, len) == size_of::<usize>()` — len follows ptr with no padding.
+3. `size_of::<PhxFatPtr>() == 2 * size_of::<usize>()` — total size is exactly two words.
+
+All three are target-independent (they pin structural invariants, not absolute byte counts). On wasm32 `usize` is 4 bytes (struct is 8 bytes total); on x86_64 it's 8 (struct is 16). Each backend reads at offsets matching its own target's word size, so the wasm32 backend's "offset 4" hand-rolled loads are correct iff `size_of::<usize>() == 4` *and* the len-follows-ptr-with-no-padding invariant holds — which the second assert pins.

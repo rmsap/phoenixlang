@@ -125,6 +125,7 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
         outcome.phx_funcs,
         outcome.runtime_min_pages,
         outcome.runtime_max_pages,
+        outcome.stack_pointer_global,
     );
 
     // Memory is declared after merge so the page floor can absorb the

@@ -593,6 +593,21 @@ impl FuncTranslateCtx {
         Ok(locals)
     }
 
+    /// Allocate a fresh single-slot WASM local of `wasm_ty` that is
+    /// *not* bound to any Phoenix `ValueId` — used as scratch by
+    /// codegen sequences that need a temporary (e.g. *sret* calls
+    /// holding the result-area pointer between the `i32.sub` and the
+    /// `i32.load`s). Returns the WASM local index. Does not appear in
+    /// `bindings` so future `binding_of` lookups won't find it; that's
+    /// intentional — temps are private to the emission sequence that
+    /// created them.
+    fn allocate_temp_local(&mut self, wasm_ty: ValType) -> u32 {
+        let idx = self.next_local;
+        self.push_local_decl(wasm_ty);
+        self.next_local += 1;
+        idx
+    }
+
     /// Append one local declaration of type `wasm_ty` to the RLE
     /// `pending_locals` list, merging into the trailing run when the
     /// types match.
@@ -724,30 +739,31 @@ fn translate_instruction(
             let local = ctx.allocate_local(vid, ValType::I32, IrType::Bool);
             ctx.emit(Instruction::LocalSet(local));
         }
-        Op::ConstString(_) => {
-            // Deferred to PR 3c: the natural lowering puts string
-            // bytes in the merged module's data section, but the
-            // runtime's compiled `__heap_base` was baked at the end
-            // of its own data section — appending user data above it
-            // collides with where the runtime's allocator starts
-            // serving bytes. Two fixes both fit PR 3c:
-            //   (a) lower string constants through `phx_string_alloc`
-            //       at module-init time (an `_initialize` callback)
-            //       so they live on the GC heap and survive collection
-            //       via PR 3c's shadow-stack roots;
-            //   (b) bump the runtime's `__heap_base` global at merge
-            //       time to sit past any user data.
-            // (a) composes more cleanly with the rest of PR 3c's
-            // heap surface; PR 3c will pick when string-heavy fixtures
-            // land in the matrix.
-            return Err(CompileError::new(
-                "wasm32-linear: `Op::ConstString` lowering not yet \
-                 implemented in PR 3b (Phase 2.4 PR 3c — lands alongside \
-                 shadow-stack root emission and `phx_string_alloc`-based \
-                 string materialization, which together avoid the \
-                 user-data-vs-runtime-heap collision documented in \
-                 `wasm/translate.rs::Op::ConstString`)",
-            ));
+        Op::ConstString(s) => {
+            // Decision H (string-literal materialization): place the
+            // bytes in a user data segment at low offsets (below the
+            // runtime's stack region), then push the segment's
+            // `(offset, len)` directly as a 2-slot `StringRef` fat
+            // pointer. The runtime's `phx_print_str` / `phx_str_concat`
+            // / etc. treat their fat-pointer args as borrowed slices,
+            // so a data-section pointer composes uniformly with heap
+            // pointers produced by runtime ops — no shadow-stack
+            // rooting needed for literals (they live in the data
+            // section forever).
+            //
+            // Bounded stack-collision risk: the runtime's stack grows
+            // down from offset 1048576 and for the current fixture
+            // set stays comfortably above the user-data region. The
+            // codegen-time tripwire is `reserve_user_data`'s upper
+            // bound (`USER_DATA_LIMIT = STACK_REGION_BASE -
+            // STACK_SAFETY_MARGIN`); a measured stack high-water-
+            // mark check is on the table for a Phase 2.5 follow-up
+            // if deeper-recursion programs surface a collision.
+            let vid = expect_result(instr, "Op::ConstString")?;
+            let (offset, len) = b.reserve_user_data(s.as_bytes())?;
+            ctx.emit(Instruction::I32Const(offset as i32));
+            ctx.emit(Instruction::I32Const(len as i32));
+            ctx.emit_store_result(vid, IrType::StringRef)?;
         }
         // Integer arithmetic. Phoenix maps `Int` → `i64`; every op
         // here produces an `i64` result.
@@ -861,7 +877,7 @@ fn translate_instruction(
                 }
             }
         }
-        Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args)?,
+        Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr)?,
         other => {
             return Err(CompileError::new(format!(
                 "wasm32-linear: IR op `{other:?}` not yet supported \
@@ -945,22 +961,11 @@ fn translate_builtin_call(
     b: &mut ModuleBuilder,
     name: &str,
     args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
 ) -> Result<(), CompileError> {
     match name {
         "print" => translate_print_builtin(ctx, b, args),
-        // `toString` defers to PR 3c. The runtime's
-        // `extern "C" -> PhxFatPtr` exports return via an *sret*
-        // pointer requiring `__stack_pointer` coordination, and the
-        // merge phase doesn't expose the stack-pointer global's
-        // merged index today. Grouping it with PR 3c's other
-        // sret-returning builtins (string concat, list/map alloc)
-        // keeps the stack-pointer plumbing in one PR rather than
-        // dribbled across two.
-        "toString" => Err(CompileError::new(
-            "wasm32-linear: `toString` builtin not yet supported in PR 3b \
-             (Phase 2.4 PR 3c — lands alongside the rest of the *sret*-\
-             returning surface that needs `__stack_pointer` coordination)",
-        )),
+        "toString" => translate_to_string_builtin(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-linear: builtin `{other}` not yet supported \
              (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
@@ -995,19 +1000,15 @@ fn translate_print_builtin(
             ctx.emit(Instruction::Call(idx));
         }
         IrType::StringRef => {
-            // `phx_print_str` is callable today via the merged runtime,
-            // but every source-level path that builds a string for
-            // `print(str)` needs either `Op::ConstString` (deferred to
-            // PR 3c above) or `BuiltinCall("toString", ..)` (deferred
-            // to PR 3c — sret machinery). Routing the call here keeps
-            // the diagnostic specific so a PR 3c regression that
-            // breaks the dispatch surfaces cleanly.
-            return Err(CompileError::new(
-                "wasm32-linear: `print(String)` not yet wired up in PR 3b \
-                 (Phase 2.4 PR 3c — depends on `Op::ConstString` and the \
-                 sret-based `BuiltinCall(\"toString\")`, both of which \
-                 land alongside shadow-stack root emission)",
-            ));
+            // `phx_print_str(ptr: i32, len: i32) -> ()` — push the
+            // fat pointer's two slots in declaration order. Works
+            // uniformly for `Op::ConstString` data-section pointers
+            // (decision H) and heap pointers produced by runtime ops
+            // (`phx_str_concat`, `phx_i64_to_str`, …) because the
+            // runtime treats the fat pointer as a borrowed slice.
+            let idx = b.require_phx_func("phx_print_str")?;
+            ctx.emit_load_all(arg)?;
+            ctx.emit(Instruction::Call(idx));
         }
         other => {
             return Err(CompileError::new(format!(
@@ -1016,6 +1017,194 @@ fn translate_print_builtin(
             )));
         }
     }
+    Ok(())
+}
+
+/// Translate `toString(value)` — convert a primitive Phoenix value to
+/// a heap-allocated `String` via the runtime's `phx_*_to_str`
+/// family. These runtime functions are declared `extern "C" fn(val) ->
+/// PhxFatPtr` in Rust source; on wasm32-wasip1 the C ABI lowers a
+/// 2-i32-field struct return via an implicit *sret* (struct-return)
+/// pointer as the first argument. The caller (us) is responsible for
+/// reserving 8 bytes of stack space, passing its pointer, and reading
+/// back the `(ptr, len)` fat pointer the callee wrote there.
+///
+/// `toString(String)` is the identity — no runtime call needed; the
+/// arg's two slots are copied straight into the result locals so the
+/// rest of the translator can treat `toString` uniformly without
+/// the caller having to know whether the source operand was already a
+/// String.
+///
+/// Stack-pointer management uses the merged runtime's `__stack_pointer`
+/// global (accessible via [`ModuleBuilder::require_stack_pointer_global`]).
+/// We save the original SP into a local, subtract the frame size (16
+/// bytes — 8 for `PhxFatPtr` plus 8 of headroom in case the struct
+/// grows; only 4-byte alignment is actually required), invoke the
+/// callee, load the result, then restore SP from the saved local.
+/// Restoring from a saved copy (rather than `current_SP + 16`) is
+/// robust against any future ABI quirk where a callee fails to
+/// restore SP on its return path: even if SP is wrong on return, we
+/// put the caller's frame back exactly. Per Decision H, the resulting
+/// heap pointer is a GC-tracked value; future shadow-stack root
+/// emission (the rest of PR 3c) will root it between the call and the
+/// next allocation site.
+fn translate_to_string_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    // Validate IR shape first — bail before doing any plumbing work
+    // (argument-type inspection, runtime-fn lookup, SP-global lookup)
+    // so an IR malformation surfaces as a clean diagnostic instead of
+    // accidentally leaving partial state in the builder.
+    let vid = expect_result(instr, "Op::BuiltinCall(\"toString\")")?;
+    // Hard arity check rather than debug_assert + `args.first()`: in
+    // release builds with `args.len() > 1`, the silent-truncation
+    // shape (debug_assert no-ops, `args[0]` is used) would silently
+    // drop the extra args. The IR verifier should prevent this, but
+    // a one-line guard keeps debug/release behavior identical on the
+    // arity edge.
+    if args.len() != 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `toString` builtin takes exactly one argument; \
+             got {} (IR verifier should have caught this)",
+            args.len(),
+        )));
+    }
+    let arg = args[0];
+    // Resolve dispatch by *reference* — `IrType` carries owned
+    // `String`/`Vec` payloads on its reference variants, so cloning
+    // for the dispatch table is wasted work. The borrow released at
+    // the end of this match lets the mutating builder calls below
+    // run unobstructed.
+    let runtime_fn_name = match &ctx.binding_of(arg)?.ir_type {
+        // `toString(String)` is the source-level identity: alias
+        // `vid` to the arg's existing binding (same locals, same
+        // IrType). No runtime call, no SP plumbing, no new locals,
+        // no `local.get`/`local.set` copies — and no shadow-stack
+        // rooting needed (the source binding is already rooted by
+        // its defining op). Future reads of `vid` resolve via
+        // `binding_of` to the same locals the arg already owns.
+        IrType::StringRef => {
+            debug_assert_ne!(
+                vid, arg,
+                "Op::BuiltinCall(toString) result must differ from its arg \
+                 (single-assignment IR invariant)"
+            );
+            let aliased = ValueBinding {
+                locals: ctx.binding_of(arg)?.locals.clone(),
+                ir_type: IrType::StringRef,
+            };
+            debug_assert_eq!(aliased.locals.len(), 2, "StringRef arg must be 2 slots");
+            ctx.bindings.insert(vid, aliased);
+            return Ok(());
+        }
+        IrType::I64 => "phx_i64_to_str",
+        IrType::F64 => "phx_f64_to_str",
+        IrType::Bool => "phx_bool_to_str",
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `toString` on argument of IR type `{other:?}` \
+                 not yet supported (only `Int` / `Float` / `Bool` / `String` \
+                 lower today)"
+            )));
+        }
+    };
+    let runtime_idx = b.require_phx_func(runtime_fn_name)?;
+    let sp_global = b.require_stack_pointer_global()?;
+
+    // Allocate two consecutive i32 locals for the (ptr, len) result.
+    let result_locals = ctx.allocate_locals_for_ir_type(vid, IrType::StringRef)?;
+    debug_assert_eq!(result_locals.len(), 2, "StringRef must be 2 slots");
+    let result_ptr_local = result_locals[0];
+    let result_len_local = result_locals[1];
+
+    // `saved_sp` — the caller's SP value at entry. Restored verbatim
+    // on the way out. `sret_ptr` — pointer to the reserved result
+    // area inside the new frame. `PhxFatPtr` is exactly 8 bytes on
+    // wasm32 (two `i32` fields, pinned by the const-block assertions
+    // in `phoenix-runtime/src/lib.rs`), but we reserve 16 to match
+    // wasm-ld's 16-byte stack alignment for the wasm32-wasip1 C ABI.
+    // Keeping every sret frame to a 16-byte multiple lets nested
+    // sret calls (and any future shadow-stack push that interleaves
+    // with one) compose without re-deriving alignment at each site.
+    //
+    // The reservation must be a multiple of 4 at minimum: every
+    // mutating site on `__stack_pointer` subtracts a multiple of 4
+    // so the sret area inherits ≥ 4-byte alignment — matching the
+    // `align: 2` hint on the loads below. A future change that
+    // picked a non-multiple-of-4 amount would break that invariant;
+    // the const-assert catches it at codegen time. (16-byte ABI
+    // alignment is the stronger invariant; 4-byte is the minimum
+    // the loads below require, asserted explicitly so a future
+    // tightening of the constant doesn't accidentally relax the
+    // load-alignment guarantee.)
+    const SRET_FRAME_BYTES: i32 = 16;
+    const _: () = assert!(
+        SRET_FRAME_BYTES % 4 == 0,
+        "SRET_FRAME_BYTES must keep `__stack_pointer` 4-byte aligned \
+         to match the `align: 2` hint on the PhxFatPtr loads below"
+    );
+    let saved_sp_local = ctx.allocate_temp_local(ValType::I32);
+    let sret_ptr_local = ctx.allocate_temp_local(ValType::I32);
+
+    // saved_sp = SP
+    ctx.emit(Instruction::GlobalGet(sp_global));
+    ctx.emit(Instruction::LocalSet(saved_sp_local));
+
+    // SP = saved_sp - SRET_FRAME_BYTES; sret_ptr = SP
+    ctx.emit(Instruction::LocalGet(saved_sp_local));
+    ctx.emit(Instruction::I32Const(SRET_FRAME_BYTES));
+    ctx.emit(Instruction::I32Sub);
+    ctx.emit(Instruction::LocalTee(sret_ptr_local));
+    ctx.emit(Instruction::GlobalSet(sp_global));
+
+    // Call: runtime_fn(sret = sret_ptr, val)
+    ctx.emit(Instruction::LocalGet(sret_ptr_local));
+    ctx.emit_load_all(arg)?;
+    ctx.emit(Instruction::Call(runtime_idx));
+
+    // Load PhxFatPtr { ptr, len } from sret_ptr.
+    // Layout: ptr at offset 0, len at offset 4. `PhxFatPtr` in
+    // `phoenix-runtime` is `#[repr(C)]`; compile-time assertions in
+    // that crate pin the offsets so these stay valid if the struct
+    // ever changes.
+    //
+    // `align: 2` (4-byte hint) matches what `SRET_FRAME_BYTES`'s
+    // multiple-of-4 invariant guarantees: SP starts at the runtime
+    // image's `__stack_pointer` init value (1_048_576 = 1 MiB, which
+    // is 16-aligned — see decision H in design-decisions.md) and
+    // every mutating site here subtracts a multiple of 4, so
+    // `sret_ptr` is always 4-byte aligned for i32 reads. This relies
+    // on the runtime never landing SP at a non-4-aligned value
+    // between our save/restore brackets; the wasm32-wasip1 runtime
+    // satisfies that today. A future codegen change that breaks
+    // the SP alignment invariant would trap on engines that enforce
+    // alignment hints — which is the right behavior, since misaligned
+    // access through `align: 2` would be a real correctness bug, not
+    // just a perf miss.
+    ctx.emit(Instruction::LocalGet(sret_ptr_local));
+    ctx.emit(Instruction::I32Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    ctx.emit(Instruction::LocalSet(result_ptr_local));
+    ctx.emit(Instruction::LocalGet(sret_ptr_local));
+    ctx.emit(Instruction::I32Load(wasm_encoder::MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    ctx.emit(Instruction::LocalSet(result_len_local));
+
+    // Restore SP from the saved copy rather than `current_SP + 16`:
+    // if the callee mismanaged SP (against ABI), we still put the
+    // caller's frame back exactly where it was.
+    ctx.emit(Instruction::LocalGet(saved_sp_local));
+    ctx.emit(Instruction::GlobalSet(sp_global));
+
     Ok(())
 }
 

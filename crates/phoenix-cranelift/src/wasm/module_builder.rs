@@ -38,6 +38,47 @@ use super::type_interner::TypeInterner;
 /// runtime_min_pages)` so the runtime's own floor wins when it's larger.
 const MIN_INITIAL_PAGES: u64 = 17;
 
+/// Byte offset where user-emitted data segments (string literals from
+/// `Op::ConstString`, etc.) start. Decision H in
+/// `docs/design-decisions.md` §Phase 2.4 picks low-offset placement
+/// inside the runtime's stack region — the stack grows down from
+/// [`STACK_REGION_BASE`], so data at `[USER_DATA_BASE, USER_DATA_LIMIT)`
+/// sits below the stack's plausible high-water mark
+/// ([`STACK_SAFETY_MARGIN`] reserves headroom). Offset 0 is reserved
+/// as a NULL sentinel.
+pub(super) const USER_DATA_BASE: u32 = 16;
+
+/// Top of the runtime's stack region — the `__stack_pointer` global's
+/// initial value, where the stack starts when WASM execution begins.
+/// The stack grows *down* from here (so the runtime's actual stack
+/// occupies `[low_water_mark, STACK_REGION_BASE)` at any given moment).
+pub(super) const STACK_REGION_BASE: u32 = 1_048_576;
+
+/// Conservative bound on the runtime's stack high-water mark — the
+/// largest single-program stack excursion we expect any realistic
+/// fixture to need. User data must end strictly below
+/// `STACK_REGION_BASE - STACK_SAFETY_MARGIN` so that a stack push *can't*
+/// trivially clobber the literal bytes (the WASM "decrement-then-store"
+/// convention means the very first stack push writes to
+/// `[SP-N, SP)` immediately below `STACK_REGION_BASE`, so an upper
+/// bound at exactly `STACK_REGION_BASE` would let user data and the
+/// stack's first frame fight over the same byte).
+///
+/// 64 KiB is heuristic: it's an order of magnitude larger than any
+/// frame the current fixture set produces, and small enough that user
+/// data still gets ~960 KiB of room before the codegen-time tripwire
+/// fires. Programs that need more than `USER_DATA_LIMIT` bytes of
+/// literal data should revisit decision H rather than expanding the
+/// margin — the underlying "stack and literals share a region" design
+/// doesn't actually scale.
+pub(super) const STACK_SAFETY_MARGIN: u32 = 65_536;
+
+/// Upper bound on user-data offsets (exclusive). See
+/// [`STACK_SAFETY_MARGIN`] for the rationale. Reservations that would
+/// push the cursor past this fail at codegen time with a diagnostic
+/// pointing at decision H.
+pub(super) const USER_DATA_LIMIT: u32 = STACK_REGION_BASE - STACK_SAFETY_MARGIN;
+
 pub(super) struct ModuleBuilder {
     /// Function-signature interning. Both user-emitted types and
     /// runtime types (via [`Self::intern_runtime_type`]) flow through
@@ -110,6 +151,17 @@ pub(super) struct ModuleBuilder {
     /// runtime calls such as `phx_print_i64`, `phx_gc_alloc`.
     phx_func_lookup: HashMap<String, u32>,
 
+    /// Merged-module global index of the runtime's `__stack_pointer`
+    /// (mutable `i32`, initialized to `1048576` — the top of the wasm32-
+    /// wasip1 stack region). Populated by [`Self::finalize_merge`].
+    /// Consulted by the IR translator's *sret* call sequences (which
+    /// must reserve stack space for the callee's struct return) and
+    /// PR 3c's shadow-stack root emission. `None` if the runtime
+    /// didn't declare a stack-pointer global — which would be an
+    /// unexpected runtime-build change and is surfaced as a clean
+    /// error rather than silently leaving sret calls broken.
+    phx_stack_pointer_global: Option<u32>,
+
     /// Memory-pages floor required by the runtime, recorded during
     /// merge. The merged module's [`Self::declare_memory`] grows to
     /// at least this many pages so the runtime allocator has the
@@ -122,16 +174,15 @@ pub(super) struct ModuleBuilder {
     runtime_max_pages: Option<u64>,
 
     /// Running byte offset where the next *user* data segment would
-    /// be appended. `Some(N)` is the high-water mark of runtime data
-    /// segments observed so far (PR 3c's user-data appender will use
-    /// this to know where the free region starts). `None` means at
-    /// least one runtime data segment had an offset expression the
-    /// merge couldn't statically decode (e.g. a globals reference) —
-    /// PR 3c's appender must refuse in that case, since user data
-    /// could collide with the unknown-position segment. PR 3a / 3b
-    /// don't emit user data, so this field is write-only today; the
-    /// contract exists for PR 3c's appender.
-    data_cursor: Option<u32>,
+    /// be appended. Initialized to [`USER_DATA_BASE`] and bumped by
+    /// [`Self::reserve_user_data`] for each `Op::ConstString` emission.
+    /// Per decision H, the user-data region (`[USER_DATA_BASE,
+    /// USER_DATA_LIMIT)`) is disjoint from where the runtime declares
+    /// its own data segments (typically at or above
+    /// [`STACK_REGION_BASE`]), and leaves [`STACK_SAFETY_MARGIN`] bytes
+    /// of headroom for the runtime's stack to grow down without
+    /// overrunning user data.
+    data_cursor: u32,
 }
 
 impl ModuleBuilder {
@@ -152,6 +203,7 @@ impl ModuleBuilder {
             phx_main_idx: None,
             phx_user_funcs: HashMap::new(),
             phx_func_lookup: HashMap::new(),
+            phx_stack_pointer_global: None,
             // 0 rather than 1: the merge always overwrites this with the
             // runtime's declared minimum (every wasm32-wasip1 cdylib has a
             // memory section), and `declare_memory` clamps to
@@ -159,7 +211,16 @@ impl ModuleBuilder {
             // observed a memory section" value would just be misleading.
             runtime_min_pages: 0,
             runtime_max_pages: None,
-            data_cursor: Some(0),
+            // User data segments place themselves starting at
+            // USER_DATA_BASE per decision H — the runtime's stack
+            // grows down from STACK_REGION_BASE, and STACK_SAFETY_MARGIN
+            // reserves headroom so user data ending at USER_DATA_LIMIT
+            // can't be clobbered by typical-depth stack excursions.
+            // Runtime data segments live at much higher offsets
+            // (typically STACK_REGION_BASE+) and don't interact with
+            // this cursor; the `data_cursor` field tracks only the
+            // user-data high-water mark.
+            data_cursor: USER_DATA_BASE,
         }
     }
 
@@ -323,36 +384,46 @@ impl ModuleBuilder {
                 let merged_mem = reencoder
                     .memory_index(memory_index)
                     .map_err(|e| reencode_err("data segment memory index", e))?;
-                // Walk the offset expression *before* handing it to
-                // the reencoder (which consumes via the operators
-                // reader internally) so we can record the segment's
-                // baked offset for the data-cursor advancement. The
-                // reencoder takes the ConstExpr by value, so this
-                // pre-scan uses a borrow from the same source.
-                let baked_offset = const_i32_offset(&offset_expr);
+                // Decision H assumes the runtime's data segments live
+                // at offsets `>= STACK_REGION_BASE`, leaving
+                // `[USER_DATA_BASE, STACK_REGION_BASE)` free for user
+                // data. Verify that invariant *before* re-encoding so
+                // a future rustc/runtime change that puts data low
+                // produces a clean diagnostic instead of a runtime
+                // overlap with user-emitted string literals. An
+                // opaque offset (anything not `i32.const N; end`)
+                // also fails: we can't prove disjointness from a
+                // shape we can't decode.
+                let baked_offset = const_i32_offset(&offset_expr).ok_or_else(|| {
+                    CompileError::new(
+                        "wasm32-linear: phoenix_runtime.wasm has a data \
+                         segment with a non-`i32.const` offset expression. \
+                         Decision H requires runtime data segments to live \
+                         at offsets >= STACK_REGION_BASE so they stay \
+                         disjoint from user-emitted string literals; an \
+                         opaque offset can't be proved disjoint. If a \
+                         runtime build legitimately needs a globals-based \
+                         offset, revisit decision H.",
+                    )
+                })?;
+                if baked_offset < STACK_REGION_BASE {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: phoenix_runtime.wasm declares a \
+                         data segment at offset {baked_offset}, below the \
+                         user-data region's upper bound \
+                         (STACK_REGION_BASE = {STACK_REGION_BASE}). \
+                         Decision H places user string literals in \
+                         [USER_DATA_BASE, STACK_REGION_BASE); a runtime \
+                         segment below that boundary would overlap with \
+                         them. Investigate the runtime build (likely a \
+                         linker-script change that moved `__data_end`).",
+                    )));
+                }
                 let offset = reencoder
                     .const_expr(offset_expr)
                     .map_err(|e| reencode_err("data segment offset expression", e))?;
                 self.data
                     .active(merged_mem, &offset, data.data.iter().copied());
-                // PR 3c's eventual user-data appender will rely on
-                // `data_cursor` being either `Some(high-water mark)`
-                // or `None` (unknown — must refuse to append). Anything
-                // opaque (non-`i32.const` offset, or >4 GiB segment
-                // length) poisons the cursor irreversibly, because we
-                // can no longer prove a user-data append wouldn't
-                // collide with the unknown-position segment.
-                match (baked_offset, u32::try_from(data.data.len())) {
-                    (Some(start), Ok(seg_len)) => {
-                        let seg_end = start.saturating_add(seg_len);
-                        if let Some(cursor) = self.data_cursor.as_mut()
-                            && seg_end > *cursor
-                        {
-                            *cursor = seg_end;
-                        }
-                    }
-                    _ => self.data_cursor = None,
-                }
             }
             wasmparser::DataKind::Passive => {
                 return Err(CompileError::new(
@@ -382,6 +453,86 @@ impl ModuleBuilder {
         &mut self.elements
     }
 
+    /// Append `bytes` as an active data segment at the current user-
+    /// data cursor (initialized to [`USER_DATA_BASE`]). Returns the
+    /// `(offset, len)` pair the caller embeds as the two i32 slots of
+    /// a `StringRef` fat pointer.
+    ///
+    /// Decision H places user data at `[USER_DATA_BASE, USER_DATA_LIMIT)`
+    /// below the runtime's stack region. Reserving past
+    /// [`USER_DATA_LIMIT`] would place literal bytes where a deep-but-
+    /// realistic stack excursion could reach them; that's rejected with
+    /// a `CompileError`. The runtime-level "stack actually grew far
+    /// enough down to clobber user data" case isn't statically
+    /// detectable from here (the deepest excursion depends on program
+    /// input) and is documented as a bounded limitation in decision H —
+    /// the [`STACK_SAFETY_MARGIN`] headroom is heuristic.
+    pub(super) fn reserve_user_data(&mut self, bytes: &[u8]) -> Result<(u32, u32), CompileError> {
+        // Empty reservations (e.g. `Op::ConstString("")`) emit no data
+        // segment — there's nothing to write, and an empty active
+        // segment just bloats the binary. Return `USER_DATA_BASE` as a
+        // fixed sentinel rather than the current cursor: after a full
+        // reservation that lands `data_cursor` at exactly
+        // [`USER_DATA_LIMIT`], returning the cursor would point an
+        // empty literal into the stack-safety margin
+        // `[USER_DATA_LIMIT, STACK_REGION_BASE)`. With `len == 0` the
+        // runtime never dereferences the pointer, so today both
+        // values are equivalent at runtime — but pinning the offset
+        // to `USER_DATA_BASE` keeps every empty-literal pointer
+        // unambiguously inside the user-data region. All empty
+        // literals alias to the same harmless in-bounds offset; the
+        // `phx_str_*` surface treats zero-length slices as empty
+        // regardless of pointer.
+        if bytes.is_empty() {
+            // All empty literals alias to USER_DATA_BASE — see the
+            // method-level doc-comment above for the rationale.
+            return Ok((USER_DATA_BASE, 0));
+        }
+        // Both the `u32::try_from(len)` failure (literal > 4 GiB) and
+        // the `checked_add` overflow are unreachable on a 32-bit target
+        // (you'd need the program text itself to be multi-gigabyte
+        // before either could fire), so a single combined error is
+        // honest about the practical failure mode: any sane Phoenix
+        // program that trips this is hitting the safety-margin bound
+        // far sooner.
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            CompileError::new(format!(
+                "wasm32-linear: user-data segment is {} bytes — over u32::MAX \
+                 (this is a >4 GiB literal, which can't be referenced by a \
+                 wasm32 fat pointer).",
+                bytes.len(),
+            ))
+        })?;
+        let offset = self.data_cursor;
+        let new_cursor = offset.checked_add(len).ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-linear: appending a {len}-byte user-data segment at \
+                 offset {offset} would overflow the u32 data cursor — the \
+                 cumulative user-data size is over 4 GiB.",
+            ))
+        })?;
+        if new_cursor > USER_DATA_LIMIT {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: appending a {len}-byte user-data segment at offset \
+                 {offset} would extend user data to {new_cursor}, past the \
+                 user-data ceiling ({USER_DATA_LIMIT} = STACK_REGION_BASE - \
+                 STACK_SAFETY_MARGIN). The runtime's stack grows down from \
+                 STACK_REGION_BASE ({STACK_REGION_BASE}); placing literal \
+                 bytes within {STACK_SAFETY_MARGIN} bytes of that boundary \
+                 risks a stack excursion overwriting them. Decision H places \
+                 user data in `[USER_DATA_BASE, USER_DATA_LIMIT)`; revisit it \
+                 if larger literal capacity is needed.",
+            )));
+        }
+        self.data.active(
+            0,
+            &wasm_encoder::ConstExpr::i32_const(offset as i32),
+            bytes.iter().copied(),
+        );
+        self.data_cursor = new_cursor;
+        Ok((offset, len))
+    }
+
     /// Record the post-merge memory floor / cap and the `phx_*` name
     /// → merged-index lookup table. Called once per `compile_wasm_linear`
     /// after the runtime merge completes.
@@ -390,10 +541,30 @@ impl ModuleBuilder {
         phx_funcs: HashMap<String, u32>,
         runtime_min_pages: u64,
         runtime_max_pages: Option<u64>,
+        stack_pointer_global: Option<u32>,
     ) {
         self.phx_func_lookup = phx_funcs;
         self.runtime_min_pages = runtime_min_pages;
         self.runtime_max_pages = runtime_max_pages;
+        self.phx_stack_pointer_global = stack_pointer_global;
+    }
+
+    /// Merged-module global index of the runtime's `__stack_pointer`.
+    /// `Err` if no such global was observed during merge — surfaces a
+    /// clean diagnostic at the *sret* call site (or shadow-stack frame
+    /// emission, etc.) rather than letting the WASM bytecode reference
+    /// a missing global index that wasmparser would reject later.
+    pub(super) fn require_stack_pointer_global(&self) -> Result<u32, CompileError> {
+        self.phx_stack_pointer_global.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-linear: phoenix_runtime.wasm did not declare a \
+                 `__stack_pointer` global; *sret* call sequences require it \
+                 (callees with struct returns need a caller-allocated stack \
+                 region). The runtime build is mismatched with this backend's \
+                 expectations — rebuild `phoenix-runtime` for wasm32-wasip1 \
+                 from the same workspace and re-run.",
+            )
+        })
     }
 
     /// Look up the merged WASM function index for a runtime export
@@ -670,6 +841,29 @@ impl ModuleBuilder {
         if !self.data.is_empty() {
             module.section(&self.data);
         }
+        // Emit a minimal `name` custom section naming the merged
+        // `__stack_pointer` global so downstream tooling (and the
+        // structural-assertion test helpers) can resolve it by symbol
+        // rather than re-running shape inference against the merged
+        // output. Rustc's name section on the runtime is consumed
+        // during merge and not propagated, so without this the merged
+        // module would have no name section at all.
+        //
+        // **Test-helper contract:** `compile_wasm_linear.rs`'s
+        // `sp_global_access_count_in_module` reads this section to
+        // locate `__stack_pointer` in any function body. If a future
+        // change ever stops emitting it — or adds other subsections
+        // before the global subsection — that helper still works
+        // (it iterates subsections), but anything that drops the
+        // `__stack_pointer` entry outright will break the SP-traffic
+        // assertions on the structural-test fixtures (fizzbuzz, etc.).
+        if let Some(sp_idx) = self.phx_stack_pointer_global {
+            let mut name_section = wasm_encoder::NameSection::new();
+            let mut global_names = wasm_encoder::NameMap::new();
+            global_names.append(sp_idx, "__stack_pointer");
+            name_section.globals(&global_names);
+            module.section(&name_section);
+        }
         module.finish()
     }
 }
@@ -692,33 +886,20 @@ pub(super) fn reencode_err(
     }
 }
 
-/// Best-effort extraction of an `i32.const N` baked offset from an
-/// active data segment's offset expression. Returns `Some(N as u32)`
-/// for the common `i32.const N; end` shape (which is what every cdylib
-/// build of `phoenix-runtime` produces today); `None` for any other
-/// const expression shape (globals references, more complex i64/f32/f64
-/// math, etc.). Used to advance `data_cursor` past runtime data
-/// segments so PR 3c's eventual user-data appender can start at the
-/// right offset.
+/// Decode a const-expression of the exact shape `i32.const N; end`
+/// and return `N`. Returns `None` for any other shape (globals.get,
+/// arithmetic, longer expressions, other operand types, etc.).
 ///
-/// Sign-bit-set values (i.e. `i32` interpreted as negative) are
-/// reinterpreted bitwise as `u32` — that's the wasm semantics for an
-/// `i32.const` used as a memory offset. Such offsets are wildly
-/// unrealistic for a `phoenix-runtime.wasm` data segment (`0x80000000`
-/// is at the 2 GiB mark, well past any sane runtime image size), but
-/// reinterpreting honestly is more robust than silently treating "sign
-/// bit set" as "unknown" — returning `None` here would poison the
-/// merger's `data_cursor` (PR 3c's appender would then refuse to append),
-/// which is correct in principle but unhelpfully cautious in practice
-/// for a sign-extended offset that does decode cleanly.
-fn const_i32_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
+/// Shared by `const_i32_offset` (data-segment offset decoding in
+/// `merge_data`) and the runtime-merge module's stack-pointer-init
+/// heuristic. Both callers add their own additional filters (positivity,
+/// sign reinterpretation) on top of this raw decoded value.
+pub(super) fn decode_const_i32(expr: &wasmparser::ConstExpr<'_>) -> Option<i32> {
     let mut reader = expr.get_operators_reader();
-    let first = reader.read().ok()?;
-    let value = match first {
+    let value = match reader.read().ok()? {
         wasmparser::Operator::I32Const { value } => value,
         _ => return None,
     };
-    // After the i32.const we expect End and nothing else.
     match reader.read().ok()? {
         wasmparser::Operator::End => {}
         _ => return None,
@@ -726,5 +907,217 @@ fn const_i32_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
     if !reader.eof() {
         return None;
     }
-    Some(value as u32)
+    Some(value)
+}
+
+/// Best-effort extraction of an `i32.const N` baked offset from an
+/// active data segment's offset expression. Returns `Some(N as u32)`
+/// for the common `i32.const N; end` shape (which is what every cdylib
+/// build of `phoenix-runtime` produces today); `None` for any other
+/// const-expression shape (globals references, more complex math,
+/// etc.). Used by `merge_data` to enforce decision H's invariant that
+/// runtime data segments live at offsets `>= STACK_REGION_BASE`.
+///
+/// Sign-bit-set values (i.e. `i32` interpreted as negative) are
+/// reinterpreted bitwise as `u32` — that's the wasm semantics for an
+/// `i32.const` used as a memory offset. Such offsets are wildly
+/// unrealistic for a `phoenix-runtime.wasm` data segment (`0x80000000`
+/// is at the 2 GiB mark, well past any sane runtime image size), but
+/// reinterpreting honestly is more robust than silently treating "sign
+/// bit set" as "unknown".
+fn const_i32_offset(expr: &wasmparser::ConstExpr<'_>) -> Option<u32> {
+    decode_const_i32(expr).map(|v| v as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the missing-runtime-symbol error paths.
+    //! These exercise the diagnostics callers see when the runtime
+    //! build is mismatched with the backend's expectations — paths
+    //! that integration tests can't reach without a custom-built
+    //! runtime artifact.
+
+    use super::*;
+
+    /// `require_stack_pointer_global` must surface the rebuild-the-
+    /// runtime guidance when `finalize_merge` recorded no SP global.
+    /// The integration test fleet exercises the happy path; this
+    /// guards the error message so a copy-edit doesn't silently lose
+    /// the "rebuild" hint that lets users self-resolve runtime skew.
+    #[test]
+    fn require_stack_pointer_global_diagnostic_includes_remediation() {
+        let mut builder = ModuleBuilder::new();
+        builder.finalize_merge(HashMap::new(), 0, None, None);
+        let err = builder
+            .require_stack_pointer_global()
+            .expect_err("missing SP global must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("__stack_pointer"),
+            "diagnostic must name the missing symbol: {msg}"
+        );
+        assert!(
+            msg.contains("rebuild") || msg.contains("Rebuild"),
+            "diagnostic must point users at the remediation (rebuild the runtime): {msg}"
+        );
+    }
+
+    /// `require_phx_func` must name the missing symbol verbatim and
+    /// point at the same rebuild remediation. Mismatched names are the
+    /// most common runtime/codegen-skew failure mode (e.g. a builtin
+    /// added in the backend but not yet exported by the runtime), and
+    /// the diagnostic is the user's main signal.
+    #[test]
+    fn require_phx_func_diagnostic_names_missing_symbol() {
+        let mut builder = ModuleBuilder::new();
+        builder.finalize_merge(HashMap::new(), 0, None, None);
+        let err = builder
+            .require_phx_func("phx_does_not_exist")
+            .expect_err("missing runtime symbol must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("phx_does_not_exist"),
+            "diagnostic must name the missing symbol: {msg}"
+        );
+        assert!(
+            msg.contains("rebuild") || msg.contains("Rebuild"),
+            "diagnostic must point users at the remediation: {msg}"
+        );
+    }
+
+    /// `reserve_user_data` must reject reservations that would cross
+    /// the [`USER_DATA_LIMIT`] ceiling (stack-region base minus the
+    /// safety margin). Decision H places user data below that
+    /// boundary; growing past it puts literal bytes within a single
+    /// stack frame's worth of where the stack writes, which would
+    /// silently corrupt them. The error path is the codegen-time
+    /// tripwire, so the diagnostic must point at decision H so the
+    /// caller can decide whether to revisit the scheme or split the
+    /// literal.
+    #[test]
+    fn reserve_user_data_rejects_past_user_data_limit() {
+        let mut builder = ModuleBuilder::new();
+        // First reservation: fills exactly up to USER_DATA_LIMIT. The
+        // tighter bound is `new_cursor > USER_DATA_LIMIT`, so a
+        // reservation that lands the cursor at exactly USER_DATA_LIMIT
+        // is the boundary case that must still succeed.
+        let near_max_len = (USER_DATA_LIMIT - USER_DATA_BASE) as usize;
+        let big = vec![0u8; near_max_len];
+        let (offset, len) = builder
+            .reserve_user_data(&big)
+            .expect("reservation up to USER_DATA_LIMIT must succeed");
+        assert_eq!(offset, USER_DATA_BASE);
+        assert_eq!(len as usize, near_max_len);
+
+        // Second reservation: a single byte past the boundary.
+        let err = builder
+            .reserve_user_data(&[0u8])
+            .expect_err("reservation crossing USER_DATA_LIMIT must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("user-data ceiling") || msg.contains("STACK_SAFETY_MARGIN"),
+            "diagnostic must mention the ceiling / safety margin: {msg}"
+        );
+        assert!(
+            msg.contains("decision H") || msg.contains("Decision H"),
+            "diagnostic should reference decision H so callers can find the design context: {msg}"
+        );
+    }
+
+    /// Empty `Op::ConstString("")` boundary: `reserve_user_data(&[])`
+    /// must succeed without advancing the cursor and without producing
+    /// a runtime trap. The returned `(offset, len)` is the empty fat
+    /// pointer the runtime's `phx_print_str` treats as an empty slice.
+    #[test]
+    fn reserve_user_data_accepts_empty_bytes() {
+        let mut builder = ModuleBuilder::new();
+        let (offset_a, len_a) = builder
+            .reserve_user_data(&[])
+            .expect("empty reservation must succeed");
+        assert_eq!(offset_a, USER_DATA_BASE);
+        assert_eq!(len_a, 0);
+
+        // A second empty reservation lands at the same offset because
+        // the cursor didn't advance. That's acceptable; it just means
+        // multiple empty literals alias. Documented here in case a
+        // future caller depends on distinct offsets.
+        let (offset_b, len_b) = builder
+            .reserve_user_data(&[])
+            .expect("second empty reservation must succeed");
+        assert_eq!(offset_b, USER_DATA_BASE);
+        assert_eq!(len_b, 0);
+    }
+
+    /// Build a minimal runtime fixture with a data segment at a low
+    /// offset (below `STACK_REGION_BASE`) so `merge_data`'s
+    /// disjointness check fires.
+    fn module_with_low_offset_data_segment() -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, FunctionSection,
+            Instruction, MemorySection, MemoryType, Module, TypeSection,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 17,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("phx_x", ExportKind::Func, 0);
+        let mut code = CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&Instruction::End);
+        code.function(&f);
+        let mut data = DataSection::new();
+        // Data at offset 256 — well below STACK_REGION_BASE — should
+        // be rejected because it would overlap with the user-data
+        // region the merger reserves for `Op::ConstString` outputs.
+        data.active(0, &ConstExpr::i32_const(256), [0xAA, 0xBB].iter().copied());
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&funcs);
+        module.section(&memories);
+        module.section(&exports);
+        module.section(&code);
+        module.section(&data);
+        module.finish()
+    }
+
+    /// `merge_data` must reject runtime data segments whose baked
+    /// offset is below [`STACK_REGION_BASE`] — they would overlap with
+    /// the user-data region. This is a future-proofing check against
+    /// rustc/linker changes that move runtime data into low offsets.
+    #[test]
+    fn merge_data_rejects_runtime_segment_below_stack_region() {
+        let bytes = module_with_low_offset_data_segment();
+        wasmparser::validate(&bytes).expect("low-offset fixture must validate");
+        let mut builder = ModuleBuilder::new();
+        let err = match super::super::runtime_merge::merge_runtime(&mut builder, &bytes) {
+            Ok(_) => panic!("low-offset data segment must be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("below") && msg.contains("STACK_REGION_BASE"),
+            "diagnostic must name the boundary that was crossed: {msg}"
+        );
+    }
+
+    // Note on the "non-`i32.const` data-segment offset" rejection
+    // branch in `merge_data`: there is intentionally no test for it.
+    // The wasm MVP only allows `global.get` of imported immutable
+    // globals inside const expressions, and the merger rejects
+    // imported globals during section processing (before any data
+    // segment is decoded), so the branch is unreachable in practice
+    // for any current wasm32-wasip1 cdylib build. The branch remains
+    // as future-proofing against the extended-const-expressions
+    // proposal (which would let local globals appear in init exprs);
+    // if that proposal lands, this is the place to add a fixture
+    // built with hand-crafted bytes.
 }

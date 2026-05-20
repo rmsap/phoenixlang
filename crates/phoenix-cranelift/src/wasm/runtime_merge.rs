@@ -63,7 +63,7 @@ use wasmparser::{Parser, Payload};
 
 use crate::error::CompileError;
 
-use super::module_builder::{ModuleBuilder, reencode_err};
+use super::module_builder::{ModuleBuilder, decode_const_i32, reencode_err};
 
 /// Outcome of [`merge_runtime`]: the lookup table from runtime-export
 /// names (e.g. `"phx_print_i64"`) to merged-module function indices.
@@ -83,6 +83,15 @@ pub(super) struct MergeOutcome {
     /// wasip1 default). Propagated so a runtime-declared sandbox cap
     /// survives the merge rather than being silently dropped.
     pub runtime_max_pages: Option<u64>,
+    /// Merged-module global index of the runtime's `__stack_pointer`.
+    /// Identified by [`RuntimeMerger::resolve_stack_pointer`] — name
+    /// section if present, else the unique mutable-i32 / positive-init
+    /// candidate. `None` if no candidate exists (the runtime declared
+    /// no globals at all); a runtime with multiple candidates *and* no
+    /// name section produces a `CompileError` during merge instead of
+    /// arriving here. Downstream *sret* calls turn `None` into a clean
+    /// diagnostic at the call site rather than producing invalid WASM.
+    pub stack_pointer_global: Option<u32>,
 }
 
 /// Top-level entry: merge `runtime_bytes` into `builder`. Returns the
@@ -134,10 +143,13 @@ pub(super) fn merge_runtime(
         }
     }
 
+    let stack_pointer_global = merger.resolve_stack_pointer()?;
+
     Ok(MergeOutcome {
         phx_funcs: merger.phx_funcs,
         runtime_min_pages: merger.runtime_min_pages,
         runtime_max_pages: merger.runtime_max_pages,
+        stack_pointer_global,
     })
 }
 
@@ -184,6 +196,25 @@ struct RuntimeMerger {
     /// under the multi-memory proposal) fails loudly rather than
     /// silently keeping the last memory.
     saw_memory_section: bool,
+
+    /// Stack-pointer candidates harvested from the runtime's global
+    /// section. Each entry is `(runtime_global_index, merged_global_index,
+    /// init_value)`. The candidate filter is "mutable i32 initialized
+    /// to a positive `i32.const`" — distinctive enough that
+    /// `__stack_pointer` is the only global matching it in current
+    /// rustc-emitted wasm32-wasip1 cdylibs. The final pick happens in
+    /// [`Self::resolve_stack_pointer`] after the name section (if any)
+    /// has been parsed.
+    sp_candidates: Vec<(u32, u32, i32)>,
+
+    /// Result of scanning the runtime's `name` custom section (if the
+    /// runtime build retained it; release builds usually strip it) for
+    /// a global subsection entry named `__stack_pointer`. Holds the
+    /// *runtime* global index (not the merged one) — resolved against
+    /// `global_remap` in `resolve_stack_pointer`. `None` means either
+    /// no name section was present or it didn't name a global
+    /// `__stack_pointer`.
+    sp_name_section_idx: Option<u32>,
 }
 
 impl RuntimeMerger {
@@ -198,6 +229,8 @@ impl RuntimeMerger {
             runtime_min_pages: 1,
             runtime_max_pages: None,
             saw_memory_section: false,
+            sp_candidates: Vec::new(),
+            sp_name_section_idx: None,
         }
     }
 
@@ -240,9 +273,73 @@ impl RuntimeMerger {
                      handle tags yet.",
                 ));
             }
-            // Everything else (custom sections, version header, end-of-module
-            // marker) is ignored.
+            // The `name` custom section (when present) lets us identify
+            // `__stack_pointer` by symbol rather than relying on rustc's
+            // "always emit it as global 0" convention. Release builds
+            // typically strip the section, so this is a best-effort
+            // hardening — `resolve_stack_pointer` has a shape-based
+            // fallback when no name match is found.
+            Payload::CustomSection(reader) if reader.name() == "name" => {
+                self.scan_name_section(reader)?;
+            }
+            // Everything else (other custom sections, version header,
+            // end-of-module marker) is ignored.
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Parse the `name` custom section looking for a `__stack_pointer`
+    /// entry in the global-names subsection. Stores the runtime global
+    /// index in `sp_name_section_idx` for `resolve_stack_pointer` to
+    /// consult.
+    ///
+    /// Two distinct "miss" modes:
+    ///
+    /// * **Unrecognized shape** (e.g. a custom-named `name`-style
+    ///   section that isn't actually the standard name section) — silently
+    ///   fall back. The name section is a hint and resolution still has
+    ///   the shape-based scan.
+    /// * **Malformed name section** (parse error mid-iteration) — that's
+    ///   a sign the runtime build itself is corrupted, not that the
+    ///   section is "just a hint we can ignore". Surface as a
+    ///   `CompileError` so a future runtime-build regression that hands
+    ///   us a busted name section produces a clear diagnostic instead
+    ///   of silently falling back to shape inference.
+    fn scan_name_section(
+        &mut self,
+        reader: wasmparser::CustomSectionReader<'_>,
+    ) -> Result<(), CompileError> {
+        let name_reader = match reader.as_known() {
+            wasmparser::KnownCustom::Name(r) => r,
+            _ => return Ok(()),
+        };
+        for subsection in name_reader {
+            let subsection = subsection.map_err(|e| {
+                CompileError::new(format!(
+                    "wasm32-linear: phoenix_runtime.wasm `name` custom section \
+                     is malformed (failed to parse a subsection): {e}. The \
+                     runtime build appears corrupted; rebuild `phoenix-runtime` \
+                     for wasm32-wasip1 from a clean tree."
+                ))
+            })?;
+            if let wasmparser::Name::Global(map) = subsection {
+                for entry in map {
+                    let entry = entry.map_err(|e| {
+                        CompileError::new(format!(
+                            "wasm32-linear: phoenix_runtime.wasm `name` custom \
+                             section is malformed (failed to parse a global-\
+                             name entry): {e}. The runtime build appears \
+                             corrupted; rebuild `phoenix-runtime` for wasm32-\
+                             wasip1 from a clean tree."
+                        ))
+                    })?;
+                    if entry.name == "__stack_pointer" {
+                        self.sp_name_section_idx = Some(entry.index);
+                        return Ok(());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -465,10 +562,35 @@ impl RuntimeMerger {
         builder: &mut ModuleBuilder,
     ) -> Result<(), CompileError> {
         let mut reencoder = MergeReencoder { remaps: self };
-        for global in rdr {
+        // `runtime_idx` here is the index *within the global section*
+        // (0-based, local-only). WASM's name-section global subsection
+        // uses *absolute* global indices (imported globals first), so
+        // the two only coincide because `observe_import` rejects every
+        // `TypeRef::Global` import outright — see `collect_imports`.
+        // `resolve_stack_pointer` indexes `global_remap` by the name-
+        // section value, which is sound only under that rejection
+        // invariant. If a future runtime build legitimately imports a
+        // global, that handler must lift first — at which point this
+        // loop needs to add `imported_global_count` to `runtime_idx`
+        // before recording the candidate.
+        for (runtime_idx, global) in rdr.into_iter().enumerate() {
+            let runtime_idx = runtime_idx as u32;
             let global = global.map_err(parse_err)?;
+            // Pre-scan the global's shape *before* moving it into the
+            // builder (the merge_global call consumes the ConstExpr).
+            // A stack-pointer candidate is "mutable i32 initialized by
+            // a single `i32.const N` with N positive"; nothing else in
+            // a wasm32-wasip1 cdylib's global section matches that
+            // shape today.
+            let sp_init = stack_pointer_init_value(&global);
             let merged_idx = builder.merge_global(&mut reencoder, global)?;
             reencoder.remaps.global_remap.push(merged_idx);
+            if let Some(init) = sp_init {
+                reencoder
+                    .remaps
+                    .sp_candidates
+                    .push((runtime_idx, merged_idx, init));
+            }
         }
         Ok(())
     }
@@ -564,6 +686,74 @@ impl RuntimeMerger {
         // `element_remap` here matching the order
         // `parse_element_section` emitted them in.
         Ok(())
+    }
+
+    /// Pick the merged-module global index for `__stack_pointer`.
+    ///
+    /// Resolution order:
+    /// 1. If the runtime's `name` custom section identified a global
+    ///    named `__stack_pointer`, use that — it's the authoritative
+    ///    symbol-level identification. Verify it's also a shape-valid
+    ///    SP candidate; if not, error (the name claims `__stack_pointer`
+    ///    but the global isn't a mutable i32 — runtime corruption).
+    /// 2. Otherwise (release builds typically strip the name section),
+    ///    look at shape-matched candidates collected during global
+    ///    merge. Exactly one candidate → use it. Zero or multiple →
+    ///    error with a diagnostic naming the candidates we did see so
+    ///    a future rustc change that adds a second mutable i32 global
+    ///    surfaces loudly instead of silently picking the wrong one.
+    fn resolve_stack_pointer(&self) -> Result<Option<u32>, CompileError> {
+        if let Some(runtime_idx) = self.sp_name_section_idx {
+            let merged_idx = self
+                .global_remap
+                .get(runtime_idx as usize)
+                .copied()
+                .ok_or_else(|| {
+                    CompileError::new(format!(
+                        "wasm32-linear: phoenix_runtime.wasm `name` section claims \
+                         global {runtime_idx} is `__stack_pointer` but only {} \
+                         globals were observed during merge — the name section is \
+                         inconsistent with the global section. Investigate the \
+                         runtime build.",
+                        self.global_remap.len(),
+                    ))
+                })?;
+            if !self
+                .sp_candidates
+                .iter()
+                .any(|(_, merged, _)| *merged == merged_idx)
+            {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: phoenix_runtime.wasm `name` section identifies \
+                     global {runtime_idx} as `__stack_pointer` but that global is \
+                     not a mutable i32 with a positive i32.const initializer \
+                     (expected stack-pointer shape). Either the name section is \
+                     stale or rustc emitted an unexpected stack-pointer shape; \
+                     investigate the runtime build."
+                )));
+            }
+            return Ok(Some(merged_idx));
+        }
+        match self.sp_candidates.as_slice() {
+            [] => Ok(None),
+            [(_, merged_idx, _)] => Ok(Some(*merged_idx)),
+            multiple => {
+                let candidate_list: Vec<String> = multiple
+                    .iter()
+                    .map(|(runtime_idx, _, init)| format!("global {runtime_idx} (init={init})"))
+                    .collect();
+                Err(CompileError::new(format!(
+                    "wasm32-linear: phoenix_runtime.wasm declares {} stack-pointer-\
+                     shaped globals (mutable i32 with positive i32.const init) but \
+                     no `name` section was present to disambiguate. Candidates: {}. \
+                     Build the runtime with the `name` section retained (e.g. drop \
+                     `--release` or pass `-C strip=none`) so `__stack_pointer` can \
+                     be identified by symbol.",
+                    multiple.len(),
+                    candidate_list.join(", "),
+                )))
+            }
+        }
     }
 }
 
@@ -701,6 +891,35 @@ impl Reencode for MergeReencoder<'_> {
             ),
         )))
     }
+}
+
+/// Examine a runtime global declaration and return `Some(init_value)`
+/// iff it has the shape of a stack-pointer candidate: mutable, `i32`,
+/// and initialized by a single `i32.const N` with `N > 0`. Returns
+/// `None` for any other shape, including globals with non-trivial init
+/// expressions (which the stack pointer never has).
+///
+/// Note: `decode_const_i32` returns the value as `i32`, so an init
+/// whose bit-31 is set (i.e. the unsigned interpretation is ≥ 2 GiB)
+/// reads as negative and falls into the `value <= 0` rejection arm.
+/// That's unreachable for any realistic wasm32-wasip1 runtime build
+/// (the stack pointer initializes to a low-MB value), but if a future
+/// linker-script change ever bumps it into the upper half of the i32
+/// range, the shape filter will silently exclude it and the merge
+/// will surface "no SP candidate". The remediation is to widen this
+/// to `value != 0` once that becomes a realistic concern.
+fn stack_pointer_init_value(global: &wasmparser::Global<'_>) -> Option<i32> {
+    if !global.ty.mutable
+        || global.ty.shared
+        || !matches!(global.ty.content_type, wasmparser::ValType::I32)
+    {
+        return None;
+    }
+    let value = decode_const_i32(&global.init_expr)?;
+    if value <= 0 {
+        return None;
+    }
+    Some(value)
 }
 
 fn parse_err(e: wasmparser::BinaryReaderError) -> CompileError {
@@ -963,7 +1182,18 @@ mod tests {
         code.function(&f);
 
         let mut data = DataSection::new();
-        data.active(0, &ConstExpr::i32_const(0), [0xAA, 0xBB].iter().copied());
+        // Place the runtime data segment at STACK_REGION_BASE
+        // (1048576) — `merge_data` enforces the disjointness invariant
+        // that runtime data lives at or above STACK_REGION_BASE so it
+        // doesn't overlap with user-emitted string literals at
+        // `[USER_DATA_BASE, STACK_REGION_BASE)`. The real wasm32-
+        // wasip1 runtime image satisfies this naturally because
+        // rustc's linker places `__data_end` at or above 1 MiB.
+        data.active(
+            0,
+            &ConstExpr::i32_const(1_048_576),
+            [0xAA, 0xBB].iter().copied(),
+        );
 
         let mut module = Module::new();
         module.section(&types);
@@ -1031,6 +1261,7 @@ mod tests {
             outcome.phx_funcs.clone(),
             outcome.runtime_min_pages,
             outcome.runtime_max_pages,
+            outcome.stack_pointer_global,
         );
         builder.declare_memory();
         let merged_bytes = builder.finish();
@@ -1145,6 +1376,350 @@ mod tests {
         assert!(
             err.contains("64-bit memory"),
             "expected memory64 rejection, got: {err}"
+        );
+    }
+
+    /// Build a runtime fixture with two stack-pointer-shaped globals
+    /// (mutable i32 with positive i32.const init) and no `name` custom
+    /// section. Used to verify that `resolve_stack_pointer` refuses to
+    /// guess between candidates and surfaces a diagnostic listing
+    /// what it saw.
+    fn module_with_two_sp_candidates() -> Vec<u8> {
+        use wasm_encoder::{
+            ConstExpr, ExportKind, ExportSection, GlobalSection, GlobalType, Instruction,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        let mut memories = wasm_encoder::MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut globals = GlobalSection::new();
+        // Two mutable-i32 / positive-init globals — both match the
+        // stack-pointer heuristic, so the merger has no way to choose
+        // between them.
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(65536),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("phx_x", ExportKind::Func, 0);
+        let mut code = wasm_encoder::CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&Instruction::End);
+        code.function(&f);
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&funcs);
+        module.section(&memories);
+        module.section(&globals);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
+    }
+
+    #[test]
+    fn rejects_ambiguous_stack_pointer_candidates() {
+        let err = expect_merge_error(&module_with_two_sp_candidates());
+        assert!(
+            err.contains("stack-pointer-shaped"),
+            "diagnostic must mention the candidate shape: {err}"
+        );
+        // The diagnostic must point at the remediation (rebuild with
+        // name section retained) so the user can self-resolve.
+        assert!(
+            err.contains("name") && err.contains("section"),
+            "diagnostic must point at the `name` section remediation: {err}"
+        );
+    }
+
+    /// Build a runtime fixture with no mutable-i32 globals at all.
+    /// The merger should return `Ok` with `stack_pointer_global =
+    /// None` — the *sret* call site is the one that surfaces the
+    /// missing-SP diagnostic, not the merger, so a runtime without
+    /// any sret-returning callers (hypothetical, but possible in
+    /// small test runtimes) still merges cleanly.
+    fn module_with_no_sp_candidate() -> Vec<u8> {
+        use wasm_encoder::{ExportKind, ExportSection};
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        let mut memories = wasm_encoder::MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut exports = ExportSection::new();
+        exports.export("phx_x", ExportKind::Func, 0);
+        let mut code = wasm_encoder::CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&wasm_encoder::Instruction::End);
+        code.function(&f);
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&funcs);
+        module.section(&memories);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
+    }
+
+    #[test]
+    fn accepts_runtime_without_sp_candidate() {
+        let bytes = module_with_no_sp_candidate();
+        wasmparser::validate(&bytes).expect("no-SP fixture must validate");
+        let mut builder = ModuleBuilder::new();
+        let outcome = merge_runtime(&mut builder, &bytes)
+            .expect("merge must succeed when runtime has no SP-shaped globals");
+        assert_eq!(
+            outcome.stack_pointer_global, None,
+            "missing SP global should be reported as None (not silently picked)"
+        );
+    }
+
+    /// Build a runtime fixture whose `name` custom section claims a
+    /// specific global is `__stack_pointer`, but the global itself has
+    /// init=0 — failing the `value > 0` shape-validity check inside
+    /// `stack_pointer_init_value`. Verifies that `resolve_stack_pointer`
+    /// refuses to trust a name-section claim that contradicts the
+    /// global's shape, rather than picking it and producing a wasm
+    /// module with a degenerate SP.
+    fn module_with_name_section_pointing_at_zero_init_global() -> Vec<u8> {
+        use wasm_encoder::{
+            ConstExpr, ExportKind, ExportSection, GlobalSection, GlobalType, Instruction, NameMap,
+            NameSection,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        let mut memories = wasm_encoder::MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut globals = GlobalSection::new();
+        // Single global, mutable i32 — but init=0, so
+        // `stack_pointer_init_value` rejects it (it's not a positive
+        // init). The name section names it anyway.
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("phx_x", ExportKind::Func, 0);
+        let mut code = wasm_encoder::CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&Instruction::End);
+        code.function(&f);
+        let mut name_section = NameSection::new();
+        let mut global_names = NameMap::new();
+        global_names.append(0, "__stack_pointer");
+        name_section.globals(&global_names);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&funcs);
+        module.section(&memories);
+        module.section(&globals);
+        module.section(&exports);
+        module.section(&code);
+        module.section(&name_section);
+        module.finish()
+    }
+
+    #[test]
+    fn rejects_name_section_pointing_at_shape_invalid_global() {
+        let bytes = module_with_name_section_pointing_at_zero_init_global();
+        wasmparser::validate(&bytes).expect("shape-mismatch fixture must validate");
+        let err = expect_merge_error(&bytes);
+        assert!(
+            err.contains("__stack_pointer"),
+            "diagnostic must name the symbol the name section claimed: {err}"
+        );
+        assert!(
+            err.contains("not a mutable i32 with a positive i32.const initializer")
+                || err.contains("expected stack-pointer shape"),
+            "diagnostic must explain the shape mismatch: {err}"
+        );
+    }
+
+    /// Build a runtime fixture whose `name` custom section claims a
+    /// global index that exceeds the actual global-section length. The
+    /// merger should refuse to remap an out-of-range index rather than
+    /// silently producing invalid WASM.
+    fn module_with_name_section_pointing_at_out_of_range_global() -> Vec<u8> {
+        use wasm_encoder::{
+            ConstExpr, ExportKind, ExportSection, GlobalSection, GlobalType, Instruction, NameMap,
+            NameSection,
+        };
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        let mut memories = wasm_encoder::MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        // Exactly one global: index 0 valid, anything ≥ 1 out of range.
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(1024),
+        );
+        let mut exports = ExportSection::new();
+        exports.export("phx_x", ExportKind::Func, 0);
+        let mut code = wasm_encoder::CodeSection::new();
+        let mut f = wasm_encoder::Function::new([]);
+        f.instruction(&Instruction::End);
+        code.function(&f);
+        // Name section claims `__stack_pointer` is global 7 — far past
+        // the only global the fixture declares.
+        let mut name_section = NameSection::new();
+        let mut global_names = NameMap::new();
+        global_names.append(7, "__stack_pointer");
+        name_section.globals(&global_names);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&funcs);
+        module.section(&memories);
+        module.section(&globals);
+        module.section(&exports);
+        module.section(&code);
+        module.section(&name_section);
+        module.finish()
+    }
+
+    #[test]
+    fn rejects_name_section_with_out_of_range_global_index() {
+        let bytes = module_with_name_section_pointing_at_out_of_range_global();
+        wasmparser::validate(&bytes).expect("out-of-range fixture must validate");
+        let err = expect_merge_error(&bytes);
+        assert!(
+            err.contains("inconsistent with the global section") || err.contains("no remap entry"),
+            "diagnostic must explain the name/global-section inconsistency: {err}"
+        );
+        assert!(
+            err.contains('7'),
+            "diagnostic should name the offending index for self-diagnosis: {err}"
+        );
+    }
+
+    /// Build a runtime module whose `name` custom section payload is
+    /// deliberately truncated — the subsection header parses (enough
+    /// to claim a length), but the body bytes run out partway through.
+    /// Used to exercise `scan_name_section`'s "malformed name section"
+    /// error path (which surfaces as a `CompileError` rather than a
+    /// silent fallback, because a corrupted name section signals a
+    /// busted runtime build).
+    fn module_with_malformed_name_section() -> Vec<u8> {
+        // Minimal valid wasm: just the header. The merge accepts an
+        // empty module gracefully; the custom section is what trips
+        // the malformed-name parser.
+        let mut module = wasm_encoder::Module::new();
+        let mut memories = wasm_encoder::MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+        // Append a hand-crafted custom section named "name" with a
+        // truncated subsection body. Custom-section layout: section
+        // id (0), section size (LEB128), name length (LEB128), name
+        // bytes, payload bytes. Inside the payload, name-section
+        // subsections are: subsection id (1 byte), subsection size
+        // (LEB128), subsection body. We claim a global-subsection
+        // (id=7) with size=100 but provide only one byte of body —
+        // wasmparser's iterator will read the subsection header
+        // successfully, then error out when trying to parse the
+        // global-name entries from the truncated body.
+        let name_str = b"name";
+        // Subsection: id=7 (global names), size=100, body=[0x00]
+        // Subsection bytes: id=7 (global names), size=100 (LEB128
+        // single byte), body=[0x00] (one byte where the header
+        // promised a hundred). wasmparser reads the header
+        // successfully but errors when iterating the truncated body.
+        let subsection: Vec<u8> = vec![7u8, 100u8, 0u8];
+        let mut payload = Vec::new();
+        payload.push(name_str.len() as u8); // name length LEB128 (small enough to fit in 1 byte)
+        payload.extend_from_slice(name_str);
+        payload.extend_from_slice(&subsection);
+
+        // Post-finish append: WASM has no end-of-module marker — sections
+        // are concatenated, so appending raw section bytes after
+        // `module.finish()` produces a valid (or in this case,
+        // intentionally invalid-in-the-name-section) module without
+        // needing first-class support in `wasm_encoder` for malformed
+        // custom sections.
+        let mut bytes = module.finish();
+        bytes.push(0u8); // section id 0 = custom
+        // Section size LEB128 — payload.len() < 128 so single byte.
+        assert!(
+            payload.len() < 128,
+            "test helper needs LEB128 for larger sections"
+        );
+        bytes.push(payload.len() as u8);
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[test]
+    fn rejects_malformed_name_section() {
+        let bytes = module_with_malformed_name_section();
+        // We don't validate this fixture — `wasmparser::validate` is
+        // strict about custom-section well-formedness and would
+        // reject it before we can exercise the merger. The merger
+        // itself parses the bytes via its own `Parser`, which
+        // surfaces the parse error through `scan_name_section`.
+        let err = expect_merge_error(&bytes);
+        assert!(
+            err.contains("malformed") && err.contains("name"),
+            "diagnostic must identify the name section as the malformed input: {err}"
+        );
+        assert!(
+            err.contains("rebuild") || err.contains("Rebuild"),
+            "diagnostic must point at the rebuild remediation: {err}"
         );
     }
 }

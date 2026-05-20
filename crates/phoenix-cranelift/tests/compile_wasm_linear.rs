@@ -240,6 +240,160 @@ fn call_targets_in_export(bytes: &[u8], export_name: &str) -> Result<Vec<u32>, S
     Ok(targets)
 }
 
+/// Count active data segments in `bytes`. Used by structural
+/// assertions on string-literal fixtures: each `Op::ConstString`
+/// reservation emits one active data segment in addition to the
+/// runtime's own segments, so the per-fixture data-segment count is
+/// "runtime baseline + N literals". A regression that silently
+/// dropped a reservation would show up as a count miss before the
+/// wasmtime tier even ran.
+fn active_data_segment_count(bytes: &[u8]) -> Result<usize, String> {
+    use wasmparser::{DataKind, Parser, Payload};
+    let mut active = 0;
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::DataSection(rdr) = payload {
+            for data in rdr {
+                let data = data.map_err(|e| format!("parsing data segment: {e}"))?;
+                if matches!(data.kind, DataKind::Active { .. }) {
+                    active += 1;
+                }
+            }
+        }
+    }
+    Ok(active)
+}
+
+/// Count `(GlobalGet, GlobalSet)` operator pairs targeting
+/// `__stack_pointer` across *every* function body in `bytes`.
+/// Module-wide variant of [`sp_global_access_count_in_export`]; the
+/// fizzbuzz fixture's *sret* sequence lives in the user `fizzbuzz`
+/// function rather than `_start`, so a per-export check would target
+/// the wrong body. Resolves `__stack_pointer` from the one-entry
+/// `name` custom section the merger always emits in the output, so
+/// this works regardless of whether the runtime build itself
+/// retained names.
+fn sp_global_access_count_in_module(bytes: &[u8]) -> Result<(usize, usize), String> {
+    use wasmparser::{Operator, Parser, Payload};
+    let mut sp_global_idx: Option<u32> = None;
+    let mut bodies: Vec<wasmparser::FunctionBody<'_>> = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        match payload {
+            Payload::CustomSection(reader) if reader.name() == "name" => {
+                if let wasmparser::KnownCustom::Name(name_reader) = reader.as_known() {
+                    for subsection in name_reader {
+                        let subsection = subsection.map_err(|e| format!("name subsection: {e}"))?;
+                        if let wasmparser::Name::Global(map) = subsection {
+                            for entry in map {
+                                let entry = entry.map_err(|e| format!("name entry: {e}"))?;
+                                if entry.name == "__stack_pointer" {
+                                    sp_global_idx = Some(entry.index);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => bodies.push(body),
+            _ => {}
+        }
+    }
+    let sp_idx = sp_global_idx
+        .ok_or_else(|| "no `__stack_pointer` entry in the name section".to_string())?;
+    let mut gets = 0;
+    let mut sets = 0;
+    for body in bodies {
+        let mut reader = body
+            .get_operators_reader()
+            .map_err(|e| format!("function-body operators: {e}"))?;
+        while !reader.eof() {
+            match reader
+                .read()
+                .map_err(|e| format!("function-body operator: {e}"))?
+            {
+                Operator::GlobalGet { global_index } if global_index == sp_idx => gets += 1,
+                Operator::GlobalSet { global_index } if global_index == sp_idx => sets += 1,
+                _ => {}
+            }
+        }
+    }
+    Ok((gets, sets))
+}
+
+/// Count function bodies that contain a *post-call* pair of
+/// `i32.load offset=0` and `i32.load offset=4` — the literal shape
+/// the *sret* sequence in `translate_to_string_builtin` emits to
+/// extract `PhxFatPtr.ptr` and `PhxFatPtr.len` from the caller-
+/// allocated result area. A body is counted iff it contains, in
+/// order: a `Call`, then (within the same body) at least one
+/// `I32Load { offset: 0 }` and at least one `I32Load { offset: 4 }`.
+///
+/// Returning a count rather than a bool lets the fizzbuzz assertion
+/// anchor against the runtime-only baseline (from `hello.phx`): a
+/// runtime body might happen to emit the same operator pattern, so
+/// "fizzbuzz has strictly more such bodies than hello does" is
+/// stronger than "fizzbuzz has at least one." A regression that
+/// drops the user-emitted loads still trips even if the runtime's
+/// own bodies match the pattern.
+///
+/// This is a tripwire for the sret loads' offset choice: a regression
+/// to e.g. `offset: 8` (reading garbage past the fat pointer) wouldn't
+/// fail wasm validation and might pass an end-to-end fixture if the
+/// garbage happened to look like a valid `len`. Asserting the exact
+/// offset shape catches that class of regression before wasmtime even
+/// runs.
+///
+/// The loose "anywhere after a Call in the same body" framing — rather
+/// than demanding the loads be *immediately* after — keeps the check
+/// stable against future codegen changes that interleave other ops
+/// (e.g. a shadow-stack-rooting push between the call and the loads).
+fn module_sret_load_shape_body_count(bytes: &[u8]) -> Result<usize, String> {
+    use wasmparser::{Operator, Parser, Payload};
+    let mut bodies: Vec<wasmparser::FunctionBody<'_>> = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::CodeSectionEntry(body) = payload {
+            bodies.push(body);
+        }
+    }
+    let mut count = 0;
+    for body in bodies {
+        let mut reader = body
+            .get_operators_reader()
+            .map_err(|e| format!("function-body operators: {e}"))?;
+        let mut seen_call = false;
+        let mut load_at_0 = false;
+        let mut load_at_4 = false;
+        while !reader.eof() {
+            let op = reader
+                .read()
+                .map_err(|e| format!("function-body operator: {e}"))?;
+            match op {
+                // Direct `Call` only — the user-emitted sret sequence
+                // uses `Operator::Call`. Counting `CallIndirect` would
+                // inflate the runtime baseline (the runtime's own
+                // bodies have plenty of CallIndirect / load patterns),
+                // weakening the `count > base_count` assertion in
+                // fizzbuzz without catching any additional regression.
+                Operator::Call { .. } => seen_call = true,
+                Operator::I32Load { memarg } if seen_call => {
+                    if memarg.offset == 0 {
+                        load_at_0 = true;
+                    } else if memarg.offset == 4 {
+                        load_at_4 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if load_at_0 && load_at_4 {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Run the AST interpreter on `source` and return its stdout. Used
 /// to build the expected-output baseline for the wasmtime comparison.
 ///
@@ -341,6 +495,50 @@ const HELLO_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/hello.phx"
 ));
+
+/// `defer_basic.phx` fixture — PR 3c's gate for the string-literal +
+/// `print(String)` surface. Defers are pre-linearized at IR lowering
+/// time (they become sequential `Op::BuiltinCall("print", ConstString)`
+/// instructions in the entry block), so this fixture exercises
+/// decision H end-to-end without needing PR 3c's `defer` exit-path
+/// machinery.
+const DEFER_BASIC_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/defer_basic.phx"
+));
+
+/// `fizzbuzz.phx` — PR 3c's gate for the *sret* call sequence. The
+/// `toString(Int)` call goes through `phx_i64_to_str`, which returns a
+/// `PhxFatPtr` struct via the wasm32-wasip1 C ABI's implicit struct-
+/// return pointer — codegen reserves stack space via
+/// `__stack_pointer`, passes the pointer, then loads the fat-pointer
+/// fields back out. Pinning this fixture pins the SP-manipulation
+/// dance; a regression that misaligns the stack or fails to restore
+/// the SP shows up as wrong output (or a wasmtime trap) on this
+/// fixture before manifesting in less obvious ways elsewhere.
+const FIZZBUZZ_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/fizzbuzz.phx"
+));
+
+/// Count the `Op::ConstString` occurrences in `source`'s lowered IR.
+/// This is what the structural data-segment assertions actually need
+/// to predict — each `Op::ConstString` reservation emits one active
+/// data segment, regardless of whether the source-level form was a
+/// `"..."` literal, a multi-line string, or (in the future) a
+/// constant-folded expression. Deriving from the IR rather than
+/// scanning the source for `"` characters means comments, escape
+/// sequences, and future syntax that doesn't map one-to-one to
+/// `Op::ConstString` can't silently throw the count off.
+fn const_string_op_count(source: &str) -> usize {
+    let ir_module = lower_to_ir(source);
+    ir_module
+        .concrete_functions()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .filter(|i| matches!(i.op, Op::ConstString(_)))
+        .count()
+}
 
 /// Fibonacci fixture, pulled directly from `tests/fixtures/fibonacci.phx`.
 /// PR 3b's headline gain — exercises `Int` arith (`isub`, `iadd`),
@@ -547,6 +745,232 @@ fn fibonacci_runs_under_wasmtime() {
     assert_wasm_matches_interp(FIBONACCI_SOURCE, "fibonacci");
 }
 
+/// Compile `hello.phx` and return its bytes, or `None` when the
+/// runtime isn't built. `hello.phx` has no string literals and no
+/// *sret* calls, so it serves as the "runtime contribution only"
+/// baseline for data-segment, SP-traffic, and sret-load counts.
+///
+/// Cached via `OnceLock` so the multiple per-test baseline helpers
+/// share a single compile pass even across the full test binary —
+/// the cost was ~one compile per fixture test before, now it's one
+/// for the whole run.
+///
+/// Critically: only `RuntimeWasmNotFound` returns `None` (the
+/// expected skip condition matching `compile_or_skip`). Any *other*
+/// compile error from `hello.phx` panics — that's a regression in
+/// the baseline fixture itself, not a runtime-availability skip, and
+/// silently swallowing it would let every structural assertion that
+/// depends on the baseline silently skip with a misleading "baseline
+/// must resolve" message at the call site.
+fn hello_compiled_bytes() -> Option<&'static [u8]> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let ir_module = lower_to_ir(HELLO_SOURCE);
+            match phoenix_cranelift::compile(&ir_module, Target::Wasm32Linear) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => None,
+                Err(e) => panic!(
+                    "hello.phx baseline compile failed for a reason other than \
+                     missing runtime: {e}. This is a regression in the baseline \
+                     fixture itself — the structural test suite cannot proceed."
+                ),
+            }
+        })
+        .as_deref()
+}
+
+/// Active-data-segment count contributed by the runtime alone (via
+/// `hello.phx`, which adds zero user-data segments).
+fn hello_data_segment_baseline() -> Option<usize> {
+    active_data_segment_count(hello_compiled_bytes()?).ok()
+}
+
+/// `(gets, sets)` of `__stack_pointer` contributed by the runtime
+/// alone. `hello.phx` doesn't emit any user-side *sret* calls — the
+/// only SP traffic comes from runtime function bodies — so any
+/// fixture with `gets > hello_baseline.0` or `sets >
+/// hello_baseline.1` provably exercised user-emitted SP manipulation.
+/// `None` only when the runtime artifact itself isn't present
+/// (`hello_compiled_bytes()` returns `None`); the merger always
+/// emits a `name` section identifying the SP global, so the
+/// resolution path doesn't itself produce skips.
+fn hello_sp_baseline() -> Option<(usize, usize)> {
+    sp_global_access_count_in_module(hello_compiled_bytes()?).ok()
+}
+
+/// Count of function bodies that contain the sret-load shape in
+/// `hello.phx` — the runtime-only contribution. Used to scope the
+/// fizzbuzz sret-load assertion to "fizzbuzz has strictly more
+/// sret-shape bodies than the runtime alone." `None` when the
+/// runtime isn't built or the scan fails.
+fn hello_sret_load_shape_body_count() -> Option<usize> {
+    module_sret_load_shape_body_count(hello_compiled_bytes()?).ok()
+}
+
+/// `defer_basic` end-to-end: PR 3c's gate for `Op::ConstString` +
+/// `print(String)` via decision H's data-section borrowed pointers.
+/// Five sequential string-literal prints; the defer ordering in the
+/// fixture is observable as LIFO output ("defer 3 / defer 2 / defer 1")
+/// — verified through the AST interp comparison.
+///
+/// Structural assertion: each `Op::ConstString` reserves one active
+/// data segment, so this fixture's segment count must be exactly
+/// `hello-baseline + N` where N is the literal count derived from
+/// the source. A regression that dropped a reservation (or aliased
+/// two literals into one segment) shows up here before the wasmtime
+/// tier even runs.
+#[test]
+fn defer_basic_runs_under_wasmtime() {
+    compile_or_skip(DEFER_BASIC_SOURCE, "defer_basic", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module for defer_basic: {e}"));
+
+        // We're inside `compile_or_skip`, so the runtime artifact is
+        // present and `hello_data_segment_baseline` must resolve — a
+        // `None` here would mean the baseline helper itself is broken
+        // (not a skip condition), so panic rather than silently bypass
+        // the assertion.
+        let baseline = hello_data_segment_baseline()
+            .expect("hello.phx baseline must resolve when the runtime artifact is available");
+        let count = active_data_segment_count(bytes)
+            .unwrap_or_else(|e| panic!("counting data segments: {e}"));
+        let literals = const_string_op_count(DEFER_BASIC_SOURCE);
+        let expected = baseline + literals;
+        assert_eq!(
+            count, expected,
+            "defer_basic lowers to {literals} `Op::ConstString` instructions \
+             so the compiled module must have exactly `hello-baseline \
+             (= {baseline}) + {literals} = {expected}` active data segments; \
+             got {count}. A miss means `Op::ConstString` lowering dropped a \
+             reservation or the runtime data-segment count drifted from \
+             hello.phx's.",
+        );
+
+        with_temp_wasm("defer_basic", bytes, |path| {
+            let Some(actual) = run_with_wasmtime(path, "defer_basic") else {
+                return;
+            };
+            let expected = run_ast_interp(DEFER_BASIC_SOURCE);
+            assert_eq!(
+                actual, expected,
+                "wasmtime stdout disagrees with AST interp for defer_basic\n\
+                 expected: {expected:?}\nactual:   {actual:?}"
+            );
+        });
+    });
+}
+
+/// `fizzbuzz` end-to-end: PR 3c's gate for the *sret* call sequence +
+/// value-returning multi-block functions of `StringRef` return type +
+/// cross-function `Op::Call` returning a fat pointer. Exercises
+/// `toString(Int)` (via `phx_i64_to_str` + stack-pointer manipulation),
+/// string-literal returns from a function (multi-value WASM return),
+/// and `imod` / `ieq` chained Branch terminators.
+///
+/// Structural assertions:
+///
+/// 1. Three string literals (`"FizzBuzz"`, `"Fizz"`, `"Buzz"`) → three
+///    active data segments above the runtime baseline.
+/// 2. SP-traffic count exceeds `hello.phx`'s baseline. Just "any SP
+///    traffic in the module" would be ~always true (the runtime's own
+///    bodies do plenty of SP work), so we anchor against the runtime-
+///    only baseline from `hello.phx` and assert fizzbuzz adds strictly
+///    more. The merged module always emits a one-entry `name` custom
+///    section identifying `__stack_pointer` (regardless of whether
+///    the runtime was built with names retained), so this assertion
+///    is unconditional.
+/// 3. The exact sret-load shape: the count of function bodies
+///    containing a `(call …; i32.load offset=0; i32.load offset=4)`
+///    pattern must strictly exceed the hello-baseline count. A
+///    regression to e.g. `offset: 8` (reading garbage past the fat
+///    pointer) would still pass wasm validation; anchoring against
+///    the baseline catches it even if the runtime's own bodies happen
+///    to match the same shape.
+#[test]
+fn fizzbuzz_runs_under_wasmtime() {
+    compile_or_skip(FIZZBUZZ_SOURCE, "fizzbuzz", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module for fizzbuzz: {e}"));
+
+        // Inside `compile_or_skip` → runtime is present → every
+        // baseline helper must resolve. A failure to resolve is a
+        // helper-side regression, not a skip condition, so panic.
+        let baseline = hello_data_segment_baseline()
+            .expect("hello.phx baseline must resolve when the runtime artifact is available");
+        let count = active_data_segment_count(bytes)
+            .unwrap_or_else(|e| panic!("counting data segments: {e}"));
+        let literals = const_string_op_count(FIZZBUZZ_SOURCE);
+        let expected = baseline + literals;
+        assert_eq!(
+            count, expected,
+            "fizzbuzz lowers to {literals} `Op::ConstString` instructions \
+             so the compiled module must have exactly `hello-baseline \
+             (= {baseline}) + {literals} = {expected}` active data segments; \
+             got {count}. The `toString` result is heap-allocated, so it \
+             doesn't add a data segment.",
+        );
+
+        // SP usage anchored against the hello.phx baseline (runtime-only
+        // contribution). Fizzbuzz's `toString(Int)` is the one user-side
+        // site that emits SP traffic in PR 3c, so the count *must*
+        // exceed the baseline; a regression that dropped the sret
+        // sequence (or emitted it as a no-op) shows up here even if
+        // gets/sets are nonzero from the runtime's own bodies.
+        let (base_gets, base_sets) = hello_sp_baseline().expect(
+            "hello.phx SP baseline must resolve — the merger emits a `name` \
+             section for `__stack_pointer` unconditionally",
+        );
+        let (gets, sets) = sp_global_access_count_in_module(bytes).expect(
+            "fizzbuzz's merged module must expose `__stack_pointer` via its `name` section",
+        );
+        assert!(
+            gets > base_gets && sets > base_sets,
+            "fizzbuzz's *sret* sequence must add at least one \
+             GlobalGet/GlobalSet pair on `__stack_pointer` beyond what \
+             the runtime itself contributes; got gets={gets} (baseline \
+             {base_gets}), sets={sets} (baseline {base_sets}). A miss \
+             means the sret sequence was reached but emitted no SP \
+             manipulation, or it was bypassed entirely."
+        );
+
+        // Structural shape of the sret loads, anchored against the
+        // hello baseline: even if a runtime body coincidentally emits
+        // the same (call; load@0; load@4) pattern, fizzbuzz must
+        // *add* at least one such body via the user-side
+        // `toString(Int)` call. A regression that dropped or relocated
+        // the user loads would fail to widen the count past the
+        // baseline.
+        let base_count = hello_sret_load_shape_body_count()
+            .expect("hello.phx sret-shape baseline must resolve when the runtime is available");
+        let count = module_sret_load_shape_body_count(bytes)
+            .unwrap_or_else(|e| panic!("scanning for sret-load shape: {e}"));
+        assert!(
+            count > base_count,
+            "fizzbuzz must add at least one body with a post-call \
+             `(i32.load offset=0, i32.load offset=4)` pair beyond what \
+             hello.phx contributes; got count={count} (baseline \
+             {base_count}). A miss means the offsets drifted in the \
+             user-emitted sret sequence (regression hazard: the same \
+             drift would silently miscompile any future sret-returning \
+             builtin)."
+        );
+
+        with_temp_wasm("fizzbuzz", bytes, |path| {
+            let Some(actual) = run_with_wasmtime(path, "fizzbuzz") else {
+                return;
+            };
+            let expected = run_ast_interp(FIZZBUZZ_SOURCE);
+            assert_eq!(
+                actual, expected,
+                "wasmtime stdout disagrees with AST interp for fizzbuzz\n\
+                 expected: {expected:?}\nactual:   {actual:?}"
+            );
+        });
+    });
+}
+
 /// Negative integer: `-123` lowers to `INeg(ConstI64(123))`. PR 3b
 /// adds `Op::INeg` (emitted as `0 - x` because WASM MVP has no
 /// `i64.neg`), so this fixture now reaches `phx_print_i64`'s
@@ -579,6 +1003,40 @@ fn zero_int_runs_under_wasmtime() {
 fn empty_main_runs_under_wasmtime() {
     let src = "function main() {}\n";
     assert_wasm_matches_interp(src, "empty_main");
+}
+
+// `toString(Float)` end-to-end coverage is deferred until `Op::ConstF64`
+// lowering lands (later in PR 3c — float arithmetic / literals follow
+// the heap surface). The dispatch arm for `IrType::F64 →
+// "phx_f64_to_str"` exists in `translate_to_string_builtin` today, but
+// there's no source-level way to construct a `Float` binding yet, so
+// any test would fail at `Op::ConstF64`'s "not yet supported"
+// diagnostic before reaching the *sret* call sequence. The bool test
+// below catches dispatch-table regressions in the meantime.
+
+/// `toString(Bool)` exercises the third *sret*-returning variant —
+/// dispatches to `phx_bool_to_str`, which takes an `i8` rather than
+/// the i64/f64 the other two take. A regression in the per-type
+/// arg-width handling (e.g. emitting an i64 arg for the bool case
+/// because the dispatch fell through) would show up here as a
+/// wasmtime trap or wrong output.
+#[test]
+fn to_string_bool_runs_under_wasmtime() {
+    let src = "function main() {\n  print(toString(true))\n  print(toString(false))\n}\n";
+    assert_wasm_matches_interp(src, "to_string_bool");
+}
+
+/// `toString(String)` is the source-level identity — `translate_to_string_builtin`
+/// short-circuits it to a 2-slot local-copy with no runtime call and
+/// no *sret* plumbing. The other `toString` tests would still pass if
+/// this branch silently fell through to the default-arm error
+/// diagnostic; this fixture pins the identity arm specifically so a
+/// regression there surfaces as a compile failure rather than a
+/// "looks like it worked because the other arms still do" silence.
+#[test]
+fn to_string_string_runs_under_wasmtime() {
+    let src = "function main() {\n  print(toString(\"hi\"))\n}\n";
+    assert_wasm_matches_interp(src, "to_string_string");
 }
 
 /// `print(bool)` routes through the merged runtime's `phx_print_bool`

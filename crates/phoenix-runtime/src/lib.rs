@@ -313,6 +313,29 @@ pub struct PhxFatPtr {
     pub len: usize,
 }
 
+// Structural layout invariants for `PhxFatPtr` — pinned because the
+// wasm32-linear backend's *sret* sequences hand-roll the offsets.
+// Rationale and the full backend contract live in
+// `docs/design-decisions.md` §Phase 2.4 decision H ("PhxFatPtr layout
+// contract").
+const _: () = {
+    assert!(
+        std::mem::offset_of!(PhxFatPtr, ptr) == 0,
+        "PhxFatPtr.ptr must be at offset 0 (the wasm32-linear backend's \
+         sret load assumes this)"
+    );
+    assert!(
+        std::mem::offset_of!(PhxFatPtr, len) == std::mem::size_of::<usize>(),
+        "PhxFatPtr.len must follow ptr with no padding (the wasm32-linear \
+         backend's sret load assumes contiguous pointer-sized fields)"
+    );
+    assert!(
+        std::mem::size_of::<PhxFatPtr>() == 2 * std::mem::size_of::<usize>(),
+        "PhxFatPtr must be exactly two pointer-sized fields with no tail \
+         padding (callers reserve 2*usize-size stack space for the sret area)"
+    );
+};
+
 /// Format a float matching interpreter semantics.
 ///
 /// Whole-number floats that are finite and fit in an `i64` are printed
