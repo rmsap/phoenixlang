@@ -321,6 +321,54 @@ fn sp_global_access_count_in_module(bytes: &[u8]) -> Result<(usize, usize), Stri
     Ok((gets, sets))
 }
 
+/// Count *occurrences* of the post-call `(I32Load@0, I32Load@4)` sret
+/// shape across every body, not just bodies-that-contain-the-pattern.
+/// Used to anchor multi-concat fixtures (e.g. `chained_string_concat`)
+/// where one body contains two distinct sret call sites; the
+/// body-count helper saturates at 1 per body and would miss the
+/// composition. State machine: `Idle → AfterCall → SawLoad0 → +1 →
+/// Idle`. A new `Call` while waiting for the loads restarts the
+/// window — abandoning the previous Call's pending pair.
+fn module_sret_call_site_occurrence_count(bytes: &[u8]) -> Result<usize, String> {
+    use wasmparser::{Operator, Parser, Payload};
+    let mut bodies: Vec<wasmparser::FunctionBody<'_>> = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::CodeSectionEntry(body) = payload {
+            bodies.push(body);
+        }
+    }
+    enum State {
+        Idle,
+        AfterCall,
+        SawLoad0,
+    }
+    let mut count = 0;
+    for body in bodies {
+        let mut reader = body
+            .get_operators_reader()
+            .map_err(|e| format!("function-body operators: {e}"))?;
+        let mut state = State::Idle;
+        while !reader.eof() {
+            let op = reader
+                .read()
+                .map_err(|e| format!("function-body operator: {e}"))?;
+            match (&state, &op) {
+                (_, Operator::Call { .. }) => state = State::AfterCall,
+                (State::AfterCall, Operator::I32Load { memarg }) if memarg.offset == 0 => {
+                    state = State::SawLoad0;
+                }
+                (State::SawLoad0, Operator::I32Load { memarg }) if memarg.offset == 4 => {
+                    count += 1;
+                    state = State::Idle;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Count function bodies that contain a *post-call* pair of
 /// `i32.load offset=0` and `i32.load offset=4` — the literal shape
 /// the *sret* sequence in `translate_to_string_builtin` emits to
@@ -809,6 +857,14 @@ fn hello_sret_load_shape_body_count() -> Option<usize> {
     module_sret_load_shape_body_count(hello_compiled_bytes()?).ok()
 }
 
+/// Same hello-baseline shape as [`hello_sret_load_shape_body_count`],
+/// but counting *occurrences* of the sret shape (one per call site)
+/// rather than bodies-containing-the-pattern. Used by the multi-concat
+/// fixtures where one body contains more than one sret call site.
+fn hello_sret_call_site_occurrence_count() -> Option<usize> {
+    module_sret_call_site_occurrence_count(hello_compiled_bytes()?).ok()
+}
+
 /// `defer_basic` end-to-end: PR 3c's gate for `Op::ConstString` +
 /// `print(String)` via decision H's data-section borrowed pointers.
 /// Five sequential string-literal prints; the defer ordering in the
@@ -965,6 +1021,103 @@ fn fizzbuzz_runs_under_wasmtime() {
             assert_eq!(
                 actual, expected,
                 "wasmtime stdout disagrees with AST interp for fizzbuzz\n\
+                 expected: {expected:?}\nactual:   {actual:?}"
+            );
+        });
+    });
+}
+
+/// `let mut` + integer-arith + while loop: PR 3c slice 2's gate for
+/// `Op::Alloca(I64)` + `Op::Load` + `Op::Store` routed through the
+/// loop+switch dispatcher's while-loop shape (bb_header / bb_body /
+/// bb_after). Pinning the sum of 1..=10 = 55 catches off-by-one
+/// regressions in the load-modify-store sequence and any local-index
+/// drift between the slot's binding and the loaded-value's binding.
+#[test]
+fn mutable_int_while_loop_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let mut sum: Int = 0\n  \
+                 let mut i: Int = 1\n  \
+                 while i <= 10 {\n    \
+                   sum = sum + i\n    \
+                   i = i + 1\n  \
+                 }\n  \
+                 print(sum)\n\
+               }\n";
+    assert_wasm_matches_interp(src, "mutable_int_while_loop");
+}
+
+/// Mutable `String` accumulator + while + `Op::StringConcat`: PR 3c
+/// slice 2's gate for the multi-slot `Op::Alloca(StringRef)` path plus
+/// the `phx_str_concat` sret call. The fixture loops three times,
+/// appending `"x"` each iteration; `Op::Load` / `Op::Store` on a 2-slot
+/// (i32 ptr, i32 len) fat-pointer slot must read/write *both* locals
+/// in the right order. A regression that read only one slot would
+/// surface as garbage output (or a wasmtime trap on the bogus pointer)
+/// rather than the expected `xxx`.
+#[test]
+fn mutable_string_concat_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let mut s: String = \"\"\n  \
+                 let mut i: Int = 0\n  \
+                 while i < 3 {\n    \
+                   s = s + \"x\"\n    \
+                   i = i + 1\n  \
+                 }\n  \
+                 print(s)\n\
+               }\n";
+    assert_wasm_matches_interp(src, "mutable_string_concat");
+}
+
+/// Three-way `Op::StringConcat` chain (`a + b + c`): pins that nested
+/// sret calls compose. Each concat allocates a new GC string; the
+/// chain `((a + b) + c)` runs `phx_str_concat` twice, with the
+/// intermediate result feeding the second call. Without shadow-stack
+/// rooting (the rest of PR 3c), this works because no GC-triggering
+/// allocation happens between the two concat calls — the second
+/// concat's allocation is the only intervening allocation, and it
+/// consumes the intermediate before triggering any sweep.
+///
+/// Structural anchor: pin that *two* distinct sret call sites land in
+/// the user code beyond what the runtime baseline contributes. A
+/// regression that collapsed the chain into one call (or that emitted
+/// the second call but dropped its `(I32Load@0, I32Load@4)` pair)
+/// would lose the `+2` margin even if stdout happened to match.
+#[test]
+fn chained_string_concat_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let a: String = \"hello\"\n  \
+                 let b: String = \", \"\n  \
+                 let c: String = \"world\"\n  \
+                 print(a + b + c)\n\
+               }\n";
+    let label = "chained_string_concat";
+    compile_or_skip(src, label, |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module for {label}: {e}"));
+
+        let base_count = hello_sret_call_site_occurrence_count().expect(
+            "hello.phx sret-occurrence baseline must resolve when the runtime is available",
+        );
+        let count = module_sret_call_site_occurrence_count(bytes)
+            .unwrap_or_else(|e| panic!("scanning for sret call sites: {e}"));
+        assert!(
+            count >= base_count + 2,
+            "chained `a + b + c` must add at least 2 sret call sites \
+             beyond the hello baseline (one per `phx_str_concat` in \
+             the chain); got count={count} (baseline {base_count}). A \
+             regression that collapsed or dropped one of the concat \
+             calls would surface here before the wasmtime tier ran."
+        );
+
+        with_temp_wasm(label, bytes, |path| {
+            let Some(actual) = run_with_wasmtime(path, label) else {
+                return;
+            };
+            let expected = run_ast_interp(src);
+            assert_eq!(
+                actual, expected,
+                "wasmtime stdout disagrees with AST interp for {label}\n\
                  expected: {expected:?}\nactual:   {actual:?}"
             );
         });
