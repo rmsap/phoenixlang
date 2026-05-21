@@ -750,7 +750,7 @@ impl ModuleBuilder {
 
     pub(super) fn emit_phoenix_bodies(&mut self, ir_module: &IrModule) -> Result<(), CompileError> {
         for func in ir_module.concrete_functions() {
-            let body = translate::translate_function(self, func)?;
+            let body = translate::translate_function(self, ir_module, func)?;
             self.code.function(&body);
         }
         Ok(())

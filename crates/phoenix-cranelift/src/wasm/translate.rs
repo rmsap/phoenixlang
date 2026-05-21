@@ -69,44 +69,43 @@ use phoenix_ir::instruction::{Op, ValueId};
 use phoenix_ir::module::IrFunction;
 use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
+use phoenix_runtime::gc::TypeTag;
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
+use super::heap_layout::{
+    EnumLayout, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
+    compute_variant_field_offsets, field_memarg, i32_memarg, is_gc_pointer_type, is_i32_field,
+};
 use super::module_builder::ModuleBuilder;
 use crate::error::CompileError;
 
-/// Map a Phoenix [`IrType`] to the single WASM [`ValType`] used to
-/// represent it. Returns an error for types whose representation
-/// requires more than one slot (e.g. `StringRef`'s `(ptr, len)`
-/// fat pointer) — those callers go through [`wasm_valtypes_for`].
-///
-/// `IrType::Void` is rejected: `Void` is the absence of a value, not
-/// a value of any slot type. Return-position handling routes through
-/// [`wasm_return_valtypes`] instead.
-pub(super) fn wasm_valtype_for(ty: &IrType) -> Result<ValType, CompileError> {
-    match ty {
-        IrType::I64 => Ok(ValType::I64),
-        IrType::F64 => Ok(ValType::F64),
-        IrType::Bool => Ok(ValType::I32),
-        IrType::Void => Err(CompileError::new(
-            "wasm32-linear: `Void` has no WASM value representation \
-             (internal: callers must route returns through \
-             `wasm_return_valtypes`)"
-                .to_string(),
-        )),
-        _ => Err(unsupported(ty, "single-slot wasm32-linear value rep")),
-    }
-}
+/// One block-param's WASM-local list, in declaration order — a single
+/// entry for `Int` / `Bool` / pointer-typed params, two entries
+/// (`[ptr_local, len_local]`) for `StringRef`. Aliased here so the
+/// nested `Vec<Vec<u32>>` in [`FuncTranslateCtx::block_param_locals`]
+/// reads as "list of param slot lists" at call sites.
+type ParamSlotLocals = Vec<u32>;
 
-/// Multi-slot version of [`wasm_valtype_for`]. Each Phoenix [`IrType`]
-/// maps to a fixed number of WASM value-stack slots — most are
-/// single-slot (1), `StringRef` is two (`i32 ptr`, `i32 len`), `Void`
-/// is zero. PR 3c will extend this for `List` / `Map` / `Closure`
-/// references (single `i32` each — pointers into the GC heap).
+/// Flatten a Phoenix [`IrType`] into the WASM `ValType` slots that
+/// represent it on the value stack. Most types are single-slot,
+/// `StringRef` is two (`i32 ptr`, `i32 len`), and `Void` is zero.
+/// GC-heap reference types (`List` / `Map` / `Closure` / user
+/// `Struct` / `Enum`) each flatten to a single `i32` GC pointer
+/// (see [`is_gc_pointer_type`]).
 ///
 /// Used for both function-signature flattening
 /// ([`super::module_builder::ModuleBuilder::declare_phoenix_functions`])
 /// and per-SSA-value local allocation (each `Vec<ValType>` entry gets
 /// its own WASM local).
+///
+/// `StructRef` / `EnumRef` flatten so user struct/enum alloc +
+/// field-access codegen can hand back single-`i32` GC pointers.
+/// `ListRef`, `MapRef`, and `ClosureRef` have no body-translator
+/// support for their *alloc* / *method* ops yet, but parameters and
+/// returns of these types must still flatten here so user methods
+/// declared against them produce valid WASM signatures during
+/// declaration — the body translator rejects the unsupported ops with
+/// a per-op diagnostic when they're actually invoked.
 pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileError> {
     match ty {
         IrType::I64 => Ok(vec![ValType::I64]),
@@ -114,8 +113,148 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
         IrType::Bool => Ok(vec![ValType::I32]),
         IrType::Void => Ok(Vec::new()),
         IrType::StringRef => Ok(vec![ValType::I32, ValType::I32]),
+        ty if is_gc_pointer_type(ty) => Ok(vec![ValType::I32]),
         _ => Err(unsupported(ty, "wasm32-linear value representation")),
     }
+}
+
+/// Reject a placeholder-typed field at codegen. Used at both the
+/// alloc and get sites for enum-variant fields where a `result_type`
+/// (or value-vid `ir_type`) carrying the `GENERIC_PLACEHOLDER`
+/// sentinel would otherwise silently size as a 4-byte i32 via
+/// `is_gc_pointer_type` matching `StructRef("__generic", [])` —
+/// truncating I64/F64 payloads or yielding only the `ptr` half of a
+/// `StringRef`. `site_label` is interpolated into the diagnostic so
+/// the failing op is identifiable; sema should have annotated the
+/// type concretely before reaching either call site.
+fn reject_placeholder_field_type(ty: &IrType, site_label: &str) -> Result<(), CompileError> {
+    if ty.is_generic_placeholder() {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: {site_label} has unresolved IR type \
+             (`GENERIC_PLACEHOLDER`); sema/IR should have annotated this \
+             with a concrete type before codegen (internal compiler bug)"
+        )));
+    }
+    Ok(())
+}
+
+/// Emit a load of the field of type `ty` at `field_offset` from the
+/// allocation whose base pointer is in `base_ptr_local`. Single-slot
+/// types push one value onto the operand stack; `StringRef` pushes
+/// two (`ptr` then `len`, in declaration order) so the caller's
+/// `emit_store_result` can pop them into the matching `[ptr, len]`
+/// locals via reverse-order `LocalSet`. `MemArg::align` comes from
+/// `phx_field_align_bytes` via `align_log2`. Used by both
+/// `Op::StructGetField` and `Op::EnumGetField`.
+fn emit_field_load(
+    ctx: &mut FuncTranslateCtx,
+    base_ptr_local: u32,
+    field_offset: u32,
+    ty: &IrType,
+) -> Result<(), CompileError> {
+    if matches!(ty, IrType::Void) {
+        return Err(CompileError::new(
+            "wasm32-linear: `Void` has no field-load representation \
+             (internal: sema/IR should reject Void-typed struct/enum fields)",
+        ));
+    }
+    let memarg = field_memarg(field_offset, ty)?;
+    match ty {
+        IrType::I64 => {
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::I64Load(memarg));
+        }
+        IrType::F64 => {
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::F64Load(memarg));
+        }
+        // `Bool` and every GC-pointer reference type collapse to one
+        // `i32.load` at the field offset — only the per-type alignment
+        // hint (computed by `field_memarg`) can differ. `is_i32_field`
+        // keeps this arm and the matching `emit_field_store` arm in
+        // lockstep: a new GC-pointer variant added to `is_gc_pointer_type`
+        // automatically picks up both paths.
+        ty if is_i32_field(ty) => {
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::I32Load(memarg));
+        }
+        IrType::StringRef => {
+            // Fat pointer: read ptr at offset, then len at offset+4.
+            // Push them in declaration order so the caller's
+            // `emit_store_result` pops them into (ptr_local, len_local)
+            // via reverse-order LocalSet.
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::I32Load(memarg));
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::I32Load(i32_memarg(field_offset + 4)));
+        }
+        _ => return Err(unsupported(ty, "field load")),
+    }
+    Ok(())
+}
+
+/// Emit a store of the value held in `value_locals` to the field of
+/// type `ty` at `field_offset` from the allocation whose base pointer
+/// is in `base_ptr_local`. Single-slot types take one local; multi-
+/// slot `StringRef` takes two (`[ptr_local, len_local]`) and emits two
+/// `i32.store`s back-to-back at `field_offset` and `field_offset + 4`.
+/// Sourcing from locals (rather than the operand stack) keeps the
+/// caller from having to thread both slots through any intermediate
+/// alloc/store sequence. Used by `Op::StructAlloc`, `Op::StructSetField`,
+/// and `Op::EnumAlloc`.
+fn emit_field_store(
+    ctx: &mut FuncTranslateCtx,
+    base_ptr_local: u32,
+    field_offset: u32,
+    ty: &IrType,
+    value_locals: &[u32],
+) -> Result<(), CompileError> {
+    if matches!(ty, IrType::Void) {
+        return Err(CompileError::new(
+            "wasm32-linear: `Void` has no field-store representation \
+             (internal: sema/IR should reject Void-typed struct/enum fields)",
+        ));
+    }
+    let memarg = field_memarg(field_offset, ty)?;
+    match ty {
+        IrType::I64 => {
+            debug_assert_eq!(value_locals.len(), 1, "I64 must be single-slot");
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::LocalGet(value_locals[0]));
+            ctx.emit(Instruction::I64Store(memarg));
+        }
+        IrType::F64 => {
+            debug_assert_eq!(value_locals.len(), 1, "F64 must be single-slot");
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::LocalGet(value_locals[0]));
+            ctx.emit(Instruction::F64Store(memarg));
+        }
+        // Single `i32` store covers both `Bool` (0/1 widened to i32)
+        // and every GC-pointer reference type. See the matching arm
+        // in `emit_field_load` for the alignment-source rationale.
+        ty if is_i32_field(ty) => {
+            debug_assert_eq!(
+                value_locals.len(),
+                1,
+                "Bool / ref types must be single-slot"
+            );
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::LocalGet(value_locals[0]));
+            ctx.emit(Instruction::I32Store(memarg));
+        }
+        IrType::StringRef => {
+            debug_assert_eq!(value_locals.len(), 2, "StringRef must be 2 slots");
+            // Store ptr at offset, then len at offset+4.
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::LocalGet(value_locals[0]));
+            ctx.emit(Instruction::I32Store(memarg));
+            ctx.emit(Instruction::LocalGet(base_ptr_local));
+            ctx.emit(Instruction::LocalGet(value_locals[1]));
+            ctx.emit(Instruction::I32Store(i32_memarg(field_offset + 4)));
+        }
+        _ => return Err(unsupported(ty, "field store")),
+    }
+    Ok(())
 }
 
 /// Map a Phoenix function's return [`IrType`] to a vector of WASM
@@ -181,6 +320,7 @@ pub(super) fn wasm_valtype_from_parser(ty: wasmparser::ValType) -> Result<ValTyp
 /// the dispatch.
 pub(super) fn translate_function(
     b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
     func: &IrFunction,
 ) -> Result<Function, CompileError> {
     if func.blocks.is_empty() {
@@ -192,9 +332,9 @@ pub(super) fn translate_function(
 
     let mut ctx = FuncTranslateCtx::new(func)?;
     if func.blocks.len() == 1 {
-        translate_block(&mut ctx, b, &func.blocks[0], None)?;
+        translate_block(&mut ctx, b, ir_module, &func.blocks[0], None)?;
     } else {
-        translate_multi_block(&mut ctx, b, func)?;
+        translate_multi_block(&mut ctx, b, ir_module, func)?;
     }
     // Every WASM function body must terminate with an `end` opcode
     // (0x0B) — `wasm_encoder::Function` requires it regardless of
@@ -239,6 +379,7 @@ pub(super) fn translate_function(
 fn translate_multi_block(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
     func: &IrFunction,
 ) -> Result<(), CompileError> {
     let n_blocks = func.blocks.len();
@@ -275,9 +416,13 @@ fn translate_multi_block(
             block.id, block_id,
         );
         for (vid, ty) in &block.params {
-            let wasm_ty = wasm_valtype_for(ty)?;
-            let local = ctx.allocate_local(*vid, wasm_ty, ty.clone());
-            ctx.register_block_param(block_id, local);
+            // Allocate the multi-slot binding for this block param
+            // (single local for `Int`/`Bool`/pointer types, two locals
+            // for `StringRef`). The binding registers the param's slot
+            // locals so `Jump`/`Branch` terminators copying args into
+            // the block can write each slot independently.
+            let slot_locals = ctx.allocate_locals_for_ir_type(*vid, ty.clone())?;
+            ctx.register_block_param(block_id, slot_locals);
         }
     }
 
@@ -334,6 +479,7 @@ fn translate_multi_block(
         translate_block(
             ctx,
             b,
+            ir_module,
             block,
             Some(DispatcherContext {
                 depth_to_loop,
@@ -414,14 +560,31 @@ struct FuncTranslateCtx {
     /// locals (assigned at function entry) and instruction-result
     /// locals (assigned as ops are visited).
     bindings: HashMap<ValueId, ValueBinding>,
-    /// Per-block param WASM locals, indexed by [`BlockId`]. The entry-
-    /// block params bind to function-parameter locals and are NOT
-    /// listed here (`BlockId(0)` resolves to function params via
-    /// `func.param_types`). Non-entry blocks' params get fresh locals
-    /// allocated in [`translate_multi_block`]; `Jump` / `Branch`
-    /// terminators look them up here when copying args before
-    /// dispatching.
-    block_param_locals: HashMap<BlockId, Vec<u32>>,
+    /// Per-block param WASM locals, indexed by [`BlockId`] then by
+    /// param-position (declaration order). Each [`ParamSlotLocals`]
+    /// entry is the slot list for one param — single-slot for `Int` /
+    /// `Bool` / pointer-typed params, two-slot for `StringRef` (fat
+    /// pointer). The entry-block params bind to function-parameter
+    /// locals and are NOT listed here (`BlockId(0)` resolves to
+    /// function params via `func.param_types`). Non-entry blocks'
+    /// params get fresh locals allocated in [`translate_multi_block`];
+    /// `Jump` / `Branch` terminators look them up here when copying
+    /// args before dispatching.
+    block_param_locals: HashMap<BlockId, Vec<ParamSlotLocals>>,
+    /// Cache of computed struct layouts (keyed by struct name) for the
+    /// current function body. `Op::StructAlloc` / `Op::StructGetField`
+    /// / `Op::StructSetField` all index into the same per-name layout,
+    /// and a single source-level struct can be touched many times in
+    /// one function (`p.x = p.y + p.z` is three accesses to `Point`'s
+    /// layout). Caching here amortizes the `HashMap` walk + per-field
+    /// alignment math across those accesses; the cache is scoped to
+    /// one function because layouts are pure functions of the IR
+    /// module, never mutated during translation.
+    struct_layout_cache: HashMap<String, StructLayout>,
+    /// Sibling cache for enum-variant layouts. Same scope and
+    /// rationale as [`Self::struct_layout_cache`]. Indexed by enum
+    /// name; each entry surfaces all declared variants.
+    enum_layout_cache: HashMap<String, EnumLayout>,
     /// Next WASM local index to assign for an instruction-result
     /// value. Initialized past the parameter locals.
     next_local: u32,
@@ -512,6 +675,8 @@ impl FuncTranslateCtx {
             pending_locals: Vec::new(),
             bindings,
             block_param_locals: HashMap::new(),
+            struct_layout_cache: HashMap::new(),
+            enum_layout_cache: HashMap::new(),
             next_local: next_wasm_local,
         })
     }
@@ -528,24 +693,61 @@ impl FuncTranslateCtx {
         idx
     }
 
-    /// Record `local` as the WASM local that holds block-param `vid`
-    /// for the given target `block`. Used by [`translate_multi_block`]
+    /// Record `locals` as the WASM-local list backing one block-param
+    /// (in declaration order) for the given target `block`. For
+    /// single-slot types `locals` is one entry; for `StringRef` it's
+    /// two (`[ptr_local, len_local]`). Used by [`translate_multi_block`]
     /// when reserving locals for non-entry blocks' params.
-    fn register_block_param(&mut self, block: BlockId, local: u32) {
+    fn register_block_param(&mut self, block: BlockId, locals: ParamSlotLocals) {
         self.block_param_locals
             .entry(block)
             .or_default()
-            .push(local);
+            .push(locals);
     }
 
-    /// Look up the WASM locals for a block's params, in declaration
-    /// order. Empty if the block has no params (or is the entry
-    /// block, whose params bind to function-parameter locals).
-    fn block_param_locals_of(&self, block: BlockId) -> &[u32] {
+    /// Look up the per-param WASM-local lists for a block's params, in
+    /// declaration order. Empty if the block has no params (or is the
+    /// entry block, whose params bind to function-parameter locals).
+    fn block_param_locals_of(&self, block: BlockId) -> &[ParamSlotLocals] {
         self.block_param_locals
             .get(&block)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Look up the struct layout for `struct_name`, computing and
+    /// caching it on first reference within this function body. The
+    /// returned [`StructLayout`] is cloned out of the cache so callers
+    /// can hand it around without borrowing `self` further (and so
+    /// subsequent `ctx.emit(...)` calls aren't blocked by an
+    /// outstanding immutable borrow).
+    fn cached_struct_layout(
+        &mut self,
+        ir_module: &phoenix_ir::module::IrModule,
+        struct_name: &str,
+    ) -> Result<StructLayout, CompileError> {
+        if let Some(layout) = self.struct_layout_cache.get(struct_name) {
+            return Ok(layout.clone());
+        }
+        let layout = compute_struct_layout(ir_module, struct_name)?;
+        self.struct_layout_cache
+            .insert(struct_name.to_string(), layout.clone());
+        Ok(layout)
+    }
+
+    /// Same caching pattern as [`Self::cached_struct_layout`] for enums.
+    fn cached_enum_layout(
+        &mut self,
+        ir_module: &phoenix_ir::module::IrModule,
+        enum_name: &str,
+    ) -> Result<EnumLayout, CompileError> {
+        if let Some(layout) = self.enum_layout_cache.get(enum_name) {
+            return Ok(layout.clone());
+        }
+        let layout = compute_enum_layout(ir_module, enum_name)?;
+        self.enum_layout_cache
+            .insert(enum_name.to_string(), layout.clone());
+        Ok(layout)
     }
 
     /// Allocate a fresh single-slot WASM local of `wasm_ty` for the
@@ -698,11 +900,12 @@ impl FuncTranslateCtx {
 fn translate_block(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
     block: &BasicBlock,
     dispatcher: Option<DispatcherContext>,
 ) -> Result<(), CompileError> {
     for instr in &block.instructions {
-        translate_instruction(ctx, b, instr)?;
+        translate_instruction(ctx, b, ir_module, instr)?;
     }
     translate_terminator(ctx, b, &block.terminator, dispatcher)?;
     Ok(())
@@ -730,6 +933,7 @@ fn expect_result(
 fn translate_instruction(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
     instr: &phoenix_ir::instruction::Instruction,
 ) -> Result<(), CompileError> {
     match &instr.op {
@@ -743,6 +947,21 @@ fn translate_instruction(
             let vid = expect_result(instr, "Op::ConstBool")?;
             ctx.emit(Instruction::I32Const(if *v { 1 } else { 0 }));
             let local = ctx.allocate_local(vid, ValType::I32, IrType::Bool);
+            ctx.emit(Instruction::LocalSet(local));
+        }
+        Op::ConstF64(n) => {
+            let vid = expect_result(instr, "Op::ConstF64")?;
+            // `wasm_encoder::Instruction::F64Const` takes an `Ieee64`
+            // wrapper rather than a raw `f64` so a bit-pattern can be
+            // emitted without round-tripping through any NaN-
+            // canonicalizing float op. `Ieee64`'s `From<f64>` impl
+            // (wasm-encoder ≥0.244) reinterprets the bytes verbatim —
+            // `u64::from_le_bytes(value.to_le_bytes())` — so the exact
+            // source bits (sign / exponent / mantissa, including
+            // signaling NaNs and the sign bit on `-0.0`) reach the
+            // emitter unchanged.
+            ctx.emit(Instruction::F64Const(wasm_encoder::Ieee64::from(*n)));
+            let local = ctx.allocate_local(vid, ValType::F64, IrType::F64);
             ctx.emit(Instruction::LocalSet(local));
         }
         Op::ConstString(s) => {
@@ -951,6 +1170,296 @@ fn translate_instruction(
             emit_sret_string_call(ctx, b, runtime_idx, &[*lhs, *rhs], vid)?;
         }
 
+        // --- Struct alloc + field access --------------------------------
+        //
+        // User struct values lower to GC-heap allocations via
+        // `phx_gc_alloc(size, TypeTag::Struct)` followed by per-field
+        // initialization. Field offsets come from
+        // [`compute_struct_layout`] (which walks `IrModule::struct_layouts`);
+        // codegen emits direct `iN.load` / `iN.store` at those offsets,
+        // matching the field-storage size + alignment from
+        // [`phx_field_size_bytes`] / [`phx_field_align_bytes`].
+        //
+        // The result `vid` is bound to a single i32 (the heap pointer).
+        // No shadow-stack rooting yet — same latent caveat as
+        // `Op::StringConcat`; closing the gap waits on the shadow-stack
+        // root-emission pass.
+        Op::StructAlloc(name, field_values) => {
+            let vid = expect_result(instr, "Op::StructAlloc")?;
+            let layout = ctx.cached_struct_layout(ir_module, name)?;
+            if layout.field_types.len() != field_values.len() {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::StructAlloc({name})` was given {} field \
+                     values but the struct declares {} fields (internal compiler \
+                     bug — IR verifier should have caught this)",
+                    field_values.len(),
+                    layout.field_types.len(),
+                )));
+            }
+            let gc_alloc_idx = b.require_phx_func("phx_gc_alloc")?;
+            // phx_gc_alloc(size: i32, tag: i32) -> i32
+            ctx.emit(Instruction::I32Const(layout.total_size as i32));
+            ctx.emit(Instruction::I32Const(TypeTag::Struct as i32));
+            ctx.emit(Instruction::Call(gc_alloc_idx));
+            // Bind the result vid to a single i32 local holding the
+            // struct pointer. Use the sema-annotated `instr.result_type`
+            // (which carries the concrete monomorphized type-args) so
+            // the binding round-trips the IR's annotated type rather
+            // than collapsing to `StructRef(name, [])`.
+            let result_locals = ctx.allocate_locals_for_ir_type(vid, instr.result_type.clone())?;
+            assert_eq!(result_locals.len(), 1, "StructRef is single-slot");
+            let struct_ptr_local = result_locals[0];
+            ctx.emit(Instruction::LocalSet(struct_ptr_local));
+            // Store each field at its computed offset. Field-value
+            // locals come from each `field_value` binding (which may
+            // be multi-slot for StringRef fields).
+            for (field_idx, &field_vid) in field_values.iter().enumerate() {
+                let offset = layout.field_offsets[field_idx];
+                let field_ty = layout.field_types[field_idx].clone();
+                let value_locals = ctx.binding_of(field_vid)?.locals.clone();
+                emit_field_store(ctx, struct_ptr_local, offset, &field_ty, &value_locals)?;
+            }
+        }
+        Op::StructGetField(struct_vid, field_idx) => {
+            let vid = expect_result(instr, "Op::StructGetField")?;
+            let struct_ir_ty = ctx.binding_of(*struct_vid)?.ir_type.clone();
+            let struct_name = match &struct_ir_ty {
+                IrType::StructRef(name, _) => name.clone(),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::StructGetField` receiver has IR \
+                         type `{other:?}` (expected `StructRef`); IR verifier \
+                         should have rejected this"
+                    )));
+                }
+            };
+            let layout = ctx.cached_struct_layout(ir_module, &struct_name)?;
+            let idx = *field_idx as usize;
+            if idx >= layout.field_offsets.len() {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::StructGetField({struct_name}, {field_idx})` \
+                     out of range (struct has {} fields)",
+                    layout.field_offsets.len(),
+                )));
+            }
+            let offset = layout.field_offsets[idx];
+            let field_ty = layout.field_types[idx].clone();
+            let struct_ptr_local = ctx.binding_of(*struct_vid)?.single_local();
+            emit_field_load(ctx, struct_ptr_local, offset, &field_ty)?;
+            ctx.emit_store_result(vid, field_ty)?;
+        }
+        Op::StructSetField(struct_vid, field_idx, value_vid) => {
+            let struct_ir_ty = ctx.binding_of(*struct_vid)?.ir_type.clone();
+            let struct_name = match &struct_ir_ty {
+                IrType::StructRef(name, _) => name.clone(),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::StructSetField` receiver has IR \
+                         type `{other:?}` (expected `StructRef`)"
+                    )));
+                }
+            };
+            let layout = ctx.cached_struct_layout(ir_module, &struct_name)?;
+            let idx = *field_idx as usize;
+            if idx >= layout.field_offsets.len() {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::StructSetField({struct_name}, {field_idx})` \
+                     out of range (struct has {} fields)",
+                    layout.field_offsets.len(),
+                )));
+            }
+            let offset = layout.field_offsets[idx];
+            let field_ty = layout.field_types[idx].clone();
+            let struct_ptr_local = ctx.binding_of(*struct_vid)?.single_local();
+            let value_locals = ctx.binding_of(*value_vid)?.locals.clone();
+            emit_field_store(ctx, struct_ptr_local, offset, &field_ty, &value_locals)?;
+        }
+
+        // --- Enum alloc + variant access --------------------------------
+        //
+        // `EnumAlloc(name, variant_idx, field_values)`: 4-byte
+        // discriminant at offset 0, payload laid out from the value
+        // vids' actual types at offsets from `compute_variant_field_offsets`.
+        // `EnumDiscriminant(v)` reads the i32 at offset 0; `EnumGetField`
+        // reconstructs the per-site layout (see heap_layout.rs::EnumLayout
+        // for the per-site / declared-vs-value-types rationale).
+        Op::EnumAlloc(name, variant_idx, field_values) => {
+            let vid = expect_result(instr, "Op::EnumAlloc")?;
+            let declared_layout = ctx.cached_enum_layout(ir_module, name)?;
+            let v_idx = *variant_idx as usize;
+            if v_idx >= declared_layout.variant_field_types.len() {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
+                     references variant index out of range (enum has {} variants)",
+                    declared_layout.variant_field_types.len(),
+                )));
+            }
+            let declared_field_count = declared_layout.variant_field_types[v_idx].len();
+            if declared_field_count != field_values.len() {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
+                     was given {} field values but the variant declares {} fields",
+                    field_values.len(),
+                    declared_field_count,
+                )));
+            }
+            // Reject multi-field variants with any placeholder-typed
+            // declared field — alloc/get offset walks can disagree
+            // otherwise (see heap_layout.rs::EnumLayout). Only fully-
+            // concrete variants or single-field placeholder variants
+            // (`Option<T>::Some(T)`, `Result<T,_>::Ok(T)`) are layout-
+            // stable.
+            let declared_placeholder_count = declared_layout.variant_field_types[v_idx]
+                .iter()
+                .filter(|ty| ty.is_generic_placeholder())
+                .count();
+            if declared_placeholder_count > 0 && declared_field_count > 1 {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
+                     targets a multi-field variant ({declared_field_count} fields) with \
+                     {declared_placeholder_count} placeholder-typed declared field(s); the \
+                     alloc-side layout (from value-vid types) and the later \
+                     `Op::EnumGetField` layout (from declared types) can disagree on \
+                     other-position offsets when any field is a placeholder. Only \
+                     single-field placeholder variants (e.g. `Option<T>`) are supported \
+                     by the current enum layout."
+                )));
+            }
+            // Walk value vids' actual types — placeholder declared
+            // fields are tolerated here because the layout follows the
+            // values' types. The rejection above caps the shapes to
+            // (a) single-field placeholder variants and (b) fully-
+            // concrete variants — both layout-stable across alloc/get.
+            let value_types: Vec<IrType> = field_values
+                .iter()
+                .map(|fvid| ctx.binding_of(*fvid).map(|b| b.ir_type.clone()))
+                .collect::<Result<_, _>>()?;
+            // Defense in depth: a sema regression leaving a placeholder
+            // here would silently size as a 4-byte i32 (see
+            // `reject_placeholder_field_type`).
+            for (i, ty) in value_types.iter().enumerate() {
+                reject_placeholder_field_type(
+                    ty,
+                    &format!(
+                        "`Op::EnumAlloc({name}, variant={variant_idx})` value at position {i}"
+                    ),
+                )?;
+            }
+            let variant = compute_variant_field_offsets(&value_types)?;
+            // Pad to the variant's max field alignment (folded with the
+            // 4-byte discriminant alignment) so an array of this enum
+            // would keep each element naturally aligned. Mirror of
+            // `compute_struct_layout`'s tail-padding policy.
+            let total_size = align_up(variant.payload_end, variant.max_align);
+            let gc_alloc_idx = b.require_phx_func("phx_gc_alloc")?;
+            ctx.emit(Instruction::I32Const(total_size as i32));
+            ctx.emit(Instruction::I32Const(TypeTag::Enum as i32));
+            ctx.emit(Instruction::Call(gc_alloc_idx));
+            // Carry through the sema-annotated type-args via
+            // `instr.result_type` so the binding matches the rest of
+            // the IR's annotated types.
+            let result_locals = ctx.allocate_locals_for_ir_type(vid, instr.result_type.clone())?;
+            assert_eq!(result_locals.len(), 1, "EnumRef is single-slot");
+            let enum_ptr_local = result_locals[0];
+            ctx.emit(Instruction::LocalSet(enum_ptr_local));
+            // Store discriminant at offset 0.
+            ctx.emit(Instruction::LocalGet(enum_ptr_local));
+            ctx.emit(Instruction::I32Const(*variant_idx as i32));
+            ctx.emit(Instruction::I32Store(i32_memarg(0)));
+            // Store each payload field using the value's actual type
+            // (so multi-slot StringRef stores both ptr and len even
+            // when the IR's declared field type is the placeholder).
+            for (field_idx, &field_vid) in field_values.iter().enumerate() {
+                let offset = variant.field_offsets[field_idx];
+                let field_ty = value_types[field_idx].clone();
+                let value_locals = ctx.binding_of(field_vid)?.locals.clone();
+                emit_field_store(ctx, enum_ptr_local, offset, &field_ty, &value_locals)?;
+            }
+        }
+        Op::EnumDiscriminant(enum_vid) => {
+            let vid = expect_result(instr, "Op::EnumDiscriminant")?;
+            let enum_ptr_local = ctx.binding_of(*enum_vid)?.single_local();
+            // Discriminant is an i32 at offset 0; promote to i64 to
+            // match the IR's "discriminant comparisons use i64
+            // constants" convention (lowering emits `IEq v_discrim,
+            // ConstI64(N)` for match-arm dispatch).
+            ctx.emit(Instruction::LocalGet(enum_ptr_local));
+            ctx.emit(Instruction::I32Load(i32_memarg(0)));
+            ctx.emit(Instruction::I64ExtendI32U);
+            let result_local = ctx.allocate_local(vid, ValType::I64, IrType::I64);
+            ctx.emit(Instruction::LocalSet(result_local));
+        }
+        Op::EnumGetField(enum_vid, variant_idx, field_idx) => {
+            let vid = expect_result(instr, "Op::EnumGetField")?;
+            let enum_ir_ty = ctx.binding_of(*enum_vid)?.ir_type.clone();
+            let enum_name = match &enum_ir_ty {
+                IrType::EnumRef(name, _) => name.clone(),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::EnumGetField` receiver has IR type \
+                         `{other:?}` (expected `EnumRef`)"
+                    )));
+                }
+            };
+            // Resolve field_idx's offset by walking the variant's
+            // *declared* fields with their concrete types — preferring
+            // sema-annotated `instr.result_type` for the requested
+            // field over the IR's placeholder. The walk reconstructs
+            // the same offsets `Op::EnumAlloc` used per-site
+            // (single-field-variant case is trivially offset=4;
+            // multi-field placeholder variants are explicitly
+            // rejected below to keep alloc/get in lockstep).
+            let declared_layout = ctx.cached_enum_layout(ir_module, &enum_name)?;
+            let v_idx = *variant_idx as usize;
+            let f_idx = *field_idx as usize;
+            if v_idx >= declared_layout.variant_field_types.len()
+                || f_idx >= declared_layout.variant_field_types[v_idx].len()
+            {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::EnumGetField({enum_name}, variant={variant_idx}, \
+                     field={field_idx})` out of range"
+                )));
+            }
+            let declared_field_types = &declared_layout.variant_field_types[v_idx];
+            // Build the variant's per-site field-type list by
+            // substituting `instr.result_type` for the requested field
+            // (the only one we have an accurate type for from sema);
+            // other fields are taken from declared_field_types.
+            // Placeholder fields in OTHER positions are an error —
+            // we can't compute correct offsets without knowing their
+            // sizes. `Op::EnumAlloc` rejects multi-field variants with
+            // any placeholder field, so reaching this guard would mean
+            // an IR that constructed a value through a different alloc
+            // path; keeping the guard here makes the failure local.
+            let mut field_types = declared_field_types.clone();
+            field_types[f_idx] = instr.result_type.clone();
+            // Mirror of the alloc-side check (see
+            // `reject_placeholder_field_type`).
+            reject_placeholder_field_type(
+                &field_types[f_idx],
+                &format!(
+                    "`Op::EnumGetField({enum_name}, variant={variant_idx}, field={field_idx})` result type"
+                ),
+            )?;
+            for (i, ty) in field_types.iter().enumerate() {
+                if i != f_idx && ty.is_generic_placeholder() {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::EnumGetField({enum_name}, variant={variant_idx}, \
+                         field={field_idx})` would need to compute offsets through \
+                         placeholder-typed field {i}; multi-field variants with \
+                         any placeholder field aren't supported by the current enum \
+                         layout"
+                    )));
+                }
+            }
+            let variant = compute_variant_field_offsets(&field_types)?;
+            let offset = variant.field_offsets[f_idx];
+            let field_ty = field_types[f_idx].clone();
+            let enum_ptr_local = ctx.binding_of(*enum_vid)?.single_local();
+            emit_field_load(ctx, enum_ptr_local, offset, &field_ty)?;
+            ctx.emit_store_result(vid, field_ty)?;
+        }
+
         other => {
             return Err(CompileError::new(format!(
                 "wasm32-linear: IR op `{other:?}` not yet supported \
@@ -1057,18 +1566,10 @@ fn emit_sret_string_call(
 
     // Load PhxFatPtr { ptr at offset 0, len at offset 4 }.
     ctx.emit(Instruction::LocalGet(sret_ptr_local));
-    ctx.emit(Instruction::I32Load(wasm_encoder::MemArg {
-        offset: 0,
-        align: 2,
-        memory_index: 0,
-    }));
+    ctx.emit(Instruction::I32Load(i32_memarg(0)));
     ctx.emit(Instruction::LocalSet(result_ptr_local));
     ctx.emit(Instruction::LocalGet(sret_ptr_local));
-    ctx.emit(Instruction::I32Load(wasm_encoder::MemArg {
-        offset: 4,
-        align: 2,
-        memory_index: 0,
-    }));
+    ctx.emit(Instruction::I32Load(i32_memarg(4)));
     ctx.emit(Instruction::LocalSet(result_len_local));
 
     // Restore SP from the saved copy (robust against any callee SP
@@ -1430,22 +1931,44 @@ fn emit_block_param_copies(
     target: BlockId,
     args: &[ValueId],
 ) -> Result<(), CompileError> {
-    let param_locals = ctx.block_param_locals_of(target).to_vec();
-    if param_locals.len() != args.len() {
+    let param_slot_lists: Vec<ParamSlotLocals> = ctx.block_param_locals_of(target).to_vec();
+    if param_slot_lists.len() != args.len() {
         return Err(CompileError::new(format!(
             "wasm32-linear: jump to {target:?} has {} args but the target \
              has {} params (internal compiler bug — IR verifier should have \
              caught this)",
             args.len(),
-            param_locals.len(),
+            param_slot_lists.len(),
         )));
     }
-    for arg in args {
-        let src_local = ctx.binding_of(*arg)?.single_local();
-        ctx.emit(Instruction::LocalGet(src_local));
+    // Push every slot of every arg in declaration order so the
+    // operand stack ends up `[arg0_slot0, ..., arg0_slotN, arg1_slot0,
+    // ...]`. Each arg's slot count matches the corresponding target
+    // param's slot count (the IR verifier rejects type mismatches
+    // upstream); a multi-slot arg expands to multiple `local.get`s.
+    for (arg, param_slots) in args.iter().zip(param_slot_lists.iter()) {
+        let arg_locals = ctx.binding_of(*arg)?.locals.clone();
+        if arg_locals.len() != param_slots.len() {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: jump to {target:?} arg/param slot-count mismatch \
+                 ({} vs {}) — internal compiler bug",
+                arg_locals.len(),
+                param_slots.len(),
+            )));
+        }
+        for src_local in &arg_locals {
+            ctx.emit(Instruction::LocalGet(*src_local));
+        }
     }
-    for dest_local in param_locals.iter().rev() {
-        ctx.emit(Instruction::LocalSet(*dest_local));
+    // Pop into the target params' slot locals. WASM pops top-of-
+    // stack first, so iterate in *reverse* — both across params (last
+    // param popped first) and within each param's slots (last slot
+    // popped first). The double-reverse below collapses to a flat
+    // reverse iteration over (param, slot) pairs.
+    for param_slots in param_slot_lists.iter().rev() {
+        for dest_local in param_slots.iter().rev() {
+            ctx.emit(Instruction::LocalSet(*dest_local));
+        }
     }
     Ok(())
 }

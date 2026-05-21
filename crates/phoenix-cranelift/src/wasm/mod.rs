@@ -76,6 +76,7 @@ use phoenix_ir::module::IrModule;
 
 use crate::error::CompileError;
 
+mod heap_layout;
 mod module_builder;
 mod runtime_discovery;
 mod runtime_merge;

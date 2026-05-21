@@ -1124,6 +1124,222 @@ fn chained_string_concat_runs_under_wasmtime() {
     });
 }
 
+/// `defaults.phx` end-to-end gate for struct alloc + field access
+/// (Counter struct) + StringConcat in a while loop + method dispatch
+/// via `Op::Call(method_func_id)`. Combines every piece of the
+/// surface in one fixture — a regression in `Op::StructAlloc` /
+/// `StructGetField` / multi-slot Alloca / String concat would surface
+/// here as either a wasmtime trap or a stdout mismatch.
+const DEFAULTS_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/defaults.phx"
+));
+
+#[test]
+fn defaults_runs_under_wasmtime() {
+    assert_wasm_matches_interp(DEFAULTS_SOURCE, "defaults");
+}
+
+/// `features.phx` end-to-end gate for enum alloc + discriminant +
+/// variant-field access (Shape) + struct alloc with method dispatch
+/// (Point) + match (lowered to chained Branch terminators) + Float
+/// constants and storage. Exercises the concrete-typed enum-variant
+/// path (Shape's Circle(Float) and Rect(Float, Float) have no
+/// placeholders) so the layout-shared-across-variants invariant is
+/// pinned.
+const FEATURES_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/features.phx"
+));
+
+#[test]
+fn features_runs_under_wasmtime() {
+    assert_wasm_matches_interp(FEATURES_SOURCE, "features");
+}
+
+/// Focused gate for the multi-slot `StringRef` field path inside
+/// `Op::StructAlloc` / `Op::StructGetField`. `defaults.phx` and
+/// `features.phx` exercise struct-with-Int-field codegen, but neither
+/// constructs a struct whose declared field type is `String`. A
+/// regression in `emit_field_store`'s two-`i32.store` `StringRef` arm
+/// (or in `emit_field_load`'s symmetric two-`i32.load` arm) would
+/// store/read only the `ptr` half of the fat pointer and miscompile
+/// silently — this test pins both halves by routing a literal through
+/// alloc, then read-back, then `print(String)`.
+#[test]
+fn struct_with_string_field_roundtrips() {
+    // `print(p.name)` exercises field-load → multi-slot result binding
+    // → `phx_print_str(ptr, len)`. `print(p.value)` rules out a
+    // field-order miscompile by pinning the Int field after the String
+    // — a swapped offset/size would surface as a wrong integer.
+    let src = "struct Pair {\n  String name\n  Int value\n}\n\
+               function main() {\n  \
+                 let p = Pair(\"hello\", 42)\n  \
+                 print(p.name)\n  \
+                 print(p.value)\n\
+               }\n";
+    assert_wasm_matches_interp(src, "struct_with_string_field");
+}
+
+/// Focused gate for `Op::StructSetField`. Phoenix source today
+/// reaches `StructAlloc` + `StructGetField` from `defaults.phx` /
+/// `features.phx` / `struct_with_string_field_roundtrips`, but no
+/// existing fixture emits `Op::StructSetField` directly — so a
+/// regression in `emit_field_store`'s non-StringRef arm at a
+/// non-initial offset would only surface once a future fixture
+/// landed. Hand-build the op shape to pin the path now.
+#[test]
+fn struct_set_field_compiles_and_validates() {
+    // Build `struct Pair { Int a; Int b }` and a `main` that
+    // allocates a Pair, overwrites field 0, then reads it back so
+    // both store and load are wired through StructSetField/GetField.
+    let mut module = IrModule::new();
+    module.struct_layouts.insert(
+        "Pair".to_string(),
+        vec![
+            ("a".to_string(), IrType::I64),
+            ("b".to_string(), IrType::I64),
+        ],
+    );
+
+    let mut f = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = f.create_block();
+    let v_a = f.emit_value(entry, Op::ConstI64(1), IrType::I64, None);
+    let v_b = f.emit_value(entry, Op::ConstI64(2), IrType::I64, None);
+    let pair = f.emit_value(
+        entry,
+        Op::StructAlloc("Pair".to_string(), vec![v_a, v_b]),
+        IrType::StructRef("Pair".to_string(), Vec::new()),
+        None,
+    );
+    let v_new = f.emit_value(entry, Op::ConstI64(99), IrType::I64, None);
+    // The op under test: overwrite field 0.
+    f.emit(
+        entry,
+        Op::StructSetField(pair, 0, v_new),
+        IrType::Void,
+        None,
+    );
+    // Read it back so the store isn't dead-code-eliminated by any
+    // future pass.
+    let _ = f.emit_value(entry, Op::StructGetField(pair, 0), IrType::I64, None);
+    f.set_terminator(entry, Terminator::Return(None));
+    module.push_concrete(f);
+
+    compile_ir_or_skip(&module, "struct_set_field", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the StructSetField module: {e}"));
+    });
+}
+
+/// Focused gate for `Op::ConstF64` codegen: a Float literal must
+/// emit an `f64.const` instruction whose 8-byte LE bit pattern matches
+/// the source literal's `f64::to_le_bytes()`. Isolates the instruction
+/// from `features_runs_under_wasmtime` (which exercises F64 via enum
+/// payloads + match lowering + StringConcat all at once) so a single-
+/// bit regression surfaces here unambiguously.
+#[test]
+fn f64_const_emits_f64_const_instruction() {
+    // `7.25` is exactly representable in f64 and far from any
+    // `f64::consts::*` (keeps `clippy::approx_constant` quiet).
+    let src = "function main() {\n  let _x: Float = 7.25\n  print(true)\n}\n";
+    compile_or_skip(src, "f64_const", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module: {e}"));
+        let wat =
+            wasmprinter::print_bytes(bytes).unwrap_or_else(|e| panic!("wasmprinter failed: {e}"));
+        assert!(
+            wat.contains("f64.const"),
+            "emitted WAT must contain at least one `f64.const` for the \
+             Float literal, but none was found.\n\
+             (first 4 KiB of WAT shown for diagnostic:)\n{}",
+            wat_excerpt(&wat),
+        );
+        // WASM encodes `f64.const` as opcode `0x44` followed by the
+        // 8 little-endian bytes of the IEEE-754 pattern. Scanning the
+        // raw bytes (rather than re-parsing) pins the actual literal
+        // that landed and isn't tied to `wasmprinter`'s hex-float
+        // rendering.
+        let pattern = 7.25_f64.to_le_bytes();
+        assert!(
+            bytes.windows(pattern.len()).any(|w| w == pattern),
+            "emitted module must contain `7.25_f64`'s little-endian \
+             bit pattern ({pattern:02x?}) in its byte stream; a \
+             regression that fed the wrong value through `Ieee64::from` \
+             would surface here.",
+        );
+    });
+}
+
+/// Sister check to [`f64_const_emits_f64_const_instruction`] that pins
+/// the *sign bit*: `-0.0` and `0.0` differ only in bit 63, so a
+/// regression that canonicalized the input through an arithmetic or
+/// `if n == 0.0 { 0.0 }` short-circuit would silently flip `-0.0` to
+/// `+0.0`. Verifying the negative-zero bit pattern lands in the
+/// emitted bytes is the cheapest way to catch that.
+///
+/// Also re-checks a non-zero negative literal (`-3.5`) to pin the
+/// general sign-bit-bearing path: a regression that masked the high
+/// bit on every f64 emission would still leak past the `-0.0` check
+/// alone, since `0.0` and `-0.0` share every bit but bit 63.
+#[test]
+fn f64_const_preserves_negative_zero_and_sign() {
+    // Phoenix's parser accepts negative float literals via unary
+    // negation, so `-0.0` lowers to `FNeg(ConstF64(0.0))` rather than
+    // a direct `ConstF64(-0.0)` in some lowerings. Skip that pre-arg
+    // by constructing IR by hand: `Op::ConstF64(-0.0)` and
+    // `Op::ConstF64(-3.5)` route straight into the F64Const arm we're
+    // here to verify.
+    let mut module = IrModule::new();
+    let mut f = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = f.create_block();
+    let _ = f.emit_value(entry, Op::ConstF64(-0.0), IrType::F64, None);
+    let _ = f.emit_value(entry, Op::ConstF64(-3.5), IrType::F64, None);
+    f.set_terminator(entry, Terminator::Return(None));
+    module.push_concrete(f);
+
+    compile_ir_or_skip(&module, "f64_const_neg_zero", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module: {e}"));
+        let neg_zero = (-0.0_f64).to_le_bytes();
+        let pos_zero = 0.0_f64.to_le_bytes();
+        assert_ne!(
+            neg_zero, pos_zero,
+            "test premise broken: `-0.0` and `+0.0` should differ in their \
+             little-endian byte patterns (sign bit)"
+        );
+        assert!(
+            bytes.windows(neg_zero.len()).any(|w| w == neg_zero),
+            "emitted module must contain `-0.0_f64`'s little-endian bit \
+             pattern ({neg_zero:02x?}); a regression that canonicalized \
+             the value to `+0.0` (or stripped the sign bit) would surface \
+             here. (`+0.0` pattern for contrast: {pos_zero:02x?})"
+        );
+        let neg_three_five = (-3.5_f64).to_le_bytes();
+        assert!(
+            bytes
+                .windows(neg_three_five.len())
+                .any(|w| w == neg_three_five),
+            "emitted module must contain `-3.5_f64`'s little-endian bit \
+             pattern ({neg_three_five:02x?})"
+        );
+    });
+}
+
 /// Negative integer: `-123` lowers to `INeg(ConstI64(123))`. PR 3b
 /// adds `Op::INeg` (emitted as `0 - x` because WASM MVP has no
 /// `i64.neg`), so this fixture now reaches `phx_print_i64`'s
@@ -1488,27 +1704,70 @@ fn rejects_unsupported_ir_op() {
     );
 }
 
+/// Shared "compile from source and expect Ok" helper used by the
+/// signature-acceptance tests. Treats `RuntimeWasmNotFound` the same
+/// way `compile_or_skip` does (skip with a warning) and panics with
+/// `failure_msg` on any other error.
+fn compile_src_or_assert_ok(src: &str, label: &str, failure_msg: &str) {
+    let ir_module = lower_to_ir(src);
+    match phoenix_cranelift::compile(&ir_module, Target::Wasm32Linear) {
+        Ok(_) => {}
+        Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => {
+            eprintln!("warning: skipping {label} — phoenix_runtime.wasm not built");
+        }
+        Err(e) => panic!("{failure_msg} — got: {e}"),
+    }
+}
+
 #[test]
-fn rejects_unrepresentable_param_type() {
-    // A `List<Int>` parameter has no WASM value representation in
-    // PR 3b — collection types land in PR 3c with shadow-stack root
-    // emission and the `phx_list_alloc`-based ABI. The fixture keeps
-    // `main` minimal and never calls `sink`, so the only path that
-    // can fire is the param-rejection one: a previous shape that
-    // called `sink([1,2,3])` would fail at `Op::ListAlloc` /
-    // `Op::Call` before hitting the param check, masking regressions
-    // in the param-rejection path we want to lock down.
+fn accepts_ref_typed_param_signature() {
+    // `wasm_valtypes_for` flattens every GC-pointer reference type
+    // (`StructRef` / `EnumRef` / `ListRef` / `MapRef` / `ClosureRef`)
+    // to a single i32 slot, so function signatures with these types
+    // in param position declare cleanly even when the body translator
+    // hasn't landed support for the matching *alloc / method* ops
+    // yet. This positive test pins the signature-level acceptance —
+    // a regression that tightened the gate back to "single-slot
+    // primitives only" would surface here before manifesting as a
+    // confusing signature-level error on collection fixtures whose
+    // op support lands later.
+    //
+    // `main` doesn't call `sink`, so the only path exercised is the
+    // signature declaration. Bodies that try to *use* the ref-typed
+    // value end up at op-level rejections covered by
+    // `rejects_unrepresentable_return_type` below.
     let src = "function main() {}\n\
                function sink(xs: List<Int>) {\n  print(true)\n}\n";
-    let err = expect_wasm_compile_error(src);
-    // Pin both the type (so a regression that swapped `ListRef` for
-    // a different fallthrough type would surface) and the path
-    // (`value representation` only comes from `wasm_valtypes_for`'s
-    // `unsupported(...)`, ruling out an op-side rejection that
-    // happened to mention `not yet supported` for unrelated reasons).
-    assert!(
-        err.contains("IR type `ListRef") && err.contains("value representation"),
-        "expected `IR type \\`ListRef ...\\` ... value representation` error, got: {err}"
+    compile_src_or_assert_ok(
+        src,
+        "accepts_ref_typed_param_signature",
+        "wasm32-linear must accept `List<Int>` in param position \
+         (ref-type flattening produces a single i32 GC pointer)",
+    );
+}
+
+/// Mirror of [`accepts_ref_typed_param_signature`] for *return*
+/// position. `wasm_valtypes_for` should accept `StructRef` as a
+/// declared return type and flatten it to a single i32 GC pointer
+/// — even when the function body itself never reaches codegen
+/// (here `main` doesn't call `make`, so the only path exercised is
+/// the signature declaration). Without this test, a regression that
+/// re-tightened the gate on return-position ref types would only
+/// surface once a struct-returning function got called.
+#[test]
+fn accepts_ref_typed_return_signature() {
+    // Phoenix structs declare fields type-first (`Int value`) and
+    // construct positionally (`Box(1)`). `main` doesn't call `make`,
+    // so only the signature is exercised — the body still lowers,
+    // but its `Op::StructAlloc` is a supported op so codegen succeeds.
+    let src = "struct Box {\n  Int value\n}\n\
+               function main() {}\n\
+               function make() -> Box {\n  return Box(1)\n}\n";
+    compile_src_or_assert_ok(
+        src,
+        "accepts_ref_typed_return_signature",
+        "wasm32-linear must accept `StructRef` in return position \
+         (single-i32 GC pointer flattening)",
     );
 }
 
@@ -1528,30 +1787,6 @@ fn rejects_main_with_params() {
 }
 
 #[test]
-fn rejects_unrepresentable_return_type() {
-    // `function returns_list() -> List<Int> { ... }` lowers to an IR
-    // function whose `return_type` is `IrType::ListRef`, which has no
-    // PR 3b WASM value representation. Pinning this branch separately
-    // from the param-side rejection in
-    // `rejects_unrepresentable_param_type` covers both halves of
-    // `wasm_valtypes_for`'s value-representation gate; without this,
-    // a regression on the return path would only surface once a
-    // list-returning function was actually called from `main`.
-    let src = "function main() {}\n\
-               function returns_list() -> List<Int> {\n  return [1, 2, 3]\n}\n";
-    let err = expect_wasm_compile_error(src);
-    // Same shape as `rejects_unrepresentable_param_type`'s tightened
-    // assertion: pin `ListRef` and the `value representation` path so
-    // a future regression that moved the rejection elsewhere (e.g.
-    // an op-side check firing first) doesn't pass silently.
-    assert!(
-        err.contains("IR type `ListRef") && err.contains("value representation"),
-        "expected `IR type \\`ListRef ...\\` ... value representation` error \
-         on return-position list, got: {err}"
-    );
-}
-
-#[test]
 fn rejects_main_with_return_value() {
     // Same shape as `rejects_main_with_params`, but for the
     // return-type side of the `main`/`_start` contract.
@@ -1561,4 +1796,256 @@ fn rejects_main_with_return_value() {
         err.contains("`main` must return void"),
         "expected main-with-return diagnostic, got: {err}"
     );
+}
+
+#[test]
+fn rejects_unrepresentable_return_type() {
+    // `wasm_valtypes_for` flattens `List<Int>` as a return type
+    // (single i32 GC pointer), so the *signature* declares fine.
+    // The body's `return [1, 2, 3]` lowers to `Op::ListAlloc`, which
+    // the body translator doesn't support — the rejection now happens
+    // at the op-translator level rather than at the signature-
+    // flattening level. Pin the op name so a regression that handled
+    // ListAlloc by accident would surface here.
+    let src = "function main() {}\n\
+               function returns_list() -> List<Int> {\n  return [1, 2, 3]\n}\n";
+    let err = expect_wasm_compile_error(src);
+    assert!(
+        err.contains("ListAlloc") && err.contains("not yet supported"),
+        "expected `ListAlloc ... not yet supported` op-level error \
+         on return-position list, got: {err}"
+    );
+}
+
+/// Hand-build an IR module whose `main` constructs an enum value
+/// for a variant whose declared field list contains
+/// `placeholder_positions`-many `GENERIC_PLACEHOLDER` entries. The
+/// total variant arity is `field_types.len()`; positions whose
+/// declared type should be concrete are taken from `field_types`,
+/// positions named in `placeholder_positions` are overwritten with a
+/// placeholder. The constructed alloc uses `value_types` for the
+/// *value vids' actual types* (so we can exercise the alloc/get
+/// layout-mismatch case where declared and actual types diverge).
+///
+/// Phoenix's source surface never produces multi-field variants with
+/// placeholder fields — stdlib generics only attach one placeholder per
+/// variant, and user enums monomorphize their type parameters out before
+/// codegen. Hand-building keeps the rejection paths testable without
+/// inventing a contrived source-level fixture.
+fn build_placeholder_enum_ir(
+    enum_name: &str,
+    declared_field_types: Vec<IrType>,
+    placeholder_positions: &[usize],
+    value_types: &[IrType],
+) -> IrModule {
+    use phoenix_ir::types::GENERIC_PLACEHOLDER;
+
+    let mut declared = declared_field_types;
+    let placeholder = IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new());
+    for &pos in placeholder_positions {
+        declared[pos] = placeholder.clone();
+    }
+
+    let mut module = IrModule::new();
+    module
+        .enum_layouts
+        .insert(enum_name.to_string(), vec![("V".to_string(), declared)]);
+
+    let mut f = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = f.create_block();
+    // Emit a constant for each value position with the requested
+    // actual type. We only need the binding's `ir_type` to be right
+    // for the alloc-side layout walk; the runtime value can be a
+    // trivial constant of the matching type.
+    let value_vids: Vec<_> = value_types
+        .iter()
+        .map(|ty| {
+            let op = match ty {
+                IrType::I64 => Op::ConstI64(0),
+                IrType::F64 => Op::ConstF64(0.0),
+                IrType::Bool => Op::ConstBool(false),
+                other => panic!(
+                    "build_placeholder_enum_ir: unsupported value type {other:?} \
+                     (extend the helper if a new actual-type case is needed)"
+                ),
+            };
+            f.emit_value(entry, op, ty.clone(), None)
+        })
+        .collect();
+    f.emit(
+        entry,
+        Op::EnumAlloc(enum_name.to_string(), 0, value_vids),
+        IrType::EnumRef(enum_name.to_string(), Vec::new()),
+        None,
+    );
+    f.set_terminator(entry, Terminator::Return(None));
+    module.push_concrete(f);
+    module
+}
+
+/// Run the compile pipeline against a hand-built IR module and assert
+/// the resulting diagnostic mentions `EnumAlloc`, `placeholder`, and
+/// the enum name. Used by both the all-placeholder and the mixed
+/// placeholder/concrete rejection tests so the assertion wording
+/// stays consistent across them.
+fn assert_enum_alloc_placeholder_rejection(ir_module: &IrModule, enum_name: &str) {
+    match phoenix_cranelift::compile(ir_module, Target::Wasm32Linear) {
+        Ok(_) => panic!(
+            "wasm32-linear must reject `EnumAlloc` into a multi-field variant \
+             with any placeholder-typed declared field ({enum_name})"
+        ),
+        Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => panic!(
+            "unexpected RuntimeWasmNotFound for {enum_name} — the placeholder \
+             check should fire during op translation, before the runtime merge. \
+             A regression that reordered the phases would surface here."
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("EnumAlloc") && msg.contains("placeholder") && msg.contains(enum_name),
+                "expected EnumAlloc/placeholder/{enum_name} in the diagnostic; got: {msg}"
+            );
+        }
+    }
+}
+
+/// Pins the up-front rejection added to `Op::EnumAlloc` for
+/// multi-field variants whose *declared* field list carries two or
+/// more placeholder types. Without it, the IR could construct values
+/// that no `Op::EnumGetField` could ever read back (every f_idx
+/// would hit at least one placeholder at i != f_idx during the
+/// offset-walk guard) — silent unreachable state.
+#[test]
+fn rejects_enum_alloc_with_multi_placeholder_variant() {
+    // `BoxedPair::Pair(__generic, __generic)` — both declared fields
+    // are placeholders. Value vids are concrete `Int`.
+    let ir_module = build_placeholder_enum_ir(
+        "BoxedPair",
+        vec![IrType::I64, IrType::I64],
+        &[0, 1],
+        &[IrType::I64, IrType::I64],
+    );
+    assert_enum_alloc_placeholder_rejection(&ir_module, "BoxedPair");
+}
+
+/// Pins the *tightened* rejection: a multi-field variant with a
+/// **single** placeholder field (and other concrete fields) must
+/// also be rejected, because the alloc-side layout (computed from the
+/// value vids' actual types) and the get-side layout (computed from
+/// the declared types with `result_type` substituted at the
+/// requested field) can disagree at other positions when the
+/// placeholder's actual type differs in size or alignment from any
+/// concrete field. The original 2025-Q1 rejection only caught the
+/// all-placeholder case; this test fixes that gap.
+///
+/// Concrete divergence: declared = `[placeholder, I64]`, alloc'd
+/// with values `[Bool, I64]`. Alloc lays out field 0 (Bool, align 4)
+/// at offset 4, field 1 (I64, align 8) at offset 8. A later
+/// `EnumGetField(field=0, result_type=Bool)` walks `[Bool, I64]` and
+/// reads from offset 4 — fine. But the IR can also construct that
+/// alloc and then **never** read field 0 back via `EnumGetField`
+/// — the value just sits in the heap, and the inconsistency
+/// surfaces only when a future PR removes the field 0 reject. Better
+/// to fail at construction.
+#[test]
+fn rejects_enum_alloc_with_mixed_placeholder_and_concrete_fields() {
+    // `MixedBag::V(__generic, I64)` — first field declared as a
+    // placeholder, second declared concrete. Value vids are
+    // `[Bool, I64]` (different size/align from any non-placeholder
+    // value the get side might substitute).
+    let ir_module = build_placeholder_enum_ir(
+        "MixedBag",
+        vec![IrType::Bool, IrType::I64], // gets overwritten at pos 0
+        &[0],
+        &[IrType::Bool, IrType::I64],
+    );
+    assert_enum_alloc_placeholder_rejection(&ir_module, "MixedBag");
+}
+
+/// Pins the defense-in-depth check added to `Op::EnumGetField` for a
+/// `GENERIC_PLACEHOLDER`-typed `instr.result_type`. Without the check,
+/// `is_gc_pointer_type` matches the placeholder sentinel (which is a
+/// `StructRef("__generic", [])`), `phx_field_size_bytes` returns 4, and
+/// `emit_field_load` emits a 4-byte `i32.load` — truncating an I64/F64
+/// payload or returning only the `ptr` half of a `StringRef`. Sema
+/// should annotate `instr.result_type` with a concrete type before
+/// codegen, but the guard makes a regression fail loud at the get site
+/// rather than miscompiling.
+#[test]
+fn rejects_enum_get_field_with_placeholder_result_type() {
+    use phoenix_ir::types::GENERIC_PLACEHOLDER;
+
+    // Build an enum with a single-field placeholder variant — that
+    // alloc shape is allowed (only multi-field placeholder variants
+    // are rejected at alloc time), so the rejection path we want
+    // to exercise here is purely on the get side.
+    let placeholder = IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new());
+    let mut module = IrModule::new();
+    module.enum_layouts.insert(
+        "OneSlot".to_string(),
+        vec![("V".to_string(), vec![placeholder.clone()])],
+    );
+
+    let mut f = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = f.create_block();
+
+    // Concrete-typed payload value (I64), so the alloc-side
+    // placeholder check passes — the value vid carries a concrete IR
+    // type even though the declared field type is the placeholder.
+    let payload_vid = f.emit_value(entry, Op::ConstI64(0), IrType::I64, None);
+    let enum_vid = f.emit_value(
+        entry,
+        Op::EnumAlloc("OneSlot".to_string(), 0, vec![payload_vid]),
+        IrType::EnumRef("OneSlot".to_string(), Vec::new()),
+        None,
+    );
+    // Hand-build the EnumGetField with `result_type = placeholder`
+    // (the sema-regression shape this guard catches). A correctly
+    // annotated IR would put `IrType::I64` here.
+    f.emit_value(
+        entry,
+        Op::EnumGetField(enum_vid, 0, 0),
+        placeholder.clone(),
+        None,
+    );
+    f.set_terminator(entry, Terminator::Return(None));
+    module.push_concrete(f);
+
+    match phoenix_cranelift::compile(&module, Target::Wasm32Linear) {
+        Ok(_) => panic!(
+            "wasm32-linear must reject `Op::EnumGetField` whose `instr.result_type` \
+             is the GENERIC_PLACEHOLDER sentinel — the silent-truncation path \
+             this guards against would miscompile"
+        ),
+        Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => {
+            eprintln!(
+                "warning: skipping rejects_enum_get_field_with_placeholder_result_type \
+                 — phoenix_runtime.wasm not built"
+            );
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("EnumGetField")
+                    && msg.contains("GENERIC_PLACEHOLDER")
+                    && msg.contains("result type"),
+                "expected EnumGetField/GENERIC_PLACEHOLDER/result type in the \
+                 diagnostic; got: {msg}"
+            );
+        }
+    }
 }
