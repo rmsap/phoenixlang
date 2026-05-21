@@ -240,6 +240,167 @@ fn call_targets_in_export(bytes: &[u8], export_name: &str) -> Result<Vec<u32>, S
     Ok(targets)
 }
 
+/// Single-pass walk of the wasm bytes collecting the bookkeeping
+/// every phx_main / shadow-stack assertion needs:
+/// * `import_func_count` so absolute function indices can be biased
+///   into code-section-local indices;
+/// * the code-section `FunctionBody`s;
+/// * the function index of the `_start` export (used to locate the
+///   user `main` function — see [`call_targets_in_phx_main`]).
+///
+/// Centralizing this in one helper means callers never have to re-parse
+/// the same bytes; each new structural assertion gets the lookups it
+/// needs from the returned bundle.
+struct WasmInspect<'a> {
+    import_func_count: u32,
+    bodies: Vec<wasmparser::FunctionBody<'a>>,
+    start_func_idx: Option<u32>,
+}
+
+fn inspect_wasm(bytes: &[u8]) -> Result<WasmInspect<'_>, String> {
+    use wasmparser::{Parser, Payload};
+
+    let mut import_func_count: u32 = 0;
+    let mut bodies: Vec<wasmparser::FunctionBody<'_>> = Vec::new();
+    let mut start_func_idx: Option<u32> = None;
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        match payload {
+            Payload::ImportSection(rdr) => {
+                for group in rdr {
+                    let group = group.map_err(|e| format!("import section: {e}"))?;
+                    match group {
+                        wasmparser::Imports::Single(_, imp) => {
+                            if matches!(imp.ty, wasmparser::TypeRef::Func(_)) {
+                                import_func_count += 1;
+                            }
+                        }
+                        wasmparser::Imports::Compact1 { items, .. } => {
+                            for item in items {
+                                let item = item.map_err(|e| format!("import items: {e}"))?;
+                                if matches!(item.ty, wasmparser::TypeRef::Func(_)) {
+                                    import_func_count += 1;
+                                }
+                            }
+                        }
+                        wasmparser::Imports::Compact2 { ty, names, .. } => {
+                            if matches!(ty, wasmparser::TypeRef::Func(_)) {
+                                for name in names {
+                                    name.map_err(|e| format!("import names: {e}"))?;
+                                    import_func_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Payload::ExportSection(rdr) => {
+                for export in rdr {
+                    let export = export.map_err(|e| format!("export section: {e}"))?;
+                    if export.name == "_start"
+                        && matches!(export.kind, wasmparser::ExternalKind::Func)
+                    {
+                        start_func_idx = Some(export.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => bodies.push(body),
+            _ => {}
+        }
+    }
+
+    Ok(WasmInspect {
+        import_func_count,
+        bodies,
+        start_func_idx,
+    })
+}
+
+/// Walk a single function body's instructions and return every
+/// `Call`-target function index in the order they appear. Used by
+/// per-function structural assertions (no parsing of the whole module
+/// is implied — that lives in [`inspect_wasm`]).
+fn call_targets_in_body(body: &wasmparser::FunctionBody<'_>) -> Result<Vec<u32>, String> {
+    use wasmparser::Operator;
+    let mut reader = body
+        .get_operators_reader()
+        .map_err(|e| format!("function-body operators: {e}"))?;
+    let mut targets = Vec::new();
+    while !reader.eof() {
+        if let Operator::Call { function_index } = reader
+            .read()
+            .map_err(|e| format!("function-body operator: {e}"))?
+        {
+            targets.push(function_index);
+        }
+    }
+    Ok(targets)
+}
+
+/// Return the list of `Call`-target indices in the body of the user
+/// `main` function (`phx_main`). The merged module doesn't re-export
+/// `phx_main` by name, but `_start` always calls it as the
+/// second-to-last call — `emit_start_body` lays out
+/// `[ctors?, phx_gc_enable, phx_main, phx_gc_shutdown]`, so phx_main
+/// is at index `len - 2`. We re-derive its function index from
+/// `_start`'s call list and walk its body for `Call` opcodes.
+///
+/// Used by the shadow-stack assertions on fibonacci (which has no
+/// ref bindings → must contain no `phx_gc_push_frame` /
+/// `phx_gc_pop_frame` calls; the surface call count is a direct
+/// regression tripwire) and on string fixtures (which gain at least
+/// one frame push + pop pair, so the count strictly exceeds the
+/// fibonacci baseline).
+fn call_targets_in_phx_main(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    let inspect = inspect_wasm(bytes)?;
+    let start_idx = inspect
+        .start_func_idx
+        .ok_or_else(|| "module has no `_start` export".to_string())?;
+    let start_body = body_for_func_idx(&inspect, start_idx)
+        .map_err(|e| format!("locating `_start` body: {e}"))?;
+    let start_calls = call_targets_in_body(start_body)?;
+    if start_calls.len() < 2 {
+        return Err(format!(
+            "`_start` body has {} `Call` ops; phx_main lookup expects at least 2 \
+             (phx_gc_enable + phx_main + phx_gc_shutdown, optionally preceded by \
+             a ctor call)",
+            start_calls.len(),
+        ));
+    }
+    // `emit_start_body` always emits phx_main second-to-last (the
+    // final call is phx_gc_shutdown). That holds with or without a
+    // ctor call leading the body.
+    let phx_main_idx = start_calls[start_calls.len() - 2];
+    let phx_main_body = body_for_func_idx(&inspect, phx_main_idx)
+        .map_err(|e| format!("locating phx_main body: {e}"))?;
+    call_targets_in_body(phx_main_body)
+}
+
+/// Resolve an absolute WASM function index (the kind that appears in a
+/// `Call` operand) to its code-section `FunctionBody` reference.
+/// Returns an error if the index points at an imported function (no
+/// body) or past the end of the code section.
+fn body_for_func_idx<'a, 'b>(
+    inspect: &'a WasmInspect<'b>,
+    func_idx: u32,
+) -> Result<&'a wasmparser::FunctionBody<'b>, String> {
+    if func_idx < inspect.import_func_count {
+        return Err(format!(
+            "function {func_idx} is imported (import_func_count={}); no local body exists",
+            inspect.import_func_count,
+        ));
+    }
+    let local_idx = (func_idx - inspect.import_func_count) as usize;
+    inspect.bodies.get(local_idx).ok_or_else(|| {
+        format!(
+            "function {func_idx} resolves to local body {local_idx} but the code \
+             section has only {} bodies",
+            inspect.bodies.len(),
+        )
+    })
+}
+
 /// Count active data segments in `bytes`. Used by structural
 /// assertions on string-literal fixtures: each `Op::ConstString`
 /// reservation emits one active data segment in addition to the
@@ -791,6 +952,218 @@ fn hello_world_runs_under_wasmtime() {
 #[test]
 fn fibonacci_runs_under_wasmtime() {
     assert_wasm_matches_interp(FIBONACCI_SOURCE, "fibonacci");
+}
+
+/// Shadow-stack rooting must NOT add any `phx_gc_push_frame` /
+/// `phx_gc_set_root` / `phx_gc_pop_frame` calls to a function whose
+/// bindings are all value types. Fibonacci is the canonical ref-free
+/// gate: every binding is `Int` or `Bool`, so `assign_gc_root_slots`
+/// returns an empty map and `setup_gc_frame` short-circuits before
+/// allocating the frame local. `phx_main`'s call list should be
+/// exactly `[fib, phx_print_i64] × 4`.
+///
+/// The exact call count (8) anchors against two regression shapes:
+/// (a) accidentally emitting `phx_gc_push_frame(0)` for ref-free
+/// functions (would push call_count to ≥9), and (b) accidentally
+/// emitting `emit_gc_set_root` for value-typed Alloca bindings (would
+/// push call_count higher still). Both are silent miscompiles — the
+/// resulting program would still print 0, 1, 5, 55, but waste GC
+/// runtime on no-op frame churn.
+///
+/// **Fixture coupling.** The exact count is keyed to `FIBONACCI_SOURCE`
+/// printing four values (`fib(0)`, `fib(1)`, `fib(5)`, `fib(10)`). If
+/// that fixture changes (extra print, fewer prints, switching to a
+/// loop), update the `assert_eq!(calls.len(), 8, …)` to match — the
+/// shape-of-bytecode invariant the test pins is "ref-free → no `phx_gc_*`
+/// calls in `phx_main`", which the distinct-target check below already
+/// captures independently of the exact count.
+#[test]
+fn fibonacci_emits_no_shadow_stack_frame_calls() {
+    compile_or_skip(
+        FIBONACCI_SOURCE,
+        "fibonacci_no_shadow_stack_frame",
+        |bytes| {
+            let calls = call_targets_in_phx_main(bytes)
+                .unwrap_or_else(|e| panic!("locating phx_main and decoding its calls failed: {e}"));
+            assert_eq!(
+                calls.len(),
+                8,
+                "fibonacci's `main` should contain exactly 8 `Call` opcodes \
+                 (4× fib + 4× phx_print_i64) — any other count means the \
+                 shadow-stack pass started emitting `phx_gc_push_frame` / \
+                 `phx_gc_set_root` / `phx_gc_pop_frame` for a function with \
+                 no ref-typed bindings, which `assign_gc_root_slots` is \
+                 supposed to short-circuit. got call targets={calls:?}"
+            );
+            // Distinct-target check: `fib` and `phx_print_i64` are the only
+            // two callees in `main`. A regression that wedged a GC frame
+            // call into the function would land a third distinct index.
+            let mut distinct = calls.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                2,
+                "fibonacci's `main` should call exactly 2 distinct \
+                 functions (`fib` and `phx_print_i64`); got {} distinct \
+                 targets ({distinct:?}) — a new distinct target most \
+                 likely means a `phx_gc_*` call leaked into a ref-free \
+                 function body.",
+                distinct.len(),
+            );
+        },
+    );
+}
+
+/// Counterpart to [`fibonacci_emits_no_shadow_stack_frame_calls`]: a
+/// function with ref-typed bindings *must* gain shadow-stack frame
+/// machinery in its body. The fixture is `let mut s: String = "x"; s
+/// = s + "y"; print(s)` — the `Op::Alloca(StringRef)` creates a
+/// ref-typed slot, `Op::Store` re-roots it after the concat write,
+/// and the function ends with a `Return(None)` that must pop the
+/// frame.
+///
+/// Asserts the call count strictly exceeds fibonacci's 8: at least
+/// one `phx_gc_push_frame` + one `phx_gc_pop_frame` + at least one
+/// `phx_gc_set_root` land in `phx_main` on top of the concat / print
+/// calls the source already requires. A regression that dropped any
+/// of the three would show up as a count miss before wasmtime even
+/// ran (and the end-to-end `mutable_string_concat_runs_under_wasmtime`
+/// catches the corresponding *behavioral* regression at the
+/// runtime tier).
+#[test]
+fn string_mut_fixture_emits_shadow_stack_frame_calls() {
+    let src = "function main() {\n  \
+                 let mut s: String = \"x\"\n  \
+                 s = s + \"y\"\n  \
+                 print(s)\n\
+               }\n";
+    compile_or_skip(src, "string_mut_shadow_stack_frame", |bytes| {
+        let calls = call_targets_in_phx_main(bytes)
+            .unwrap_or_else(|e| panic!("locating phx_main and decoding its calls failed: {e}"));
+        // Frame-balance tripwire: every `phx_gc_push_frame` call must
+        // be matched by exactly one `phx_gc_pop_frame`. A regression
+        // that wired up the push side but skipped the pop on some
+        // terminator path would leak frame entries — the runtime's
+        // per-thread frame counter would drift, eventually tripping a
+        // debug-assert or (in release) silently misrooting future
+        // allocations.
+        //
+        // Resolving these function indices by name isn't free in the
+        // merged module: the merger doesn't re-export the runtime's
+        // `phx_gc_*` symbols and doesn't preserve a Function name
+        // subsection in the output. The codegen *contract* pins them
+        // structurally instead — `setup_gc_frame` emits the push as
+        // the very first Call in the function body (no other Call can
+        // run before it), and `emit_gc_pop_frame` runs before every
+        // `Return`, so for a single-Return fixture like this one the
+        // pop is the very last Call. We anchor on those positions and
+        // count their occurrences across the body, which catches a
+        // dropped pop without needing the name resolution.
+        let push_idx = *calls
+            .first()
+            .expect("ref-using `main` should emit at least one Call (phx_gc_push_frame)");
+        let pop_idx = *calls
+            .last()
+            .expect("ref-using `main` should emit at least one Call (phx_gc_pop_frame)");
+        assert_ne!(
+            push_idx, pop_idx,
+            "first and last `Call` opcodes in `phx_main` should target different \
+             runtime functions (push_frame ≠ pop_frame); both came back as {push_idx} \
+             — most likely the pop emission was dropped and the last call now resolves \
+             to whatever the previous emission was. calls={calls:?}",
+        );
+        let push_count = calls.iter().filter(|&&t| t == push_idx).count();
+        let pop_count = calls.iter().filter(|&&t| t == pop_idx).count();
+        assert_eq!(
+            push_count, pop_count,
+            "phx_gc_push_frame (idx {push_idx}, by codegen-contract the first Call) \
+             and phx_gc_pop_frame (idx {pop_idx}, by codegen-contract the last Call) \
+             must appear an equal number of times in `phx_main` — got push={push_count}, \
+             pop={pop_count}. A mismatch means some Return path skipped the pop and \
+             the runtime's frame counter will drift. calls={calls:?}",
+        );
+        assert_eq!(
+            push_count, 1,
+            "single-Return `main` fixture should emit exactly one push/pop pair; got \
+             push_count={push_count} — either codegen started emitting per-block frames \
+             or the fixture grew a second control-flow path. calls={calls:?}",
+        );
+        // Lower bound counting (each emit_gc_set_root that the shadow-
+        // stack pass adds):
+        //   1× phx_gc_push_frame
+        //   1× phx_gc_set_root after `Op::Store` re-roots `s`
+        //   1× phx_gc_set_root after the `Op::Load` that re-binds `s`
+        //   1× phx_gc_set_root after `Op::StringConcat`'s result
+        //   1× phx_str_concat
+        //   1× phx_print_str
+        //   1× phx_gc_pop_frame
+        // = 7 calls floor. Without shadow-stack rooting the fixture
+        // would emit just 2 (`phx_str_concat` + `phx_print_str`), so a
+        // floor of 5 — well above the no-shadow-stack baseline of 2 —
+        // is a robust regression tripwire even if a future codegen
+        // change drops one of the set_root sites.
+        assert!(
+            calls.len() >= 5,
+            "ref-using `main` should contain at least 5 `Call` opcodes \
+             (push_frame + ≥1 set_root + str_concat + print_str + \
+             pop_frame); got {} (targets={calls:?}). A regression that \
+             dropped the shadow-stack frame setup would collapse this \
+             count back to the pre-shadow-stack baseline of 2 (concat \
+             + print only).",
+            calls.len(),
+        );
+        // Distinct-target tripwire: pre-shadow-stack code path would
+        // call exactly 2 distinct functions (`phx_str_concat` and
+        // `phx_print_str`). Shadow-stack rooting adds 3 more distinct
+        // targets (push_frame, set_root, pop_frame). Asserting ≥ 3
+        // distinct targets rules out the regression where the frame
+        // machinery is silently elided for ref-using functions (e.g.
+        // an `is_ref_type` predicate that started returning `false`
+        // for `StringRef`).
+        let mut distinct = calls.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 3,
+            "ref-using `main` should call at least 3 distinct functions \
+             (phx_gc_push_frame, phx_gc_set_root, phx_gc_pop_frame are \
+             three of them; phx_str_concat / phx_print_str add more); \
+             got {} distinct targets ({distinct:?}). A regression that \
+             collapsed shadow-stack rooting back to a no-op would land \
+             near 2 distinct targets (concat + print).",
+            distinct.len(),
+        );
+    });
+}
+
+/// End-to-end gate for a ref-typed function *return* — exercises
+/// `translate_terminator`'s `Return(Some(v))` arm: a helper function
+/// allocates a string, returns it, and `main` prints it. The wasmtime
+/// run compared against the AST interpreter confirms that rooting the
+/// return value across the callee's frame pop produces the expected
+/// output.
+///
+/// **What this test does NOT pin.** It does not catch a swapped
+/// pop-then-load vs. load-then-pop ordering inside `Return(Some(v))`,
+/// because the current emit sequence has no GC-triggering op between
+/// `emit_load_all(*v)` and `Return` (the load is `local.get` only).
+/// Either order produces a behaviorally identical program today; a
+/// dedicated structural assertion (e.g. "the `Call(phx_gc_pop_frame)`
+/// opcode in `greet`'s body appears at a byte offset BEFORE any
+/// `local.get` for the return value's slots") would be needed to pin
+/// the ordering itself. The original comment overstated the
+/// guarantee — leaving this note in so a future regression doesn't
+/// look surprising when it slips past this test.
+#[test]
+fn ref_typed_return_runs_under_wasmtime() {
+    let src = "function greet(name: String) -> String {\n  \
+                 return \"hi, \" + name\n\
+               }\n\
+               function main() {\n  \
+                 print(greet(\"world\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "ref_typed_return");
 }
 
 /// Compile `hello.phx` and return its bytes, or `None` when the

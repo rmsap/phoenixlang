@@ -33,15 +33,35 @@
 //! - **Multi-slot values:** [`IrType::StringRef`] is two WASM slots
 //!   (`(i32 ptr, i32 len)`). Function parameters and returns flatten via
 //!   [`wasm_valtypes_for`]; SSA bindings carry a `Vec<u32>` of locals;
-//!   non-entry block params are restricted to single-slot today
-//!   (deferred to PR 3c alongside the rest of the heap-aware surface).
+//!   non-entry block params lower the same way — `emit_block_param_copies`
+//!   walks each arg's slot list against the target param's slot list,
+//!   so `StringRef` block params work end-to-end alongside scalars.
+//!
+//! # Shadow-stack root emission
+//!
+//! Every ref-typed Phoenix binding (entry-block params, non-entry
+//! block params, ref-result instructions) is assigned a slot in a
+//! per-function shadow-stack frame before any body code is emitted
+//! ([`assign_gc_root_slots`] + [`setup_gc_frame`]). Function entry
+//! calls `phx_gc_push_frame(n_roots)`; every value-producing op that
+//! lands a heap pointer in a binding follows with a
+//! `phx_gc_set_root(frame, slot, value)` so a subsequent `phx_gc_alloc`'s
+//! mark phase observes a live root for the binding. `Op::Store`,
+//! `Jump`, and `Branch` re-use the binding's pre-assigned slot when
+//! updating a stored value so the GC always sees the local's current
+//! value, not its definition-site value. Every `Return` terminator
+//! emits `phx_gc_pop_frame` first; `Unreachable` traps the program
+//! and skips the pop (no further WASM execution observes the frame).
+//! Data-section literals (`Op::ConstString`) and zero-initialized
+//! `Op::Alloca` storage skip the root call entirely — the data-
+//! section pointer is never registered with the GC, and the alloca
+//! slot is already null after `phx_gc_push_frame`'s init.
 //!
 //! # Deferred to PR 3c (still unimplemented)
 //!
-//! Struct / enum / list / map / closure allocation, the shadow-stack
-//! root-emission pass, `defer` exit-path emission, and multi-slot
-//! non-entry block params. Each rejection in this file cites PR 3c so
-//! a regression in the deferred-error wording is visible.
+//! List / map / closure allocation, `defer` exit-path emission. Each
+//! rejection in this file cites PR 3c so a regression in the
+//! deferred-error wording is visible.
 //!
 //! # SSA → WASM-locals mapping
 //!
@@ -72,6 +92,9 @@ use phoenix_ir::types::IrType;
 use phoenix_runtime::gc::TypeTag;
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
+use super::gc_root::{
+    emit_gc_pop_frame, emit_gc_set_root, op_produces_heap_pointer, setup_gc_frame,
+};
 use super::heap_layout::{
     EnumLayout, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
     compute_variant_field_offsets, field_memarg, i32_memarg, is_gc_pointer_type, is_i32_field,
@@ -82,9 +105,29 @@ use crate::error::CompileError;
 /// One block-param's WASM-local list, in declaration order — a single
 /// entry for `Int` / `Bool` / pointer-typed params, two entries
 /// (`[ptr_local, len_local]`) for `StringRef`. Aliased here so the
-/// nested `Vec<Vec<u32>>` in [`FuncTranslateCtx::block_param_locals`]
+/// nested `Vec<...>` in [`FuncTranslateCtx::block_param_locals`]
 /// reads as "list of param slot lists" at call sites.
 type ParamSlotLocals = Vec<u32>;
+
+/// One block-param's record: the Phoenix `ValueId` paired with its
+/// WASM-local list. The vid is retained so `emit_block_param_copies`
+/// can re-root the param on the shadow stack after writing the
+/// updated value into its locals (`Jump` / `Branch` reassigns a
+/// param's value each time control transfers to the block; the GC
+/// must see the latest write, not the value at definition time).
+///
+/// `Clone` exists solely so [`emit_block_param_copies`] can lift the
+/// record list out of a `&FuncTranslateCtx` borrow with `.to_vec()`
+/// before it switches to `&mut FuncTranslateCtx` for emission. The
+/// records are small (a `ValueId` + a `Vec<u32>` of at most two
+/// entries on the current type-flatten surface), so the clone is
+/// cheap relative to restructuring the code to interleave reads and
+/// writes through the same borrow.
+#[derive(Clone)]
+struct BlockParamRecord {
+    vid: ValueId,
+    locals: ParamSlotLocals,
+}
 
 /// Flatten a Phoenix [`IrType`] into the WASM `ValType` slots that
 /// represent it on the value stack. Most types are single-slot,
@@ -331,6 +374,19 @@ pub(super) fn translate_function(
     }
 
     let mut ctx = FuncTranslateCtx::new(func)?;
+    // Shadow-stack root setup: assign a unique slot to every ref-typed
+    // binding before any body code runs, then emit `phx_gc_push_frame`
+    // with the total slot count. Subsequent ref-producing ops emit
+    // `phx_gc_set_root` to populate slots; `Op::Store` / `Jump` /
+    // `Branch` re-use a binding's pre-assigned slot when updating the
+    // stored value. Every Return / Unreachable terminator emits
+    // `phx_gc_pop_frame` before exiting.
+    //
+    // For functions with no ref-typed bindings (most arithmetic-only
+    // helpers — fibonacci is the gate example), the map is empty and
+    // we skip the push/pop entirely so the bytecode shape stays
+    // minimal.
+    setup_gc_frame(&mut ctx, b, func)?;
     if func.blocks.len() == 1 {
         translate_block(&mut ctx, b, ir_module, &func.blocks[0], None)?;
     } else {
@@ -422,7 +478,7 @@ fn translate_multi_block(
             // locals so `Jump`/`Branch` terminators copying args into
             // the block can write each slot independently.
             let slot_locals = ctx.allocate_locals_for_ir_type(*vid, ty.clone())?;
-            ctx.register_block_param(block_id, slot_locals);
+            ctx.register_block_param(block_id, *vid, slot_locals);
         }
     }
 
@@ -546,7 +602,7 @@ impl ValueBinding {
 /// Per-function translation state. Buffers instructions until
 /// finalization so `wasm_encoder::Function::new` can be called with
 /// the complete locals list.
-struct FuncTranslateCtx {
+pub(super) struct FuncTranslateCtx {
     /// Instruction buffer. Replayed in [`Self::into_function`].
     instructions: Vec<Instruction<'static>>,
     /// Locals declared by the body, in declaration order, in the
@@ -560,17 +616,16 @@ struct FuncTranslateCtx {
     /// locals (assigned at function entry) and instruction-result
     /// locals (assigned as ops are visited).
     bindings: HashMap<ValueId, ValueBinding>,
-    /// Per-block param WASM locals, indexed by [`BlockId`] then by
-    /// param-position (declaration order). Each [`ParamSlotLocals`]
-    /// entry is the slot list for one param — single-slot for `Int` /
-    /// `Bool` / pointer-typed params, two-slot for `StringRef` (fat
-    /// pointer). The entry-block params bind to function-parameter
-    /// locals and are NOT listed here (`BlockId(0)` resolves to
-    /// function params via `func.param_types`). Non-entry blocks'
-    /// params get fresh locals allocated in [`translate_multi_block`];
-    /// `Jump` / `Branch` terminators look them up here when copying
-    /// args before dispatching.
-    block_param_locals: HashMap<BlockId, Vec<ParamSlotLocals>>,
+    /// Per-block param records, indexed by [`BlockId`] then by
+    /// param-position (declaration order). Each entry pairs the
+    /// param's Phoenix `ValueId` with its WASM-local list — the vid
+    /// lets `emit_block_param_copies` re-root the param on the shadow
+    /// stack after a write, the locals carry the storage. The entry-
+    /// block params bind to function-parameter locals and are NOT
+    /// listed here (`BlockId(0)` resolves to function params via
+    /// `func.param_types`). Non-entry blocks' params get fresh locals
+    /// allocated in [`translate_multi_block`].
+    block_param_locals: HashMap<BlockId, Vec<BlockParamRecord>>,
     /// Cache of computed struct layouts (keyed by struct name) for the
     /// current function body. `Op::StructAlloc` / `Op::StructGetField`
     /// / `Op::StructSetField` all index into the same per-name layout,
@@ -588,6 +643,22 @@ struct FuncTranslateCtx {
     /// Next WASM local index to assign for an instruction-result
     /// value. Initialized past the parameter locals.
     next_local: u32,
+
+    /// Merged-module WASM local holding the shadow-stack frame
+    /// pointer for the current function. Allocated at function-entry
+    /// time when [`assign_gc_root_slots`] returns a non-empty map;
+    /// `None` for ref-free functions (most arithmetic-only helpers
+    /// fall in this bucket). Consulted by `emit_gc_set_root` and
+    /// `emit_gc_pop_frame`.
+    gc_frame_local: Option<u32>,
+    /// Phoenix `ValueId` → shadow-stack root-slot index. Populated
+    /// once at function-entry time by [`assign_gc_root_slots`]; one
+    /// slot per ref-typed binding (entry params, non-entry block
+    /// params, ref-result instructions). Op::Store / Jump / Branch
+    /// re-use the binding's pre-assigned slot when updating the
+    /// stored value, so the GC always sees the local's current
+    /// value rather than the stale write at definition site.
+    gc_root_slot_for: HashMap<ValueId, u32>,
 }
 
 /// Dispatcher context shared by [`translate_block`] and the
@@ -678,6 +749,8 @@ impl FuncTranslateCtx {
             struct_layout_cache: HashMap::new(),
             enum_layout_cache: HashMap::new(),
             next_local: next_wasm_local,
+            gc_frame_local: None,
+            gc_root_slot_for: HashMap::new(),
         })
     }
 
@@ -693,22 +766,25 @@ impl FuncTranslateCtx {
         idx
     }
 
-    /// Record `locals` as the WASM-local list backing one block-param
-    /// (in declaration order) for the given target `block`. For
+    /// Record `(vid, locals)` as one block-param record (in
+    /// declaration order) for the given target `block`. For
     /// single-slot types `locals` is one entry; for `StringRef` it's
     /// two (`[ptr_local, len_local]`). Used by [`translate_multi_block`]
-    /// when reserving locals for non-entry blocks' params.
-    fn register_block_param(&mut self, block: BlockId, locals: ParamSlotLocals) {
+    /// when reserving locals for non-entry blocks' params. The vid is
+    /// retained so re-rooting on the shadow stack after a write
+    /// (`emit_block_param_copies`) doesn't have to re-walk
+    /// `block.params` to find it.
+    fn register_block_param(&mut self, block: BlockId, vid: ValueId, locals: ParamSlotLocals) {
         self.block_param_locals
             .entry(block)
             .or_default()
-            .push(locals);
+            .push(BlockParamRecord { vid, locals });
     }
 
     /// Look up the per-param WASM-local lists for a block's params, in
     /// declaration order. Empty if the block has no params (or is the
     /// entry block, whose params bind to function-parameter locals).
-    fn block_param_locals_of(&self, block: BlockId) -> &[ParamSlotLocals] {
+    fn block_param_locals_of(&self, block: BlockId) -> &[BlockParamRecord] {
         self.block_param_locals
             .get(&block)
             .map(Vec::as_slice)
@@ -809,7 +885,7 @@ impl FuncTranslateCtx {
     /// `bindings` so future `binding_of` lookups won't find it; that's
     /// intentional — temps are private to the emission sequence that
     /// created them.
-    fn allocate_temp_local(&mut self, wasm_ty: ValType) -> u32 {
+    pub(super) fn allocate_temp_local(&mut self, wasm_ty: ValType) -> u32 {
         let idx = self.next_local;
         self.push_local_decl(wasm_ty);
         self.next_local += 1;
@@ -827,8 +903,53 @@ impl FuncTranslateCtx {
     }
 
     /// Push an instruction onto the buffered body.
-    fn emit(&mut self, instr: Instruction<'static>) {
+    pub(super) fn emit(&mut self, instr: Instruction<'static>) {
         self.instructions.push(instr);
+    }
+
+    // --- Shadow-stack accessors (consumed by `super::gc_root`) ---------
+    //
+    // The shadow-stack helpers live in a sibling module so this file
+    // stays focused on the IR-op switch. They reach into the per-
+    // function state via the small accessor surface below rather than
+    // touching the fields directly — keeping the cross-module coupling
+    // narrow.
+
+    /// Currently-active shadow-stack frame-pointer local, or `None` for
+    /// ref-free functions. Set once by `gc_root::setup_gc_frame` at
+    /// function entry.
+    pub(super) fn gc_frame_local(&self) -> Option<u32> {
+        self.gc_frame_local
+    }
+
+    /// Record the frame-pointer local allocated at function entry.
+    pub(super) fn set_gc_frame_local(&mut self, local: u32) {
+        self.gc_frame_local = Some(local);
+    }
+
+    /// Pre-assigned shadow-stack slot for `vid`, if any. Returns `None`
+    /// for non-ref bindings, which the per-op blanket set-root call
+    /// uses as its "skip" signal.
+    pub(super) fn gc_root_slot_of(&self, vid: ValueId) -> Option<u32> {
+        self.gc_root_slot_for.get(&vid).copied()
+    }
+
+    /// Install the slot map produced by `assign_gc_root_slots` once,
+    /// at function entry. Subsequent reads go through
+    /// [`Self::gc_root_slot_of`].
+    pub(super) fn install_gc_root_slot_map(&mut self, map: HashMap<ValueId, u32>) {
+        self.gc_root_slot_for = map;
+    }
+
+    /// First (root-value-carrying) WASM local for `vid`'s binding, or
+    /// `None` if the binding is missing. For multi-slot `StringRef`
+    /// bindings this is the `i32 ptr` slot; slot 1 is the i32 length
+    /// and is not a pointer. The shadow-stack helpers use this to
+    /// look up the source local for a `phx_gc_set_root` call.
+    pub(super) fn binding_root_local(&self, vid: ValueId) -> Option<u32> {
+        self.bindings
+            .get(&vid)
+            .and_then(|binding| binding.locals.first().copied())
     }
 
     /// Emit a sequence of `local.get` for every WASM local backing
@@ -1146,6 +1267,14 @@ fn translate_instruction(
             for local in slot_locals.iter().rev() {
                 ctx.emit(Instruction::LocalSet(*local));
             }
+            // Re-root the alloca slot on the shadow stack: the slot's
+            // local now holds the freshly-stored value, and the GC
+            // must see *that* value (not whatever was there at
+            // function entry). `emit_gc_set_root` no-ops when the
+            // slot's IR type is a value type — Alloca(Int) doesn't
+            // get an entry in `gc_root_slot_for` and never reaches
+            // the `Call(phx_gc_set_root)` path.
+            emit_gc_set_root(ctx, b, *slot_vid)?;
         }
 
         // --- String concatenation (sret-returning) ------------------
@@ -1158,12 +1287,9 @@ fn translate_instruction(
         // [`emit_sret_string_call`] so the SP-manipulation dance is
         // declared once.
         //
-        // TODO(pr-3c-shadow-stack): the concat output is not yet
-        // shadow-stack rooted. Current fixtures don't allocate between
-        // the call and the result's first use, so a sweep can't strand
-        // the result — but the next PR-3c slice must add a root push
-        // here (and at every other GC-allocating sret site) before any
-        // fixture lands that allocates between concat and use.
+        // Shadow-stack rooting of the result happens at the bottom of
+        // `translate_instruction` via the blanket `emit_gc_set_root`
+        // for ref-typed results — no per-op call needed here.
         Op::StringConcat(lhs, rhs) => {
             let vid = expect_result(instr, "Op::StringConcat")?;
             let runtime_idx = b.require_phx_func("phx_str_concat")?;
@@ -1181,9 +1307,8 @@ fn translate_instruction(
         // [`phx_field_size_bytes`] / [`phx_field_align_bytes`].
         //
         // The result `vid` is bound to a single i32 (the heap pointer).
-        // No shadow-stack rooting yet — same latent caveat as
-        // `Op::StringConcat`; closing the gap waits on the shadow-stack
-        // root-emission pass.
+        // The result is rooted on the shadow stack via the blanket
+        // `emit_gc_set_root` at the bottom of `translate_instruction`.
         Op::StructAlloc(name, field_values) => {
             let vid = expect_result(instr, "Op::StructAlloc")?;
             let layout = ctx.cached_struct_layout(ir_module, name)?;
@@ -1468,6 +1593,26 @@ fn translate_instruction(
             )));
         }
     }
+    // Shadow-stack rooting: if this instruction produced a ref-typed
+    // binding holding an actual heap pointer, write that pointer into
+    // its pre-assigned slot so a subsequent `phx_gc_alloc` mark cycle
+    // can see it as a root. `emit_gc_set_root` no-ops for non-ref
+    // result types (the binding won't have an entry in
+    // `gc_root_slot_for`) and for `Op::Store` (no `instr.result`),
+    // keeping this a safe blanket call for the remaining ops.
+    //
+    // `op_produces_heap_pointer` skips the call for ops whose result
+    // is known not to be a fresh heap pointer (`Op::ConstString` lives
+    // in the data section; `Op::Alloca`'s storage is zero-initialized
+    // and rooted on its first `Op::Store`). `phx_gc_push_frame`
+    // already zeroes every slot, so a redundant `set_root(slot, 0)`
+    // there would be pure overhead.
+    if let Some(vid) = instr.result
+        && instr.result_type.is_ref_type()
+        && op_produces_heap_pointer(&instr.op)
+    {
+        emit_gc_set_root(ctx, b, vid)?;
+    }
     Ok(())
 }
 
@@ -1514,9 +1659,10 @@ const _: () = assert!(
 /// callee fails to restore SP on its return path: even if SP is wrong
 /// on return, we put the caller's frame back exactly.
 ///
-/// Per Decision H, the resulting heap pointer is a GC-tracked value;
-/// future shadow-stack root emission (the rest of PR 3c) will root it
-/// between the call and the next allocation site.
+/// Per Decision H, the resulting heap pointer is a GC-tracked value.
+/// Rooting on the shadow stack happens at the bottom of
+/// `translate_instruction` via the blanket `emit_gc_set_root` for
+/// ref-typed results — no per-call wiring is needed here.
 ///
 /// # Load alignment
 ///
@@ -1804,7 +1950,7 @@ fn translate_to_string_builtin(
 /// / `Unreachable` are reachable; the others would mean a sema/IR bug.
 fn translate_terminator(
     ctx: &mut FuncTranslateCtx,
-    _b: &mut ModuleBuilder,
+    b: &mut ModuleBuilder,
     term: &Terminator,
     dispatcher: Option<DispatcherContext>,
 ) -> Result<(), CompileError> {
@@ -1813,6 +1959,10 @@ fn translate_terminator(
             // Bare `return` — no operand. WASM `return` exits the
             // function and ignores any nesting; matches Phoenix's
             // "Return ignores enclosing block scopes" semantics.
+            // Pop the shadow-stack frame first so the runtime's
+            // frame counter stays in lockstep with the actual call
+            // depth on every exit path.
+            emit_gc_pop_frame(ctx, b)?;
             ctx.emit(Instruction::Return);
             // After `return`, WASM is in unreachable code; we don't
             // need an explicit `unreachable` because every code path
@@ -1823,14 +1973,22 @@ fn translate_terminator(
             // Multi-slot returns (`StringRef`) push their slots in
             // declaration order, then `return` exits with all
             // operand-stack values matching the function's return
-            // type (WASM multi-value return).
+            // type (WASM multi-value return). Pop the shadow-stack
+            // frame *before* pushing the return value: the popped
+            // frame is now invisible to GC, but the return value
+            // lives on the operand stack (not the shadow stack), so
+            // it doesn't matter that the frame is gone — and an
+            // intervening `phx_gc_alloc` between the load and the
+            // return is impossible (no IR ops can be emitted past a
+            // terminator).
+            emit_gc_pop_frame(ctx, b)?;
             ctx.emit_load_all(*v)?;
             ctx.emit(Instruction::Return);
             Ok(())
         }
         Terminator::Jump { target, args } => {
             let dispatcher = require_dispatcher(dispatcher)?;
-            emit_block_param_copies(ctx, *target, args)?;
+            emit_block_param_copies(ctx, b, *target, args)?;
             ctx.emit(Instruction::I32Const(target.0 as i32));
             ctx.emit(Instruction::LocalSet(dispatcher.dispatch_local));
             ctx.emit(Instruction::Br(dispatcher.depth_to_loop));
@@ -1848,12 +2006,12 @@ fn translate_terminator(
             ctx.emit(Instruction::LocalGet(cond_local));
             ctx.emit(Instruction::If(BlockType::Empty));
             // Then-branch: jump to `true_block`.
-            emit_block_param_copies(ctx, *true_block, true_args)?;
+            emit_block_param_copies(ctx, b, *true_block, true_args)?;
             ctx.emit(Instruction::I32Const(true_block.0 as i32));
             ctx.emit(Instruction::LocalSet(dispatcher.dispatch_local));
             ctx.emit(Instruction::Else);
             // Else-branch: jump to `false_block`.
-            emit_block_param_copies(ctx, *false_block, false_args)?;
+            emit_block_param_copies(ctx, b, *false_block, false_args)?;
             ctx.emit(Instruction::I32Const(false_block.0 as i32));
             ctx.emit(Instruction::LocalSet(dispatcher.dispatch_local));
             ctx.emit(Instruction::End);
@@ -1869,6 +2027,11 @@ fn translate_terminator(
             Ok(())
         }
         Terminator::Unreachable => {
+            // `Unreachable` traps the WASM execution; the runtime
+            // never returns from a trap, so the frame counter never
+            // reads again. Skipping `phx_gc_pop_frame` here is
+            // intentional — it'd be unreachable code anyway, and a
+            // trap is a hard host-level abort.
             ctx.emit(Instruction::Unreachable);
             Ok(())
         }
@@ -1928,17 +2091,18 @@ fn require_dispatcher(
 /// will pin this path against regression.
 fn emit_block_param_copies(
     ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
     target: BlockId,
     args: &[ValueId],
 ) -> Result<(), CompileError> {
-    let param_slot_lists: Vec<ParamSlotLocals> = ctx.block_param_locals_of(target).to_vec();
-    if param_slot_lists.len() != args.len() {
+    let param_records: Vec<BlockParamRecord> = ctx.block_param_locals_of(target).to_vec();
+    if param_records.len() != args.len() {
         return Err(CompileError::new(format!(
             "wasm32-linear: jump to {target:?} has {} args but the target \
              has {} params (internal compiler bug — IR verifier should have \
              caught this)",
             args.len(),
-            param_slot_lists.len(),
+            param_records.len(),
         )));
     }
     // Push every slot of every arg in declaration order so the
@@ -1946,14 +2110,14 @@ fn emit_block_param_copies(
     // ...]`. Each arg's slot count matches the corresponding target
     // param's slot count (the IR verifier rejects type mismatches
     // upstream); a multi-slot arg expands to multiple `local.get`s.
-    for (arg, param_slots) in args.iter().zip(param_slot_lists.iter()) {
+    for (arg, record) in args.iter().zip(param_records.iter()) {
         let arg_locals = ctx.binding_of(*arg)?.locals.clone();
-        if arg_locals.len() != param_slots.len() {
+        if arg_locals.len() != record.locals.len() {
             return Err(CompileError::new(format!(
                 "wasm32-linear: jump to {target:?} arg/param slot-count mismatch \
                  ({} vs {}) — internal compiler bug",
                 arg_locals.len(),
-                param_slots.len(),
+                record.locals.len(),
             )));
         }
         for src_local in &arg_locals {
@@ -1963,12 +2127,21 @@ fn emit_block_param_copies(
     // Pop into the target params' slot locals. WASM pops top-of-
     // stack first, so iterate in *reverse* — both across params (last
     // param popped first) and within each param's slots (last slot
-    // popped first). The double-reverse below collapses to a flat
-    // reverse iteration over (param, slot) pairs.
-    for param_slots in param_slot_lists.iter().rev() {
-        for dest_local in param_slots.iter().rev() {
+    // popped first).
+    for record in param_records.iter().rev() {
+        for dest_local in record.locals.iter().rev() {
             ctx.emit(Instruction::LocalSet(*dest_local));
         }
+    }
+    // Re-root any ref-typed block params on the shadow stack. The
+    // pre-assigned slot in `gc_root_slot_for` is the param's "home"
+    // slot; the value just written into the param's local is what the
+    // GC now needs to track. `emit_gc_set_root` filters non-ref params
+    // (no entry in `gc_root_slot_for`) and the ref-free-function case
+    // (`gc_frame_local == None`), so no spurious `phx_gc_set_root`
+    // calls land in the emitted bytecode for either case.
+    for record in &param_records {
+        emit_gc_set_root(ctx, b, record.vid)?;
     }
     Ok(())
 }
