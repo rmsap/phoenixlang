@@ -183,6 +183,24 @@ pub(super) struct ModuleBuilder {
     /// of headroom for the runtime's stack to grow down without
     /// overrunning user data.
     data_cursor: u32,
+
+    /// Phoenix [`FuncId`] → closure-table slot, populated by the
+    /// pre-scan in [`Self::register_closure_table`]. Each function
+    /// referenced as the target of an [`Op::ClosureAlloc`] gets a
+    /// unique slot in the merged module's *closure* funcref table
+    /// (separate from any indirect-function table the runtime
+    /// declares — see [`Self::closure_table_idx`]). Slots are
+    /// indices into that single closure table, *not* WASM function
+    /// indices: `Op::ClosureAlloc` stores the slot at heap offset 0
+    /// of the closure object, and `Op::CallIndirect` loads it back
+    /// and feeds it to `call_indirect (table closure_table_idx)`.
+    closure_target_slots: HashMap<FuncId, u32>,
+    /// Merged-module WASM table index of the Phoenix closure table.
+    /// `None` until [`Self::register_closure_table`] has run; remains
+    /// `None` if no `Op::ClosureAlloc` references were found (no
+    /// table is declared in that case, so the output module stays
+    /// minimal).
+    closure_table_idx: Option<u32>,
 }
 
 impl ModuleBuilder {
@@ -221,6 +239,8 @@ impl ModuleBuilder {
             // this cursor; the `data_cursor` field tracks only the
             // user-data high-water mark.
             data_cursor: USER_DATA_BASE,
+            closure_target_slots: HashMap::new(),
+            closure_table_idx: None,
         }
     }
 
@@ -712,6 +732,151 @@ impl ModuleBuilder {
                  have caught this before codegen)"
             ))
         })
+    }
+
+    /// Pre-scan `ir_module` for every `Op::ClosureAlloc(fid, _)`
+    /// reference, declare a single funcref table sized to hold every
+    /// such closure target, and emit an active element segment
+    /// populating it with the corresponding WASM function indices.
+    ///
+    /// Must be called *after* [`Self::declare_phoenix_functions`] —
+    /// the element segment writes WASM function indices read from
+    /// [`Self::phx_user_funcs`], which doesn't exist yet at the start
+    /// of the pipeline.
+    ///
+    /// **Slot assignment is iteration-order-stable.** The walk visits
+    /// functions in their `IrModule`'s declaration order, blocks /
+    /// instructions in their natural order, and assigns slots on
+    /// first encounter via `entry().or_insert_with(...)`. This makes
+    /// the closure-table layout reproducible across builds (important
+    /// for `wasmprinter` snapshots and for any future
+    /// content-addressed caching).
+    ///
+    /// No-op (table not declared, element segment not emitted) when
+    /// the IR has zero `Op::ClosureAlloc` references. Keeps modules
+    /// for closure-free programs (`hello.phx`, `fibonacci.phx`, etc.)
+    /// byte-identical to the pre-closure-support output.
+    pub(super) fn register_closure_table(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        // Collect every closure-target FuncId in IR-iteration order.
+        let mut ordered_targets: Vec<FuncId> = Vec::new();
+        for func in ir_module.concrete_functions() {
+            for block in &func.blocks {
+                for instr in &block.instructions {
+                    if let phoenix_ir::instruction::Op::ClosureAlloc(target_fid, _) = &instr.op
+                        && !self.closure_target_slots.contains_key(target_fid)
+                    {
+                        let slot = self.closure_target_slots.len() as u32;
+                        self.closure_target_slots.insert(*target_fid, slot);
+                        ordered_targets.push(*target_fid);
+                    }
+                }
+            }
+        }
+        if ordered_targets.is_empty() {
+            return Ok(());
+        }
+
+        // Declare the funcref table. `minimum` must equal the number
+        // of slots we'll fill via the active element segment below —
+        // wasm-encoder + wasmtime reject element offsets past the
+        // declared table size, and we want the segment to cover every
+        // slot the body translator may reference.
+        let n_slots = ordered_targets.len() as u64;
+        let table_idx = self.tables.len();
+        self.tables.table(wasm_encoder::TableType {
+            element_type: wasm_encoder::RefType::FUNCREF,
+            table64: false,
+            minimum: n_slots,
+            maximum: Some(n_slots),
+            shared: false,
+        });
+        self.closure_table_idx = Some(table_idx);
+
+        // Resolve each closure target's WASM function index from the
+        // already-populated user-funcs map. A miss here would mean
+        // the pre-scan found a `ClosureAlloc(fid)` referencing an
+        // un-declared function — sema / IR builder invariant
+        // violation; surface as an ICE-shaped diagnostic.
+        let func_indices: Vec<u32> = ordered_targets
+            .iter()
+            .map(|fid| self.require_phx_user_func(*fid))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Active segment: write `func_indices` into table at offset 0.
+        // The offset expression must reference an i32 constant — WASM
+        // active-segment offsets are typed against the table's index
+        // type (i32 for 32-bit tables, which is the default we chose
+        // above). `funcs` arg below is borrowed; the segment encoder
+        // copies bytes immediately so the local goes out of scope safely.
+        let offset = wasm_encoder::ConstExpr::i32_const(0);
+        self.elements.active(
+            Some(table_idx),
+            &offset,
+            wasm_encoder::Elements::Functions(std::borrow::Cow::Borrowed(&func_indices)),
+        );
+        Ok(())
+    }
+
+    /// Look up the closure-table slot for `fid`. Returns `None` if no
+    /// `Op::ClosureAlloc` in the IR module referenced this function as
+    /// a target (so it has no slot reserved). Callers reaching `None`
+    /// indicates an internal compiler bug (`register_closure_table`'s
+    /// pre-scan and `Op::ClosureAlloc`'s body emission walk the same
+    /// IR; they should agree on which FuncIds appear).
+    pub(super) fn closure_target_slot(&self, fid: FuncId) -> Option<u32> {
+        self.closure_target_slots.get(&fid).copied()
+    }
+
+    /// Like [`Self::closure_target_slot`] but produces the uniform
+    /// internal-compiler-bug diagnostic on miss. Routed through by
+    /// [`super::translate::translate_instruction`]'s `Op::ClosureAlloc`
+    /// arm.
+    pub(super) fn require_closure_target_slot(&self, fid: FuncId) -> Result<u32, CompileError> {
+        self.closure_target_slot(fid).ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-linear: `Op::ClosureAlloc({fid:?}, ..)` references a \
+                 function not registered as a closure target (internal compiler \
+                 bug — `register_closure_table`'s pre-scan should have seen it)"
+            ))
+        })
+    }
+
+    /// Merged-module WASM table index of the Phoenix closure table.
+    /// `Err` if no `Op::ClosureAlloc` references appeared in the IR
+    /// (so no table was declared); reaching this from `Op::CallIndirect`
+    /// without prior `Op::ClosureAlloc` somewhere in the module would
+    /// mean the IR conjured a closure value out of thin air, which is
+    /// an internal compiler bug.
+    pub(super) fn require_closure_table_idx(&self) -> Result<u32, CompileError> {
+        self.closure_table_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-linear: `Op::CallIndirect` reached codegen but no \
+                 closure table was declared (no `Op::ClosureAlloc` references \
+                 found in pre-scan) — internal compiler bug",
+            )
+        })
+    }
+
+    /// Intern a WASM function type for `Op::CallIndirect`'s
+    /// `call_indirect` instruction.
+    ///
+    /// `param_valtypes` is the FULL flattened-WASM parameter list,
+    /// including the leading env-pointer i32 (the closure's heap ptr)
+    /// and the user-visible params in order. `return_valtypes` is the
+    /// flattened-WASM return list.
+    ///
+    /// The returned type-index is what `call_indirect` reads to
+    /// validate the on-stack arg shape against the table entry's
+    /// signature at runtime.
+    pub(super) fn intern_call_indirect_type(
+        &mut self,
+        param_valtypes: &[wasm_encoder::ValType],
+        return_valtypes: &[wasm_encoder::ValType],
+    ) -> u32 {
+        self.types.intern(param_valtypes, return_valtypes)
     }
 
     fn validate_main_shape(func: &phoenix_ir::module::IrFunction) -> Result<(), CompileError> {

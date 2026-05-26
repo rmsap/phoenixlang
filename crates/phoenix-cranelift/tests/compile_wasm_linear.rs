@@ -1618,6 +1618,42 @@ fn alloc_loop_runs_under_wasmtime() {
     assert_wasm_matches_interp(ALLOC_LOOP_SOURCE, "alloc_loop");
 }
 
+/// `closures.phx` — gate for `Op::ClosureAlloc`, `Op::CallIndirect`,
+/// `Op::ClosureLoadCapture`. Exercises:
+///
+/// - A capture-less closure (`let double = function(x: Int) -> Int { x * 2 }`)
+///   passed to `applyTwice(f, x)` as a function-typed parameter,
+///   reached via `Op::CallIndirect` from inside `applyTwice`.
+/// - A `String`-capturing closure (`let say = function(name) -> { prefix + name }`)
+///   where `prefix` is a multi-slot `StringRef` capture, requiring
+///   the alloc-side `StringRef` two-`i32.store` path plus the load
+///   side's two-`i32.load` `emit_field_load` arm to land at the
+///   matching computed offset (4-byte fn-idx + natural alignment).
+/// - The env-pointer calling convention: the closure pointer arrives
+///   as the WASM function's first param and `Op::ClosureLoadCapture`
+///   reads from it.
+/// - A closure capturing BOTH an `Int` and a `String` (`combine`),
+///   exercising non-trivial capture-layout alignment: the 8-byte-
+///   aligned `Int` forces `align_up` past the 4-byte fn-table-idx,
+///   and the two-capture record drives the offset-accumulation walk
+///   in `capture_offset` / the `Op::ClosureAlloc` arm beyond the
+///   single-already-aligned-capture case the other closures cover.
+///
+/// Expected stdout:
+///   result: alice
+///   result: bob
+///   12
+///   combined: 15
+const CLOSURES_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/closures.phx"
+));
+
+#[test]
+fn closures_runs_under_wasmtime() {
+    assert_wasm_matches_interp(CLOSURES_SOURCE, "closures");
+}
+
 /// `defer_try.phx` — gate for `Result.isErr` in conditional dispatch
 /// plus a `defer` that fires on the early-`?`-return path. The fixture
 /// exercises:

@@ -98,7 +98,7 @@ use super::gc_root::{
 use super::heap_layout::{
     EnumLayout, LIST_HEADER, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
     compute_variant_field_offsets, field_memarg, i32_memarg, is_gc_pointer_type, is_i32_field,
-    phx_field_size_bytes,
+    phx_field_align_bytes, phx_field_size_bytes,
 };
 use super::module_builder::ModuleBuilder;
 use crate::error::CompileError;
@@ -660,6 +660,14 @@ pub(super) struct FuncTranslateCtx {
     /// stored value, so the GC always sees the local's current
     /// value rather than the stale write at definition site.
     gc_root_slot_for: HashMap<ValueId, u32>,
+
+    /// Snapshot of the enclosing function's `capture_types` (cloned
+    /// from [`IrFunction::capture_types`] at construction). Read by
+    /// `Op::ClosureLoadCapture` to walk capture widths and compute
+    /// the byte offset of capture `capture_idx` within the closure
+    /// heap object. Always set; an empty vector means the current
+    /// function is not a closure body.
+    current_capture_types: Vec<IrType>,
 }
 
 /// Dispatcher context shared by [`translate_block`] and the
@@ -752,7 +760,45 @@ impl FuncTranslateCtx {
             next_local: next_wasm_local,
             gc_frame_local: None,
             gc_root_slot_for: HashMap::new(),
+            current_capture_types: func.capture_types.clone(),
         })
+    }
+
+    /// Walk this function's `capture_types[..idx]` and compute the
+    /// byte offset of capture `idx` within the closure heap object.
+    /// The closure layout is `[fn_table_idx: i32 @ 0, capture_0,
+    /// capture_1, ...]`: the fn-table-idx occupies offset 0..4, then
+    /// each capture lives at its natural alignment past the previous
+    /// one.
+    ///
+    /// Used by `Op::ClosureLoadCapture` to compute the load offset.
+    /// Returns `Err` if `idx` is out of range — the IR verifier should
+    /// reject `Op::ClosureLoadCapture` with an out-of-range index
+    /// before codegen, so reaching the `Err` path indicates an
+    /// internal compiler bug.
+    pub(super) fn capture_offset(&self, idx: usize) -> Result<u32, CompileError> {
+        if idx >= self.current_capture_types.len() {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `Op::ClosureLoadCapture` capture index {idx} \
+                 out of range (current function has {} captures) — internal \
+                 compiler bug",
+                self.current_capture_types.len()
+            )));
+        }
+        // Start past the 4-byte fn-table-idx at offset 0; walk the
+        // capture types in order and pad each by its natural
+        // alignment before adding its size. Mirrors the alloc-side
+        // walk in `Op::ClosureAlloc` so the offsets line up exactly.
+        let mut cursor: u32 = 4;
+        for cap_ty in &self.current_capture_types[..idx] {
+            let align = phx_field_align_bytes(cap_ty)?;
+            let size = phx_field_size_bytes(cap_ty)?;
+            cursor = align_up(cursor, align);
+            cursor += size;
+        }
+        let cap_ty = &self.current_capture_types[idx];
+        let align = phx_field_align_bytes(cap_ty)?;
+        Ok(align_up(cursor, align))
     }
 
     /// Allocate the `i32` "next block ID" local used by the loop+switch
@@ -1641,6 +1687,210 @@ fn translate_instruction(
                 let arg_locals = arg_binding.locals.clone();
                 let arg_ty = arg_binding.ir_type.clone();
                 emit_field_store(ctx, list_ptr_local, offset, &arg_ty, &arg_locals)?;
+            }
+        }
+
+        // --- Closure allocation -------------------------------------
+        //
+        // Closure heap layout: `[fn_table_idx: i32 @ 0, capture_0,
+        // capture_1, ...]`. The first i32 is the index of the target
+        // function within the merged module's *closure table* (a
+        // funcref table declared by
+        // [`ModuleBuilder::register_closure_table`]'s pre-scan), not
+        // a raw function pointer — wasm32 has no observable function
+        // addresses, only table slots. `Op::CallIndirect` reloads
+        // that i32 and feeds it to `call_indirect`.
+        //
+        // Captures lay out at WASM-natural alignment past the fn-idx:
+        // `phx_field_align_bytes` + `phx_field_size_bytes` (the same
+        // helpers struct/enum fields use). This matches the offsets
+        // `Op::ClosureLoadCapture` reconstructs via
+        // [`FuncTranslateCtx::capture_offset`].
+        //
+        // The blanket post-instruction `emit_gc_set_root` at the end
+        // of this function roots the resulting closure pointer.
+        Op::ClosureAlloc(target_fid, captures) => {
+            let vid = expect_result(instr, "Op::ClosureAlloc")?;
+            // The IR-side `lower_lambda` records the lambda's
+            // `capture_types` directly on the target `IrFunction`;
+            // walking *those* (rather than re-deriving from the IR
+            // module's `bindings`/`type_map` like the native path
+            // does) keeps the alloc-side and load-side
+            // (`Op::ClosureLoadCapture`) layouts pinned to the same
+            // source.
+            // `get_concrete` is an O(1) `FuncId`-indexed lookup
+            // (`FuncId` is the slot position); it returns `None` for an
+            // out-of-range id or a generic-template slot, both of which
+            // are IR builder / monomorphizer drift at this point.
+            let target_func = ir_module.get_concrete(*target_fid).ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-linear: `Op::ClosureAlloc({target_fid:?})` references a \
+                     function with no concrete body (out of range, or an \
+                     un-specialized template — internal compiler bug, IR builder \
+                     / monomorphizer drift)"
+                ))
+            })?;
+            let capture_types = &target_func.capture_types;
+            if capture_types.len() != captures.len() {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::ClosureAlloc({target_fid:?})` arity \
+                     mismatch — IR target declares {} captures but the alloc \
+                     site supplies {} (internal compiler bug — IR builder \
+                     invariant violated)",
+                    capture_types.len(),
+                    captures.len()
+                )));
+            }
+            // Walk capture types to compute per-capture byte offset
+            // and the total allocation size. Mirrors `capture_offset`
+            // exactly — keeping the loop here (rather than calling
+            // `capture_offset` in a loop) costs less and avoids the
+            // redundant per-call prefix-sum recomputation.
+            let mut cursor: u32 = 4; // skip the fn-table-idx
+            let mut offsets: Vec<u32> = Vec::with_capacity(capture_types.len());
+            let mut max_align: u32 = 4; // fn-table-idx is i32
+            for ty in capture_types {
+                let align = phx_field_align_bytes(ty)?;
+                let size = phx_field_size_bytes(ty)?;
+                if align > max_align {
+                    max_align = align;
+                }
+                let off = align_up(cursor, align);
+                offsets.push(off);
+                cursor = off + size;
+            }
+            let total_size = align_up(cursor, max_align);
+            // Allocate. `phx_gc_alloc(size, type_tag)` returns the i32
+            // heap pointer (both args are i32 on wasm32; `usize` in the
+            // runtime's Rust signature lowers to i32 here, not i64).
+            // `TypeTag::Closure` (= 4) tags the allocation for the
+            // GC's mark phase.
+            let alloc_idx = b.require_phx_func("phx_gc_alloc")?;
+            ctx.emit(Instruction::I32Const(total_size as i32));
+            ctx.emit(Instruction::I32Const(TypeTag::Closure as i32));
+            ctx.emit(Instruction::Call(alloc_idx));
+            let closure_ptr_local =
+                ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
+            ctx.emit(Instruction::LocalSet(closure_ptr_local));
+            // Store fn-table-idx at offset 0 as i32.
+            let fn_table_slot = b.require_closure_target_slot(*target_fid)?;
+            ctx.emit(Instruction::LocalGet(closure_ptr_local));
+            ctx.emit(Instruction::I32Const(fn_table_slot as i32));
+            ctx.emit(Instruction::I32Store(i32_memarg(0)));
+            // Store each capture at its computed offset.
+            for (i, cap_vid) in captures.iter().enumerate() {
+                let offset = offsets[i];
+                let cap_locals = ctx.binding_of(*cap_vid)?.locals.clone();
+                // Take the store shape from the SAME `capture_types[i]`
+                // the offset was derived from, so the alloc-side offset
+                // and the store width can't drift apart. If the captured
+                // value's binding carries a different slot count than this
+                // type implies, `emit_field_store`'s per-arm
+                // `value_locals.len()` debug-asserts fire — localizing an
+                // IR-builder invariant violation here rather than as a
+                // far-removed wasmparser/runtime fault.
+                let cap_ty = &capture_types[i];
+                emit_field_store(ctx, closure_ptr_local, offset, cap_ty, &cap_locals)?;
+            }
+        }
+
+        // --- Closure capture load -----------------------------------
+        //
+        // Inside a closure function body, read capture #idx from the
+        // env pointer (the closure's first param). `capture_offset`
+        // walks `current_capture_types[..idx]` to reconstruct the
+        // same byte offset the alloc side wrote at — they have to
+        // agree by construction since both consult the same
+        // `IrFunction::capture_types` source.
+        Op::ClosureLoadCapture(env_vid, capture_idx) => {
+            let vid = expect_result(instr, "Op::ClosureLoadCapture")?;
+            let env_local = ctx.binding_of(*env_vid)?.single_local();
+            let offset = ctx.capture_offset(*capture_idx as usize)?;
+            let result_ty = instr.result_type.clone();
+            emit_field_load(ctx, env_local, offset, &result_ty)?;
+            ctx.emit_store_result(vid, result_ty)?;
+        }
+
+        // --- Indirect call through a closure ------------------------
+        //
+        // `Op::CallIndirect(closure_vid, args)` loads the fn-table-
+        // idx from the closure's heap object (i32 at offset 0) and
+        // emits `call_indirect (type T) (table closure_table_idx)`
+        // with `(closure_ptr, user_args...)` on the operand stack
+        // (env-pointer ABI: the closure pointer itself is the env,
+        // passed as the first arg so the callee can resolve captures
+        // via `Op::ClosureLoadCapture` from it).
+        //
+        // The type signature `T` is built from the closure's own
+        // `IrType::ClosureRef { param_types, return_type }`, with an
+        // i32 env prepended. Interning per call site keeps the type
+        // section minimal — coincident signatures (e.g. all `(Int) ->
+        // Int` closures across the module) collapse to one entry.
+        Op::CallIndirect(closure_vid, args) => {
+            let closure_binding = ctx.binding_of(*closure_vid)?;
+            let closure_ptr_local = closure_binding.single_local();
+            let closure_ir_ty = closure_binding.ir_type.clone();
+            let (user_param_types, return_type): (Vec<IrType>, IrType) = match &closure_ir_ty {
+                IrType::ClosureRef {
+                    param_types,
+                    return_type,
+                } => (param_types.clone(), (**return_type).clone()),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::CallIndirect` receiver has IR type \
+                         `{other:?}`, expected `ClosureRef` (internal compiler bug \
+                         — IR verifier should have caught this)"
+                    )));
+                }
+            };
+            // Full param list for the call_indirect signature: env-ptr
+            // first (typed as the closure's own ref → flattens to a
+            // single i32), then user params each flattened in
+            // declaration order.
+            let mut full_param_valtypes: Vec<ValType> = Vec::new();
+            full_param_valtypes.extend(wasm_valtypes_for(&closure_ir_ty)?);
+            for pt in &user_param_types {
+                full_param_valtypes.extend(wasm_valtypes_for(pt)?);
+            }
+            let return_valtypes = wasm_return_valtypes(&return_type)?;
+            let type_idx = b.intern_call_indirect_type(&full_param_valtypes, &return_valtypes);
+            let closure_table_idx = b.require_closure_table_idx()?;
+            // Push env (closure pointer itself) and user args in
+            // declaration order, then the fn-table-idx on top of the
+            // stack (which `call_indirect` pops as the table index).
+            ctx.emit(Instruction::LocalGet(closure_ptr_local));
+            for arg in args {
+                ctx.emit_load_all(*arg)?;
+            }
+            // Load fn-table-idx from closure[0] last so it ends up
+            // on top of the stack when `call_indirect` consumes it.
+            ctx.emit(Instruction::LocalGet(closure_ptr_local));
+            ctx.emit(Instruction::I32Load(i32_memarg(0)));
+            ctx.emit(Instruction::CallIndirect {
+                type_index: type_idx,
+                table_index: closure_table_idx,
+            });
+            // Bind result. Same mismatch-rejection shape as
+            // `Op::Call` above.
+            match (instr.result, &instr.result_type) {
+                (Some(_), IrType::Void) => {
+                    return Err(CompileError::new(
+                        "wasm32-linear: `Op::CallIndirect` has a result binding but \
+                         a Void return type (internal compiler bug)"
+                            .to_string(),
+                    ));
+                }
+                (Some(vid), ty) => {
+                    ctx.emit_store_result(vid, ty.clone())?;
+                }
+                (None, IrType::Void) => {}
+                (None, ty) => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::CallIndirect` returns `{ty:?}` but has \
+                         no result binding — the call's return slots would be \
+                         stranded on the operand stack (internal compiler bug)"
+                    )));
+                }
             }
         }
 

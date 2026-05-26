@@ -137,6 +137,15 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
     builder.declare_memory();
 
     builder.declare_phoenix_functions(ir_module)?;
+    // After every Phoenix function has a stable WASM function index,
+    // pre-scan the IR for `Op::ClosureAlloc(fid, _)` references and
+    // declare/populate the closure funcref table that
+    // `Op::CallIndirect` reads. Must come *after*
+    // `declare_phoenix_functions` (the element segment writes WASM
+    // function indices read from `phx_user_funcs`) and *before*
+    // `emit_phoenix_bodies` (so body emission can resolve
+    // `closure_target_slot(fid)` and `require_closure_table_idx()`).
+    builder.register_closure_table(ir_module)?;
     builder.declare_start();
     builder.emit_exports();
     builder.emit_phoenix_bodies(ir_module)?;

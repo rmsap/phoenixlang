@@ -19,4 +19,16 @@ function main() {
   // Indirect call through a function-typed parameter.
   let double = function(x: Int) -> Int { x * 2 }
   print(applyTwice(double, 3))
+
+  // Closure capturing BOTH an 8-byte-aligned Int and a fat-pointer
+  // String, so the capture layout has to pad past the 4-byte
+  // fn-table-idx to land the Int on its natural 8-byte boundary and
+  // walk a multi-capture offset accumulation (not just the single,
+  // already-aligned String capture above).
+  let base: Int = 10
+  let label: String = "combined: "
+  let combine = function(n: Int) -> String {
+    label + toString(base + n)
+  }
+  print(combine(5))
 }
