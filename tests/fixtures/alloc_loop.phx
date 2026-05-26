@@ -2,6 +2,11 @@
 // list and a string, neither of which escape. With a working GC the
 // process terminates with bounded memory; without one it would OOM.
 //
+// `label` is intentionally never read — it exists only to add a second
+// per-iteration heap allocation (the `StringConcat`) on top of the list,
+// doubling GC pressure. Don't "fix" the unused binding; the test's ≈8 MB
+// estimate assumes both allocations are retained each iteration.
+//
 // `n` is sized so the cumulative allocation comfortably exceeds the
 // 1-MB auto-collect threshold (each iter allocates ~80 bytes; 100k
 // iterations ≈ 8 MB), so the threshold-driven sweep path runs many

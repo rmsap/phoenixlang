@@ -1876,11 +1876,99 @@ fn translate_builtin_call(
             args,
             instr,
         ),
+        // `Result.<method>` / `Option.<method>` dispatchers. This
+        // slice covers just the discriminant-equality checks
+        // (`isOk` / `isErr` / `isSome` / `isNone`); the
+        // payload-handling methods (`unwrap` / `unwrapOr` / `map` /
+        // `andThen` / ...) ship in a later PR 3d slice that needs
+        // multi-block conditional emission inside builtins plus
+        // closure handling for `map` / `andThen`.
+        result_method if result_method.starts_with("Result.") => translate_enum_is_variant_builtin(
+            ctx,
+            "Result",
+            result_method.strip_prefix("Result.").unwrap(),
+            args,
+            instr,
+        ),
+        option_method if option_method.starts_with("Option.") => translate_enum_is_variant_builtin(
+            ctx,
+            "Option",
+            option_method.strip_prefix("Option.").unwrap(),
+            args,
+            instr,
+        ),
         other => Err(CompileError::new(format!(
             "wasm32-linear: builtin `{other}` not yet supported \
              (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
         ))),
     }
+}
+
+/// Lower a `BuiltinCall("Result.<m>", ...)` or
+/// `BuiltinCall("Option.<m>", ...)` where `m` is a discriminant-
+/// equality check (`isOk` / `isErr` / `isSome` / `isNone`).
+///
+/// The semantics:
+///
+/// - `isOk` / `isSome`: discriminant == 0 (the positive variant —
+///   `Result::Ok` and `Option::Some` are both declared first in the
+///   stdlib enum layouts, so their discriminant is 0).
+/// - `isErr` / `isNone`: discriminant != 0 (negation of the positive
+///   check).
+///
+/// Emitting i32.eq / i32.ne against the loaded discriminant lets us
+/// avoid the `compute_enum_layout`-and-variant-index lookup the
+/// native path does — the binary-enum-with-Ok-as-first invariant is
+/// stable across the stdlib and pinning it here keeps the WASM dispatch
+/// trivial. Multi-payload non-stdlib enums route through
+/// `Op::EnumDiscriminant` directly at the IR level; nothing in
+/// user code can reach this builtin path with a non-`Result`/-`Option`
+/// receiver.
+///
+/// All four methods return `Bool` (single i32 0/1) and have no GC-
+/// ref-typed result, so the blanket post-instruction `emit_gc_set_root`
+/// is a no-op for them.
+fn translate_enum_is_variant_builtin(
+    ctx: &mut FuncTranslateCtx,
+    enum_name: &str,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let positive_check = match (enum_name, method) {
+        ("Result", "isOk") | ("Option", "isSome") => true,
+        ("Result", "isErr") | ("Option", "isNone") => false,
+        _ => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` not yet \
+                 supported (Phase 2.4 PR 3d — see docs/design-decisions.md §Phase 2.4 \
+                 for the remaining stdlib-enum method surface)"
+            )));
+        }
+    };
+    let vid = expect_result(instr, "BuiltinCall(\"enum.is_variant\")")?;
+    let receiver_vid = *args.first().ok_or_else(|| {
+        CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` requires 1 arg \
+             (the {enum_name} receiver), got 0 (internal compiler bug — IR \
+             verifier should have caught this)"
+        ))
+    })?;
+    let recv_ptr_local = ctx.binding_of(receiver_vid)?.single_local();
+    // Discriminant is i32 at offset 0 of the enum payload — the same
+    // load shape `Op::EnumDiscriminant` uses. Comparing with i32.eq /
+    // i32.ne keeps the result on the operand stack as an i32 0/1
+    // which lines up exactly with `Bool`'s wasm-encoding.
+    ctx.emit(Instruction::LocalGet(recv_ptr_local));
+    ctx.emit(Instruction::I32Load(i32_memarg(0)));
+    ctx.emit(Instruction::I32Const(0));
+    if positive_check {
+        ctx.emit(Instruction::I32Eq);
+    } else {
+        ctx.emit(Instruction::I32Ne);
+    }
+    ctx.emit_store_result(vid, IrType::Bool)?;
+    Ok(())
 }
 
 /// Lower a `BuiltinCall("List.<method>", args)`. `method` is the

@@ -1,0 +1,35 @@
+// Exhaustive gate for the four stdlib-enum discriminant predicates on
+// the wasm32-linear backend: `Result.isOk` / `Result.isErr` /
+// `Option.isSome` / `Option.isNone`. Each is printed for both variants
+// of its enum so both the positive (discriminant == 0, `i32.eq`) and
+// negative (discriminant != 0, `i32.ne`) branches of
+// `translate_enum_is_variant_builtin` are exercised. The `isOk` /
+// `isSome` lines in particular pin the eq-branch and the
+// "positive variant is declared first ⇒ discriminant 0" invariant the
+// wasm path hard-codes instead of computing a layout.
+//
+// Expected stdout:
+//   true
+//   false
+//   false
+//   true
+//   true
+//   false
+//   false
+//   true
+function main() {
+  let ok: Result<Int, String> = Ok(1)
+  let err: Result<Int, String> = Err("boom")
+  let some: Option<Int> = Some(5)
+  let none: Option<Int> = None
+
+  print(ok.isOk())
+  print(ok.isErr())
+  print(err.isOk())
+  print(err.isErr())
+
+  print(some.isSome())
+  print(some.isNone())
+  print(none.isSome())
+  print(none.isNone())
+}

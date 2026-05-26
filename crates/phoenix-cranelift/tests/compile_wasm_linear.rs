@@ -1587,6 +1587,86 @@ fn features_runs_under_wasmtime() {
     assert_wasm_matches_interp(FEATURES_SOURCE, "features");
 }
 
+/// `alloc_loop.phx` — first real GC-pressure stress test under
+/// wasmtime. 100k iterations, each allocating a 3-element `List<Int>`
+/// plus a `toString` + `StringConcat` chain producing a fresh heap
+/// string; cumulative allocation ≈ 8 MB which comfortably exceeds the
+/// runtime's 1 MB auto-collect threshold so the threshold-driven
+/// sweep path runs many times during the test rather than not at all.
+///
+/// **This is what PR 3c slice 4's shadow-stack root emission gates.**
+/// Without precise rooting, the GC's conservative scan happens to
+/// keep current fixtures alive — but a 100k-allocation loop forces
+/// the sweep through every register/local boundary, so any missed
+/// root would surface as either:
+///
+/// - Wasmtime trap on a use-after-free (sweep zeroed a still-live
+///   heap pointer, subsequent load reads through the dangling
+///   reference).
+/// - OOM (no sweep ever frees the per-iteration allocs because they
+///   *all* root as conservative-scan hits in the data segment).
+/// - Wrong sum (the `total` accumulator gets clobbered).
+///
+/// Expected stdout: `300000` (100000 iterations × 3 elements per list).
+const ALLOC_LOOP_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/alloc_loop.phx"
+));
+
+#[test]
+fn alloc_loop_runs_under_wasmtime() {
+    assert_wasm_matches_interp(ALLOC_LOOP_SOURCE, "alloc_loop");
+}
+
+/// `defer_try.phx` — gate for `Result.isErr` in conditional dispatch
+/// plus a `defer` that fires on the early-`?`-return path. The fixture
+/// exercises:
+///
+/// - `Op::EnumAlloc` with stdlib-`Result` (Ok/Err variants).
+/// - `BuiltinCall("Result.isErr")` returning a Bool from a
+///   discriminant-equality check.
+/// - The `?` operator's early-return lowering — `lower_try` emits a
+///   discriminant branch, payload extraction on the Ok arm, and a
+///   `Terminator::Return` of the original Err value on the Err arm.
+/// - `defer print("cleanup")` from the entry block runs before the
+///   early Return fires (the defer pre-linearization pass inserts
+///   the print before *every* exit terminator).
+///
+/// Expected stdout:
+///   cleanup
+///   failed
+const DEFER_TRY_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/defer_try.phx"
+));
+
+#[test]
+fn defer_try_runs_under_wasmtime() {
+    assert_wasm_matches_interp(DEFER_TRY_SOURCE, "defer_try");
+}
+
+/// `enum_predicates.phx` — exhaustive gate for all four stdlib-enum
+/// discriminant predicates (`Result.isOk` / `isErr`, `Option.isSome` /
+/// `isNone`). `defer_try` only exercises `isErr` (the `i32.ne`
+/// negative branch); this fixture prints every predicate against both
+/// variants of its enum, so `translate_enum_is_variant_builtin`'s
+/// `i32.eq` positive branch (`isOk` / `isSome`) and the
+/// "positive variant ⇒ discriminant 0" invariant — which the wasm path
+/// hard-codes rather than deriving from a layout — are both pinned.
+///
+/// Expected stdout (per the fixture): the eight booleans
+///   true false false true   (Result: ok/err × isOk/isErr)
+///   true false false true   (Option: some/none × isSome/isNone)
+const ENUM_PREDICATES_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/enum_predicates.phx"
+));
+
+#[test]
+fn enum_predicates_runs_under_wasmtime() {
+    assert_wasm_matches_interp(ENUM_PREDICATES_SOURCE, "enum_predicates");
+}
+
 /// Focused gate for the multi-slot `StringRef` field path inside
 /// `Op::StructAlloc` / `Op::StructGetField`. `defaults.phx` and
 /// `features.phx` exercise struct-with-Int-field codegen, but neither
