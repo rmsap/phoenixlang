@@ -29,6 +29,7 @@ use phoenix_modules::{ResolveError, ResolvedSourceModule, resolve_with_overlay};
 use phoenix_parser::parser;
 use phoenix_sema::checker;
 use tower_lsp::lsp_types::*;
+use tracing::{info_span, instrument};
 
 use crate::convert::{span_to_range, to_lsp_diagnostic};
 use crate::state::DocumentState;
@@ -300,7 +301,10 @@ pub(crate) fn compute_single_file_state(uri: Url, text: String) -> SingleFileRes
         .map(|d| to_lsp_diagnostic(d, &source_map, &source_id_to_url, &uri))
         .collect();
 
-    let check_result = checker::check(&program);
+    let check_result = {
+        let _span = info_span!("check").entered();
+        checker::check(&program)
+    };
     diagnostics.extend(
         check_result
             .diagnostics
@@ -391,7 +395,10 @@ pub(crate) fn compute_project_outcome(
 ) -> AnalyzeOutcome {
     let source_id_to_url = Arc::new(build_source_id_to_url(&modules));
     let source_id_to_module = Arc::new(build_source_id_to_module(&modules));
-    let analysis = Arc::new(checker::check_modules(&modules));
+    let analysis = {
+        let _span = info_span!("check_modules", modules = modules.len()).entered();
+        Arc::new(checker::check_modules(&modules))
+    };
 
     // Bucket project diagnostics by URI. A diagnostic whose source id
     // isn't in the URL map (defensive — shouldn't normally happen) is
@@ -594,6 +601,7 @@ pub(crate) fn compute_resolve_error_outcome(
 /// Pure dispatch: snapshot in, outcome out. Picks the project-success,
 /// resolve-error, or single-file branch based on the URI shape and
 /// resolver result.
+#[instrument(skip_all, name = "compute_analyze")]
 pub(crate) fn compute_analyze(
     snapshot: HashMap<Url, BufferSnapshot>,
     edited_uri: Url,
@@ -609,7 +617,10 @@ pub(crate) fn compute_analyze(
     let overlay = build_overlay_from_snapshot(&snapshot, &edited_uri, &edited_text);
 
     let mut source_map = SourceMap::new();
-    let resolve_result = resolve_with_overlay(&entry_path, &mut source_map, &overlay);
+    let resolve_result = {
+        let _span = info_span!("resolve").entered();
+        resolve_with_overlay(&entry_path, &mut source_map, &overlay)
+    };
     let source_map = Arc::new(source_map);
 
     match resolve_result {

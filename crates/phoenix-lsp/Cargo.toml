@@ -19,6 +19,8 @@ phoenix-sema = { path = "../phoenix-sema" }
 phoenix-modules = { path = "../phoenix-modules" }
 tower-lsp = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

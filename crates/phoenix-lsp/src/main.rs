@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tracing::instrument;
 
 mod convert;
 mod handlers;
@@ -46,6 +47,7 @@ impl Backend {
     /// resulting state writes and diagnostic publishes. The lock is
     /// *not* held across canonicalize syscalls, parsing, or `await`
     /// points.
+    #[instrument(skip_all, fields(uri = %uri, bytes = text.len()))]
     pub(crate) async fn analyze(&self, uri: Url, text: String) {
         let edited_path = uri.to_file_path().ok();
         let snapshot = self.snapshot_open_documents();
@@ -154,12 +156,14 @@ impl LanguageServer for Backend {
     }
 
     /// Analyzes a newly opened document and publishes diagnostics.
+    #[instrument(skip_all)]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         self.analyze(params.text_document.uri, params.text_document.text)
             .await;
     }
 
     /// Re-analyzes a document after edits and publishes updated diagnostics.
+    #[instrument(skip_all)]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
             self.analyze(params.text_document.uri, change.text).await;
@@ -194,6 +198,7 @@ impl LanguageServer for Backend {
     }
 
     /// Returns the resolved type at the cursor position as a Markdown hover.
+    #[instrument(skip_all)]
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
@@ -206,6 +211,7 @@ impl LanguageServer for Backend {
 
     /// Returns completion items: struct/enum/function names visible in
     /// the current module, plus keywords.
+    #[instrument(skip_all)]
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let docs = self.documents.lock().expect("document lock poisoned");
@@ -222,6 +228,7 @@ impl LanguageServer for Backend {
     /// it lives in a different file than the cursor. On single-file
     /// fallback (resolve error, edited buffer outside the import graph,
     /// non-`file://` URI) only same-file definitions resolve.
+    #[instrument(skip_all)]
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
@@ -239,6 +246,7 @@ impl LanguageServer for Backend {
     /// referenced. In multi-module mode this spans every file the most
     /// recent project analyze touched; on single-file fallback it
     /// covers only the edited buffer.
+    #[instrument(skip_all)]
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -254,6 +262,7 @@ impl LanguageServer for Backend {
     /// carries a per-URI bucket so each affected file gets its own
     /// coherent edit stream; on single-file fallback the edit set is
     /// scoped to the edited buffer only.
+    #[instrument(skip_all)]
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
@@ -268,8 +277,39 @@ impl LanguageServer for Backend {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    init_tracing();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+/// Install the latency-tracing subscriber.
+///
+/// stdout is the LSP transport, so all instrumentation is written to
+/// **stderr** (which editors capture into their language-server log).
+/// Output is line-delimited JSON; one record is emitted per span close
+/// carrying `time.busy`/`time.idle` (nanoseconds), so request and
+/// pipeline-stage latencies can be aggregated offline — e.g. redirect
+/// stderr to a file and run `jq` over it for p50/p99 per span name.
+///
+/// Tracing defaults to `off`: the spans sit on the per-keystroke
+/// analyze path, so leaving them on would add synchronous stderr writes
+/// to the hottest editing path for users who never asked to profile.
+/// Opt in at runtime via the `PHOENIX_LSP_LOG` env var (standard
+/// `tracing` filter syntax) — e.g. `PHOENIX_LSP_LOG=info` covers every
+/// span added here, and `PHOENIX_LSP_LOG=phoenix_lsp=debug` narrows to
+/// this crate.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    let filter =
+        EnvFilter::try_from_env("PHOENIX_LSP_LOG").unwrap_or_else(|_| EnvFilter::new("off"));
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(std::io::stderr)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_env_filter(filter)
+        .init();
 }
