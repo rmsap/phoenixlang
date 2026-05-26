@@ -764,19 +764,39 @@ impl FuncTranslateCtx {
         })
     }
 
-    /// Walk this function's `capture_types[..idx]` and compute the
-    /// byte offset of capture `idx` within the closure heap object.
-    /// The closure layout is `[fn_table_idx: i32 @ 0, capture_0,
-    /// capture_1, ...]`: the fn-table-idx occupies offset 0..4, then
-    /// each capture lives at its natural alignment past the previous
-    /// one.
+    /// Compute the byte offset of capture `idx` within the closure
+    /// heap object, given `target_ty` as the *concrete* type of that
+    /// capture. The closure layout is `[fn_table_idx: i32 @ 0,
+    /// capture_0, capture_1, ...]`: the fn-table-idx occupies offset
+    /// 0..4, then each capture lives at its natural alignment past the
+    /// previous one.
     ///
-    /// Used by `Op::ClosureLoadCapture` to compute the load offset.
+    /// Used by `Op::ClosureLoadCapture`, which passes `instr.result_type`
+    /// (the sema-substituted, concrete capture type) as `target_ty`
+    /// rather than reading `current_capture_types[idx]`. The reason:
+    /// for closures defined inside a generic, the closure's declared
+    /// `capture_types` can retain an unsubstituted `TypeVar("T")` (the
+    /// inner closure function is shared across single-instantiation
+    /// specializations rather than cloned). The instruction's
+    /// `result_type` *is* substituted, so it gives the real width.
+    /// Preceding captures are still walked from `current_capture_types`
+    /// — for the single-capture case (the only generic shape exercised
+    /// today; see `closures_over_generic.phx`) that slice is empty, so
+    /// no `TypeVar` is evaluated. Any closure inside a generic with a
+    /// *preceding* capture still typed `TypeVar` (i.e. a multi-capture
+    /// generic, regardless of whether the instantiations are cross-width)
+    /// instead surfaces a clean `phx_field_align_bytes` error rather than
+    /// miscompiling; that case stays a documented known issue.
+    ///
     /// Returns `Err` if `idx` is out of range — the IR verifier should
     /// reject `Op::ClosureLoadCapture` with an out-of-range index
     /// before codegen, so reaching the `Err` path indicates an
     /// internal compiler bug.
-    pub(super) fn capture_offset(&self, idx: usize) -> Result<u32, CompileError> {
+    pub(super) fn capture_offset(
+        &self,
+        idx: usize,
+        target_ty: &IrType,
+    ) -> Result<u32, CompileError> {
         if idx >= self.current_capture_types.len() {
             return Err(CompileError::new(format!(
                 "wasm32-linear: `Op::ClosureLoadCapture` capture index {idx} \
@@ -785,20 +805,7 @@ impl FuncTranslateCtx {
                 self.current_capture_types.len()
             )));
         }
-        // Start past the 4-byte fn-table-idx at offset 0; walk the
-        // capture types in order and pad each by its natural
-        // alignment before adding its size. Mirrors the alloc-side
-        // walk in `Op::ClosureAlloc` so the offsets line up exactly.
-        let mut cursor: u32 = 4;
-        for cap_ty in &self.current_capture_types[..idx] {
-            let align = phx_field_align_bytes(cap_ty)?;
-            let size = phx_field_size_bytes(cap_ty)?;
-            cursor = align_up(cursor, align);
-            cursor += size;
-        }
-        let cap_ty = &self.current_capture_types[idx];
-        let align = phx_field_align_bytes(cap_ty)?;
-        Ok(align_up(cursor, align))
+        capture_byte_offset(&self.current_capture_types[..idx], target_ty)
     }
 
     /// Allocate the `i32` "next block ID" local used by the loop+switch
@@ -1788,53 +1795,73 @@ fn translate_instruction(
         // of this function roots the resulting closure pointer.
         Op::ClosureAlloc(target_fid, captures) => {
             let vid = expect_result(instr, "Op::ClosureAlloc")?;
-            // The IR-side `lower_lambda` records the lambda's
-            // `capture_types` directly on the target `IrFunction`;
-            // walking *those* (rather than re-deriving from the IR
-            // module's `bindings`/`type_map` like the native path
-            // does) keeps the alloc-side and load-side
-            // (`Op::ClosureLoadCapture`) layouts pinned to the same
+            // Layout source: the *alloc-site value types* of the
+            // capture vids, not the target closure function's declared
+            // `capture_types`. For closures defined inside a generic,
+            // the declared `capture_types` can retain an unsubstituted
+            // `TypeVar("T")` (the inner closure function is shared
+            // across single-instantiation specializations rather than
+            // cloned — see `closures_over_generic.phx`). The alloc-site
+            // values, by contrast, live in the enclosing *monomorphized*
+            // function, so their binding types are always concrete.
+            // This mirrors the native backend, which reads capture
+            // types from `state.type_map` at the alloc site for exactly
+            // this reason. The load side (`Op::ClosureLoadCapture`)
+            // recovers the concrete target type from the instruction's
+            // `result_type`, so both sides agree on offsets.
+            // Collect each capture's concrete value type *and* its
+            // locals from the SAME binding lookup (one `binding_of` per
+            // capture, not two), so the offset computed below and the
+            // store that consumes it are derived from one consistent
             // source.
-            // `get_concrete` is an O(1) `FuncId`-indexed lookup
-            // (`FuncId` is the slot position); it returns `None` for an
-            // out-of-range id or a generic-template slot, both of which
-            // are IR builder / monomorphizer drift at this point.
-            let target_func = ir_module.get_concrete(*target_fid).ok_or_else(|| {
-                CompileError::new(format!(
-                    "wasm32-linear: `Op::ClosureAlloc({target_fid:?})` references a \
-                     function with no concrete body (out of range, or an \
-                     un-specialized template — internal compiler bug, IR builder \
-                     / monomorphizer drift)"
-                ))
-            })?;
-            let capture_types = &target_func.capture_types;
-            if capture_types.len() != captures.len() {
-                return Err(CompileError::new(format!(
-                    "wasm32-linear: `Op::ClosureAlloc({target_fid:?})` arity \
-                     mismatch — IR target declares {} captures but the alloc \
-                     site supplies {} (internal compiler bug — IR builder \
-                     invariant violated)",
-                    capture_types.len(),
-                    captures.len()
-                )));
+            let mut capture_value_types: Vec<IrType> = Vec::with_capacity(captures.len());
+            let mut capture_locals: Vec<ParamSlotLocals> = Vec::with_capacity(captures.len());
+            for cap_vid in captures {
+                let bnd = ctx.binding_of(*cap_vid)?;
+                capture_value_types.push(bnd.ir_type.clone());
+                capture_locals.push(bnd.locals.clone());
             }
-            // Walk capture types to compute per-capture byte offset
-            // and the total allocation size. Mirrors `capture_offset`
-            // exactly — keeping the loop here (rather than calling
-            // `capture_offset` in a loop) costs less and avoids the
-            // redundant per-call prefix-sum recomputation.
-            let mut cursor: u32 = 4; // skip the fn-table-idx
-            let mut offsets: Vec<u32> = Vec::with_capacity(capture_types.len());
+            // Layout is taken entirely from the alloc-site bindings above,
+            // but the supplied capture *count* must still match the target
+            // closure's declared capture arity — a mismatch is an IR
+            // builder invariant violation. Only the arity is checked here:
+            // the declared element types can retain unsubstituted
+            // `TypeVar`s for closures inside generics (precisely why layout
+            // comes from the bindings, not from here), but their count is
+            // always correct. `get_concrete` returns `None` for an
+            // out-of-range or un-specialized template slot; that is its own
+            // form of drift, surfaced downstream by
+            // `require_closure_target_slot`, so this assert simply skips it.
+            debug_assert!(
+                ir_module
+                    .get_concrete(*target_fid)
+                    .is_none_or(|f| f.capture_types.len() == captures.len()),
+                "wasm32-linear: `Op::ClosureAlloc({target_fid:?})` arity mismatch — \
+                 IR target declares {:?} captures but the alloc site supplies {} \
+                 (internal compiler bug — IR builder invariant violated)",
+                ir_module
+                    .get_concrete(*target_fid)
+                    .map(|f| f.capture_types.len()),
+                captures.len(),
+            );
+            // Per-capture byte offsets via the shared `place_capture`
+            // step — the same per-capture logic the load side
+            // (`Op::ClosureLoadCapture` → `capture_byte_offset`) uses, so
+            // the two cannot drift. A single running cursor keeps this
+            // O(n) (no per-capture prefix-sum recomputation), and each
+            // capture's align/size is fetched exactly once. The running
+            // cursor's final value is the end of the last capture, so the
+            // total allocation size is just that rounded up to the
+            // object's max alignment. With no captures the object is the
+            // 4-byte fn-table-idx alone.
+            let mut offsets: Vec<u32> = Vec::with_capacity(capture_value_types.len());
+            let mut cursor: u32 = 4; // skip the fn-table-idx at offset 0
             let mut max_align: u32 = 4; // fn-table-idx is i32
-            for ty in capture_types {
-                let align = phx_field_align_bytes(ty)?;
-                let size = phx_field_size_bytes(ty)?;
-                if align > max_align {
-                    max_align = align;
-                }
-                let off = align_up(cursor, align);
-                offsets.push(off);
-                cursor = off + size;
+            for ty in &capture_value_types {
+                let (offset, end, align) = place_capture(cursor, ty)?;
+                offsets.push(offset);
+                cursor = end;
+                max_align = max_align.max(align);
             }
             let total_size = align_up(cursor, max_align);
             // Allocate. `phx_gc_alloc(size, type_tag)` returns the i32
@@ -1854,20 +1881,17 @@ fn translate_instruction(
             ctx.emit(Instruction::LocalGet(closure_ptr_local));
             ctx.emit(Instruction::I32Const(fn_table_slot as i32));
             ctx.emit(Instruction::I32Store(i32_memarg(0)));
-            // Store each capture at its computed offset.
-            for (i, cap_vid) in captures.iter().enumerate() {
-                let offset = offsets[i];
-                let cap_locals = ctx.binding_of(*cap_vid)?.locals.clone();
-                // Take the store shape from the SAME `capture_types[i]`
-                // the offset was derived from, so the alloc-side offset
-                // and the store width can't drift apart. If the captured
-                // value's binding carries a different slot count than this
-                // type implies, `emit_field_store`'s per-arm
-                // `value_locals.len()` debug-asserts fire — localizing an
-                // IR-builder invariant violation here rather than as a
-                // far-removed wasmparser/runtime fault.
-                let cap_ty = &capture_types[i];
-                emit_field_store(ctx, closure_ptr_local, offset, cap_ty, &cap_locals)?;
+            // Store each capture at its computed offset, using the same
+            // alloc-site value type and locals the offset was derived
+            // from so the offset and store width can't drift apart.
+            for i in 0..capture_value_types.len() {
+                emit_field_store(
+                    ctx,
+                    closure_ptr_local,
+                    offsets[i],
+                    &capture_value_types[i],
+                    &capture_locals[i],
+                )?;
             }
         }
 
@@ -1875,15 +1899,19 @@ fn translate_instruction(
         //
         // Inside a closure function body, read capture #idx from the
         // env pointer (the closure's first param). `capture_offset`
-        // walks `current_capture_types[..idx]` to reconstruct the
-        // same byte offset the alloc side wrote at — they have to
-        // agree by construction since both consult the same
-        // `IrFunction::capture_types` source.
+        // reconstructs the same byte offset the alloc side wrote at:
+        // it walks `current_capture_types[..idx]` for the preceding
+        // captures and takes `instr.result_type` (the concrete,
+        // sema-substituted capture type) as the target. Passing
+        // `result_type` rather than reading `current_capture_types[idx]`
+        // is what lets a closure defined inside a generic resolve its
+        // capture even when the declared `capture_types` retains an
+        // unsubstituted `TypeVar` — see `capture_offset`'s docs.
         Op::ClosureLoadCapture(env_vid, capture_idx) => {
             let vid = expect_result(instr, "Op::ClosureLoadCapture")?;
             let env_local = ctx.binding_of(*env_vid)?.single_local();
-            let offset = ctx.capture_offset(*capture_idx as usize)?;
             let result_ty = instr.result_type.clone();
+            let offset = ctx.capture_offset(*capture_idx as usize, &result_ty)?;
             emit_field_load(ctx, env_local, offset, &result_ty)?;
             ctx.emit_store_result(vid, result_ty)?;
         }
@@ -2177,6 +2205,45 @@ fn emit_restore_stack_frame(
     ctx.emit(Instruction::LocalGet(saved_sp_local));
     ctx.emit(Instruction::GlobalSet(sp_global));
     Ok(())
+}
+
+/// One step of the closure heap-layout walk: given `cursor` (the byte
+/// position just past the previous capture — starts at 4 to clear the
+/// fn-table-idx at offset 0), align `ty` to its natural alignment and
+/// return `(offset, end, align)` where `offset` is where this capture
+/// starts, `end` is the cursor just past it (`offset + size`), and
+/// `align` is the capture's alignment (so callers tracking the object's
+/// max alignment don't re-fetch it).
+///
+/// The single source of the per-capture layout step, shared by the
+/// alloc-side walk (`Op::ClosureAlloc`) and the load-side
+/// reconstruction ([`capture_byte_offset`]) so the two cannot drift.
+fn place_capture(cursor: u32, ty: &IrType) -> Result<(u32, u32, u32), CompileError> {
+    let align = phx_field_align_bytes(ty)?;
+    let offset = align_up(cursor, align);
+    Ok((offset, offset + phx_field_size_bytes(ty)?, align))
+}
+
+/// Compute the byte offset of a closure capture given the ordered
+/// types of the captures that *precede* it plus the concrete type of
+/// the target capture. Walks each preceding capture through
+/// [`place_capture`], then places the target the same way and returns
+/// its offset.
+///
+/// Used by the load side ([`FuncTranslateCtx::capture_offset`], which
+/// passes `current_capture_types[..idx]` for the preceding walk and the
+/// instruction's `result_type` as the target). The alloc side
+/// (`Op::ClosureAlloc`) walks the captures itself in O(n) but through
+/// the same [`place_capture`] step, so the offsets are byte-for-byte
+/// consistent without recomputing the prefix sum per capture.
+fn capture_byte_offset(preceding: &[IrType], target_ty: &IrType) -> Result<u32, CompileError> {
+    let mut cursor: u32 = 4; // skip the fn-table-idx at offset 0
+    for cap_ty in preceding {
+        let (_, end, _) = place_capture(cursor, cap_ty)?;
+        cursor = end;
+    }
+    let (offset, _, _) = place_capture(cursor, target_ty)?;
+    Ok(offset)
 }
 
 /// Emit an i64 binary arith op. Loads both operands, applies the WASM

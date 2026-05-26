@@ -1654,6 +1654,40 @@ fn closures_runs_under_wasmtime() {
     assert_wasm_matches_interp(CLOSURES_SOURCE, "closures");
 }
 
+/// `closures_over_generic.phx` — gate for closures defined inside a
+/// generic function. The closure `makeBox<T>` captures `x: T`; after
+/// monomorphization to `makeBox<Int>`, the inner closure function is
+/// *shared* (not cloned per specialization), so its declared
+/// `capture_types` retains an unsubstituted `TypeVar("T")`.
+///
+/// The WASM backend resolves this exactly as the native backend does:
+///
+/// - `Op::ClosureAlloc` derives the capture layout from the *alloc-
+///   site value types* (the capture vids' bindings in the enclosing
+///   *monomorphized* `makeBox<Int>`, which are concrete `Int`), not
+///   from the shared closure's declared `capture_types`.
+/// - `Op::ClosureLoadCapture` derives the load offset using the
+///   instruction's substituted `result_type` (concrete `Int`) as the
+///   target capture type, walking `current_capture_types` only for
+///   the preceding captures (empty for the single-capture shape here).
+///
+/// A regression that reverted either side to reading the closure's
+/// declared `capture_types` would fail compilation with a `TypeVar`
+/// reaching `phx_field_align_bytes`.
+///
+/// Expected stdout:
+///   42
+///   12
+const CLOSURES_OVER_GENERIC_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/closures_over_generic.phx"
+));
+
+#[test]
+fn closures_over_generic_runs_under_wasmtime() {
+    assert_wasm_matches_interp(CLOSURES_OVER_GENERIC_SOURCE, "closures_over_generic");
+}
+
 /// `Map<String, Int>` literal + length + contains + remove: PR 3d
 /// slice 4's gate for `Op::MapAlloc`, `BuiltinCall("Map.length")`,
 /// `BuiltinCall("Map.contains")`, and `BuiltinCall("Map.remove")`.
