@@ -1690,6 +1690,83 @@ fn translate_instruction(
             }
         }
 
+        // --- Map allocation -----------------------------------------
+        //
+        // `Op::MapAlloc(pairs)` lowers to a single
+        // `phx_map_from_pairs(key_size, val_size, n_pairs, pair_data)`
+        // runtime call: codegen reserves an on-stack pair buffer (via
+        // [`emit_alloc_stack_frame`]), writes each `(key, val)` pair
+        // back-to-back at densely packed offsets (no slot padding —
+        // the runtime indexes by `(ks + vs) * i`), then hands the
+        // whole buffer over and lets the runtime hash-build the table
+        // in one pass. Avoids the O(n) per-insert overhead of driving
+        // the literal through `phx_map_set_raw`.
+        //
+        // Empty literals (`{}`) skip the buffer entirely and pass a
+        // null pair_data pointer — the runtime's `n_pairs == 0`
+        // carve-out makes the buffer unnecessary in that case (it's
+        // never dereferenced).
+        //
+        // The result is a fresh heap-allocated map; the blanket
+        // post-instruction `emit_gc_set_root` roots it.
+        Op::MapAlloc(entries) => {
+            let vid = expect_result(instr, "Op::MapAlloc")?;
+            let (key_ty, val_ty) = match &instr.result_type {
+                IrType::MapRef(k, v) => (k.as_ref().clone(), v.as_ref().clone()),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::MapAlloc` result type must be `MapRef`, \
+                         got `{other:?}` (internal compiler bug — IR verifier should \
+                         have caught this)"
+                    )));
+                }
+            };
+            let ks = phx_field_size_bytes(&key_ty)? as i64;
+            let vs = phx_field_size_bytes(&val_ty)? as i64;
+            let count = entries.len() as i64;
+            let map_from_pairs_idx = b.require_phx_func("phx_map_from_pairs")?;
+
+            if entries.is_empty() {
+                // `phx_map_from_pairs(ks, vs, 0, null_i32)` — runtime
+                // safety doc explicitly allows null `pair_data` when
+                // `n_pairs == 0`.
+                ctx.emit(Instruction::I64Const(ks));
+                ctx.emit(Instruction::I64Const(vs));
+                ctx.emit(Instruction::I64Const(0));
+                ctx.emit(Instruction::I32Const(0));
+                ctx.emit(Instruction::Call(map_from_pairs_idx));
+                ctx.emit_store_result(vid, instr.result_type.clone())?;
+            } else {
+                let pair_size = (ks + vs) as u32;
+                let buf_size = pair_size * entries.len() as u32;
+                let (saved_sp, frame_ptr_local) = emit_alloc_stack_frame(ctx, b, buf_size)?;
+
+                // Write each `(key, val)` pair at offset `i * pair_size`.
+                // Key at `pair_off`, value at `pair_off + ks` —
+                // mirrors the runtime's `pair_data.add(i * pair_size)` /
+                // `pair_data.add(i * pair_size + ks)` access shape.
+                for (i, (k_vid, v_vid)) in entries.iter().enumerate() {
+                    let pair_off = (i as u32) * pair_size;
+                    let k_binding = ctx.binding_of(*k_vid)?;
+                    let k_locals = k_binding.locals.clone();
+                    let k_ty = k_binding.ir_type.clone();
+                    emit_field_store(ctx, frame_ptr_local, pair_off, &k_ty, &k_locals)?;
+                    let v_binding = ctx.binding_of(*v_vid)?;
+                    let v_locals = v_binding.locals.clone();
+                    let v_ty = v_binding.ir_type.clone();
+                    emit_field_store(ctx, frame_ptr_local, pair_off + ks as u32, &v_ty, &v_locals)?;
+                }
+
+                ctx.emit(Instruction::I64Const(ks));
+                ctx.emit(Instruction::I64Const(vs));
+                ctx.emit(Instruction::I64Const(count));
+                ctx.emit(Instruction::LocalGet(frame_ptr_local));
+                ctx.emit(Instruction::Call(map_from_pairs_idx));
+                ctx.emit_store_result(vid, instr.result_type.clone())?;
+                emit_restore_stack_frame(ctx, b, saved_sp)?;
+            }
+        }
+
         // --- Closure allocation -------------------------------------
         //
         // Closure heap layout: `[fn_table_idx: i32 @ 0, capture_0,
@@ -2035,6 +2112,73 @@ fn emit_sret_string_call(
     Ok(())
 }
 
+/// Reserve `n_bytes` (rounded up to 16-byte alignment) on the WASM
+/// shadow stack via `__stack_pointer` global manipulation. Returns
+/// `(saved_sp_local, frame_ptr_local)`:
+///
+/// - `saved_sp_local` (i32) holds the pre-decrement SP — pass it to
+///   [`emit_restore_stack_frame`] after the call to restore SP exactly,
+///   robust against any callee SP mismanagement.
+/// - `frame_ptr_local` (i32) holds the post-decrement SP, which is the
+///   base address of the reserved frame. Use `emit_field_store` or
+///   raw `i32.store` to fill it before invoking the runtime.
+///
+/// The 16-byte rounding matches [`SRET_FRAME_BYTES`]'s alignment and
+/// the runtime image's `__stack_pointer` init value (1 MiB, 16-aligned
+/// per decision H) so the resulting frame pointer is 16-byte aligned
+/// regardless of `n_bytes`. Callers pass the *exact* byte count they
+/// need; this helper does the padding.
+///
+/// Used by `Op::MapAlloc` (pair-data buffer) and the
+/// `Map.<method>(key, ...)` family (single-key buffer). Future
+/// callouts that need scratch space on the shadow stack route through
+/// here too so the SP-manipulation dance stays in one place.
+fn emit_alloc_stack_frame(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    n_bytes: u32,
+) -> Result<(u32, u32), CompileError> {
+    let sp_global = b.require_stack_pointer_global()?;
+    // Pad up to 16-byte alignment. Power-of-two-mask trick: rounds
+    // `n_bytes` to the next multiple of 16. The +15 can't overflow
+    // because n_bytes comes from `phx_field_size_bytes * small_count`
+    // in practice — pathologically huge values would hit
+    // `wasm-encoder`'s i32 limit long before reaching here.
+    let padded = (n_bytes + 15) & !15;
+
+    let saved_sp_local = ctx.allocate_temp_local(ValType::I32);
+    let frame_ptr_local = ctx.allocate_temp_local(ValType::I32);
+
+    // saved_sp = SP
+    ctx.emit(Instruction::GlobalGet(sp_global));
+    ctx.emit(Instruction::LocalSet(saved_sp_local));
+
+    // SP = saved_sp - padded; frame_ptr = SP
+    ctx.emit(Instruction::LocalGet(saved_sp_local));
+    ctx.emit(Instruction::I32Const(padded as i32));
+    ctx.emit(Instruction::I32Sub);
+    ctx.emit(Instruction::LocalTee(frame_ptr_local));
+    ctx.emit(Instruction::GlobalSet(sp_global));
+
+    Ok((saved_sp_local, frame_ptr_local))
+}
+
+/// Restore SP from the local returned by [`emit_alloc_stack_frame`].
+/// Pop the operand-stack result of any preceding runtime call first
+/// — this helper only modifies the SP global, not the operand stack,
+/// so a still-pending result on top of the operand stack would be left
+/// orphaned across the restore.
+fn emit_restore_stack_frame(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    saved_sp_local: u32,
+) -> Result<(), CompileError> {
+    let sp_global = b.require_stack_pointer_global()?;
+    ctx.emit(Instruction::LocalGet(saved_sp_local));
+    ctx.emit(Instruction::GlobalSet(sp_global));
+    Ok(())
+}
+
 /// Emit an i64 binary arith op. Loads both operands, applies the WASM
 /// instruction, stores the result into a fresh i64 local. Shared by
 /// IAdd / ISub / IMul / IDiv / IMod.
@@ -2147,11 +2291,211 @@ fn translate_builtin_call(
             args,
             instr,
         ),
+        // `Map.<method>` dispatcher. This slice covers the read-side
+        // surface (`length`, `contains`, `keys`, `values`) plus
+        // `remove` (which returns a fresh map). The `get` / `set`
+        // payload-returning methods ship later — `get` needs
+        // multi-block Option construction inside a builtin, `set`
+        // needs both a key buffer and a value buffer on the same
+        // stack frame.
+        map_method if map_method.starts_with("Map.") => translate_map_method_builtin(
+            ctx,
+            b,
+            map_method.strip_prefix("Map.").unwrap(),
+            args,
+            instr,
+        ),
         other => Err(CompileError::new(format!(
             "wasm32-linear: builtin `{other}` not yet supported \
              (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
         ))),
     }
+}
+
+/// Lower a `BuiltinCall("Map.<method>", args)`. `method` is the
+/// stripped suffix (e.g. `"length"`, `"contains"`).
+///
+/// Methods that take a key arg (`contains` / `remove`) stage the key
+/// onto the WASM shadow stack first (via [`emit_alloc_stack_frame`]
+/// and [`emit_field_store`]), then pass `(map, key_ptr, key_size)` to
+/// the runtime. SP is restored after the call returns so map literals
+/// or chained method calls don't leak stack space.
+fn translate_map_method_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    match method {
+        // `phx_map_length(map: i32) -> i64`. The result is the scalar
+        // `Int`, so the store type is pinned to `I64` rather than read
+        // from `instr.result_type` (matches `List.length`).
+        "length" => emit_map_unary_call(
+            ctx,
+            b,
+            "phx_map_length",
+            "Map.length",
+            args,
+            instr,
+            IrType::I64,
+        ),
+        // `phx_map_keys(map: i32) -> i32` (list pointer). The returned
+        // list is GC-tracked; the blanket post-instruction
+        // `emit_gc_set_root` at the bottom of `translate_instruction`
+        // roots it, so the `ListRef` result type flows through verbatim.
+        "keys" => emit_map_unary_call(
+            ctx,
+            b,
+            "phx_map_keys",
+            "Map.keys",
+            args,
+            instr,
+            instr.result_type.clone(),
+        ),
+        // `phx_map_values(map: i32) -> i32` (list pointer). Same shape
+        // as `keys`.
+        "values" => emit_map_unary_call(
+            ctx,
+            b,
+            "phx_map_values",
+            "Map.values",
+            args,
+            instr,
+            instr.result_type.clone(),
+        ),
+        // `phx_map_contains(map: i32, key_ptr: i32, key_size: i64) -> i32`.
+        // C ABI widens the runtime's `i8` return to i32 on wasm32, so the
+        // bool result lands as a single-slot i32 0/1 — exactly what
+        // `IrType::Bool` flattens to, so the store type is pinned to
+        // `Bool` rather than read from `instr.result_type`.
+        "contains" => emit_map_key_staged_call(
+            ctx,
+            b,
+            "phx_map_contains",
+            "Map.contains",
+            args,
+            instr,
+            IrType::Bool,
+        ),
+        // `phx_map_remove_raw(map: i32, key_ptr: i32, key_size: i64) -> i32`
+        // returns a fresh map with the entry removed (or an equivalent
+        // if the key was absent). The returned map pointer is GC-tracked;
+        // the blanket post-instruction `emit_gc_set_root` roots it, so the
+        // `MapRef` result type flows through verbatim.
+        "remove" => emit_map_key_staged_call(
+            ctx,
+            b,
+            "phx_map_remove_raw",
+            "Map.remove",
+            args,
+            instr,
+            instr.result_type.clone(),
+        ),
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"Map.{other}\")` not yet supported \
+             (Phase 2.4 PR 3d — `get` / `set` ship in a later slice; `get` \
+             needs multi-block Option construction inside a builtin, `set` \
+             needs a key + value pair on the same stack frame)"
+        ))),
+    }
+}
+
+/// Emit a unary `phx_map_<m>(map: i32) -> R` runtime call: resolve the
+/// single map-pointer arg, invoke `runtime_fn`, and store the result as
+/// `result_ty`. Shared by `Map.length` / `Map.keys` / `Map.values` — the
+/// methods that take no key and so need no shadow-stack staging.
+///
+/// `result_ty` is passed explicitly rather than read from
+/// `instr.result_type` so scalar-returning `length` can pin `I64` while
+/// the list-returning `keys` / `values` forward their `ListRef` result
+/// type. A ref-typed result is rooted by the blanket post-instruction
+/// `emit_gc_set_root`.
+fn emit_map_unary_call(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    runtime_fn: &str,
+    label: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+    result_ty: IrType,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, &format!("BuiltinCall(\"{label}\")"))?;
+    if args.len() != 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"{label}\")` requires 1 arg \
+             (the map), got {} (internal compiler bug — IR verifier should \
+             have caught this)",
+            args.len()
+        )));
+    }
+    let map_ptr_local = ctx.binding_of(args[0])?.single_local();
+    let idx = b.require_phx_func(runtime_fn)?;
+    ctx.emit(Instruction::LocalGet(map_ptr_local));
+    ctx.emit(Instruction::Call(idx));
+    ctx.emit_store_result(vid, result_ty)?;
+    Ok(())
+}
+
+/// Emit a key-staged `phx_map_<m>(map, key_ptr, key_size) -> R` runtime
+/// call: resolve `(map, key)` via [`resolve_map_key_call`], stage the key
+/// onto the WASM shadow stack (via [`emit_alloc_stack_frame`] and
+/// [`emit_field_store`]), invoke `runtime_fn`, store the result as
+/// `result_ty`, then restore SP so map literals or chained method calls
+/// don't leak stack space. Shared by `Map.contains` / `Map.remove`.
+///
+/// `result_ty` is passed explicitly so `contains` can pin `Bool` (the
+/// `i8`-widened-to-i32 runtime return) while `remove` forwards its
+/// `MapRef` result type — rooted by the blanket post-instruction
+/// `emit_gc_set_root`. The result is stored *before* SP is restored:
+/// `emit_restore_stack_frame` only touches the SP global, so a result
+/// still pending on the operand stack would be orphaned across it.
+fn emit_map_key_staged_call(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    runtime_fn: &str,
+    label: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+    result_ty: IrType,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, &format!("BuiltinCall(\"{label}\")"))?;
+    let (map_ptr_local, key_locals, key_ty) = resolve_map_key_call(ctx, label, args)?;
+    let key_size = phx_field_size_bytes(&key_ty)? as i64;
+    let (saved_sp, key_frame_local) = emit_alloc_stack_frame(ctx, b, key_size as u32)?;
+    emit_field_store(ctx, key_frame_local, 0, &key_ty, &key_locals)?;
+    let idx = b.require_phx_func(runtime_fn)?;
+    ctx.emit(Instruction::LocalGet(map_ptr_local));
+    ctx.emit(Instruction::LocalGet(key_frame_local));
+    ctx.emit(Instruction::I64Const(key_size));
+    ctx.emit(Instruction::Call(idx));
+    ctx.emit_store_result(vid, result_ty)?;
+    emit_restore_stack_frame(ctx, b, saved_sp)?;
+    Ok(())
+}
+
+/// Resolve `(map_ptr_local, key_locals, key_ir_type)` for the
+/// 2-arg `Map.<m>(map, key)` shape. Centralizes the arity check and
+/// the binding-lookup so [`emit_map_key_staged_call`] only handles the
+/// runtime call shape.
+fn resolve_map_key_call(
+    ctx: &FuncTranslateCtx,
+    label: &str,
+    args: &[ValueId],
+) -> Result<(u32, Vec<u32>, IrType), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"{label}\")` requires 2 args \
+             (map, key), got {} (internal compiler bug — IR verifier should \
+             have caught this)",
+            args.len()
+        )));
+    }
+    let map_ptr_local = ctx.binding_of(args[0])?.single_local();
+    let key_binding = ctx.binding_of(args[1])?;
+    let key_locals = key_binding.locals.clone();
+    let key_ty = key_binding.ir_type.clone();
+    Ok((map_ptr_local, key_locals, key_ty))
 }
 
 /// Lower a `BuiltinCall("Result.<m>", ...)` or

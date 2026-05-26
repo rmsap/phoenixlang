@@ -1654,6 +1654,102 @@ fn closures_runs_under_wasmtime() {
     assert_wasm_matches_interp(CLOSURES_SOURCE, "closures");
 }
 
+/// `Map<String, Int>` literal + length + contains + remove: PR 3d
+/// slice 4's gate for `Op::MapAlloc`, `BuiltinCall("Map.length")`,
+/// `BuiltinCall("Map.contains")`, and `BuiltinCall("Map.remove")`.
+/// The fixture exercises:
+///
+/// - `Op::MapAlloc` with three `(String, Int)` pairs — uses the WASM
+///   shadow-stack pair-buffer staging dance: reserve `3 * (ks + vs)
+///   = 48` bytes, write keys (multi-slot `StringRef`) and values
+///   (`i64`) at densely packed offsets, then call
+///   `phx_map_from_pairs`.
+/// - `Map.contains` with a key buffer staged on the shadow stack —
+///   write the `String` key into a 8-byte frame, pass pointer + size
+///   to `phx_map_contains`, restore SP after.
+/// - `Map.remove` returning a fresh map (`m2`) — same staging shape
+///   as `contains`, but the result is a GC-tracked map pointer rooted
+///   by the blanket post-instruction `emit_gc_set_root`.
+///
+/// Pinned to fixed scalars (counts) rather than iterating the map's
+/// contents so the test stays order-insensitive — `Map` iteration
+/// order is unspecified and would diverge from the interpreter on
+/// any rebuild.
+#[test]
+fn map_basic_ops_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, Int> = {\"alice\": 1, \"bob\": 2, \"carol\": 3}\n  \
+                 print(m.length())\n  \
+                 print(m.contains(\"bob\"))\n  \
+                 print(m.contains(\"dan\"))\n  \
+                 let m2 = m.remove(\"bob\")\n  \
+                 print(m2.length())\n  \
+                 print(m2.contains(\"bob\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_basic_ops");
+}
+
+/// Empty `Map<String, Int>` literal: pins the `n_pairs == 0` carve-
+/// out path in `Op::MapAlloc` — codegen skips the stack-buffer
+/// reservation entirely and passes a null `pair_data` pointer, per
+/// the runtime's documented safety contract. The runtime returns a
+/// fresh empty map; `Map.length` reads back zero.
+#[test]
+fn empty_map_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, Int> = {}\n  \
+                 print(m.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "empty_map");
+}
+
+/// `Map.keys` / `Map.values` returning fresh `List<K>` / `List<V>`.
+/// Iterating the keys list directly would be order-sensitive (Map
+/// iteration order is unspecified), so this fixture only pins
+/// `.length()` on the returned lists — the keys/values pointer must
+/// be a valid list whose length matches the source map's.
+#[test]
+fn map_keys_values_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, Int> = {\"a\": 1, \"b\": 2}\n  \
+                 let ks: List<String> = m.keys()\n  \
+                 let vs: List<Int> = m.values()\n  \
+                 print(ks.length())\n  \
+                 print(vs.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_keys_values");
+}
+
+/// `Map<String, String>` literal: exercises the multi-slot `StringRef`
+/// *value* store inside `Op::MapAlloc`'s densely-packed pair buffer.
+/// The `Map<String, Int>` fixtures above only write single-slot i64
+/// values; here each value writes a fat pointer instead (`ptr` at
+/// `pair_off + ks`, `len` at `pair_off + ks + 4`). A wrong value
+/// offset or size would clobber the adjacent pair's key bytes, so
+/// pinning `.length()` plus `.contains()` on every key (and a missing
+/// key) catches buffer-integrity regressions even though the value
+/// bytes themselves can't be read back by key yet (`Map.get` ships in
+/// a later slice). `.values().length()` confirms the value list builds.
+///
+/// Values are deliberately different lengths (`"x"` / `"yy"` / `"zzz"`)
+/// so a stale or fixed-width `len` slot would diverge from the
+/// interpreter. Order-insensitive by construction — no iteration over
+/// the map's contents, since `Map` iteration order is unspecified.
+#[test]
+fn map_string_values_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, String> = {\"alice\": \"x\", \"bob\": \"yy\", \"carol\": \"zzz\"}\n  \
+                 print(m.length())\n  \
+                 print(m.contains(\"alice\"))\n  \
+                 print(m.contains(\"bob\"))\n  \
+                 print(m.contains(\"carol\"))\n  \
+                 print(m.contains(\"dan\"))\n  \
+                 let vs: List<String> = m.values()\n  \
+                 print(vs.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_string_values");
+}
+
 /// `defer_try.phx` — gate for `Result.isErr` in conditional dispatch
 /// plus a `defer` that fires on the early-`?`-return path. The fixture
 /// exercises:
@@ -2279,9 +2375,10 @@ fn accepts_ref_typed_param_signature() {
     // op support lands later.
     //
     // `main` doesn't call `sink`, so the only path exercised is the
-    // signature declaration. Bodies that try to *use* the ref-typed
-    // value end up at op-level rejections covered by
-    // `rejects_unrepresentable_return_type` below.
+    // signature declaration. Bodies that try to *use* a ref-typed
+    // value through a still-unsupported surface (a builtin without
+    // a WASM lowering, today) end up at builtin-level rejections
+    // covered by `rejects_unsupported_list_method` below.
     let src = "function main() {}\n\
                function sink(xs: List<Int>) {\n  print(true)\n}\n";
     compile_src_or_assert_ok(
@@ -2345,26 +2442,29 @@ fn rejects_main_with_return_value() {
 }
 
 #[test]
-fn rejects_unrepresentable_return_type() {
-    // `wasm_valtypes_for` flattens `Map<K, V>` as a return type
-    // (single i32 GC pointer), so the *signature* declares fine.
-    // The body's `return {"a": 1}` lowers to `Op::MapAlloc`, which
-    // the body translator doesn't yet handle — the rejection
-    // happens at the op-translator level rather than at the
-    // signature-flattening level. Pin the op name so a regression
-    // that handled MapAlloc by accident would surface here.
+fn rejects_unsupported_list_method() {
+    // `BuiltinCall("List.contains", ...)` reaches the WASM body
+    // translator from `xs.contains(x)` (Phoenix sema accepts the
+    // method, IR lowering emits the builtin), but
+    // `translate_list_method_builtin` doesn't yet handle it — the
+    // rejection happens at the builtin-dispatcher level with a clean
+    // per-method diagnostic. Pin the method name so a regression
+    // that handled List.contains by accident would surface here.
     //
-    // (PR 3d slice 1 lifted the ListAlloc restriction; this test
-    // moved from `Op::ListAlloc` to `Op::MapAlloc` so the rejection
-    // surface keeps pinning *some* still-unsupported op until PR 3d
-    // is complete.)
-    let src = "function main() {}\n\
-               function returns_map() -> Map<String, Int> {\n  return {\"a\": 1}\n}\n";
+    // (PR 3d slices 1 / 4 lifted the `ListAlloc` / `MapAlloc`
+    // restrictions; this test moved from those op-level rejections
+    // to a builtin-level rejection on a still-unsupported method, so
+    // the test surface keeps pinning *some* still-gated path until
+    // PR 3d is complete.)
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [1, 2, 3]\n  \
+                 print(xs.contains(2))\n\
+               }\n";
     let err = expect_wasm_compile_error(src);
     assert!(
-        err.contains("MapAlloc") && err.contains("not yet supported"),
-        "expected `MapAlloc ... not yet supported` op-level error \
-         on return-position map, got: {err}"
+        err.contains("List.contains") && err.contains("not yet supported"),
+        "expected `List.contains ... not yet supported` builtin-level error, \
+         got: {err}"
     );
 }
 
