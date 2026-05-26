@@ -1442,6 +1442,63 @@ fn mutable_string_concat_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "mutable_string_concat");
 }
 
+/// `List<Int>` literal + length + for-loop iteration: PR 3d slice 1's
+/// gate for `Op::ListAlloc`, `BuiltinCall("List.length")`, and
+/// `BuiltinCall("List.get")`. The for-loop in Phoenix lowers to a
+/// multi-block CFG with an i64 counter alloca, `List.length` once,
+/// `List.get` per iteration, and an `ILt` against the cached length;
+/// this fixture exercises the full trio plus the existing
+/// loop+switch dispatcher. `List.length()` is also called as a
+/// standalone method to pin the BuiltinCall path independent of the
+/// for-loop's lowering.
+#[test]
+fn list_int_iteration_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [10, 20, 30]\n  \
+                 print(xs.length())\n  \
+                 for x in xs {\n    \
+                   print(x)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_int_iteration");
+}
+
+/// Empty `List<Int>` literal: pins that `Op::ListAlloc` with zero
+/// initial elements emits a valid `phx_list_alloc(elem_size, 0)`
+/// call and that `phx_list_length` reads back zero. A for-loop over
+/// the empty list would invoke `List.get` zero times — print just
+/// the length so the test stays in slice 1's surface even if the
+/// for-loop body were never reached on a real regression.
+#[test]
+fn empty_list_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = []\n  \
+                 print(xs.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "empty_list");
+}
+
+/// `List<String>` literal + for-loop iteration: pins the *multi-slot*
+/// element path that the `List<Int>` fixtures never reach. A
+/// `StringRef` element is an 8-byte fat pointer (i32 ptr + i32 len) on
+/// wasm32, so `Op::ListAlloc` exercises the two-`i32.store` `StringRef`
+/// arm of `emit_field_store` at a per-element `LIST_HEADER + i * 8`
+/// offset, and `List.get` exercises the `ptr` + `len@+4` arm of
+/// `emit_field_load`. The loaded string pointer is GC-managed, so this
+/// also covers the blanket `emit_gc_set_root` rooting the `List.get`
+/// result.
+#[test]
+fn list_string_iteration_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<String> = [\"alpha\", \"beta\", \"gamma\"]\n  \
+                 print(xs.length())\n  \
+                 for s in xs {\n    \
+                   print(s)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_string_iteration");
+}
+
 /// Three-way `Op::StringConcat` chain (`a + b + c`): pins that nested
 /// sret calls compose. Each concat allocates a new GC string; the
 /// chain `((a + b) + c)` runs `phx_str_concat` twice, with the
@@ -2173,20 +2230,25 @@ fn rejects_main_with_return_value() {
 
 #[test]
 fn rejects_unrepresentable_return_type() {
-    // `wasm_valtypes_for` flattens `List<Int>` as a return type
+    // `wasm_valtypes_for` flattens `Map<K, V>` as a return type
     // (single i32 GC pointer), so the *signature* declares fine.
-    // The body's `return [1, 2, 3]` lowers to `Op::ListAlloc`, which
-    // the body translator doesn't support — the rejection now happens
-    // at the op-translator level rather than at the signature-
-    // flattening level. Pin the op name so a regression that handled
-    // ListAlloc by accident would surface here.
+    // The body's `return {"a": 1}` lowers to `Op::MapAlloc`, which
+    // the body translator doesn't yet handle — the rejection
+    // happens at the op-translator level rather than at the
+    // signature-flattening level. Pin the op name so a regression
+    // that handled MapAlloc by accident would surface here.
+    //
+    // (PR 3d slice 1 lifted the ListAlloc restriction; this test
+    // moved from `Op::ListAlloc` to `Op::MapAlloc` so the rejection
+    // surface keeps pinning *some* still-unsupported op until PR 3d
+    // is complete.)
     let src = "function main() {}\n\
-               function returns_list() -> List<Int> {\n  return [1, 2, 3]\n}\n";
+               function returns_map() -> Map<String, Int> {\n  return {\"a\": 1}\n}\n";
     let err = expect_wasm_compile_error(src);
     assert!(
-        err.contains("ListAlloc") && err.contains("not yet supported"),
-        "expected `ListAlloc ... not yet supported` op-level error \
-         on return-position list, got: {err}"
+        err.contains("MapAlloc") && err.contains("not yet supported"),
+        "expected `MapAlloc ... not yet supported` op-level error \
+         on return-position map, got: {err}"
     );
 }
 

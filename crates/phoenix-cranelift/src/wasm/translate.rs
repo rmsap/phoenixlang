@@ -96,8 +96,9 @@ use super::gc_root::{
     emit_gc_pop_frame, emit_gc_set_root, op_produces_heap_pointer, setup_gc_frame,
 };
 use super::heap_layout::{
-    EnumLayout, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
+    EnumLayout, LIST_HEADER, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
     compute_variant_field_offsets, field_memarg, i32_memarg, is_gc_pointer_type, is_i32_field,
+    phx_field_size_bytes,
 };
 use super::module_builder::ModuleBuilder;
 use crate::error::CompileError;
@@ -1585,6 +1586,64 @@ fn translate_instruction(
             ctx.emit_store_result(vid, field_ty)?;
         }
 
+        // --- List allocation ----------------------------------------
+        //
+        // `Op::ListAlloc(elements)` lowers to
+        // `phx_list_alloc(elem_size, count)` followed by a store of
+        // each initial element at `LIST_HEADER + i * elem_size`.
+        // Element stride is *WASM-natural*, not native-matched:
+        // `phx_field_size_bytes` gives 4 bytes for `Bool` / GC-pointer
+        // refs and 8 bytes for `StringRef` (vs. 8 / 16 on native). The
+        // runtime is element-size-agnostic — `phx_list_alloc` stores
+        // the chosen elem_size in the list header and every subsequent
+        // accessor (`phx_list_get_raw`, `phx_list_length`,
+        // `phx_list_take`, ...) reads it back from the header, so a
+        // wasm32-sized stride works without runtime changes.
+        //
+        // The blanket post-instruction `emit_gc_set_root` at the end
+        // of this function roots the resulting list pointer.
+        Op::ListAlloc(elements) => {
+            let vid = expect_result(instr, "Op::ListAlloc")?;
+            let elem_ty = match &instr.result_type {
+                IrType::ListRef(t) => t.as_ref().clone(),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::ListAlloc` result type must be `ListRef`, \
+                         got `{other:?}` (internal compiler bug — IR verifier should \
+                         have caught this)"
+                    )));
+                }
+            };
+            let elem_size = phx_field_size_bytes(&elem_ty)?;
+            let count = elements.len();
+            // `phx_list_alloc` signature: `(elem_size: i64, count: i64) -> *mut u8`.
+            // Both args are i64 in the runtime ABI even on wasm32 (the
+            // runtime crate uses `i64` for portability — the wasm32
+            // lowering of `phx_list_alloc` declares an `(i64, i64) -> i32`
+            // function type, matching what `b.require_phx_func` returns
+            // from the merge).
+            let list_alloc_idx = b.require_phx_func("phx_list_alloc")?;
+            ctx.emit(Instruction::I64Const(elem_size as i64));
+            ctx.emit(Instruction::I64Const(count as i64));
+            ctx.emit(Instruction::Call(list_alloc_idx));
+            let list_ptr_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
+            ctx.emit(Instruction::LocalSet(list_ptr_local));
+            // Initial-element stores. Each element's value sits in its
+            // own already-bound binding (the IR lowering pass evaluated
+            // the literal before the alloc); read it via `binding_of`
+            // and write through `emit_field_store` at the per-i offset.
+            // Skipping if `elem_size == 0` is unnecessary — `Void`-typed
+            // elements would already have errored at the
+            // `phx_field_size_bytes(&elem_ty)?` call above.
+            for (i, elem_vid) in elements.iter().enumerate() {
+                let offset = LIST_HEADER + (i as u32) * elem_size;
+                let arg_binding = ctx.binding_of(*elem_vid)?;
+                let arg_locals = arg_binding.locals.clone();
+                let arg_ty = arg_binding.ir_type.clone();
+                emit_field_store(ctx, list_ptr_local, offset, &arg_ty, &arg_locals)?;
+            }
+        }
+
         other => {
             return Err(CompileError::new(format!(
                 "wasm32-linear: IR op `{other:?}` not yet supported \
@@ -1803,9 +1862,102 @@ fn translate_builtin_call(
     match name {
         "print" => translate_print_builtin(ctx, b, args),
         "toString" => translate_to_string_builtin(ctx, b, args, instr),
+        // `List.<method>` dispatcher. Phoenix lowers `xs.length()` /
+        // `xs[i]` / for-loops to `BuiltinCall("List.length", ...)` /
+        // `BuiltinCall("List.get", ...)`; this slice covers those two
+        // (the iteration trio with `Op::Alloca`'s i64 counter).
+        // Functional methods like `xs.map(f)` route through
+        // `list_methods_closure::translate_list_map` on native; those
+        // ship in a later PR 3d slice once closures land.
+        list_method if list_method.starts_with("List.") => translate_list_method_builtin(
+            ctx,
+            b,
+            list_method.strip_prefix("List.").unwrap(),
+            args,
+            instr,
+        ),
         other => Err(CompileError::new(format!(
             "wasm32-linear: builtin `{other}` not yet supported \
              (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
+        ))),
+    }
+}
+
+/// Lower a `BuiltinCall("List.<method>", args)`. `method` is the
+/// stripped suffix (e.g. `"length"`, `"get"`). Covers the iteration
+/// trio (`length`, `get`) needed by `for x in xs`-shaped loops. Other
+/// list methods (`map` / `filter` / `reduce` / `sortBy` / `flatMap` /
+/// `contains`) are rejected here so they show up as a clean
+/// "unsupported" diagnostic until later PR 3d slices add them.
+fn translate_list_method_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    match method {
+        "length" => {
+            // `phx_list_length(list) -> i64`. Returns 0 for an empty
+            // list. Result vid is i64; the blanket post-instruction
+            // `emit_gc_set_root` is a no-op for value types.
+            let vid = expect_result(instr, "BuiltinCall(\"List.length\")")?;
+            if args.len() != 1 {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `BuiltinCall(\"List.length\")` requires 1 arg \
+                     (the list), got {} (internal compiler bug — IR verifier should \
+                     have caught this)",
+                    args.len()
+                )));
+            }
+            let list_vid = args[0];
+            let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
+            let length_idx = b.require_phx_func("phx_list_length")?;
+            ctx.emit(Instruction::LocalGet(list_ptr_local));
+            ctx.emit(Instruction::Call(length_idx));
+            ctx.emit_store_result(vid, IrType::I64)?;
+            Ok(())
+        }
+        "get" => {
+            // `phx_list_get_raw(list, index) -> *const u8` returns a
+            // pointer to the element's bytes inside the list's data
+            // region. Load the element value(s) from offset 0 via
+            // `emit_field_load`, which handles single-slot scalars and
+            // the multi-slot `StringRef` fat pointer uniformly. The
+            // element's `IrType` comes from `instr.result_type` —
+            // sema annotated it from the list's element type.
+            let vid = expect_result(instr, "BuiltinCall(\"List.get\")")?;
+            if args.len() != 2 {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `BuiltinCall(\"List.get\")` requires 2 args \
+                     (list, index), got {} (internal compiler bug — IR verifier \
+                     should have caught this)",
+                    args.len()
+                )));
+            }
+            let list_vid = args[0];
+            let idx_vid = args[1];
+            let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
+            let idx_local = ctx.binding_of(idx_vid)?.single_local();
+            let get_raw_idx = b.require_phx_func("phx_list_get_raw")?;
+            ctx.emit(Instruction::LocalGet(list_ptr_local));
+            ctx.emit(Instruction::LocalGet(idx_local));
+            ctx.emit(Instruction::Call(get_raw_idx));
+            // Stash the data-region pointer in a local so
+            // `emit_field_load` can re-read it for each slot (a
+            // multi-slot `StringRef` needs the base pointer twice —
+            // once for ptr at offset 0 and once for len at offset 4).
+            let data_ptr_local = ctx.allocate_temp_local(ValType::I32);
+            ctx.emit(Instruction::LocalSet(data_ptr_local));
+            let elem_ty = instr.result_type.clone();
+            emit_field_load(ctx, data_ptr_local, 0, &elem_ty)?;
+            ctx.emit_store_result(vid, elem_ty)?;
+            Ok(())
+        }
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.{other}\")` not yet supported \
+             (Phase 2.4 PR 3d — see docs/phases/phase-2.md §2.4 PR 3d for the \
+             remaining list methods)"
         ))),
     }
 }

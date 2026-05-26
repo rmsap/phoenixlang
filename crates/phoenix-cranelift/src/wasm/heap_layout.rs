@@ -35,6 +35,17 @@ use phoenix_ir::types::IrType;
 
 use crate::error::CompileError;
 
+/// Bytes of bookkeeping at the head of every `phx_list_alloc`-produced
+/// list buffer (length, capacity, element-size, GC-header fields).
+/// The first element of the data region sits at `LIST_HEADER` from the
+/// list pointer; subsequent elements are at `LIST_HEADER + i * elem_size`.
+/// The value is pinned against the `phoenix_runtime::list_methods`
+/// implementation by the unit test `wasm_list_header_matches_runtime`
+/// below (a compile-time `const_assert!` inside the runtime can't see
+/// this constant — codegen and runtime are separate crates — so the
+/// test runs the lockstep check).
+pub(super) const LIST_HEADER: u32 = 24;
+
 /// `true` for IR types that flatten to a single `i32` GC pointer on
 /// wasm32 — `StructRef` / `EnumRef` / `ListRef` / `MapRef` /
 /// `ClosureRef`. Centralizing the list keeps [`super::translate::wasm_valtypes_for`],
@@ -340,4 +351,28 @@ fn unsupported(ty: &IrType, where_: &str) -> CompileError {
         "wasm32-linear: IR type `{ty:?}` not yet supported in {where_} \
          (Phase 2.4 PR 3 — see docs/design-decisions.md §Phase 2.4)"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lockstep check that the wasm32-linear backend's `LIST_HEADER`
+    /// matches the runtime's list-header size. The wasm constant is a
+    /// separate value from the native backend's `LIST_HEADER` (pinned
+    /// by `translate::layout::containers::list_header_matches_runtime`),
+    /// so it needs its own assertion: a runtime `HEADER_SIZE` change
+    /// would otherwise leave this one silently drifted, causing every
+    /// `Op::ListAlloc` store and `phx_list_get_raw` load to disagree on
+    /// the data-region offset (silent memory corruption). `LIST_HEADER`
+    /// is `pub(super)`, so this lives as a crate-internal unit test
+    /// rather than in `tests/compile_wasm_linear.rs`.
+    #[test]
+    fn wasm_list_header_matches_runtime() {
+        assert_eq!(
+            LIST_HEADER as usize,
+            phoenix_runtime::list_header_size(),
+            "wasm32-linear LIST_HEADER mismatch between compiler and runtime"
+        );
+    }
 }
