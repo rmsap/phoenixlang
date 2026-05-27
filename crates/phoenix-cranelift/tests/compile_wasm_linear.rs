@@ -1694,6 +1694,120 @@ fn list_map_filter_reduce_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "list_map_filter_reduce");
 }
 
+/// `List.flatMap` — gate for the nested-loop functional method.
+/// Each element's closure returns a `List<Int>`; the results are
+/// concatenated into one output list via repeated
+/// `phx_list_push_raw` (immutable-append: each push allocates a fresh
+/// list, so the output pointer is re-stored and re-rooted every
+/// iteration). The closure here *allocates* (`[n, n * 10]` builds a
+/// fresh list per element), so the inner list returned by the closure
+/// must stay rooted in its ad-hoc shadow frame across the push loop's
+/// allocations. This test pins only the *functional* result — three
+/// elements never approach the 1 MB auto-collect threshold, so a
+/// regression that dropped the inner-list root would still pass it. The
+/// presence of that root is gated deterministically by
+/// `list_flatmap_emits_adhoc_shadow_frame` below, which pins the ad-hoc
+/// shadow frame structurally (the runtime tier can't reliably surface
+/// the use-after-free — see that test's comment for why).
+///
+/// `[1,2,3].flatMap(\n -> [n, n*10])` → `[1,10,2,20,3,30]`.
+///
+/// Expected stdout:
+///   1
+///   10
+///   2
+///   20
+///   3
+///   30
+#[test]
+fn list_flatmap_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let nested: List<Int> = [1, 2, 3]\n  \
+                 let flat = nested.flatMap(function(n: Int) -> List<Int> { [n, n * 10] })\n  \
+                 for x in flat {\n    \
+                   print(x)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_flatmap");
+}
+
+/// Deterministic gate for `flatMap`'s inner-list rooting — the part the
+/// functional test above can't pin. The closure's per-element inner
+/// list has no IR `ValueId`, so it's rooted in a dedicated *ad-hoc*
+/// shadow frame (`emit_gc_push_frame_at` / `emit_gc_set_root_at` /
+/// `emit_gc_pop_frame_at`) held across the push loop's allocations.
+///
+/// An end-to-end "run it under GC pressure" test can't reliably catch a
+/// regression that drops this frame: the runtime is mark-sweep over the
+/// *system* allocator with no freed-memory poisoning (see
+/// `gc/heap.rs::sweep_phase`'s bare `dealloc`), and within one inner
+/// push loop the only intervening allocations are the *growing* output
+/// buffers — never the inner list's size — so a swept-but-unrooted
+/// inner list is never reused/clobbered before its remaining elements
+/// are copied. The use-after-free reads stale-but-intact bytes and the
+/// program prints the right answer anyway. (Confirmed empirically: with
+/// the `emit_gc_set_root_at` call commented out, a 30k-iteration
+/// flatMap loop forcing ~12 collections still matched the interpreter.)
+///
+/// So we pin the frame *structurally* instead, exactly as
+/// [`string_mut_fixture_emits_shadow_stack_frame_calls`] pins the
+/// function-level frame. `phx_main` here emits two `phx_gc_push_frame`
+/// calls — the function-level frame (always the first `Call`, per
+/// `setup_gc_frame`) plus `flatMap`'s ad-hoc inner-list frame — and the
+/// two matching `phx_gc_pop_frame` calls (the function-level pop is the
+/// last `Call`). A regression that dropped the ad-hoc frame collapses
+/// `push_count` from 2 to 1; the balance check catches a dropped pop.
+/// `flatMap` is currently the only construct that emits a nested frame,
+/// so the count of 2 is unambiguous.
+#[test]
+fn list_flatmap_emits_adhoc_shadow_frame() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [1, 2, 3]\n  \
+                 let flat = xs.flatMap(function(n: Int) -> List<Int> { [n, n * 10] })\n  \
+                 print(flat.length())\n\
+               }\n";
+    compile_or_skip(src, "list_flatmap_adhoc_frame", |bytes| {
+        let calls = call_targets_in_phx_main(bytes)
+            .unwrap_or_else(|e| panic!("locating phx_main and decoding its calls failed: {e}"));
+        // Same structural anchoring as the string-mut fixture: the
+        // function-level `phx_gc_push_frame` is the first `Call` and the
+        // function-level `phx_gc_pop_frame` is the last. Both ad-hoc
+        // frame calls resolve to those same two runtime function
+        // indices, so counting occurrences of each tallies *all* the
+        // pushes/pops in the body without name resolution (the merger
+        // strips the runtime's Function name subsection).
+        let push_idx = *calls
+            .first()
+            .expect("flatMap `main` should emit at least one Call (phx_gc_push_frame)");
+        let pop_idx = *calls
+            .last()
+            .expect("flatMap `main` should emit at least one Call (phx_gc_pop_frame)");
+        assert_ne!(
+            push_idx, pop_idx,
+            "first and last `Call` in `phx_main` should differ (push_frame ≠ pop_frame); \
+             both came back as {push_idx}. calls={calls:?}",
+        );
+        let push_count = calls.iter().filter(|&&t| t == push_idx).count();
+        let pop_count = calls.iter().filter(|&&t| t == pop_idx).count();
+        assert_eq!(
+            push_count, pop_count,
+            "phx_gc_push_frame (idx {push_idx}) and phx_gc_pop_frame (idx {pop_idx}) must \
+             appear an equal number of times in `phx_main` — got push={push_count}, \
+             pop={pop_count}. A mismatch means flatMap's ad-hoc frame push/pop pair is \
+             unbalanced (the runtime's frame counter would drift). calls={calls:?}",
+        );
+        assert_eq!(
+            push_count, 2,
+            "flatMap `main` should emit exactly two phx_gc_push_frame calls — the \
+             function-level frame plus flatMap's ad-hoc inner-list frame. Got \
+             {push_count}: a count of 1 means the ad-hoc frame that roots the closure's \
+             per-element inner list across the push loop was dropped (a latent \
+             use-after-free under GC pressure that the runtime tier can't reliably \
+             surface). calls={calls:?}",
+        );
+    });
+}
+
 /// `List.reduce` building a `String` accumulator — exercises the
 /// ref-typed-accumulator rooting path. Each `acc + x` allocates a
 /// fresh heap string via `phx_str_concat`; the running accumulator

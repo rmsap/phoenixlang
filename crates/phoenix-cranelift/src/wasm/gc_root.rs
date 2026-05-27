@@ -266,6 +266,66 @@ pub(super) fn emit_gc_pop_frame(
     Ok(())
 }
 
+// --- Nested (ad-hoc) shadow-stack frames ------------------------------
+//
+// The helpers above manage the *function-level* frame keyed off
+// `ctx.gc_frame_local()` and the per-vid slot map. The helpers below
+// manage an additional, manually-scoped frame whose pointer the caller
+// holds in an explicit local. List functional methods that materialize
+// ref-typed intermediates with no IR `ValueId` of their own (e.g.
+// `flatMap`'s inner list, `sortBy`'s `key` element) push such a frame
+// around their inner loop, root those intermediates into it, and pop it
+// when the loop is done — so the comparator/closure's allocations can't
+// sweep a live-but-vid-less buffer mid-method.
+
+/// Push a fresh shadow-stack frame of `n_roots` slots and return the
+/// temp local holding its frame pointer. The caller is responsible for
+/// a matching [`emit_gc_pop_frame_at`] on every exit path out of the
+/// scope the frame guards.
+pub(super) fn emit_gc_push_frame_at(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    n_roots: u32,
+) -> Result<u32, CompileError> {
+    let push_idx = b.require_phx_func("phx_gc_push_frame")?;
+    let frame_local = ctx.allocate_temp_local(ValType::I32);
+    ctx.emit(Instruction::I32Const(n_roots as i32));
+    ctx.emit(Instruction::Call(push_idx));
+    ctx.emit(Instruction::LocalSet(frame_local));
+    Ok(frame_local)
+}
+
+/// Emit `phx_gc_set_root(frame_local, slot, value_local)` against an
+/// explicit ad-hoc frame. Unlike [`emit_gc_set_root`], this takes the
+/// frame pointer and root value as raw locals rather than resolving a
+/// vid — for intermediates that have no IR `ValueId`.
+pub(super) fn emit_gc_set_root_at(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    frame_local: u32,
+    slot: u32,
+    value_local: u32,
+) -> Result<(), CompileError> {
+    let set_root_idx = b.require_phx_func("phx_gc_set_root")?;
+    ctx.emit(Instruction::LocalGet(frame_local));
+    ctx.emit(Instruction::I32Const(slot as i32));
+    ctx.emit(Instruction::LocalGet(value_local));
+    ctx.emit(Instruction::Call(set_root_idx));
+    Ok(())
+}
+
+/// Pop an ad-hoc frame whose pointer is held in `frame_local`.
+pub(super) fn emit_gc_pop_frame_at(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    frame_local: u32,
+) -> Result<(), CompileError> {
+    let pop_idx = b.require_phx_func("phx_gc_pop_frame")?;
+    ctx.emit(Instruction::LocalGet(frame_local));
+    ctx.emit(Instruction::Call(pop_idx));
+    Ok(())
+}
+
 /// True if `op`'s ref-typed result needs its own shadow-stack root
 /// entry on the way out of `translate_instruction`. The check is not
 /// "did this op allocate?" — `Op::Load` aliases the alloca's pointer

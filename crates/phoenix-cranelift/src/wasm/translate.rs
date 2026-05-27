@@ -93,7 +93,8 @@ use phoenix_runtime::gc::TypeTag;
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
 use super::gc_root::{
-    emit_gc_pop_frame, emit_gc_set_root, op_produces_heap_pointer, setup_gc_frame,
+    emit_gc_pop_frame, emit_gc_pop_frame_at, emit_gc_push_frame_at, emit_gc_set_root,
+    emit_gc_set_root_at, op_produces_heap_pointer, setup_gc_frame,
 };
 use super::heap_layout::{
     EnumLayout, LIST_HEADER, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
@@ -2787,11 +2788,11 @@ fn translate_list_method_builtin(
         "reduce" => translate_list_reduce(ctx, b, args, instr),
         "map" => translate_list_map(ctx, b, args, instr),
         "filter" => translate_list_filter(ctx, b, args, instr),
+        "flatMap" => translate_list_flatmap(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"List.{other}\")` not yet supported \
              (Phase 2.4 PR 3d — see docs/phases/phase-2.md §2.4 PR 3d for the \
-             remaining list methods: `sortBy` / `flatMap` / `contains` ship in a \
-             later slice)"
+             remaining list methods: `sortBy` / `contains` ship in a later slice)"
         ))),
     }
 }
@@ -3106,6 +3107,104 @@ fn store_stack_into_locals(ctx: &mut FuncTranslateCtx, locals: &[u32]) {
     for &local in locals.iter().rev() {
         ctx.emit(Instruction::LocalSet(local));
     }
+}
+
+/// `List.flatMap(list, closure)`: apply the closure to each element
+/// (it must return a `List<U>`), concatenate the resulting lists.
+///
+/// `args = [list, closure]`. The output starts as an empty `List<U>`
+/// and grows via `phx_list_push_raw` — which is *immutable-append*:
+/// it allocates a fresh `length + 1` list and returns it, so the output
+/// pointer changes on every push and must be re-stored + re-rooted.
+///
+/// GC: the output list is rooted via the result vid's slot (re-rooted
+/// after each push, since the pointer moves). The per-element inner
+/// list returned by the closure has no IR vid, so it's rooted in a
+/// dedicated 1-slot ad-hoc shadow frame for the duration of the inner
+/// push loop — `phx_list_push_raw` allocates, and without rooting the
+/// inner list its elements could be swept before they're all copied.
+/// Elements pushed from the inner list don't need separate rooting:
+/// `push_raw` copies their bytes by value, and the pointed-to objects
+/// become reachable through the (rooted) output list.
+fn translate_list_flatmap(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.flatMap\")` requires 2 args \
+             (list, closure), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"List.flatMap\")")?;
+    let list_vid = args[0];
+    let closure_vid = args[1];
+    let in_elem_ty = list_elem_type(ctx, list_vid)?;
+    let in_elem_size = phx_field_size_bytes(&in_elem_ty)?;
+    // Output element type = the flatMap result's list element type
+    // (also the element type of each inner list the closure returns).
+    let out_elem_ty = match &instr.result_type {
+        IrType::ListRef(t) => t.as_ref().clone(),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `List.flatMap` result type must be `ListRef`, got \
+                 `{other:?}` (internal compiler bug)"
+            )));
+        }
+    };
+    let out_elem_size = phx_field_size_bytes(&out_elem_ty)?;
+
+    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
+    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
+    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
+
+    // Output: start with an empty list (`phx_list_alloc(out_es, 0)`).
+    let list_alloc_idx = b.require_phx_func("phx_list_alloc")?;
+    ctx.emit(Instruction::I64Const(out_elem_size as i64));
+    ctx.emit(Instruction::I64Const(0));
+    ctx.emit(Instruction::Call(list_alloc_idx));
+    let out_ptr_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
+    ctx.emit(Instruction::LocalSet(out_ptr_local));
+    emit_gc_set_root(ctx, b, vid)?;
+
+    // Ad-hoc 1-slot frame rooting the closure's per-element inner list
+    // across the push loop's allocations.
+    let inner_frame_local = emit_gc_push_frame_at(ctx, b, 1)?;
+    let inner_list_local = ctx.allocate_temp_local(ValType::I32);
+    let in_elem_locals = ctx.allocate_locals_for_ir_type_anon(&in_elem_ty)?;
+    let push_raw_idx = b.require_phx_func("phx_list_push_raw")?;
+
+    emit_list_loop(ctx, b, list_ptr_local, |ctx, b, i_local| {
+        // elem = in[i]; inner = closure(elem).
+        let in_addr = emit_list_elem_addr(ctx, list_ptr_local, i_local, in_elem_size);
+        emit_field_load(ctx, in_addr, 0, &in_elem_ty)?;
+        store_stack_into_locals(ctx, &in_elem_locals);
+        let call_args = vec![in_elem_locals.clone()];
+        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
+        ctx.emit(Instruction::LocalSet(inner_list_local));
+        // Root the inner list before the push loop (push allocates).
+        emit_gc_set_root_at(ctx, b, inner_frame_local, 0, inner_list_local)?;
+        // Inner loop: for j in 0..inner_len, push inner[j] onto out.
+        emit_list_loop(ctx, b, inner_list_local, |ctx, b, j_local| {
+            // out = phx_list_push_raw(out, &inner[j], out_es). The
+            // element pointer is inner[j]'s address in the inner list's
+            // data region — `push_raw` copies its bytes by value.
+            let inner_addr = emit_list_elem_addr(ctx, inner_list_local, j_local, out_elem_size);
+            ctx.emit(Instruction::LocalGet(out_ptr_local));
+            ctx.emit(Instruction::LocalGet(inner_addr));
+            ctx.emit(Instruction::I64Const(out_elem_size as i64));
+            ctx.emit(Instruction::Call(push_raw_idx));
+            // push_raw returns a fresh list ptr — update + re-root out.
+            ctx.emit(Instruction::LocalSet(out_ptr_local));
+            emit_gc_set_root(ctx, b, vid)?;
+            Ok(())
+        })
+    })?;
+    emit_gc_pop_frame_at(ctx, b, inner_frame_local)?;
+    Ok(())
 }
 
 /// Translate `print(value)` — dispatch on the value's Phoenix
