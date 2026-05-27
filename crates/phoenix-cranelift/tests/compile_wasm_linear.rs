@@ -1654,6 +1654,208 @@ fn closures_runs_under_wasmtime() {
     assert_wasm_matches_interp(CLOSURES_SOURCE, "closures");
 }
 
+/// `List.map` → `List.filter` → `List.reduce` chain: PR 3d slice 6's
+/// gate for the single-loop functional methods. Each lowers to an
+/// inline WASM `block`/`loop` with a `call_indirect` per element:
+///
+/// - `map` allocates an output list sized to the input, applies the
+///   closure per element, stores results at matching indices.
+/// - `filter` allocates an output list (capacity = input length),
+///   writes matching elements contiguously, then patches the output
+///   list's i64 length field to the kept count.
+/// - `reduce` folds with the accumulator held in the result vid's
+///   locals (seeded from `init`), re-rooted on the shadow stack each
+///   iteration.
+///
+/// The `for x in evens` loop afterward confirms the filtered list's
+/// length field was patched correctly (iteration reads the patched
+/// length, not the over-allocated capacity).
+///
+/// `xs = [1,2,3,4,5]` → `doubled = [2,4,6,8,10]` →
+/// `evens (>4) = [6,8,10]` → `sum = 24`.
+///
+/// Expected stdout:
+///   24
+///   6
+///   8
+///   10
+#[test]
+fn list_map_filter_reduce_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [1, 2, 3, 4, 5]\n  \
+                 let doubled = xs.map(function(x: Int) -> Int { x * 2 })\n  \
+                 let evens = doubled.filter(function(x: Int) -> Bool { x > 4 })\n  \
+                 let sum = evens.reduce(0, function(acc: Int, x: Int) -> Int { acc + x })\n  \
+                 print(sum)\n  \
+                 for x in evens {\n    \
+                   print(x)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_map_filter_reduce");
+}
+
+/// `List.reduce` building a `String` accumulator — exercises the
+/// ref-typed-accumulator rooting path. Each `acc + x` allocates a
+/// fresh heap string via `phx_str_concat`; the running accumulator
+/// must stay rooted on the shadow stack (via the result vid's slot,
+/// re-rooted each iteration) across those allocations. A regression
+/// that dropped the re-root would risk the accumulator being swept
+/// mid-fold under GC pressure.
+///
+/// `["a","b","c"].reduce("", \acc x -> acc + x)` → `"abc"`.
+#[test]
+fn list_reduce_string_acc_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<String> = [\"a\", \"b\", \"c\"]\n  \
+                 let joined = xs.reduce(\"\", function(acc: String, x: String) -> String { acc + x })\n  \
+                 print(joined)\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_reduce_string_acc");
+}
+
+/// `List.map` / `List.filter` over `String` (fat-pointer) elements —
+/// the ref-typed-*element* counterpart to the ref-typed-*accumulator*
+/// coverage in [`list_reduce_string_acc_runs_under_wasmtime`]. Where
+/// the `Int` chain test exercises single-slot element load/store, this
+/// drives the 2-slot `StringRef` path through both loops:
+///
+/// - `map(s -> s + "!")` loads each input element via the 2-slot
+///   `emit_field_load`, runs a closure that **allocates** a fresh heap
+///   string (`phx_str_concat`) every iteration, and stores the result
+///   via the 2-slot `emit_field_store`. Because the output list is
+///   filled progressively (index 0, 1, 2, …) while each closure call
+///   allocates, a GC triggered mid-loop scans the rooted output list
+///   when it is *partially* filled — slots `[0, i]` hold live fat
+///   pointers and `[i+1, len)` are still the zeroed bytes from
+///   `phx_list_alloc`. This is the partial-fill fat-pointer scan path;
+///   a regression that dropped the output-list root (or mis-sized the
+///   element store) would surface as a swept/garbled string here.
+/// - `filter(_ -> false)` keeps nothing: `out_count` stays 0, the
+///   length field is patched to 0, and the over-allocated capacity
+///   slots remain zeroed (GC-safe null fat pointers).
+/// - `filter(_ -> true)` keeps everything: `out_count == capacity`,
+///   exercising the 2-slot `StringRef` store for every element with no
+///   trailing slack.
+///
+/// The WASM backend does not lower `String` equality or `String`
+/// methods yet, so the predicate can't vary on element *content* — a
+/// genuinely partial `filter` of strings waits on that slice. The
+/// keep-none / keep-all pair plus `map`'s progressive fill still cover
+/// every fat-pointer element path the loops emit today.
+///
+/// `["a","bb","ccc"]` → `map` → `["a!","bb!","ccc!"]`;
+/// `filter(false)` → `[]` (length 0); `filter(true)` → `["a","bb","ccc"]`.
+///
+/// Expected stdout:
+///   a!
+///   bb!
+///   ccc!
+///   0
+///   a
+///   bb
+///   ccc
+#[test]
+fn list_map_filter_string_elems_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let words: List<String> = [\"a\", \"bb\", \"ccc\"]\n  \
+                 let shouted = words.map(function(s: String) -> String { s + \"!\" })\n  \
+                 for w in shouted {\n    \
+                   print(w)\n  \
+                 }\n  \
+                 let none = words.filter(function(s: String) -> Bool { false })\n  \
+                 print(none.length())\n  \
+                 let all = words.filter(function(s: String) -> Bool { true })\n  \
+                 for w in all {\n    \
+                   print(w)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_map_filter_string_elems");
+}
+
+/// Empty-list and `filter` boundary coverage for the single-loop
+/// functional methods. The other tests only hit the genuinely-partial
+/// case (`[6,8,10]` kept out of five); this pins the degenerate ends:
+///
+/// - **Empty input** (`[]`): `map` / `filter` / `reduce` each take the
+///   zero-iteration path — the `i >= len` guard fails on the first
+///   check, so the loop body never runs. `map` / `filter` allocate a
+///   zero-length output list; `reduce` returns its seed (`100`)
+///   untouched. A guard that ran one iteration on an empty list (e.g.
+///   `i > len` instead of `i >= len`, or a signedness slip) would read
+///   out of bounds and diverge from the interp here.
+/// - **`filter` keeps nothing** (`x > 100`): `out_count` stays 0 and
+///   the length field is patched to 0.
+/// - **`filter` keeps everything** (`x > 0`): `out_count == capacity`,
+///   so the contiguous-write fills the output list exactly with no
+///   length shrink.
+///
+/// `[]` → all empty (lengths 0, 0; reduce seed 100);
+/// `[1,2,3]` → `filter(>100)` → `[]` (length 0);
+/// `[1,2,3]` → `filter(>0)` → `[1,2,3]` (length 3).
+///
+/// Expected stdout:
+///   0
+///   0
+///   100
+///   0
+///   3
+///   1
+///   2
+///   3
+#[test]
+fn list_methods_empty_and_filter_bounds_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let empty: List<Int> = []\n  \
+                 let em = empty.map(function(x: Int) -> Int { x + 1 })\n  \
+                 let ef = empty.filter(function(x: Int) -> Bool { x > 0 })\n  \
+                 let es = empty.reduce(100, function(acc: Int, x: Int) -> Int { acc + x })\n  \
+                 print(em.length())\n  \
+                 print(ef.length())\n  \
+                 print(es)\n  \
+                 let nums: List<Int> = [1, 2, 3]\n  \
+                 let keepNone = nums.filter(function(x: Int) -> Bool { x > 100 })\n  \
+                 let keepAll = nums.filter(function(x: Int) -> Bool { x > 0 })\n  \
+                 print(keepNone.length())\n  \
+                 print(keepAll.length())\n  \
+                 for x in keepAll {\n    \
+                   print(x)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_methods_empty_and_filter_bounds");
+}
+
+/// `List.map` that **changes element width** — `Int` (8-byte `i64`
+/// stride) → `Bool` (4-byte `i32` stride). Every other map test is
+/// width-preserving (`Int`→`Int`, `String`→`String`), so a bug that
+/// addressed the *output* store with the *input* element size (or vice
+/// versa) would pass them all. Here the input is read at stride 8 while
+/// the result is written at stride 4: `translate_list_map` allocates
+/// the output list with `out_elem_size` and tracks `in_elem_size` /
+/// `out_elem_size` separately across the two `emit_list_elem_addr`
+/// calls. The trailing `for b in bigs` reads the output list back at
+/// its own header-recorded element size (4), so any stride mismatch
+/// surfaces as garbled bools or an out-of-bounds trap rather than a
+/// silently-correct result.
+///
+/// `[1,2,3,4].map(x -> x > 2)` → `[false, false, true, true]`.
+///
+/// Expected stdout:
+///   false
+///   false
+///   true
+///   true
+#[test]
+fn list_map_changes_elem_width_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let nums: List<Int> = [1, 2, 3, 4]\n  \
+                 let bigs = nums.map(function(x: Int) -> Bool { x > 2 })\n  \
+                 for b in bigs {\n    \
+                   print(b)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_map_changes_elem_width");
+}
+
 /// `closures_over_generic.phx` — gate for closures defined inside a
 /// generic function. The closure `makeBox<T>` captures `x: T`; after
 /// monomorphization to `makeBox<Int>`, the inner closure function is

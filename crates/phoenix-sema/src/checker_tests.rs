@@ -3769,6 +3769,87 @@ fn populated_list_of_dyn_literal_is_currently_accepted_by_sema() {
     );
 }
 
+/// Guards `Checker::pin_inferred_type_to_annotation` for the empty-map
+/// case (the companion to the empty-list / zero-field-enum pinning that
+/// the IR test `enum_type_at_handles_zero_field_generic_variant` and the
+/// WASM `list_methods_empty_and_filter_bounds` test cover). An empty
+/// `{}` infers as `Map<K, V>` with unconstrained type vars; the `let m:
+/// Map<String, Int>` annotation must be pinned onto the *expression*'s
+/// recorded type (not just the variable), because IR / WASM lowering
+/// reads `expr_types` for the `MapAlloc` key/value type args. Without
+/// the pin the recorded type keeps the type vars and lowers to the
+/// `__generic` placeholder.
+#[test]
+fn pin_empty_map_literal_records_concrete_annotation_type() {
+    let result = check_full(
+        r#"
+function main() {
+    let m: Map<String, Int> = {}
+}
+"#,
+    );
+    // The `{}` initializer is the only recorded expression. It must now
+    // read as the concrete `Map<String, Int>`, not `Map<K, V>`.
+    let pinned = result.module.expr_types.values().any(|t| {
+        matches!(t, Type::Generic(name, args)
+            if name == "Map" && **args == [Type::String, Type::Int])
+    });
+    assert!(
+        pinned,
+        "empty map literal should be pinned to Map<String, Int>, got: {:?}",
+        result.module.expr_types.values().collect::<Vec<_>>()
+    );
+    // And no recorded expression type may still carry a type var.
+    assert!(
+        !result.module.expr_types.values().any(Type::has_type_vars),
+        "pinning should leave no type-var-bearing recorded types, got: {:?}",
+        result.module.expr_types.values().collect::<Vec<_>>()
+    );
+}
+
+/// Guards the `dyn`-annotation carve-out in
+/// `Checker::pin_inferred_type_to_annotation`. Inside a generic fn, `let
+/// d: dyn Drawable = s` (with `s: T`, `T: Drawable`) infers the
+/// initializer as the bare type var `T` — which *does* trip the pin's
+/// `init_type.has_type_vars()` precondition. But the annotation is `dyn
+/// Drawable` (`Type::Dyn`), not the same generic constructor as `T`, so
+/// the pin must leave `s`'s recorded type as `T`. IR lowering relies on
+/// that gap to materialize the `T` → `dyn Drawable` (`DynRef`) coercion
+/// at the `let`; clobbering the recorded type to `dyn Drawable` would
+/// skip the wrap and leave the raw value. A future loosening of the
+/// same-constructor guard that started clobbering this would fail here.
+#[test]
+fn dyn_annotation_does_not_clobber_generic_param_initializer() {
+    let result = check_full(
+        "trait Drawable { function draw(self) -> String }
+         function render<T: Drawable>(s: T) {
+             let d: dyn Drawable = s
+         }
+         function main() { }",
+    );
+    // The lone initializer expression `s` must stay recorded as the
+    // type var `T`, never rewritten to `dyn Drawable`.
+    assert!(
+        result
+            .module
+            .expr_types
+            .values()
+            .any(|t| matches!(t, Type::TypeVar(_))),
+        "the `s` initializer should stay a type var, got: {:?}",
+        result.module.expr_types.values().collect::<Vec<_>>()
+    );
+    assert!(
+        !result
+            .module
+            .expr_types
+            .values()
+            .any(|t| matches!(t, Type::Dyn(_))),
+        "the `dyn Drawable` annotation must not be pinned onto the \
+         initializer expression, got: {:?}",
+        result.module.expr_types.values().collect::<Vec<_>>()
+    );
+}
+
 /// Multi-bound trait objects (`dyn Foo + Bar`) are out of scope for Phase
 /// 2.2. The parser must surface a clean diagnostic at the `+` rather than
 /// silently accepting one bound and leaving the other dangling.

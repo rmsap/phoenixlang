@@ -1704,17 +1704,18 @@ function main() {
 /// (companion to `enum_type_at_handles_zero_field_non_generic_variant`).
 ///
 /// Sema cannot infer `T` from the `Empty` literal alone — the variant
-/// carries no payload to pin the type parameter, and sema does *not*
-/// currently thread the `let: Box<Int>` binding annotation back into the
-/// RHS expression's type. The result is
-/// `EnumRef("Box", [GENERIC_PLACEHOLDER])`, which Pass D would preserve
-/// as-is (the placeholder is a concrete `StructRef`, not a `TypeVar`).
+/// carries no payload to pin the type parameter. The `let b: Box<Int>`
+/// annotation supplies it: `Checker::pin_inferred_type_to_annotation`
+/// rewrites the initializer's recorded type from the inferred `Box<T>`
+/// to the declared `Box<Int>` before IR lowering, so the `EnumAlloc`
+/// result type is `EnumRef("Box", [I64])` with no `__generic`
+/// placeholder.
 ///
-/// This test locks in the current behavior so a future sema improvement
-/// that propagates annotations to zero-field variants is caught by the
-/// test failing — at which point the expectation should switch to
-/// `[I64]`. Guards the enum_type_at path from regressing in the opposite
-/// direction (e.g. dropping args entirely).
+/// This previously asserted `[GENERIC_PLACEHOLDER]` and documented the
+/// switch to `[I64]` once sema propagated the annotation — that
+/// improvement landed alongside the same fix for empty collection
+/// literals (`let xs: List<Int> = []`), so the expectation now reads
+/// `[I64]`.
 #[test]
 fn enum_type_at_handles_zero_field_generic_variant() {
     let module = lower_source(
@@ -1736,13 +1737,7 @@ function main() {
         .expect("expected an EnumAlloc for Empty");
     assert_eq!(
         alloc_inst.result_type,
-        IrType::EnumRef(
-            "Box".to_string(),
-            vec![IrType::StructRef(
-                crate::types::GENERIC_PLACEHOLDER.to_string(),
-                Vec::new()
-            )]
-        ),
+        IrType::EnumRef("Box".to_string(), vec![IrType::I64]),
     );
 }
 

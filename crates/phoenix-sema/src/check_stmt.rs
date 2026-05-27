@@ -2,7 +2,7 @@ use crate::checker::Checker;
 use crate::scope::VarInfo;
 use crate::types::Type;
 use phoenix_parser::ast::{
-    ForSource, ForStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget, WhileStmt,
+    Expr, ForSource, ForStmt, ReturnStmt, Statement, VarDecl, VarDeclTarget, WhileStmt,
 };
 
 impl Checker {
@@ -80,6 +80,18 @@ impl Checker {
                     if !declared_type.is_error() {
                         self.var_annotation_types
                             .insert(var.span, declared_type.clone());
+                        // A payload-free literal initializer (empty `[]`,
+                        // a zero-field generic enum variant) infers with an
+                        // unconstrained type var — nothing drives inference.
+                        // The variable takes the annotation, but the
+                        // expression's recorded type (what IR lowering reads
+                        // for the alloc's type args) keeps the type var and
+                        // lowers to the `__generic` placeholder, which
+                        // miscompiles on the WASM backend. Pin it to the
+                        // annotation. See `pin_inferred_type_to_annotation`.
+                        if !init_type.is_error() && init_type.has_type_vars() {
+                            self.pin_inferred_type_to_annotation(&var.initializer, &declared_type);
+                        }
                     }
                     declared_type
                 } else {
@@ -164,6 +176,72 @@ impl Checker {
                 } else {
                     self.error(format!("unknown struct type `{}`", type_name), var.span);
                 }
+            }
+        }
+    }
+
+    /// Pin the recorded type of a *payload-free* literal initializer to
+    /// its binding's declared type.
+    ///
+    /// The checker is single-pass (no bidirectional/expected-type
+    /// threading), so a payload-free literal is inferred with an
+    /// unconstrained type var before the annotation is seen: an empty
+    /// `[]` infers as `List<T>`, a zero-field generic enum variant
+    /// (`Empty` in `enum Box<T>`) infers as `Box<T>`. The *variable*
+    /// takes the annotation, but the *expression*'s recorded type — what
+    /// `phoenix-ir` lowering reads (`expr_types[span]`) for the
+    /// `ListAlloc` / `MapAlloc` / `EnumAlloc` type args — keeps the type
+    /// var. An unresolved type var lowers to the `__generic` placeholder,
+    /// which the WASM backend sizes as a bare pointer (i32); that
+    /// mismatches the real element/payload width when, e.g., a list
+    /// method's closure ABI flattens it, and wasmparser rejects the
+    /// module. Rewriting the recorded type to the annotation closes the
+    /// hole.
+    ///
+    /// Two guards keep this from clobbering legitimate inference:
+    ///
+    /// - The recorded type must still carry a type var — a concretely
+    ///   inferred expression is left exactly as the checker computed it.
+    /// - The annotation must be a *refinement* of the inferred type: the
+    ///   same generic constructor with its params pinned (`List<T>` →
+    ///   `List<Int>`, `Box<T>` → `Box<Int>`), not a structurally
+    ///   different coercion target. `let d: dyn Drawable = s` inside a
+    ///   generic fn infers `s` as the bare type var `S` and relies on IR
+    ///   lowering coercing `S` → `dyn Drawable` at the `let`; overwriting
+    ///   `s`'s recorded type to `dyn Drawable` would erase the gap the
+    ///   coercion needs (the `DynRef` wrap is skipped, leaving the raw
+    ///   struct). The same-constructor check excludes that — `S` is a
+    ///   bare `TypeVar`, not a `Generic`.
+    ///
+    /// Only *empty* collection literals are pinned: a non-empty
+    /// collection may hold elements that themselves need coercion to the
+    /// declared element type (`[circle]: List<dyn Drawable>`), and
+    /// pinning the container type would skip that. Non-collection
+    /// payload-free literals (zero-field generic enum variants) are leaf
+    /// expressions with no sub-values to coerce, so they pin directly.
+    fn pin_inferred_type_to_annotation(&mut self, expr: &Expr, declared: &Type) {
+        // Refinement check: only fill type-var holes when the recorded
+        // type still has a type var *and* the annotation is the same
+        // generic constructor (so the rewrite pins params rather than
+        // re-typing across a coercion like `S` → `dyn Drawable`).
+        let same_constructor = matches!(
+            (self.expr_types.get(&expr.span()), declared),
+            (Some(Type::Generic(rec_name, rec_args)), Type::Generic(dec_name, dec_args))
+                if rec_name == dec_name
+                    && rec_args.len() == dec_args.len()
+                    && rec_args.iter().any(Type::has_type_vars)
+        );
+        if !same_constructor {
+            return;
+        }
+        match expr {
+            // Non-empty collections may carry elements needing their own
+            // coercion to the declared element type — pinning the
+            // container would skip it. Leave them for lowering to handle.
+            Expr::ListLiteral(list) if !list.elements.is_empty() => {}
+            Expr::MapLiteral(map) if !map.entries.is_empty() => {}
+            _ => {
+                self.expr_types.insert(expr.span(), declared.clone());
             }
         }
     }
