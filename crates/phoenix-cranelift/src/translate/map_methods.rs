@@ -165,11 +165,26 @@ pub(super) fn translate_map_method(
             let temp_val = store_to_temp(builder, &val_vals, &val_ty);
             let ks_val = builder.ins().iconst(cl::I64, ks);
             let vs_val = builder.ins().iconst(cl::I64, vs);
+            // `key_is_string` is only consulted by the runtime on the
+            // placeholder/shape-change recovery branch (empty map whose
+            // stored sizes differ from the caller's). Required on wasm32
+            // where size alone can't disambiguate `StringRef` from
+            // `Int` / `Float`; passed here too so a single runtime ABI
+            // serves both backends. Shared with wasm via
+            // [`IrType::string_flag`].
+            let key_is_string_val = builder.ins().iconst(cl::I64, key_ty.string_flag() as i64);
             Ok(call_runtime(
                 builder,
                 ctx,
                 ctx.runtime.map_set_raw,
-                &[map_ptr, temp_key, temp_val, ks_val, vs_val],
+                &[
+                    map_ptr,
+                    temp_key,
+                    temp_val,
+                    ks_val,
+                    vs_val,
+                    key_is_string_val,
+                ],
             ))
         }
         "remove" => {
@@ -209,8 +224,9 @@ pub(super) fn translate_map_method(
 /// hash-layout decision (capacity, probing, tags) inside the runtime.
 ///
 /// Empty literals (`{}`) skip the buffer entirely and call
-/// `phx_map_from_pairs(ks, vs, 0, 0)` — the runtime's `# Safety` doc
-/// explicitly carves out null `pair_data` when `n_pairs == 0`.
+/// `phx_map_from_pairs(ks, vs, 0, 0, key_is_string)` — the runtime's
+/// `# Safety` doc explicitly carves out null `pair_data` when
+/// `n_pairs == 0`.
 pub(super) fn translate_map_alloc(
     builder: &mut FunctionBuilder,
     ctx: &mut CompileContext,
@@ -234,6 +250,14 @@ pub(super) fn translate_map_alloc(
     let ks_val = builder.ins().iconst(cl::I64, ks);
     let vs_val = builder.ins().iconst(cl::I64, vs);
     let count_val = builder.ins().iconst(cl::I64, count);
+    // `key_is_string`: string keys hash/compare by content. Recorded in
+    // the map header so every later lookup reads it back. On 64-bit
+    // native the runtime's size-based fallback (a string key is uniquely
+    // 16 bytes) would also catch this; the explicit flag keeps the
+    // backends uniform and is *required* on wasm32, where a string key
+    // is 8 bytes and indistinguishable from `Int` / `Float` by size.
+    // Shared with wasm via [`IrType::string_flag`].
+    let key_is_string_val = builder.ins().iconst(cl::I64, key_ty.string_flag() as i64);
 
     // Materialize the pair buffer when there's anything to write, or a
     // null pointer for empty literals (the runtime's `n_pairs == 0`
@@ -285,7 +309,7 @@ pub(super) fn translate_map_alloc(
         builder,
         ctx,
         ctx.runtime.map_from_pairs,
-        &[ks_val, vs_val, count_val, buf_addr],
+        &[ks_val, vs_val, count_val, buf_addr, key_is_string_val],
     );
 
     Ok(vec![map_ptr[0]])

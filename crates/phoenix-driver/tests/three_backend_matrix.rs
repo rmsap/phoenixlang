@@ -197,24 +197,15 @@ backend_matrix_test!(
 backend_matrix_test!(matrix_gc_keeps_alive, "gc_keeps_alive.phx");
 backend_matrix_test!(matrix_gc_loop_carried_ref, "gc_loop_carried_ref.phx");
 
-/// Regression marker for closures returned from generic functions at
-/// *cross-width* instantiations (Int + String). Currently fails in
-/// `phoenix build` because the inner closure function is shared across
-/// specializations rather than cloned, and pass D erases its
-/// TypeVar-bearing `capture_types` to the `__generic` placeholder.
-/// Cranelift then mis-sizes the closure heap object for the wider
-/// instantiation. See the fixture's header comment and
-/// `docs/known-issues.md` for the full diagnosis.
-///
-/// Flip this to a `backend_matrix_test!` invocation when
-/// monomorphization clones closure functions per enclosing-generic
-/// substitution. `phoenix run` / `phoenix run-ir` already agree on
-/// the expected output (`15\nhi:there\n`).
-#[test]
-#[ignore = "closures-over-generic at cross-width instantiations: \
-            inner closure shared across specializations, capture_types \
-            erased to __generic, Cranelift mis-sizes heap layout. See \
-            docs/known-issues.md."]
-fn matrix_closures_over_generic_cross_width() {
-    assert_three_backend_agreement("closures_over_generic_cross_width.phx");
-}
+// Closures returned from generic functions at *cross-width*
+// instantiations (Int → 1 slot, String → 2-slot fat pointer). Now
+// passes on all three backends: monomorphization clones the inner
+// closure function per enclosing-generic instantiation (following
+// `Op::ClosureAlloc` edges), so each specialization has concrete
+// `capture_types` / return type rather than the shared `__generic`
+// placeholder the Cranelift backend used to mis-size. Expected output
+// is `15\nhi:there\n`.
+backend_matrix_test!(
+    matrix_closures_over_generic_cross_width,
+    "closures_over_generic_cross_width.phx"
+);

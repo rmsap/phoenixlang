@@ -131,14 +131,22 @@ pub(super) fn translate_list_method(
             let es = elem_size_bytes(&elem_ty);
             let temp_ptr = store_to_temp(builder, &elem_vals, &elem_ty);
             let es_val = builder.ins().iconst(cl::I64, es);
+            // `is_float` / `is_string`: shared with wasm via
+            // [`IrType::float_flag`] / [`IrType::string_flag`]. The
+            // runtime treats `is_string` as authoritative (no
+            // size-based fallback), so this must be set whenever the
+            // element type is a string.
             let is_float = builder
                 .ins()
-                .iconst(ir::types::I8, if elem_ty == IrType::F64 { 1 } else { 0 });
+                .iconst(ir::types::I8, elem_ty.float_flag() as i64);
+            let is_string = builder
+                .ins()
+                .iconst(ir::types::I8, elem_ty.string_flag() as i64);
             Ok(call_runtime(
                 builder,
                 ctx,
                 ctx.runtime.list_contains,
-                &[list_ptr, temp_ptr, es_val, is_float],
+                &[list_ptr, temp_ptr, es_val, is_float, is_string],
             ))
         }
         "first" | "last" => {

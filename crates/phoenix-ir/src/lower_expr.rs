@@ -1270,15 +1270,17 @@ impl<'a> LoweringContext<'a> {
 
         // `id` is overwritten by `push_concrete` to match the slot
         // index; passing `FuncId(u32::MAX)` here makes that explicit.
-        // Closures are always concrete — they have no type parameters
-        // of their own. (Their bodies may still carry `IrType::TypeVar`
-        // from an enclosing generic; monomorphization substitutes those
-        // via the same `for_each_type_mut` walk that visits regular
-        // functions.) `new_closure` is used over `new` to record the
-        // capture-type vector on the function in one step — backends
-        // and the verifier index it when handling
+        // Closures introduce no type parameters of their own, but they
+        // **inherit** the enclosing generic's `type_param_names` (set
+        // below) so monomorphization can clone them per enclosing
+        // substitution. Their bodies may still carry `IrType::TypeVar`
+        // from that enclosing generic; monomorphization substitutes
+        // those via the same `for_each_type_mut` walk that visits
+        // regular functions. `new_closure` is used over `new` to record
+        // the capture-type vector on the function in one step —
+        // backends and the verifier index it when handling
         // `Op::ClosureLoadCapture`.
-        let closure_func = IrFunction::new_closure(
+        let mut closure_func = IrFunction::new_closure(
             crate::instruction::FuncId(u32::MAX),
             closure_name,
             param_types,
@@ -1287,6 +1289,16 @@ impl<'a> LoweringContext<'a> {
             Some(lambda.span),
             capture_types.clone(),
         );
+        // A closure defined inside a generic function inherits the
+        // enclosing's `type_param_names` so monomorphization can
+        // specialize it per enclosing instantiation (it walks
+        // `Op::ClosureAlloc` edges and builds the substitution from
+        // these names). Empty for closures in non-generic functions.
+        // Reads from `current_type_param_names`, maintained explicitly
+        // at function entry/exit so the inheritance does not depend on
+        // the order in which the enclosing's `type_param_names` field
+        // is written.
+        closure_func.type_param_names = self.current_type_param_names.clone();
         let func_id = self.module.push_concrete(closure_func);
 
         // Save current function state and lower the lambda body.

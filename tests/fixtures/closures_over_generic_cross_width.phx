@@ -1,38 +1,22 @@
-// Regression marker for: closures returned from generic functions at
-// *different-width* type instantiations (e.g. Int → 1 slot, String →
-// 2-slot fat pointer).
+// Closures returned from generic functions at *different-width* type
+// instantiations (e.g. Int → 1 slot, String → 2-slot fat pointer).
 //
-// **Status: known broken in `phoenix build`** as of 2026-04-27. The
-// inner closure function is shared across all specializations of its
-// enclosing generic — it is pushed once at lowering time and the
-// `Op::ClosureAlloc(closure_func_id, ...)` site in each specialization
-// of `makeAppender` points at the same `FuncId`. Pass D
-// (`erase_type_vars_in_non_templates`) then erases its TypeVar-bearing
-// `capture_types` to the `__generic` placeholder before codegen.
+// Historically broken in `phoenix build`: the inner closure function was
+// shared across all specializations of its enclosing generic, so each
+// `makeAppender<T>` specialization's `Op::ClosureAlloc` pointed at the
+// same `FuncId`, and Pass D erased its TypeVar-bearing `capture_types`
+// to the `__generic` placeholder. Cranelift's `TypeLayout::of` mapped
+// `__generic` to a 1-slot fallback, so `makeAppender<Int>` accidentally
+// worked while `makeAppender<String>` mis-sized the 2-slot fat pointer
+// (wild allocation). `phoenix run` / `phoenix run-ir` were unaffected
+// (they dispatch on runtime value shape, not a static layout).
 //
-// Cranelift's `TypeLayout::of` maps `__generic` to a 1-slot fallback,
-// so:
-//   - `makeAppender<Int>` (1-slot capture) accidentally works
-//   - `makeAppender<String>` (2-slot capture) reads / writes the
-//     fat-pointer fields through the 1-slot placeholder layout, which
-//     yields a wild allocation on the second instantiation — observed
-//     symptom: `memory allocation of 99840571645959 bytes failed`.
-//
-// `phoenix run` and `phoenix run-ir` both produce the correct output
-// because they dispatch on runtime value shape, not on a static
-// capture layout — IR-interp / tree-walk are unaffected by the type
-// erasure. The bug is specific to the Cranelift codegen path's
-// reliance on `current_capture_types` for slot accounting.
-//
-// **Fix direction.** Monomorphization needs to clone closure functions
-// per substitution of their enclosing generic, the same way it clones
-// generic-template bodies, so each closure ends up with concrete
-// `capture_types` and a concrete `Op::ClosureLoadCapture` result type
-// per specialization. Tracked in `docs/known-issues.md`.
-//
-// This fixture is registered as an `#[ignore]`d test in the three-backend
-// matrix so the gap is visible without breaking CI. When the fix lands,
-// flip it to a regular `backend_matrix_test!` invocation.
+// **Fixed:** monomorphization now clones the closure function per
+// enclosing-generic substitution (following `Op::ClosureAlloc` edges),
+// so each specialization carries concrete `capture_types` and a concrete
+// `Op::ClosureLoadCapture` result type. All three backends — `phoenix
+// run`, `phoenix run-ir`, and `phoenix build` (native + wasm32-linear) —
+// agree on `15\nhi:there\n`. See `docs/known-issues.md`.
 
 function makeAppender<T>(seed: T, combiner: (T, T) -> T) -> (T) -> T {
   return function(x: T) -> T { combiner(seed, x) }

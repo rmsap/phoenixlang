@@ -12,6 +12,45 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
+      - name: Install wasmtime
+        # The wasmtime version is the single source of truth in
+        # `.wasmtime-version` at the repo root. Local dev setup reads
+        # the same file, so CI and the workstation stay in lockstep
+        # without a separate `WASMTIME_VERSION` env that can drift.
+        # Downloaded as a prebuilt release tarball — no third-party
+        # action (supply chain) and no from-source `cargo install`
+        # (slow, not restored by rust-cache).
+        #
+        # Linux-only: the URL hardcodes the `x86_64-linux` tarball, so
+        # gate on `runner.os == 'Linux'`. Adding a macOS row to the
+        # matrix without expanding this step would otherwise 404 on the
+        # tarball download; with the gate it surfaces as `wasmtime not
+        # installed` in the require-wasmtime test step instead.
+        if: runner.os == 'Linux'
+        run: |
+          version="$(tr -d '[:space:]' < .wasmtime-version)"
+          url="https://github.com/bytecodealliance/wasmtime/releases/download/${version}/wasmtime-${version}-x86_64-linux.tar.xz"
+          curl -fsSL "$url" -o /tmp/wasmtime.tar.xz
+          tar -xf /tmp/wasmtime.tar.xz -C /tmp
+          echo "/tmp/wasmtime-${version}-x86_64-linux" >> "$GITHUB_PATH"
+      - name: Verify wasmtime version matches .wasmtime-version
+        # Strict equality is intentional: a wasmtime release that
+        # changed our behavior must come with an explicit
+        # `.wasmtime-version` bump, not a silent acceptance via a
+        # prefix match. `wasmtime --version` prints e.g.
+        # `wasmtime-cli 45.0.0`; the pinned tag is `v45.0.0`. If a
+        # future wasmtime release alters the `--version` output format
+        # (a hash, "dev" suffix, etc.), update the parser here to
+        # match — do *not* loosen the comparison.
+        if: runner.os == 'Linux'
+        run: |
+          pinned="$(tr -d '[:space:]' < .wasmtime-version)"
+          pinned_no_v="${pinned#v}"
+          actual="$(wasmtime --version | awk '{print $2}')"
+          if [ "$actual" != "$pinned_no_v" ]; then
+            echo "::error::wasmtime version drift: .wasmtime-version pins ${pinned} (→ ${pinned_no_v}), but the installed binary reports ${actual}"
+            exit 1
+          fi
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test -p phoenix-common
@@ -26,5 +65,17 @@ jobs:
       - run: cargo test -p phoenix-runtime
       - run: cargo build -p phoenix-runtime
       - run: cargo build -p phoenix-runtime --target wasm32-wasip1 --release
+      # Force the wasm tiers to fail loudly rather than silently skip,
+      # on both the driver matrix (which reaches wasm via
+      # `three_backend_matrix`) and the cranelift wasm tests:
+      # REQUIRE_RUNTIME_WASM if the wasm runtime artifact is missing,
+      # REQUIRE_WASMTIME if the `wasmtime` binary isn't on PATH. Both
+      # are provisioned above, so a skip here means a real regression.
       - run: cargo test -p phoenix-driver
+        env:
+          PHOENIX_REQUIRE_RUNTIME_WASM: "1"
+          PHOENIX_REQUIRE_WASMTIME: "1"
       - run: cargo test -p phoenix-cranelift
+        env:
+          PHOENIX_REQUIRE_RUNTIME_WASM: "1"
+          PHOENIX_REQUIRE_WASMTIME: "1"

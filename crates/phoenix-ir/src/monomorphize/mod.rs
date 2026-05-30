@@ -442,6 +442,44 @@ fn erase_type_vars_in_fn(func: &mut IrFunction) {
         *pt = pt.erase_type_vars();
     }
     func.return_type = func.return_type.erase_type_vars();
+    // `capture_types` are a type annotation too: a closure defined
+    // inside a generic that never gets specialized (e.g. the original,
+    // now-unreferenced template copy left behind once mono clones it per
+    // instantiation) still reaches the backend via
+    // `concrete_functions()`, and its `Op::ClosureLoadCapture` lowering
+    // reads `capture_types` through `TypeLayout::of`. Without erasing
+    // them a residual `TypeVar` reaches codegen and ICEs.
+    //
+    // ## Placeholder paths (canonical reference)
+    //
+    // Two inert paths leave `__generic` / `TypeVar` placeholders
+    // reaching codegen:
+    //
+    // 1. **Unconstrained empty literals.** An empty `[]` / `{}` whose
+    //    element type sema never constrained is erased to `__generic`
+    //    by Pass D below.
+    // 2. **Dead template-copy closures.** Once mono clones a
+    //    closure-in-a-generic per instantiation, the original
+    //    (unreferenced) copy is still a concrete function. Its
+    //    erased `capture_types` are `__generic`, and codegen still
+    //    walks it via `concrete_functions()`.
+    //
+    // Neither path roots a live placeholder-typed allocation that
+    // outlives a collection cycle: empty literals have no live
+    // payload; the dead closures are never called. That justifies
+    // both this `capture_types` erasure and the placeholder skip in
+    // `phoenix-cranelift/src/translate/gc_roots.rs::is_tracked_ref`.
+    //
+    // Cleanup pair: if a future pass prunes unreferenced template-copy
+    // closures (or marks them `FunctionSlot::Template`), path (2)
+    // disappears and this erasure can drop. Path (1) is independent —
+    // closing it would require either constraining empty literals at
+    // sema or teaching codegen to handle the placeholder shape — so
+    // the `gc_roots` skip can only be tightened to `debug_assert!`
+    // once both are done.
+    for ct in &mut func.capture_types {
+        *ct = ct.erase_type_vars();
+    }
     for block in &mut func.blocks {
         for instr in &mut block.instructions {
             instr.result_type = instr.result_type.erase_type_vars();

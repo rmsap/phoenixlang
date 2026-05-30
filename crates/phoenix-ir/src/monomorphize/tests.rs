@@ -783,13 +783,13 @@ fn struct_mono_no_op_when_no_generic_structs() {
 /// annotations: the `IrFunction.capture_types` vector and the
 /// per-value type of an `Op::ClosureLoadCapture` result.
 ///
-/// This pins the contract regardless of whether monomorphization
-/// currently *invokes* substitution on closure functions defined inside
-/// generic templates — that end-to-end gap is tracked separately (see
-/// the cross-width fixture and `docs/known-issues.md`). When the gap
-/// closes by cloning closure functions per enclosing-generic
-/// substitution, this test guarantees the cloned bodies will have
-/// their TypeVars correctly rewritten.
+/// This pins the substitution contract that the closure-cloning fix
+/// relies on. Monomorphization now *does* clone closure functions
+/// defined inside generic templates (per enclosing-generic
+/// substitution, following `Op::ClosureAlloc` edges); this test
+/// guarantees those cloned bodies have their TypeVars correctly
+/// rewritten across `capture_types`, the `Op::ClosureLoadCapture`
+/// result type, the return type, and nested `ClosureRef` params.
 #[test]
 fn for_each_type_mut_substitutes_capture_types_and_load_result() {
     use crate::module::IrFunction;
@@ -851,13 +851,12 @@ fn for_each_type_mut_substitutes_capture_types_and_load_result() {
 }
 
 /// Companion to the test above: substitution at a *2-slot* type
-/// (StringRef) must reach the same annotations. If
-/// monomorphization ever does start cloning closure functions per
-/// enclosing-generic substitution, this is the case where the
-/// Cranelift backend's slot accounting will diverge from the
-/// erased-placeholder fallback — pinning that the substitution
-/// itself is correct keeps the eventual fix's blast radius
-/// confined to the cloning machinery.
+/// (StringRef) must reach the same annotations. This is the width at
+/// which the Cranelift backend's slot accounting would diverge from the
+/// 1-slot erased-placeholder fallback, so it's the case the
+/// closure-cloning fix most depends on getting right — pinning the
+/// substitution keeps that fix's blast radius confined to the cloning
+/// machinery in `function_mono.rs`.
 #[test]
 fn for_each_type_mut_substitutes_capture_types_at_string() {
     use crate::module::IrFunction;
@@ -898,4 +897,79 @@ fn for_each_type_mut_substitutes_capture_types_at_string() {
         func.instruction_result_type(loaded),
         Some(&IrType::StringRef)
     );
+}
+
+/// Negative-case companion to the closure-cloning fix: an
+/// `Op::ClosureAlloc` whose target closure has *empty* `type_param_names`
+/// (a closure that doesn't reference its enclosing's `T`) must be left
+/// completely untouched by Pass B at every specialization site of the
+/// enclosing generic. Pin this so a future change that drops the
+/// `type_param_names.is_empty() ? continue` filter in Pass A would
+/// surface a debug-assert failure in Pass B (no spec was enqueued, but
+/// the rewrite expected one) rather than silently remapping a
+/// non-generic closure to a stale FuncId.
+///
+/// Setup:
+///   - `__plain`: concrete closure, no captures, no type parameters.
+///   - `g<T>`: generic template whose body emits `ClosureAlloc(__plain)`.
+///   - `main`: calls `g<Int>()`.
+///
+/// After monomorphize:
+///   - `__plain` retains its original `FuncId(0)` and produces no
+///     specializations (the `__plain__i64` slot does not exist).
+///   - `g__i64`'s `ClosureAlloc` target is still `FuncId(0)`, verbatim.
+#[test]
+fn non_generic_closure_inside_generic_keeps_original_fid() {
+    // Result type for the `Op::ClosureAlloc` site — its actual shape
+    // doesn't matter to mono (it never inspects ClosureRef bodies for
+    // generic-call edges), so a no-param/no-return closure ref is
+    // a clean stand-in.
+    let closure_result_ty = IrType::ClosureRef {
+        param_types: vec![],
+        return_type: Box::new(IrType::Void),
+    };
+
+    let mut module = module_of(vec![
+        FnBuilder::new(0, "__plain").build(),
+        FnBuilder::new(1, "g")
+            .generic(&["T"])
+            .instr(
+                Op::ClosureAlloc(FuncId(0), vec![]),
+                closure_result_ty.clone(),
+            )
+            .build(),
+        FnBuilder::new(2, "main")
+            .instr(gcall(1, vec![IrType::I64]), IrType::Void)
+            .build(),
+    ]);
+
+    monomorphize(&mut module);
+
+    // The non-generic closure stays unchanged.
+    let plain = lookup(&module, "__plain");
+    assert_eq!(
+        plain.id,
+        FuncId(0),
+        "non-generic closure's FuncId should be unchanged after monomorphize"
+    );
+    assert!(
+        !module.function_index.contains_key("__plain__i64"),
+        "non-generic closure must NOT produce a `__plain__i64` specialization \
+         — the Pass A `type_param_names.is_empty() ? continue` filter is the \
+         only thing preventing it"
+    );
+
+    // The specialization of `g` keeps the original FuncId at the
+    // ClosureAlloc site.
+    let g_spec = lookup(&module, "g__i64");
+    match &g_spec.blocks[0].instructions[0].op {
+        Op::ClosureAlloc(callee, _) => assert_eq!(
+            *callee,
+            FuncId(0),
+            "Op::ClosureAlloc target should remain FuncId(0) (the original \
+             non-generic closure); a remap means Pass B's filter for \
+             non-generic closures regressed"
+        ),
+        other => panic!("expected Op::ClosureAlloc at g__i64 [0][0], got {other:?}"),
+    }
 }

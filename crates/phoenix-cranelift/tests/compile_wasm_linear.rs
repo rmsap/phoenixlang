@@ -338,6 +338,37 @@ fn call_targets_in_body(body: &wasmparser::FunctionBody<'_>) -> Result<Vec<u32>,
     Ok(targets)
 }
 
+/// Same as [`call_targets_in_body`], but pairs each `Call` target with
+/// the immediately preceding `I32Const` literal (if any). Used by tests
+/// that need to identify a specific `phx_gc_push_frame(N)` site by its
+/// `N` argument — the ad-hoc 1-slot key frame in `List.sortBy`, for
+/// example, is the only push preceded by `I32Const(1)` whose target
+/// also matches the function-level push.
+fn call_targets_with_preceding_i32const(
+    body: &wasmparser::FunctionBody<'_>,
+) -> Result<Vec<(u32, Option<i32>)>, String> {
+    use wasmparser::Operator;
+    let mut reader = body
+        .get_operators_reader()
+        .map_err(|e| format!("function-body operators: {e}"))?;
+    let mut targets = Vec::new();
+    let mut last_const: Option<i32> = None;
+    while !reader.eof() {
+        match reader
+            .read()
+            .map_err(|e| format!("function-body operator: {e}"))?
+        {
+            Operator::I32Const { value } => last_const = Some(value),
+            Operator::Call { function_index } => {
+                targets.push((function_index, last_const));
+                last_const = None;
+            }
+            _ => last_const = None,
+        }
+    }
+    Ok(targets)
+}
+
 /// Return the list of `Call`-target indices in the body of the user
 /// `main` function (`phx_main`). The merged module doesn't re-export
 /// `phx_main` by name, but `_start` always calls it as the
@@ -375,6 +406,29 @@ fn call_targets_in_phx_main(bytes: &[u8]) -> Result<Vec<u32>, String> {
     let phx_main_body = body_for_func_idx(&inspect, phx_main_idx)
         .map_err(|e| format!("locating phx_main body: {e}"))?;
     call_targets_in_body(phx_main_body)
+}
+
+/// Same as [`call_targets_in_phx_main`] but pairs each Call with its
+/// immediately preceding `I32Const` literal. Used by tests that
+/// distinguish push-frame sites by their frame-size argument.
+fn call_targets_with_const_in_phx_main(bytes: &[u8]) -> Result<Vec<(u32, Option<i32>)>, String> {
+    let inspect = inspect_wasm(bytes)?;
+    let start_idx = inspect
+        .start_func_idx
+        .ok_or_else(|| "module has no `_start` export".to_string())?;
+    let start_body = body_for_func_idx(&inspect, start_idx)
+        .map_err(|e| format!("locating `_start` body: {e}"))?;
+    let start_calls = call_targets_in_body(start_body)?;
+    if start_calls.len() < 2 {
+        return Err(format!(
+            "`_start` body has {} `Call` ops; phx_main lookup expects at least 2",
+            start_calls.len(),
+        ));
+    }
+    let phx_main_idx = start_calls[start_calls.len() - 2];
+    let phx_main_body = body_for_func_idx(&inspect, phx_main_idx)
+        .map_err(|e| format!("locating phx_main body: {e}"))?;
+    call_targets_with_preceding_i32const(phx_main_body)
 }
 
 /// Resolve an absolute WASM function index (the kind that appears in a
@@ -1731,6 +1785,205 @@ fn list_flatmap_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "list_flatmap");
 }
 
+/// `List.sortBy` — gate for the stable insertion-sort lowering with a
+/// custom nested `block`/`loop` (decreasing inner counter `j`, compound
+/// stop condition `j < 0 || cmp(copy[j], key) <= 0`). The comparator
+/// `a - b` gives ascending order; the unsorted input with a duplicate
+/// (`1` appears twice) confirms the sort is total and stable (the two
+/// `1`s are indistinguishable, so output is deterministic either way).
+///
+/// `[3,1,4,1,5,9,2,6].sortBy(\a b -> a - b)` → `[1,1,2,3,4,5,6,9]`.
+#[test]
+fn list_sortby_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let unsorted: List<Int> = [3, 1, 4, 1, 5, 9, 2, 6]\n  \
+                 let sorted = unsorted.sortBy(function(a: Int, b: Int) -> Int { a - b })\n  \
+                 for x in sorted {\n    \
+                   print(x)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_sortby");
+}
+
+/// `List.sortBy` at **n=50** — pin correctness past the 8-element
+/// fixture above. A buggy inner-loop termination (off-by-one,
+/// signed/unsigned mix on `j < 0`, wrong `LOOP_BREAK` depth) that
+/// happened to give the right answer for small inputs would diverge
+/// from the interpreter's merge sort here. The input is the LCG
+/// `x_{i+1} = (1103515245 · x_i + 12345) mod 2^15` seeded at 42 —
+/// chosen so the test source is self-contained (no large literal
+/// list) and the sequence is deterministic across runs.
+///
+/// The byte-identical match against the interpreter is the assertion:
+/// wasm32's insertion sort and the interpreter's merge sort are both
+/// stable, so they must agree on the full sorted output (including
+/// duplicates, which the LCG produces).
+#[test]
+fn list_sortby_n50_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let mut xs: List<Int> = []\n  \
+                 let mut seed: Int = 42\n  \
+                 let mut i: Int = 0\n  \
+                 while i < 50 {\n    \
+                   seed = (1103515245 * seed + 12345) % 32768\n    \
+                   xs = xs.push(seed)\n    \
+                   i = i + 1\n  \
+                 }\n  \
+                 let sorted = xs.sortBy(function(a: Int, b: Int) -> Int { a - b })\n  \
+                 for x in sorted {\n    \
+                   print(x)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_sortby_n50");
+}
+
+/// Structural gate for sortBy's ref-element ad-hoc `key` frame:
+/// `phx_main` must emit exactly two `phx_gc_push_frame` calls (the
+/// function-level frame + sortBy's `key` frame). Push/pop indices come
+/// from `calls.first()` / `calls.last()` (`setup_gc_frame` invariant);
+/// the `key` frame is the unique `push_idx` preceded by `I32Const(1)`.
+#[test]
+fn list_sortby_ref_elem_emits_adhoc_shadow_frame() {
+    let src = "function main() {\n  \
+                 let nested: List<List<Int>> = [[3, 0], [1, 0], [2, 0]]\n  \
+                 let sorted = nested.sortBy(function(a: List<Int>, b: List<Int>) -> Int { a.get(0) - b.get(0) })\n  \
+                 print(sorted.length())\n\
+               }\n";
+    compile_or_skip(src, "list_sortby_ref_adhoc_frame", |bytes| {
+        let calls_with_const = call_targets_with_const_in_phx_main(bytes)
+            .unwrap_or_else(|e| panic!("locating phx_main and decoding its calls failed: {e}"));
+        let calls: Vec<u32> = calls_with_const.iter().map(|(t, _)| *t).collect();
+        // Brittle invariant: the function-level `phx_gc_push_frame` is
+        // assumed to be the **first** Call in `phx_main` and its
+        // matching `pop_frame` the **last**. That holds today because
+        // the prologue / epilogue bracket every other runtime call, but
+        // a future codegen change that inserted a different Call ahead
+        // of the prologue push would mis-identify `push_idx` here. The
+        // `pushes_with_size_1 == 1` follow-up assertion below is what
+        // would catch such a mis-identification — the wrong index
+        // wouldn't be preceded by an `I32Const(1)` in this fixture,
+        // since sortBy's ad-hoc push is the only size-1 push.
+        let push_idx = *calls
+            .first()
+            .expect("sortBy `main` should emit at least one Call (phx_gc_push_frame)");
+        let pop_idx = *calls
+            .last()
+            .expect("sortBy `main` should emit at least one Call (phx_gc_pop_frame)");
+        assert_ne!(
+            push_idx, pop_idx,
+            "first and last `Call` in `phx_main` should differ (push_frame ≠ pop_frame); \
+             both came back as {push_idx}. calls={calls:?}",
+        );
+        let push_count = calls.iter().filter(|&&t| t == push_idx).count();
+        let pop_count = calls.iter().filter(|&&t| t == pop_idx).count();
+        assert_eq!(
+            push_count, pop_count,
+            "phx_gc_push_frame (idx {push_idx}) and phx_gc_pop_frame (idx {pop_idx}) must \
+             appear an equal number of times in `phx_main` — got push={push_count}, \
+             pop={pop_count}. A mismatch means sortBy's ad-hoc key frame push/pop pair is \
+             unbalanced (the runtime's frame counter would drift). calls={calls:?}",
+        );
+        assert_eq!(
+            push_count, 2,
+            "sortBy `main` with a ref-typed element should emit exactly two \
+             phx_gc_push_frame calls — the function-level frame plus sortBy's ad-hoc \
+             `key` frame. Got {push_count}: a count of 1 means the frame that roots the \
+             `key` element across the comparator call was dropped (a latent \
+             use-after-free under GC pressure). calls={calls:?}",
+        );
+
+        // Confirm we really identified `phx_gc_push_frame` (not some
+        // unrelated `Call` that happened to be the first opcode): the
+        // ad-hoc `key` frame uses `frame_size = 1`, so exactly one of
+        // the two `push_idx` calls must be preceded by `I32Const(1)`.
+        // A future codegen change that put a different `Call` first
+        // (mis-identifying push_idx) would fail this — the wrong index
+        // wouldn't have a matching `I32Const(1)` predecessor at all,
+        // since sortBy's ad-hoc push is the *only* size-1 push in this
+        // fixture.
+        let pushes_with_size_1 = calls_with_const
+            .iter()
+            .filter(|(t, c)| *t == push_idx && *c == Some(1))
+            .count();
+        assert_eq!(
+            pushes_with_size_1, 1,
+            "expected exactly one `phx_gc_push_frame(1)` site (sortBy's ad-hoc `key` frame); \
+             got {pushes_with_size_1}. Either push_idx is not actually phx_gc_push_frame \
+             (a different `Call` is now the first in the body), or sortBy stopped emitting \
+             the size-1 ad-hoc frame. calls_with_const={calls_with_const:?}",
+        );
+    });
+}
+
+/// `List<String>.sortBy` — sortBy over a 2-slot ref element. Pins
+/// that the multi-slot key load/store round-trip both slots of the fat
+/// pointer faithfully and that the ad-hoc frame survives an allocating
+/// comparator call. Comparator returns `0` so the inner shift body
+/// never fires (companion test below covers the shift path).
+#[test]
+fn list_string_sortby_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<String> = [\"banana\", \"fig\", \"cherry\", \"date\"]\n  \
+                 let sorted = xs.sortBy(function(a: String, b: String) -> Int {\n    \
+                   let _scratch: String = a + \"_\" + b\n    \
+                   0\n  \
+                 })\n  \
+                 for s in sorted {\n    \
+                   print(s)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_string_sortby");
+}
+
+/// `List<String>.sortBy` 2-slot shift path. Comparator returns `1`
+/// unconditionally — exercises the multi-slot key store across many
+/// shifts (every outer-loop element rides to slot 0).
+///
+/// **Caveat: not a total order.** A constant-`1` comparator violates
+/// antisymmetry, so sortBy's "byte-identical to interp for any total
+/// order" docstring guarantee does not cover this test. It still passes
+/// today by coincidence: both Phoenix's bottom-up merge sort
+/// ([`phoenix_common::algorithms::merge_sort_by`]) and wasm32's
+/// insertion sort reverse the input under cmp ≡ 1. A future change to
+/// *either* sort algorithm could break the byte-identical match. The
+/// purpose of the test is *mechanical* — it forces every shift to fire
+/// to pin the multi-slot key-store / GC-frame interactions — not to
+/// validate sort semantics, which the [`list_sortby_runs_under_wasmtime`]
+/// and `list_sortby_n50_runs_under_wasmtime` tests cover under a real
+/// total order. A `String.length()`-based comparator would be a cleaner
+/// shift-path exerciser, but wasm32 doesn't yet lower
+/// `BuiltinCall("String.length")` — revisit once it does.
+#[test]
+fn list_string_sortby_shifts_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<String> = [\"alpha\", \"beta\", \"gamma\", \"delta\"]\n  \
+                 let sorted = xs.sortBy(function(a: String, b: String) -> Int {\n    \
+                   let _scratch: String = a + \"_\" + b\n    \
+                   1\n  \
+                 })\n  \
+                 for s in sorted {\n    \
+                   print(s)\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_string_sortby_shifts");
+}
+
+/// `collections.phx` end-to-end — the full functional-collections
+/// fixture: `map` → `filter` → `reduce`, `sortBy`, `flatMap`, plus a
+/// `Map` literal with `length` / `contains` / `remove`. This is the
+/// fixture PR 3d's list/map/closure slices were built toward; it
+/// passing byte-identical with the interpreter confirms the whole
+/// functional-collections surface composes.
+const COLLECTIONS_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/collections.phx"
+));
+
+#[test]
+fn collections_runs_under_wasmtime() {
+    assert_wasm_matches_interp(COLLECTIONS_SOURCE, "collections");
+}
+
 /// Deterministic gate for `flatMap`'s inner-list rooting — the part the
 /// functional test above can't pin. The closure's per-element inner
 /// list has no IR `ValueId`, so it's rooted in a dedicated *ad-hoc*
@@ -2098,6 +2351,28 @@ fn map_string_values_run_under_wasmtime() {
                  print(vs.length())\n\
                }\n";
     assert_wasm_matches_interp(src, "map_string_values");
+}
+
+/// `Map<String, Int>.contains` pins string-content comparison on
+/// wasm32. The lookup key is built via a helper so it's a fresh heap
+/// allocation distinct from the literal in the map — pointer-identity
+/// comparison (the only thing the size fallback could give on wasm32,
+/// where `StringRef` is 8 bytes) would answer `false`. Routing through
+/// a function call also defends against future string interning /
+/// constant folding. Counterpart to
+/// [`list_string_contains_by_content_runs_under_wasmtime`].
+#[test]
+fn map_string_keys_contains_by_content_runs_under_wasmtime() {
+    let src = "function tail(prefix: String) -> String { prefix + \"ob\" }\n\
+               function tail2(prefix: String) -> String { prefix + \"an\" }\n\
+               function main() {\n  \
+                 let m: Map<String, Int> = {\"alice\": 1, \"bob\": 2, \"carol\": 3}\n  \
+                 let needle_hit: String = tail(\"b\")\n  \
+                 let needle_miss: String = tail2(\"d\")\n  \
+                 print(m.contains(needle_hit))\n  \
+                 print(m.contains(needle_miss))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_string_keys_contains_by_content");
 }
 
 /// `defer_try.phx` — gate for `Result.isErr` in conditional dispatch
@@ -2791,29 +3066,168 @@ fn rejects_main_with_return_value() {
     );
 }
 
+/// Boundary cases for `take` / `drop` / `push`: zero counts, counts
+/// past `length`, and `push` onto an empty list. Pins the wasm32 ABI
+/// of the runtime calls across each boundary; the interpreter is the
+/// authoritative oracle.
 #[test]
-fn rejects_unsupported_list_method() {
-    // `BuiltinCall("List.contains", ...)` reaches the WASM body
-    // translator from `xs.contains(x)` (Phoenix sema accepts the
-    // method, IR lowering emits the builtin), but
-    // `translate_list_method_builtin` doesn't yet handle it — the
-    // rejection happens at the builtin-dispatcher level with a clean
-    // per-method diagnostic. Pin the method name so a regression
-    // that handled List.contains by accident would surface here.
-    //
-    // (PR 3d slices 1 / 4 lifted the `ListAlloc` / `MapAlloc`
-    // restrictions; this test moved from those op-level rejections
-    // to a builtin-level rejection on a still-unsupported method, so
-    // the test surface keeps pinning *some* still-gated path until
-    // PR 3d is complete.)
+fn list_take_drop_push_edge_cases_run_under_wasmtime() {
     let src = "function main() {\n  \
                  let xs: List<Int> = [1, 2, 3]\n  \
-                 print(xs.contains(2))\n\
+                 let empty: List<Int> = []\n  \
+                 print(xs.take(0).length())\n  \
+                 print(xs.take(99).length())\n  \
+                 print(xs.drop(0).length())\n  \
+                 print(xs.drop(99).length())\n  \
+                 let pushed: List<Int> = empty.push(42)\n  \
+                 print(pushed.length())\n  \
+                 print(pushed.get(0))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_take_drop_push_edge_cases");
+}
+
+#[test]
+fn list_take_drop_push_contains_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [10, 20, 30]\n  \
+                 print(xs.take(2).length())\n  \
+                 let d: List<Int> = xs.drop(1)\n  \
+                 print(d.get(0))\n  \
+                 print(xs.push(40).length())\n  \
+                 print(xs.contains(20))\n  \
+                 print(xs.contains(99))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_take_drop_push_contains");
+}
+
+/// `List<String>.contains` pins string-content comparison on wasm32.
+/// The needle is built via a helper function so it's a fresh heap
+/// allocation distinct from the literal in the list — pointer-identity
+/// comparison would answer `false`. Routing through a function call
+/// also defends against future string interning / constant folding.
+#[test]
+fn list_string_contains_by_content_runs_under_wasmtime() {
+    let src = "function tail(prefix: String) -> String { prefix + \"ob\" }\n\
+               function tail2(prefix: String) -> String { prefix + \"an\" }\n\
+               function main() {\n  \
+                 let xs: List<String> = [\"alice\", \"bob\", \"carol\"]\n  \
+                 let needle_hit: String = tail(\"b\")\n  \
+                 let needle_miss: String = tail2(\"d\")\n  \
+                 print(xs.contains(needle_hit))\n  \
+                 print(xs.contains(needle_miss))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_string_contains_by_content");
+}
+
+/// `List.any` / `List.all` — value cases. Short-circuit behavior is
+/// pinned separately by [`list_any_all_short_circuits_like_interp`].
+#[test]
+fn list_any_all_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [2, 4, 6]\n  \
+                 print(xs.any(function(x: Int) -> Bool { x > 5 }))\n  \
+                 print(xs.any(function(x: Int) -> Bool { x > 10 }))\n  \
+                 print(xs.all(function(x: Int) -> Bool { x % 2 == 0 }))\n  \
+                 print(xs.all(function(x: Int) -> Bool { x > 2 }))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_any_all");
+}
+
+/// `List.any` / `List.all` short-circuit like the interpreter — each
+/// predicate `print`s its element so the printed count reveals exactly
+/// how far the fold ran. A lowering that evaluated every element would
+/// print extra values and fail the byte-identical match.
+#[test]
+fn list_any_all_short_circuits_like_interp() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [1, 3, 5]\n  \
+                 print(xs.any(function(x: Int) -> Bool {\n    \
+                   print(x)\n    \
+                   x > 2\n  \
+                 }))\n  \
+                 let ys: List<Int> = [4, 1, 6]\n  \
+                 print(ys.all(function(x: Int) -> Bool {\n    \
+                   print(x)\n    \
+                   x > 2\n  \
+                 }))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_any_all_short_circuit");
+}
+
+/// `List.any` / `List.all` on an **empty** list — boundary case for the
+/// hand-rolled loop's seed. With `len == 0` the body never runs, the
+/// `i >= len` guard immediately branches to `$exit`, and `result_local`
+/// retains its initial seed: `0` (false) for `any`, `1` (true) for
+/// `all`. Matches the interpreter's mathematical convention
+/// (`any([]) = false`, `all([]) = true`).
+#[test]
+fn list_any_all_on_empty_list_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = []\n  \
+                 print(xs.any(function(x: Int) -> Bool { x > 0 }))\n  \
+                 print(xs.all(function(x: Int) -> Bool { x > 0 }))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_any_all_empty");
+}
+
+/// `List.sortBy` on an **empty** list — boundary case for the outer
+/// loop's `i = 1; while i < len` guard. With `len == 0` the outer loop
+/// never enters, the comparator is never called, and the `phx_list_take`
+/// copy of the empty list is returned verbatim. Pins that the
+/// `elem_is_ref` ad-hoc-frame push/pop is still balanced (push happens
+/// before the loop, pop after) even when the inner body is skipped — a
+/// regression that put the pop inside the loop body would leak a frame
+/// on every empty-list sortBy.
+#[test]
+fn list_sortby_on_empty_list_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = []\n  \
+                 let sorted: List<Int> = xs.sortBy(function(a: Int, b: Int) -> Int { a - b })\n  \
+                 print(sorted.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_sortby_empty_int");
+}
+
+/// `List<String>.sortBy` on an **empty** list — same as above but with
+/// a ref-typed element (`elem_is_ref = true`), so the ad-hoc shadow
+/// frame is *actually pushed* even though the outer loop never executes.
+/// This is the path the [`list_sortby_ref_elem_emits_adhoc_shadow_frame`]
+/// docstring leans on when it argues placeholder typing is safe ("the
+/// outer loop's `i < len` condition is false ... so the inner loop never
+/// executes"). Without runtime coverage of the empty-ref path, that
+/// argument is unpinned.
+#[test]
+fn list_sortby_on_empty_string_list_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<String> = []\n  \
+                 let sorted: List<String> = xs.sortBy(function(a: String, b: String) -> Int { 0 })\n  \
+                 print(sorted.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_sortby_empty_string");
+}
+
+#[test]
+fn rejects_list_find_unsupported() {
+    // `BuiltinCall("List.find", ...)` reaches the WASM body translator
+    // from `xs.find(pred)` (Phoenix sema accepts the method, IR
+    // lowering emits the builtin), but `translate_list_method_builtin`
+    // doesn't yet handle it — the rejection happens at the builtin-
+    // dispatcher level with a clean per-method diagnostic. Pin the
+    // method name so a regression that handled List.find by accident
+    // would surface here.
+    //
+    // (Earlier PR 3d slices lifted the `ListAlloc` / `MapAlloc` /
+    // `List.contains` restrictions; this test tracks the frontier,
+    // pinning *some* still-gated method until coverage is complete.)
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [1, 2, 3]\n  \
+                 let _ = xs.find(function(x: Int) -> Bool { x > 1 })\n  \
+                 print(true)\n\
                }\n";
     let err = expect_wasm_compile_error(src);
     assert!(
-        err.contains("List.contains") && err.contains("not yet supported"),
-        "expected `List.contains ... not yet supported` builtin-level error, \
+        err.contains("List.find") && err.contains("not yet supported"),
+        "expected `List.find ... not yet supported` builtin-level error, \
          got: {err}"
     );
 }

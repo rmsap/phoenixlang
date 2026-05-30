@@ -1724,8 +1724,9 @@ fn translate_instruction(
         // --- Map allocation -----------------------------------------
         //
         // `Op::MapAlloc(pairs)` lowers to a single
-        // `phx_map_from_pairs(key_size, val_size, n_pairs, pair_data)`
-        // runtime call: codegen reserves an on-stack pair buffer (via
+        // `phx_map_from_pairs(key_size, val_size, n_pairs, pair_data,
+        // key_is_string)` runtime call: codegen reserves an on-stack
+        // pair buffer (via
         // [`emit_alloc_stack_frame`]), writes each `(key, val)` pair
         // back-to-back at densely packed offsets (no slot padding —
         // the runtime indexes by `(ks + vs) * i`), then hands the
@@ -1755,16 +1756,24 @@ fn translate_instruction(
             let ks = phx_field_size_bytes(&key_ty)? as i64;
             let vs = phx_field_size_bytes(&val_ty)? as i64;
             let count = entries.len() as i64;
+            // `key_is_string`: recorded in the map header so every later
+            // lookup compares string keys by content. Required on wasm32,
+            // where a `StringRef` key is 8 bytes and can't be told from an
+            // `Int` / `Float` key by size. See the runtime's
+            // `phx_map_from_pairs` / `elements_equal`. Shared with the
+            // cranelift backend via [`IrType::string_flag`].
+            let key_is_string = key_ty.string_flag() as i64;
             let map_from_pairs_idx = b.require_phx_func("phx_map_from_pairs")?;
 
             if entries.is_empty() {
-                // `phx_map_from_pairs(ks, vs, 0, null_i32)` — runtime
-                // safety doc explicitly allows null `pair_data` when
-                // `n_pairs == 0`.
+                // `phx_map_from_pairs(ks, vs, 0, null_i32, key_is_string)`
+                // — runtime safety doc explicitly allows null `pair_data`
+                // when `n_pairs == 0`.
                 ctx.emit(Instruction::I64Const(ks));
                 ctx.emit(Instruction::I64Const(vs));
                 ctx.emit(Instruction::I64Const(0));
                 ctx.emit(Instruction::I32Const(0));
+                ctx.emit(Instruction::I64Const(key_is_string));
                 ctx.emit(Instruction::Call(map_from_pairs_idx));
                 ctx.emit_store_result(vid, instr.result_type.clone())?;
             } else {
@@ -1792,6 +1801,7 @@ fn translate_instruction(
                 ctx.emit(Instruction::I64Const(vs));
                 ctx.emit(Instruction::I64Const(count));
                 ctx.emit(Instruction::LocalGet(frame_ptr_local));
+                ctx.emit(Instruction::I64Const(key_is_string));
                 ctx.emit(Instruction::Call(map_from_pairs_idx));
                 ctx.emit_store_result(vid, instr.result_type.clone())?;
                 emit_restore_stack_frame(ctx, b, saved_sp)?;
@@ -2789,10 +2799,20 @@ fn translate_list_method_builtin(
         "map" => translate_list_map(ctx, b, args, instr),
         "filter" => translate_list_filter(ctx, b, args, instr),
         "flatMap" => translate_list_flatmap(ctx, b, args, instr),
+        "sortBy" => translate_list_sortby(ctx, b, args, instr),
+        // `take(n)` / `drop(n)`: pure runtime calls returning a fresh
+        // list. The count arg is an i64 `Int`; the result is a
+        // GC-rooted list (blanket post-instruction set_root).
+        "take" => translate_list_take_drop(ctx, b, "take", "phx_list_take", args, instr),
+        "drop" => translate_list_take_drop(ctx, b, "drop", "phx_list_drop", args, instr),
+        "push" => translate_list_push(ctx, b, args, instr),
+        "contains" => translate_list_contains(ctx, b, args, instr),
+        "any" => translate_list_any_all(ctx, b, args, instr, true),
+        "all" => translate_list_any_all(ctx, b, args, instr, false),
         other => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"List.{other}\")` not yet supported \
-             (Phase 2.4 PR 3d — see docs/phases/phase-2.md §2.4 PR 3d for the \
-             remaining list methods: `sortBy` / `contains` ship in a later slice)"
+             (Phase 2.4 PR 3d — see docs/phases/phase-2.md §2.4 PR 3d; \
+             `find` ships in a later slice)"
         ))),
     }
 }
@@ -2806,6 +2826,238 @@ fn list_elem_type(ctx: &FuncTranslateCtx, list_vid: ValueId) -> Result<IrType, C
              method, got `{other:?}` (internal compiler bug)"
         ))),
     }
+}
+
+/// `List.take(n)` / `List.drop(n)`: `runtime_fn(list, n) -> list`.
+/// `n` is an i64 `Int`. The fresh list is GC-rooted by the blanket
+/// post-instruction set_root.
+fn translate_list_take_drop(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method_name: &str,
+    runtime_fn: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.{method_name}\")` requires 2 args \
+             (list, n), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"List.take/drop\")")?;
+    let list_ptr_local = ctx.binding_of(args[0])?.single_local();
+    let n_local = ctx.binding_of(args[1])?.single_local();
+    let fn_idx = b.require_phx_func(runtime_fn)?;
+    ctx.emit(Instruction::LocalGet(list_ptr_local));
+    ctx.emit(Instruction::LocalGet(n_local));
+    ctx.emit(Instruction::Call(fn_idx));
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `br_if` / `br` depth that exits a [`emit_breakable_loop`] body.
+const LOOP_BREAK: u32 = 1;
+/// `br` depth that continues a [`emit_breakable_loop`] body.
+const LOOP_CONTINUE: u32 = 0;
+
+/// `(block (loop body))` skeleton where `body` handles bounds, work,
+/// advance, and the trailing `br LOOP_CONTINUE`. Use when the body
+/// needs to short-circuit (`List.any`/`all`) or when the loop shape
+/// isn't a simple `for i in 0..len` walk (`sortBy`'s decreasing inner
+/// counter). Distinct from [`emit_list_loop`], which owns the bounds
+/// check itself and forbids the body from branching. Nesting is
+/// sound — inner depths shift by 2 — which [`translate_list_sortby`]
+/// relies on.
+fn emit_breakable_loop<F>(ctx: &mut FuncTranslateCtx, body: F) -> Result<(), CompileError>
+where
+    F: FnOnce(&mut FuncTranslateCtx) -> Result<(), CompileError>,
+{
+    ctx.emit(Instruction::Block(BlockType::Empty));
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    body(ctx)?;
+    ctx.emit(Instruction::End); // close loop
+    ctx.emit(Instruction::End); // close exit block
+    Ok(())
+}
+
+/// `List.any(pred)` / `List.all(pred)`: short-circuiting boolean fold.
+/// `any` seeds `false` and ORs each `pred(elem)`, breaking at the first
+/// `true`; `all` seeds `true` and ANDs, breaking at the first `false`.
+/// Matches the interpreter, so a side-effecting predicate observes the
+/// same call sequence under wasm and tree-walk.
+///
+/// ## Bool canonicalization
+///
+/// The `i32.or` / `i32.and` combine and the `i32.eqz` short-circuit
+/// test rely on Phoenix `Bool` values being exactly `0` or `1`. This is
+/// not a property of [`wasm_valtypes_for`] (which only maps `Bool` to
+/// `ValType::I32`) — it's an invariant maintained by every site that
+/// *produces* a Bool: comparison ops (`i32.eq`/`i64.eq` etc. return 0
+/// or 1), `i32.eqz`, the seed `I32Const(0|1)` below, and the user
+/// predicate's return value (whose codegen must respect the same
+/// invariant — `LowerBoolNot`, comparisons, and Bool literals all do).
+///
+/// Hand-rolled around [`emit_breakable_loop`] so the body can `br_if`
+/// out — [`emit_list_loop`] forbids branching.
+fn translate_list_any_all(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+    is_any: bool,
+) -> Result<(), CompileError> {
+    let method = if is_any { "any" } else { "all" };
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.{method}\")` requires 2 args \
+             (list, predicate), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"List.any/all\")")?;
+    let list_vid = args[0];
+    let closure_vid = args[1];
+    let elem_ty = list_elem_type(ctx, list_vid)?;
+    let elem_size = phx_field_size_bytes(&elem_ty)?;
+    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
+    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
+    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
+
+    // result = seed (0 for any, 1 for all).
+    let result_local = ctx.allocate_temp_local(ValType::I32);
+    ctx.emit(Instruction::I32Const(if is_any { 0 } else { 1 }));
+    ctx.emit(Instruction::LocalSet(result_local));
+
+    let elem_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
+    let length_idx = b.require_phx_func("phx_list_length")?;
+    let len_local = ctx.allocate_temp_local(ValType::I64);
+    let i_local = ctx.allocate_temp_local(ValType::I64);
+    ctx.emit(Instruction::LocalGet(list_ptr_local));
+    ctx.emit(Instruction::Call(length_idx));
+    ctx.emit(Instruction::LocalSet(len_local));
+    ctx.emit(Instruction::I64Const(0));
+    ctx.emit(Instruction::LocalSet(i_local));
+
+    emit_breakable_loop(ctx, |ctx| {
+        // i >= len → break out of the loop.
+        ctx.emit(Instruction::LocalGet(i_local));
+        ctx.emit(Instruction::LocalGet(len_local));
+        ctx.emit(Instruction::I64GeS);
+        ctx.emit(Instruction::BrIf(LOOP_BREAK));
+        // pred = closure(list[i]) → i32 on stack.
+        let addr = emit_list_elem_addr(ctx, list_ptr_local, i_local, elem_size);
+        emit_field_load(ctx, addr, 0, &elem_ty)?;
+        store_stack_into_locals(ctx, &elem_locals);
+        let call_args = vec![elem_locals.clone()];
+        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
+        // result = result OR/AND pred (predicate result is on the stack).
+        ctx.emit(Instruction::LocalGet(result_local));
+        if is_any {
+            ctx.emit(Instruction::I32Or);
+        } else {
+            ctx.emit(Instruction::I32And);
+        }
+        ctx.emit(Instruction::LocalSet(result_local));
+        // Short-circuit: `any` breaks once result is true, `all` once
+        // it is false (i32.eqz flips the test).
+        ctx.emit(Instruction::LocalGet(result_local));
+        if !is_any {
+            ctx.emit(Instruction::I32Eqz);
+        }
+        ctx.emit(Instruction::BrIf(LOOP_BREAK));
+        // i += 1; continue.
+        ctx.emit(Instruction::LocalGet(i_local));
+        ctx.emit(Instruction::I64Const(1));
+        ctx.emit(Instruction::I64Add);
+        ctx.emit(Instruction::LocalSet(i_local));
+        ctx.emit(Instruction::Br(LOOP_CONTINUE));
+        Ok(())
+    })?;
+
+    // Bind the result Bool.
+    ctx.emit(Instruction::LocalGet(result_local));
+    ctx.emit_store_result(vid, IrType::Bool)?;
+    Ok(())
+}
+
+/// `List.push(elem)`: `phx_list_push_raw(list, &elem, es) -> list`.
+/// Stages the element value into a shadow-stack scratch frame and
+/// passes its address (push copies the bytes by value, so the staged
+/// element needs no rooting). Returns a fresh GC-rooted list.
+fn translate_list_push(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.push\")` requires 2 args \
+             (list, elem), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"List.push\")")?;
+    let list_ptr_local = ctx.binding_of(args[0])?.single_local();
+    let elem_binding = ctx.binding_of(args[1])?;
+    let elem_locals = elem_binding.locals.clone();
+    let elem_ty = elem_binding.ir_type.clone();
+    let es = phx_field_size_bytes(&elem_ty)?;
+
+    let (saved_sp, frame_local) = emit_alloc_stack_frame(ctx, b, es)?;
+    emit_field_store(ctx, frame_local, 0, &elem_ty, &elem_locals)?;
+    let push_idx = b.require_phx_func("phx_list_push_raw")?;
+    ctx.emit(Instruction::LocalGet(list_ptr_local));
+    ctx.emit(Instruction::LocalGet(frame_local));
+    ctx.emit(Instruction::I64Const(es as i64));
+    ctx.emit(Instruction::Call(push_idx));
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    emit_restore_stack_frame(ctx, b, saved_sp)?;
+    Ok(())
+}
+
+/// `List.contains(elem)`: `phx_list_contains(list, &elem, es, is_float,
+/// is_string) -> i8`. Stages the element on the shadow stack; the two
+/// flags use [`IrType::float_flag`] / [`IrType::string_flag`] so
+/// cranelift and wasm encode them identically. The runtime treats
+/// `is_string` as authoritative, which is what makes
+/// `List<String>.contains` compare by content on wasm32 (where a
+/// `StringRef` is 8 bytes, indistinguishable from `Int` / `Float` by
+/// size).
+fn translate_list_contains(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.contains\")` requires 2 args \
+             (list, elem), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"List.contains\")")?;
+    let list_ptr_local = ctx.binding_of(args[0])?.single_local();
+    let elem_binding = ctx.binding_of(args[1])?;
+    let elem_locals = elem_binding.locals.clone();
+    let elem_ty = elem_binding.ir_type.clone();
+    let es = phx_field_size_bytes(&elem_ty)?;
+
+    let (saved_sp, frame_local) = emit_alloc_stack_frame(ctx, b, es)?;
+    emit_field_store(ctx, frame_local, 0, &elem_ty, &elem_locals)?;
+    let contains_idx = b.require_phx_func("phx_list_contains")?;
+    ctx.emit(Instruction::LocalGet(list_ptr_local));
+    ctx.emit(Instruction::LocalGet(frame_local));
+    ctx.emit(Instruction::I64Const(es as i64));
+    ctx.emit(Instruction::I32Const(elem_ty.float_flag() as i32));
+    ctx.emit(Instruction::I32Const(elem_ty.string_flag() as i32));
+    ctx.emit(Instruction::Call(contains_idx));
+    ctx.emit_store_result(vid, IrType::Bool)?;
+    emit_restore_stack_frame(ctx, b, saved_sp)?;
+    Ok(())
 }
 
 /// Emit the shared list-iteration loop skeleton and run `body` once
@@ -3204,6 +3456,209 @@ fn translate_list_flatmap(
         })
     })?;
     emit_gc_pop_frame_at(ctx, b, inner_frame_local)?;
+    Ok(())
+}
+
+/// `List.sortBy(list, comparator)`: return a new list sorted by the
+/// comparator closure `(a, b) -> Int` (negative = `a` before `b`).
+///
+/// Uses **stable insertion sort** rather than native's bottom-up merge
+/// sort. The output is byte-identical for any total-order comparator:
+/// insertion sort is stable (ties keep input order via the `cmp <= 0`
+/// stop condition), matching the interpreter and native backends. It
+/// trades native's O(n log n) for O(n²), acceptable for the
+/// small-list use the method sees today; the WASM port favors a
+/// structured-control-flow shape that maps cleanly to nested
+/// `block`/`loop`s over replicating merge sort's many-edged CFG.
+///
+/// The sort runs in place on a fresh copy of the input
+/// (`phx_list_take(list, len)` — Phoenix lists are immutable, so the
+/// input is never mutated). The copy is bound to the result vid and
+/// rooted via its slot.
+///
+/// GC: when the element type is a ref, the `key` being inserted is
+/// held in locals across the comparator call (which may allocate) —
+/// and after the first shift `copy[i]` is overwritten, so `key` is no
+/// longer reachable through the rooted copy. A dedicated 1-slot ad-hoc
+/// shadow frame roots `key` for the outer loop's duration. Value-typed
+/// elements (the common case) skip the frame entirely. Shifted
+/// elements (`copy[j] → copy[j+1]`) stay reachable through the rooted
+/// copy throughout.
+///
+/// The 1-slot frame is sufficient because today every Phoenix ref type
+/// occupies at most one *pointer* slot: single-slot refs (`List`, `Map`,
+/// `Closure`, `Struct`, `Enum`) are a bare GC pointer in `key_locals[0]`,
+/// and the only 2-slot ref — `StringRef` — stores the heap pointer in
+/// `key_locals[0]` and the (non-pointer) `len` in `key_locals[1]`.
+/// Rooting slot 0 keeps the underlying object live in every current
+/// case. A future 2-pointer ref type (e.g. a fat reference whose second
+/// slot is itself a GC pointer) would need this frame widened to 2 slots
+/// — `phx_field_size_bytes` adding a non-`StringRef` 2-slot ref-type
+/// branch is the tripwire for the rewrite.
+fn translate_list_sortby(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"List.sortBy\")` requires 2 args \
+             (list, comparator), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"List.sortBy\")")?;
+    let list_vid = args[0];
+    let closure_vid = args[1];
+    let elem_ty = list_elem_type(ctx, list_vid)?;
+    let elem_size = phx_field_size_bytes(&elem_ty)?;
+    // `is_ref_type()` returns true for the `__generic` placeholder
+    // (`StructRef("__generic", [])`), so a sortBy over a placeholder-typed
+    // empty list would take the ref branch. Sema closes off that path in
+    // practice today — `let xs = []` is rejected as ambiguous
+    // (`phoenix-sema/src/check_stmt.rs::check_let`'s "cannot infer type"
+    // diagnostic) and `let xs: List<T> = []` is pinned to the annotation
+    // by `pin_inferred_type_to_annotation` — so every sortBy reachable
+    // from user code carries a concrete element type. The placeholder
+    // branch is therefore unreachable today; it is kept defensively (and
+    // is safe by construction: `len == 0` on the only path that could
+    // reach it, so the inner loop never executes and the rooted slot
+    // never participates in a collection). The GC-root emitter paired
+    // with `gc_roots::is_tracked_ref`'s placeholder skip makes this
+    // safe; see that file's docstring for the joint contract.
+    let elem_is_ref = elem_ty.is_ref_type();
+
+    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
+    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
+    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
+
+    // len = phx_list_length(list); copy = phx_list_take(list, len).
+    let length_idx = b.require_phx_func("phx_list_length")?;
+    let take_idx = b.require_phx_func("phx_list_take")?;
+    let len_local = ctx.allocate_temp_local(ValType::I64);
+    ctx.emit(Instruction::LocalGet(list_ptr_local));
+    ctx.emit(Instruction::Call(length_idx));
+    ctx.emit(Instruction::LocalSet(len_local));
+    ctx.emit(Instruction::LocalGet(list_ptr_local));
+    ctx.emit(Instruction::LocalGet(len_local));
+    ctx.emit(Instruction::Call(take_idx));
+    let copy_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
+    ctx.emit(Instruction::LocalSet(copy_local));
+    emit_gc_set_root(ctx, b, vid)?; // root the copy
+
+    // Optional ad-hoc frame rooting the `key` element (ref types only).
+    let key_frame_local = if elem_is_ref {
+        Some(emit_gc_push_frame_at(ctx, b, 1)?)
+    } else {
+        None
+    };
+
+    let key_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
+    let cmp_a_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
+    // Executable tripwire for the docstring's single-pointer-slot
+    // assumption. Today every ref type either occupies one slot (a
+    // bare GC pointer in slot 0) or is exactly `StringRef` (slot 0 =
+    // heap pointer, slot 1 = non-pointer `len`). A future ref type
+    // whose second slot is also a GC pointer would need this frame
+    // widened to 2 slots; this assert fires before that case silently
+    // miscompiles.
+    debug_assert!(
+        !elem_is_ref || matches!(&elem_ty, IrType::StringRef) || key_locals.len() == 1,
+        "sortBy: ref element type {:?} occupies {} slots — the ad-hoc \
+         key frame only roots slot 0, but this type may have a pointer \
+         in another slot. Widen the frame to match (see the docstring's \
+         tripwire note).",
+        elem_ty,
+        key_locals.len(),
+    );
+    let i_local = ctx.allocate_temp_local(ValType::I64);
+    let j_local = ctx.allocate_temp_local(ValType::I64);
+    let jp1_local = ctx.allocate_temp_local(ValType::I64);
+    let cmp_result_local = ctx.allocate_temp_local(ValType::I64);
+
+    // i = 1 (element 0 is trivially sorted).
+    ctx.emit(Instruction::I64Const(1));
+    ctx.emit(Instruction::LocalSet(i_local));
+
+    // Outer loop: for i in 1..len.
+    emit_breakable_loop(ctx, |ctx| {
+        // i >= len → break outer.
+        ctx.emit(Instruction::LocalGet(i_local));
+        ctx.emit(Instruction::LocalGet(len_local));
+        ctx.emit(Instruction::I64GeS);
+        ctx.emit(Instruction::BrIf(LOOP_BREAK));
+        // key = copy[i].
+        let key_addr = emit_list_elem_addr(ctx, copy_local, i_local, elem_size);
+        emit_field_load(ctx, key_addr, 0, &elem_ty)?;
+        store_stack_into_locals(ctx, &key_locals);
+        if let Some(frame) = key_frame_local {
+            emit_gc_set_root_at(ctx, b, frame, 0, key_locals[0])?;
+        }
+        // j = i - 1.
+        ctx.emit(Instruction::LocalGet(i_local));
+        ctx.emit(Instruction::I64Const(1));
+        ctx.emit(Instruction::I64Sub);
+        ctx.emit(Instruction::LocalSet(j_local));
+
+        // Inner loop: while j >= 0 && cmp(copy[j], key) > 0:
+        //                  copy[j+1] = copy[j]; j -= 1.
+        // Inner LOOP_BREAK / LOOP_CONTINUE refer to the inner loop —
+        // emit_breakable_loop's nesting shifts the outer depths by 2.
+        emit_breakable_loop(ctx, |ctx| {
+            // j < 0 → break inner.
+            ctx.emit(Instruction::LocalGet(j_local));
+            ctx.emit(Instruction::I64Const(0));
+            ctx.emit(Instruction::I64LtS);
+            ctx.emit(Instruction::BrIf(LOOP_BREAK));
+            // cmp_a = copy[j].
+            let cj_addr = emit_list_elem_addr(ctx, copy_local, j_local, elem_size);
+            emit_field_load(ctx, cj_addr, 0, &elem_ty)?;
+            store_stack_into_locals(ctx, &cmp_a_locals);
+            // c = comparator(copy[j], key) → i64 on stack.
+            let cmp_args = vec![cmp_a_locals.clone(), key_locals.clone()];
+            emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &cmp_args)?;
+            ctx.emit(Instruction::LocalSet(cmp_result_local));
+            // c <= 0 → stop shifting (stable: ties keep left/original order).
+            ctx.emit(Instruction::LocalGet(cmp_result_local));
+            ctx.emit(Instruction::I64Const(0));
+            ctx.emit(Instruction::I64LeS);
+            ctx.emit(Instruction::BrIf(LOOP_BREAK));
+            // copy[j+1] = copy[j] (cmp_a_locals still holds copy[j]).
+            ctx.emit(Instruction::LocalGet(j_local));
+            ctx.emit(Instruction::I64Const(1));
+            ctx.emit(Instruction::I64Add);
+            ctx.emit(Instruction::LocalSet(jp1_local));
+            let shift_dst = emit_list_elem_addr(ctx, copy_local, jp1_local, elem_size);
+            emit_field_store(ctx, shift_dst, 0, &elem_ty, &cmp_a_locals)?;
+            // j -= 1.
+            ctx.emit(Instruction::LocalGet(j_local));
+            ctx.emit(Instruction::I64Const(1));
+            ctx.emit(Instruction::I64Sub);
+            ctx.emit(Instruction::LocalSet(j_local));
+            ctx.emit(Instruction::Br(LOOP_CONTINUE));
+            Ok(())
+        })?;
+
+        // copy[j+1] = key.
+        ctx.emit(Instruction::LocalGet(j_local));
+        ctx.emit(Instruction::I64Const(1));
+        ctx.emit(Instruction::I64Add);
+        ctx.emit(Instruction::LocalSet(jp1_local));
+        let insert_dst = emit_list_elem_addr(ctx, copy_local, jp1_local, elem_size);
+        emit_field_store(ctx, insert_dst, 0, &elem_ty, &key_locals)?;
+        // i += 1.
+        ctx.emit(Instruction::LocalGet(i_local));
+        ctx.emit(Instruction::I64Const(1));
+        ctx.emit(Instruction::I64Add);
+        ctx.emit(Instruction::LocalSet(i_local));
+        ctx.emit(Instruction::Br(LOOP_CONTINUE));
+        Ok(())
+    })?;
+
+    if let Some(frame) = key_frame_local {
+        emit_gc_pop_frame_at(ctx, b, frame)?;
+    }
     Ok(())
 }
 

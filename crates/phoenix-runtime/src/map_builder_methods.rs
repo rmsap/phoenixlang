@@ -27,7 +27,8 @@
 //!   offset 16:  i64   key_size       (bytes per key)
 //!   offset 24:  i64   val_size       (bytes per value)
 //!   offset 32:  i64   frozen         (0 = mutable; 1 = frozen)
-//!   offset 40:  *mut  data_ptr       (heap pointer into the buffer object)
+//!   offset 40:  i64   key_is_string  (1 if keys are string fat pointers)
+//!   offset 48:  *mut  data_ptr       (heap pointer into the buffer object)
 //!
 //! Buffer (GC-tracked, TypeTag::Unknown):
 //!   offset 0:   u8[ capacity * (key_size + val_size) ]
@@ -47,15 +48,16 @@ use crate::gc::{TypeTag, phx_gc_alloc};
 use crate::map_methods::phx_map_from_pairs;
 use crate::runtime_abort;
 
-/// Builder handle size in bytes (6 × i64).
-pub(crate) const BUILDER_HEADER_SIZE: usize = 48;
+/// Builder handle size in bytes (7 × i64).
+pub(crate) const BUILDER_HEADER_SIZE: usize = 56;
 
 const OFF_LENGTH: usize = 0;
 const OFF_CAPACITY: usize = 8;
 const OFF_KEY_SIZE: usize = 16;
 const OFF_VAL_SIZE: usize = 24;
 const OFF_FROZEN: usize = 32;
-const OFF_DATA_PTR: usize = 40;
+const OFF_KEY_IS_STRING: usize = 40;
+const OFF_DATA_PTR: usize = 48;
 
 /// Initial pair-slot capacity. 8 matches `phx_list_builder_alloc`'s
 /// choice — the existing per-doubling reasoning applies.
@@ -78,8 +80,17 @@ unsafe fn write_ptr(ptr: *mut u8, offset: usize, value: *mut u8) {
 }
 
 /// Allocate a fresh `MapBuilder<K, V>` with capacity 8 pairs.
+///
+/// `key_is_string` is recorded in the handle and threaded through
+/// `phx_map_from_pairs` on freeze so the resulting `Map`'s lookups
+/// compare string keys by content. Codegen passes the static answer
+/// for the key type.
 #[unsafe(no_mangle)]
-pub extern "C" fn phx_map_builder_alloc(key_size: i64, val_size: i64) -> *mut u8 {
+pub extern "C" fn phx_map_builder_alloc(
+    key_size: i64,
+    val_size: i64,
+    key_is_string: i64,
+) -> *mut u8 {
     // Reject zero / negative sizes. See the same check in
     // `phx_list_builder_alloc` for the rationale — a zero-sized pair
     // would let `length` increment forever without ever growing the
@@ -116,6 +127,7 @@ pub extern "C" fn phx_map_builder_alloc(key_size: i64, val_size: i64) -> *mut u8
         write_i64(handle, OFF_KEY_SIZE, key_size);
         write_i64(handle, OFF_VAL_SIZE, val_size);
         write_i64(handle, OFF_FROZEN, 0);
+        write_i64(handle, OFF_KEY_IS_STRING, key_is_string);
         write_ptr(handle, OFF_DATA_PTR, buffer);
     }
     unsafe { shadow_stack::pop_frame(frame) };
@@ -144,7 +156,7 @@ unsafe fn assert_unfrozen(handle: *const u8, method: &str) {
 /// - **`handle` must be rooted by the caller's shadow-stack frame.**
 ///   A grow allocates via `phx_gc_alloc`, which can trigger
 ///   auto-collect.
-/// - If a key or value is a 16-byte string fat pointer, the
+/// - If a key or value is a string fat pointer, the
 ///   *pointed-to* heap string must also be rooted by the caller —
 ///   same rule as `phx_map_from_pairs` itself.
 #[unsafe(no_mangle)]
@@ -230,6 +242,7 @@ pub unsafe extern "C" fn phx_map_builder_freeze(handle: *mut u8) -> *mut u8 {
     let key_size = unsafe { read_i64(handle, OFF_KEY_SIZE) };
     let val_size = unsafe { read_i64(handle, OFF_VAL_SIZE) };
     let length = unsafe { read_i64(handle, OFF_LENGTH) };
+    let key_is_string = unsafe { read_i64(handle, OFF_KEY_IS_STRING) };
     let data_ptr = unsafe { read_ptr(handle, OFF_DATA_PTR) };
 
     // Mark frozen *before* calling `phx_map_from_pairs` — that call
@@ -239,7 +252,7 @@ pub unsafe extern "C" fn phx_map_builder_freeze(handle: *mut u8) -> *mut u8 {
     // ordering unambiguous.
     unsafe { write_i64(handle, OFF_FROZEN, 1) };
 
-    unsafe { phx_map_from_pairs(key_size, val_size, length, data_ptr) }
+    unsafe { phx_map_from_pairs(key_size, val_size, length, data_ptr, key_is_string) }
 }
 
 #[cfg(test)]
@@ -248,7 +261,7 @@ mod tests {
 
     #[test]
     fn builder_alloc_initializes_header() {
-        let b = phx_map_builder_alloc(8, 8);
+        let b = phx_map_builder_alloc(8, 8, 0);
         unsafe {
             assert_eq!(read_i64(b, OFF_LENGTH), 0);
             assert_eq!(read_i64(b, OFF_CAPACITY), INITIAL_CAPACITY as i64);
@@ -269,7 +282,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "MapBuilder.set: builder was already frozen")]
     fn assert_unfrozen_panics_when_frozen() {
-        let b = phx_map_builder_alloc(8, 8);
+        let b = phx_map_builder_alloc(8, 8, 0);
         unsafe { write_i64(b, OFF_FROZEN, 1) };
         unsafe { assert_unfrozen(b, "set") };
     }
@@ -280,7 +293,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "MapBuilder.freeze: builder was already frozen")]
     fn assert_unfrozen_panics_with_freeze_method_name() {
-        let b = phx_map_builder_alloc(8, 8);
+        let b = phx_map_builder_alloc(8, 8, 0);
         unsafe { write_i64(b, OFF_FROZEN, 1) };
         unsafe { assert_unfrozen(b, "freeze") };
     }
@@ -288,14 +301,18 @@ mod tests {
     /// Sanity: still-mutable builder does not panic on the check.
     #[test]
     fn assert_unfrozen_does_not_panic_when_mutable() {
-        let b = phx_map_builder_alloc(8, 8);
+        let b = phx_map_builder_alloc(8, 8, 0);
         unsafe { assert_unfrozen(b, "set") };
         unsafe { assert_unfrozen(b, "freeze") };
     }
 
+    /// Round-trip for `key_is_string = 0` (scalar keys, `Int → Int`).
+    /// The companion `builder_string_keys_match_by_content_after_freeze`
+    /// below covers `key_is_string = 1`; together they pin that the
+    /// flag is threaded through both branches of `elements_equal`.
     #[test]
     fn builder_set_and_freeze_round_trip() {
-        let b = phx_map_builder_alloc(8, 8);
+        let b = phx_map_builder_alloc(8, 8, 0);
         for k in 0i64..20 {
             let v: i64 = k * 7;
             let kb = k.to_le_bytes();
@@ -315,9 +332,39 @@ mod tests {
         }
     }
 
+    /// `freeze` threads the builder's stored `key_is_string` through to
+    /// `phx_map_from_pairs`, so string-keyed builders produce maps whose
+    /// lookups compare by content (distinct heap pointer, same bytes).
+    #[test]
+    fn builder_string_keys_match_by_content_after_freeze() {
+        // Distinct heap allocations — literals would dedup via rodata
+        // and the test would pass trivially on pointer equality.
+        let s1: String = ['h', 'e', 'l', 'l', 'o'].iter().collect();
+        let s2: String = ['h', 'e', 'l', 'l', 'o'].iter().collect();
+        assert_ne!(s1.as_ptr(), s2.as_ptr(), "test setup: s1/s2 must differ");
+        let v: i64 = 99;
+        let b = phx_map_builder_alloc(16, 8, 1);
+        let k1 = [s1.as_ptr() as i64, s1.len() as i64];
+        unsafe {
+            phx_map_builder_set(
+                b,
+                k1.as_ptr() as *const u8,
+                &v as *const i64 as *const u8,
+                16,
+                8,
+            )
+        };
+        let m = unsafe { phx_map_builder_freeze(b) };
+        let k2 = [s2.as_ptr() as i64, s2.len() as i64];
+        let result =
+            unsafe { crate::__test_support::phx_map_get_raw(m, k2.as_ptr() as *const u8, 16) };
+        assert!(!result.is_null(), "content-equal string key was missed");
+        assert_eq!(unsafe { *(result as *const i64) }, 99);
+    }
+
     #[test]
     fn builder_set_last_wins_after_freeze() {
-        let b = phx_map_builder_alloc(8, 8);
+        let b = phx_map_builder_alloc(8, 8, 0);
         let k = 42i64.to_le_bytes();
         let v1 = 1i64.to_le_bytes();
         let v2 = 2i64.to_le_bytes();

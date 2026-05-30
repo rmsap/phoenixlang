@@ -15,15 +15,27 @@
 //! offset 8:    i64  capacity      (bucket count, power of two)
 //! offset 16:   i64  key_size      (bytes per key)
 //! offset 24:   i64  val_size      (bytes per value)
-//! offset 32:   u8[capacity]       per-bucket tag (Empty/Occupied/Tombstone)
+//! offset 32:   i64  key_is_string (1 if keys are string fat pointers)
+//! offset 40:   u8[capacity]       per-bucket tag (Empty/Occupied/Tombstone)
 //! offset O:    u32[capacity]      order[i] = bucket index of the
 //!                                  i-th-inserted entry (first `length`
 //!                                  slots are meaningful)
 //! offset Pₜ:   u8[capacity * (ks+vs)]  pairs[i] = (key_i, val_i)
 //! ```
 //!
-//! `O = align_up(32 + capacity, 4)` and `Pₜ = align_up(O + 4 * capacity, 8)`
-//! so each region stays naturally aligned regardless of capacity.
+//! `O = align_up(HEADER_SIZE + capacity, 4)` and
+//! `Pₜ = align_up(O + 4 * capacity, 8)` so each region stays naturally
+//! aligned regardless of capacity.
+//!
+//! ## `key_is_string`
+//!
+//! Whether the key type is a `String` (fat pointer) can't be inferred
+//! from `key_size` alone: on wasm32 a `StringRef`, `Int`, and `Float`
+//! key are *all* 8 bytes. Codegen therefore records the key's kind once,
+//! at construction (`phx_map_from_pairs`), and every lookup reads it back
+//! from the header — so string keys compare by *content* and scalars by
+//! raw bytes on both 64-bit and wasm32 targets. See
+//! [`crate::list_methods::elements_equal`].
 //!
 //! ## Effective-size pattern
 //!
@@ -44,11 +56,93 @@
 use std::slice;
 
 use crate::gc::{TypeTag, phx_gc_alloc};
-use crate::list_methods::{MAX_REASONABLE_STRING_LEN, STRING_FAT_POINTER_SIZE};
+use crate::list_methods::MAX_REASONABLE_STRING_LEN;
 use crate::runtime_abort;
 
-/// Header size in bytes (length + capacity + key_size + val_size).
-pub(crate) const HEADER_SIZE: usize = 32;
+/// Header size in bytes (length + capacity + key_size + val_size +
+/// key_is_string).
+pub(crate) const HEADER_SIZE: usize = 40;
+
+/// Byte offset of the `key_is_string` field within the map header.
+/// See the module-header diagram. Named (rather than reaching the field
+/// via `(map as *const i64).add(4)`) so a later header rearrangement
+/// only edits this constant — same pattern as
+/// `map_builder_methods.rs::OFF_FROZEN`.
+const OFF_KEY_IS_STRING: usize = 32;
+
+// Catch a future header rearrangement that updates one of
+// `OFF_KEY_IS_STRING` / `HEADER_SIZE` but not the other: if
+// `key_is_string` ever stops being the last header field (or its width
+// changes), this fails at compile time instead of silently overlapping
+// the per-bucket tag region.
+const _: () = assert!(OFF_KEY_IS_STRING + 8 == HEADER_SIZE);
+
+/// The triple `(key_size, val_size, key_is_string)` that every internal
+/// alloc / insert / rehash helper needs to agree on. Bundling them keeps
+/// `phx_map_set_raw`'s recovery / grow / same-shape forks readable and
+/// drops the `#[allow(clippy::too_many_arguments)]` from
+/// `insert_into_fresh`. Copy-cheap (two `usize`s and a `bool`), passed
+/// by value everywhere.
+#[derive(Copy, Clone)]
+struct MapShape {
+    ks: usize,
+    vs: usize,
+    key_is_string: bool,
+}
+
+impl MapShape {
+    fn pair_size(self) -> usize {
+        self.ks + self.vs
+    }
+
+    /// Read the shape from a live map header in a single pass —
+    /// avoids the double header-deref of calling [`map_header`] and
+    /// [`map_key_is_string`] separately.
+    ///
+    /// # Safety
+    ///
+    /// `map` must point to a valid map allocated by [`phx_map_alloc`] or
+    /// [`phx_map_from_pairs`].
+    unsafe fn from_map(map: *const u8) -> Self {
+        let header = map as *const i64;
+        let ks = unsafe { *header.add(2) } as usize;
+        let vs = unsafe { *header.add(3) } as usize;
+        let key_is_string = unsafe { *(map.add(OFF_KEY_IS_STRING) as *const i64) != 0 };
+        MapShape {
+            ks,
+            vs,
+            key_is_string,
+        }
+    }
+
+    /// Read the full header in a single sweep: shape plus `length` and
+    /// `capacity`. Used by the public `phx_map_set_raw` / `phx_map_remove_raw`
+    /// entry points, which need both the shape and the size metadata. A
+    /// single deref over the five header `i64`s instead of one
+    /// [`map_header`] call plus one [`Self::from_map`] call.
+    ///
+    /// # Safety
+    ///
+    /// `map` must point to a valid map allocated by [`phx_map_alloc`] or
+    /// [`phx_map_from_pairs`].
+    unsafe fn from_map_with_meta(map: *const u8) -> (Self, usize, usize) {
+        let header = map as *const i64;
+        let length = unsafe { *header } as usize;
+        let capacity = unsafe { *header.add(1) } as usize;
+        let ks = unsafe { *header.add(2) } as usize;
+        let vs = unsafe { *header.add(3) } as usize;
+        let key_is_string = unsafe { *header.add(4) != 0 };
+        (
+            MapShape {
+                ks,
+                vs,
+                key_is_string,
+            },
+            length,
+            capacity,
+        )
+    }
+}
 
 const TAG_EMPTY: u8 = 0;
 const TAG_OCCUPIED: u8 = 1;
@@ -153,20 +247,34 @@ unsafe fn map_header(map: *const u8) -> (usize, usize, usize, usize) {
     (length, capacity, key_size, val_size)
 }
 
+/// Read the `key_is_string` header field. Kept separate from
+/// [`map_header`] so the many call sites that only need the size fields
+/// don't have to thread a fifth tuple element. Hashing and key
+/// comparison consult this so string keys compare by content; see the
+/// module header's `key_is_string` section.
+///
+/// # Safety
+///
+/// `map` must point to a valid map allocated by [`phx_map_alloc`] or
+/// [`phx_map_from_pairs`].
+unsafe fn map_key_is_string(map: *const u8) -> bool {
+    unsafe { *(map.add(OFF_KEY_IS_STRING) as *const i64) != 0 }
+}
+
 /// Compare two keys for equality, handling fat pointers (strings).
 ///
 /// Delegates to [`crate::list_methods::elements_equal`] with
 /// `is_float = false`. Maps deliberately use byte-wise (not IEEE) key
 /// comparison even for 8-byte float keys: NaN keys must stay distinct
 /// from each other and `-0.0` / `0.0` must stay distinct under map
-/// identity. If `elements_equal` is ever taught float semantics for
-/// 8-byte elements, this helper will need a `kind`-tag parameter.
+/// identity. `is_string` (from the map header) selects string-content
+/// comparison for `String` keys.
 ///
 /// # Safety
 ///
 /// Both `a` and `b` must point to `size` valid bytes.
-unsafe fn keys_equal(a: *const u8, b: *const u8, size: usize) -> bool {
-    unsafe { crate::list_methods::elements_equal(a, b, size, false) }
+unsafe fn keys_equal(a: *const u8, b: *const u8, size: usize, is_string: bool) -> bool {
+    unsafe { crate::list_methods::elements_equal(a, b, size, false, is_string) }
 }
 
 /// 64-bit FNV-1a hash over the given byte slice. Stable across runs;
@@ -185,24 +293,31 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 /// Hash a key for bucket selection.
 ///
-/// For 16-byte keys (string fat pointers) we hash the *string content*
-/// — matching [`keys_equal`]'s by-content comparison. Wild fat-pointer
-/// data (impossibly large `len`) falls back to byte-wise hashing of
-/// the raw fat-pointer bytes; this keeps the hash defined for malformed
-/// inputs without dereferencing a wild pointer.
+/// When `is_string`, the key is a `(ptr, len)` fat pointer and we hash
+/// the pointed-to bytes so it matches [`keys_equal`]'s by-content
+/// comparison. Otherwise hash the raw key bytes. The flag is
+/// authoritative — codegen sets it from the static key type, so a
+/// 16-byte non-string key would not accidentally hash by content.
+///
+/// Wild fat-pointer data (impossibly large `len`) falls back to
+/// byte-wise hashing of the raw fat-pointer bytes — must agree with the
+/// threshold in `elements_equal` so a malformed key hashes the same way
+/// it compares.
 ///
 /// # Safety
 ///
-/// `key_ptr` must point to `key_size` valid bytes; if `key_size == 16`
-/// the data is interpreted as a `(ptr, len)` fat pointer.
-unsafe fn hash_key(key_ptr: *const u8, key_size: usize) -> u64 {
-    if key_size == STRING_FAT_POINTER_SIZE {
-        let str_ptr = unsafe { *(key_ptr as *const i64) } as *const u8;
-        let str_len = unsafe { *((key_ptr as *const i64).add(1)) } as usize;
+/// `key_ptr` must point to `key_size` valid bytes; when `is_string`,
+/// the data is a pointer-width `(ptr, len)` fat pointer.
+unsafe fn hash_key(key_ptr: *const u8, key_size: usize, is_string: bool) -> u64 {
+    if is_string {
+        debug_assert!(
+            key_size >= 2 * std::mem::size_of::<usize>(),
+            "hash_key: string key size {key_size} < 2 * sizeof(usize) ({})",
+            2 * std::mem::size_of::<usize>(),
+        );
+        let str_ptr = unsafe { *(key_ptr as *const usize) } as *const u8;
+        let str_len = unsafe { *((key_ptr as *const usize).add(1)) };
         if str_len > MAX_REASONABLE_STRING_LEN {
-            // Not a sensible string fat pointer; treat as raw bytes.
-            // Must agree with the threshold in `elements_equal` so a
-            // malformed key hashes the same way it compares.
             let bytes = unsafe { slice::from_raw_parts(key_ptr, key_size) };
             return fnv1a_64(bytes);
         }
@@ -244,10 +359,11 @@ unsafe fn probe(
 ) -> ProbeResult {
     let mask = capacity - 1;
     let pair_size = ks + vs;
+    let is_string = unsafe { map_key_is_string(map) };
     let tags = unsafe { map.add(HEADER_SIZE) };
     let pairs = unsafe { map.add(pairs_offset(capacity)) };
 
-    let mut idx = (unsafe { hash_key(key_ptr, ks) } as usize) & mask;
+    let mut idx = (unsafe { hash_key(key_ptr, ks, is_string) } as usize) & mask;
     let mut first_empty_or_tombstone: Option<usize> = None;
 
     for _ in 0..capacity {
@@ -259,7 +375,7 @@ unsafe fn probe(
             }
             TAG_OCCUPIED => {
                 let entry = unsafe { pairs.add(idx * pair_size) };
-                if unsafe { keys_equal(key_ptr, entry, ks) } {
+                if unsafe { keys_equal(key_ptr, entry, ks, is_string) } {
                     return ProbeResult::Found(idx);
                 }
             }
@@ -304,7 +420,12 @@ unsafe fn probe(
 /// it is reached from `extern "C"` and the workspace's `unwind` panic
 /// strategy would otherwise UB across the FFI boundary.
 #[unsafe(no_mangle)]
-pub extern "C" fn phx_map_alloc(key_size: i64, val_size: i64, count: i64) -> *mut u8 {
+pub extern "C" fn phx_map_alloc(
+    key_size: i64,
+    val_size: i64,
+    count: i64,
+    key_is_string: i64,
+) -> *mut u8 {
     if key_size < 0 {
         runtime_abort(&format!(
             "phx_map_alloc: key_size must be non-negative, got {key_size}"
@@ -334,6 +455,7 @@ pub extern "C" fn phx_map_alloc(key_size: i64, val_size: i64, count: i64) -> *mu
         *((ptr as *mut i64).add(1)) = capacity as i64;
         *((ptr as *mut i64).add(2)) = key_size;
         *((ptr as *mut i64).add(3)) = val_size;
+        *(ptr.add(OFF_KEY_IS_STRING) as *mut i64) = key_is_string;
     }
     // Tags are already zeroed by phx_gc_alloc, so all buckets start EMPTY.
     ptr
@@ -365,7 +487,7 @@ pub extern "C" fn phx_map_alloc(key_size: i64, val_size: i64, count: i64) -> *mu
 ///   lowering relies on this carve-out (it elides the stack buffer
 ///   and passes a null pointer).
 /// - Key and value sizes must be non-negative.
-/// - **If any key or value bytes are 16-byte string fat pointers (or
+/// - **If any key or value bytes are string fat pointers (or
 ///   any other reference into a GC-managed allocation), the
 ///   *pointed-to* heap objects must be rooted by the caller for the
 ///   duration of this call.** The `phx_map_alloc` at the top of the
@@ -385,6 +507,7 @@ pub unsafe extern "C" fn phx_map_from_pairs(
     val_size: i64,
     n_pairs: i64,
     pair_data: *const u8,
+    key_is_string: i64,
 ) -> *mut u8 {
     if key_size < 0 || val_size < 0 || n_pairs < 0 {
         runtime_abort(&format!(
@@ -395,7 +518,8 @@ pub unsafe extern "C" fn phx_map_from_pairs(
     let ks = key_size as usize;
     let vs = val_size as usize;
     let n = n_pairs as usize;
-    let map = phx_map_alloc(key_size, val_size, n_pairs);
+    let is_string = key_is_string != 0;
+    let map = phx_map_alloc(key_size, val_size, n_pairs, key_is_string);
     if n == 0 {
         return map;
     }
@@ -411,7 +535,7 @@ pub unsafe extern "C" fn phx_map_from_pairs(
     for i in 0..n {
         let kp = unsafe { pair_data.add(i * pair_size) };
         let vp = unsafe { pair_data.add(i * pair_size + ks) };
-        let mut idx = (unsafe { hash_key(kp, ks) } as usize) & mask;
+        let mut idx = (unsafe { hash_key(kp, ks, is_string) } as usize) & mask;
         loop {
             let tag = unsafe { *tags.add(idx) };
             if tag == TAG_EMPTY {
@@ -427,7 +551,7 @@ pub unsafe extern "C" fn phx_map_from_pairs(
             }
             // No tombstones in a fresh build, so tag must be OCCUPIED.
             let entry = unsafe { pairs.add(idx * pair_size) };
-            if unsafe { keys_equal(kp, entry, ks) } {
+            if unsafe { keys_equal(kp, entry, ks, is_string) } {
                 // Duplicate key — last-wins on value, do not touch the
                 // order array (the first insertion's position is kept).
                 unsafe {
@@ -526,29 +650,29 @@ unsafe fn copy_map_same_layout(
 ///
 /// `map` must be a valid hash-table allocation with `capacity`
 /// buckets (power of two); `key_ptr` / `val_ptr` must point to
-/// `ks` / `vs` valid bytes; `order_pos` must be a valid order-array
-/// slot. The load-factor invariant must hold so the probe terminates.
+/// `shape.ks` / `shape.vs` valid bytes; `order_pos` must be a valid
+/// order-array slot. The load-factor invariant must hold so the probe
+/// terminates.
 unsafe fn insert_into_fresh(
     map: *mut u8,
     capacity: usize,
-    ks: usize,
-    vs: usize,
+    shape: MapShape,
     key_ptr: *const u8,
     val_ptr: *const u8,
     order_pos: usize,
 ) {
-    let pair_size = ks + vs;
+    let pair_size = shape.pair_size();
     let mask = capacity - 1;
     let tags = unsafe { map.add(HEADER_SIZE) };
     let pairs = unsafe { map.add(pairs_offset(capacity)) };
-    let mut idx = (unsafe { hash_key(key_ptr, ks) } as usize) & mask;
+    let mut idx = (unsafe { hash_key(key_ptr, shape.ks, shape.key_is_string) } as usize) & mask;
     while unsafe { *tags.add(idx) } == TAG_OCCUPIED {
         idx = (idx + 1) & mask;
     }
     unsafe {
         *tags.add(idx) = TAG_OCCUPIED;
-        std::ptr::copy_nonoverlapping(key_ptr, pairs.add(idx * pair_size), ks);
-        std::ptr::copy_nonoverlapping(val_ptr, pairs.add(idx * pair_size + ks), vs);
+        std::ptr::copy_nonoverlapping(key_ptr, pairs.add(idx * pair_size), shape.ks);
+        std::ptr::copy_nonoverlapping(val_ptr, pairs.add(idx * pair_size + shape.ks), shape.vs);
         order_write(map, capacity, order_pos, idx as u32);
     }
 }
@@ -563,9 +687,10 @@ unsafe fn insert_into_fresh(
 /// large enough to hold every occupied entry below the load-factor
 /// threshold.
 unsafe fn rehash_into(src: *const u8, new_capacity: usize) -> *mut u8 {
-    let (length, src_capacity, ks, vs) = unsafe { map_header(src) };
-    let dst = phx_map_alloc_internal(new_capacity, ks, vs, length);
-    let pair_size = ks + vs;
+    let (length, src_capacity, _, _) = unsafe { map_header(src) };
+    let shape = unsafe { MapShape::from_map(src) };
+    let dst = phx_map_alloc_internal(new_capacity, shape, length);
+    let pair_size = shape.pair_size();
     let src_tags = unsafe { src.add(HEADER_SIZE) };
     let src_pairs = unsafe { src.add(pairs_offset(src_capacity)) };
 
@@ -583,39 +708,49 @@ unsafe fn rehash_into(src: *const u8, new_capacity: usize) -> *mut u8 {
             "order entry {ord_idx} → bucket {src_bucket} is not occupied"
         );
         let entry = unsafe { src_pairs.add(src_bucket * pair_size) };
-        let val = unsafe { entry.add(ks) };
-        unsafe { insert_into_fresh(dst, new_capacity, ks, vs, entry, val, ord_idx) };
+        let val = unsafe { entry.add(shape.ks) };
+        unsafe { insert_into_fresh(dst, new_capacity, shape, entry, val, ord_idx) };
     }
     dst
+}
+
+/// Same-shape `key_is_string` cross-check, factored out of
+/// [`phx_map_set_raw`] so the contract is reachable from a unit test.
+/// `phx_map_set_raw` is `extern "C"` and a panic inside it would hit
+/// the `cannot_unwind` shim and abort the process — making
+/// `#[should_panic]` useless. This pure-Rust helper sits above the
+/// boundary and panics normally on disagreement, so the test can pin
+/// the contract.
+#[inline]
+fn debug_check_same_shape_key_is_string(stored: bool, caller: bool) {
+    debug_assert!(
+        stored == caller,
+        "phx_map_set_raw: caller key_is_string disagrees with stored flag"
+    );
 }
 
 /// Set a key-value pair, returning a new map (Phoenix maps are
 /// immutable).
 ///
-/// If the key already exists the new map has the same capacity and
-/// length, with the value at the matched bucket overwritten. If the
-/// key is new we either copy-and-insert at the found vacant bucket
-/// (if load factor stays below 70 %) or grow the table to twice the
-/// current capacity, rehashing in the process.
+/// Existing key: same-capacity copy with the bucket value overwritten.
+/// New key: copy-and-insert at the vacant bucket, growing to 2× capacity
+/// when load factor would exceed 70 %.
+///
+/// `key_is_string` participates in the shape-change recovery trigger
+/// (empty source map, caller disagrees on sizes *or* on the flag), so
+/// a mis-matched flag is corrected by reallocating at the caller's
+/// shape rather than silently using the stored flag's hash function on
+/// the new key. The same-shape path then trusts the stored flag and
+/// debug-asserts the caller agrees.
 ///
 /// # Safety
 ///
-/// - `map` must point to a valid map.
-/// - `map` must be rooted by the caller's shadow-stack frame for the
-///   duration of this call. The internal `phx_gc_alloc` (via
-///   `phx_map_alloc_internal` / `rehash_into`) can trigger an
-///   auto-collect that would sweep an unrooted input before
-///   `copy_map_same_layout` reads from it. See the *Rooting contract*
-///   in the `list_methods` module header.
-/// - `key_ptr` and `val_ptr` must point to `key_size` / `val_size`
-///   valid bytes respectively. **If the key or value bytes are a
-///   16-byte string fat pointer (or any other reference into a
-///   GC-managed allocation), the *pointed-to* heap object must also be
-///   rooted by the caller for the duration of this call** — the same
-///   internal `phx_gc_alloc` that endangers `map` would sweep an unrooted
-///   string before its bytes are read by `copy_nonoverlapping`. The
-///   fat-pointer bytes themselves are captured by value (no rooting
-///   needed for `key_ptr`/`val_ptr` as locations).
+/// - `map` must point to a valid map and be rooted on the caller's
+///   shadow-stack frame (internal allocs can auto-collect).
+/// - `key_ptr` / `val_ptr` must point to `key_size` / `val_size` valid
+///   bytes. If the key or value is a string fat pointer (or other
+///   GC-managed reference), the pointed-to heap object must also be
+///   rooted by the caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_map_set_raw(
     map: *const u8,
@@ -623,51 +758,64 @@ pub unsafe extern "C" fn phx_map_set_raw(
     val_ptr: *const u8,
     key_size: i64,
     val_size: i64,
+    key_is_string: i64,
 ) -> *mut u8 {
-    let (length, capacity, stored_ks, stored_vs) = unsafe { map_header(map) };
+    let (stored_shape, length, capacity) = unsafe { MapShape::from_map_with_meta(map) };
     // Empty maps may carry placeholder stored sizes from generic-type
     // resolution; the caller's sizes are authoritative in that case.
-    let ks = if length == 0 {
-        key_size as usize
+    let (ks, vs) = if length == 0 {
+        (key_size as usize, val_size as usize)
     } else {
-        stored_ks
-    };
-    let vs = if length == 0 {
-        val_size as usize
-    } else {
-        stored_vs
+        (stored_shape.ks, stored_shape.vs)
     };
     let pair_size = ks + vs;
 
-    // Empty map whose stored sizes differ from the caller's: allocate
-    // a fresh table at the caller's sizes and insert the pair directly.
-    //
-    // The motivating case is generic-type-resolution placeholders
-    // (stored ks/vs = 0 followed by a concrete-sized insert). The same
-    // branch also catches concrete-to-concrete shape changes — an empty
-    // `Map<Int, Int>` followed by a `Map<String, Int>` insert — which
-    // `phoenix-ir` does not currently produce, but if a future pass
-    // emits one this branch silently rewrites the shape rather than
-    // wedging at the old stride. That's intentional: the input is
-    // empty and discardable, and the caller's sizes are by definition
-    // authoritative.
-    //
-    // The single allocation here is critical — any second `phx_gc_alloc`
-    // between `phx_map_alloc_internal` returning and the body fully
-    // written would put `new_map` at risk of being swept (it's held
-    // only in a Rust local, not on the shadow stack), so we never
-    // recurse back into `phx_map_set_raw`.
-    if length == 0 && (ks != stored_ks || vs != stored_vs) {
-        let new_map = phx_map_alloc_internal(MIN_BUCKETS, ks, vs, 1);
-        unsafe { insert_into_fresh(new_map, MIN_BUCKETS, ks, vs, key_ptr, val_ptr, 0) };
+    // Empty map whose stored shape differs from the caller's: allocate
+    // a fresh table at the caller's shape and insert directly. Motivated
+    // by generic-type-resolution placeholders (stored ks/vs = 0); also
+    // catches a hypothetical empty-concrete shape change, including a
+    // disagreement on `key_is_string` alone (on wasm32, `Int` and
+    // `StringRef` keys both have `ks = 8`, so a same-size flag-only
+    // mismatch is a real shape change there). The single allocation
+    // here is critical — recursing back into `phx_map_set_raw` would
+    // leak the fresh map across a second `phx_gc_alloc` while it's held
+    // only in a Rust local.
+    let caller_is_string = key_is_string != 0;
+    if length == 0
+        && (ks != stored_shape.ks
+            || vs != stored_shape.vs
+            || caller_is_string != stored_shape.key_is_string)
+    {
+        // Shape change: the source map's stored shape is stale, so the
+        // caller's sizes / flag are authoritative.
+        let recovered = MapShape {
+            ks,
+            vs,
+            key_is_string: caller_is_string,
+        };
+        let new_map = phx_map_alloc_internal(MIN_BUCKETS, recovered, 1);
+        unsafe { insert_into_fresh(new_map, MIN_BUCKETS, recovered, key_ptr, val_ptr, 0) };
         return new_map;
     }
+
+    // Same-shape: the stored flag is authoritative (every existing
+    // bucket was hashed under it) *and* now provably equal to the
+    // caller's flag (the shape-change branch above caught any
+    // disagreement on non-empty length too — since for `length > 0` the
+    // stored shape is what we use regardless, a mismatch there is a
+    // codegen bug, not a recoverable shape change). The cross-check
+    // remains as a debug-only tripwire — extracted to
+    // [`debug_check_same_shape_key_is_string`] so the contract can be
+    // unit-tested without crossing the `extern "C"` boundary (a panic
+    // from inside this function would hit `cannot_unwind` and abort).
+    debug_check_same_shape_key_is_string(stored_shape.key_is_string, caller_is_string);
+    let shape = stored_shape;
 
     match unsafe { probe(map, key_ptr, ks, vs, capacity) } {
         ProbeResult::Found(idx) => {
             // Same-shape copy + value overwrite at `idx`. Insertion
             // order is unchanged because the key was already present.
-            let new_map = phx_map_alloc_internal(capacity, ks, vs, length);
+            let new_map = phx_map_alloc_internal(capacity, shape, length);
             unsafe { copy_map_same_layout(new_map, map, capacity, ks, vs) };
             let pairs = unsafe { new_map.add(pairs_offset(capacity)) };
             let dst_val = unsafe { pairs.add(idx * pair_size + ks) };
@@ -685,14 +833,14 @@ pub unsafe extern "C" fn phx_map_set_raw(
                 // Insert the new key into the freshly rehashed table
                 // (no tombstones, no possible duplicate) and bump length.
                 unsafe {
-                    insert_into_fresh(grown, new_capacity, ks, vs, key_ptr, val_ptr, length);
+                    insert_into_fresh(grown, new_capacity, shape, key_ptr, val_ptr, length);
                     *(grown as *mut i64) = new_length as i64;
                 }
                 grown
             } else {
                 // Same-capacity copy + insert at `bucket`, then append
                 // `bucket` to the order array at slot `length`.
-                let new_map = phx_map_alloc_internal(capacity, ks, vs, new_length);
+                let new_map = phx_map_alloc_internal(capacity, shape, new_length);
                 unsafe { copy_map_same_layout(new_map, map, capacity, ks, vs) };
                 let tags = unsafe { new_map.add(HEADER_SIZE) };
                 let pairs = unsafe { new_map.add(pairs_offset(capacity)) };
@@ -724,14 +872,15 @@ pub unsafe extern "C" fn phx_map_set_raw(
 /// decided the new layout. Not exposed as `extern "C"` because the
 /// pre-computed capacity must agree with the table's `buckets_for`
 /// invariants, and the header `length` write trusts the caller.
-fn phx_map_alloc_internal(capacity: usize, ks: usize, vs: usize, length: usize) -> *mut u8 {
-    let total = total_size(capacity, ks, vs);
+fn phx_map_alloc_internal(capacity: usize, shape: MapShape, length: usize) -> *mut u8 {
+    let total = total_size(capacity, shape.ks, shape.vs);
     let ptr = phx_gc_alloc(total, TypeTag::Map as u32);
     unsafe {
         *(ptr as *mut i64) = length as i64;
         *((ptr as *mut i64).add(1)) = capacity as i64;
-        *((ptr as *mut i64).add(2)) = ks as i64;
-        *((ptr as *mut i64).add(3)) = vs as i64;
+        *((ptr as *mut i64).add(2)) = shape.ks as i64;
+        *((ptr as *mut i64).add(3)) = shape.vs as i64;
+        *(ptr.add(OFF_KEY_IS_STRING) as *mut i64) = shape.key_is_string as i64;
     }
     ptr
 }
@@ -770,7 +919,7 @@ fn phx_map_alloc_internal(capacity: usize, ks: usize, vs: usize, length: usize) 
 ///   it. See the *Rooting contract* in the `list_methods` module
 ///   header.
 /// - `key_ptr` must point to `key_size` valid bytes. **If the key
-///   bytes are a 16-byte string fat pointer (or any other reference
+///   bytes are a string fat pointer (or any other reference
 ///   into a GC-managed allocation), the *pointed-to* heap object must
 ///   also be rooted by the caller for the duration of this call** —
 ///   `probe` reads the key content via `keys_equal` after the internal
@@ -781,28 +930,31 @@ pub unsafe extern "C" fn phx_map_remove_raw(
     key_ptr: *const u8,
     _key_size: i64,
 ) -> *mut u8 {
-    let (length, capacity, stored_ks, stored_vs) = unsafe { map_header(map) };
+    let (shape, length, capacity) = unsafe { MapShape::from_map_with_meta(map) };
     if length == 0 {
         // Nothing to remove; return a fresh empty map carrying the
         // input's stored shape verbatim. See the doc above for why we
         // don't try to splice in the caller's `key_size`.
-        return phx_map_alloc(stored_ks as i64, stored_vs as i64, 0);
+        return phx_map_alloc(
+            shape.ks as i64,
+            shape.vs as i64,
+            0,
+            shape.key_is_string as i64,
+        );
     }
-    let ks = stored_ks;
-    let vs = stored_vs;
-    match unsafe { probe(map, key_ptr, ks, vs, capacity) } {
+    match unsafe { probe(map, key_ptr, shape.ks, shape.vs, capacity) } {
         ProbeResult::Vacant { .. } => {
             // Not found — same-shape copy.
-            let new_map = phx_map_alloc_internal(capacity, ks, vs, length);
-            unsafe { copy_map_same_layout(new_map, map, capacity, ks, vs) };
+            let new_map = phx_map_alloc_internal(capacity, shape, length);
+            unsafe { copy_map_same_layout(new_map, map, capacity, shape.ks, shape.vs) };
             new_map
         }
         ProbeResult::Found(idx) => {
             // Same-shape copy with the bucket flipped to TOMBSTONE,
             // and the order array compacted to drop the entry whose
             // bucket index was `idx`.
-            let new_map = phx_map_alloc_internal(capacity, ks, vs, length - 1);
-            unsafe { copy_map_same_layout(new_map, map, capacity, ks, vs) };
+            let new_map = phx_map_alloc_internal(capacity, shape, length - 1);
+            unsafe { copy_map_same_layout(new_map, map, capacity, shape.ks, shape.vs) };
             let tags = unsafe { new_map.add(HEADER_SIZE) };
             unsafe { *tags.add(idx) = TAG_TOMBSTONE };
             // Single-pass compaction over the order array: scan until
@@ -900,7 +1052,7 @@ mod tests {
     use super::*;
 
     fn alloc_i64_i64(count: i64) -> *mut u8 {
-        phx_map_alloc(8, 8, count)
+        phx_map_alloc(8, 8, count, 0)
     }
 
     fn set_i64(map: *mut u8, k: i64, v: i64) -> *mut u8 {
@@ -911,6 +1063,7 @@ mod tests {
                 &v as *const i64 as *const u8,
                 8,
                 8,
+                0,
             )
         }
     }
@@ -1029,7 +1182,7 @@ mod tests {
             "test setup failed: s1 and s3 share a backing buffer, so this \
              test would not actually exercise content-based lookup",
         );
-        let map = phx_map_alloc(16, 8, 0);
+        let map = phx_map_alloc(16, 8, 0, 1);
         let k1 = [s1.as_ptr() as i64, s1.len() as i64];
         let v1: i64 = 1;
         let map = unsafe {
@@ -1039,6 +1192,7 @@ mod tests {
                 &v1 as *const i64 as *const u8,
                 16,
                 8,
+                1,
             )
         };
         let k2 = [s2.as_ptr() as i64, s2.len() as i64];
@@ -1050,6 +1204,7 @@ mod tests {
                 &v2 as *const i64 as *const u8,
                 16,
                 8,
+                1,
             )
         };
         // Look up using s3 (same content as s1, distinct pointer).
@@ -1059,12 +1214,31 @@ mod tests {
         assert_eq!(unsafe { *(result as *const i64) }, 1);
     }
 
+    /// The same-shape branch's `key_is_string` cross-check fires when
+    /// caller and stored disagree. Pinning this guarantees codegen bugs
+    /// surface loudly in debug builds — silent drift in release would
+    /// otherwise leave the map's hashing behaviour intact (the stored
+    /// flag is authoritative) but mask a real mismatch in the caller's
+    /// code generation.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "caller key_is_string disagrees with stored flag")]
+    fn same_shape_key_is_string_check_panics_on_mismatch() {
+        debug_check_same_shape_key_is_string(false, true);
+    }
+
+    #[test]
+    fn same_shape_key_is_string_check_accepts_agreement() {
+        debug_check_same_shape_key_is_string(false, false);
+        debug_check_same_shape_key_is_string(true, true);
+    }
+
     #[test]
     fn from_pairs_builder_matches_set_raw() {
         // Build via the literal-path builder and via repeated set_raw;
         // the two maps should agree on every key's value.
         let pair_data: Vec<i64> = vec![1, 100, 2, 200, 3, 300];
-        let from_pairs = unsafe { phx_map_from_pairs(8, 8, 3, pair_data.as_ptr() as *const u8) };
+        let from_pairs = unsafe { phx_map_from_pairs(8, 8, 3, pair_data.as_ptr() as *const u8, 0) };
         let mut by_set = alloc_i64_i64(0);
         for (k, v) in [(1, 100), (2, 200), (3, 300)] {
             by_set = set_i64(by_set, k as i64, v as i64);
@@ -1077,7 +1251,7 @@ mod tests {
     #[test]
     fn from_pairs_last_write_wins_on_duplicate_keys() {
         let pair_data: Vec<i64> = vec![5, 100, 5, 200, 5, 300];
-        let m = unsafe { phx_map_from_pairs(8, 8, 3, pair_data.as_ptr() as *const u8) };
+        let m = unsafe { phx_map_from_pairs(8, 8, 3, pair_data.as_ptr() as *const u8, 0) };
         assert_eq!(unsafe { phx_map_length(m) }, 1);
         assert_eq!(get_i64(m, 5), Some(300));
     }
@@ -1089,7 +1263,7 @@ mod tests {
     /// "let's just always read pair_data" simplification fails loudly.
     #[test]
     fn from_pairs_with_null_pair_data_when_n_pairs_zero() {
-        let m = unsafe { phx_map_from_pairs(8, 8, 0, std::ptr::null()) };
+        let m = unsafe { phx_map_from_pairs(8, 8, 0, std::ptr::null(), 0) };
         assert_eq!(unsafe { phx_map_length(m) }, 0);
         assert!(get_i64(m, 0).is_none());
         assert!(get_i64(m, 42).is_none());
@@ -1204,7 +1378,7 @@ mod tests {
             pair_data.push(i * 13 + 1);
             pair_data.push(i * 100);
         }
-        let m = unsafe { phx_map_from_pairs(8, 8, N, pair_data.as_ptr() as *const u8) };
+        let m = unsafe { phx_map_from_pairs(8, 8, N, pair_data.as_ptr() as *const u8, 0) };
         assert_eq!(unsafe { phx_map_length(m) }, N);
         for i in 0..N {
             assert_eq!(get_i64(m, i * 13 + 1), Some(i * 100));
@@ -1216,7 +1390,7 @@ mod tests {
         // Source order is non-sorted; the resulting map's keys() should
         // come back in exactly that order.
         let pair_data: Vec<i64> = vec![42, 1, 7, 2, 99, 3, 1, 4, 88, 5];
-        let m = unsafe { phx_map_from_pairs(8, 8, 5, pair_data.as_ptr() as *const u8) };
+        let m = unsafe { phx_map_from_pairs(8, 8, 5, pair_data.as_ptr() as *const u8, 0) };
         assert_eq!(keys_i64_vec(m), [42, 7, 99, 1, 88]);
         assert_eq!(values_i64_vec(m), [1, 2, 3, 4, 5]);
     }
@@ -1227,7 +1401,7 @@ mod tests {
         // 100, 200, 300. Expected behaviour: one entry, position is the
         // *first* sighting (index 0), value is the *last* (300).
         let pair_data: Vec<i64> = vec![5, 100, 9, 11, 5, 200, 7, 22, 5, 300];
-        let m = unsafe { phx_map_from_pairs(8, 8, 5, pair_data.as_ptr() as *const u8) };
+        let m = unsafe { phx_map_from_pairs(8, 8, 5, pair_data.as_ptr() as *const u8, 0) };
         assert_eq!(unsafe { phx_map_length(m) }, 3);
         assert_eq!(keys_i64_vec(m), [5, 9, 7]);
         assert_eq!(values_i64_vec(m), [300, 11, 22]);
@@ -1245,7 +1419,7 @@ mod tests {
     #[test]
     fn set_on_empty_concrete_sized_map_accepts_shape_change() {
         // Empty Map<Int, Int>: stored ks/vs = 8/8.
-        let initial = phx_map_alloc(8, 8, 0);
+        let initial = phx_map_alloc(8, 8, 0, 0);
         // Insert a 16-byte fat-pointer-shaped key with an i64 value —
         // caller's sizes (16, 8) differ from stored (8, 8). The
         // recovery branch must allocate a fresh table at the caller's
@@ -1260,6 +1434,7 @@ mod tests {
                 &val as *const i64 as *const u8,
                 16,
                 8,
+                1,
             )
         };
         assert_eq!(unsafe { phx_map_length(map) }, 1);
@@ -1286,7 +1461,7 @@ mod tests {
     #[test]
     fn set_on_empty_placeholder_sized_map_recovers_with_caller_sizes() {
         // Allocate as if from a generic placeholder: ks = vs = 0.
-        let placeholder = phx_map_alloc(0, 0, 0);
+        let placeholder = phx_map_alloc(0, 0, 0, 0);
         // Insert with concrete (8, 8) sizes — the same shape codegen
         // would emit once the generic was resolved to Map<Int, Int>.
         let key: i64 = 7;
@@ -1298,6 +1473,7 @@ mod tests {
                 &val as *const i64 as *const u8,
                 8,
                 8,
+                0,
             )
         };
         assert_eq!(unsafe { phx_map_length(map) }, 1);
@@ -1307,6 +1483,49 @@ mod tests {
         let stored_vs = unsafe { *((map as *const i64).add(3)) };
         assert_eq!(stored_ks, 8);
         assert_eq!(stored_vs, 8);
+    }
+
+    /// Shape-change recovery on `key_is_string` alone — important on
+    /// wasm32 where `Int` and `StringRef` keys both have `ks = 8`, so a
+    /// flag-only mismatch is a real shape change there. The empty map
+    /// here has `(ks=8, vs=8, key_is_string=0)`; the caller asserts
+    /// `(ks=8, vs=8, key_is_string=1)`. The recovery branch must
+    /// reallocate at the caller's flag so the new key hashes by content.
+    /// Pre-fix this slipped through to the same-shape path and silently
+    /// mis-hashed the key in release (the debug_assert caught it only in
+    /// debug builds).
+    #[test]
+    fn set_on_empty_map_with_flag_mismatch_recovers_with_caller_flag() {
+        let placeholder = phx_map_alloc(16, 8, 0, 0);
+        let s1: String = ['k', 'e', 'y'].iter().collect();
+        let s2: String = ['k', 'e', 'y'].iter().collect();
+        assert_ne!(s1.as_ptr(), s2.as_ptr(), "test setup: s1/s2 must differ");
+        let k1 = [s1.as_ptr() as i64, s1.len() as i64];
+        let val: i64 = 99;
+        let map = unsafe {
+            phx_map_set_raw(
+                placeholder,
+                k1.as_ptr() as *const u8,
+                &val as *const i64 as *const u8,
+                16,
+                8,
+                1,
+            )
+        };
+        // Header should reflect the caller's key_is_string flag.
+        let stored_flag = unsafe { *(map.add(OFF_KEY_IS_STRING) as *const i64) };
+        assert_eq!(
+            stored_flag, 1,
+            "recovery should adopt caller's key_is_string=1"
+        );
+        // Content-equal lookup with a distinct heap allocation must hit.
+        let k2 = [s2.as_ptr() as i64, s2.len() as i64];
+        let result = unsafe { phx_map_get_raw(map, k2.as_ptr() as *const u8, 16) };
+        assert!(
+            !result.is_null(),
+            "content-equal string key was missed — flag mismatch was not recovered"
+        );
+        assert_eq!(unsafe { *(result as *const i64) }, 99);
     }
 
     /// Float-key invariant — pinned because `keys_equal`/`hash_key`
@@ -1333,6 +1552,7 @@ mod tests {
                 &v as *const i64 as *const u8,
                 8,
                 8,
+                0,
             )
         }
     }
@@ -1348,7 +1568,7 @@ mod tests {
 
     #[test]
     fn float_keys_pos_zero_and_neg_zero_are_distinct() {
-        let map = phx_map_alloc(8, 8, 0);
+        let map = phx_map_alloc(8, 8, 0, 0);
         let map = set_f64(map, 0.0, 1);
         let map = set_f64(map, -0.0, 2);
         assert_eq!(unsafe { phx_map_length(map) }, 2);
@@ -1364,7 +1584,7 @@ mod tests {
         let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
         let nan_b = f64::from_bits(0x7ff8_0000_0000_0002);
         assert!(nan_a.is_nan() && nan_b.is_nan());
-        let map = phx_map_alloc(8, 8, 0);
+        let map = phx_map_alloc(8, 8, 0, 0);
         let map = set_f64(map, nan_a, 100);
         let map = set_f64(map, nan_b, 200);
         assert_eq!(unsafe { phx_map_length(map) }, 2);
@@ -1379,7 +1599,7 @@ mod tests {
         // elements, this fails (`get_f64` would return None).
         let nan = f64::from_bits(0x7ff8_dead_beef_cafe);
         assert!(nan.is_nan());
-        let map = phx_map_alloc(8, 8, 0);
+        let map = phx_map_alloc(8, 8, 0, 0);
         let map = set_f64(map, nan, 999);
         assert_eq!(get_f64(map, nan), Some(999));
         assert_eq!(unsafe { phx_map_length(map) }, 1);

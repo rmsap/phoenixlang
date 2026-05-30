@@ -171,6 +171,24 @@ impl IrType {
         matches!(self, IrType::TypeVar(_))
     }
 
+    /// `true` iff this type is `StringRef` — the canonical predicate
+    /// behind the `key_is_string` / `is_string` flag threaded into the
+    /// runtime's map and list `contains` ABIs. Call sites cast to the
+    /// integer width they need (`as i64` / `as i32` / `as i8`); the
+    /// single predicate keeps the cranelift and wasm backends provably
+    /// in agreement on what counts as a string element.
+    pub fn string_flag(&self) -> bool {
+        matches!(self, IrType::StringRef)
+    }
+
+    /// `true` iff this type is `F64` — the canonical predicate behind
+    /// the `is_float` flag passed to `phx_list_contains` so float
+    /// elements compare under IEEE 754 (not raw bytes). Companion to
+    /// [`Self::string_flag`].
+    pub fn float_flag(&self) -> bool {
+        matches!(self, IrType::F64)
+    }
+
     /// Returns `true` if this type is the [`GENERIC_PLACEHOLDER`] sentinel,
     /// representing an unresolved generic type parameter.
     pub fn is_generic_placeholder(&self) -> bool {

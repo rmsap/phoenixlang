@@ -36,53 +36,24 @@ use super::helpers::call_runtime;
 
 /// Predicate: is this `ValueId`'s type a GC-tracked reference?
 ///
-/// Erased generic placeholders (`__generic`) and unresolved type
-/// variables can reach codegen via the closures-over-generic
-/// monomorphization gap tracked in `docs/known-issues.md` ("Closure
-/// functions inside generic templates are not cloned per
-/// specialization"). Skip them: the placeholder paths covered by
-/// today's matrix never reach an allocation that outlives a collection
-/// cycle (1-slot Int/Bool instantiations are non-ref; wider
-/// instantiations are gated by the closures-over-generic ignore list).
+/// Returns `false` (silent skip) for `__generic` placeholders and
+/// `TypeVar`s. They still reach codegen on two inert paths — see the
+/// rationale anchored in
+/// `phoenix-ir/src/monomorphize/mod.rs::erase_type_vars_in_fn` — and
+/// neither roots a live allocation, so skipping them is sound:
 ///
-/// ## Tripwire — convert to `ice!` once monomorphization is fixed
+/// 1. Empty `[]` / `{}` literals whose element type sema never
+///    constrained: no live payload to outlive a collection cycle.
+/// 2. Dead template-copy closures left behind once monomorphization
+///    clones a closure-in-a-generic per instantiation: never called,
+///    so their `Op::ClosureLoadCapture`s with `__generic` result type
+///    never execute.
 ///
-/// When the closures-over-generic fix lands, every value reaching
-/// codegen will have a concrete type and the early-return branch
-/// becomes dead. The ignored fixtures in
-/// `phoenix-driver/tests/three_backend_matrix.rs` (search for
-/// `closures_over_generic` / `closures_over_generic_cross_width`) will
-/// be re-enabled at that point — the moment they pass under the
-/// matrix, this branch is guaranteed-unreachable for production paths.
-/// Replace it with:
-///
-/// ```ignore
-/// debug_assert!(
-///     !ty.is_type_var() && !ty.is_generic_placeholder(),
-///     "placeholder type reached codegen: {ty:?}",
-/// );
-/// ```
-///
-/// then delete the `if` and let `ty.is_ref_type()` answer directly.
-/// The grep test `variable_from_u32_only_in_funcstate` already
-/// fences off direct `Variable::from_u32` calls; the analogous fence
-/// here is "no `is_type_var()`/`is_generic_placeholder()` predicate
-/// in `gc_roots.rs` after the fix lands."
+/// Paired with that Pass D erasure: both guards become removable
+/// together if a future pass prunes unreferenced template-copy
+/// closures *and* sema constrains unconstrained empty literals.
 fn is_tracked_ref(ty: &IrType) -> bool {
     if ty.is_type_var() || ty.is_generic_placeholder() {
-        // Silent skip. Originally this branch raised a one-shot
-        // `eprintln!` warning and was later promoted to
-        // `debug_assert!(false, ...)`, but both forms misfire in
-        // practice: `closures_over_generic.phx` runs in the supported
-        // matrix and passes a `StructRef("__generic", [])` payload
-        // through codegen on every build. The closures-over-generic
-        // monomorphization gap (tracked in `docs/known-issues.md`) is
-        // load-bearing for that fixture's correctness today, so the
-        // silent return is the only behavior that doesn't regress the
-        // matrix. The tripwire stays in the module-level docstring:
-        // when monomorphization is fixed and the ignore-list fixtures
-        // re-enable cleanly, this `if` becomes guaranteed-unreachable
-        // and can be deleted.
         return false;
     }
     ty.is_ref_type()

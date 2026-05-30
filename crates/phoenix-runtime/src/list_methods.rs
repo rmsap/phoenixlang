@@ -44,17 +44,6 @@ use crate::runtime_abort;
 /// Header size in bytes (length + capacity + elem_size).
 pub(crate) const HEADER_SIZE: usize = 24;
 
-/// The element size (in bytes) that is treated as a string fat pointer by
-/// [`elements_equal`].  Currently 16 (pointer + length, two 8-byte slots).
-///
-/// **Invariant:** The Cranelift codegen must ensure that no non-string type
-/// produces elements of this size.  `TypeLayout::of` in
-/// `phoenix-cranelift/src/translate/layout/type_layout.rs` matches every IR
-/// type explicitly, so that adding a new 2-slot type triggers a compile
-/// error.  If a new 2-slot non-string type is added, both `elements_equal`
-/// and `TypeLayout::of` must be updated.
-pub(crate) const STRING_FAT_POINTER_SIZE: usize = 16;
-
 /// A length field on a string fat pointer larger than this is treated
 /// as a sign that the 16 bytes are not actually a string fat pointer
 /// (e.g. a non-string 16-byte type or a wild value). Both
@@ -75,43 +64,44 @@ unsafe fn list_header(list: *const u8) -> (usize, usize) {
     (length, elem_size)
 }
 
-/// Compare two elements for equality, handling 16-byte fat pointers (strings)
-/// and IEEE 754 float semantics.
+/// Compare two elements for equality.
 ///
-/// For 16-byte elements, assumes the element is a string fat pointer
-/// (ptr + len) and compares the pointed-to content rather than the raw
-/// pointer bytes.  This assumption holds because strings are currently
-/// the only Phoenix type that uses 16-byte elements.
+/// `is_string`: element is a `(ptr, len)` fat pointer; compare by the
+/// pointed-to bytes. This flag is authoritative — codegen sets it from
+/// the static element type, so a 16-byte non-string element does not
+/// accidentally hit the string branch.
 ///
-/// When `is_float` is true, the elements are compared using IEEE 754 equality
-/// (`f64::eq`), which correctly handles `-0.0 == 0.0` and `NaN != NaN`.
+/// `is_float` (when `is_string` is false): use IEEE 754 equality
+/// (`-0.0 == 0.0`, `NaN != NaN`). All other elements compare bytewise.
 ///
 /// # Safety
 ///
 /// - Both `a` and `b` must point to `size` valid bytes.
-/// - The caller must guarantee that 16-byte elements are string fat pointers.
-///   The Cranelift codegen enforces this via `TypeLayout::of` in
-///   `phoenix-cranelift/src/translate/layout/type_layout.rs`, which matches
-///   every `IrType` variant explicitly so that adding a new 2-slot non-string
-///   type triggers a compile error.  If a new 2-slot type is added, a `kind`
-///   tag must be added to this function's signature.
+/// - When `is_string`, the bytes must be a valid `(ptr, len)` fat
+///   pointer (pointer-width fields).
 pub(crate) unsafe fn elements_equal(
     a: *const u8,
     b: *const u8,
     size: usize,
     is_float: bool,
+    is_string: bool,
 ) -> bool {
-    if size == STRING_FAT_POINTER_SIZE {
-        // Fat pointer (string): compare by content.
+    if is_string {
+        // Pointer-width reads — `i64` would misinterpret the two `i32`
+        // halves of a wasm32 fat pointer as a single field.
         debug_assert!(
             !is_float,
-            "elements_equal: 16-byte float elements are not supported — \
-             16-byte elements are assumed to be string fat pointers"
+            "elements_equal: an element cannot be both a string and `is_float`"
         );
-        let a_ptr = unsafe { *(a as *const i64) } as *const u8;
-        let a_len = unsafe { *((a as *const i64).add(1)) } as usize;
-        let b_ptr = unsafe { *(b as *const i64) } as *const u8;
-        let b_len = unsafe { *((b as *const i64).add(1)) } as usize;
+        debug_assert!(
+            size >= 2 * std::mem::size_of::<usize>(),
+            "elements_equal: string element size {size} < 2 * sizeof(usize) ({})",
+            2 * std::mem::size_of::<usize>(),
+        );
+        let a_ptr = unsafe { *(a as *const usize) } as *const u8;
+        let a_len = unsafe { *((a as *const usize).add(1)) };
+        let b_ptr = unsafe { *(b as *const usize) } as *const u8;
+        let b_len = unsafe { *((b as *const usize).add(1)) };
         // Guard: if length looks unreasonably large (> 1 GiB), the data
         // is almost certainly not a string fat pointer.  Fall back to
         // byte-wise comparison to avoid dereferencing a wild pointer.
@@ -269,19 +259,8 @@ pub unsafe extern "C" fn phx_list_push_raw(
 
 /// Check if a list contains an element.
 ///
-/// For 16-byte elements, assumes the element is a string fat pointer
-/// (ptr + len) and compares the pointed-to content rather than the raw
-/// pointer bytes.  This assumption holds because strings are currently
-/// the only Phoenix type that uses 16-byte elements.  If a future type
-/// also occupies 16 bytes, this heuristic will need a type tag.
-///
-/// When `is_float` is non-zero, elements are compared using IEEE 754
-/// equality (`f64::eq`), which correctly handles `-0.0 == 0.0` and
-/// `NaN != NaN`.
-///
-/// For all other sizes, uses byte-wise comparison.
-///
-/// Returns 1 if found, 0 otherwise.
+/// `is_string` / `is_float` select the comparison flavor; see
+/// [`elements_equal`] for the rules. Returns 1 if found, 0 otherwise.
 ///
 /// # Safety
 ///
@@ -293,6 +272,7 @@ pub unsafe extern "C" fn phx_list_contains(
     elem_ptr: *const u8,
     elem_size: i64,
     is_float: i8,
+    is_string: i8,
 ) -> i8 {
     let (length, es) = unsafe { list_header(list) };
     debug_assert!(
@@ -301,10 +281,11 @@ pub unsafe extern "C" fn phx_list_contains(
     );
     let data = unsafe { list.add(HEADER_SIZE) };
     let float_cmp = is_float != 0;
+    let string_cmp = is_string != 0;
 
     for i in 0..length {
         let item = unsafe { data.add(i * es) };
-        if unsafe { elements_equal(elem_ptr, item, es, float_cmp) } {
+        if unsafe { elements_equal(elem_ptr, item, es, float_cmp, string_cmp) } {
             return 1;
         }
     }
@@ -461,7 +442,7 @@ mod tests {
         }
         let val: i64 = 20;
         assert_eq!(
-            unsafe { phx_list_contains(list, &val as *const i64 as *const u8, 8, 0) },
+            unsafe { phx_list_contains(list, &val as *const i64 as *const u8, 8, 0, 0) },
             1
         );
     }
@@ -476,7 +457,7 @@ mod tests {
         }
         let val: i64 = 30;
         assert_eq!(
-            unsafe { phx_list_contains(list, &val as *const i64 as *const u8, 8, 0) },
+            unsafe { phx_list_contains(list, &val as *const i64 as *const u8, 8, 0, 0) },
             0
         );
     }
@@ -492,13 +473,13 @@ mod tests {
         }
         let val: f64 = 0.0;
         assert_eq!(
-            unsafe { phx_list_contains(list, &val as *const f64 as *const u8, 8, 1) },
+            unsafe { phx_list_contains(list, &val as *const f64 as *const u8, 8, 1, 0) },
             1,
             "-0.0 should equal 0.0 with float comparison"
         );
         // Without float flag, byte comparison would fail.
         assert_eq!(
-            unsafe { phx_list_contains(list, &val as *const f64 as *const u8, 8, 0) },
+            unsafe { phx_list_contains(list, &val as *const f64 as *const u8, 8, 0, 0) },
             0,
             "-0.0 and 0.0 have different byte representations"
         );
@@ -514,7 +495,7 @@ mod tests {
         }
         let val: f64 = f64::NAN;
         assert_eq!(
-            unsafe { phx_list_contains(list, &val as *const f64 as *const u8, 8, 1) },
+            unsafe { phx_list_contains(list, &val as *const f64 as *const u8, 8, 1, 0) },
             0,
             "NaN should not equal NaN with float comparison"
         );
@@ -561,7 +542,7 @@ mod tests {
         let list = phx_list_alloc(8, 0);
         let val: i64 = 1;
         assert_eq!(
-            unsafe { phx_list_contains(list, &val as *const i64 as *const u8, 8, 0) },
+            unsafe { phx_list_contains(list, &val as *const i64 as *const u8, 8, 0, 0) },
             0
         );
     }

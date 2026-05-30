@@ -30,32 +30,6 @@ When an integer or float literal is out of range, the parser emits a diagnostic 
 
 **Target phase:** None — no fix planned. Acceptable as-is; revisit if it causes real-world confusion, at which point add an `ErrorLiteral` AST variant.
 
-### Closure functions inside generic templates are not cloned per specialization
-
-When a generic function `f<T>(...)` defines a closure whose body or captures reference `T`, the closure function is pushed to `IrModule.functions` as a single concrete entry at lowering time. Monomorphization specializes `f<T>` per concrete type substitution but does **not** clone the closure function — the same `FuncId` is shared by every `f<T1>` / `f<T2>` / ... specialization. Pass D (`erase_type_vars_in_non_templates`) then erases the closure body's residual TypeVars to the `__generic` placeholder.
-
-**Symptoms.**
-
-- `phoenix run` (tree-walk) and `phoenix run-ir` (IR-interp) produce correct output. They dispatch on the runtime value shape, not on a static layout, so the erased placeholder is harmless.
-- `phoenix build` (Cranelift) is unsafe whenever the closure body's slot layout depends on `T`. `TypeLayout::of(__generic)` falls back to a 1-slot layout, so the codegen happens to work for 1-slot type instantiations (Int / Bool) and silently miscompiles for wider ones (String / fat-pointer types) — observed as wild allocations or out-of-bounds loads on the wider instantiation.
-- Where the closure body *directly* references `T` in a position Cranelift cannot finesse — e.g. `Op::ClosureLoadCapture` whose result type is `T` and is consumed by an op needing a known layout — Cranelift emits an explicit ICE: `TypeLayout::of on IrType::TypeVar(T) — monomorphization should have eliminated all type variables before codegen`.
-
-**Workaround.** Avoid generic functions that return or contain closures referencing `T` in their captures or body. For now, write monomorphic closures or manually specialize the generic at each concrete type.
-
-**Planned fix.** Extend monomorphization to clone closure functions per substitution of their enclosing generic, mirroring how struct-mono clones methods on generic structs. The substitution machinery itself already reaches `IrFunction.capture_types` and the `Op::ClosureLoadCapture` result-type slot via `for_each_type_mut` — pinned by tests in `crates/phoenix-ir/src/monomorphize/tests.rs::for_each_type_mut_substitutes_capture_types_*`. The remaining work is in the cloning machinery (`crates/phoenix-ir/src/monomorphize/function_mono.rs::clone_and_substitute_bodies`): when a generic template body contains an `Op::ClosureAlloc(closure_fid, ...)`, the specialization needs its own clone of `closure_fid` registered, with TypeVars substituted, and the `Op::ClosureAlloc` rewritten to point at the clone.
-
-**Downstream silent skip in GC root emission.** `phoenix-cranelift/src/translate/gc_roots.rs::is_tracked_ref` returns `false` for `IrType::TypeVar` and generic-placeholder types so the codegen doesn't ICE on the residual placeholders this gap leaves behind. The 1-slot Int/Bool instantiations covered by today's matrix never produce a placeholder ref-typed value that outlives a collection cycle, so the silent skip is harmless *now*. **Risk if the gap widens:** any future codegen path that produces a placeholder ref type whose underlying allocation crosses an auto-collect threshold will see a use-after-free with no test coverage. The branch is documented as a tripwire — when this entry's planned fix lands and the cross-width fixture re-enables, the `is_tracked_ref` early return becomes unreachable and should be replaced with a `debug_assert!(!ty.is_type_var() && !ty.is_generic_placeholder())`.
-
-**Tracked in:**
-- `tests/fixtures/closures_over_generic.phx` — passing fixture covering single-instantiation cases that work today.
-- `tests/fixtures/closures_over_generic_cross_width.phx` — `#[ignore]`d regression marker for the cross-width case.
-- `crates/phoenix-driver/tests/three_backend_matrix.rs::matrix_closures_over_generic_cross_width`.
-- `crates/phoenix-cranelift/src/translate/gc_roots.rs::is_tracked_ref` — the silent-skip tripwire described above.
-
-**Target phase:** Phase 3. The Phase 2.6 module-system fixture set landed without tripping this gap.
-
----
-
 ## Code Quality
 
 ### Map copy-on-write blits the full table body regardless of load factor

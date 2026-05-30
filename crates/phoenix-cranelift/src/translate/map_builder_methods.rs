@@ -82,11 +82,12 @@ pub(super) fn translate_map_builder_method(
             };
             let ks = builder.ins().iconst(cl::I64, elem_size_bytes(&k_ty));
             let vs = builder.ins().iconst(cl::I64, elem_size_bytes(&v_ty));
+            let kis = builder.ins().iconst(cl::I64, k_ty.string_flag() as i64);
             Ok(call_runtime(
                 builder,
                 ctx,
                 ctx.runtime.map_builder_alloc,
-                &[ks, vs],
+                &[ks, vs, kis],
             ))
         }
         "set" => {

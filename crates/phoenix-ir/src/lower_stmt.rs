@@ -91,6 +91,13 @@ impl<'a> LoweringContext<'a> {
         self.var_scopes.clear();
         self.loop_stack.clear();
         self.pending_defers.clear();
+        // Top-level functions are never lowered re-entrantly (lower_modules
+        // walks the module's functions sequentially), so a plain assign
+        // suffices — no save/restore needed.
+        self.current_type_param_names = self.module.functions[func_id.index()]
+            .func()
+            .type_param_names
+            .clone();
         self.push_scope();
 
         // Create the entry block.
@@ -164,6 +171,7 @@ impl<'a> LoweringContext<'a> {
         self.pop_scope();
         self.current_func_id = None;
         self.current_block = None;
+        self.current_type_param_names.clear();
     }
 
     /// Lower a block of statements.  Returns `None` — does not produce a

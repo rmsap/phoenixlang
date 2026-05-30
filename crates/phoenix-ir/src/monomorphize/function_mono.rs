@@ -30,6 +30,40 @@ use crate::types::IrType;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
+/// Enqueue `(callee, targs)` for specialization if it hasn't already
+/// been registered. Shared by the `Op::Call` and `Op::ClosureAlloc` arms
+/// of Pass A so the two paths can't drift.
+fn enqueue_if_new(
+    worklist: &mut VecDeque<SpecKey>,
+    specialized: &SpecMap,
+    callee: FuncId,
+    targs: Vec<IrType>,
+) {
+    if !specialized.contains_key(&(callee, targs.clone())) {
+        worklist.push_back((callee, targs));
+    }
+}
+
+/// Repoint `callee` at its specialization if Pass A enqueued one. The
+/// `expect_spec` flag selects whether a missing specialization is a
+/// debug-assert failure (`Op::Call` with non-empty type_args, and
+/// type-parameterized `Op::ClosureAlloc` — Pass A is contractually
+/// obliged to enqueue these) or simply a no-op (non-generic
+/// `Op::ClosureAlloc`, where the original FuncId is the right target).
+fn rewrite_to_spec(
+    callee: &mut FuncId,
+    specialized: &SpecMap,
+    targs: &[IrType],
+    expect_spec: bool,
+    diag: impl FnOnce() -> String,
+) {
+    let spec_id = specialized.get(&(*callee, targs.to_vec())).copied();
+    debug_assert!(!expect_spec || spec_id.is_some(), "{}", diag());
+    if let Some(spec_id) = spec_id {
+        *callee = spec_id;
+    }
+}
+
 /// Collect the BFS seed: every `(caller, block, instr, callee, type_args)`
 /// for generic calls in non-template functions. Sorted for determinism so
 /// that FuncId assignment order is reproducible across builds.
@@ -114,22 +148,37 @@ pub(super) fn assign_specialization_ids(
             .zip(targs.iter().cloned())
             .collect();
 
-        // Walk the template's body for nested generic calls. For each
-        // Op::Call with non-empty type_args, substitute any TypeVars in
-        // its recorded type args using `subst`, then enqueue the
-        // resolved specialization.
+        // Walk the template's body for nested specializations to enqueue:
+        //
+        // - `Op::Call` with non-empty type_args: resolve and enqueue.
+        // - `Op::ClosureAlloc` to a closure with non-empty
+        //   `type_param_names` (defined inside this generic): enqueue
+        //   `(closure_fid, targs)` so the closure specializes per
+        //   enclosing instantiation.
         for block in &orig.blocks {
             for instr in &block.instructions {
-                let Op::Call(inner_callee, inner_targs, _) = &instr.op else {
-                    continue;
-                };
-                if inner_targs.is_empty() {
-                    continue;
-                }
-                let resolved: Vec<IrType> =
-                    inner_targs.iter().map(|t| substitute(t, &subst)).collect();
-                if !specialized.contains_key(&(*inner_callee, resolved.clone())) {
-                    worklist.push_back((*inner_callee, resolved));
+                match &instr.op {
+                    Op::Call(inner_callee, inner_targs, _) if !inner_targs.is_empty() => {
+                        let resolved: Vec<IrType> =
+                            inner_targs.iter().map(|t| substitute(t, &subst)).collect();
+                        enqueue_if_new(&mut worklist, &specialized, *inner_callee, resolved);
+                    }
+                    Op::ClosureAlloc(closure_fid, _) => {
+                        let closure_fn = module.functions[closure_fid.index()].func();
+                        if closure_fn.type_param_names.is_empty() {
+                            continue;
+                        }
+                        // Hard `assert!` (not `debug_assert!`): a mismatch
+                        // would mis-substitute the closure body in Pass B
+                        // (wrong code, not just a missed specialization).
+                        assert_eq!(
+                            closure_fn.type_param_names, orig.type_param_names,
+                            "closure {closure_fid:?} inside generic {orig_id:?} must \
+                             inherit the enclosing's `type_param_names` verbatim",
+                        );
+                        enqueue_if_new(&mut worklist, &specialized, *closure_fid, targs.clone());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -191,28 +240,50 @@ pub(super) fn clone_and_substitute_bodies(
         // name; mono supplies the name and registers the vtable.
         resolve_unresolved_dyn_allocs(&mut spec_fn, module);
 
-        // Rewrite internal generic Op::Call targets and clear their
-        // type_args (since the callee is now a concrete specialization).
+        // Rewrite internal targets to their concrete specializations:
+        //
+        // - `Op::Call`: resolve type_args through `subst`, repoint to the
+        //   specialized callee, and clear `type_args`.
+        // - `Op::ClosureAlloc` to a type-parameterized closure: repoint
+        //   to the closure specialized at this instantiation's `targs`.
+        //   Non-generic closures keep their original FuncId verbatim.
         for block in spec_fn.blocks.iter_mut() {
             for instr in block.instructions.iter_mut() {
-                let Op::Call(callee, call_targs, _) = &mut instr.op else {
-                    continue;
-                };
-                if call_targs.is_empty() {
-                    continue;
-                }
-                let resolved: Vec<IrType> =
-                    call_targs.iter().map(|t| substitute(t, &subst)).collect();
-                let spec_id = specialized.get(&(*callee, resolved.clone())).copied();
-                debug_assert!(
-                    spec_id.is_some(),
-                    "Pass A should have enqueued every nested generic call, but no \
-                     specialization exists for callee={callee:?} targs={resolved:?} \
-                     reached from template {orig_id:?} at spec {new_id:?}"
-                );
-                if let Some(spec_id) = spec_id {
-                    *callee = spec_id;
-                    call_targs.clear();
+                match &mut instr.op {
+                    Op::Call(callee, call_targs, _) if !call_targs.is_empty() => {
+                        let resolved: Vec<IrType> =
+                            call_targs.iter().map(|t| substitute(t, &subst)).collect();
+                        let orig_callee = *callee;
+                        rewrite_to_spec(callee, specialized, &resolved, true, || {
+                            format!(
+                                "Pass A missed nested generic call \
+                                 callee={orig_callee:?} targs={resolved:?} \
+                                 reached from {orig_id:?} at {new_id:?}"
+                            )
+                        });
+                        call_targs.clear();
+                    }
+                    Op::ClosureAlloc(closure_fid, _) => {
+                        let is_generic_closure = !module.functions[closure_fid.index()]
+                            .func()
+                            .type_param_names
+                            .is_empty();
+                        let orig_fid = *closure_fid;
+                        rewrite_to_spec(
+                            closure_fid,
+                            specialized,
+                            targs,
+                            is_generic_closure,
+                            || {
+                                format!(
+                                    "Pass A missed generic closure \
+                                 closure={orig_fid:?} targs={targs:?} \
+                                 reached from {orig_id:?} at {new_id:?}"
+                                )
+                            },
+                        );
+                    }
+                    _ => {}
                 }
             }
         }

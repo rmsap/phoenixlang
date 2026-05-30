@@ -360,8 +360,13 @@ fn with_synthetic_function<R>(
     let saved_scopes = std::mem::take(&mut ctx.var_scopes);
     let saved_loops = std::mem::take(&mut ctx.loop_stack);
     let saved_module = std::mem::replace(&mut ctx.current_module, module);
+    let saved_type_param_names = std::mem::take(&mut ctx.current_type_param_names);
 
     ctx.current_func_id = Some(func_id);
+    ctx.current_type_param_names = ctx.module.functions[func_id.index()]
+        .func()
+        .type_param_names
+        .clone();
     ctx.push_scope();
 
     let result = body(ctx);
@@ -372,6 +377,7 @@ fn with_synthetic_function<R>(
     ctx.current_func_id = saved_func_id;
     ctx.current_block = saved_block;
     ctx.current_module = saved_module;
+    ctx.current_type_param_names = saved_type_param_names;
 
     result
 }

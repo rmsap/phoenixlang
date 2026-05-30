@@ -43,16 +43,16 @@ impl TypeLayout {
     /// new `IrType` variant must produce a compile error here so silent
     /// miscompilation of multi-slot types is impossible.
     ///
-    /// # Cross-crate invariant — 16-byte fat pointers
+    /// # Cross-crate invariant — string-content comparison flag
     ///
-    /// The runtime's `phx_list_contains` / `phx_map_*` use `elem_size == 16`
-    /// as a heuristic for "`StringRef` fat pointer — compare by content".
-    /// `DynRef` is also 16 bytes and is indistinguishable from a string at
-    /// the runtime boundary — today this is fine because `List<dyn Trait>`
-    /// is not yet supported end-to-end (see known-issues.md). When it lands,
-    /// `phoenix-runtime/src/list_methods.rs` must be taught a different
-    /// discriminator (e.g. a per-list element-kind tag) before this layout
-    /// acquires a third 16-byte variant.
+    /// The runtime's `phx_list_contains` / `phx_map_*` take an explicit
+    /// `is_string` / `key_is_string` flag (set by codegen from
+    /// [`IrType::string_flag`]) to decide whether to compare elements
+    /// by pointed-to content. The 16-byte-elem heuristic that lived
+    /// here previously was retired so a future 16-byte non-string type
+    /// — `DynRef`, for instance — would not silently miscompare. The
+    /// match is still exhaustive so adding any new `IrType` forces a
+    /// matching update both here and at every flag-setting call site.
     #[must_use]
     pub(crate) fn of(ty: &IrType) -> Self {
         match ty {

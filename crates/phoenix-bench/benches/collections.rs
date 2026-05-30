@@ -97,7 +97,9 @@ fn bench_map_ops(c: &mut Criterion) {
         // cannot trigger a sweep that would miss the not-yet-rooted
         // map; we re-enable auto-collect only after the frame is set.
         let pairs = build_pair_buffer(n as usize);
-        let map = unsafe { phx_map_from_pairs(KEY_SIZE, VAL_SIZE, n, pairs.as_ptr()) };
+        // `key_is_string = 0`: bench keys are `Int` (`KEY_SIZE == 8`), so
+        // the map hashes/compares them by raw bytes.
+        let map = unsafe { phx_map_from_pairs(KEY_SIZE, VAL_SIZE, n, pairs.as_ptr(), 0) };
         let frame = phx_gc_push_frame(1);
         unsafe { phx_gc_set_root(frame, 0, map) };
         let _frame_guard = RootedFrameGuard::new(frame as *mut u8);
@@ -140,6 +142,7 @@ fn bench_map_ops(c: &mut Criterion) {
                             black_box(&v as *const i64 as *const u8),
                             KEY_SIZE,
                             VAL_SIZE,
+                            0,
                         )
                     };
                     black_box(r);

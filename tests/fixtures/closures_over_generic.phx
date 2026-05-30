@@ -4,15 +4,13 @@
 // `for_each_type_mut` walk visits: `IrFunction.capture_types` and the
 // result type of `Op::ClosureLoadCapture`.
 //
-// **Scope.** This fixture covers single-instantiation cases that all
-// three backends agree on today. The cases where the same generic
-// closure factory is instantiated at *different widths* (e.g. Int and
-// String) are tracked as a known issue — the inner closure function
-// is shared across specializations rather than cloned, so its
-// `capture_types` retains the erased `__generic` placeholder and the
-// Cranelift backend mis-sizes its heap layout for at least one of the
-// instantiations. See `tests/fixtures/closures_over_generic_cross_width.phx`
-// for the regression marker covering that gap.
+// **Scope.** This fixture covers single-instantiation cases. The
+// cross-width case (the same generic closure factory instantiated at
+// Int *and* String) is covered by
+// `tests/fixtures/closures_over_generic_cross_width.phx`; both now pass
+// on all three backends, since monomorphization clones the inner closure
+// function per enclosing-generic substitution (following
+// `Op::ClosureAlloc` edges) rather than sharing one erased copy.
 //
 // Three-backend matrix: `phoenix run`, `phoenix run-ir`, and `phoenix
 // build` must agree on stdout, byte-for-byte. A divergence here would

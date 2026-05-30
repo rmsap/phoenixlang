@@ -680,7 +680,7 @@ fn map_set_on_placeholder_survives_collect_inside_recovery() {
 
     // Empty placeholder map (ks = vs = 0 — the shape generic-type
     // resolution emits before the type parameters bind).
-    let placeholder = phoenix_runtime::__test_support::phx_map_alloc(0, 0, 0);
+    let placeholder = phoenix_runtime::__test_support::phx_map_alloc(0, 0, 0, 0);
 
     let key: i64 = 7;
     let val: i64 = 42;
@@ -691,6 +691,7 @@ fn map_set_on_placeholder_survives_collect_inside_recovery() {
             &val as *const i64 as *const u8,
             8,
             8,
+            0,
         )
     };
     assert_eq!(
@@ -746,6 +747,7 @@ fn map_from_pairs_survives_collect_during_build() {
             8,
             N,
             pair_data.as_ptr() as *const u8,
+            0,
         )
     };
     assert_eq!(

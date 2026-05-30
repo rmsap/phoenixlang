@@ -743,7 +743,7 @@ mod tests {
     /// coupling to `MIN_BUCKETS`.
     #[test]
     fn map_alloc_initializes_header() {
-        let ptr = crate::map_methods::phx_map_alloc(8, 8, 4);
+        let ptr = crate::map_methods::phx_map_alloc(8, 8, 4, 0);
         assert!(!ptr.is_null());
         unsafe {
             assert_eq!(*(ptr as *const i64), 0); // length

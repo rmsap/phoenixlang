@@ -56,7 +56,7 @@ pub struct RuntimeFunctions {
     pub list_builder_push: FuncId,
     /// `phx_list_builder_freeze(handle) -> list_ptr`.
     pub list_builder_freeze: FuncId,
-    /// `phx_map_builder_alloc(key_size, val_size) -> handle_ptr`.
+    /// `phx_map_builder_alloc(key_size, val_size, key_is_string) -> handle_ptr`.
     pub map_builder_alloc: FuncId,
     /// `phx_map_builder_set(handle, key_ptr, val_ptr, key_size, val_size)`.
     pub map_builder_set: FuncId,
@@ -93,16 +93,18 @@ pub struct RuntimeFunctions {
     pub list_get_raw: FuncId,
     /// `phx_list_push_raw(list_ptr, elem_ptr, elem_size) -> new_list_ptr`.
     pub list_push_raw: FuncId,
-    /// `phx_list_contains(list_ptr, elem_ptr, elem_size, is_float) -> i8`.
+    /// `phx_list_contains(list_ptr, elem_ptr, elem_size, is_float, is_string) -> i8`.
     pub list_contains: FuncId,
     /// `phx_list_take(list_ptr, n) -> new_list_ptr`.
     pub list_take: FuncId,
     /// `phx_list_drop(list_ptr, n) -> new_list_ptr`.
     pub list_drop: FuncId,
     // ── Map runtime functions ───────────────────────────────────────
-    /// `phx_map_from_pairs(key_size, val_size, n_pairs, pair_data) -> map_ptr`.
+    /// `phx_map_from_pairs(key_size, val_size, n_pairs, pair_data, key_is_string) -> map_ptr`.
     /// Used by the map-literal lowering: codegen writes each pair into a
     /// stack buffer and the runtime hash-builds the table in one pass.
+    /// `key_is_string` is recorded in the map header so later lookups
+    /// compare `String` keys by content (required on wasm32).
     /// Replaces the previous `phx_map_alloc`-then-write-pairs path; the
     /// runtime keeps `phx_map_alloc` as an internal helper for `set` /
     /// `remove`, but compiled code no longer needs to call it directly.
@@ -111,7 +113,11 @@ pub struct RuntimeFunctions {
     pub map_length: FuncId,
     /// `phx_map_get_raw(map_ptr, key_ptr, key_size) -> val_ptr_or_null`.
     pub map_get_raw: FuncId,
-    /// `phx_map_set_raw(map_ptr, key_ptr, val_ptr, key_size, val_size) -> new_map_ptr`.
+    /// `phx_map_set_raw(map_ptr, key_ptr, val_ptr, key_size, val_size,
+    /// key_is_string) -> new_map_ptr`. `key_is_string` is consulted only
+    /// on the placeholder/shape-change recovery branch; required on
+    /// wasm32 where a `StringRef` key is 8 bytes and can't be told from
+    /// `Int` / `Float` by size.
     pub map_set_raw: FuncId,
     /// `phx_map_remove_raw(map_ptr, key_ptr, key_size) -> new_map_ptr`.
     pub map_remove_raw: FuncId,
@@ -186,7 +192,7 @@ impl RuntimeFunctions {
             map_builder_alloc: declare_func(
                 module,
                 "phx_map_builder_alloc",
-                &[I64, I64],
+                &[I64, I64, I64],
                 &[I64],
                 call_conv,
             )?,
@@ -255,7 +261,7 @@ impl RuntimeFunctions {
             list_contains: declare_func(
                 module,
                 "phx_list_contains",
-                &[I64, I64, I64, I8],
+                &[I64, I64, I64, I8, I8],
                 &[I8],
                 call_conv,
             )?,
@@ -265,7 +271,7 @@ impl RuntimeFunctions {
             map_from_pairs: declare_func(
                 module,
                 "phx_map_from_pairs",
-                &[I64, I64, I64, I64],
+                &[I64, I64, I64, I64, I64],
                 &[I64],
                 call_conv,
             )?,
@@ -280,7 +286,7 @@ impl RuntimeFunctions {
             map_set_raw: declare_func(
                 module,
                 "phx_map_set_raw",
-                &[I64, I64, I64, I64, I64],
+                &[I64, I64, I64, I64, I64, I64],
                 &[I64],
                 call_conv,
             )?,

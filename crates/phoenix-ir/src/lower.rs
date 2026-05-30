@@ -336,6 +336,26 @@ pub(crate) struct LoweringContext<'a> {
     /// b: ListBuilder<String> = List.builder()` (annotation source)
     /// and `b = List.builder()` reassignment (slot-type source).
     pub(crate) current_target_type: Option<IrType>,
+    /// `type_param_names` of the innermost enclosing generic function,
+    /// or empty if none. Maintained explicitly (saved/restored at
+    /// function entry/exit) so closure inheritance does not depend on
+    /// the order in which the enclosing function's `type_param_names`
+    /// field is written. Read by closure lowering in `lower_expr.rs`.
+    ///
+    /// **Assumption: at most one enclosing generic in scope.** Phoenix
+    /// today has no nested generic *function* definitions, so a closure
+    /// can only sit inside one generic ancestor — its `type_param_names`
+    /// uniquely identifies that ancestor's parameter list. If Phoenix
+    /// ever grows nested generic functions (e.g. `f<T>` defining a
+    /// generic `g<U>` that defines a closure capturing both `T` and
+    /// `U`), this single-vector scheme breaks: the closure would need
+    /// to inherit the *union* of all enclosing generics' params, and
+    /// monomorphization's hard assert in
+    /// `function_mono.rs::assign_specialization_ids`
+    /// (`closure_fn.type_param_names == orig.type_param_names`) would
+    /// no longer hold. The fix at that point is a stack-of-vectors here
+    /// plus an aligned substitution in mono's Pass B.
+    pub(crate) current_type_param_names: Vec<String>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -353,6 +373,7 @@ impl<'a> LoweringContext<'a> {
             pending_defers: Vec::new(),
             defer_outer_scope_depth: 0,
             current_target_type: None,
+            current_type_param_names: Vec::new(),
         }
     }
 
