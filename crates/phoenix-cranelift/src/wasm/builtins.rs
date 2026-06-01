@@ -576,10 +576,23 @@ fn translate_result_option_builtin(
         // index from the IR layout rather than hardcoding it, matching
         // the construction-side helpers.
         (_, "unwrapOr") => translate_enum_unwrap_or(ctx, b, ir_module, enum_name, args, instr),
+        // `unwrap` extracts the positive variant's payload or panics
+        // (Phoenix's `phx_panic`) with a static message reserved in the
+        // user-data region. Shared between Option and Result.
+        (_, "unwrap") => translate_enum_unwrap(ctx, b, ir_module, enum_name, args, instr),
+        // `Result.ok` / `Result.err`: convert one side of a `Result`
+        // into an `Option`. Pure branching, no closure.
+        ("Result", "ok") => translate_result_to_option(ctx, b, ir_module, "Ok", args, instr),
+        ("Result", "err") => translate_result_to_option(ctx, b, ir_module, "Err", args, instr),
+        // `Option.okOr`: convert `Option<T>` into `Result<T, E>` by
+        // tagging the `None` case with a caller-supplied default `Err`
+        // value. Pure branching + enum construct, no closure.
+        ("Option", "okOr") => translate_option_okor(ctx, b, ir_module, args, instr),
         _ => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` not yet supported \
-             (Phase 2.4 PR 3d — payload-handling methods like `unwrap` / `map` / \
-             `andThen` ship in a later slice)"
+             (Phase 2.4 PR 3d — closure-payload-transform methods like `map` / \
+             `mapErr` / `andThen` / `orElse` / `unwrapOrElse` / `filter` ship \
+             in a later slice)"
         ))),
     }
 }
@@ -675,6 +688,240 @@ fn translate_enum_unwrap_or(
         ctx.emit(Instruction::LocalGet(local));
     }
     ctx.emit_store_result(vid, payload_ty)?;
+    Ok(())
+}
+
+/// `Option.unwrap()` / `Result.unwrap()` — extract the positive
+/// variant's payload, or trap via `phx_panic` on the negative variant.
+/// The panic message is reserved per call site in the user-data
+/// region (each unwrap call site gets its own offset — the messages
+/// are short and dedup isn't worth the bookkeeping).
+///
+/// The negative arm ends in `phx_panic` followed by `unreachable`,
+/// satisfying WASM's branch-result-typing rules without a multi-value
+/// block type — the typed result is materialized in result-locals on
+/// the positive arm only, and pushed onto the stack after the
+/// `If`/`Else`/`End` closes.
+fn translate_enum_unwrap(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    enum_name: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"{enum_name}.unwrap\")` requires 1 arg \
+             (receiver), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"enum.unwrap\")")?;
+    let (positive_variant, panic_msg) = match enum_name {
+        OPTION_ENUM => ("Some", "called Option.unwrap on None"),
+        RESULT_ENUM => ("Ok", "called Result.unwrap on Err"),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `unwrap` on enum `{other}` — only `Option` / \
+                 `Result` are supported (internal compiler bug)"
+            )));
+        }
+    };
+    let positive_idx = find_variant_index(ir_module, enum_name, positive_variant)?;
+    let recv_local = ctx.binding_of(args[0])?.single_local();
+    let payload_ty = instr.result_type.clone();
+    let variant = compute_variant_field_offsets(std::slice::from_ref(&payload_ty))?;
+    let payload_offset = variant.field_offsets[0];
+
+    let result_locals = ctx.allocate_locals_for_ir_type_anon(&payload_ty)?;
+    let (msg_off, msg_len) = b.reserve_user_data(panic_msg.as_bytes())?;
+    let panic_idx = b.require_phx_func("phx_panic")?;
+
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::I32Load(i32_memarg(0)));
+    ctx.emit(Instruction::I32Const(positive_idx as i32));
+    ctx.emit(Instruction::I32Eq);
+    ctx.emit(Instruction::If(BlockType::Empty));
+    // Positive arm: extract payload into result_locals.
+    emit_field_load(ctx, recv_local, payload_offset, &payload_ty)?;
+    store_stack_into_locals(ctx, &result_locals);
+    ctx.emit(Instruction::Else);
+    // Negative arm: panic + unreachable (no value materialized — WASM
+    // accepts `unreachable` as any type, so the empty-result block
+    // shape is well-typed even though only the positive arm writes
+    // to result_locals).
+    ctx.emit(Instruction::I32Const(msg_off as i32));
+    ctx.emit(Instruction::I32Const(msg_len as i32));
+    ctx.emit(Instruction::Call(panic_idx));
+    ctx.emit(Instruction::Unreachable);
+    ctx.emit(Instruction::End);
+    for &local in &result_locals {
+        ctx.emit(Instruction::LocalGet(local));
+    }
+    ctx.emit_store_result(vid, payload_ty)?;
+    Ok(())
+}
+
+/// `Result.ok()` (`tag = "Ok"`) → `Option<T>` carrying the Ok payload.
+/// `Result.err()` (`tag = "Err"`) → `Option<E>` carrying the Err payload.
+///
+/// In both cases the matching arm wraps the extracted payload in
+/// `Some`; the mismatching arm yields `None`. The block result is
+/// `i32` (the Option pointer); both arms leave that pointer on the
+/// stack — no result-locals dance needed because Option pointers are
+/// single-slot regardless of payload type.
+fn translate_result_to_option(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    tag: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"Result.{}\")` requires 1 arg \
+             (receiver), got {} (internal compiler bug)",
+            tag.to_lowercase(),
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"Result.ok/err\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let payload_ty = match (&recv_binding.ir_type, tag) {
+        (IrType::EnumRef(name, targs), "Ok") if name == RESULT_ENUM => {
+            targs.first().cloned().ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-linear: `Result.ok` receiver missing type arg `T` \
+                     (internal compiler bug)"
+                        .to_string(),
+                )
+            })?
+        }
+        (IrType::EnumRef(name, targs), "Err") if name == RESULT_ENUM => {
+            targs.get(1).cloned().ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-linear: `Result.err` receiver missing type arg `E` \
+                     (internal compiler bug)"
+                        .to_string(),
+                )
+            })?
+        }
+        (other, t) => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `Result.{}` receiver must be `Result<T, E>`, got \
+                 `{other:?}` (internal compiler bug)",
+                t.to_lowercase()
+            )));
+        }
+    };
+    let payload_idx = find_variant_index(ir_module, RESULT_ENUM, tag)?;
+    let variant = compute_variant_field_offsets(std::slice::from_ref(&payload_ty))?;
+    let payload_offset = variant.field_offsets[0];
+
+    let payload_locals = ctx.allocate_locals_for_ir_type_anon(&payload_ty)?;
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::I32Load(i32_memarg(0)));
+    ctx.emit(Instruction::I32Const(payload_idx as i32));
+    ctx.emit(Instruction::I32Eq);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Matching arm: build Some(payload).
+    emit_field_load(ctx, recv_local, payload_offset, &payload_ty)?;
+    store_stack_into_locals(ctx, &payload_locals);
+    emit_option_some(ctx, b, ir_module, &payload_ty, &payload_locals)?;
+    ctx.emit(Instruction::Else);
+    emit_option_none(ctx, b, ir_module)?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Option.okOr(default_err)` — convert `Option<T>` to
+/// `Result<T, E>`: `Some(t)` becomes `Ok(t)`, `None` becomes
+/// `Err(default_err)`.
+///
+/// Block result is `i32` (the Result pointer); the matching arm
+/// extracts the `Some` payload and re-wraps as `Ok`, the negative arm
+/// constructs `Err` with the caller's default value (already in
+/// locals — no staging needed). The `Err` payload type comes from
+/// `args[1]`'s binding (the concrete `E`).
+fn translate_option_okor(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"Option.okOr\")` requires 2 args \
+             (receiver, default_err), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    let vid = expect_result(instr, "BuiltinCall(\"Option.okOr\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let some_ty = match &recv_binding.ir_type {
+        IrType::EnumRef(name, targs) if name == OPTION_ENUM => {
+            targs.first().cloned().ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-linear: `Option.okOr` receiver missing type arg `T` \
+                     (internal compiler bug)"
+                        .to_string(),
+                )
+            })?
+        }
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `Option.okOr` receiver must be `Option<T>`, got \
+                 `{other:?}` (internal compiler bug)"
+            )));
+        }
+    };
+    let err_binding = ctx.binding_of(args[1])?;
+    let err_locals = err_binding.locals.clone();
+    let err_ty = err_binding.ir_type.clone();
+    let some_idx = find_variant_index(ir_module, OPTION_ENUM, "Some")?;
+    let ok_idx = find_variant_index(ir_module, RESULT_ENUM, "Ok")?;
+    let err_idx = find_variant_index(ir_module, RESULT_ENUM, "Err")?;
+    let some_variant = compute_variant_field_offsets(std::slice::from_ref(&some_ty))?;
+    let some_offset = some_variant.field_offsets[0];
+
+    let payload_locals = ctx.allocate_locals_for_ir_type_anon(&some_ty)?;
+    let payload_locals_owned = vec![payload_locals.clone()];
+    let err_locals_owned = vec![err_locals];
+
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::I32Load(i32_memarg(0)));
+    ctx.emit(Instruction::I32Const(some_idx as i32));
+    ctx.emit(Instruction::I32Eq);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Some path: extract T, build Ok(T).
+    emit_field_load(ctx, recv_local, some_offset, &some_ty)?;
+    store_stack_into_locals(ctx, &payload_locals);
+    emit_enum_construct(
+        ctx,
+        b,
+        RESULT_ENUM,
+        ok_idx,
+        std::slice::from_ref(&some_ty),
+        &payload_locals_owned,
+    )?;
+    ctx.emit(Instruction::Else);
+    // None path: build Err(default_err).
+    emit_enum_construct(
+        ctx,
+        b,
+        RESULT_ENUM,
+        err_idx,
+        std::slice::from_ref(&err_ty),
+        &err_locals_owned,
+    )?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
     Ok(())
 }
 

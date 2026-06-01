@@ -3253,6 +3253,106 @@ fn map_get_set_run_under_wasmtime() {
     assert_wasm_matches_interp(src, "map_get_set");
 }
 
+/// `Option.unwrap` / `Result.unwrap` — positive-variant payload
+/// extraction. The negative arm panics via `phx_panic` and never
+/// returns, so we only test the positive path here. The negative
+/// path is exercised by `panics_on_option_unwrap_of_none` below.
+///
+/// Expected: 10 / 7 / hello.
+#[test]
+fn enum_unwrap_positive_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let s: Option<Int> = Some(10)\n  \
+                 print(s.unwrap())\n  \
+                 let r: Result<Int, String> = Ok(7)\n  \
+                 print(r.unwrap())\n  \
+                 let so: Option<String> = Some(\"hello\")\n  \
+                 print(so.unwrap())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "enum_unwrap_positive");
+}
+
+/// `Option.unwrap` on `None` traps via `phx_panic`. The compiled
+/// program exits with a non-zero status; assert that the wasmtime
+/// invocation fails rather than producing matching stdout. (Match
+/// against the AST interpreter would be wrong here — the interp
+/// raises a `RuntimeError`, the compiled binary aborts.)
+#[test]
+fn enum_unwrap_negative_panics_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let n: Option<Int> = None\n  \
+                 print(n.unwrap())\n\
+               }\n";
+    let label = "enum_unwrap_panic";
+    compile_or_skip(src, label, |bytes| {
+        let spawn = Command::new("wasmtime").arg("--version").output();
+        if spawn.is_err() {
+            if require_wasmtime() {
+                panic!("PHOENIX_REQUIRE_WASMTIME=1 but wasmtime not on PATH");
+            }
+            eprintln!("warning: skipping {label} — wasmtime not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("panic.wasm");
+        std::fs::write(&path, bytes).expect("write wasm");
+        let out = Command::new("wasmtime")
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("invoke wasmtime");
+        assert!(
+            !out.status.success(),
+            "expected wasmtime to abort on Option.unwrap of None, got success: \
+             stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+}
+
+/// `Result.ok` / `Result.err` — convert `Result<T, E>` into
+/// `Option<T>` / `Option<E>` respectively. The matching arm extracts
+/// the variant's payload and wraps it as `Some`; the mismatching arm
+/// yields `None`.
+///
+/// Expected: 1 / true / true / false / true (for the bool flags).
+#[test]
+fn result_ok_err_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let ok: Result<Int, String> = Ok(1)\n  \
+                 let er: Result<Int, String> = Err(\"oops\")\n  \
+                 print(ok.ok().unwrapOr(0))\n  \
+                 print(ok.ok().isSome())\n  \
+                 print(ok.err().isSome())\n  \
+                 print(er.ok().isSome())\n  \
+                 print(er.err().isSome())\n  \
+                 print(er.err().unwrapOr(\"none\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "result_ok_err");
+}
+
+/// `Option.okOr` — convert `Option<T>` to `Result<T, E>` by tagging
+/// `None` with a caller-supplied `Err` value. Matches the
+/// interpreter's behavior across both variants.
+///
+/// Expected stdout: true / 5 / false / err.
+#[test]
+fn option_okor_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let s: Option<Int> = Some(5)\n  \
+                 let n: Option<Int> = None\n  \
+                 let r1: Result<Int, String> = s.okOr(\"missing\")\n  \
+                 let r2: Result<Int, String> = n.okOr(\"err\")\n  \
+                 print(r1.isOk())\n  \
+                 print(r1.unwrapOr(0))\n  \
+                 print(r2.isOk())\n  \
+                 print(r2.err().unwrapOr(\"none\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "option_okor");
+}
+
 /// `Map.get` / `Map.set` with **`Int` keys** — exercises the
 /// `key_is_string == false` branch in `translate_map_set` and the
 /// fixed-width (non-fat-pointer) key staging in both helpers. The
