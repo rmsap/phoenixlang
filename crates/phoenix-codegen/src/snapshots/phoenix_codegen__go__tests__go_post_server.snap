@@ -9,7 +9,6 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"strconv"
 	"strings"
 )
 
@@ -24,7 +23,10 @@ func NewRouter(h Handlers) *http.ServeMux {
 		}
 		result, err := h.CreateUser(body)
 		if err != nil {
-			if strings.Contains(err.Error(), "Conflict") { http.Error(w, "Conflict", 409); return }
+			if strings.Contains(err.Error(), "Conflict") {
+				http.Error(w, "Conflict", 409)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

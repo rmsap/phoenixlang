@@ -79,3 +79,42 @@ jobs:
         env:
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
+
+  # Phoenix Gen "the generated code actually compiles and lints" harness.
+  # Kept OFF the fast `check` job because it installs Go/Node/redocly
+  # toolchains (slow) and shells out to them. `PHOENIX_GEN_E2E=1` makes a
+  # missing toolchain a HARD failure instead of a silent skip, so this job
+  # cannot quietly stop exercising a target. See
+  # `crates/phoenix-codegen/tests/compiles_and_lints.rs`.
+  gen-compiles-and-lints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      # golangci-lint is invoked by the Go target step of the harness; the
+      # binary must be on PATH or the E2E gate hard-fails.
+      - name: Install golangci-lint
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v1.61.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # redocly is fetched on demand via `npx --yes @redocly/cli`; pre-warm it
+      # so the OpenAPI target step does not pay the download inside the test.
+      - name: Pre-fetch redocly CLI
+        run: npx --yes @redocly/cli --version
+      - name: Compile-and-lint generated output (all installed targets)
+        env:
+          PHOENIX_GEN_E2E: "1"
+        run: cargo test -p phoenix-codegen --test compiles_and_lints
+
+      # Parity guard: the standalone `phoenix-gen` binary and `phoenix gen`
+      # must accept an identical option surface (roadmap §8).
+      - name: Help parity (phoenix gen vs phoenix-gen)
+        run: cargo test -p phoenix-driver --test help_parity

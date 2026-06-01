@@ -37,6 +37,9 @@ endpoint listPosts: GET "/api/posts" {
         Int limit = 20
         Option<String> tag
         Option<String> search
+        Bool featured = false
+        Float minScore = 0.0
+        Option<Float> maxScore
     }
     response List<Post>
 }

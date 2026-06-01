@@ -12,6 +12,22 @@ Phoenix combines functional and object-oriented programming with a clean, famili
 
 ---
 
+## Two products in one repo
+
+This repository ships **two products** that share one compiler front-end:
+
+1. **The Phoenix language** — a strict, statically-typed language with its own lexer, parser, type checker, interpreter, and (in progress) native/WASM backends.
+2. **Phoenix Gen** — a multi-language API codegen tool that turns a `.phx` schema into typed clients and servers for **TypeScript, Python, and Go**, plus an **OpenAPI 3.1** spec. It is usable **without learning the Phoenix language**: write a schema, generate code, ship it.
+
+Phoenix Gen has two entry points that share one implementation, so they cannot drift:
+
+- `phoenix gen schema.phx --target typescript --out ./generated` — the `gen` subcommand of the language driver.
+- `phoenix-gen schema.phx --target typescript --out ./generated` — a standalone binary for teams who only want codegen.
+
+See [docs/phoenix-gen.md](docs/phoenix-gen.md) for the current feature set and [docs/phoenix-gen-roadmap.md](docs/phoenix-gen-roadmap.md) for the path to a v1.0 product.
+
+---
+
 ## Highlights
 
 - **Two execution modes** — tree-walk interpreter for fast iteration, Cranelift-backed native compilation for production

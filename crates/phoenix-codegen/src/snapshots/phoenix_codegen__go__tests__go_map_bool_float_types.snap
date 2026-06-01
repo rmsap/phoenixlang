@@ -7,7 +7,7 @@ expression: files.types
 package api
 
 type Config struct {
-	Settings map[string]string `json:"settings"`
-	Enabled bool `json:"enabled"`
-	Threshold float64 `json:"threshold"`
+	Settings  map[string]string `json:"settings"`
+	Enabled   bool              `json:"enabled"`
+	Threshold float64           `json:"threshold"`
 }

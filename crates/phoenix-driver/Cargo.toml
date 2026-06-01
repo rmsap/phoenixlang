@@ -7,9 +7,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "phoenix_driver"
+path = "src/lib.rs"
+
 [[bin]]
 name = "phoenix"
 path = "src/main.rs"
+
+[[bin]]
+name = "phoenix-gen"
+path = "src/bin/phoenix-gen.rs"
 
 [dependencies]
 phoenix-common = { path = "../phoenix-common" }

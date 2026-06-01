@@ -7,11 +7,11 @@ expression: files.client
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 // ApiClient is a typed HTTP client for the API.

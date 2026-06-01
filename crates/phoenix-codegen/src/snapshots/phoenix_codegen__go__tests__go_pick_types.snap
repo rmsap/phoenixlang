@@ -7,10 +7,10 @@ expression: files.types
 package api
 
 type User struct {
-	Id int64 `json:"id"`
-	Name string `json:"name"`
+	Id    int64  `json:"id"`
+	Name  string `json:"name"`
 	Email string `json:"email"`
-	Age int64 `json:"age"`
+	Age   int64  `json:"age"`
 }
 
 type UpdateEmailBody struct {

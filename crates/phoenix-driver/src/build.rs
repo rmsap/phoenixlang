@@ -28,7 +28,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `target_str` is the user-supplied `--target` value or `None` for
 /// the default (native). Unknown values produce a single
 /// "unknown target" diagnostic listing every accepted spelling.
-pub(crate) fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
+pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
     let target = match target_str {
         Some(s) => match Target::from_cli(s) {
             Some(t) => t,

@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 )
 
 // ApiClient is a typed HTTP client for the API.
@@ -22,8 +24,15 @@ type ApiClient struct {
 func NewApiClient(baseURL string) *ApiClient {
 	return &ApiClient{BaseURL: baseURL, Client: http.DefaultClient}
 }
-func (c *ApiClient) GetStatus() (*Status, error) {
-	u := fmt.Sprintf("%s/api/status", c.BaseURL)
+func (c *ApiClient) ListItems(minScore float64, sort Sort, fallback *Sort) (*[]Item, error) {
+	u := fmt.Sprintf("%s/api/items", c.BaseURL)
+	q := url.Values{}
+	q.Set("minScore", strconv.FormatFloat(minScore, 'f', -1, 64))
+	q.Set("sort", fmt.Sprint(sort))
+	if fallback != nil {
+		q.Set("fallback", fmt.Sprint(*fallback))
+	}
+	u += "?" + q.Encode()
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -36,7 +45,7 @@ func (c *ApiClient) GetStatus() (*Status, error) {
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	var result Status
+	var result []Item
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}

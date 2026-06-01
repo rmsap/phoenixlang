@@ -67,8 +67,14 @@ expression: spec
             },
             "description": "NotFound"
           }
-        }
+        },
+        "summary": "getUser"
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
 }

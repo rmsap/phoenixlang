@@ -9,8 +9,6 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"strconv"
-	"strings"
 )
 
 // NewRouter creates an http.ServeMux that routes requests to the given handlers.

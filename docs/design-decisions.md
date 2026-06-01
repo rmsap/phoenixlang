@@ -1044,3 +1044,12 @@ To make any layout change a build break instead, `crates/phoenix-runtime/src/lib
 3. `size_of::<PhxFatPtr>() == 2 * size_of::<usize>()` — total size is exactly two words.
 
 All three are target-independent (they pin structural invariants, not absolute byte counts). On wasm32 `usize` is 4 bytes (struct is 8 bytes total); on x86_64 it's 8 (struct is 16). Each backend reads at offsets matching its own target's word size, so the wasm32 backend's "offset 4" hand-rolled loads are correct iff `size_of::<usize>() == 4` *and* the len-follows-ptr-with-no-padding invariant holds — which the second assert pins.
+
+---
+
+## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)
+
+The [Phoenix Gen roadmap](phoenix-gen-roadmap.md) §9 listed several open decisions, five of which block downstream v1.0 work. They are recorded here as the **current working direction** — each is the roadmap's own recommendation, adopted as the decision of record. They can be revisited if a strong reason emerges, but absent that they are the plan.
+
+1. **v1.0 server-framework list (locked)** → TypeScript: Express + Fastify; Python: FastAPI; Go: `net/http` + chi. Rationale: a small, popular set covers most users while bounding maintenance cost; lock it before beta.
+2. **Pagination shape** → Support **both** cursor and offset pagination, selected via an explicit annotation on the response type. Rationale: it is the most common API shape and forcing a single style would push teams to reinvent the other.

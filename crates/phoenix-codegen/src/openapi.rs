@@ -51,6 +51,9 @@ pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
             "title": "API",
             "version": "1.0.0"
         },
+        "servers": [
+            { "url": "/" }
+        ],
         "paths": paths,
         "components": {
             "schemas": schemas,
@@ -85,6 +88,18 @@ fn build_paths(endpoints: &[EndpointInfo]) -> Value {
 fn build_operation(ep: &EndpointInfo) -> Value {
     let mut op: Map<String, Value> = Map::new();
     op.insert("operationId".to_string(), json!(ep.name));
+
+    // A summary is required by common OpenAPI linters (redocly's
+    // `operation-summary`). Derive it from the doc comment's first line when
+    // present, otherwise fall back to the endpoint name.
+    let summary = ep
+        .doc_comment
+        .as_ref()
+        .and_then(|doc| doc.lines().next())
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| ep.name.clone());
+    op.insert("summary".to_string(), json!(summary));
 
     if let Some(ref doc) = ep.doc_comment {
         op.insert("description".to_string(), json!(doc));

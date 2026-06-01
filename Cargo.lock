@@ -1163,6 +1163,7 @@ dependencies = [
  "phoenix-parser",
  "phoenix-sema",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

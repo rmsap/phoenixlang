@@ -71,8 +71,14 @@ expression: spec
             },
             "description": "Successful response"
           }
-        }
+        },
+        "summary": "createUser"
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
 }

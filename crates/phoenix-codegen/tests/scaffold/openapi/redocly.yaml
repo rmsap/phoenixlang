@@ -1,0 +1,28 @@
+# Redocly lint configuration for Phoenix Gen's generated OpenAPI output.
+#
+# This is the config the compile-and-lint harness (and, eventually, the docs'
+# per-target guide) uses to validate generated `openapi.json`. It starts from
+# redocly's `recommended` ruleset and turns OFF the rules that conflict with
+# Phoenix Gen's deliberate, documented design choices. Each disable below has a
+# rationale tied to the roadmap so we don't silently paper over real problems.
+extends:
+  - recommended
+
+rules:
+  # Auth is intentionally NOT modeled in the schema (roadmap §4: "Auth as a
+  # first-class schema concept" is punted post-v1.0 — wire it through framework
+  # middleware instead). The `security-defined` rule requires every operation to
+  # reference a declared security scheme; since Gen emits no security by design,
+  # this rule would fail every operation. Disabled until/unless auth lands.
+  security-defined: off
+
+  # Gen does not emit a license in the `info` block (the generated spec describes
+  # the user's API, whose license is the user's to declare, not ours). Warning,
+  # not an error — downgraded to off to keep generated output lint-clean.
+  info-license: off
+
+  # Not every endpoint declares an error variant (e.g. a simple GET list), so
+  # requiring a 4XX response on every operation is too strict for generated
+  # output. Endpoints that DO declare `error { ... }` still get their 4xx
+  # responses generated.
+  operation-4xx-response: off

@@ -80,8 +80,14 @@ expression: spec
             },
             "description": "Successful response"
           }
-        }
+        },
+        "summary": "listItems"
       }
     }
-  }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
 }

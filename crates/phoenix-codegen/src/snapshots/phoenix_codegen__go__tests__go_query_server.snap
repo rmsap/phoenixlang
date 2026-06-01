@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"strings"
 )
 
 // NewRouter creates an http.ServeMux that routes requests to the given handlers.
@@ -25,7 +24,10 @@ func NewRouter(h Handlers) *http.ServeMux {
 		if v := r.URL.Query().Get("limit"); v != "" {
 			limit, _ = strconv.ParseInt(v, 10, 64)
 		}
-		search := r.URL.Query().Get("search")
+		var search *string
+		if v := r.URL.Query().Get("search"); v != "" {
+			search = &v
+		}
 		result, err := h.ListUsers(page, limit, search)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

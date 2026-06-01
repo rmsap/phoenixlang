@@ -7,11 +7,11 @@ expression: files.client
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 )
 
 // ApiClient is a typed HTTP client for the API.
@@ -29,7 +29,9 @@ func (c *ApiClient) ListUsers(page int64, limit int64, search *string) (*[]User,
 	q := url.Values{}
 	q.Set("page", strconv.FormatInt(page, 10))
 	q.Set("limit", strconv.FormatInt(limit, 10))
-	q.Set("search", fmt.Sprint(search))
+	if search != nil {
+		q.Set("search", *search)
+	}
 	u += "?" + q.Encode()
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {

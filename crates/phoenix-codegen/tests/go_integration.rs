@@ -57,6 +57,16 @@ fn generate_full() -> phoenix_codegen::GoFiles {
     phoenix_codegen::generate_go(&program, &result)
 }
 
+/// Returns true if `src` has a line whose whitespace-collapsed tokens equal
+/// `cols`. Used to assert a generated row's content and column order without
+/// hard-coding gofmt's exact padding (which depends on sibling rows and would
+/// make these checks brittle to unrelated schema edits — the `.snap` tests lock
+/// the exact alignment).
+fn has_row(src: &str, cols: &[&str]) -> bool {
+    src.lines()
+        .any(|l| l.split_whitespace().collect::<Vec<_>>() == cols)
+}
+
 // ── types.go ────────────────────────────────────────────────────────
 
 #[test]
@@ -69,17 +79,26 @@ fn types_has_package() {
 fn types_has_user_struct() {
     let files = generate_full();
     assert!(files.types.contains("type User struct {"));
-    assert!(files.types.contains("Id int64 `json:\"id\"`"));
-    assert!(files.types.contains("Name string `json:\"name\"`"));
-    assert!(files.types.contains("Bio *string `json:\"bio\"`"));
+    assert!(has_row(&files.types, &["Id", "int64", "`json:\"id\"`"]));
+    assert!(has_row(
+        &files.types,
+        &["Name", "string", "`json:\"name\"`"]
+    ));
+    assert!(has_row(&files.types, &["Bio", "*string", "`json:\"bio\"`"]));
 }
 
 #[test]
 fn types_has_enum() {
     let files = generate_full();
     assert!(files.types.contains("type Role string"));
-    assert!(files.types.contains("RoleAdmin Role = \"Admin\""));
-    assert!(files.types.contains("RoleEditor Role = \"Editor\""));
+    assert!(has_row(
+        &files.types,
+        &["RoleAdmin", "Role", "=", "\"Admin\""]
+    ));
+    assert!(has_row(
+        &files.types,
+        &["RoleEditor", "Role", "=", "\"Editor\""]
+    ));
 }
 
 #[test]

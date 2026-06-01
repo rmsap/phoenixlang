@@ -12,13 +12,13 @@ import (
 )
 
 type User struct {
-	Id int64 `json:"id"`
+	Id    int64  `json:"id"`
 	Email string `json:"email"`
 }
 
 // Validate checks all field constraints for User.
 func (s User) Validate() error {
-	if !((strings.Contains(s.Email, "@") && (len(s.Email) > 3))) {
+	if !(strings.Contains(s.Email, "@") && (len(s.Email) > 3)) {
 		return fmt.Errorf("email: constraint violated")
 	}
 	return nil

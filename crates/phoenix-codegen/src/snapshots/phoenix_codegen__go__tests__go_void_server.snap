@@ -7,9 +7,7 @@ expression: files.server
 package api
 
 import (
-	"encoding/json"
 	"net/http"
-	"strconv"
 	"strings"
 )
 
@@ -20,7 +18,10 @@ func NewRouter(h Handlers) *http.ServeMux {
 		id := r.PathValue("id")
 		err := h.DeleteUser(id)
 		if err != nil {
-			if strings.Contains(err.Error(), "NotFound") { http.Error(w, "NotFound", 404); return }
+			if strings.Contains(err.Error(), "NotFound") {
+				http.Error(w, "NotFound", 404)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

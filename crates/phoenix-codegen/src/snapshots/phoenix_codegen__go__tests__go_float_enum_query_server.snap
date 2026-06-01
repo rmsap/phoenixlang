@@ -9,19 +9,24 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 )
 
 // NewRouter creates an http.ServeMux that routes requests to the given handlers.
 func NewRouter(h Handlers) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /api/users/{id}", func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		var body ReplaceUserBody
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+	mux.HandleFunc("GET /api/items", func(w http.ResponseWriter, r *http.Request) {
+		minScore := float64(0.5)
+		if v := r.URL.Query().Get("minScore"); v != "" {
+			minScore, _ = strconv.ParseFloat(v, 64)
 		}
-		result, err := h.ReplaceUser(id, body)
+		sort := Sort(r.URL.Query().Get("sort"))
+		var fallback *Sort
+		if v := r.URL.Query().Get("fallback"); v != "" {
+			cv := Sort(v)
+			fallback = &cv
+		}
+		result, err := h.ListItems(minScore, sort, fallback)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

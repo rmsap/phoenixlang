@@ -9,7 +9,7 @@ package api
 type Role string
 
 const (
-	RoleAdmin Role = "Admin"
+	RoleAdmin  Role = "Admin"
 	RoleEditor Role = "Editor"
 	RoleViewer Role = "Viewer"
 )
