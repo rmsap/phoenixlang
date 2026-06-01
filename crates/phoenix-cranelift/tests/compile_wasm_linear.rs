@@ -3170,6 +3170,267 @@ fn list_any_all_on_empty_list_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "list_any_all_empty");
 }
 
+/// `List.first` / `List.last` / `List.find` — `Option<T>`-returning
+/// lookups built inline. Each branches on length / found-flag and
+/// constructs `Some(elem)` or `None` via the shared
+/// `emit_option_some` / `emit_option_none` helpers (one
+/// `phx_gc_alloc(size, TypeTag::Enum)` per construction). Tested via
+/// `isSome` / `unwrapOr` since `unwrap` ships in a later slice.
+///
+/// `xs = [10, 20, 30]`:
+///   first  ⇒ Some(10), last ⇒ Some(30),
+///   find(x > 15) ⇒ Some(20), find(x > 100) ⇒ None.
+///
+/// Empty list: first ⇒ None (pins the `len == 0` branch); find ⇒ None
+/// (pins the loop-never-runs path, where the `found` flag stays 0).
+#[test]
+fn list_first_last_find_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [10, 20, 30]\n  \
+                 print(xs.first().isSome())\n  \
+                 print(xs.first().unwrapOr(0))\n  \
+                 print(xs.last().isSome())\n  \
+                 print(xs.last().unwrapOr(0))\n  \
+                 let found = xs.find(function(x: Int) -> Bool { x > 15 })\n  \
+                 print(found.isSome())\n  \
+                 print(found.unwrapOr(0))\n  \
+                 let empty: List<Int> = []\n  \
+                 print(empty.first().isSome())\n  \
+                 print(empty.find(function(x: Int) -> Bool { x > 0 }).isSome())\n  \
+                 print(xs.find(function(x: Int) -> Bool { x > 100 }).isSome())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_first_last_find");
+}
+
+/// `List.find` **short-circuits** at the first match — the predicate is
+/// not evaluated on elements past the match, matching the interpreter's
+/// first-match-and-return. Pins this against a regression to a
+/// full-iteration `found`-flag loop.
+///
+/// The predicate divides by the element, so it traps on `0`. The list
+/// is `[5, 0]`: a short-circuiting `find` matches at `5` (index 0) and
+/// never touches the `0`, so both wasm and the interpreter return
+/// `Some(5)` and print `5`. A full-iteration implementation would
+/// evaluate the predicate on `0`, trapping under wasmtime (`i64.div_s`
+/// by zero) — a divergence this test would catch.
+#[test]
+fn list_find_short_circuits_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let xs: List<Int> = [5, 0]\n  \
+                 let found = xs.find(function(x: Int) -> Bool { return (100 / x) > 0 })\n  \
+                 print(found.unwrapOr(0 - 1))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_find_short_circuits");
+}
+
+/// `Map.get` / `Map.set` — Option-returning lookup + immutable
+/// insertion via copy-on-write. `set` stages key and value back-to-
+/// back in one shadow-stack frame and passes the value pointer as
+/// `frame + ks` so a single SP restore covers both; `get` stages
+/// just the key, branches on the runtime's null return, and
+/// constructs `None` or `Some(value)`.
+///
+/// `{"alice": 1, "bob": 2}`: get("alice") = Some(1), get("dan") = None.
+/// `set("carol", 3)` → new map of length 3, get("carol") = Some(3).
+/// `set("alice", 99)` → length stays 2 (update, not insert), and the
+/// updated value reads back as 99 while the original map is unchanged
+/// (copy-on-write).
+#[test]
+fn map_get_set_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, Int> = {\"alice\": 1, \"bob\": 2}\n  \
+                 print(m.get(\"alice\").isSome())\n  \
+                 print(m.get(\"alice\").unwrapOr(0))\n  \
+                 print(m.get(\"dan\").isSome())\n  \
+                 let m2 = m.set(\"carol\", 3)\n  \
+                 print(m2.length())\n  \
+                 print(m2.get(\"carol\").unwrapOr(0))\n  \
+                 let m3 = m.set(\"alice\", 99)\n  \
+                 print(m3.length())\n  \
+                 print(m3.get(\"alice\").unwrapOr(0))\n  \
+                 print(m.get(\"alice\").unwrapOr(0))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_get_set");
+}
+
+/// `Map.get` / `Map.set` with **`Int` keys** — exercises the
+/// `key_is_string == false` branch in `translate_map_set` and the
+/// fixed-width (non-fat-pointer) key staging in both helpers. The
+/// `Map<String, _>` fixtures above only cover content-hashed string
+/// keys, so without this the integer-key path is unrun.
+///
+/// `{1: 10, 2: 20}`: get(1) = Some(10), get(9) = None.
+/// `set(3, 30)` → length 3, get(3) = Some(30).
+#[test]
+fn map_get_set_int_keys_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<Int, Int> = {1: 10, 2: 20}\n  \
+                 print(m.get(1).isSome())\n  \
+                 print(m.get(1).unwrapOr(0))\n  \
+                 print(m.get(9).isSome())\n  \
+                 let m2 = m.set(3, 30)\n  \
+                 print(m2.length())\n  \
+                 print(m2.get(3).unwrapOr(0))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_get_set_int_keys");
+}
+
+/// `Map.get` / `Map.set` with a **GC-ref value type**
+/// (`Map<String, List<Int>>`) — exercises the rooting claim in
+/// `translate_map_get`: the value loaded from the map's data region is
+/// a heap pointer that must stay reachable across the `phx_gc_alloc`
+/// that builds the `Some`. The `Int`-valued fixtures above only load a
+/// scalar, so this is the only test where the loaded value is itself a
+/// collectible object. `set` likewise stages a list pointer as the
+/// value bytes.
+///
+/// `{"a": [1, 2], "b": [3]}`: get("a") = Some([1,2]) (length 2),
+/// get("b") = Some([3]) (length 1), get("z") = None.
+/// `set("c", [4, 5, 6])` → new map of length 3, get("c") length 3,
+/// while the original map still lacks "c" (copy-on-write).
+#[test]
+fn map_get_set_ref_values_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, List<Int>> = {\"a\": [1, 2], \"b\": [3]}\n  \
+                 print(m.get(\"a\").unwrapOr([99]).length())\n  \
+                 print(m.get(\"b\").unwrapOr([99]).length())\n  \
+                 print(m.get(\"z\").isSome())\n  \
+                 let m2 = m.set(\"c\", [4, 5, 6])\n  \
+                 print(m2.length())\n  \
+                 print(m2.get(\"c\").unwrapOr([99]).length())\n  \
+                 print(m.get(\"c\").isSome())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_get_set_ref_values");
+}
+
+/// `Result.unwrapOr` — the `unwrapOr` dispatch is generic over the
+/// stdlib enum, but the `List` / `Map` fixtures only ever reach it
+/// through `Option`. This pins the `Result` arm: `Ok(v).unwrapOr(d)`
+/// extracts the Ok payload at variant index 0, `Err(_).unwrapOr(d)`
+/// yields the default.
+///
+/// `Ok(7).unwrapOr(0)` = 7; `Err("boom").unwrapOr(99)` = 99.
+#[test]
+fn result_unwrap_or_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let ok: Result<Int, String> = Ok(7)\n  \
+                 print(ok.unwrapOr(0))\n  \
+                 let err: Result<Int, String> = Err(\"boom\")\n  \
+                 print(err.unwrapOr(99))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "result_unwrap_or");
+}
+
+/// `Option<String>.unwrapOr` — multi-slot (`StringRef` fat-pointer)
+/// payload. The `Int` `unwrapOr` fixtures above only exercise the
+/// single-slot case; this pins the multi-slot local copy in both the
+/// positive (`emit_field_load` of the 2-slot payload) and negative
+/// (zip-copy of the default's 2 locals) branches, where a slot-count
+/// mismatch would truncate the fat pointer.
+///
+/// `["hi", "yo"].first().unwrapOr("none")` = "hi" (Some path);
+/// `[].first().unwrapOr("none")` = "none" (None path).
+#[test]
+fn option_string_unwrap_or_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let names: List<String> = [\"hi\", \"yo\"]\n  \
+                 print(names.first().unwrapOr(\"none\"))\n  \
+                 let empty: List<String> = []\n  \
+                 print(empty.first().unwrapOr(\"none\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "option_string_unwrap_or");
+}
+
+/// `List.find` with a **GC-ref element type** (`List<List<Int>>`) —
+/// `first`/`last`/`find` all share `emit_option_some`, but `find` is
+/// the one that captures the matched element into `found_elem_locals`
+/// and carries it across the post-loop `phx_gc_alloc` that builds the
+/// `Some`. The `Int`-element fixtures above only capture a scalar; this
+/// pins that a *collectible* element survives that alloc — it stays
+/// reachable through the rooted input list during the carry.
+///
+/// `[[1], [2, 3], [4, 5, 6]]`: find(len == 2) ⇒ Some([2, 3]) (length 2);
+/// find(len == 9) ⇒ None.
+#[test]
+fn list_find_ref_element_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let lol: List<List<Int>> = [[1], [2, 3], [4, 5, 6]]\n  \
+                 let found = lol.find(function(xs: List<Int>) -> Bool { xs.length() == 2 })\n  \
+                 print(found.isSome())\n  \
+                 print(found.unwrapOr([]).length())\n  \
+                 let missing = lol.find(function(xs: List<Int>) -> Bool { xs.length() == 9 })\n  \
+                 print(missing.isSome())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_find_ref_element");
+}
+
+/// `Map.set` with a **multi-slot value** (`Map<String, String>`) —
+/// the `Int` / `List`-valued fixtures above store a single-slot value,
+/// so this is the only case where `translate_map_set`'s
+/// `emit_field_store` writes a 2-slot `StringRef` fat pointer at the
+/// non-zero `ks` frame offset (`[key bytes | value fat pointer]`). A
+/// slot-count or offset bug in the value store would truncate the
+/// stored string here.
+///
+/// `{"k": "v"}`: get("k") = Some("v"), get("x") = None.
+/// `set("k2", "v2")` → length 2, get("k2") = "v2", get("k") = "v".
+/// `set("k", "vv")` → length stays 1 (update), get("k") = "vv".
+#[test]
+fn map_set_string_value_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, String> = {\"k\": \"v\"}\n  \
+                 print(m.get(\"k\").unwrapOr(\"none\"))\n  \
+                 print(m.get(\"x\").isSome())\n  \
+                 let m2 = m.set(\"k2\", \"v2\")\n  \
+                 print(m2.length())\n  \
+                 print(m2.get(\"k2\").unwrapOr(\"none\"))\n  \
+                 print(m2.get(\"k\").unwrapOr(\"none\"))\n  \
+                 let m3 = m.set(\"k\", \"vv\")\n  \
+                 print(m3.length())\n  \
+                 print(m3.get(\"k\").unwrapOr(\"none\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "map_set_string_value");
+}
+
+/// **GC-pressure** tier for the ref-returning `Option` lookups
+/// (`Map.get` and `List.find` on collectible value/element types). The
+/// `map_get_set_ref_values` / `list_find_ref_element` fixtures above pin
+/// the *functional* result, but their handful of allocations never
+/// approach the 1 MB auto-collect threshold — so a regression that
+/// dropped the rooting (the loaded value/element must stay reachable
+/// through its rooted container across the `Some`-construction
+/// `phx_gc_alloc`) would still pass them, exactly as the `flatMap`
+/// runtime test documents for its inner-list root. This test closes that
+/// gap the same way `alloc_loop` does: a ~100k-iteration loop whose
+/// per-iteration `Some(List)` constructions plus `[99]` defaults sum to
+/// several MB, so the threshold-driven sweep runs many times *while*
+/// `get` / `find` hold an interior pointer into a rooted collection. A
+/// missed root would surface as a wasmtime use-after-free trap or a
+/// clobbered `total`.
+///
+/// `m = {"a": [1, 2], "b": [3]}`, `lol = [[1], [2, 3], [4, 5, 6]]`. Each
+/// iteration: `m.get("a")` ⇒ Some([1, 2]) (length 2) and
+/// `lol.find(len == 2)` ⇒ Some([2, 3]) (length 2), so `total += 4` per
+/// iteration ⇒ `4 * 100000 = 400000`.
+#[test]
+fn ref_option_lookups_under_gc_pressure_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let m: Map<String, List<Int>> = {\"a\": [1, 2], \"b\": [3]}\n  \
+                 let lol: List<List<Int>> = [[1], [2, 3], [4, 5, 6]]\n  \
+                 let n: Int = 100000\n  \
+                 let mut total: Int = 0\n  \
+                 let mut i: Int = 0\n  \
+                 while (i < n) {\n    \
+                   let got: List<Int> = m.get(\"a\").unwrapOr([99])\n    \
+                   let found: List<Int> = lol.find(function(xs: List<Int>) -> Bool { xs.length() == 2 }).unwrapOr([99])\n    \
+                   total = total + got.length() + found.length()\n    \
+                   i = i + 1\n  \
+                 }\n  \
+                 print(total)\n\
+               }\n";
+    assert_wasm_matches_interp(src, "ref_option_lookups_under_gc_pressure");
+}
+
 /// `List.sortBy` on an **empty** list — boundary case for the outer
 /// loop's `i = 1; while i < len` guard. With `len == 0` the outer loop
 /// never enters, the comparator is never called, and the `phx_list_take`
@@ -3207,27 +3468,22 @@ fn list_sortby_on_empty_string_list_runs_under_wasmtime() {
 }
 
 #[test]
-fn rejects_list_find_unsupported() {
-    // `BuiltinCall("List.find", ...)` reaches the WASM body translator
-    // from `xs.find(pred)` (Phoenix sema accepts the method, IR
-    // lowering emits the builtin), but `translate_list_method_builtin`
-    // doesn't yet handle it — the rejection happens at the builtin-
-    // dispatcher level with a clean per-method diagnostic. Pin the
-    // method name so a regression that handled List.find by accident
-    // would surface here.
-    //
-    // (Earlier PR 3d slices lifted the `ListAlloc` / `MapAlloc` /
-    // `List.contains` restrictions; this test tracks the frontier,
-    // pinning *some* still-gated method until coverage is complete.)
+fn rejects_result_map_unsupported() {
+    // Frontier tracker for the next still-gated method. `List.find`,
+    // `Map.get` / `Map.set`, `Option.unwrapOr` and friends have all
+    // landed; the rejection slot now sits on `Result.map`, which
+    // needs the closure-payload-transform machinery (load discriminant,
+    // branch, extract Ok payload, call closure, re-wrap into a fresh
+    // Result) and so ships in a later slice.
     let src = "function main() {\n  \
-                 let xs: List<Int> = [1, 2, 3]\n  \
-                 let _ = xs.find(function(x: Int) -> Bool { x > 1 })\n  \
+                 let r: Result<Int, String> = Ok(1)\n  \
+                 let _ = r.map(function(x: Int) -> Int { x + 1 })\n  \
                  print(true)\n\
                }\n";
     let err = expect_wasm_compile_error(src);
     assert!(
-        err.contains("List.find") && err.contains("not yet supported"),
-        "expected `List.find ... not yet supported` builtin-level error, \
+        err.contains("Result.map") && err.contains("not yet supported"),
+        "expected `Result.map ... not yet supported` builtin-level error, \
          got: {err}"
     );
 }

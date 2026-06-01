@@ -92,9 +92,9 @@ use phoenix_ir::types::IrType;
 use phoenix_runtime::gc::TypeTag;
 use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
+use super::builtins::translate_builtin_call;
 use super::gc_root::{
-    emit_gc_pop_frame, emit_gc_pop_frame_at, emit_gc_push_frame_at, emit_gc_set_root,
-    emit_gc_set_root_at, op_produces_heap_pointer, setup_gc_frame,
+    emit_gc_pop_frame, emit_gc_set_root, op_produces_heap_pointer, setup_gc_frame,
 };
 use super::heap_layout::{
     EnumLayout, LIST_HEADER, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
@@ -172,7 +172,10 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
 /// `StringRef`. `site_label` is interpolated into the diagnostic so
 /// the failing op is identifiable; sema should have annotated the
 /// type concretely before reaching either call site.
-fn reject_placeholder_field_type(ty: &IrType, site_label: &str) -> Result<(), CompileError> {
+pub(super) fn reject_placeholder_field_type(
+    ty: &IrType,
+    site_label: &str,
+) -> Result<(), CompileError> {
     if ty.is_generic_placeholder() {
         return Err(CompileError::new(format!(
             "wasm32-linear: {site_label} has unresolved IR type \
@@ -191,7 +194,7 @@ fn reject_placeholder_field_type(ty: &IrType, site_label: &str) -> Result<(), Co
 /// locals via reverse-order `LocalSet`. `MemArg::align` comes from
 /// `phx_field_align_bytes` via `align_log2`. Used by both
 /// `Op::StructGetField` and `Op::EnumGetField`.
-fn emit_field_load(
+pub(super) fn emit_field_load(
     ctx: &mut FuncTranslateCtx,
     base_ptr_local: u32,
     field_offset: u32,
@@ -247,7 +250,7 @@ fn emit_field_load(
 /// caller from having to thread both slots through any intermediate
 /// alloc/store sequence. Used by `Op::StructAlloc`, `Op::StructSetField`,
 /// and `Op::EnumAlloc`.
-fn emit_field_store(
+pub(super) fn emit_field_store(
     ctx: &mut FuncTranslateCtx,
     base_ptr_local: u32,
     field_offset: u32,
@@ -571,9 +574,9 @@ fn translate_multi_block(
 /// translator can route on the *Phoenix* type even when several IR
 /// types collapse to the same WASM `ValType` (e.g. `Bool` and a
 /// raw `i32` heap-pointer both occupy `ValType::I32`).
-struct ValueBinding {
-    locals: Vec<u32>,
-    ir_type: IrType,
+pub(super) struct ValueBinding {
+    pub(super) locals: Vec<u32>,
+    pub(super) ir_type: IrType,
 }
 
 impl ValueBinding {
@@ -588,7 +591,7 @@ impl ValueBinding {
     /// no codegen referencing it, and the operand stack would be off
     /// by one for the next instruction). Catching this at codegen time
     /// is better than a far-removed wasmparser validation error.
-    fn single_local(&self) -> u32 {
+    pub(super) fn single_local(&self) -> u32 {
         assert_eq!(
             self.locals.len(),
             1,
@@ -891,7 +894,7 @@ impl FuncTranslateCtx {
     /// Multi-slot bindings (currently only `StringRef`) go through
     /// [`Self::allocate_locals_for_ir_type`] which allocates the
     /// matching number of consecutive slots.
-    fn allocate_local(&mut self, vid: ValueId, wasm_ty: ValType, ir_ty: IrType) -> u32 {
+    pub(super) fn allocate_local(&mut self, vid: ValueId, wasm_ty: ValType, ir_ty: IrType) -> u32 {
         let idx = self.next_local;
         self.push_local_decl(wasm_ty);
         self.next_local += 1;
@@ -909,7 +912,7 @@ impl FuncTranslateCtx {
     /// Phoenix [`IrType`] backing `vid`. Returns the locals' indices
     /// in declaration order (matching [`wasm_valtypes_for`]'s slot
     /// ordering — for `StringRef` that's `[ptr_local, len_local]`).
-    fn allocate_locals_for_ir_type(
+    pub(super) fn allocate_locals_for_ir_type(
         &mut self,
         vid: ValueId,
         ir_ty: IrType,
@@ -940,7 +943,7 @@ impl FuncTranslateCtx {
     /// order (`[ptr, len]` for `StringRef`), matching
     /// [`Self::allocate_locals_for_ir_type`]'s ordering so the same
     /// `emit_field_load` / `emit_field_store` helpers apply.
-    fn allocate_locals_for_ir_type_anon(
+    pub(super) fn allocate_locals_for_ir_type_anon(
         &mut self,
         ir_ty: &IrType,
     ) -> Result<Vec<u32>, CompileError> {
@@ -1037,7 +1040,7 @@ impl FuncTranslateCtx {
     /// stack ends up `[..., ptr, len]` — matching the call-arg order
     /// `phoenix-runtime`'s `extern "C" fn phx_print_str(ptr, len)`
     /// declares.
-    fn emit_load_all(&mut self, vid: ValueId) -> Result<(), CompileError> {
+    pub(super) fn emit_load_all(&mut self, vid: ValueId) -> Result<(), CompileError> {
         let locals = self.binding_of(vid)?.locals.clone();
         for local in locals {
             self.emit(Instruction::LocalGet(local));
@@ -1057,7 +1060,11 @@ impl FuncTranslateCtx {
     /// pushes `[ptr, len]` onto the stack at the call's exit; we
     /// `local.set $len_local` first (popping `len`), then
     /// `local.set $ptr_local` (popping `ptr`).
-    fn emit_store_result(&mut self, vid: ValueId, ir_type: IrType) -> Result<(), CompileError> {
+    pub(super) fn emit_store_result(
+        &mut self,
+        vid: ValueId,
+        ir_type: IrType,
+    ) -> Result<(), CompileError> {
         let locals = self.allocate_locals_for_ir_type(vid, ir_type)?;
         // Reverse: top-of-stack pops first, which is the last slot in
         // declaration order.
@@ -1070,13 +1077,29 @@ impl FuncTranslateCtx {
     /// Look up the binding for a Phoenix `ValueId`. Errors indicate a
     /// use-before-definition, which is an IR bug — the verifier should
     /// catch this before codegen.
-    fn binding_of(&self, vid: ValueId) -> Result<&ValueBinding, CompileError> {
+    pub(super) fn binding_of(&self, vid: ValueId) -> Result<&ValueBinding, CompileError> {
         self.bindings.get(&vid).ok_or_else(|| {
             CompileError::new(format!(
                 "wasm32-linear: ValueId {vid:?} used before definition \
                  (internal compiler bug — IR verifier should have caught this)"
             ))
         })
+    }
+
+    /// Alias `vid` to `src`'s existing binding — same locals, same IR
+    /// type, no `local.get`/`local.set` copies and no new locals. Used
+    /// by source-level identities like `toString(String)`, where the
+    /// result must resolve to the slots the argument already owns (and
+    /// is already rooted through). The IR's single-assignment invariant
+    /// guarantees `vid != src`.
+    pub(super) fn alias_binding(&mut self, vid: ValueId, src: ValueId) -> Result<(), CompileError> {
+        let src_binding = self.binding_of(src)?;
+        let aliased = ValueBinding {
+            locals: src_binding.locals.clone(),
+            ir_type: src_binding.ir_type.clone(),
+        };
+        self.bindings.insert(vid, aliased);
+        Ok(())
     }
 
     /// Finalize: produce a `wasm_encoder::Function` with the
@@ -1115,7 +1138,7 @@ fn translate_block(
 /// would leave its result stranded on the WASM operand stack and fail
 /// validation. Centralizing the diagnostic keeps the phrasing
 /// consistent across the (still-growing) set of value-producing ops.
-fn expect_result(
+pub(super) fn expect_result(
     instr: &phoenix_ir::instruction::Instruction,
     op_name: &str,
 ) -> Result<ValueId, CompileError> {
@@ -1301,7 +1324,9 @@ fn translate_instruction(
                 }
             }
         }
-        Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr)?,
+        Op::BuiltinCall(name, args) => {
+            translate_builtin_call(ctx, b, ir_module, name, args, instr)?
+        }
 
         // --- Mutable-variable surface --------------------------------
         //
@@ -2092,7 +2117,7 @@ const _: () = assert!(
 /// is 16-aligned — see decision H in design-decisions.md) and every
 /// mutating site here subtracts a multiple of 4, so `sret_ptr` is
 /// always 4-byte aligned for i32 reads.
-fn emit_sret_string_call(
+pub(super) fn emit_sret_string_call(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
     runtime_fn_idx: u32,
@@ -2165,7 +2190,7 @@ fn emit_sret_string_call(
 /// `Map.<method>(key, ...)` family (single-key buffer). Future
 /// callouts that need scratch space on the shadow stack route through
 /// here too so the SP-manipulation dance stays in one place.
-fn emit_alloc_stack_frame(
+pub(super) fn emit_alloc_stack_frame(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
     n_bytes: u32,
@@ -2200,7 +2225,7 @@ fn emit_alloc_stack_frame(
 /// — this helper only modifies the SP global, not the operand stack,
 /// so a still-pending result on top of the operand stack would be left
 /// orphaned across the restore.
-fn emit_restore_stack_frame(
+pub(super) fn emit_restore_stack_frame(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
     saved_sp_local: u32,
@@ -2243,7 +2268,7 @@ fn place_capture(cursor: u32, ty: &IrType) -> Result<(u32, u32, u32), CompileErr
 /// `StringRef`: `[ptr, len]`). Shared by `Op::CallIndirect` (args
 /// from vids) and the inline list-method loops (args from temp
 /// locals).
-fn emit_closure_call_raw(
+pub(super) fn emit_closure_call_raw(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
     closure_ptr_local: u32,
@@ -2297,7 +2322,7 @@ fn emit_closure_call_raw(
 /// `emit_field_load` / `emit_field_store` take a *constant* offset, so
 /// the per-iteration index has to be folded into the base pointer
 /// here, then those helpers run with offset 0).
-fn emit_list_elem_addr(
+pub(super) fn emit_list_elem_addr(
     ctx: &mut FuncTranslateCtx,
     base_ptr_local: u32,
     index_local: u32,
@@ -2399,1394 +2424,6 @@ fn emit_i32_cmp(
     let result_local = ctx.allocate_local(vid, ValType::I32, IrType::Bool);
     ctx.emit(Instruction::LocalSet(result_local));
     Ok(())
-}
-
-/// Translate a `BuiltinCall(name, args)`. PR 3b covers `print` for
-/// `Int` / `Bool` / `String`, plus `toString(Int)`. Other builtins
-/// (`toString(Float)` / `toString(Bool)`, string method calls,
-/// list/map methods) defer to PR 3c.
-fn translate_builtin_call(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    name: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    match name {
-        "print" => translate_print_builtin(ctx, b, args),
-        "toString" => translate_to_string_builtin(ctx, b, args, instr),
-        // `List.<method>` dispatcher. Phoenix lowers `xs.length()` /
-        // `xs[i]` / for-loops to `BuiltinCall("List.length", ...)` /
-        // `BuiltinCall("List.get", ...)`; this slice covers those two
-        // (the iteration trio with `Op::Alloca`'s i64 counter).
-        // Functional methods like `xs.map(f)` route through
-        // `list_methods_closure::translate_list_map` on native; those
-        // ship in a later PR 3d slice once closures land.
-        list_method if list_method.starts_with("List.") => translate_list_method_builtin(
-            ctx,
-            b,
-            list_method.strip_prefix("List.").unwrap(),
-            args,
-            instr,
-        ),
-        // `Result.<method>` / `Option.<method>` dispatchers. This
-        // slice covers just the discriminant-equality checks
-        // (`isOk` / `isErr` / `isSome` / `isNone`); the
-        // payload-handling methods (`unwrap` / `unwrapOr` / `map` /
-        // `andThen` / ...) ship in a later PR 3d slice that needs
-        // multi-block conditional emission inside builtins plus
-        // closure handling for `map` / `andThen`.
-        result_method if result_method.starts_with("Result.") => translate_enum_is_variant_builtin(
-            ctx,
-            "Result",
-            result_method.strip_prefix("Result.").unwrap(),
-            args,
-            instr,
-        ),
-        option_method if option_method.starts_with("Option.") => translate_enum_is_variant_builtin(
-            ctx,
-            "Option",
-            option_method.strip_prefix("Option.").unwrap(),
-            args,
-            instr,
-        ),
-        // `Map.<method>` dispatcher. This slice covers the read-side
-        // surface (`length`, `contains`, `keys`, `values`) plus
-        // `remove` (which returns a fresh map). The `get` / `set`
-        // payload-returning methods ship later — `get` needs
-        // multi-block Option construction inside a builtin, `set`
-        // needs both a key buffer and a value buffer on the same
-        // stack frame.
-        map_method if map_method.starts_with("Map.") => translate_map_method_builtin(
-            ctx,
-            b,
-            map_method.strip_prefix("Map.").unwrap(),
-            args,
-            instr,
-        ),
-        other => Err(CompileError::new(format!(
-            "wasm32-linear: builtin `{other}` not yet supported \
-             (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
-        ))),
-    }
-}
-
-/// Lower a `BuiltinCall("Map.<method>", args)`. `method` is the
-/// stripped suffix (e.g. `"length"`, `"contains"`).
-///
-/// Methods that take a key arg (`contains` / `remove`) stage the key
-/// onto the WASM shadow stack first (via [`emit_alloc_stack_frame`]
-/// and [`emit_field_store`]), then pass `(map, key_ptr, key_size)` to
-/// the runtime. SP is restored after the call returns so map literals
-/// or chained method calls don't leak stack space.
-fn translate_map_method_builtin(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    method: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    match method {
-        // `phx_map_length(map: i32) -> i64`. The result is the scalar
-        // `Int`, so the store type is pinned to `I64` rather than read
-        // from `instr.result_type` (matches `List.length`).
-        "length" => emit_map_unary_call(
-            ctx,
-            b,
-            "phx_map_length",
-            "Map.length",
-            args,
-            instr,
-            IrType::I64,
-        ),
-        // `phx_map_keys(map: i32) -> i32` (list pointer). The returned
-        // list is GC-tracked; the blanket post-instruction
-        // `emit_gc_set_root` at the bottom of `translate_instruction`
-        // roots it, so the `ListRef` result type flows through verbatim.
-        "keys" => emit_map_unary_call(
-            ctx,
-            b,
-            "phx_map_keys",
-            "Map.keys",
-            args,
-            instr,
-            instr.result_type.clone(),
-        ),
-        // `phx_map_values(map: i32) -> i32` (list pointer). Same shape
-        // as `keys`.
-        "values" => emit_map_unary_call(
-            ctx,
-            b,
-            "phx_map_values",
-            "Map.values",
-            args,
-            instr,
-            instr.result_type.clone(),
-        ),
-        // `phx_map_contains(map: i32, key_ptr: i32, key_size: i64) -> i32`.
-        // C ABI widens the runtime's `i8` return to i32 on wasm32, so the
-        // bool result lands as a single-slot i32 0/1 — exactly what
-        // `IrType::Bool` flattens to, so the store type is pinned to
-        // `Bool` rather than read from `instr.result_type`.
-        "contains" => emit_map_key_staged_call(
-            ctx,
-            b,
-            "phx_map_contains",
-            "Map.contains",
-            args,
-            instr,
-            IrType::Bool,
-        ),
-        // `phx_map_remove_raw(map: i32, key_ptr: i32, key_size: i64) -> i32`
-        // returns a fresh map with the entry removed (or an equivalent
-        // if the key was absent). The returned map pointer is GC-tracked;
-        // the blanket post-instruction `emit_gc_set_root` roots it, so the
-        // `MapRef` result type flows through verbatim.
-        "remove" => emit_map_key_staged_call(
-            ctx,
-            b,
-            "phx_map_remove_raw",
-            "Map.remove",
-            args,
-            instr,
-            instr.result_type.clone(),
-        ),
-        other => Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"Map.{other}\")` not yet supported \
-             (Phase 2.4 PR 3d — `get` / `set` ship in a later slice; `get` \
-             needs multi-block Option construction inside a builtin, `set` \
-             needs a key + value pair on the same stack frame)"
-        ))),
-    }
-}
-
-/// Emit a unary `phx_map_<m>(map: i32) -> R` runtime call: resolve the
-/// single map-pointer arg, invoke `runtime_fn`, and store the result as
-/// `result_ty`. Shared by `Map.length` / `Map.keys` / `Map.values` — the
-/// methods that take no key and so need no shadow-stack staging.
-///
-/// `result_ty` is passed explicitly rather than read from
-/// `instr.result_type` so scalar-returning `length` can pin `I64` while
-/// the list-returning `keys` / `values` forward their `ListRef` result
-/// type. A ref-typed result is rooted by the blanket post-instruction
-/// `emit_gc_set_root`.
-fn emit_map_unary_call(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    runtime_fn: &str,
-    label: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-    result_ty: IrType,
-) -> Result<(), CompileError> {
-    let vid = expect_result(instr, &format!("BuiltinCall(\"{label}\")"))?;
-    if args.len() != 1 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"{label}\")` requires 1 arg \
-             (the map), got {} (internal compiler bug — IR verifier should \
-             have caught this)",
-            args.len()
-        )));
-    }
-    let map_ptr_local = ctx.binding_of(args[0])?.single_local();
-    let idx = b.require_phx_func(runtime_fn)?;
-    ctx.emit(Instruction::LocalGet(map_ptr_local));
-    ctx.emit(Instruction::Call(idx));
-    ctx.emit_store_result(vid, result_ty)?;
-    Ok(())
-}
-
-/// Emit a key-staged `phx_map_<m>(map, key_ptr, key_size) -> R` runtime
-/// call: resolve `(map, key)` via [`resolve_map_key_call`], stage the key
-/// onto the WASM shadow stack (via [`emit_alloc_stack_frame`] and
-/// [`emit_field_store`]), invoke `runtime_fn`, store the result as
-/// `result_ty`, then restore SP so map literals or chained method calls
-/// don't leak stack space. Shared by `Map.contains` / `Map.remove`.
-///
-/// `result_ty` is passed explicitly so `contains` can pin `Bool` (the
-/// `i8`-widened-to-i32 runtime return) while `remove` forwards its
-/// `MapRef` result type — rooted by the blanket post-instruction
-/// `emit_gc_set_root`. The result is stored *before* SP is restored:
-/// `emit_restore_stack_frame` only touches the SP global, so a result
-/// still pending on the operand stack would be orphaned across it.
-fn emit_map_key_staged_call(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    runtime_fn: &str,
-    label: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-    result_ty: IrType,
-) -> Result<(), CompileError> {
-    let vid = expect_result(instr, &format!("BuiltinCall(\"{label}\")"))?;
-    let (map_ptr_local, key_locals, key_ty) = resolve_map_key_call(ctx, label, args)?;
-    let key_size = phx_field_size_bytes(&key_ty)? as i64;
-    let (saved_sp, key_frame_local) = emit_alloc_stack_frame(ctx, b, key_size as u32)?;
-    emit_field_store(ctx, key_frame_local, 0, &key_ty, &key_locals)?;
-    let idx = b.require_phx_func(runtime_fn)?;
-    ctx.emit(Instruction::LocalGet(map_ptr_local));
-    ctx.emit(Instruction::LocalGet(key_frame_local));
-    ctx.emit(Instruction::I64Const(key_size));
-    ctx.emit(Instruction::Call(idx));
-    ctx.emit_store_result(vid, result_ty)?;
-    emit_restore_stack_frame(ctx, b, saved_sp)?;
-    Ok(())
-}
-
-/// Resolve `(map_ptr_local, key_locals, key_ir_type)` for the
-/// 2-arg `Map.<m>(map, key)` shape. Centralizes the arity check and
-/// the binding-lookup so [`emit_map_key_staged_call`] only handles the
-/// runtime call shape.
-fn resolve_map_key_call(
-    ctx: &FuncTranslateCtx,
-    label: &str,
-    args: &[ValueId],
-) -> Result<(u32, Vec<u32>, IrType), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"{label}\")` requires 2 args \
-             (map, key), got {} (internal compiler bug — IR verifier should \
-             have caught this)",
-            args.len()
-        )));
-    }
-    let map_ptr_local = ctx.binding_of(args[0])?.single_local();
-    let key_binding = ctx.binding_of(args[1])?;
-    let key_locals = key_binding.locals.clone();
-    let key_ty = key_binding.ir_type.clone();
-    Ok((map_ptr_local, key_locals, key_ty))
-}
-
-/// Lower a `BuiltinCall("Result.<m>", ...)` or
-/// `BuiltinCall("Option.<m>", ...)` where `m` is a discriminant-
-/// equality check (`isOk` / `isErr` / `isSome` / `isNone`).
-///
-/// The semantics:
-///
-/// - `isOk` / `isSome`: discriminant == 0 (the positive variant —
-///   `Result::Ok` and `Option::Some` are both declared first in the
-///   stdlib enum layouts, so their discriminant is 0).
-/// - `isErr` / `isNone`: discriminant != 0 (negation of the positive
-///   check).
-///
-/// Emitting i32.eq / i32.ne against the loaded discriminant lets us
-/// avoid the `compute_enum_layout`-and-variant-index lookup the
-/// native path does — the binary-enum-with-Ok-as-first invariant is
-/// stable across the stdlib and pinning it here keeps the WASM dispatch
-/// trivial. Multi-payload non-stdlib enums route through
-/// `Op::EnumDiscriminant` directly at the IR level; nothing in
-/// user code can reach this builtin path with a non-`Result`/-`Option`
-/// receiver.
-///
-/// All four methods return `Bool` (single i32 0/1) and have no GC-
-/// ref-typed result, so the blanket post-instruction `emit_gc_set_root`
-/// is a no-op for them.
-fn translate_enum_is_variant_builtin(
-    ctx: &mut FuncTranslateCtx,
-    enum_name: &str,
-    method: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    let positive_check = match (enum_name, method) {
-        ("Result", "isOk") | ("Option", "isSome") => true,
-        ("Result", "isErr") | ("Option", "isNone") => false,
-        _ => {
-            return Err(CompileError::new(format!(
-                "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` not yet \
-                 supported (Phase 2.4 PR 3d — see docs/design-decisions.md §Phase 2.4 \
-                 for the remaining stdlib-enum method surface)"
-            )));
-        }
-    };
-    let vid = expect_result(instr, "BuiltinCall(\"enum.is_variant\")")?;
-    let receiver_vid = *args.first().ok_or_else(|| {
-        CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` requires 1 arg \
-             (the {enum_name} receiver), got 0 (internal compiler bug — IR \
-             verifier should have caught this)"
-        ))
-    })?;
-    let recv_ptr_local = ctx.binding_of(receiver_vid)?.single_local();
-    // Discriminant is i32 at offset 0 of the enum payload — the same
-    // load shape `Op::EnumDiscriminant` uses. Comparing with i32.eq /
-    // i32.ne keeps the result on the operand stack as an i32 0/1
-    // which lines up exactly with `Bool`'s wasm-encoding.
-    ctx.emit(Instruction::LocalGet(recv_ptr_local));
-    ctx.emit(Instruction::I32Load(i32_memarg(0)));
-    ctx.emit(Instruction::I32Const(0));
-    if positive_check {
-        ctx.emit(Instruction::I32Eq);
-    } else {
-        ctx.emit(Instruction::I32Ne);
-    }
-    ctx.emit_store_result(vid, IrType::Bool)?;
-    Ok(())
-}
-
-/// Lower a `BuiltinCall("List.<method>", args)`. `method` is the
-/// stripped suffix (e.g. `"length"`, `"get"`). Covers the iteration
-/// trio (`length`, `get`) needed by `for x in xs`-shaped loops. Other
-/// list methods (`map` / `filter` / `reduce` / `sortBy` / `flatMap` /
-/// `contains`) are rejected here so they show up as a clean
-/// "unsupported" diagnostic until later PR 3d slices add them.
-fn translate_list_method_builtin(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    method: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    match method {
-        "length" => {
-            // `phx_list_length(list) -> i64`. Returns 0 for an empty
-            // list. Result vid is i64; the blanket post-instruction
-            // `emit_gc_set_root` is a no-op for value types.
-            let vid = expect_result(instr, "BuiltinCall(\"List.length\")")?;
-            if args.len() != 1 {
-                return Err(CompileError::new(format!(
-                    "wasm32-linear: `BuiltinCall(\"List.length\")` requires 1 arg \
-                     (the list), got {} (internal compiler bug — IR verifier should \
-                     have caught this)",
-                    args.len()
-                )));
-            }
-            let list_vid = args[0];
-            let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-            let length_idx = b.require_phx_func("phx_list_length")?;
-            ctx.emit(Instruction::LocalGet(list_ptr_local));
-            ctx.emit(Instruction::Call(length_idx));
-            ctx.emit_store_result(vid, IrType::I64)?;
-            Ok(())
-        }
-        "get" => {
-            // `phx_list_get_raw(list, index) -> *const u8` returns a
-            // pointer to the element's bytes inside the list's data
-            // region. Load the element value(s) from offset 0 via
-            // `emit_field_load`, which handles single-slot scalars and
-            // the multi-slot `StringRef` fat pointer uniformly. The
-            // element's `IrType` comes from `instr.result_type` —
-            // sema annotated it from the list's element type.
-            let vid = expect_result(instr, "BuiltinCall(\"List.get\")")?;
-            if args.len() != 2 {
-                return Err(CompileError::new(format!(
-                    "wasm32-linear: `BuiltinCall(\"List.get\")` requires 2 args \
-                     (list, index), got {} (internal compiler bug — IR verifier \
-                     should have caught this)",
-                    args.len()
-                )));
-            }
-            let list_vid = args[0];
-            let idx_vid = args[1];
-            let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-            let idx_local = ctx.binding_of(idx_vid)?.single_local();
-            let get_raw_idx = b.require_phx_func("phx_list_get_raw")?;
-            ctx.emit(Instruction::LocalGet(list_ptr_local));
-            ctx.emit(Instruction::LocalGet(idx_local));
-            ctx.emit(Instruction::Call(get_raw_idx));
-            // Stash the data-region pointer in a local so
-            // `emit_field_load` can re-read it for each slot (a
-            // multi-slot `StringRef` needs the base pointer twice —
-            // once for ptr at offset 0 and once for len at offset 4).
-            let data_ptr_local = ctx.allocate_temp_local(ValType::I32);
-            ctx.emit(Instruction::LocalSet(data_ptr_local));
-            let elem_ty = instr.result_type.clone();
-            emit_field_load(ctx, data_ptr_local, 0, &elem_ty)?;
-            ctx.emit_store_result(vid, elem_ty)?;
-            Ok(())
-        }
-        "reduce" => translate_list_reduce(ctx, b, args, instr),
-        "map" => translate_list_map(ctx, b, args, instr),
-        "filter" => translate_list_filter(ctx, b, args, instr),
-        "flatMap" => translate_list_flatmap(ctx, b, args, instr),
-        "sortBy" => translate_list_sortby(ctx, b, args, instr),
-        // `take(n)` / `drop(n)`: pure runtime calls returning a fresh
-        // list. The count arg is an i64 `Int`; the result is a
-        // GC-rooted list (blanket post-instruction set_root).
-        "take" => translate_list_take_drop(ctx, b, "take", "phx_list_take", args, instr),
-        "drop" => translate_list_take_drop(ctx, b, "drop", "phx_list_drop", args, instr),
-        "push" => translate_list_push(ctx, b, args, instr),
-        "contains" => translate_list_contains(ctx, b, args, instr),
-        "any" => translate_list_any_all(ctx, b, args, instr, true),
-        "all" => translate_list_any_all(ctx, b, args, instr, false),
-        other => Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.{other}\")` not yet supported \
-             (Phase 2.4 PR 3d — see docs/phases/phase-2.md §2.4 PR 3d; \
-             `find` ships in a later slice)"
-        ))),
-    }
-}
-
-/// Helper: extract the element `IrType` from a list-typed binding.
-fn list_elem_type(ctx: &FuncTranslateCtx, list_vid: ValueId) -> Result<IrType, CompileError> {
-    match &ctx.binding_of(list_vid)?.ir_type {
-        IrType::ListRef(t) => Ok(t.as_ref().clone()),
-        other => Err(CompileError::new(format!(
-            "wasm32-linear: expected a `ListRef` receiver for a list functional \
-             method, got `{other:?}` (internal compiler bug)"
-        ))),
-    }
-}
-
-/// `List.take(n)` / `List.drop(n)`: `runtime_fn(list, n) -> list`.
-/// `n` is an i64 `Int`. The fresh list is GC-rooted by the blanket
-/// post-instruction set_root.
-fn translate_list_take_drop(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    method_name: &str,
-    runtime_fn: &str,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.{method_name}\")` requires 2 args \
-             (list, n), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.take/drop\")")?;
-    let list_ptr_local = ctx.binding_of(args[0])?.single_local();
-    let n_local = ctx.binding_of(args[1])?.single_local();
-    let fn_idx = b.require_phx_func(runtime_fn)?;
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::LocalGet(n_local));
-    ctx.emit(Instruction::Call(fn_idx));
-    ctx.emit_store_result(vid, instr.result_type.clone())?;
-    Ok(())
-}
-
-/// `br_if` / `br` depth that exits a [`emit_breakable_loop`] body.
-const LOOP_BREAK: u32 = 1;
-/// `br` depth that continues a [`emit_breakable_loop`] body.
-const LOOP_CONTINUE: u32 = 0;
-
-/// `(block (loop body))` skeleton where `body` handles bounds, work,
-/// advance, and the trailing `br LOOP_CONTINUE`. Use when the body
-/// needs to short-circuit (`List.any`/`all`) or when the loop shape
-/// isn't a simple `for i in 0..len` walk (`sortBy`'s decreasing inner
-/// counter). Distinct from [`emit_list_loop`], which owns the bounds
-/// check itself and forbids the body from branching. Nesting is
-/// sound — inner depths shift by 2 — which [`translate_list_sortby`]
-/// relies on.
-fn emit_breakable_loop<F>(ctx: &mut FuncTranslateCtx, body: F) -> Result<(), CompileError>
-where
-    F: FnOnce(&mut FuncTranslateCtx) -> Result<(), CompileError>,
-{
-    ctx.emit(Instruction::Block(BlockType::Empty));
-    ctx.emit(Instruction::Loop(BlockType::Empty));
-    body(ctx)?;
-    ctx.emit(Instruction::End); // close loop
-    ctx.emit(Instruction::End); // close exit block
-    Ok(())
-}
-
-/// `List.any(pred)` / `List.all(pred)`: short-circuiting boolean fold.
-/// `any` seeds `false` and ORs each `pred(elem)`, breaking at the first
-/// `true`; `all` seeds `true` and ANDs, breaking at the first `false`.
-/// Matches the interpreter, so a side-effecting predicate observes the
-/// same call sequence under wasm and tree-walk.
-///
-/// ## Bool canonicalization
-///
-/// The `i32.or` / `i32.and` combine and the `i32.eqz` short-circuit
-/// test rely on Phoenix `Bool` values being exactly `0` or `1`. This is
-/// not a property of [`wasm_valtypes_for`] (which only maps `Bool` to
-/// `ValType::I32`) — it's an invariant maintained by every site that
-/// *produces* a Bool: comparison ops (`i32.eq`/`i64.eq` etc. return 0
-/// or 1), `i32.eqz`, the seed `I32Const(0|1)` below, and the user
-/// predicate's return value (whose codegen must respect the same
-/// invariant — `LowerBoolNot`, comparisons, and Bool literals all do).
-///
-/// Hand-rolled around [`emit_breakable_loop`] so the body can `br_if`
-/// out — [`emit_list_loop`] forbids branching.
-fn translate_list_any_all(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-    is_any: bool,
-) -> Result<(), CompileError> {
-    let method = if is_any { "any" } else { "all" };
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.{method}\")` requires 2 args \
-             (list, predicate), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.any/all\")")?;
-    let list_vid = args[0];
-    let closure_vid = args[1];
-    let elem_ty = list_elem_type(ctx, list_vid)?;
-    let elem_size = phx_field_size_bytes(&elem_ty)?;
-    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
-    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
-
-    // result = seed (0 for any, 1 for all).
-    let result_local = ctx.allocate_temp_local(ValType::I32);
-    ctx.emit(Instruction::I32Const(if is_any { 0 } else { 1 }));
-    ctx.emit(Instruction::LocalSet(result_local));
-
-    let elem_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    let length_idx = b.require_phx_func("phx_list_length")?;
-    let len_local = ctx.allocate_temp_local(ValType::I64);
-    let i_local = ctx.allocate_temp_local(ValType::I64);
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::Call(length_idx));
-    ctx.emit(Instruction::LocalSet(len_local));
-    ctx.emit(Instruction::I64Const(0));
-    ctx.emit(Instruction::LocalSet(i_local));
-
-    emit_breakable_loop(ctx, |ctx| {
-        // i >= len → break out of the loop.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::LocalGet(len_local));
-        ctx.emit(Instruction::I64GeS);
-        ctx.emit(Instruction::BrIf(LOOP_BREAK));
-        // pred = closure(list[i]) → i32 on stack.
-        let addr = emit_list_elem_addr(ctx, list_ptr_local, i_local, elem_size);
-        emit_field_load(ctx, addr, 0, &elem_ty)?;
-        store_stack_into_locals(ctx, &elem_locals);
-        let call_args = vec![elem_locals.clone()];
-        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
-        // result = result OR/AND pred (predicate result is on the stack).
-        ctx.emit(Instruction::LocalGet(result_local));
-        if is_any {
-            ctx.emit(Instruction::I32Or);
-        } else {
-            ctx.emit(Instruction::I32And);
-        }
-        ctx.emit(Instruction::LocalSet(result_local));
-        // Short-circuit: `any` breaks once result is true, `all` once
-        // it is false (i32.eqz flips the test).
-        ctx.emit(Instruction::LocalGet(result_local));
-        if !is_any {
-            ctx.emit(Instruction::I32Eqz);
-        }
-        ctx.emit(Instruction::BrIf(LOOP_BREAK));
-        // i += 1; continue.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Add);
-        ctx.emit(Instruction::LocalSet(i_local));
-        ctx.emit(Instruction::Br(LOOP_CONTINUE));
-        Ok(())
-    })?;
-
-    // Bind the result Bool.
-    ctx.emit(Instruction::LocalGet(result_local));
-    ctx.emit_store_result(vid, IrType::Bool)?;
-    Ok(())
-}
-
-/// `List.push(elem)`: `phx_list_push_raw(list, &elem, es) -> list`.
-/// Stages the element value into a shadow-stack scratch frame and
-/// passes its address (push copies the bytes by value, so the staged
-/// element needs no rooting). Returns a fresh GC-rooted list.
-fn translate_list_push(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.push\")` requires 2 args \
-             (list, elem), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.push\")")?;
-    let list_ptr_local = ctx.binding_of(args[0])?.single_local();
-    let elem_binding = ctx.binding_of(args[1])?;
-    let elem_locals = elem_binding.locals.clone();
-    let elem_ty = elem_binding.ir_type.clone();
-    let es = phx_field_size_bytes(&elem_ty)?;
-
-    let (saved_sp, frame_local) = emit_alloc_stack_frame(ctx, b, es)?;
-    emit_field_store(ctx, frame_local, 0, &elem_ty, &elem_locals)?;
-    let push_idx = b.require_phx_func("phx_list_push_raw")?;
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::LocalGet(frame_local));
-    ctx.emit(Instruction::I64Const(es as i64));
-    ctx.emit(Instruction::Call(push_idx));
-    ctx.emit_store_result(vid, instr.result_type.clone())?;
-    emit_restore_stack_frame(ctx, b, saved_sp)?;
-    Ok(())
-}
-
-/// `List.contains(elem)`: `phx_list_contains(list, &elem, es, is_float,
-/// is_string) -> i8`. Stages the element on the shadow stack; the two
-/// flags use [`IrType::float_flag`] / [`IrType::string_flag`] so
-/// cranelift and wasm encode them identically. The runtime treats
-/// `is_string` as authoritative, which is what makes
-/// `List<String>.contains` compare by content on wasm32 (where a
-/// `StringRef` is 8 bytes, indistinguishable from `Int` / `Float` by
-/// size).
-fn translate_list_contains(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.contains\")` requires 2 args \
-             (list, elem), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.contains\")")?;
-    let list_ptr_local = ctx.binding_of(args[0])?.single_local();
-    let elem_binding = ctx.binding_of(args[1])?;
-    let elem_locals = elem_binding.locals.clone();
-    let elem_ty = elem_binding.ir_type.clone();
-    let es = phx_field_size_bytes(&elem_ty)?;
-
-    let (saved_sp, frame_local) = emit_alloc_stack_frame(ctx, b, es)?;
-    emit_field_store(ctx, frame_local, 0, &elem_ty, &elem_locals)?;
-    let contains_idx = b.require_phx_func("phx_list_contains")?;
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::LocalGet(frame_local));
-    ctx.emit(Instruction::I64Const(es as i64));
-    ctx.emit(Instruction::I32Const(elem_ty.float_flag() as i32));
-    ctx.emit(Instruction::I32Const(elem_ty.string_flag() as i32));
-    ctx.emit(Instruction::Call(contains_idx));
-    ctx.emit_store_result(vid, IrType::Bool)?;
-    emit_restore_stack_frame(ctx, b, saved_sp)?;
-    Ok(())
-}
-
-/// Emit the shared list-iteration loop skeleton and run `body` once
-/// per element inside it.
-///
-/// Allocates an i64 counter local `i` (initialized to 0) and an i64
-/// `len` local (from `phx_list_length(list)`), then emits:
-///
-/// ```text
-/// (block            ;; $exit
-///   (loop           ;; $loop
-///     local.get i; local.get len; i64.ge_s; br_if 1   ;; i >= len → exit
-///     <body>                                          ;; caller-emitted
-///     local.get i; i64.const 1; i64.add; local.set i  ;; i += 1
-///     br 0                                            ;; continue
-///   )
-/// )
-/// ```
-///
-/// `body` is invoked with the loop counter local (`i`) and the loop's
-/// element-size (the input list's `elem_size`); it emits the per-
-/// element work (load element, call closure, store result). Because
-/// the block/loop is fully nested and the caller's `body` only ever
-/// branches to the loop's own labels (none — it falls through), the
-/// br-depths stay self-contained regardless of any enclosing
-/// function-level dispatcher.
-fn emit_list_loop(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    list_ptr_local: u32,
-    mut body: impl FnMut(&mut FuncTranslateCtx, &mut ModuleBuilder, u32) -> Result<(), CompileError>,
-) -> Result<(), CompileError> {
-    let len_local = ctx.allocate_temp_local(ValType::I64);
-    let i_local = ctx.allocate_temp_local(ValType::I64);
-    let length_idx = b.require_phx_func("phx_list_length")?;
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::Call(length_idx));
-    ctx.emit(Instruction::LocalSet(len_local));
-    ctx.emit(Instruction::I64Const(0));
-    ctx.emit(Instruction::LocalSet(i_local));
-
-    ctx.emit(Instruction::Block(BlockType::Empty));
-    ctx.emit(Instruction::Loop(BlockType::Empty));
-    // i >= len → break to $exit (depth 1).
-    ctx.emit(Instruction::LocalGet(i_local));
-    ctx.emit(Instruction::LocalGet(len_local));
-    ctx.emit(Instruction::I64GeS);
-    ctx.emit(Instruction::BrIf(1));
-    // Body.
-    body(ctx, b, i_local)?;
-    // i += 1; continue.
-    ctx.emit(Instruction::LocalGet(i_local));
-    ctx.emit(Instruction::I64Const(1));
-    ctx.emit(Instruction::I64Add);
-    ctx.emit(Instruction::LocalSet(i_local));
-    ctx.emit(Instruction::Br(0));
-    ctx.emit(Instruction::End); // close loop
-    ctx.emit(Instruction::End); // close block
-    Ok(())
-}
-
-/// `List.reduce(list, init, closure)`: fold over elements.
-///
-/// `args = [list, init, closure]`. The accumulator lives in the
-/// *result vid's* locals (so the final accumulator is already the
-/// instruction's bound result — no post-loop copy), seeded from
-/// `init`. Each iteration loads the element, calls
-/// `closure(acc, elem)`, and writes the result back into the acc
-/// locals.
-///
-/// GC: when the accumulator is ref-typed, it's re-rooted on the
-/// shadow stack (via the result vid's pre-assigned slot) after the
-/// seed and after each update, so an allocating closure can't sweep
-/// the live accumulator mid-fold. Elements loaded from the input list
-/// need no separate rooting — they stay reachable transitively through
-/// the input list, which is itself a rooted method argument.
-fn translate_list_reduce(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 3 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.reduce\")` requires 3 args \
-             (list, init, closure), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.reduce\")")?;
-    let list_vid = args[0];
-    let init_vid = args[1];
-    let closure_vid = args[2];
-    let elem_ty = list_elem_type(ctx, list_vid)?;
-    let elem_size = phx_field_size_bytes(&elem_ty)?;
-    let acc_ty = instr.result_type.clone();
-
-    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
-    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
-
-    // Accumulator locals = the result binding's locals, seeded from
-    // `init`. Allocating the result binding up front lets the fold
-    // mutate it in place and leaves the final value already bound.
-    let acc_locals = ctx.allocate_locals_for_ir_type(vid, acc_ty.clone())?;
-    let init_locals = ctx.binding_of(init_vid)?.locals.clone();
-    if init_locals.len() != acc_locals.len() {
-        return Err(CompileError::new(
-            "wasm32-linear: `List.reduce` init/acc slot-count mismatch (internal \
-             compiler bug)"
-                .to_string(),
-        ));
-    }
-    for (dst, src) in acc_locals.iter().zip(init_locals.iter()) {
-        ctx.emit(Instruction::LocalGet(*src));
-        ctx.emit(Instruction::LocalSet(*dst));
-    }
-    // Root the seeded accumulator (no-op for value-typed acc).
-    emit_gc_set_root(ctx, b, vid)?;
-
-    let elem_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    let acc_locals_for_body = acc_locals.clone();
-    emit_list_loop(ctx, b, list_ptr_local, |ctx, b, i_local| {
-        // Load element into elem_locals.
-        let addr_local = emit_list_elem_addr(ctx, list_ptr_local, i_local, elem_size);
-        emit_field_load(ctx, addr_local, 0, &elem_ty)?;
-        store_stack_into_locals(ctx, &elem_locals);
-        // new_acc = closure(acc, elem).
-        let call_args = vec![acc_locals_for_body.clone(), elem_locals.clone()];
-        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
-        store_stack_into_locals(ctx, &acc_locals_for_body);
-        // Re-root the updated accumulator (no-op for value types).
-        emit_gc_set_root(ctx, b, vid)?;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-/// `List.map(list, closure)`: apply closure to each element, collect
-/// results into a new list.
-///
-/// Allocates the output list (length = input length, element size =
-/// closure return type's size) before the loop and roots it via the
-/// result vid's slot so it survives any allocation inside the closure.
-/// Each iteration loads the input element, calls the closure, and
-/// stores the result at the matching index in the output list.
-fn translate_list_map(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.map\")` requires 2 args \
-             (list, closure), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.map\")")?;
-    let list_vid = args[0];
-    let closure_vid = args[1];
-    let in_elem_ty = list_elem_type(ctx, list_vid)?;
-    let in_elem_size = phx_field_size_bytes(&in_elem_ty)?;
-    // Output element type = the map result's list element type.
-    let out_elem_ty = match &instr.result_type {
-        IrType::ListRef(t) => t.as_ref().clone(),
-        other => {
-            return Err(CompileError::new(format!(
-                "wasm32-linear: `List.map` result type must be `ListRef`, got \
-                 `{other:?}` (internal compiler bug)"
-            )));
-        }
-    };
-    let out_elem_size = phx_field_size_bytes(&out_elem_ty)?;
-
-    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
-    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
-
-    // Allocate output list (length = input length).
-    let length_idx = b.require_phx_func("phx_list_length")?;
-    let list_alloc_idx = b.require_phx_func("phx_list_alloc")?;
-    ctx.emit(Instruction::I64Const(out_elem_size as i64));
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::Call(length_idx)); // len (i64)
-    ctx.emit(Instruction::Call(list_alloc_idx)); // phx_list_alloc(out_es, len)
-    let out_ptr_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
-    ctx.emit(Instruction::LocalSet(out_ptr_local));
-    // Root the output list for the duration of the loop.
-    emit_gc_set_root(ctx, b, vid)?;
-
-    let in_elem_locals = ctx.allocate_locals_for_ir_type_anon(&in_elem_ty)?;
-    let out_elem_locals = ctx.allocate_locals_for_ir_type_anon(&out_elem_ty)?;
-    emit_list_loop(ctx, b, list_ptr_local, |ctx, b, i_local| {
-        // elem = in[i].
-        let in_addr = emit_list_elem_addr(ctx, list_ptr_local, i_local, in_elem_size);
-        emit_field_load(ctx, in_addr, 0, &in_elem_ty)?;
-        store_stack_into_locals(ctx, &in_elem_locals);
-        // result = closure(elem).
-        let call_args = vec![in_elem_locals.clone()];
-        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
-        store_stack_into_locals(ctx, &out_elem_locals);
-        // out[i] = result.
-        let out_addr = emit_list_elem_addr(ctx, out_ptr_local, i_local, out_elem_size);
-        emit_field_store(ctx, out_addr, 0, &out_elem_ty, &out_elem_locals)?;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-/// `List.filter(list, closure)`: keep elements where the predicate
-/// returns true.
-///
-/// Allocates an output list with capacity = input length, walks the
-/// input writing matching elements contiguously while tracking an
-/// `out_count`, then patches the output list's length field (i64 at
-/// offset 0) to `out_count` at the end. Roots the output list via the
-/// result vid's slot for the loop's duration.
-fn translate_list_filter(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.filter\")` requires 2 args \
-             (list, closure), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.filter\")")?;
-    let list_vid = args[0];
-    let closure_vid = args[1];
-    let elem_ty = list_elem_type(ctx, list_vid)?;
-    let elem_size = phx_field_size_bytes(&elem_ty)?;
-
-    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
-    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
-
-    // Allocate output list sized to input length (worst case: all kept).
-    let length_idx = b.require_phx_func("phx_list_length")?;
-    let list_alloc_idx = b.require_phx_func("phx_list_alloc")?;
-    ctx.emit(Instruction::I64Const(elem_size as i64));
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::Call(length_idx));
-    ctx.emit(Instruction::Call(list_alloc_idx));
-    let out_ptr_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
-    ctx.emit(Instruction::LocalSet(out_ptr_local));
-    emit_gc_set_root(ctx, b, vid)?;
-
-    // out_count: number of elements written so far (i64).
-    let out_count_local = ctx.allocate_temp_local(ValType::I64);
-    ctx.emit(Instruction::I64Const(0));
-    ctx.emit(Instruction::LocalSet(out_count_local));
-
-    let elem_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    let pred_local = ctx.allocate_temp_local(ValType::I32);
-    emit_list_loop(ctx, b, list_ptr_local, |ctx, b, i_local| {
-        // elem = in[i].
-        let in_addr = emit_list_elem_addr(ctx, list_ptr_local, i_local, elem_size);
-        emit_field_load(ctx, in_addr, 0, &elem_ty)?;
-        store_stack_into_locals(ctx, &elem_locals);
-        // pred = closure(elem)  (Bool → i32 0/1).
-        let call_args = vec![elem_locals.clone()];
-        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
-        ctx.emit(Instruction::LocalSet(pred_local));
-        // if pred != 0: out[out_count] = elem; out_count += 1.
-        ctx.emit(Instruction::LocalGet(pred_local));
-        ctx.emit(Instruction::If(BlockType::Empty));
-        let out_addr = emit_list_elem_addr(ctx, out_ptr_local, out_count_local, elem_size);
-        emit_field_store(ctx, out_addr, 0, &elem_ty, &elem_locals)?;
-        ctx.emit(Instruction::LocalGet(out_count_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Add);
-        ctx.emit(Instruction::LocalSet(out_count_local));
-        ctx.emit(Instruction::End); // close if
-        Ok(())
-    })?;
-    // Patch the output list's length field (i64 @ offset 0) to the
-    // actual kept count.
-    ctx.emit(Instruction::LocalGet(out_ptr_local));
-    ctx.emit(Instruction::LocalGet(out_count_local));
-    ctx.emit(Instruction::I64Store(wasm_encoder::MemArg {
-        offset: 0,
-        align: 3, // log2(8) — i64
-        memory_index: 0,
-    }));
-    Ok(())
-}
-
-/// Pop the top-of-stack value slots into `locals`, last slot first.
-/// WASM `local.set` pops the operand stack top, so to store a multi-
-/// slot value pushed in declaration order (`[slot0, slot1, ...]`) we
-/// `local.set` in reverse. Single-slot values collapse to one set.
-fn store_stack_into_locals(ctx: &mut FuncTranslateCtx, locals: &[u32]) {
-    for &local in locals.iter().rev() {
-        ctx.emit(Instruction::LocalSet(local));
-    }
-}
-
-/// `List.flatMap(list, closure)`: apply the closure to each element
-/// (it must return a `List<U>`), concatenate the resulting lists.
-///
-/// `args = [list, closure]`. The output starts as an empty `List<U>`
-/// and grows via `phx_list_push_raw` — which is *immutable-append*:
-/// it allocates a fresh `length + 1` list and returns it, so the output
-/// pointer changes on every push and must be re-stored + re-rooted.
-///
-/// GC: the output list is rooted via the result vid's slot (re-rooted
-/// after each push, since the pointer moves). The per-element inner
-/// list returned by the closure has no IR vid, so it's rooted in a
-/// dedicated 1-slot ad-hoc shadow frame for the duration of the inner
-/// push loop — `phx_list_push_raw` allocates, and without rooting the
-/// inner list its elements could be swept before they're all copied.
-/// Elements pushed from the inner list don't need separate rooting:
-/// `push_raw` copies their bytes by value, and the pointed-to objects
-/// become reachable through the (rooted) output list.
-fn translate_list_flatmap(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.flatMap\")` requires 2 args \
-             (list, closure), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.flatMap\")")?;
-    let list_vid = args[0];
-    let closure_vid = args[1];
-    let in_elem_ty = list_elem_type(ctx, list_vid)?;
-    let in_elem_size = phx_field_size_bytes(&in_elem_ty)?;
-    // Output element type = the flatMap result's list element type
-    // (also the element type of each inner list the closure returns).
-    let out_elem_ty = match &instr.result_type {
-        IrType::ListRef(t) => t.as_ref().clone(),
-        other => {
-            return Err(CompileError::new(format!(
-                "wasm32-linear: `List.flatMap` result type must be `ListRef`, got \
-                 `{other:?}` (internal compiler bug)"
-            )));
-        }
-    };
-    let out_elem_size = phx_field_size_bytes(&out_elem_ty)?;
-
-    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
-    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
-
-    // Output: start with an empty list (`phx_list_alloc(out_es, 0)`).
-    let list_alloc_idx = b.require_phx_func("phx_list_alloc")?;
-    ctx.emit(Instruction::I64Const(out_elem_size as i64));
-    ctx.emit(Instruction::I64Const(0));
-    ctx.emit(Instruction::Call(list_alloc_idx));
-    let out_ptr_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
-    ctx.emit(Instruction::LocalSet(out_ptr_local));
-    emit_gc_set_root(ctx, b, vid)?;
-
-    // Ad-hoc 1-slot frame rooting the closure's per-element inner list
-    // across the push loop's allocations.
-    let inner_frame_local = emit_gc_push_frame_at(ctx, b, 1)?;
-    let inner_list_local = ctx.allocate_temp_local(ValType::I32);
-    let in_elem_locals = ctx.allocate_locals_for_ir_type_anon(&in_elem_ty)?;
-    let push_raw_idx = b.require_phx_func("phx_list_push_raw")?;
-
-    emit_list_loop(ctx, b, list_ptr_local, |ctx, b, i_local| {
-        // elem = in[i]; inner = closure(elem).
-        let in_addr = emit_list_elem_addr(ctx, list_ptr_local, i_local, in_elem_size);
-        emit_field_load(ctx, in_addr, 0, &in_elem_ty)?;
-        store_stack_into_locals(ctx, &in_elem_locals);
-        let call_args = vec![in_elem_locals.clone()];
-        emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &call_args)?;
-        ctx.emit(Instruction::LocalSet(inner_list_local));
-        // Root the inner list before the push loop (push allocates).
-        emit_gc_set_root_at(ctx, b, inner_frame_local, 0, inner_list_local)?;
-        // Inner loop: for j in 0..inner_len, push inner[j] onto out.
-        emit_list_loop(ctx, b, inner_list_local, |ctx, b, j_local| {
-            // out = phx_list_push_raw(out, &inner[j], out_es). The
-            // element pointer is inner[j]'s address in the inner list's
-            // data region — `push_raw` copies its bytes by value.
-            let inner_addr = emit_list_elem_addr(ctx, inner_list_local, j_local, out_elem_size);
-            ctx.emit(Instruction::LocalGet(out_ptr_local));
-            ctx.emit(Instruction::LocalGet(inner_addr));
-            ctx.emit(Instruction::I64Const(out_elem_size as i64));
-            ctx.emit(Instruction::Call(push_raw_idx));
-            // push_raw returns a fresh list ptr — update + re-root out.
-            ctx.emit(Instruction::LocalSet(out_ptr_local));
-            emit_gc_set_root(ctx, b, vid)?;
-            Ok(())
-        })
-    })?;
-    emit_gc_pop_frame_at(ctx, b, inner_frame_local)?;
-    Ok(())
-}
-
-/// `List.sortBy(list, comparator)`: return a new list sorted by the
-/// comparator closure `(a, b) -> Int` (negative = `a` before `b`).
-///
-/// Uses **stable insertion sort** rather than native's bottom-up merge
-/// sort. The output is byte-identical for any total-order comparator:
-/// insertion sort is stable (ties keep input order via the `cmp <= 0`
-/// stop condition), matching the interpreter and native backends. It
-/// trades native's O(n log n) for O(n²), acceptable for the
-/// small-list use the method sees today; the WASM port favors a
-/// structured-control-flow shape that maps cleanly to nested
-/// `block`/`loop`s over replicating merge sort's many-edged CFG.
-///
-/// The sort runs in place on a fresh copy of the input
-/// (`phx_list_take(list, len)` — Phoenix lists are immutable, so the
-/// input is never mutated). The copy is bound to the result vid and
-/// rooted via its slot.
-///
-/// GC: when the element type is a ref, the `key` being inserted is
-/// held in locals across the comparator call (which may allocate) —
-/// and after the first shift `copy[i]` is overwritten, so `key` is no
-/// longer reachable through the rooted copy. A dedicated 1-slot ad-hoc
-/// shadow frame roots `key` for the outer loop's duration. Value-typed
-/// elements (the common case) skip the frame entirely. Shifted
-/// elements (`copy[j] → copy[j+1]`) stay reachable through the rooted
-/// copy throughout.
-///
-/// The 1-slot frame is sufficient because today every Phoenix ref type
-/// occupies at most one *pointer* slot: single-slot refs (`List`, `Map`,
-/// `Closure`, `Struct`, `Enum`) are a bare GC pointer in `key_locals[0]`,
-/// and the only 2-slot ref — `StringRef` — stores the heap pointer in
-/// `key_locals[0]` and the (non-pointer) `len` in `key_locals[1]`.
-/// Rooting slot 0 keeps the underlying object live in every current
-/// case. A future 2-pointer ref type (e.g. a fat reference whose second
-/// slot is itself a GC pointer) would need this frame widened to 2 slots
-/// — `phx_field_size_bytes` adding a non-`StringRef` 2-slot ref-type
-/// branch is the tripwire for the rewrite.
-fn translate_list_sortby(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    if args.len() != 2 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"List.sortBy\")` requires 2 args \
-             (list, comparator), got {} (internal compiler bug)",
-            args.len()
-        )));
-    }
-    let vid = expect_result(instr, "BuiltinCall(\"List.sortBy\")")?;
-    let list_vid = args[0];
-    let closure_vid = args[1];
-    let elem_ty = list_elem_type(ctx, list_vid)?;
-    let elem_size = phx_field_size_bytes(&elem_ty)?;
-    // `is_ref_type()` returns true for the `__generic` placeholder
-    // (`StructRef("__generic", [])`), so a sortBy over a placeholder-typed
-    // empty list would take the ref branch. Sema closes off that path in
-    // practice today — `let xs = []` is rejected as ambiguous
-    // (`phoenix-sema/src/check_stmt.rs::check_let`'s "cannot infer type"
-    // diagnostic) and `let xs: List<T> = []` is pinned to the annotation
-    // by `pin_inferred_type_to_annotation` — so every sortBy reachable
-    // from user code carries a concrete element type. The placeholder
-    // branch is therefore unreachable today; it is kept defensively (and
-    // is safe by construction: `len == 0` on the only path that could
-    // reach it, so the inner loop never executes and the rooted slot
-    // never participates in a collection). The GC-root emitter paired
-    // with `gc_roots::is_tracked_ref`'s placeholder skip makes this
-    // safe; see that file's docstring for the joint contract.
-    let elem_is_ref = elem_ty.is_ref_type();
-
-    let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
-    let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
-    let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
-
-    // len = phx_list_length(list); copy = phx_list_take(list, len).
-    let length_idx = b.require_phx_func("phx_list_length")?;
-    let take_idx = b.require_phx_func("phx_list_take")?;
-    let len_local = ctx.allocate_temp_local(ValType::I64);
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::Call(length_idx));
-    ctx.emit(Instruction::LocalSet(len_local));
-    ctx.emit(Instruction::LocalGet(list_ptr_local));
-    ctx.emit(Instruction::LocalGet(len_local));
-    ctx.emit(Instruction::Call(take_idx));
-    let copy_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
-    ctx.emit(Instruction::LocalSet(copy_local));
-    emit_gc_set_root(ctx, b, vid)?; // root the copy
-
-    // Optional ad-hoc frame rooting the `key` element (ref types only).
-    let key_frame_local = if elem_is_ref {
-        Some(emit_gc_push_frame_at(ctx, b, 1)?)
-    } else {
-        None
-    };
-
-    let key_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    let cmp_a_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    // Executable tripwire for the docstring's single-pointer-slot
-    // assumption. Today every ref type either occupies one slot (a
-    // bare GC pointer in slot 0) or is exactly `StringRef` (slot 0 =
-    // heap pointer, slot 1 = non-pointer `len`). A future ref type
-    // whose second slot is also a GC pointer would need this frame
-    // widened to 2 slots; this assert fires before that case silently
-    // miscompiles.
-    debug_assert!(
-        !elem_is_ref || matches!(&elem_ty, IrType::StringRef) || key_locals.len() == 1,
-        "sortBy: ref element type {:?} occupies {} slots — the ad-hoc \
-         key frame only roots slot 0, but this type may have a pointer \
-         in another slot. Widen the frame to match (see the docstring's \
-         tripwire note).",
-        elem_ty,
-        key_locals.len(),
-    );
-    let i_local = ctx.allocate_temp_local(ValType::I64);
-    let j_local = ctx.allocate_temp_local(ValType::I64);
-    let jp1_local = ctx.allocate_temp_local(ValType::I64);
-    let cmp_result_local = ctx.allocate_temp_local(ValType::I64);
-
-    // i = 1 (element 0 is trivially sorted).
-    ctx.emit(Instruction::I64Const(1));
-    ctx.emit(Instruction::LocalSet(i_local));
-
-    // Outer loop: for i in 1..len.
-    emit_breakable_loop(ctx, |ctx| {
-        // i >= len → break outer.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::LocalGet(len_local));
-        ctx.emit(Instruction::I64GeS);
-        ctx.emit(Instruction::BrIf(LOOP_BREAK));
-        // key = copy[i].
-        let key_addr = emit_list_elem_addr(ctx, copy_local, i_local, elem_size);
-        emit_field_load(ctx, key_addr, 0, &elem_ty)?;
-        store_stack_into_locals(ctx, &key_locals);
-        if let Some(frame) = key_frame_local {
-            emit_gc_set_root_at(ctx, b, frame, 0, key_locals[0])?;
-        }
-        // j = i - 1.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Sub);
-        ctx.emit(Instruction::LocalSet(j_local));
-
-        // Inner loop: while j >= 0 && cmp(copy[j], key) > 0:
-        //                  copy[j+1] = copy[j]; j -= 1.
-        // Inner LOOP_BREAK / LOOP_CONTINUE refer to the inner loop —
-        // emit_breakable_loop's nesting shifts the outer depths by 2.
-        emit_breakable_loop(ctx, |ctx| {
-            // j < 0 → break inner.
-            ctx.emit(Instruction::LocalGet(j_local));
-            ctx.emit(Instruction::I64Const(0));
-            ctx.emit(Instruction::I64LtS);
-            ctx.emit(Instruction::BrIf(LOOP_BREAK));
-            // cmp_a = copy[j].
-            let cj_addr = emit_list_elem_addr(ctx, copy_local, j_local, elem_size);
-            emit_field_load(ctx, cj_addr, 0, &elem_ty)?;
-            store_stack_into_locals(ctx, &cmp_a_locals);
-            // c = comparator(copy[j], key) → i64 on stack.
-            let cmp_args = vec![cmp_a_locals.clone(), key_locals.clone()];
-            emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &cmp_args)?;
-            ctx.emit(Instruction::LocalSet(cmp_result_local));
-            // c <= 0 → stop shifting (stable: ties keep left/original order).
-            ctx.emit(Instruction::LocalGet(cmp_result_local));
-            ctx.emit(Instruction::I64Const(0));
-            ctx.emit(Instruction::I64LeS);
-            ctx.emit(Instruction::BrIf(LOOP_BREAK));
-            // copy[j+1] = copy[j] (cmp_a_locals still holds copy[j]).
-            ctx.emit(Instruction::LocalGet(j_local));
-            ctx.emit(Instruction::I64Const(1));
-            ctx.emit(Instruction::I64Add);
-            ctx.emit(Instruction::LocalSet(jp1_local));
-            let shift_dst = emit_list_elem_addr(ctx, copy_local, jp1_local, elem_size);
-            emit_field_store(ctx, shift_dst, 0, &elem_ty, &cmp_a_locals)?;
-            // j -= 1.
-            ctx.emit(Instruction::LocalGet(j_local));
-            ctx.emit(Instruction::I64Const(1));
-            ctx.emit(Instruction::I64Sub);
-            ctx.emit(Instruction::LocalSet(j_local));
-            ctx.emit(Instruction::Br(LOOP_CONTINUE));
-            Ok(())
-        })?;
-
-        // copy[j+1] = key.
-        ctx.emit(Instruction::LocalGet(j_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Add);
-        ctx.emit(Instruction::LocalSet(jp1_local));
-        let insert_dst = emit_list_elem_addr(ctx, copy_local, jp1_local, elem_size);
-        emit_field_store(ctx, insert_dst, 0, &elem_ty, &key_locals)?;
-        // i += 1.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Add);
-        ctx.emit(Instruction::LocalSet(i_local));
-        ctx.emit(Instruction::Br(LOOP_CONTINUE));
-        Ok(())
-    })?;
-
-    if let Some(frame) = key_frame_local {
-        emit_gc_pop_frame_at(ctx, b, frame)?;
-    }
-    Ok(())
-}
-
-/// Translate `print(value)` — dispatch on the value's Phoenix
-/// [`IrType`] to the matching `phx_print_*` runtime export.
-fn translate_print_builtin(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-) -> Result<(), CompileError> {
-    let arg = *args.first().ok_or_else(|| {
-        CompileError::new(
-            "wasm32-linear: `print` builtin called with zero arguments — \
-             IR verifier should have caught this"
-                .to_string(),
-        )
-    })?;
-    let arg_ir_ty = ctx.binding_of(arg)?.ir_type.clone();
-    match arg_ir_ty {
-        IrType::I64 => {
-            let idx = b.require_phx_func("phx_print_i64")?;
-            ctx.emit_load_all(arg)?;
-            ctx.emit(Instruction::Call(idx));
-        }
-        IrType::Bool => {
-            let idx = b.require_phx_func("phx_print_bool")?;
-            ctx.emit_load_all(arg)?;
-            ctx.emit(Instruction::Call(idx));
-        }
-        IrType::StringRef => {
-            // `phx_print_str(ptr: i32, len: i32) -> ()` — push the
-            // fat pointer's two slots in declaration order. Works
-            // uniformly for `Op::ConstString` data-section pointers
-            // (decision H) and heap pointers produced by runtime ops
-            // (`phx_str_concat`, `phx_i64_to_str`, …) because the
-            // runtime treats the fat pointer as a borrowed slice.
-            let idx = b.require_phx_func("phx_print_str")?;
-            ctx.emit_load_all(arg)?;
-            ctx.emit(Instruction::Call(idx));
-        }
-        other => {
-            return Err(CompileError::new(format!(
-                "wasm32-linear: `print` on argument of IR type `{other:?}` \
-                 not yet supported (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Translate `toString(value)` — convert a primitive Phoenix value to
-/// a heap-allocated `String` via the runtime's `phx_*_to_str` family.
-/// These runtime functions are declared `extern "C" fn(val) ->
-/// PhxFatPtr` in Rust source; the wasm32-wasip1 C ABI lowers the
-/// struct return via an implicit *sret* pointer as the first
-/// argument. The SP-management dance lives in
-/// [`emit_sret_string_call`] and is shared with `Op::StringConcat`.
-///
-/// `toString(String)` is the identity — no runtime call needed; the
-/// arg's two slots are aliased into the result binding so the rest
-/// of the translator can treat `toString` uniformly without the
-/// caller having to know whether the source operand was already a
-/// String.
-fn translate_to_string_builtin(
-    ctx: &mut FuncTranslateCtx,
-    b: &mut ModuleBuilder,
-    args: &[ValueId],
-    instr: &phoenix_ir::instruction::Instruction,
-) -> Result<(), CompileError> {
-    // Validate IR shape first — bail before doing any plumbing work
-    // (argument-type inspection, runtime-fn lookup, SP-global lookup)
-    // so an IR malformation surfaces as a clean diagnostic instead of
-    // accidentally leaving partial state in the builder.
-    let vid = expect_result(instr, "Op::BuiltinCall(\"toString\")")?;
-    // Hard arity check rather than debug_assert + `args.first()`: in
-    // release builds with `args.len() > 1`, the silent-truncation
-    // shape (debug_assert no-ops, `args[0]` is used) would silently
-    // drop the extra args. The IR verifier should prevent this, but
-    // a one-line guard keeps debug/release behavior identical on the
-    // arity edge.
-    if args.len() != 1 {
-        return Err(CompileError::new(format!(
-            "wasm32-linear: `toString` builtin takes exactly one argument; \
-             got {} (IR verifier should have caught this)",
-            args.len(),
-        )));
-    }
-    let arg = args[0];
-    // Resolve dispatch by *reference* — `IrType` carries owned
-    // `String`/`Vec` payloads on its reference variants, so cloning
-    // for the dispatch table is wasted work. The borrow released at
-    // the end of this match lets the mutating builder calls below
-    // run unobstructed.
-    let runtime_fn_name = match &ctx.binding_of(arg)?.ir_type {
-        // `toString(String)` is the source-level identity: alias
-        // `vid` to the arg's existing binding (same locals, same
-        // IrType). No runtime call, no SP plumbing, no new locals,
-        // no `local.get`/`local.set` copies — and no shadow-stack
-        // rooting needed (the source binding is already rooted by
-        // its defining op). Future reads of `vid` resolve via
-        // `binding_of` to the same locals the arg already owns.
-        IrType::StringRef => {
-            debug_assert_ne!(
-                vid, arg,
-                "Op::BuiltinCall(toString) result must differ from its arg \
-                 (single-assignment IR invariant)"
-            );
-            let aliased = ValueBinding {
-                locals: ctx.binding_of(arg)?.locals.clone(),
-                ir_type: IrType::StringRef,
-            };
-            debug_assert_eq!(aliased.locals.len(), 2, "StringRef arg must be 2 slots");
-            ctx.bindings.insert(vid, aliased);
-            return Ok(());
-        }
-        IrType::I64 => "phx_i64_to_str",
-        IrType::F64 => "phx_f64_to_str",
-        IrType::Bool => "phx_bool_to_str",
-        other => {
-            return Err(CompileError::new(format!(
-                "wasm32-linear: `toString` on argument of IR type `{other:?}` \
-                 not yet supported (only `Int` / `Float` / `Bool` / `String` \
-                 lower today)"
-            )));
-        }
-    };
-    let runtime_idx = b.require_phx_func(runtime_fn_name)?;
-    emit_sret_string_call(ctx, b, runtime_idx, &[arg], vid)
 }
 
 /// Translate a basic-block terminator.
@@ -3998,7 +2635,7 @@ fn emit_block_param_copies(
     Ok(())
 }
 
-fn unsupported(ty: &IrType, where_: &str) -> CompileError {
+pub(super) fn unsupported(ty: &IrType, where_: &str) -> CompileError {
     CompileError::new(format!(
         "wasm32-linear: IR type `{ty:?}` not yet supported in {where_} \
          (Phase 2.4 PR 3 — see docs/design-decisions.md §Phase 2.4)"
