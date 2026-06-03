@@ -1,145 +1,66 @@
-//! Three-backend roundtrip matrix for multi-file Phoenix projects.
+//! Four-backend roundtrip matrix for multi-file Phoenix projects.
 //!
 //! Walks every `tests/fixtures/multi/<name>/main.phx` and asserts
-//! that `phoenix run`, `phoenix run-ir`, and `phoenix build` + execute
-//! all produce byte-identical stdout. Mirrors the single-file
-//! `three_backend_matrix.rs`.
+//! that `phoenix run`, `phoenix run-ir`, `phoenix build` (native), and
+//! `phoenix build --target wasm32-linear` + execute under `wasmtime`
+//! all produce byte-identical stdout, plus a check against the
+//! project's `expected.txt`. The harness is shared with the single-file
+//! `three_backend_matrix.rs` via [`common::backend_matrix`]; this file
+//! only supplies the multi-file [`MatrixCfg`] conventions (including
+//! the `expected.txt` pin) and the project list.
+//!
+//! The `wasm32-linear` column soft-skips when `wasmtime` isn't on
+//! `$PATH` (with a visible warning); `PHOENIX_REQUIRE_WASMTIME=1`
+//! turns the skip into a hard failure. CI sets it (see ci.yml).
 //!
 //! One `#[test]` per fixture so a divergence names the offending
 //! project in `cargo test` output. Stdout-only comparison (same as
 //! the single-file matrix); stderr is intentionally not gated.
 
-use std::path::PathBuf;
-use std::process::Command;
+mod common;
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
+use common::backend_matrix::MatrixCfg;
+
+fn source_rel(project: &str) -> String {
+    format!("tests/fixtures/multi/{project}/main.phx")
 }
 
-fn phoenix_bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_phoenix"));
-    cmd.current_dir(workspace_root());
-    cmd
+fn label(project: &str) -> String {
+    format!("multi/{project}")
 }
 
-/// Run `phoenix <subcommand> tests/fixtures/multi/<project>/main.phx`
-/// and return its stdout. Panics on non-zero exit.
-fn run_subcommand(subcommand: &str, project: &str) -> Vec<u8> {
-    let path = format!("tests/fixtures/multi/{project}/main.phx");
-    let output = phoenix_bin()
-        .args([subcommand, &path])
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `phoenix {subcommand} {path}`: {e}"));
-    if !output.status.success() {
-        panic!(
-            "`phoenix {subcommand} {path}` exited non-zero\n  stdout: {}\n  stderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    output.stdout
+fn bin_stem(project: &str) -> String {
+    format!("phoenix_multi_matrix_{project}")
 }
 
-/// RAII guard for the temporary build output. See the matching guard
-/// in `three_backend_matrix.rs` for the "fill /tmp on failure"
-/// rationale.
-struct TempBin(PathBuf);
-
-impl Drop for TempBin {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+fn expected_rel(project: &str) -> String {
+    format!("tests/fixtures/multi/{project}/expected.txt")
 }
 
-/// Compile via `phoenix build` and run the resulting binary, returning
-/// its stdout.
-fn build_and_execute(project: &str) -> Vec<u8> {
-    let path = format!("tests/fixtures/multi/{project}/main.phx");
-    // Bin name is qualified by `(pid, thread id, project)` so two
-    // simultaneous `cargo test` invocations against the same workspace
-    // can't collide (different pids), AND a future change that fans
-    // the same project across multiple harness threads can't collide
-    // either (different thread ids). `ThreadId`'s `Debug` impl is the
-    // documented way to obtain a usable identifier.
-    let bin_name = format!(
-        "phoenix_multi_matrix_{}_{:?}_{}",
-        std::process::id(),
-        std::thread::current().id(),
-        project,
-    );
-    let bin = TempBin(std::env::temp_dir().join(&bin_name));
-    let _ = std::fs::remove_file(&bin.0);
-
-    let build = phoenix_bin()
-        .args(["build", &path, "-o"])
-        .arg(&bin.0)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `phoenix build {path}`: {e}"));
-    if !build.status.success() {
-        panic!(
-            "`phoenix build {path}` exited non-zero\n  stdout: {}\n  stderr: {}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
-    }
-
-    let run = Command::new(&bin.0)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn compiled `{}`: {e}", bin.0.display()));
-    if !run.status.success() {
-        panic!(
-            "compiled `{}` exited non-zero\n  stdout: {}\n  stderr: {}",
-            bin.0.display(),
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        );
-    }
-    run.stdout
-}
-
-/// Read the fixture's `expected.txt` (which pins what stdout *should*
-/// be, not just what all three backends agree on). A coherent
-/// regression that broke all three backends the same way would still
-/// produce identical stdout across them, so stdout-equality alone is
-/// necessary but not sufficient — comparing against the fixture's
-/// `expected.txt` closes that gap.
-fn read_expected(project: &str) -> Vec<u8> {
-    let path = workspace_root().join(format!("tests/fixtures/multi/{project}/expected.txt"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
-}
-
-fn assert_three_backend_agreement(project: &str) {
-    let run_stdout = run_subcommand("run", project);
-    let run_ir_stdout = run_subcommand("run-ir", project);
-    let build_stdout = build_and_execute(project);
-    if run_stdout != run_ir_stdout || run_ir_stdout != build_stdout {
-        panic!(
-            "multi/{project}: backends disagree on stdout\n  run:    {:?}\n  run-ir: {:?}\n  build:  {:?}",
-            String::from_utf8_lossy(&run_stdout),
-            String::from_utf8_lossy(&run_ir_stdout),
-            String::from_utf8_lossy(&build_stdout)
-        );
-    }
-    let expected = read_expected(project);
-    if run_stdout != expected {
-        panic!(
-            "multi/{project}: stdout does not match expected.txt\n  expected: {:?}\n  got:      {:?}",
-            String::from_utf8_lossy(&expected),
-            String::from_utf8_lossy(&run_stdout),
-        );
-    }
-}
+static CFG: MatrixCfg = MatrixCfg {
+    source_rel,
+    label,
+    bin_stem,
+    expected_rel: Some(expected_rel),
+};
 
 macro_rules! multi_matrix_test {
     ($name:ident, $project:literal) => {
         #[test]
         fn $name() {
-            assert_three_backend_agreement($project);
+            common::backend_matrix::assert_backend_agreement(&CFG, $project);
+        }
+    };
+    // No multi-file fixture needs this arm yet — every project lowers
+    // to wasm. It's the ready-to-use escape hatch (mirroring the
+    // single-file matrix's `traits_dyn` carve-out) for the first
+    // project that reaches for an op the wasm32-linear backend doesn't
+    // lower. Referenced by full path so this unexpanded arm doesn't
+    // force an otherwise-unused import.
+    ($name:ident, $project:literal, skip_wasm: $reason:literal) => {
+        #[test]
+        fn $name() {
+            common::backend_matrix::assert_backend_agreement_skip_wasm(&CFG, $project, $reason);
         }
     };
 }

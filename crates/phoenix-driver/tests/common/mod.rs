@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+pub mod backend_matrix;
 pub mod compiled_fixtures;
 
 use phoenix_common::span::SourceId;

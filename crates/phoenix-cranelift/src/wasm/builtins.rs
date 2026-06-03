@@ -232,9 +232,59 @@ pub(super) fn translate_builtin_call(
             args,
             instr,
         ),
+        string_method if string_method.starts_with("String.") => translate_string_method_builtin(
+            ctx,
+            b,
+            string_method.strip_prefix("String.").unwrap(),
+            args,
+            instr,
+        ),
         other => Err(CompileError::new(format!(
             "wasm32-linear: builtin `{other}` not yet supported \
              (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
+        ))),
+    }
+}
+
+/// `String.<method>` dispatcher. Today only `length` is wired up —
+/// the only string method any matrix fixture actually calls. The
+/// transform-returning methods (`trim` / `toLowerCase` / `toUpperCase`
+/// → fresh String), the predicate methods (`contains` / `startsWith` /
+/// `endsWith` → Bool), and the `Int`-returning `indexOf` share the
+/// existing shadow-stack and predicate machinery and can be wired up
+/// opportunistically when a fixture or user program reaches for them.
+fn translate_string_method_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    match method {
+        "length" => {
+            // `phx_str_length(ptr: i32, len: i32) -> i64`. The
+            // receiver is a `StringRef` → 2 slots `[ptr, len]`; push
+            // both in declaration order and the runtime returns the
+            // byte length.
+            let vid = expect_result(instr, "BuiltinCall(\"String.length\")")?;
+            if args.len() != 1 {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `BuiltinCall(\"String.length\")` requires 1 arg \
+                     (the string), got {} (internal compiler bug — IR verifier should \
+                     have caught this)",
+                    args.len()
+                )));
+            }
+            let recv_vid = args[0];
+            ctx.emit_load_all(recv_vid)?;
+            let idx = b.require_phx_func("phx_str_length")?;
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, IrType::I64)?;
+            Ok(())
+        }
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"String.{other}\")` not yet supported \
+             (Phase 2.4 — opportunistic enablement)"
         ))),
     }
 }

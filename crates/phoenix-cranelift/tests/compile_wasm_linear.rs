@@ -1608,6 +1608,28 @@ fn chained_string_concat_runs_under_wasmtime() {
     });
 }
 
+/// Focused gate for `BuiltinCall("String.length")` lowering: the
+/// receiver is a 2-slot `StringRef`, so this pins that both slots
+/// (`[ptr, len]`) are pushed in declaration order into
+/// `phx_str_length` and that the `i64` result flows back. Covers the
+/// method on a literal, on a concatenation result (whose `len` is
+/// computed at runtime rather than baked in), and on the empty string.
+/// The backend matrix exercises `String.length` only transitively
+/// (and only when `wasmtime` is on `$PATH`); this keeps the lowering
+/// pinned independent of those fixtures.
+#[test]
+fn string_length_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let s: String = \"hello\"\n  \
+                 print(s.length())\n  \
+                 let joined: String = s + \", world\"\n  \
+                 print(joined.length())\n  \
+                 let empty: String = \"\"\n  \
+                 print(empty.length())\n\
+               }\n";
+    assert_wasm_matches_interp(src, "string_length");
+}
+
 /// `defaults.phx` end-to-end gate for struct alloc + field access
 /// (Counter struct) + StringConcat in a while loop + method dispatch
 /// via `Op::Call(method_func_id)`. Combines every piece of the
@@ -1935,31 +1957,27 @@ fn list_string_sortby_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "list_string_sortby");
 }
 
-/// `List<String>.sortBy` 2-slot shift path. Comparator returns `1`
-/// unconditionally — exercises the multi-slot key store across many
-/// shifts (every outer-loop element rides to slot 0).
+/// `List<String>.sortBy` 2-slot shift path, under a real total order.
+/// The comparator sorts by `String.length()` and the input is in
+/// reverse length order (longest first), so every element inserts ahead
+/// of all its predecessors — forcing the maximum number of shifts and
+/// exercising the multi-slot key store across each one.
 ///
-/// **Caveat: not a total order.** A constant-`1` comparator violates
-/// antisymmetry, so sortBy's "byte-identical to interp for any total
-/// order" docstring guarantee does not cover this test. It still passes
-/// today by coincidence: both Phoenix's bottom-up merge sort
-/// ([`phoenix_common::algorithms::merge_sort_by`]) and wasm32's
-/// insertion sort reverse the input under cmp ≡ 1. A future change to
-/// *either* sort algorithm could break the byte-identical match. The
-/// purpose of the test is *mechanical* — it forces every shift to fire
-/// to pin the multi-slot key-store / GC-frame interactions — not to
-/// validate sort semantics, which the [`list_sortby_runs_under_wasmtime`]
-/// and `list_sortby_n50_runs_under_wasmtime` tests cover under a real
-/// total order. A `String.length()`-based comparator would be a cleaner
-/// shift-path exerciser, but wasm32 doesn't yet lower
-/// `BuiltinCall("String.length")` — revisit once it does.
+/// Unlike a constant-`1` comparator, `a.length() - b.length()` is a
+/// genuine total order over these distinct-length inputs, so sortBy's
+/// "byte-identical to interp for any total order" guarantee actually
+/// covers this test rather than passing by coincidence of matching sort
+/// algorithms. It also pins `BuiltinCall("String.length")` lowering
+/// inside a closure body on wasm32-linear.
 #[test]
 fn list_string_sortby_shifts_runs_under_wasmtime() {
+    // Lengths: elderberry=10, banana=6, apple=5, kiwi=4, fig=3 — all
+    // distinct and in descending order, so the ascending-by-length sort
+    // reverses the list and every insertion shifts every prior element.
     let src = "function main() {\n  \
-                 let xs: List<String> = [\"alpha\", \"beta\", \"gamma\", \"delta\"]\n  \
+                 let xs: List<String> = [\"elderberry\", \"banana\", \"apple\", \"kiwi\", \"fig\"]\n  \
                  let sorted = xs.sortBy(function(a: String, b: String) -> Int {\n    \
-                   let _scratch: String = a + \"_\" + b\n    \
-                   1\n  \
+                   a.length() - b.length()\n  \
                  })\n  \
                  for s in sorted {\n    \
                    print(s)\n  \
