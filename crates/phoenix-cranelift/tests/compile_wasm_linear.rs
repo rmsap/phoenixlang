@@ -3353,6 +3353,117 @@ fn option_okor_run_under_wasmtime() {
     assert_wasm_matches_interp(src, "option_okor");
 }
 
+/// Option closure-payload transforms — `map`, `andThen`, `filter`,
+/// `orElse`, `unwrapOrElse`. Each branches on the discriminant and
+/// either runs a user closure on the matching variant's payload (for
+/// `map`/`andThen`/`filter`) or on the negative variant (for
+/// `orElse`/`unwrapOrElse`). Mixed `Int` (single-slot) and `String`
+/// (multi-slot) payload types exercise the rooting-on-ref-result
+/// path in `emit_option_some` after an allocating closure, and a
+/// `filter` over an `Option<String>` drives the ref-payload rooting
+/// branch in `translate_option_filter` that the `Int` cases skip.
+#[test]
+fn option_payload_transforms_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let s: Option<Int> = Some(3)\n  \
+                 let n: Option<Int> = None\n  \
+                 // map\n  \
+                 print(s.map(function(x: Int) -> Int { x * 10 }).unwrapOr(0))\n  \
+                 print(n.map(function(x: Int) -> Int { x * 10 }).isSome())\n  \
+                 // andThen\n  \
+                 print(s.andThen(function(x: Int) -> Option<Int> { Some(x + 1) }).unwrapOr(0))\n  \
+                 print(s.andThen(function(x: Int) -> Option<Int> { None }).isSome())\n  \
+                 // filter\n  \
+                 print(s.filter(function(x: Int) -> Bool { x > 0 }).isSome())\n  \
+                 print(s.filter(function(x: Int) -> Bool { x > 100 }).isSome())\n  \
+                 // orElse\n  \
+                 print(n.orElse(function() -> Option<Int> { Some(42) }).unwrapOr(0))\n  \
+                 print(s.orElse(function() -> Option<Int> { Some(42) }).unwrapOr(0))\n  \
+                 // unwrapOrElse\n  \
+                 print(n.unwrapOrElse(function() -> Int { 99 }))\n  \
+                 print(s.unwrapOrElse(function() -> Int { 99 }))\n  \
+                 // unwrapOrElse with a multi-slot (String) payload — drives\n  \
+                 // the BlockType::Empty + fat-pointer result-locals path in\n  \
+                 // translate_enum_unwrap_or_else (the Int cases above only\n  \
+                 // exercise the single-slot store/reload).\n  \
+                 let ns: Option<String> = None\n  \
+                 let ks: Option<String> = Some(\"have\")\n  \
+                 print(ns.unwrapOrElse(function() -> String { \"made\" }))\n  \
+                 print(ks.unwrapOrElse(function() -> String { \"made\" }))\n  \
+                 // map across ref payload (closure allocates) — pins the\n  \
+                 // ad-hoc ref-rooting path around emit_option_some.\n  \
+                 let si: Option<Int> = Some(7)\n  \
+                 print(si.map(function(x: Int) -> String { \"v=\" + toString(x) }).unwrapOr(\"none\"))\n  \
+                 // filter across a ref payload (String) — drives the\n  \
+                 // maybe_root_ref_payload branch in translate_option_filter\n  \
+                 // (the Int cases above only hit the value-typed no-op).\n  \
+                 let ss: Option<String> = Some(\"keep\")\n  \
+                 print(ss.filter(function(x: String) -> Bool { true }).unwrapOr(\"dropped\"))\n  \
+                 print(ss.filter(function(x: String) -> Bool { false }).unwrapOr(\"dropped\"))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "option_payload_transforms");
+}
+
+/// Result closure-payload transforms — `map`, `mapErr`, `andThen`,
+/// `orElse`, `unwrapOrElse`. The pass-through pointer trick (sending
+/// the receiver pointer down the non-matching arm because the
+/// preserved variant's layout is identical between input and output
+/// `Result` types) is exercised for both `map` (Err pass-through) and
+/// `mapErr` (Ok pass-through).
+///
+/// Two extra cases pin paths the Int→Int fixtures above leave
+/// uncovered:
+///   - `map` returning a ref-typed `U` that allocates (`Int -> String`)
+///     drives the `maybe_root_ref_payload` + `emit_enum_construct`
+///     rooting branch in `translate_result_map` (the Ok→Int cases only
+///     hit the value-typed branch).
+///   - the *passthrough with a payload-size change*: `map(Int ->
+///     String)` reading the Err arm and `mapErr(String -> Int)` reading
+///     the Ok arm both alias a receiver whose preserved-variant offset
+///     stays put while the *other* variant's payload size changes —
+///     the exact assumption the passthrough trick rests on.
+#[test]
+fn result_payload_transforms_run_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let ok: Result<Int, String> = Ok(5)\n  \
+                 let er: Result<Int, String> = Err(\"oops\")\n  \
+                 // map (Ok → Ok(f), Err passthrough)\n  \
+                 print(ok.map(function(x: Int) -> Int { x + 1 }).unwrapOr(0))\n  \
+                 print(er.map(function(x: Int) -> Int { x + 1 }).isOk())\n  \
+                 // map with a ref-typed (allocating) U — roots Ok(U) across construct\n  \
+                 print(ok.map(function(x: Int) -> String { \"v=\" + toString(x) }).unwrapOr(\"none\"))\n  \
+                 // map Int → String, then read the Err passthrough (Ok payload\n  \
+                 // size grew Int → String, Err offset must be unchanged)\n  \
+                 print(er.map(function(x: Int) -> String { \"v=\" + toString(x) }).err().unwrapOr(\"none\"))\n  \
+                 // mapErr (Ok passthrough, Err → Err(f))\n  \
+                 print(ok.mapErr(function(e: String) -> String { e + \"!\" }).isOk())\n  \
+                 print(er.mapErr(function(e: String) -> String { e + \"!\" }).err().unwrapOr(\"none\"))\n  \
+                 // mapErr String → Int, then read the Ok passthrough (Err payload\n  \
+                 // size shrank String → Int, Ok offset must be unchanged)\n  \
+                 print(ok.mapErr(function(e: String) -> Int { 0 }).unwrapOr(-1))\n  \
+                 // andThen\n  \
+                 print(ok.andThen(function(x: Int) -> Result<Int, String> { Ok(x * 2) }).unwrapOr(0))\n  \
+                 print(ok.andThen(function(x: Int) -> Result<Int, String> { Err(\"nope\") }).isOk())\n  \
+                 print(er.andThen(function(x: Int) -> Result<Int, String> { Ok(x * 2) }).isOk())\n  \
+                 // orElse\n  \
+                 print(er.orElse(function(e: String) -> Result<Int, String> { Ok(0) }).unwrapOr(-1))\n  \
+                 print(ok.orElse(function(e: String) -> Result<Int, String> { Ok(0) }).unwrapOr(-1))\n  \
+                 // unwrapOrElse\n  \
+                 print(ok.unwrapOrElse(function(e: String) -> Int { 0 }))\n  \
+                 print(er.unwrapOrElse(function(e: String) -> Int { 100 }))\n  \
+                 // unwrapOrElse with a multi-slot (String) Ok payload —\n  \
+                 // drives the BlockType::Empty + fat-pointer result-locals\n  \
+                 // path in translate_enum_unwrap_or_else, and passes the Err\n  \
+                 // payload into the recovery closure (the Int cases above\n  \
+                 // only exercise the single-slot store/reload).\n  \
+                 let oks: Result<String, String> = Ok(\"good\")\n  \
+                 let ers: Result<String, String> = Err(\"bad\")\n  \
+                 print(oks.unwrapOrElse(function(e: String) -> String { e + \"!\" }))\n  \
+                 print(ers.unwrapOrElse(function(e: String) -> String { e + \"!\" }))\n\
+               }\n";
+    assert_wasm_matches_interp(src, "result_payload_transforms");
+}
+
 /// `Map.get` / `Map.set` with **`Int` keys** — exercises the
 /// `key_is_string == false` branch in `translate_map_set` and the
 /// fixed-width (non-fat-pointer) key staging in both helpers. The
@@ -3567,25 +3678,29 @@ fn list_sortby_on_empty_string_list_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "list_sortby_empty_string");
 }
 
+/// Positive sibling of the historical "frontier" rejection test: all
+/// the List / Map / Result / Option methods native supports are now
+/// supported by the WASM backend too. The fixture exercises a method
+/// from each formerly-gated tier — `List.find` (closure-payload
+/// transform with Option result), `Map.get` (Option-returning
+/// lookup), `Option.unwrap` (positive payload), `Result.map`
+/// (Ok-arm closure transform with Err passthrough) — to pin that
+/// the closure-payload + Option-construct + payload-extract paths
+/// all compose end-to-end. A regression that re-broke any one of
+/// them would fail this test rather than silently surfacing only at
+/// an integration-level fixture.
 #[test]
-fn rejects_result_map_unsupported() {
-    // Frontier tracker for the next still-gated method. `List.find`,
-    // `Map.get` / `Map.set`, `Option.unwrapOr` and friends have all
-    // landed; the rejection slot now sits on `Result.map`, which
-    // needs the closure-payload-transform machinery (load discriminant,
-    // branch, extract Ok payload, call closure, re-wrap into a fresh
-    // Result) and so ships in a later slice.
+fn frontier_method_coverage_complete() {
     let src = "function main() {\n  \
+                 let xs: List<Int> = [1, 2, 3]\n  \
+                 let m: Map<String, Int> = {\"a\": 10}\n  \
                  let r: Result<Int, String> = Ok(1)\n  \
-                 let _ = r.map(function(x: Int) -> Int { x + 1 })\n  \
-                 print(true)\n\
+                 print(xs.find(function(x: Int) -> Bool { x > 1 }).unwrapOr(0))\n  \
+                 print(m.get(\"a\").unwrapOr(0))\n  \
+                 print(Some(7).unwrap())\n  \
+                 print(r.map(function(x: Int) -> Int { x + 100 }).unwrapOr(0))\n\
                }\n";
-    let err = expect_wasm_compile_error(src);
-    assert!(
-        err.contains("Result.map") && err.contains("not yet supported"),
-        "expected `Result.map ... not yet supported` builtin-level error, \
-         got: {err}"
-    );
+    assert_wasm_matches_interp(src, "frontier_method_coverage_complete");
 }
 
 /// Hand-build an IR module whose `main` constructs an enum value

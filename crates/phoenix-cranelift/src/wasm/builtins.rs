@@ -555,9 +555,13 @@ fn translate_map_set(
 /// Per-method dispatcher for `Result.<m>` / `Option.<m>` builtins.
 /// Routes the simple discriminant-equality checks to
 /// [`translate_enum_is_variant_builtin`] and the payload-handling
-/// methods to their own helpers (currently `unwrapOr`; `unwrap` /
-/// `map` / `andThen` / `mapErr` / `ok` / `err` / `orElse` / `filter`
-/// / `okOr` / `unwrapOrElse` ship in later slices).
+/// methods to their own helpers. The full method surface the
+/// interpreter recognizes is now lowered (`is*` / `unwrap` /
+/// `unwrapOr` / `unwrapOrElse` / `map` / `mapErr` / `andThen` /
+/// `orElse` / `filter` / `ok` / `err` / `okOr`), so the catch-all
+/// arm is defensive: a valid program never reaches it (an unknown
+/// method is rejected earlier by the type checker as "no method `m`
+/// on type `Option`/`Result`").
 fn translate_result_option_builtin(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
@@ -588,11 +592,33 @@ fn translate_result_option_builtin(
         // tagging the `None` case with a caller-supplied default `Err`
         // value. Pure branching + enum construct, no closure.
         ("Option", "okOr") => translate_option_okor(ctx, b, ir_module, args, instr),
+        // Closure-payload transforms: each invokes a user closure on
+        // the matching variant's payload (or in the `*OrElse` family,
+        // the *non*-matching variant's payload) and rebuilds the result
+        // enum from the closure's return.
+        ("Option", "map") => translate_option_map(ctx, b, ir_module, args, instr),
+        ("Option", "andThen") => translate_option_and_then(ctx, b, ir_module, args, instr),
+        ("Option", "orElse") => translate_option_or_else(ctx, b, ir_module, args, instr),
+        ("Option", "unwrapOrElse") => {
+            translate_enum_unwrap_or_else(ctx, b, ir_module, OPTION_ENUM, args, instr)
+        }
+        ("Option", "filter") => translate_option_filter(ctx, b, ir_module, args, instr),
+        ("Result", "map") => translate_result_map(ctx, b, ir_module, args, instr),
+        ("Result", "mapErr") => translate_result_map_err(ctx, b, ir_module, args, instr),
+        ("Result", "andThen") => translate_result_and_then(ctx, b, ir_module, args, instr),
+        ("Result", "orElse") => translate_result_or_else(ctx, b, ir_module, args, instr),
+        ("Result", "unwrapOrElse") => {
+            translate_enum_unwrap_or_else(ctx, b, ir_module, RESULT_ENUM, args, instr)
+        }
+        // Unreachable for a valid program: every method the sema layer
+        // and IR interpreter recognize on `Option`/`Result` is dispatched
+        // above. An unknown method is rejected earlier by the type checker
+        // ("no method `m` on type `Option`/`Result`"), so reaching here
+        // means the IR is malformed.
         _ => Err(CompileError::new(format!(
-            "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` not yet supported \
-             (Phase 2.4 PR 3d — closure-payload-transform methods like `map` / \
-             `mapErr` / `andThen` / `orElse` / `unwrapOrElse` / `filter` ship \
-             in a later slice)"
+            "wasm32-linear: `BuiltinCall(\"{enum_name}.{method}\")` reached the \
+             dispatcher catch-all — the type checker should have rejected an \
+             unknown `{enum_name}` method (internal compiler bug)"
         ))),
     }
 }
@@ -790,33 +816,20 @@ fn translate_result_to_option(
     let vid = expect_result(instr, "BuiltinCall(\"Result.ok/err\")")?;
     let recv_binding = ctx.binding_of(args[0])?;
     let recv_local = recv_binding.single_local();
-    let payload_ty = match (&recv_binding.ir_type, tag) {
-        (IrType::EnumRef(name, targs), "Ok") if name == RESULT_ENUM => {
-            targs.first().cloned().ok_or_else(|| {
-                CompileError::new(
-                    "wasm32-linear: `Result.ok` receiver missing type arg `T` \
-                     (internal compiler bug)"
-                        .to_string(),
-                )
-            })?
-        }
-        (IrType::EnumRef(name, targs), "Err") if name == RESULT_ENUM => {
-            targs.get(1).cloned().ok_or_else(|| {
-                CompileError::new(
-                    "wasm32-linear: `Result.err` receiver missing type arg `E` \
-                     (internal compiler bug)"
-                        .to_string(),
-                )
-            })?
-        }
-        (other, t) => {
+    // `ok` reads `T` (type arg 0), `err` reads `E` (type arg 1) — both via
+    // the shared `enum_targ` extractor that the closure-payload transforms
+    // use, so the receiver-shape diagnostic stays consistent across sites.
+    let targ_idx = match tag {
+        "Ok" => 0,
+        "Err" => 1,
+        other => {
             return Err(CompileError::new(format!(
-                "wasm32-linear: `Result.{}` receiver must be `Result<T, E>`, got \
-                 `{other:?}` (internal compiler bug)",
-                t.to_lowercase()
+                "wasm32-linear: `translate_result_to_option` got tag `{other}` — \
+                 only `Ok` / `Err` are supported (internal compiler bug)"
             )));
         }
     };
+    let payload_ty = enum_targ(&recv_binding.ir_type, RESULT_ENUM, targ_idx)?;
     let payload_idx = find_variant_index(ir_module, RESULT_ENUM, tag)?;
     let variant = compute_variant_field_offsets(std::slice::from_ref(&payload_ty))?;
     let payload_offset = variant.field_offsets[0];
@@ -920,6 +933,513 @@ fn translate_option_okor(
         std::slice::from_ref(&err_ty),
         &err_locals_owned,
     )?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+// --- Closure-payload transforms ---------------------------------------
+//
+// The methods below share a structural pattern: load the receiver's
+// discriminant, branch on it, run a closure on one side's payload (or
+// emit a passthrough/short-circuit on the other), and produce a result
+// enum or unwrapped value. Common helpers below cover the shared bits.
+
+/// Pull the closure's user-facing return type out of its `IrType`.
+fn closure_return_type(closure_ir_ty: &IrType) -> Result<IrType, CompileError> {
+    match closure_ir_ty {
+        IrType::ClosureRef { return_type, .. } => Ok((**return_type).clone()),
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: expected `ClosureRef` for closure, got `{other:?}` \
+             (internal compiler bug)"
+        ))),
+    }
+}
+
+/// Extract one type-arg from an `EnumRef` (e.g. `T` from `Option<T>`,
+/// `E` from `Result<T, E>`). `targ_idx` is 0 for the first type arg.
+fn enum_targ(ty: &IrType, expected_name: &str, targ_idx: usize) -> Result<IrType, CompileError> {
+    match ty {
+        IrType::EnumRef(name, targs) if name == expected_name => {
+            targs.get(targ_idx).cloned().ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-linear: `{expected_name}` receiver missing type arg \
+                     [{targ_idx}] (internal compiler bug)"
+                ))
+            })
+        }
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: expected `{expected_name}<...>` receiver, got \
+             `{other:?}` (internal compiler bug)"
+        ))),
+    }
+}
+
+/// If `ty` is ref-typed, push a 1-slot ad-hoc shadow frame and root
+/// `value_local`'s first slot into it, returning the frame local for
+/// a later pop. No-op (returns `None`) for value-typed payloads. Used
+/// to keep closure results alive across the subsequent enum-construct
+/// `phx_gc_alloc`.
+fn maybe_root_ref_payload(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ty: &IrType,
+    value_local: u32,
+) -> Result<Option<u32>, CompileError> {
+    if !ty.is_ref_type() {
+        return Ok(None);
+    }
+    let frame = emit_gc_push_frame_at(ctx, b, 1)?;
+    emit_gc_set_root_at(ctx, b, frame, 0, value_local)?;
+    Ok(Some(frame))
+}
+
+/// Counterpart to [`maybe_root_ref_payload`] — pop the ad-hoc frame
+/// if one was pushed. Cheap no-op for the `None` (value-typed) case.
+fn maybe_pop_ref_frame(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    frame: Option<u32>,
+) -> Result<(), CompileError> {
+    if let Some(f) = frame {
+        emit_gc_pop_frame_at(ctx, b, f)?;
+    }
+    Ok(())
+}
+
+/// Validate that a closure-payload transform got exactly its two
+/// arguments — `(receiver, closure)`. Every transform in this section
+/// has the same arity, so the check and its diagnostic live here
+/// rather than being copy-pasted into each translator. `method` is the
+/// `Enum.method` name used in the error message.
+fn expect_receiver_and_closure(args: &[ValueId], method: &str) -> Result<(), CompileError> {
+    if args.len() != 2 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"{method}\")` requires 2 args \
+             (receiver, closure), got {} (internal compiler bug)",
+            args.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Emit the discriminant-equality prelude shared by every
+/// closure-payload transform: load the receiver's discriminant (the
+/// `i32` at offset 0), compare it against `variant_idx`, and leave the
+/// boolean on the stack for a following `If`.
+fn emit_discriminant_eq(ctx: &mut FuncTranslateCtx, recv_local: u32, variant_idx: u32) {
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::I32Load(i32_memarg(0)));
+    ctx.emit(Instruction::I32Const(variant_idx as i32));
+    ctx.emit(Instruction::I32Eq);
+}
+
+/// `Option.map(f: T -> U)` -> `Option<U>`.
+///
+/// `Some(t)` → `Some(f(t))`, `None` → `None`. The closure runs on the
+/// extracted `T` payload; its `U` return value is wrapped in a fresh
+/// `Some`. When `U` is ref-typed, the closure result is rooted in an
+/// ad-hoc shadow frame across the `emit_option_some` allocation so an
+/// allocating closure can't be swept by the wrap-side `phx_gc_alloc`.
+fn translate_option_map(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Option.map")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Option.map\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let t_ty = enum_targ(&recv_binding.ir_type, OPTION_ENUM, 0)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let u_ty = closure_return_type(&closure_ir_ty)?;
+
+    let some_idx = find_variant_index(ir_module, OPTION_ENUM, "Some")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&t_ty))?;
+    let t_offset = variant_in.field_offsets[0];
+
+    let t_locals = ctx.allocate_locals_for_ir_type_anon(&t_ty)?;
+    let u_locals = ctx.allocate_locals_for_ir_type_anon(&u_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, some_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Some path: extract T, call f(T) → U, wrap as Some(U).
+    emit_field_load(ctx, recv_local, t_offset, &t_ty)?;
+    store_stack_into_locals(ctx, &t_locals);
+    let call_args = vec![t_locals];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    store_stack_into_locals(ctx, &u_locals);
+    let root_frame = maybe_root_ref_payload(ctx, b, &u_ty, u_locals[0])?;
+    emit_option_some(ctx, b, ir_module, &u_ty, &u_locals)?;
+    maybe_pop_ref_frame(ctx, b, root_frame)?;
+    ctx.emit(Instruction::Else);
+    emit_option_none(ctx, b, ir_module)?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Option.andThen(f: T -> Option<U>)` -> `Option<U>`. The closure
+/// already returns the final `Option<U>`, so the positive arm hands
+/// the closure result straight through (no rewrap). `None` produces a
+/// fresh `None` on the negative arm.
+fn translate_option_and_then(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Option.andThen")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Option.andThen\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let t_ty = enum_targ(&recv_binding.ir_type, OPTION_ENUM, 0)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let some_idx = find_variant_index(ir_module, OPTION_ENUM, "Some")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&t_ty))?;
+    let t_offset = variant_in.field_offsets[0];
+    let t_locals = ctx.allocate_locals_for_ir_type_anon(&t_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, some_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    emit_field_load(ctx, recv_local, t_offset, &t_ty)?;
+    store_stack_into_locals(ctx, &t_locals);
+    let call_args = vec![t_locals];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    // Closure return is already Option<U>; leave on stack.
+    ctx.emit(Instruction::Else);
+    emit_option_none(ctx, b, ir_module)?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Option.orElse(f: () -> Option<T>)` -> `Option<T>`. The closure
+/// takes no user arg; it runs on the `None` path and its return is
+/// the result. The `Some` path passes the receiver pointer through
+/// unchanged — the input and output types match exactly.
+fn translate_option_or_else(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Option.orElse")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Option.orElse\")")?;
+    let recv_local = ctx.binding_of(args[0])?.single_local();
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let some_idx = find_variant_index(ir_module, OPTION_ENUM, "Some")?;
+
+    emit_discriminant_eq(ctx, recv_local, some_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Some path: passthrough receiver (same Option<T> type).
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::Else);
+    // None path: call f() → Option<T>, leave on stack.
+    let call_args: Vec<Vec<u32>> = Vec::new();
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Option.filter(pred: T -> Bool)` -> `Option<T>`. On `Some(t)`,
+/// runs the predicate: keep as `Some(t)` if true, otherwise yield
+/// `None`. `None` is passed through.
+fn translate_option_filter(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Option.filter")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Option.filter\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let t_ty = enum_targ(&recv_binding.ir_type, OPTION_ENUM, 0)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let some_idx = find_variant_index(ir_module, OPTION_ENUM, "Some")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&t_ty))?;
+    let t_offset = variant_in.field_offsets[0];
+    let t_locals = ctx.allocate_locals_for_ir_type_anon(&t_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, some_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Some path: extract T, call pred(T) → Bool. The predicate's `Bool`
+    // result is left on the stack to drive the keep/drop `If` directly.
+    emit_field_load(ctx, recv_local, t_offset, &t_ty)?;
+    store_stack_into_locals(ctx, &t_locals);
+    let call_args = vec![t_locals.clone()];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // pred true: rebuild Some(t). `t` stays reachable through the
+    // (rooted) receiver across the predicate call, so this re-root is
+    // belt-and-suspenders: it pins `t` directly across the Some
+    // allocation rather than relying on the receiver root. No-op for
+    // value-typed `t`.
+    let root_frame = maybe_root_ref_payload(ctx, b, &t_ty, t_locals[0])?;
+    emit_option_some(ctx, b, ir_module, &t_ty, &t_locals)?;
+    maybe_pop_ref_frame(ctx, b, root_frame)?;
+    ctx.emit(Instruction::Else);
+    emit_option_none(ctx, b, ir_module)?;
+    ctx.emit(Instruction::End);
+    ctx.emit(Instruction::Else);
+    emit_option_none(ctx, b, ir_module)?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Option.unwrapOrElse` / `Result.unwrapOrElse`: extract the
+/// positive-variant payload, or call the closure (no user args for
+/// Option; the Err payload for Result) and use its return.
+fn translate_enum_unwrap_or_else(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    enum_name: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, &format!("{enum_name}.unwrapOrElse"))?;
+    let vid = expect_result(instr, "BuiltinCall(\"enum.unwrapOrElse\")")?;
+    let positive_variant = match enum_name {
+        OPTION_ENUM => "Some",
+        RESULT_ENUM => "Ok",
+        _ => unreachable!("dispatcher restricts to Option/Result"),
+    };
+    let positive_idx = find_variant_index(ir_module, enum_name, positive_variant)?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let recv_ir_type = recv_binding.ir_type.clone();
+    let payload_ty = instr.result_type.clone();
+    let variant = compute_variant_field_offsets(std::slice::from_ref(&payload_ty))?;
+    let payload_offset = variant.field_offsets[0];
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+
+    let result_locals = ctx.allocate_locals_for_ir_type_anon(&payload_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, positive_idx);
+    ctx.emit(Instruction::If(BlockType::Empty));
+    // Positive arm: extract payload.
+    emit_field_load(ctx, recv_local, payload_offset, &payload_ty)?;
+    store_stack_into_locals(ctx, &result_locals);
+    ctx.emit(Instruction::Else);
+    // Negative arm: call closure. For Result, closure takes the Err
+    // payload as its single user arg; for Option, the closure takes
+    // no user args.
+    let call_args: Vec<Vec<u32>> = if enum_name == RESULT_ENUM {
+        let err_ty = enum_targ(&recv_ir_type, RESULT_ENUM, 1)?;
+        let err_variant = compute_variant_field_offsets(std::slice::from_ref(&err_ty))?;
+        let err_offset = err_variant.field_offsets[0];
+        let err_locals = ctx.allocate_locals_for_ir_type_anon(&err_ty)?;
+        emit_field_load(ctx, recv_local, err_offset, &err_ty)?;
+        store_stack_into_locals(ctx, &err_locals);
+        vec![err_locals]
+    } else {
+        Vec::new()
+    };
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    store_stack_into_locals(ctx, &result_locals);
+    ctx.emit(Instruction::End);
+    for &local in &result_locals {
+        ctx.emit(Instruction::LocalGet(local));
+    }
+    ctx.emit_store_result(vid, payload_ty)?;
+    Ok(())
+}
+
+/// `Result.map(f: T -> U)` -> `Result<U, E>`. Ok arm runs the closure
+/// and wraps the result as Ok(U); Err arm passes the receiver pointer
+/// through unchanged (the Err(E) layout is identical between
+/// `Result<T, E>` and `Result<U, E>`).
+fn translate_result_map(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Result.map")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Result.map\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let t_ty = enum_targ(&recv_binding.ir_type, RESULT_ENUM, 0)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let u_ty = closure_return_type(&closure_ir_ty)?;
+    let ok_idx = find_variant_index(ir_module, RESULT_ENUM, "Ok")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&t_ty))?;
+    let t_offset = variant_in.field_offsets[0];
+    let t_locals = ctx.allocate_locals_for_ir_type_anon(&t_ty)?;
+    let u_locals = ctx.allocate_locals_for_ir_type_anon(&u_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, ok_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Ok path: extract T, call f → U, build Ok(U) of new Result type.
+    emit_field_load(ctx, recv_local, t_offset, &t_ty)?;
+    store_stack_into_locals(ctx, &t_locals);
+    let call_args = vec![t_locals];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    store_stack_into_locals(ctx, &u_locals);
+    let root_frame = maybe_root_ref_payload(ctx, b, &u_ty, u_locals[0])?;
+    let u_locals_owned = vec![u_locals.clone()];
+    emit_enum_construct(
+        ctx,
+        b,
+        RESULT_ENUM,
+        ok_idx,
+        std::slice::from_ref(&u_ty),
+        &u_locals_owned,
+    )?;
+    maybe_pop_ref_frame(ctx, b, root_frame)?;
+    ctx.emit(Instruction::Else);
+    // Err path: passthrough receiver (Err(E) layout is independent of T/U).
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Result.mapErr(f: E -> E2)` -> `Result<T, E2>`. Err arm runs the
+/// closure and wraps as Err(E2); Ok arm passes the receiver pointer
+/// through unchanged.
+fn translate_result_map_err(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Result.mapErr")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Result.mapErr\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let e_ty = enum_targ(&recv_binding.ir_type, RESULT_ENUM, 1)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let e2_ty = closure_return_type(&closure_ir_ty)?;
+    let ok_idx = find_variant_index(ir_module, RESULT_ENUM, "Ok")?;
+    let err_idx = find_variant_index(ir_module, RESULT_ENUM, "Err")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&e_ty))?;
+    let e_offset = variant_in.field_offsets[0];
+    let e_locals = ctx.allocate_locals_for_ir_type_anon(&e_ty)?;
+    let e2_locals = ctx.allocate_locals_for_ir_type_anon(&e2_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, ok_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Ok path: passthrough.
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::Else);
+    // Err path: extract E, call f → E2, build Err(E2).
+    emit_field_load(ctx, recv_local, e_offset, &e_ty)?;
+    store_stack_into_locals(ctx, &e_locals);
+    let call_args = vec![e_locals];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    store_stack_into_locals(ctx, &e2_locals);
+    let root_frame = maybe_root_ref_payload(ctx, b, &e2_ty, e2_locals[0])?;
+    let e2_locals_owned = vec![e2_locals.clone()];
+    emit_enum_construct(
+        ctx,
+        b,
+        RESULT_ENUM,
+        err_idx,
+        std::slice::from_ref(&e2_ty),
+        &e2_locals_owned,
+    )?;
+    maybe_pop_ref_frame(ctx, b, root_frame)?;
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Result.andThen(f: T -> Result<U, E>)` -> `Result<U, E>`. Ok arm
+/// calls the closure; its return (already a Result) is the answer.
+/// Err arm passes the receiver pointer through unchanged.
+fn translate_result_and_then(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Result.andThen")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Result.andThen\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let t_ty = enum_targ(&recv_binding.ir_type, RESULT_ENUM, 0)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let ok_idx = find_variant_index(ir_module, RESULT_ENUM, "Ok")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&t_ty))?;
+    let t_offset = variant_in.field_offsets[0];
+    let t_locals = ctx.allocate_locals_for_ir_type_anon(&t_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, ok_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    emit_field_load(ctx, recv_local, t_offset, &t_ty)?;
+    store_stack_into_locals(ctx, &t_locals);
+    let call_args = vec![t_locals];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
+    ctx.emit(Instruction::Else);
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::End);
+    ctx.emit_store_result(vid, instr.result_type.clone())?;
+    Ok(())
+}
+
+/// `Result.orElse(f: E -> Result<T, E2>)` -> `Result<T, E2>`. Err
+/// arm calls the closure with the extracted Err payload; the return
+/// (already a Result) is the answer. Ok arm passes the receiver
+/// pointer through unchanged.
+fn translate_result_or_else(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_receiver_and_closure(args, "Result.orElse")?;
+    let vid = expect_result(instr, "BuiltinCall(\"Result.orElse\")")?;
+    let recv_binding = ctx.binding_of(args[0])?;
+    let recv_local = recv_binding.single_local();
+    let e_ty = enum_targ(&recv_binding.ir_type, RESULT_ENUM, 1)?;
+    let closure_binding = ctx.binding_of(args[1])?;
+    let closure_local = closure_binding.single_local();
+    let closure_ir_ty = closure_binding.ir_type.clone();
+    let ok_idx = find_variant_index(ir_module, RESULT_ENUM, "Ok")?;
+    let variant_in = compute_variant_field_offsets(std::slice::from_ref(&e_ty))?;
+    let e_offset = variant_in.field_offsets[0];
+    let e_locals = ctx.allocate_locals_for_ir_type_anon(&e_ty)?;
+
+    emit_discriminant_eq(ctx, recv_local, ok_idx);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // Ok path: passthrough.
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::Else);
+    // Err path: extract E, call f → Result<T, E2>.
+    emit_field_load(ctx, recv_local, e_offset, &e_ty)?;
+    store_stack_into_locals(ctx, &e_locals);
+    let call_args = vec![e_locals];
+    emit_closure_call_raw(ctx, b, closure_local, &closure_ir_ty, &call_args)?;
     ctx.emit(Instruction::End);
     ctx.emit_store_result(vid, instr.result_type.clone())?;
     Ok(())
