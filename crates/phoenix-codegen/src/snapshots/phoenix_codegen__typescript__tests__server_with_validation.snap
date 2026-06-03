@@ -18,7 +18,10 @@ export function createRouter(handlers: Handlers): Router {
       const result = await handlers.createUser(body);
       res.json(result);
     } catch (error: unknown) {
-      if (error instanceof ValidationError) { res.status(400).json({ error: error.message }); return; }
+      if (error instanceof ValidationError) {
+        res.status(400).json({ error: error.message });
+        return;
+      }
       res.status(500).json({ error: "Internal Server Error" });
     }
   });

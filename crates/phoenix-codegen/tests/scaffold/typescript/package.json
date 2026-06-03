@@ -1,0 +1,21 @@
+{
+  "name": "phoenix-gen-ts-scaffold",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Compile-and-lint scaffold for Phoenix Gen's TypeScript target. The harness drops generated .ts files into generated/ and runs tsc/eslint/prettier against this project's pinned toolchain.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint generated/",
+    "format-check": "prettier --check generated/"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.2",
+    "eslint": "9.17.0",
+    "express": "5.0.1",
+    "prettier": "3.4.2",
+    "typescript": "5.7.2",
+    "typescript-eslint": "8.18.1"
+  }
+}

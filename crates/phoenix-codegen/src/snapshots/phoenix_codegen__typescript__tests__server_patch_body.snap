@@ -7,23 +7,30 @@ expression: files.server
 import { Router } from "express";
 import type { Request, Response } from "express";
 import type { Handlers } from "./handlers";
+import type { UpdateUserBody } from "./types";
 
 export function createRouter(handlers: Handlers): Router {
   const router = Router();
 
-  router.patch("/api/users/:id", async (req: Request, res: Response) => {
-    try {
-      const id = req.params.id;
-      const body = req.body;
-      const result = await handlers.updateUser(id, body);
-      res.json(result);
-    } catch (error: unknown) {
-      if (error instanceof Error) {
-        if (error.message === "NotFound") { res.status(404).json({ error: "NotFound" }); return; }
+  router.patch(
+    "/api/users/:id",
+    async (req: Request<{ id: string }>, res: Response) => {
+      try {
+        const id = req.params.id;
+        const body = req.body as UpdateUserBody;
+        const result = await handlers.updateUser(id, body);
+        res.json(result);
+      } catch (error: unknown) {
+        if (error instanceof Error) {
+          if (error.message === "NotFound") {
+            res.status(404).json({ error: "NotFound" });
+            return;
+          }
+        }
+        res.status(500).json({ error: "Internal Server Error" });
       }
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
+    },
+  );
 
   return router;
 }

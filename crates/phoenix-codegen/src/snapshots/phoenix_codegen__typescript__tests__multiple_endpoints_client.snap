@@ -18,9 +18,9 @@ export const api = {
       method: "GET",
     });
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
-    return await response.json();
+    return (await response.json()) as User[];
   },
 
   async createUser(body: CreateUserBody): Promise<User> {
@@ -30,9 +30,9 @@ export const api = {
       body: JSON.stringify(body),
     });
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
-    return await response.json();
+    return (await response.json()) as User;
   },
 
   async getUser(id: string): Promise<User> {
@@ -40,9 +40,9 @@ export const api = {
       method: "GET",
     });
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
-    return await response.json();
+    return (await response.json()) as User;
   },
 
   async deleteUser(id: string): Promise<void> {
@@ -50,8 +50,7 @@ export const api = {
       method: "DELETE",
     });
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
   },
-
-}
+};

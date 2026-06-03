@@ -7,6 +7,7 @@ expression: files.server
 import { Router } from "express";
 import type { Request, Response } from "express";
 import type { Handlers } from "./handlers";
+import type { CreateUserBody } from "./types";
 
 export function createRouter(handlers: Handlers): Router {
   const router = Router();
@@ -15,40 +16,46 @@ export function createRouter(handlers: Handlers): Router {
     try {
       const result = await handlers.listUsers();
       res.json(result);
-    } catch (error: unknown) {
+    } catch {
       res.status(500).json({ error: "Internal Server Error" });
     }
   });
 
   router.post("/api/users", async (req: Request, res: Response) => {
     try {
-      const body = req.body;
+      const body = req.body as CreateUserBody;
       const result = await handlers.createUser(body);
       res.json(result);
-    } catch (error: unknown) {
+    } catch {
       res.status(500).json({ error: "Internal Server Error" });
     }
   });
 
-  router.get("/api/users/:id", async (req: Request, res: Response) => {
-    try {
-      const id = req.params.id;
-      const result = await handlers.getUser(id);
-      res.json(result);
-    } catch (error: unknown) {
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
+  router.get(
+    "/api/users/:id",
+    async (req: Request<{ id: string }>, res: Response) => {
+      try {
+        const id = req.params.id;
+        const result = await handlers.getUser(id);
+        res.json(result);
+      } catch {
+        res.status(500).json({ error: "Internal Server Error" });
+      }
+    },
+  );
 
-  router.delete("/api/users/:id", async (req: Request, res: Response) => {
-    try {
-      const id = req.params.id;
-      await handlers.deleteUser(id);
-      res.status(204).end();
-    } catch (error: unknown) {
-      res.status(500).json({ error: "Internal Server Error" });
-    }
-  });
+  router.delete(
+    "/api/users/:id",
+    async (req: Request<{ id: string }>, res: Response) => {
+      try {
+        const id = req.params.id;
+        await handlers.deleteUser(id);
+        res.status(204).end();
+      } catch {
+        res.status(500).json({ error: "Internal Server Error" });
+      }
+    },
+  );
 
   return router;
 }

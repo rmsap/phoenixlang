@@ -109,6 +109,23 @@ jobs:
       # so the OpenAPI target step does not pay the download inside the test.
       - name: Pre-fetch redocly CLI
         run: npx --yes @redocly/cli --version
+      # The TypeScript target runs tsc/eslint/prettier against the pinned npm
+      # project at tests/scaffold/typescript. Install its locked deps so the
+      # harness's node_modules check passes and the E2E gate stays enforced.
+      - name: Install TypeScript scaffold deps (npm ci)
+        working-directory: crates/phoenix-codegen/tests/scaffold/typescript
+        run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The Python target runs black/ruff/mypy against the pinned project at
+      # tests/scaffold/python. Create its local .venv and install the locked
+      # deps so the harness's .venv check passes and the E2E gate stays enforced.
+      - name: Install Python scaffold deps (venv)
+        working-directory: crates/phoenix-codegen/tests/scaffold/python
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements-dev.txt
       - name: Compile-and-lint generated output (all installed targets)
         env:
           PHOENIX_GEN_E2E: "1"

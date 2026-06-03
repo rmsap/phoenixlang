@@ -391,11 +391,28 @@ fn server_imports_express() {
 #[test]
 fn server_has_routes_for_all_endpoints() {
     let files = generate_full_schema();
-    assert!(files.server.contains("router.get(\"/api/users\""));
-    assert!(files.server.contains("router.post(\"/api/users\""));
-    assert!(files.server.contains("router.put(\"/api/users/:id\""));
-    assert!(files.server.contains("router.get(\"/api/users/:id\""));
-    assert!(files.server.contains("router.delete(\"/api/users/:id\""));
+    // A route's `router.X(...)` opener stays on one line when it fits the print
+    // width, but wraps (method call and path on separate lines) once a path
+    // param widens the `Request<{...}>` type past it. Assert the exact form for
+    // each so a regression in either layout is caught — not just that the method
+    // and path appear somewhere.
+    let inline = |method: &str, path: &str| {
+        files
+            .server
+            .contains(&format!("router.{method}(\"{path}\", async (req: "))
+    };
+    let wrapped = |method: &str, path: &str| {
+        files
+            .server
+            .contains(&format!("router.{method}(\n    \"{path}\",\n"))
+    };
+    // Collection routes (no path param) fit inline.
+    assert!(inline("get", "/api/users"));
+    assert!(inline("post", "/api/users"));
+    // Item routes carry a `Request<{ id: string }>` param type and wrap.
+    assert!(wrapped("put", "/api/users/:id"));
+    assert!(wrapped("get", "/api/users/:id"));
+    assert!(wrapped("delete", "/api/users/:id"));
 }
 
 #[test]
@@ -784,6 +801,51 @@ fn generate_constrained_openapi() -> String {
     phoenix_codegen::generate_openapi(&program, &result)
 }
 
+/// A constrained field whose name is a non-ASCII (Unicode) identifier — Phoenix
+/// accepts these (see the lexer's `unicode_identifier_*` tests) — and is long
+/// enough to overflow the print width so the validation guard's condition is
+/// broken across lines. That break path runs `split_top_level` over an
+/// expression containing multi-byte characters; byte-indexing there would panic
+/// mid-character. This test fails (panics) on a regression and otherwise locks
+/// the wrapped output.
+#[test]
+fn constraint_unicode_field_name_wraps_without_panic() {
+    let schema = r#"
+struct Perfil {
+    Int id
+    String descripciónMuyLargaConCaracteresÑoÑoParaForzarElAjusteDeLínea where self.length > 0 && self.length <= 100
+}
+
+endpoint createPerfil: POST "/api/perfiles" {
+    body Perfil omit { id }
+    response Perfil
+}
+"#;
+    let tokens = tokenize(schema, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+
+    // The overflowing constraint guard must break across lines (negation opened
+    // on its own line, conjuncts joined by a trailing `&&`).
+    assert!(
+        files.types.contains("    !(\n"),
+        "expected the negated constraint to break across lines, got:\n{}",
+        files.types
+    );
+    assert!(
+        files.types.contains(".length > 0 &&\n"),
+        "expected the `&&` conjuncts to each take their own line, got:\n{}",
+        files.types
+    );
+}
+
 #[test]
 fn constraint_types_has_validation_error_class() {
     let files = generate_constrained();
@@ -807,8 +869,8 @@ fn constraint_types_has_validate_function() {
 #[test]
 fn constraint_validate_checks_type() {
     let files = generate_constrained();
-    assert!(files.types.contains("typeof obj.name !== 'string'"));
-    assert!(files.types.contains("typeof obj.age !== 'number'"));
+    assert!(files.types.contains("typeof obj.name !== \"string\""));
+    assert!(files.types.contains("typeof obj.age !== \"number\""));
 }
 
 #[test]

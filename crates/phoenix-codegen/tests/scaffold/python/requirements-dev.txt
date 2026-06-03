@@ -1,0 +1,14 @@
+# Pinned toolchain + runtime deps for the Phoenix Gen Python compile-and-lint
+# scaffold. The harness drops generated *.py into generated/ and runs
+# black/ruff/mypy against this project's venv (.venv), which is gitignored and
+# acts as the analog of node_modules. Versions are pinned for reproducibility.
+
+# Static analysis / formatting toolchain.
+black==24.10.0
+ruff==0.8.4
+mypy==1.13.0
+
+# Runtime deps the generated code imports, so mypy can resolve them.
+pydantic==2.10.4
+fastapi==0.115.6
+httpx==0.28.1

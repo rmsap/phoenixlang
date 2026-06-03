@@ -8,5 +8,6 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+
 class Measurement(BaseModel):
-    value: float = Field(..., ge=0, le=100.5)
+    value: float = Field(..., ge=0.0, le=100.5)

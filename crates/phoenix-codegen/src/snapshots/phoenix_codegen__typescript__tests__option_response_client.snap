@@ -18,9 +18,8 @@ export const api = {
       method: "GET",
     });
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
-    return await response.json();
+    return (await response.json()) as User | undefined;
   },
-
-}
+};

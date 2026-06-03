@@ -7,5 +7,9 @@ expression: files.handlers
 import type { User } from "./types";
 
 export interface Handlers {
-  listUsers(query: { page: number; limit: number; search?: string | undefined }): Promise<User[]>;
+  listUsers(query: {
+    page: number;
+    limit: number;
+    search?: string | undefined;
+  }): Promise<User[]>;
 }

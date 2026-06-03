@@ -1,0 +1,7 @@
+# Intentionally (almost) empty.
+#
+# Prettier defaults its --ignore-path to [".gitignore", ".prettierignore"]. Our
+# .gitignore lists `generated/` (so generated output isn't committed), which
+# would also make `prettier --check generated/` silently skip every file. The
+# harness passes `--ignore-path .prettierignore` so this file REPLACES that
+# default list, and Prettier actually checks the generated files.

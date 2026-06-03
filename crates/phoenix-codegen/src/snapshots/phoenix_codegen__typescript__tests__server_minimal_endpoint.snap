@@ -15,7 +15,7 @@ export function createRouter(handlers: Handlers): Router {
     try {
       await handlers.healthCheck();
       res.status(204).end();
-    } catch (error: unknown) {
+    } catch {
       res.status(500).json({ error: "Internal Server Error" });
     }
   });

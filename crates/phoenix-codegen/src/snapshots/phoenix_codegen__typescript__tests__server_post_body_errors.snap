@@ -7,19 +7,26 @@ expression: files.server
 import { Router } from "express";
 import type { Request, Response } from "express";
 import type { Handlers } from "./handlers";
+import type { CreateUserBody } from "./types";
 
 export function createRouter(handlers: Handlers): Router {
   const router = Router();
 
   router.post("/api/users", async (req: Request, res: Response) => {
     try {
-      const body = req.body;
+      const body = req.body as CreateUserBody;
       const result = await handlers.createUser(body);
       res.json(result);
     } catch (error: unknown) {
       if (error instanceof Error) {
-        if (error.message === "ValidationError") { res.status(400).json({ error: "ValidationError" }); return; }
-        if (error.message === "Conflict") { res.status(409).json({ error: "Conflict" }); return; }
+        if (error.message === "ValidationError") {
+          res.status(400).json({ error: "ValidationError" });
+          return;
+        }
+        if (error.message === "Conflict") {
+          res.status(409).json({ error: "Conflict" });
+          return;
+        }
       }
       res.status(500).json({ error: "Internal Server Error" });
     }

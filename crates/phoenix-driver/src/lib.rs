@@ -409,6 +409,7 @@ fn emit_target(
         }
         "python" => {
             let files = phoenix_codegen::generate_python(program, check_result);
+            generated.push(write_file(out_dir, "__init__.py", &files.init)?);
             generated.push(write_file(out_dir, "models.py", &files.models)?);
             if mode != GenMode::ServerOnly {
                 generated.push(write_file(out_dir, "client.py", &files.client)?);

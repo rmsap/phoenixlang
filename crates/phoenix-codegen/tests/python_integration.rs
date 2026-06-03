@@ -58,6 +58,32 @@ fn generate_full() -> phoenix_codegen::PythonFiles {
     phoenix_codegen::generate_python(&program, &result)
 }
 
+// ── __init__.py tests ───────────────────────────────────────────────
+
+/// The generator must emit a non-empty `__init__.py` so the output dir is a
+/// package and the intra-package relative imports (`from .models import ...`)
+/// in client/handlers/server resolve. Locks that the package marker keeps
+/// being produced — its absence would break those imports at import time.
+#[test]
+fn emits_package_init() {
+    let files = generate_full();
+    assert!(
+        !files.init.trim().is_empty(),
+        "expected a non-empty __init__.py, got: {:?}",
+        files.init
+    );
+    // It is a comment-only marker, not runnable logic, so it must not declare
+    // any names. Guard against accidentally emitting code here.
+    assert!(
+        files.init.lines().all(|l| {
+            let l = l.trim();
+            l.is_empty() || l.starts_with('#')
+        }),
+        "expected __init__.py to be comment-only, got: {:?}",
+        files.init
+    );
+}
+
 // ── models.py tests ─────────────────────────────────────────────────
 
 #[test]
@@ -135,9 +161,16 @@ fn client_has_api_class() {
 #[test]
 fn client_has_list_with_query_params() {
     let files = generate_full();
-    assert!(files.client.contains(
-        "async def list_users(self, *, page: int = 1, limit: int = 20, search: str | None = None)"
-    ));
+    // The signature exceeds black's 88-col line length, so it is emitted in the
+    // exploded one-param-per-line form.
+    assert!(files.client.contains("async def list_users(\n"));
+    assert!(files.client.contains("        page: int = 1,\n"));
+    assert!(files.client.contains("        limit: int = 20,\n"));
+    assert!(
+        files
+            .client
+            .contains("        search: str | None = None,\n")
+    );
 }
 
 #[test]
@@ -173,7 +206,7 @@ fn client_has_delete() {
 #[test]
 fn handlers_has_class() {
     let files = generate_full();
-    assert!(files.handlers.contains("class Handlers:"));
+    assert!(files.handlers.contains("class Handlers(Protocol):"));
 }
 
 #[test]

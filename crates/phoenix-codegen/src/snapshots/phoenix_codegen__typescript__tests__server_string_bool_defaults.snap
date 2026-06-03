@@ -15,12 +15,15 @@ export function createRouter(handlers: Handlers): Router {
     try {
       const query = {
         sort: req.query.sort !== undefined ? req.query.sort as string : "name",
-        ascending: req.query.ascending !== undefined ? req.query.ascending === "true" : true,
+        ascending:
+          req.query.ascending !== undefined
+            ? req.query.ascending === "true"
+            : true,
         limit: req.query.limit !== undefined ? Number(req.query.limit) : 50,
       };
       const result = await handlers.listItems(query);
       res.json(result);
-    } catch (error: unknown) {
+    } catch {
       res.status(500).json({ error: "Internal Server Error" });
     }
   });

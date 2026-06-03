@@ -17,6 +17,9 @@ use phoenix_sema::Analysis;
 use phoenix_sema::checker::{DefaultValue, EndpointInfo, ResolvedDerivedType};
 use phoenix_sema::types::Type;
 
+mod format;
+use format::*;
+
 /// The output of TypeScript code generation: four file contents.
 pub struct GeneratedFiles {
     /// Content for `types.ts` — interfaces, enums, derived types, error types.
@@ -116,11 +119,16 @@ impl<'a> TsGenerator<'a> {
         self.emit_client_imports();
         self.emit_client_preamble();
 
-        for ep in &self.check_result.endpoints {
+        for (i, ep) in self.check_result.endpoints.iter().enumerate() {
+            // One blank line between methods (none before the first).
+            if i > 0 {
+                self.client_out.push('\n');
+            }
             self.emit_client_function(ep);
         }
 
-        self.client_out.push_str("}\n");
+        // Close the `api` object literal (assigned to a const → needs `;`).
+        self.client_out.push_str("};\n");
 
         // Generate handlers.ts
         self.handlers_out
@@ -141,10 +149,10 @@ impl<'a> TsGenerator<'a> {
         self.emit_server_router();
 
         GeneratedFiles {
-            types: self.types_out,
-            client: self.client_out,
-            handlers: self.handlers_out,
-            server: self.server_out,
+            types: finalize(self.types_out),
+            client: finalize(self.client_out),
+            handlers: finalize(self.handlers_out),
+            server: finalize(self.server_out),
         }
     }
 
@@ -198,66 +206,32 @@ impl<'a> TsGenerator<'a> {
             self.emitted_validation_error = true;
         }
 
-        self.types_out.push_str(&format!(
-            "export function validate{}(input: unknown): {} {{\n",
-            s.name, s.name
-        ));
-        self.types_out.push_str(
-            "  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');\n",
-        );
-        self.types_out
-            .push_str("  const obj = input as Record<string, unknown>;\n");
-
-        for f in &info.fields {
-            let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
-            let inner_ty = if is_option {
-                if let Type::Generic(_, args) = &f.ty {
-                    &args[0]
+        emit_validate_signature(&mut self.types_out, &s.name);
+        let vfields: Vec<ValidationField> = info
+            .fields
+            .iter()
+            .map(|f| {
+                let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                let inner_ty = if is_option {
+                    match &f.ty {
+                        Type::Generic(_, args) => &args[0],
+                        _ => &f.ty,
+                    }
                 } else {
                     &f.ty
+                };
+                ValidationField {
+                    name: f.name.clone(),
+                    optional: is_option,
+                    ts_typeof: ts_typeof_of(inner_ty),
+                    constraint: f
+                        .constraint
+                        .as_ref()
+                        .map(|c| constraint_expr_to_ts(c, &f.name)),
                 }
-            } else {
-                &f.ty
-            };
-
-            let ts_typeof = match inner_ty {
-                Type::Int | Type::Float => Some("number"),
-                Type::String => Some("string"),
-                Type::Bool => Some("boolean"),
-                _ => None,
-            };
-
-            // Type check for primitive fields
-            if let Some(typeof_str) = ts_typeof {
-                if is_option {
-                    self.types_out.push_str(&format!(
-                        "  if (obj.{name} !== undefined && typeof obj.{name} !== '{ty}') throw new ValidationError('{name}: expected {ty}');\n",
-                        name = f.name, ty = typeof_str
-                    ));
-                } else {
-                    self.types_out.push_str(&format!(
-                        "  if (typeof obj.{name} !== '{ty}') throw new ValidationError('{name}: expected {ty}');\n",
-                        name = f.name, ty = typeof_str
-                    ));
-                }
-            }
-
-            // Constraint check
-            if let Some(ref constraint) = f.constraint {
-                let ts_expr = constraint_expr_to_ts(constraint, &f.name);
-                if is_option {
-                    self.types_out.push_str(&format!(
-                        "  if (obj.{name} !== undefined && !({expr})) throw new ValidationError('{name}: constraint violated');\n",
-                        name = f.name, expr = ts_expr,
-                    ));
-                } else {
-                    self.types_out.push_str(&format!(
-                        "  if (!({expr})) throw new ValidationError('{name}: constraint violated');\n",
-                        name = f.name, expr = ts_expr,
-                    ));
-                }
-            }
-        }
+            })
+            .collect();
+        emit_validation_body(&mut self.types_out, &vfields);
 
         self.types_out
             .push_str(&format!("  return obj as unknown as {};\n", s.name));
@@ -278,33 +252,28 @@ impl<'a> TsGenerator<'a> {
                 .iter()
                 .map(|v| format!("\"{}\"", v.name))
                 .collect();
-            self.types_out.push_str(&format!(
-                "export type {} = {};\n\n",
-                e.name,
-                variants.join(" | ")
-            ));
+            emit_union_type_alias(&mut self.types_out, &e.name, &variants);
         } else {
-            // Tagged union
-            self.types_out
-                .push_str(&format!("export type {} =\n", e.name));
-            for v in &e.variants {
-                if v.fields.is_empty() {
-                    self.types_out
-                        .push_str(&format!("  | {{ tag: \"{}\" }}\n", v.name));
-                } else if v.fields.len() == 1 {
-                    let ts = type_expr_to_ts(&v.fields[0]);
-                    self.types_out
-                        .push_str(&format!("  | {{ tag: \"{}\"; value: {} }}\n", v.name, ts));
-                } else {
-                    let ts: Vec<String> = v.fields.iter().map(type_expr_to_ts).collect();
-                    self.types_out.push_str(&format!(
-                        "  | {{ tag: \"{}\"; value: [{}] }}\n",
-                        v.name,
-                        ts.join(", ")
-                    ));
-                }
-            }
-            self.types_out.push('\n');
+            // Tagged union → discriminated union of `{ tag; value }` objects.
+            // Routed through `emit_union_type_alias` so the members get the same
+            // Prettier-correct layout as string unions (one line if it fits, else
+            // a leading-`|` member per line) and a `;` terminator.
+            let members: Vec<String> = e
+                .variants
+                .iter()
+                .map(|v| {
+                    if v.fields.is_empty() {
+                        format!("{{ tag: \"{}\" }}", v.name)
+                    } else if v.fields.len() == 1 {
+                        let ts = type_expr_to_ts(&v.fields[0]);
+                        format!("{{ tag: \"{}\"; value: {} }}", v.name, ts)
+                    } else {
+                        let ts: Vec<String> = v.fields.iter().map(type_expr_to_ts).collect();
+                        format!("{{ tag: \"{}\"; value: [{}] }}", v.name, ts.join(", "))
+                    }
+                })
+                .collect();
+            emit_union_type_alias(&mut self.types_out, &e.name, &members);
         }
     }
 
@@ -342,11 +311,7 @@ impl<'a> TsGenerator<'a> {
             .iter()
             .map(|(name, _)| format!("\"{name}\""))
             .collect();
-        self.types_out.push_str(&format!(
-            "export type {} = {};\n\n",
-            type_name,
-            variants.join(" | ")
-        ));
+        emit_union_type_alias(&mut self.types_out, &type_name, &variants);
 
         // Const object mapping variant names to status codes
         let entries: Vec<String> = ep
@@ -385,55 +350,21 @@ impl<'a> TsGenerator<'a> {
         }
 
         let type_name = format!("{}Body", capitalize(&ep.name));
-        self.types_out.push_str(&format!(
-            "export function validate{}(input: unknown): {} {{\n",
-            type_name, type_name
-        ));
-        self.types_out.push_str(
-            "  if (typeof input !== 'object' || input === null) throw new ValidationError('expected object');\n",
-        );
-        self.types_out
-            .push_str("  const obj = input as Record<string, unknown>;\n");
-
-        for f in &body.fields {
-            let ts_typeof = match &f.ty {
-                Type::Int | Type::Float => Some("number"),
-                Type::String => Some("string"),
-                Type::Bool => Some("boolean"),
-                _ => None,
-            };
-
-            // Type check for primitive fields
-            if let Some(typeof_str) = ts_typeof {
-                if f.optional {
-                    self.types_out.push_str(&format!(
-                        "  if (obj.{name} !== undefined && typeof obj.{name} !== '{ty}') throw new ValidationError('{name}: expected {ty}');\n",
-                        name = f.name, ty = typeof_str
-                    ));
-                } else {
-                    self.types_out.push_str(&format!(
-                        "  if (typeof obj.{name} !== '{ty}') throw new ValidationError('{name}: expected {ty}');\n",
-                        name = f.name, ty = typeof_str
-                    ));
-                }
-            }
-
-            // Constraint check
-            if let Some(ref constraint) = f.constraint {
-                let ts_expr = constraint_expr_to_ts(constraint, &f.name);
-                if f.optional {
-                    self.types_out.push_str(&format!(
-                        "  if (obj.{name} !== undefined && !({expr})) throw new ValidationError('{name}: constraint violated');\n",
-                        name = f.name, expr = ts_expr,
-                    ));
-                } else {
-                    self.types_out.push_str(&format!(
-                        "  if (!({expr})) throw new ValidationError('{name}: constraint violated');\n",
-                        name = f.name, expr = ts_expr,
-                    ));
-                }
-            }
-        }
+        emit_validate_signature(&mut self.types_out, &type_name);
+        let vfields: Vec<ValidationField> = body
+            .fields
+            .iter()
+            .map(|f| ValidationField {
+                name: f.name.clone(),
+                optional: f.optional,
+                ts_typeof: ts_typeof_of(&f.ty),
+                constraint: f
+                    .constraint
+                    .as_ref()
+                    .map(|c| constraint_expr_to_ts(c, &f.name)),
+            })
+            .collect();
+        emit_validation_body(&mut self.types_out, &vfields);
 
         self.types_out
             .push_str(&format!("  return obj as unknown as {};\n", type_name));
@@ -458,10 +389,8 @@ impl<'a> TsGenerator<'a> {
 
         if !type_imports.is_empty() {
             let joined: Vec<_> = type_imports.into_iter().collect();
-            self.client_out.push_str(&format!(
-                "import type {{ {} }} from \"./types\";\n\n",
-                joined.join(", ")
-            ));
+            emit_import(&mut self.client_out, "import type", &joined, "./types");
+            self.client_out.push('\n');
         }
     }
 
@@ -486,7 +415,7 @@ impl<'a> TsGenerator<'a> {
                 .push_str("    public readonly body: string,\n");
             self.client_out.push_str("  ) {\n");
             self.client_out
-                .push_str("    super(`${code} (${status}): ${body}`);\n");
+                .push_str("    super(`${code} (${String(status)}): ${body}`);\n");
             self.client_out.push_str("    this.name = \"ApiError\";\n");
             self.client_out.push_str("  }\n");
             self.client_out.push_str("}\n\n");
@@ -512,13 +441,13 @@ impl<'a> TsGenerator<'a> {
         let has_query = !ep.query_params.is_empty();
 
         // Build function parameters
-        let mut params = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
         for pp in &ep.path_params {
-            params.push(format!("{pp}: string"));
+            params.push(Param::Simple(format!("{pp}: string")));
         }
         if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
-            params.push(format!("body: {body_type}"));
+            params.push(Param::Simple(format!("body: {body_type}")));
         }
         if has_query {
             let fields: Vec<String> = ep
@@ -534,14 +463,12 @@ impl<'a> TsGenerator<'a> {
                 })
                 .collect();
             let all_optional = ep.query_params.iter().all(is_query_param_optional);
-            if all_optional {
-                params.push(format!("opts?: {{ {} }}", fields.join("; ")));
-            } else {
-                params.push(format!("opts: {{ {} }}", fields.join("; ")));
-            }
+            let prefix = if all_optional { "opts?: " } else { "opts: " };
+            params.push(Param::Object {
+                prefix: prefix.to_string(),
+                fields,
+            });
         }
-
-        let params_str = params.join(", ");
 
         // Doc comment
         if let Some(ref doc) = ep.doc_comment {
@@ -549,20 +476,17 @@ impl<'a> TsGenerator<'a> {
         }
 
         // Function signature
-        self.client_out.push_str(&format!(
-            "  async {}({}): Promise<{}> {{\n",
-            ep.name, params_str, response_type
-        ));
+        let head = format!("  async {}", ep.name);
+        let tail = format!(": Promise<{response_type}> {{");
+        self.client_out
+            .push_str(&format_signature(&head, &params, &tail, "  "));
 
         // Query string construction (only if endpoint has query params)
         if has_query {
             self.client_out
                 .push_str("    const params = new URLSearchParams();\n");
             for qp in &ep.query_params {
-                self.client_out.push_str(&format!(
-                    "    if (opts?.{name} !== undefined) params.set(\"{name}\", String(opts.{name}));\n",
-                    name = qp.name
-                ));
+                emit_param_set(&mut self.client_out, "    ", &qp.name);
             }
             self.client_out
                 .push_str("    const query = params.toString();\n");
@@ -570,54 +494,54 @@ impl<'a> TsGenerator<'a> {
 
         // Build URL with path param substitution
         let url_expr = build_url_expr(&ep.path, &ep.path_params);
-        if has_query {
-            self.client_out.push_str(&format!(
-                "    const response = await fetch(`${{baseUrl}}{url_expr}${{query ? `?${{query}}` : \"\"}}`, {{\n"
-            ));
+        let url_arg = if has_query {
+            format!("`${{baseUrl}}{url_expr}${{query ? `?${{query}}` : \"\"}}`")
         } else {
-            self.client_out.push_str(&format!(
-                "    const response = await fetch(`${{baseUrl}}{url_expr}`, {{\n"
-            ));
-        }
-        self.client_out
-            .push_str(&format!("      method: \"{method}\",\n"));
+            format!("`${{baseUrl}}{url_expr}`")
+        };
 
+        // Build the fetch init object body.
+        let mut init_lines: Vec<String> = vec![format!("method: \"{method}\"")];
         if ep.body.is_some() {
-            self.client_out
-                .push_str("      headers: { \"Content-Type\": \"application/json\" },\n");
-            self.client_out
-                .push_str("      body: JSON.stringify(body),\n");
+            init_lines.push("headers: { \"Content-Type\": \"application/json\" }".to_string());
+            init_lines.push("body: JSON.stringify(body)".to_string());
         }
-
-        self.client_out.push_str("    });\n");
+        emit_fetch_call(&mut self.client_out, "    ", &url_arg, &init_lines);
 
         // Error handling
         if ep.errors.is_empty() {
             self.client_out.push_str("    if (!response.ok) {\n");
-            self.client_out
-                .push_str("      throw new Error(`${response.status}: ${response.statusText}`);\n");
+            self.client_out.push_str(
+                "      throw new Error(`${String(response.status)}: ${response.statusText}`);\n",
+            );
             self.client_out.push_str("    }\n");
         } else {
             self.client_out.push_str("    if (!response.ok) {\n");
             self.client_out
                 .push_str("      const errorBody = await response.text();\n");
             for (name, code) in &ep.errors {
-                self.client_out.push_str(&format!(
-                    "      if (response.status === {code}) throw new ApiError(\"{name}\", {code}, errorBody);\n"
-                ));
+                emit_if_stmt(
+                    &mut self.client_out,
+                    "      ",
+                    &format!("response.status === {code}"),
+                    &format!("throw new ApiError(\"{name}\", {code}, errorBody);"),
+                );
             }
             self.client_out
                 .push_str("      throw new ApiError(\"Unknown\", response.status, errorBody);\n");
             self.client_out.push_str("    }\n");
         }
 
-        // Return
+        // Return. `response.json()` is typed `any`; assert the declared response
+        // type so callers get a typed result and strict lint rules (no-unsafe-*)
+        // are satisfied.
         if response_type != "void" {
-            self.client_out
-                .push_str("    return await response.json();\n");
+            self.client_out.push_str(&format!(
+                "    return (await response.json()) as {response_type};\n"
+            ));
         }
 
-        self.client_out.push_str("  },\n\n");
+        self.client_out.push_str("  },\n");
     }
 
     // ── Handler emission ────────────────────────────────────────────
@@ -638,10 +562,8 @@ impl<'a> TsGenerator<'a> {
 
         if !imports.is_empty() {
             let joined: Vec<_> = imports.into_iter().collect();
-            self.handlers_out.push_str(&format!(
-                "import type {{ {} }} from \"./types\";\n\n",
-                joined.join(", ")
-            ));
+            emit_import(&mut self.handlers_out, "import type", &joined, "./types");
+            self.handlers_out.push('\n');
         }
     }
 
@@ -658,13 +580,13 @@ impl<'a> TsGenerator<'a> {
             .map(type_to_ts)
             .unwrap_or_else(|| "void".to_string());
 
-        let mut params = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
         for pp in &ep.path_params {
-            params.push(format!("{pp}: string"));
+            params.push(Param::Simple(format!("{pp}: string")));
         }
         if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
-            params.push(format!("body: {body_type}"));
+            params.push(Param::Simple(format!("body: {body_type}")));
         }
         if !ep.query_params.is_empty() {
             let fields: Vec<String> = ep
@@ -682,18 +604,19 @@ impl<'a> TsGenerator<'a> {
                     }
                 })
                 .collect();
-            params.push(format!("query: {{ {} }}", fields.join("; ")));
+            params.push(Param::Object {
+                prefix: "query: ".to_string(),
+                fields,
+            });
         }
-
-        let params_str = params.join(", ");
 
         if let Some(ref doc) = ep.doc_comment {
             self.handlers_out.push_str(&format!("  /** {} */\n", doc));
         }
-        self.handlers_out.push_str(&format!(
-            "  {}({}): Promise<{}>;\n",
-            ep.name, params_str, response_type
-        ));
+        let head = format!("  {}", ep.name);
+        let tail = format!(": Promise<{response_type}>;");
+        self.handlers_out
+            .push_str(&format_signature(&head, &params, &tail, "  "));
     }
     // ── Server router emission ─────────────────────────────────────
 
@@ -719,10 +642,27 @@ impl<'a> TsGenerator<'a> {
         }
         if !validate_imports.is_empty() {
             validate_imports.insert(0, "ValidationError".to_string());
-            self.server_out.push_str(&format!(
-                "import {{ {} }} from \"./types\";\n",
-                validate_imports.join(", ")
-            ));
+            emit_import(&mut self.server_out, "import", &validate_imports, "./types");
+        }
+
+        // Import the body *type* for endpoints whose body has no constraints: the
+        // route casts `req.body as XBody` (there is no validate function whose
+        // return type would otherwise supply it).
+        let mut body_type_imports: Vec<String> = Vec::new();
+        for ep in &self.check_result.endpoints {
+            if let Some(ref body) = ep.body
+                && !body.fields.iter().any(|f| f.constraint.is_some())
+            {
+                body_type_imports.push(format!("{}Body", capitalize(&ep.name)));
+            }
+        }
+        if !body_type_imports.is_empty() {
+            emit_import(
+                &mut self.server_out,
+                "import type",
+                &body_type_imports,
+                "./types",
+            );
         }
 
         self.server_out.push('\n');
@@ -751,96 +691,168 @@ impl<'a> TsGenerator<'a> {
         // Convert Phoenix path params to Express-style: {id} → :id
         let express_path = ep.path.replace('{', ":").replace('}', "");
 
-        self.server_out.push_str(&format!(
-            "  router.{}(\"{}\", async (req: Request, res: Response) => {{\n",
-            method, express_path
-        ));
-        self.server_out.push_str("    try {\n");
+        // Type the request's path params so `req.params.id` resolves to `string`
+        // rather than Express's default `string | string[]`.
+        let req_type = if ep.path_params.is_empty() {
+            "Request".to_string()
+        } else {
+            let params = ep
+                .path_params
+                .iter()
+                .map(|pp| format!("{pp}: string"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("Request<{{ {params} }}>")
+        };
+
+        // Decide up front whether the `router.X(...)` call stays inline or breaks
+        // across lines: a wide `Request<{…}>` (several path params) pushes the
+        // opener past the print width. This fixes the arrow body's indentation,
+        // so the body is built at its final depth and the width-sensitive
+        // emitters (handler call, query coercion) make correct decisions.
+        let inline_opener = format!(
+            "  router.{method}(\"{express_path}\", async (req: {req_type}, res: Response) => {{"
+        );
+        let wraps = inline_opener.len() > PRINT_WIDTH;
+        // `try`/`catch` indent, statement indent, and nested-block indent. When
+        // the call wraps, the whole arrow body sits one level (2 spaces) deeper.
+        let ti = if wraps { "      " } else { "    " };
+        let si = if wraps { "        " } else { "      " };
+        let ni = if wraps { "          " } else { "        " };
+
+        let mut body = String::new();
+        body.push_str(&format!("{ti}try {{\n"));
 
         // Build handler call arguments
         let mut args = Vec::new();
 
         // Path params: extract from req.params
         for pp in &ep.path_params {
-            self.server_out
-                .push_str(&format!("      const {pp} = req.params.{pp};\n"));
+            body.push_str(&format!("{si}const {pp} = req.params.{pp};\n"));
             args.push(pp.clone());
         }
 
         // Body: parse from req.body, with validation if constraints exist
-        if let Some(ref body) = ep.body {
-            let has_constraints = body.fields.iter().any(|f| f.constraint.is_some());
+        if let Some(ref ep_body) = ep.body {
+            let has_constraints = ep_body.fields.iter().any(|f| f.constraint.is_some());
             if has_constraints {
                 let type_name = format!("{}Body", capitalize(&ep.name));
-                self.server_out.push_str(&format!(
-                    "      const body = validate{}(req.body);\n",
-                    type_name
+                body.push_str(&format!(
+                    "{si}const body = validate{type_name}(req.body);\n"
                 ));
             } else {
-                self.server_out.push_str("      const body = req.body;\n");
+                // No constraints to validate, but `req.body` is `any`; cast to
+                // the body type so the handler call is type-safe (and strict
+                // `no-unsafe-*` lint rules are satisfied).
+                let type_name = format!("{}Body", capitalize(&ep.name));
+                body.push_str(&format!("{si}const body = req.body as {type_name};\n"));
             }
             args.push("body".to_string());
         }
 
         // Query params: extract, coerce, and apply defaults
         if !ep.query_params.is_empty() {
-            self.server_out.push_str("      const query = {\n");
+            body.push_str(&format!("{si}const query = {{\n"));
             for qp in &ep.query_params {
-                let coerce = query_param_coercion(qp);
-                self.server_out
-                    .push_str(&format!("        {}: {},\n", qp.name, coerce));
+                emit_object_property(
+                    &mut body,
+                    &format!("{si}  "),
+                    &qp.name,
+                    &query_param_coercion(qp),
+                );
             }
-            self.server_out.push_str("      };\n");
+            body.push_str(&format!("{si}}};\n"));
             args.push("query".to_string());
         }
 
-        // Call the handler
-        let args_str = args.join(", ");
+        // Call the handler (breaking the argument list when it overflows).
         if ep.response.is_some() {
-            self.server_out.push_str(&format!(
-                "      const result = await handlers.{}({});\n",
-                ep.name, args_str
-            ));
-            self.server_out.push_str("      res.json(result);\n");
+            emit_call_stmt(
+                &mut body,
+                si,
+                &format!("const result = await handlers.{}", ep.name),
+                &args,
+                ";",
+            );
+            body.push_str(&format!("{si}res.json(result);\n"));
         } else {
-            self.server_out.push_str(&format!(
-                "      await handlers.{}({});\n",
-                ep.name, args_str
-            ));
-            self.server_out.push_str("      res.status(204).end();\n");
+            emit_call_stmt(
+                &mut body,
+                si,
+                &format!("await handlers.{}", ep.name),
+                &args,
+                ";",
+            );
+            body.push_str(&format!("{si}res.status(204).end();\n"));
         }
-
-        // Error handling with status code mapping
-        self.server_out.push_str("    } catch (error: unknown) {\n");
 
         // Catch validation errors from constrained bodies
         let has_body_constraints = ep
             .body
             .as_ref()
             .is_some_and(|b| b.fields.iter().any(|f| f.constraint.is_some()));
+
+        // Error handling with status code mapping. The caught binding is only
+        // referenced when there are body constraints or declared errors;
+        // otherwise use an optional catch binding (`catch {`) so no-unused-vars
+        // has nothing to flag.
+        if has_body_constraints || !ep.errors.is_empty() {
+            body.push_str(&format!("{ti}}} catch (error: unknown) {{\n"));
+        } else {
+            body.push_str(&format!("{ti}}} catch {{\n"));
+        }
         if has_body_constraints {
-            self.server_out.push_str(
-                "      if (error instanceof ValidationError) { res.status(400).json({ error: error.message }); return; }\n",
+            emit_guarded_block(
+                &mut body,
+                si,
+                "error instanceof ValidationError",
+                &[
+                    "res.status(400).json({ error: error.message });".to_string(),
+                    "return;".to_string(),
+                ],
             );
         }
 
         if ep.errors.is_empty() {
-            self.server_out
-                .push_str("      res.status(500).json({ error: \"Internal Server Error\" });\n");
+            body.push_str(&format!(
+                "{si}res.status(500).json({{ error: \"Internal Server Error\" }});\n"
+            ));
+        } else {
+            body.push_str(&format!("{si}if (error instanceof Error) {{\n"));
+            for (name, code) in &ep.errors {
+                emit_guarded_block(
+                    &mut body,
+                    ni,
+                    &format!("error.message === \"{name}\""),
+                    &[
+                        format!("res.status({code}).json({{ error: \"{name}\" }});"),
+                        "return;".to_string(),
+                    ],
+                );
+            }
+            body.push_str(&format!("{si}}}\n"));
+            body.push_str(&format!(
+                "{si}res.status(500).json({{ error: \"Internal Server Error\" }});\n"
+            ));
+        }
+        body.push_str(&format!("{ti}}}\n"));
+
+        // Emit the route. When the inline opener fits, the whole `router.X(...)`
+        // call stays on one line above the body; otherwise the call breaks one
+        // argument per line, and the arrow function's own parameter list breaks
+        // too if it overflows (Prettier style).
+        if !wraps {
+            self.server_out.push_str(&inline_opener);
+            self.server_out.push('\n');
+            self.server_out.push_str(&body);
+            self.server_out.push_str("  });\n\n");
         } else {
             self.server_out
-                .push_str("      if (error instanceof Error) {\n");
-            for (name, code) in &ep.errors {
-                self.server_out.push_str(&format!(
-                    "        if (error.message === \"{name}\") {{ res.status({code}).json({{ error: \"{name}\" }}); return; }}\n"
-                ));
-            }
-            self.server_out.push_str("      }\n");
-            self.server_out
-                .push_str("      res.status(500).json({ error: \"Internal Server Error\" });\n");
+                .push_str(&format!("  router.{method}(\n    \"{express_path}\",\n"));
+            emit_arrow_header(&mut self.server_out, "    ", &req_type);
+            self.server_out.push_str(&body);
+            self.server_out.push_str("    },\n  );\n\n");
         }
-        self.server_out.push_str("    }\n");
-        self.server_out.push_str("  });\n\n");
     }
 }
 
@@ -884,6 +896,11 @@ fn query_param_coercion(qp: &phoenix_sema::checker::QueryParamInfo) -> String {
 }
 
 /// Converts a [`DefaultValue`] to a TypeScript literal.
+///
+/// Unlike the Python generator (which forces a decimal point so a float reads as
+/// a `float`), `Float` is rendered with a plain `to_string()` here on purpose:
+/// JavaScript has a single `number` type, so `0` and `0.0` are identical and no
+/// fix-up is needed. Keep this divergence from `python.rs` intentional.
 fn default_value_to_ts(val: &DefaultValue) -> String {
     match val {
         DefaultValue::Int(v) => v.to_string(),
@@ -897,49 +914,79 @@ fn default_value_to_ts(val: &DefaultValue) -> String {
 /// string, replacing `self` with `obj.{field_name}` for use in validation
 /// functions.
 fn constraint_expr_to_ts(expr: &phoenix_parser::ast::Expr, field_name: &str) -> String {
+    constraint_expr_prec(expr, field_name).0
+}
+
+/// JS operator-precedence tiers used to decide when parentheses are needed.
+/// Higher binds tighter. Mirrors the standard JS grammar closely enough for the
+/// expressions Phoenix constraints can produce, so output matches Prettier's
+/// minimal-parens style.
+const PREC_ATOM: u8 = 100;
+const PREC_UNARY: u8 = 14;
+const PREC_OR: u8 = 3;
+const PREC_AND: u8 = 4;
+
+/// Converts a constraint `Expr` to `(code, precedence)`. The precedence lets the
+/// caller decide whether to wrap the child in parentheses.
+fn constraint_expr_prec(expr: &phoenix_parser::ast::Expr, field_name: &str) -> (String, u8) {
     use phoenix_parser::ast::{BinaryOp, Expr, LiteralKind, UnaryOp};
+
+    // Wraps `child` in parens only if its precedence is below `min`.
+    fn paren(child: (String, u8), min: u8) -> String {
+        if child.1 < min {
+            format!("({})", child.0)
+        } else {
+            child.0
+        }
+    }
+
     match expr {
-        Expr::Ident(ident) if ident.name == "self" => format!("obj.{field_name}"),
-        Expr::Ident(ident) => ident.name.clone(),
-        Expr::Literal(lit) => match &lit.kind {
-            LiteralKind::Int(v) => v.to_string(),
-            LiteralKind::Float(v) => v.to_string(),
-            LiteralKind::String(v) => format!("\"{}\"", v),
-            LiteralKind::Bool(v) => v.to_string(),
-        },
-        Expr::Binary(bin) => {
-            let left = constraint_expr_to_ts(&bin.left, field_name);
-            let right = constraint_expr_to_ts(&bin.right, field_name);
-            let op = match bin.op {
-                BinaryOp::Add => "+",
-                BinaryOp::Sub => "-",
-                BinaryOp::Mul => "*",
-                BinaryOp::Div => "/",
-                BinaryOp::Mod => "%",
-                BinaryOp::Eq => "===",
-                BinaryOp::NotEq => "!==",
-                BinaryOp::Lt => "<",
-                BinaryOp::Gt => ">",
-                BinaryOp::LtEq => "<=",
-                BinaryOp::GtEq => ">=",
-                BinaryOp::And => "&&",
-                BinaryOp::Or => "||",
+        Expr::Ident(ident) if ident.name == "self" => (format!("obj.{field_name}"), PREC_ATOM),
+        Expr::Ident(ident) => (ident.name.clone(), PREC_ATOM),
+        Expr::Literal(lit) => {
+            let s = match &lit.kind {
+                LiteralKind::Int(v) => v.to_string(),
+                LiteralKind::Float(v) => v.to_string(),
+                LiteralKind::String(v) => format!("\"{}\"", v),
+                LiteralKind::Bool(v) => v.to_string(),
             };
-            format!("({left} {op} {right})")
+            (s, PREC_ATOM)
+        }
+        Expr::Binary(bin) => {
+            let (op, prec) = match bin.op {
+                BinaryOp::Or => ("||", PREC_OR),
+                BinaryOp::And => ("&&", PREC_AND),
+                BinaryOp::Eq => ("===", 8),
+                BinaryOp::NotEq => ("!==", 8),
+                BinaryOp::Lt => ("<", 9),
+                BinaryOp::Gt => (">", 9),
+                BinaryOp::LtEq => ("<=", 9),
+                BinaryOp::GtEq => (">=", 9),
+                BinaryOp::Add => ("+", 11),
+                BinaryOp::Sub => ("-", 11),
+                BinaryOp::Mul => ("*", 12),
+                BinaryOp::Div => ("/", 12),
+                BinaryOp::Mod => ("%", 12),
+            };
+            // Left-associative: left child needs only >= prec, right child > prec.
+            let left = paren(constraint_expr_prec(&bin.left, field_name), prec);
+            let right = paren(constraint_expr_prec(&bin.right, field_name), prec + 1);
+            (format!("{left} {op} {right}"), prec)
         }
         Expr::Unary(un) => {
-            let operand = constraint_expr_to_ts(&un.operand, field_name);
-            match un.op {
-                UnaryOp::Neg => format!("(-{operand})"),
-                UnaryOp::Not => format!("(!{operand})"),
-            }
+            let operand = paren(constraint_expr_prec(&un.operand, field_name), PREC_UNARY);
+            let s = match un.op {
+                UnaryOp::Neg => format!("-{operand}"),
+                UnaryOp::Not => format!("!{operand}"),
+            };
+            (s, PREC_UNARY)
         }
         Expr::FieldAccess(fa) => {
-            let object = constraint_expr_to_ts(&fa.object, field_name);
-            format!("{object}.{}", fa.field)
+            let object = paren(constraint_expr_prec(&fa.object, field_name), PREC_ATOM);
+            (format!("{object}.{}", fa.field), PREC_ATOM)
         }
         Expr::MethodCall(mc) => {
-            let object = constraint_expr_to_ts(&mc.object, field_name);
+            let object = paren(constraint_expr_prec(&mc.object, field_name), PREC_ATOM);
             let args: Vec<String> = mc
                 .args
                 .iter()
@@ -950,9 +997,9 @@ fn constraint_expr_to_ts(expr: &phoenix_parser::ast::Expr, field_name: &str) -> 
                 "contains" => "includes",
                 other => other,
             };
-            format!("{object}.{method}({})", args.join(", "))
+            (format!("{object}.{method}({})", args.join(", ")), PREC_ATOM)
         }
-        _ => "true".to_string(),
+        _ => ("true".to_string(), PREC_ATOM),
     }
 }
 

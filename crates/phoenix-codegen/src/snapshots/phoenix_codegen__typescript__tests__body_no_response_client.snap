@@ -20,8 +20,7 @@ export const api = {
       body: JSON.stringify(body),
     });
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
   },
-
-}
+};

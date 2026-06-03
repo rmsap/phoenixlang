@@ -14,13 +14,15 @@ export function setBaseUrl(url: string): void {
 
 export const api = {
   async getComment(userId: string, postId: string): Promise<Comment> {
-    const response = await fetch(`${baseUrl}/api/users/${userId}/posts/${postId}`, {
-      method: "GET",
-    });
+    const response = await fetch(
+      `${baseUrl}/api/users/${userId}/posts/${postId}`,
+      {
+        method: "GET",
+      },
+    );
     if (!response.ok) {
-      throw new Error(`${response.status}: ${response.statusText}`);
+      throw new Error(`${String(response.status)}: ${response.statusText}`);
     }
-    return await response.json();
+    return (await response.json()) as Comment;
   },
-
-}
+};

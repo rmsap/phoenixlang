@@ -7,4 +7,4 @@ expression: files.types
 export type Shape =
   | { tag: "Circle"; value: number }
   | { tag: "Rect"; value: [number, number] }
-  | { tag: "Point" }
+  | { tag: "Point" };

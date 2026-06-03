@@ -377,11 +377,17 @@ class CreateUserBody(BaseModel):
     age: int
 
 # generated/handlers.py — developer implements these
-class Handlers:
+from typing import Protocol
+
+class Handlers(Protocol):
     async def list_users(self, page: int, limit: int, search: str | None) -> list[User]: ...
     async def create_user(self, body: CreateUserBody) -> User: ...
     async def get_user(self, id: int) -> User: ...
 ```
+
+`Handlers` is emitted as a `typing.Protocol` (the Python analog of the Go
+`Handlers` interface): the developer's implementation is matched structurally,
+so it does not need to subclass `Handlers` to satisfy the type checker.
 
 ### Go
 
