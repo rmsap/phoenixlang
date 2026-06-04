@@ -1,0 +1,62 @@
+// Multi-method `dyn Trait` dispatch. Complements `traits_dyn.phx`,
+// whose single-method trait only ever reaches vtable slot 0 and never
+// passes arguments through a `dyn` call. This fixture exercises:
+//
+// - vtable slots beyond 0: `kind` is slot 0 (vtable byte offset 0),
+//   `scaledArea` slot 1 (offset 4), `tagged` slot 2 (offset 8), so the
+//   `vtable_ptr + method_idx * 4` load and the multi-entry vtable byte
+//   layout are validated, not just the offset-0 degenerate case.
+// - dyn methods that take arguments: `scaledArea` takes an `Int` (one
+//   wasm slot) and `tagged` takes a `String` (a two-slot fat pointer),
+//   exercising the single- and multi-slot arg-push paths in
+//   `Op::DynCall`.
+//
+// Two concrete impls (`Rect`, `Circle`) force two distinct vtables.
+// Bodies avoid string interpolation (see the note in `traits_dyn.phx`).
+
+trait Shape {
+  function kind(self) -> String
+  function scaledArea(self, factor: Int) -> Int
+  function tagged(self, prefix: String) -> String
+}
+
+struct Rect {
+  Int w
+  Int h
+
+  impl Shape {
+    function kind(self) -> String { "rect" }
+    function scaledArea(self, factor: Int) -> Int { self.w * self.h * factor }
+    function tagged(self, prefix: String) -> String { prefix + "rect" }
+  }
+}
+
+struct Circle {
+  Int r
+
+  impl Shape {
+    function kind(self) -> String { "circle" }
+    function scaledArea(self, factor: Int) -> Int { self.r * self.r * factor }
+    function tagged(self, prefix: String) -> String { prefix + "circle" }
+  }
+}
+
+// Receiver is `dyn Shape`: every call below is a vtable dispatch.
+// `s.kind()` (slot 0) feeds the argument of `s.tagged(...)` (slot 2),
+// so a dyn-call result flows into a dyn-call argument.
+function describe(s: dyn Shape) -> String {
+  s.tagged(s.kind() + ":")
+}
+
+function main() {
+  let a: dyn Shape = Rect(3, 4)
+  let b: dyn Shape = Circle(5)
+
+  print(a.kind())
+  print(a.scaledArea(2))
+  print(describe(a))
+
+  print(b.kind())
+  print(b.scaledArea(3))
+  print(describe(b))
+}

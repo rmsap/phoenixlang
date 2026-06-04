@@ -2508,13 +2508,13 @@ fn translate_list_flatmap(
 /// The 1-slot frame is sufficient because today every Phoenix ref type
 /// occupies at most one *pointer* slot: single-slot refs (`List`, `Map`,
 /// `Closure`, `Struct`, `Enum`) are a bare GC pointer in `key_locals[0]`,
-/// and the only 2-slot ref — `StringRef` — stores the heap pointer in
-/// `key_locals[0]` and the (non-pointer) `len` in `key_locals[1]`.
-/// Rooting slot 0 keeps the underlying object live in every current
-/// case. A future 2-pointer ref type (e.g. a fat reference whose second
-/// slot is itself a GC pointer) would need this frame widened to 2 slots
-/// — `phx_field_size_bytes` adding a non-`StringRef` 2-slot ref-type
-/// branch is the tripwire for the rewrite.
+/// and the two 2-slot refs — `StringRef` (`ptr`, `len`) and `DynRef`
+/// (`data_ptr`, `vtable_ptr`) — both keep their only GC pointer in
+/// `key_locals[0]`; slot 1 is a non-pointer (`len` / data-section vtable
+/// offset). Rooting slot 0 keeps the underlying object live in every
+/// current case. A future 2-*pointer* ref type (whose second slot is
+/// itself a GC pointer) would need this frame widened to 2 slots — that
+/// type, not merely any 2-slot ref, is the tripwire for the rewrite.
 fn translate_list_sortby(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
@@ -2577,14 +2577,17 @@ fn translate_list_sortby(
     let key_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
     let cmp_a_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
     // Executable tripwire for the docstring's single-pointer-slot
-    // assumption. Today every ref type either occupies one slot (a
-    // bare GC pointer in slot 0) or is exactly `StringRef` (slot 0 =
-    // heap pointer, slot 1 = non-pointer `len`). A future ref type
+    // assumption. Today every ref type either occupies one slot (a bare
+    // GC pointer in slot 0) or is one of the two 2-slot fat pointers
+    // whose slot 1 is a non-pointer: `StringRef` (slot 1 = `len`) and
+    // `DynRef` (slot 1 = data-section vtable offset). A future ref type
     // whose second slot is also a GC pointer would need this frame
     // widened to 2 slots; this assert fires before that case silently
     // miscompiles.
     debug_assert!(
-        !elem_is_ref || matches!(&elem_ty, IrType::StringRef) || key_locals.len() == 1,
+        !elem_is_ref
+            || matches!(&elem_ty, IrType::StringRef | IrType::DynRef(_))
+            || key_locals.len() == 1,
         "sortBy: ref element type {:?} occupies {} slots — the ad-hoc \
          key frame only roots slot 0, but this type may have a pointer \
          in another slot. Widen the frame to match (see the docstring's \

@@ -1,0 +1,59 @@
+// `dyn Trait` method return-type coverage. Complements `traits_dyn.phx`,
+// `traits_dyn_multi.phx`, `traits_dyn_field.phx`, and `traits_dyn_list.phx`,
+// whose `dyn` methods all return `String` or `Int`. This fixture pins the
+// two `Op::DynCall` result arms those never reach:
+//
+// - A `dyn` method returning `Void`: `noise(self)` returns nothing, so the
+//   call is a statement and `Op::DynCall` takes its `(None, Void)` arm —
+//   no result binding, no operand-stack residue.
+// - A `dyn` method returning a ref type *other than* `String`: `tags(self)`
+//   returns `List<Int>`, a single-slot GC pointer, so the post-`DynCall`
+//   blanket `emit_gc_set_root` roots the fresh list pointer in slot 0 —
+//   a path the `String` (2-slot) and `Int` (non-ref) returns never take.
+//
+// Two concrete impls (`Rect`, `Circle`) force two distinct vtables.
+// Bodies avoid string interpolation (see the note in `traits_dyn.phx`).
+
+trait Shape {
+  function noise(self)
+  function tags(self) -> List<Int>
+}
+
+struct Rect {
+  Int w
+  Int h
+
+  impl Shape {
+    function noise(self) { print("rect-noise") }
+    function tags(self) -> List<Int> { [self.w, self.h] }
+  }
+}
+
+struct Circle {
+  Int r
+
+  impl Shape {
+    function noise(self) { print("circle-noise") }
+    function tags(self) -> List<Int> { [self.r] }
+  }
+}
+
+function main() {
+  let a: dyn Shape = Rect(3, 4)
+  let b: dyn Shape = Circle(5)
+
+  // Void-returning dyn dispatch used purely for its side effect.
+  a.noise()
+  b.noise()
+
+  // Ref-returning (non-String) dyn dispatch: the returned `List<Int>`
+  // is a GC pointer that must be rooted before the next allocation.
+  let ta: List<Int> = a.tags()
+  let tb: List<Int> = b.tags()
+  for t in ta {
+    print(t)
+  }
+  for t in tb {
+    print(t)
+  }
+}

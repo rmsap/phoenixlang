@@ -73,16 +73,34 @@ backend_matrix_test!(matrix_fizzbuzz, "fizzbuzz.phx");
 backend_matrix_test!(matrix_features, "features.phx");
 backend_matrix_test!(matrix_generics, "generics.phx");
 backend_matrix_test!(matrix_traits_static, "traits_static.phx");
-// `traits_dyn.phx` exercises `dyn Trait` (vtable ABI). The wasm32-
-// linear backend doesn't yet lower `Op::DynAlloc` / `Op::DynCall`, so
-// the WASM column is carved out until that op surface lands. The
-// three-backend agreement (run / run-ir / native build) is still
-// asserted.
-backend_matrix_test!(
-    matrix_traits_dyn,
-    "traits_dyn.phx",
-    skip_wasm: "Op::DynAlloc / Op::DynCall not yet lowered for wasm32-linear"
-);
+backend_matrix_test!(matrix_traits_dyn, "traits_dyn.phx");
+// Multi-method trait: reaches vtable slots beyond 0 and passes Int /
+// String arguments through `dyn` dispatch — paths `traits_dyn.phx`
+// (single self-only method) never exercises.
+backend_matrix_test!(matrix_traits_dyn_multi, "traits_dyn_multi.phx");
+// `dyn Trait` stored in a struct field: exercises the `DynRef`
+// field-storage layout (size 8 / align 4) and the two-slot field
+// load/store paths, plus offsets of the `Int`s bracketing the
+// 8-byte fat pointer — paths a `dyn` local/param never reaches.
+backend_matrix_test!(matrix_traits_dyn_field, "traits_dyn_field.phx");
+// `dyn Trait` as a `List` element: exercises `DynRef` list-element
+// storage (8-byte stride) and `List.sortBy` over a `dyn` element type,
+// pinning that the sortBy GC key-frame tripwire admits `DynRef` (slot 1
+// is a non-pointer vtable offset, so rooting slot 0 suffices).
+backend_matrix_test!(matrix_traits_dyn_list, "traits_dyn_list.phx");
+// `dyn Trait` method return types: a `Void`-returning method (the
+// `Op::DynCall` `(None, Void)` arm) and a `List<Int>`-returning method
+// (a single-slot ref result rooted by the post-`DynCall` blanket
+// `emit_gc_set_root`) — return shapes the other dyn fixtures, all
+// `String`/`Int`, never reach.
+backend_matrix_test!(matrix_traits_dyn_ret, "traits_dyn_ret.phx");
+// `dyn Trait` in function *return position*: `pick(...) -> dyn Shape`
+// flattens its two-slot `(data_ptr, vtable_ptr)` fat pointer through the
+// `call` signature's `[i32, i32]` result and the caller re-binds + roots
+// it — a `DynRef` crossing a user-function boundary as a return value,
+// which the other dyn fixtures (locals / params / fields / elements)
+// never exercise.
+backend_matrix_test!(matrix_traits_dyn_factory, "traits_dyn_factory.phx");
 backend_matrix_test!(matrix_collections, "collections.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");

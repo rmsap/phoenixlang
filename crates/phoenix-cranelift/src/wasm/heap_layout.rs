@@ -85,8 +85,8 @@ pub(super) fn is_i32_field(ty: &IrType) -> bool {
 pub(super) fn phx_field_size_bytes(ty: &IrType) -> Result<u32, CompileError> {
     match ty {
         IrType::I64 | IrType::F64 => Ok(8),
-        IrType::Bool => Ok(4),      // padded to i32 for natural alignment
-        IrType::StringRef => Ok(8), // fat pointer: i32 ptr + i32 len
+        IrType::Bool => Ok(4), // padded to i32 for natural alignment
+        IrType::StringRef | IrType::DynRef(_) => Ok(8), // 2 × i32 (ptr+len, or data+vtable)
         ty if is_gc_pointer_type(ty) => Ok(4), // single i32 GC pointer
         IrType::Void => Err(CompileError::new(
             "wasm32-linear: `Void` has no field-storage representation \
@@ -101,7 +101,7 @@ pub(super) fn phx_field_size_bytes(ty: &IrType) -> Result<u32, CompileError> {
 pub(super) fn phx_field_align_bytes(ty: &IrType) -> Result<u32, CompileError> {
     match ty {
         IrType::I64 | IrType::F64 => Ok(8),
-        IrType::Bool | IrType::StringRef => Ok(4),
+        IrType::Bool | IrType::StringRef | IrType::DynRef(_) => Ok(4),
         ty if is_gc_pointer_type(ty) => Ok(4),
         IrType::Void => Err(CompileError::new(
             "wasm32-linear: `Void` has no alignment (internal: sema/IR \
@@ -126,6 +126,13 @@ pub(super) fn field_memarg(
         memory_index: 0,
     })
 }
+
+/// Byte width of one `dyn Trait` vtable entry: a single i32
+/// function-table index. Couples the two sites that must agree on the
+/// layout — vtable emission (`ModuleBuilder::require_dyn_vtable`, one
+/// `i32::to_le_bytes` per method) and the `Op::DynCall` dispatch load
+/// (`i32.load` at `vtable_ptr + method_idx * DYN_VTABLE_ENTRY_SIZE`).
+pub(super) const DYN_VTABLE_ENTRY_SIZE: u32 = 4;
 
 /// `MemArg` for an `i32` access at `offset` (`align: 2` = log2(4)).
 /// Used for the fat-pointer `len` half of `StringRef` field accesses

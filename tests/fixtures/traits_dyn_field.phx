@@ -1,0 +1,65 @@
+// `dyn Trait` stored in a struct field. Complements `traits_dyn.phx`
+// and `traits_dyn_multi.phx`, which only ever hold `dyn` values in
+// locals / parameters. This fixture exercises the heap-layout and
+// field load/store paths that a `dyn` field reaches but a `dyn` local
+// never does:
+//
+// - `DynRef` field storage: `phx_field_size_bytes` (8 = data_ptr +
+//   vtable_ptr) and `phx_field_align_bytes` (4) on the wasm32-linear
+//   backend, plus the two-slot `emit_field_load` / `emit_field_store`
+//   arms that read/write slot 0 at `field_offset` and slot 1 at
+//   `field_offset + 4`.
+// - Correct field *offsets around* the 8-byte `dyn` slot: `before`
+//   sits before it and `after` sits after it, so a wrong `dyn` field
+//   size or alignment would corrupt one of the bracketing `Int`s and
+//   diverge across backends.
+//
+// Two concrete impls (`Rect`, `Circle`) force two distinct vtables.
+// Bodies avoid string interpolation (see the note in `traits_dyn.phx`).
+
+trait Shape {
+  function kind(self) -> String
+  function area(self) -> Int
+}
+
+struct Rect {
+  Int w
+  Int h
+
+  impl Shape {
+    function kind(self) -> String { "rect" }
+    function area(self) -> Int { self.w * self.h }
+  }
+}
+
+struct Circle {
+  Int r
+
+  impl Shape {
+    function kind(self) -> String { "circle" }
+    function area(self) -> Int { self.r * self.r }
+  }
+}
+
+// The `dyn Shape` field is bracketed by plain `Int` fields so the
+// fixture also pins the field offsets on either side of the 8-byte
+// fat pointer.
+struct Boxed {
+  Int before
+  dyn Shape shape
+  Int after
+}
+
+function main() {
+  let r: Boxed = Boxed(1, Rect(3, 4), 2)
+  print(r.before)
+  print(r.shape.kind())
+  print(r.shape.area())
+  print(r.after)
+
+  let c: Boxed = Boxed(9, Circle(5), 8)
+  print(c.before)
+  print(c.shape.kind())
+  print(c.shape.area())
+  print(c.after)
+}

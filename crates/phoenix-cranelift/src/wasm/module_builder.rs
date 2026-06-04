@@ -185,16 +185,28 @@ pub(super) struct ModuleBuilder {
     data_cursor: u32,
 
     /// Phoenix [`FuncId`] → closure-table slot, populated by the
-    /// pre-scan in [`Self::register_closure_table`]. Each function
-    /// referenced as the target of an [`Op::ClosureAlloc`] gets a
-    /// unique slot in the merged module's *closure* funcref table
-    /// (separate from any indirect-function table the runtime
+    /// pre-scan in [`Self::register_closure_table`]. Two op kinds
+    /// contribute targets: every [`Op::ClosureAlloc`] target FuncId,
+    /// and every method FuncId of a `(concrete, trait)` vtable named
+    /// by an `Op::DynAlloc` (see [`Self::require_dyn_vtable`]). Each
+    /// gets a unique slot in the merged module's *closure* funcref
+    /// table (separate from any indirect-function table the runtime
     /// declares — see [`Self::closure_table_idx`]). Slots are
     /// indices into that single closure table, *not* WASM function
     /// indices: `Op::ClosureAlloc` stores the slot at heap offset 0
-    /// of the closure object, and `Op::CallIndirect` loads it back
-    /// and feeds it to `call_indirect (table closure_table_idx)`.
+    /// of the closure object and `Op::CallIndirect` loads it back; a
+    /// dyn vtable stores the slot per method and `Op::DynCall` loads
+    /// it back. Both feed it to `call_indirect (table closure_table_idx)`.
     closure_target_slots: HashMap<FuncId, u32>,
+    /// Cache: `(concrete_type, trait_name)` → user-data byte offset
+    /// of the emitted dyn vtable. Each vtable is a tight array of i32
+    /// function-table indices in trait-declaration order (one i32 per
+    /// method); [`Self::require_dyn_vtable`] emits it lazily on first
+    /// reference and reuses the offset on subsequent calls so a given
+    /// `(concrete, trait)` pair contributes exactly one segment to the
+    /// data section, regardless of how many `Op::DynAlloc` sites
+    /// reference it.
+    dyn_vtable_offsets: HashMap<(String, String), u32>,
     /// Merged-module WASM table index of the Phoenix closure table.
     /// `None` until [`Self::register_closure_table`] has run; remains
     /// `None` if no `Op::ClosureAlloc` references were found (no
@@ -240,6 +252,7 @@ impl ModuleBuilder {
             // user-data high-water mark.
             data_cursor: USER_DATA_BASE,
             closure_target_slots: HashMap::new(),
+            dyn_vtable_offsets: HashMap::new(),
             closure_table_idx: None,
         }
     }
@@ -760,17 +773,49 @@ impl ModuleBuilder {
         &mut self,
         ir_module: &IrModule,
     ) -> Result<(), CompileError> {
-        // Collect every closure-target FuncId in IR-iteration order.
+        // Collect every indirect-call target FuncId in IR-iteration order.
+        // Two sources contribute: `Op::ClosureAlloc(fid, _)` (the original
+        // closure-table use case) and `Op::DynAlloc(trait, concrete, _)`
+        // (every entry of the vtable for `(concrete, trait)` becomes a
+        // potential `call_indirect` target). Sharing one funcref table
+        // between the two keeps the module shape minimal — a `dyn Trait`
+        // dispatch and a closure invocation both `call_indirect` through
+        // the same table, just at different slots.
         let mut ordered_targets: Vec<FuncId> = Vec::new();
+        let insert_target =
+            |slots: &mut HashMap<FuncId, u32>, ordered: &mut Vec<FuncId>, fid: FuncId| {
+                if !slots.contains_key(&fid) {
+                    let slot = slots.len() as u32;
+                    slots.insert(fid, slot);
+                    ordered.push(fid);
+                }
+            };
         for func in ir_module.concrete_functions() {
             for block in &func.blocks {
                 for instr in &block.instructions {
-                    if let phoenix_ir::instruction::Op::ClosureAlloc(target_fid, _) = &instr.op
-                        && !self.closure_target_slots.contains_key(target_fid)
-                    {
-                        let slot = self.closure_target_slots.len() as u32;
-                        self.closure_target_slots.insert(*target_fid, slot);
-                        ordered_targets.push(*target_fid);
+                    match &instr.op {
+                        phoenix_ir::instruction::Op::ClosureAlloc(target_fid, _) => {
+                            insert_target(
+                                &mut self.closure_target_slots,
+                                &mut ordered_targets,
+                                *target_fid,
+                            );
+                        }
+                        phoenix_ir::instruction::Op::DynAlloc(trait_name, concrete, _) => {
+                            // Every method in the (concrete, trait) vtable
+                            // becomes a `call_indirect` target.
+                            let key = (concrete.clone(), trait_name.clone());
+                            if let Some(entries) = ir_module.dyn_vtables.get(&key) {
+                                for (_method_name, fid) in entries {
+                                    insert_target(
+                                        &mut self.closure_target_slots,
+                                        &mut ordered_targets,
+                                        *fid,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -821,11 +866,12 @@ impl ModuleBuilder {
     }
 
     /// Look up the closure-table slot for `fid`. Returns `None` if no
-    /// `Op::ClosureAlloc` in the IR module referenced this function as
-    /// a target (so it has no slot reserved). Callers reaching `None`
-    /// indicates an internal compiler bug (`register_closure_table`'s
-    /// pre-scan and `Op::ClosureAlloc`'s body emission walk the same
-    /// IR; they should agree on which FuncIds appear).
+    /// `Op::ClosureAlloc` target and no `Op::DynAlloc` vtable method in
+    /// the IR module referenced this function (so it has no slot
+    /// reserved). Callers reaching `None` indicates an internal compiler
+    /// bug (`register_closure_table`'s pre-scan and the body emission of
+    /// `Op::ClosureAlloc` / `Op::DynAlloc` walk the same IR; they should
+    /// agree on which FuncIds appear).
     pub(super) fn closure_target_slot(&self, fid: FuncId) -> Option<u32> {
         self.closure_target_slots.get(&fid).copied()
     }
@@ -845,17 +891,18 @@ impl ModuleBuilder {
     }
 
     /// Merged-module WASM table index of the Phoenix closure table.
-    /// `Err` if no `Op::ClosureAlloc` references appeared in the IR
-    /// (so no table was declared); reaching this from `Op::CallIndirect`
-    /// without prior `Op::ClosureAlloc` somewhere in the module would
-    /// mean the IR conjured a closure value out of thin air, which is
-    /// an internal compiler bug.
+    /// `Err` if no indirect-call target appeared in the IR (so no table
+    /// was declared). The table is populated from both `Op::ClosureAlloc`
+    /// and `Op::DynAlloc` vtable entries (see [`Self::register_closure_table`]),
+    /// so reaching here from `Op::CallIndirect` or `Op::DynCall` without
+    /// any such reference in the module would mean the IR conjured an
+    /// indirect-call value out of thin air — an internal compiler bug.
     pub(super) fn require_closure_table_idx(&self) -> Result<u32, CompileError> {
         self.closure_table_idx.ok_or_else(|| {
             CompileError::new(
-                "wasm32-linear: `Op::CallIndirect` reached codegen but no \
-                 closure table was declared (no `Op::ClosureAlloc` references \
-                 found in pre-scan) — internal compiler bug",
+                "wasm32-linear: `call_indirect` reached codegen but no funcref \
+                 table was declared (no `Op::ClosureAlloc` / `Op::DynAlloc` \
+                 references found in pre-scan) — internal compiler bug",
             )
         })
     }
@@ -877,6 +924,58 @@ impl ModuleBuilder {
         return_valtypes: &[wasm_encoder::ValType],
     ) -> u32 {
         self.types.intern(param_valtypes, return_valtypes)
+    }
+
+    /// Emit (or look up in the cache) the data-section vtable for a
+    /// `(concrete_type, trait_name)` pair and return its byte offset.
+    ///
+    /// The vtable is a flat array of i32 function-table indices, one
+    /// per trait method, in trait-declaration order. The indices are
+    /// resolved through [`Self::closure_target_slots`] (which
+    /// `register_closure_table` populated to include every dyn-method
+    /// FuncId). At an `Op::DynCall` site the codegen does a single
+    /// `i32.load` at `vtable_offset + method_idx * DYN_VTABLE_ENTRY_SIZE`
+    /// to fetch the fn-table-idx, then `call_indirect` through the
+    /// closure table.
+    ///
+    /// **Endianness:** WASM linear memory is little-endian; we encode
+    /// each slot via `i32::to_le_bytes` so the in-memory layout
+    /// matches what `i32.load` will read back.
+    pub(super) fn require_dyn_vtable(
+        &mut self,
+        ir_module: &IrModule,
+        concrete_type: &str,
+        trait_name: &str,
+    ) -> Result<u32, CompileError> {
+        let key = (concrete_type.to_string(), trait_name.to_string());
+        if let Some(off) = self.dyn_vtable_offsets.get(&key) {
+            return Ok(*off);
+        }
+        let entries = ir_module.dyn_vtables.get(&key).ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-linear: vtable for `{concrete_type}` as `dyn {trait_name}` \
+                 not registered in IrModule::dyn_vtables — IR lowering must \
+                 populate it before `Op::DynAlloc` reaches the backend \
+                 (internal compiler bug)"
+            ))
+        })?;
+        let mut bytes: Vec<u8> =
+            Vec::with_capacity(entries.len() * super::heap_layout::DYN_VTABLE_ENTRY_SIZE as usize);
+        for (method_name, phx_fid) in entries {
+            let slot = self.closure_target_slot(*phx_fid).ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-linear: dyn vtable for `{concrete_type}` as \
+                     `dyn {trait_name}` method `{method_name}` references \
+                     FuncId {phx_fid:?} that wasn't reserved by \
+                     `register_closure_table`'s pre-scan (internal compiler \
+                     bug — pre-scan and emission walk the same IR)"
+                ))
+            })?;
+            bytes.extend_from_slice(&(slot as i32).to_le_bytes());
+        }
+        let (offset, _len) = self.reserve_user_data(&bytes)?;
+        self.dyn_vtable_offsets.insert(key, offset);
+        Ok(offset)
     }
 
     fn validate_main_shape(func: &phoenix_ir::module::IrFunction) -> Result<(), CompileError> {

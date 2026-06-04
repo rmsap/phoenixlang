@@ -1,0 +1,62 @@
+// `dyn Trait` as a collection element. Complements `traits_dyn.phx`,
+// `traits_dyn_multi.phx`, and `traits_dyn_field.phx`, which hold `dyn`
+// values only in locals, parameters, and struct fields. This fixture
+// exercises the paths a `List<dyn Trait>` reaches that those never do:
+//
+// - `DynRef` list-element storage: `phx_list_get_raw` + the generic
+//   `emit_field_load` arm read the 8-byte `(data_ptr, vtable_ptr)` fat
+//   pointer back out of the list's data region (size 8 / align 4), so a
+//   wrong `DynRef` element size would mis-stride the backing array and
+//   diverge across backends.
+// - `List.sortBy` over a `dyn` element type: the comparator holds the
+//   `key` element in locals across a call that may allocate, so the
+//   ad-hoc 1-slot GC key-frame roots `data_ptr` (slot 0). `DynRef`'s
+//   slot 1 is the non-pointer vtable offset, so rooting slot 0 is
+//   sufficient — this fixture pins that the `sortBy` tripwire admits
+//   `DynRef` rather than rejecting it as a 2-pointer fat ref.
+//
+// Two concrete impls (`Rect`, `Circle`) force two distinct vtables, and
+// the sorted output interleaves them, so a vtable mix-up (calling the
+// wrong concrete `area`) would change the printed order.
+// Bodies avoid string interpolation (see the note in `traits_dyn.phx`).
+
+trait Shape {
+  function area(self) -> Int
+}
+
+struct Rect {
+  Int w
+  Int h
+
+  impl Shape {
+    function area(self) -> Int { self.w * self.h }
+  }
+}
+
+struct Circle {
+  Int r
+
+  impl Shape {
+    function area(self) -> Int { self.r * self.r }
+  }
+}
+
+function main() {
+  let a: dyn Shape = Rect(3, 4)
+  let b: dyn Shape = Circle(5)
+  let c: dyn Shape = Rect(1, 1)
+  let shapes: List<dyn Shape> = [a, b, c]
+
+  // Direct element access / iteration: exercises `List.get` /
+  // for-loop element loads of the `DynRef` fat pointer.
+  for s in shapes {
+    print(s.area())
+  }
+
+  // `sortBy` over `dyn` elements: ascending by area.
+  let sorted: List<dyn Shape> =
+    shapes.sortBy(function(p: dyn Shape, q: dyn Shape) -> Int { p.area() - q.area() })
+  for s in sorted {
+    print(s.area())
+  }
+}

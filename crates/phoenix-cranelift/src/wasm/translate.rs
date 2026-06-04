@@ -97,9 +97,9 @@ use super::gc_root::{
     emit_gc_pop_frame, emit_gc_set_root, op_produces_heap_pointer, setup_gc_frame,
 };
 use super::heap_layout::{
-    EnumLayout, LIST_HEADER, StructLayout, align_up, compute_enum_layout, compute_struct_layout,
-    compute_variant_field_offsets, field_memarg, i32_memarg, is_gc_pointer_type, is_i32_field,
-    phx_field_align_bytes, phx_field_size_bytes,
+    DYN_VTABLE_ENTRY_SIZE, EnumLayout, LIST_HEADER, StructLayout, align_up, compute_enum_layout,
+    compute_struct_layout, compute_variant_field_offsets, field_memarg, i32_memarg,
+    is_gc_pointer_type, is_i32_field, phx_field_align_bytes, phx_field_size_bytes,
 };
 use super::module_builder::ModuleBuilder;
 use crate::error::CompileError;
@@ -157,7 +157,13 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
         IrType::F64 => Ok(vec![ValType::F64]),
         IrType::Bool => Ok(vec![ValType::I32]),
         IrType::Void => Ok(Vec::new()),
-        IrType::StringRef => Ok(vec![ValType::I32, ValType::I32]),
+        // Two-slot fat pointers: `StringRef` is `(ptr, len)`; `DynRef`
+        // is `(data_ptr, vtable_ptr)` per the `dyn Trait` ABI. Both
+        // flatten to `[i32, i32]` on wasm32 — the second slot stores
+        // a different semantic value (length vs. vtable address) but
+        // the slot shape, alignment, and load/store sequence are
+        // identical, so the codegen treats them uniformly.
+        IrType::StringRef | IrType::DynRef(_) => Ok(vec![ValType::I32, ValType::I32]),
         ty if is_gc_pointer_type(ty) => Ok(vec![ValType::I32]),
         _ => Err(unsupported(ty, "wasm32-linear value representation")),
     }
@@ -226,11 +232,12 @@ pub(super) fn emit_field_load(
             ctx.emit(Instruction::LocalGet(base_ptr_local));
             ctx.emit(Instruction::I32Load(memarg));
         }
-        IrType::StringRef => {
-            // Fat pointer: read ptr at offset, then len at offset+4.
-            // Push them in declaration order so the caller's
-            // `emit_store_result` pops them into (ptr_local, len_local)
-            // via reverse-order LocalSet.
+        // Two-slot fat pointers: `StringRef = (ptr, len)`, `DynRef =
+        // (data_ptr, vtable_ptr)`. Read slot 0 at `field_offset`, slot
+        // 1 at `field_offset + 4`. Push them in declaration order so
+        // the caller's `emit_store_result` pops via reverse-order
+        // `local.set`.
+        IrType::StringRef | IrType::DynRef(_) => {
             ctx.emit(Instruction::LocalGet(base_ptr_local));
             ctx.emit(Instruction::I32Load(memarg));
             ctx.emit(Instruction::LocalGet(base_ptr_local));
@@ -290,9 +297,12 @@ pub(super) fn emit_field_store(
             ctx.emit(Instruction::LocalGet(value_locals[0]));
             ctx.emit(Instruction::I32Store(memarg));
         }
-        IrType::StringRef => {
-            debug_assert_eq!(value_locals.len(), 2, "StringRef must be 2 slots");
-            // Store ptr at offset, then len at offset+4.
+        // Two-slot fat pointers (see the matching `emit_field_load`
+        // arm). `StringRef` is `(ptr, len)`; `DynRef` is `(data_ptr,
+        // vtable_ptr)`. Both store slot 0 at `field_offset` and slot
+        // 1 at `field_offset + 4`.
+        IrType::StringRef | IrType::DynRef(_) => {
+            debug_assert_eq!(value_locals.len(), 2, "2-slot type must be 2 slots");
             ctx.emit(Instruction::LocalGet(base_ptr_local));
             ctx.emit(Instruction::LocalGet(value_locals[0]));
             ctx.emit(Instruction::I32Store(memarg));
@@ -2023,6 +2033,155 @@ fn translate_instruction(
                         "wasm32-linear: `Op::CallIndirect` returns `{ty:?}` but has \
                          no result binding — the call's return slots would be \
                          stranded on the operand stack (internal compiler bug)"
+                    )));
+                }
+            }
+        }
+
+        // --- dyn Trait ABI -----------------------------------------
+        //
+        // `Op::DynAlloc(trait, concrete, value)` produces a 2-slot
+        // `(data_ptr, vtable_ptr)` fat pointer. `data_ptr` is the
+        // concrete-type's heap pointer (the value vid's single local);
+        // `vtable_ptr` is the user-data byte offset of the rodata
+        // vtable for `(concrete, trait)`. The vtable holds an i32
+        // function-table-index per trait method; `Op::DynCall` reads
+        // those indices and does a `call_indirect` through the
+        // shared closure table.
+        //
+        // `Op::UnresolvedDynAlloc` shouldn't reach codegen — the IR
+        // monomorphizer rewrites it to a concrete `Op::DynAlloc`
+        // before any specialization is emitted. If it does, surface
+        // an internal-compiler-bug diagnostic with the trait name so
+        // a future regression in the monomorphizer is easy to triage.
+        Op::DynAlloc(trait_name, concrete_type, value) => {
+            let vid = expect_result(instr, "Op::DynAlloc")?;
+            let value_binding = ctx.binding_of(*value)?;
+            // The `dyn` fat-pointer ABI stores the concrete value as a
+            // single i32 `data_ptr` (a GC-heap pointer). Reject any
+            // concrete that isn't a GC-pointer type up front: a `Bool`
+            // would smuggle through `single_local` and an `I64`/`F64`
+            // would emit a `local.set i32 ← i64/f64` that only fails at
+            // wasmparser validation, far from this site. Surface it as
+            // an ICE instead — sema's object-safety / coercion rules are
+            // expected to keep primitives out of `dyn` positions.
+            if !is_gc_pointer_type(&value_binding.ir_type) {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::DynAlloc` of `{concrete_type}` as \
+                     `dyn {trait_name}` has a non-GC-pointer data type \
+                     `{:?}` — the dyn fat-pointer ABI requires a single-i32 \
+                     heap pointer (internal compiler bug — sema should reject \
+                     dyn coercion of non-pointer concretes)",
+                    value_binding.ir_type
+                )));
+            }
+            let data_ptr_local = value_binding.single_local();
+            let vtable_offset = b.require_dyn_vtable(ir_module, concrete_type, trait_name)?;
+            let dyn_ty = IrType::DynRef(trait_name.clone());
+            let result_locals = ctx.allocate_locals_for_ir_type(vid, dyn_ty)?;
+            debug_assert_eq!(result_locals.len(), 2, "DynRef must be 2 slots");
+            // data_ptr_local → result_locals[0]
+            ctx.emit(Instruction::LocalGet(data_ptr_local));
+            ctx.emit(Instruction::LocalSet(result_locals[0]));
+            // vtable byte offset → result_locals[1]
+            ctx.emit(Instruction::I32Const(vtable_offset as i32));
+            ctx.emit(Instruction::LocalSet(result_locals[1]));
+        }
+        Op::UnresolvedDynAlloc(trait_name, _) => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: `Op::UnresolvedDynAlloc` for `dyn {trait_name}` \
+                 reached codegen — monomorphization was expected to rewrite \
+                 it to a concrete `Op::DynAlloc` first (internal compiler bug)"
+            )));
+        }
+        Op::DynCall(trait_name, method_idx, receiver, args) => {
+            let recv_binding = ctx.binding_of(*receiver)?;
+            let recv_locals = recv_binding.locals.clone();
+            if recv_locals.len() != 2 {
+                return Err(CompileError::new(format!(
+                    "wasm32-linear: `Op::DynCall` receiver expected 2 slots \
+                     (data_ptr, vtable_ptr), got {} (internal compiler bug)",
+                    recv_locals.len()
+                )));
+            }
+            let data_ptr_local = recv_locals[0];
+            let vtable_ptr_local = recv_locals[1];
+            // Resolve the trait method's signature from the IR module
+            // (params + return type, excluding self). Build the
+            // wasm32 signature: prepend an i32 receiver slot, then
+            // flatten each user param and the return.
+            let (method_params, method_return) = ir_module
+                .trait_method_signature(trait_name, *method_idx as usize)
+                .ok_or_else(|| {
+                    CompileError::new(format!(
+                        "wasm32-linear: no IR trait metadata for `dyn {trait_name}` \
+                         slot {method_idx} — trait is missing or non-object-safe \
+                         (internal compiler bug)"
+                    ))
+                })?;
+            let mut full_param_valtypes: Vec<ValType> = vec![ValType::I32];
+            for pt in method_params {
+                full_param_valtypes.extend(wasm_valtypes_for(pt)?);
+            }
+            let return_valtypes = wasm_return_valtypes(method_return)?;
+            // The `call_indirect` type is built from the trait metadata's
+            // `method_return`, but `emit_store_result` below binds the
+            // result using `instr.result_type`. The two must agree in
+            // slot shape or the indirect call would leave a stack-type
+            // mismatch the validator reports far from here. They should
+            // always match (IR sets `result_type` from this same trait
+            // method), so pin it as a debug tripwire rather than a
+            // release-path error.
+            debug_assert_eq!(
+                wasm_valtypes_for(&instr.result_type).ok(),
+                Some(return_valtypes.clone()),
+                "DynCall result_type {:?} flattens differently from the \
+                 trait method's declared return {:?} — call_indirect \
+                 signature and emit_store_result would disagree",
+                instr.result_type,
+                method_return,
+            );
+            let type_idx = b.intern_call_indirect_type(&full_param_valtypes, &return_valtypes);
+            let table_idx = b.require_closure_table_idx()?;
+            // Push data_ptr (the self receiver), then each user arg's
+            // slots, then the fn-table-idx loaded from
+            // `vtable_ptr + method_idx * 4`. `call_indirect` consumes
+            // the fn-table-idx from the top of the stack and matches
+            // the rest against the signature.
+            ctx.emit(Instruction::LocalGet(data_ptr_local));
+            for arg in args {
+                ctx.emit_load_all(*arg)?;
+            }
+            ctx.emit(Instruction::LocalGet(vtable_ptr_local));
+            // `i32_memarg`'s `align: 2` hint claims 4-byte alignment, but
+            // the vtable base comes from `reserve_user_data`, which makes
+            // no alignment guarantee — so this load may be effectively
+            // unaligned. That is harmless on WASM: the memarg alignment is
+            // only a hint, and linear-memory loads are always valid
+            // regardless of the operand address's actual alignment.
+            ctx.emit(Instruction::I32Load(i32_memarg(
+                *method_idx * DYN_VTABLE_ENTRY_SIZE,
+            )));
+            ctx.emit(Instruction::CallIndirect {
+                type_index: type_idx,
+                table_index: table_idx,
+            });
+            match (instr.result, &instr.result_type) {
+                (Some(_), IrType::Void) => {
+                    return Err(CompileError::new(
+                        "wasm32-linear: `Op::DynCall` has a result binding but a \
+                         Void return type (internal compiler bug)"
+                            .to_string(),
+                    ));
+                }
+                (Some(vid), ty) => {
+                    ctx.emit_store_result(vid, ty.clone())?;
+                }
+                (None, IrType::Void) => {}
+                (None, ty) => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `Op::DynCall` returns `{ty:?}` but has \
+                         no result binding (internal compiler bug)"
                     )));
                 }
             }

@@ -1,0 +1,64 @@
+// `dyn Trait` in *function return position*. Complements the other
+// `traits_dyn_*` fixtures, where every `dyn` value is held in a local,
+// parameter, struct field, or list element but never crosses a
+// user-function boundary as a return value. This fixture exercises the
+// one structural shape those never reach:
+//
+// - `DynRef` as a user function's return type: `choose(...) -> dyn Shape`
+//   flattens its two-slot `(data_ptr, vtable_ptr)` fat pointer through
+//   `wasm_return_valtypes` into the `call`/`call_indirect` signature's
+//   `[i32, i32]` result, and the caller binds the two returned slots
+//   back into a `DynRef` local. A wrong return-slot count would strand
+//   the second slot on the operand stack or mis-bind the vtable ptr.
+// - The returned `DynRef`'s `data_ptr` (slot 0) is a fresh GC pointer
+//   that must stay rooted: `let s = choose(...)` roots slot 0 via the
+//   blanket `emit_gc_set_root`, and the later `s.area()` dispatch must
+//   still find a live concrete object.
+//
+// Two concrete impls (`Rect`, `Circle`) force two distinct vtables, and
+// `choose` returns either depending on its argument, so a return-ABI or
+// vtable mix-up (calling the wrong concrete `area`) changes the output.
+// Bodies avoid string interpolation (see the note in `traits_dyn.phx`).
+
+trait Shape {
+  function area(self) -> Int
+}
+
+struct Rect {
+  Int w
+  Int h
+
+  impl Shape {
+    function area(self) -> Int { self.w * self.h }
+  }
+}
+
+struct Circle {
+  Int r
+
+  impl Shape {
+    function area(self) -> Int { self.r * self.r }
+  }
+}
+
+// Returns `dyn Shape`: the concrete is chosen at runtime, so the result
+// is a genuine fat pointer the caller can only dispatch through. Each
+// branch coerces its concrete to `dyn Shape` through a typed local
+// before returning (a bare `if/else` join over two distinct concretes
+// is a type error — the branches must already agree on `dyn Shape`).
+function choose(big: Bool) -> dyn Shape {
+  if big {
+    let r: dyn Shape = Rect(3, 4)
+    return r
+  }
+  let c: dyn Shape = Circle(5)
+  return c
+}
+
+function main() {
+  let s: dyn Shape = choose(true)
+  print(s.area())
+
+  let t: dyn Shape = choose(false)
+  print(t.area())
+}
