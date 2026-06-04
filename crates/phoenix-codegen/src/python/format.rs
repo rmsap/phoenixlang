@@ -102,10 +102,45 @@ pub(crate) fn format_def_signature(
     let param_indent = format!("{base_indent}    ");
     let mut out = format!("{base_indent}{def_keyword} {name}(\n");
     for p in params {
-        out.push_str(&format!("{param_indent}{p},\n"));
+        let line = format!("{param_indent}{p},");
+        if line.len() <= LINE_LENGTH {
+            out.push_str(&line);
+            out.push('\n');
+        } else {
+            // The param itself overflows. Black, for a `lhs = Call(args)`
+            // parameter, breaks *inside* the call: the call's args go on an
+            // indented continuation line and the `)` closes at the param's own
+            // indent. The ONLY over-long param the generator emits is a FastAPI
+            // `Query(...)` default (a long camelCase alias), which has exactly
+            // this shape, so `wrap_call_param` handles it. A hypothetical
+            // non-call param over the limit (e.g. a 90-col bare type annotation)
+            // would fall back to the unwrapped line — still valid Python, but
+            // `black --check` in the compile-and-lint suite would reject it. The
+            // generator produces no such param today; if that ever changes, this
+            // branch needs a general black-style line wrapper, not just the call
+            // form.
+            out.push_str(&wrap_call_param(&param_indent, p));
+        }
     }
     out.push_str(&format!("{base_indent}){suffix}\n"));
     out
+}
+
+/// Wraps a single over-long function parameter of the form
+/// `lhs = Callee(inner)` the way black does: `lhs = Callee(` on the first line,
+/// `inner` indented one level deeper, and `)` back at the parameter's indent —
+/// followed by the trailing comma. Falls back to the param unchanged if it does
+/// not match that shape.
+fn wrap_call_param(param_indent: &str, param: &str) -> String {
+    if let Some(open) = param.find('(')
+        && param.ends_with(')')
+    {
+        let head = &param[..open]; // e.g. `x: int = Query`
+        let inner = &param[open + 1..param.len() - 1]; // call args
+        let inner_indent = format!("{param_indent}    ");
+        return format!("{param_indent}{head}(\n{inner_indent}{inner}\n{param_indent}),\n");
+    }
+    format!("{param_indent}{param},\n")
 }
 
 /// Ensures `buf` ends with exactly `blank_lines` blank lines before the next
@@ -130,5 +165,66 @@ pub(crate) fn ensure_blank_lines(buf: &mut String, blank_lines: usize) {
     let blanks = if opens_block { 0 } else { blank_lines };
     for _ in 0..=blanks {
         buf.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An over-long `lhs = Callee(args)` param wraps black-style: the call opens
+    /// on the param's line, its args drop to a deeper indent, and `)` closes back
+    /// at the param indent, followed by the trailing comma.
+    #[test]
+    fn wrap_call_param_breaks_inside_the_call() {
+        let wrapped = wrap_call_param(
+            "        ",
+            "sort_by: str = Query(\"default\", alias=\"sortBy\")",
+        );
+        assert_eq!(
+            wrapped,
+            "        sort_by: str = Query(\n            \"default\", alias=\"sortBy\"\n        ),\n"
+        );
+    }
+
+    /// A param with no `Callee(...)` shape (no parens) can't be re-wrapped, so it
+    /// falls back to the unwrapped single line — still valid Python.
+    #[test]
+    fn wrap_call_param_falls_back_without_call_shape() {
+        let wrapped = wrap_call_param("        ", "body: SomeVeryLongRequestBodyTypeName");
+        assert_eq!(wrapped, "        body: SomeVeryLongRequestBodyTypeName,\n");
+    }
+
+    /// `format_def_signature` must route an individually-overflowing `Query(...)`
+    /// param through `wrap_call_param`, not emit it as one >88-col line. Exercises
+    /// the overflow branch end-to-end (the generator's real param lines are all
+    /// short, so this is the only coverage of that path).
+    #[test]
+    fn format_def_signature_wraps_overflowing_query_param() {
+        let param = "extremely_long_query_parameter_name: str = \
+             Query(\"some_default\", alias=\"extremelyLongQueryParameterName\")"
+            .to_string();
+        let sig = format_def_signature(
+            "    ",
+            "async def",
+            "list_things",
+            std::slice::from_ref(&param),
+            " -> None:",
+        );
+        // The call opened and broke (args dropped to a continuation line)...
+        assert!(
+            sig.contains("= Query(\n"),
+            "overflowing Query param should break inside the call:\n{sig}"
+        );
+        // ...and `)` closed back at the 8-col param indent with the trailing comma.
+        assert!(
+            sig.contains("\n        ),\n"),
+            "wrapped call should close `)` at the param indent:\n{sig}"
+        );
+        // The param must NOT survive as one unwrapped >88-col line.
+        assert!(
+            !sig.contains(&format!("{param},")),
+            "overflowing param should not be emitted on a single line:\n{sig}"
+        );
     }
 }

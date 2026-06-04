@@ -1,0 +1,289 @@
+[
+  {
+    "name": "getPost_happy_path_param",
+    "endpoint": "getPost",
+    "kind": "ok",
+    "call": {
+      "path_params": { "id": "42" }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "42"
+      },
+      "returns": {
+        "id": 42,
+        "title": "Hello World",
+        "body": "First post body",
+        "author": {
+          "id": 7,
+          "name": "Ada",
+          "email": "ada@example.com",
+          "avatarUrl": null
+        },
+        "status": "Published",
+        "tags": ["intro", "news"]
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "id": 42,
+        "title": "Hello World",
+        "body": "First post body",
+        "author": {
+          "id": 7,
+          "name": "Ada",
+          "email": "ada@example.com",
+          "avatarUrl": null
+        },
+        "status": "Published",
+        "tags": ["intro", "news"]
+      }
+    }
+  },
+  {
+    "name": "searchPosts_required_aliased_query",
+    "endpoint": "searchPosts",
+    "kind": "ok",
+    "call": {
+      "query": {
+        "maxResults": 10,
+        "sortField": "title"
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "maxResults": 10,
+        "sortField": "title"
+      },
+      "returns": [
+        {
+          "id": 5,
+          "title": "Matched Post",
+          "body": "matched body",
+          "author": {
+            "id": 7,
+            "name": "Ada",
+            "email": "ada@example.com",
+            "avatarUrl": null
+          },
+          "status": "Published",
+          "tags": ["search"]
+        }
+      ]
+    },
+    "expect_client": {
+      "ok": [
+        {
+          "id": 5,
+          "title": "Matched Post",
+          "body": "matched body",
+          "author": {
+            "id": 7,
+            "name": "Ada",
+            "email": "ada@example.com",
+            "avatarUrl": null
+          },
+          "status": "Published",
+          "tags": ["search"]
+        }
+      ]
+    }
+  },
+  {
+    "name": "listPosts_happy_query_coercion",
+    "endpoint": "listPosts",
+    "kind": "ok",
+    "call": {
+      "query": {
+        "page": 3,
+        "limit": 25,
+        "tag": "rust",
+        "featured": true,
+        "minScore": 0.75
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "page": 3,
+        "limit": 25,
+        "tag": "rust",
+        "search": null,
+        "featured": true,
+        "minScore": 0.75,
+        "maxScore": null
+      },
+      "returns": [
+        {
+          "id": 1,
+          "title": "Only Post",
+          "body": "body text",
+          "author": {
+            "id": 7,
+            "name": "Ada",
+            "email": "ada@example.com",
+            "avatarUrl": null
+          },
+          "status": "Published",
+          "tags": ["rust"]
+        }
+      ]
+    },
+    "expect_client": {
+      "ok": [
+        {
+          "id": 1,
+          "title": "Only Post",
+          "body": "body text",
+          "author": {
+            "id": 7,
+            "name": "Ada",
+            "email": "ada@example.com",
+            "avatarUrl": null
+          },
+          "status": "Published",
+          "tags": ["rust"]
+        }
+      ]
+    }
+  },
+  {
+    "name": "createPost_happy_body",
+    "endpoint": "createPost",
+    "kind": "ok",
+    "call": {
+      "body": {
+        "title": "New Post",
+        "body": "Some body content",
+        "status": "Draft",
+        "tags": ["a", "b"]
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "title": "New Post",
+        "body": "Some body content",
+        "status": "Draft",
+        "tags": ["a", "b"]
+      },
+      "returns": {
+        "id": 99,
+        "title": "New Post",
+        "body": "Some body content",
+        "author": {
+          "id": 7,
+          "name": "Ada",
+          "email": "ada@example.com",
+          "avatarUrl": null
+        },
+        "status": "Draft",
+        "tags": ["a", "b"]
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "id": 99,
+        "title": "New Post",
+        "body": "Some body content",
+        "author": {
+          "id": 7,
+          "name": "Ada",
+          "email": "ada@example.com",
+          "avatarUrl": null
+        },
+        "status": "Draft",
+        "tags": ["a", "b"]
+      }
+    }
+  },
+  {
+    "name": "getPost_error_not_found",
+    "endpoint": "getPost",
+    "kind": "error",
+    "call": {
+      "path_params": { "id": "404404" }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "404404"
+      },
+      "raises": "NotFound"
+    },
+    "expect_client": {
+      "error": {
+        "variant": "NotFound",
+        "status_per_target": { "go": 404, "typescript": 404, "python": 404 }
+      }
+    }
+  },
+  {
+    "name": "createPost_error_unauthorized",
+    "endpoint": "createPost",
+    "kind": "error",
+    "call": {
+      "body": {
+        "title": "New Post",
+        "body": "Some body content",
+        "status": "Draft",
+        "tags": ["a", "b"]
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "title": "New Post",
+        "body": "Some body content",
+        "status": "Draft",
+        "tags": ["a", "b"]
+      },
+      "raises": "Unauthorized"
+    },
+    "expect_client": {
+      "error": {
+        "variant": "Unauthorized",
+        "status_per_target": { "go": 401, "typescript": 401, "python": 401 }
+      }
+    }
+  },
+  {
+    "name": "createPost_constraint_empty_title",
+    "endpoint": "createPost",
+    "kind": "constraint",
+    "call": {
+      "body": {
+        "title": "",
+        "body": "Some body content",
+        "status": "Draft",
+        "tags": ["a", "b"]
+      }
+    },
+    "handler": {
+      "expect_not_called": true
+    },
+    "expect_client": {
+      "error": {
+        "variant": "ValidationError",
+        "status_per_target": { "go": 400, "typescript": 400, "python": 422 }
+      }
+    }
+  },
+  {
+    "name": "updateAuthorProfile_constraint_empty_optional_field",
+    "endpoint": "updateAuthorProfile",
+    "kind": "constraint",
+    "call": {
+      "path_params": { "id": "7" },
+      "body": {
+        "name": "Ada Lovelace",
+        "avatarUrl": ""
+      }
+    },
+    "handler": {
+      "expect_not_called": true
+    },
+    "expect_client": {
+      "error": {
+        "variant": "ValidationError",
+        "status_per_target": { "go": 400, "typescript": 400, "python": 422 }
+      }
+    }
+  }
+]

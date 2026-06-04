@@ -183,20 +183,52 @@ pub(crate) fn emit_if_stmt(out: &mut String, indent: &str, cond: &str, stmt: &st
     }
 }
 
-/// Emits the client's `if (opts?.x !== undefined) params.set("x", String(opts.x));`
-/// guard, matching Prettier's three layouts as the names lengthen:
-///   * everything on one line;
-///   * the guard's condition kept on the `if` line, the `params.set(...)` call
-///     dropped onto the next line;
-///   * the `params.set(...)` call further broken one argument per line with a
-///     magic trailing comma.
+/// Emits a query param's `params.set(...)` line for the client.
 ///
-/// (The condition `opts?.x !== undefined` is short for any realistic field name,
-/// so its own overflow layout is not emulated here.)
-pub(crate) fn emit_param_set(out: &mut String, indent: &str, name: &str) {
-    let cond = format!("opts?.{name} !== undefined");
+/// A **required** param (`optional == false`) is always present on a
+/// non-nullable `opts`, so it is set unconditionally — emitting a
+/// `!== undefined` guard or `opts?.` chain there trips eslint's
+/// `no-unnecessary-condition`. An **optional** param keeps the
+/// `if (… !== undefined)` guard; the access uses `opts?.` only when `opts`
+/// itself is nullable (`opts_nullable`, i.e. every param is optional), and a
+/// plain `opts.` otherwise (a redundant `?.` on a non-nullable `opts` would also
+/// trip eslint).
+///
+/// Matches Prettier's layouts as the line lengthens: everything on one line; the
+/// `params.set(...)` call dropped onto the next line; then the call broken one
+/// argument per line with a magic trailing comma. (The condition is short for
+/// any realistic field name, so its own overflow layout is not emulated.)
+pub(crate) fn emit_param_set(
+    out: &mut String,
+    indent: &str,
+    name: &str,
+    optional: bool,
+    opts_nullable: bool,
+) {
     let arg0 = format!("\"{name}\"");
     let arg1 = format!("String(opts.{name})");
+
+    if !optional {
+        // Required: opts is non-nullable and the field is always present.
+        let one_line = format!("{indent}params.set({arg0}, {arg1});");
+        if one_line.len() <= PRINT_WIDTH {
+            out.push_str(&one_line);
+            out.push('\n');
+        } else {
+            out.push_str(&format!("{indent}params.set(\n"));
+            out.push_str(&format!("{indent}  {arg0},\n"));
+            out.push_str(&format!("{indent}  {arg1},\n"));
+            out.push_str(&format!("{indent});\n"));
+        }
+        return;
+    }
+
+    let access = if opts_nullable {
+        format!("opts?.{name}")
+    } else {
+        format!("opts.{name}")
+    };
+    let cond = format!("{access} !== undefined");
 
     let one_line = format!("{indent}if ({cond}) params.set({arg0}, {arg1});");
     if one_line.len() <= PRINT_WIDTH {
@@ -613,5 +645,54 @@ pub(crate) fn emit_validation_body(out: &mut String, fields: &[ValidationField])
             conds.push(format!("!({expr})"));
             emit_guard(out, "  ", &conds, &format!("{name}: constraint violated"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A required param sets unconditionally (no `!== undefined` guard or `opts?.`
+    /// chain — both would trip eslint's `no-unnecessary-condition`).
+    #[test]
+    fn emit_param_set_required_is_unconditional() {
+        let mut out = String::new();
+        emit_param_set(&mut out, "    ", "term", false, false);
+        assert_eq!(out, "    params.set(\"term\", String(opts.term));\n");
+    }
+
+    /// An over-long *required* `params.set(...)` breaks one argument per line with
+    /// a magic trailing comma and closes `)` at the param's own indent — the same
+    /// Prettier layout the optional branch uses. The generator's real field names
+    /// are short, so this is the only coverage of that break.
+    #[test]
+    fn emit_param_set_required_breaks_when_overflowing() {
+        let mut out = String::new();
+        let name = "aReallyExtremelyLongRequiredQueryParameterNameThatOverflows";
+        emit_param_set(&mut out, "    ", name, false, false);
+        assert_eq!(
+            out,
+            format!("    params.set(\n      \"{name}\",\n      String(opts.{name}),\n    );\n")
+        );
+    }
+
+    /// An optional param on a *nullable* `opts` (every param optional) guards with
+    /// `opts?.`; on a non-nullable `opts` (some param required) a plain `opts.` is
+    /// used so the `?.` is not a redundant chain.
+    #[test]
+    fn emit_param_set_optional_access_tracks_opts_nullability() {
+        let mut nullable = String::new();
+        emit_param_set(&mut nullable, "    ", "page", true, true);
+        assert_eq!(
+            nullable,
+            "    if (opts?.page !== undefined) params.set(\"page\", String(opts.page));\n"
+        );
+
+        let mut non_nullable = String::new();
+        emit_param_set(&mut non_nullable, "    ", "page", true, false);
+        assert_eq!(
+            non_nullable,
+            "    if (opts.page !== undefined) params.set(\"page\", String(opts.page));\n"
+        );
     }
 }

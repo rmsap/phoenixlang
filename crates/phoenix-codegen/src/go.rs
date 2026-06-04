@@ -11,10 +11,19 @@
 
 use std::collections::BTreeSet;
 
-use phoenix_parser::ast::{Declaration, EnumDecl, Program, StructDecl};
+use phoenix_parser::ast::{Declaration, EnumDecl, Expr, Program, StructDecl};
 use phoenix_sema::Analysis;
-use phoenix_sema::checker::{DefaultValue, EndpointInfo, QueryParamInfo};
+use phoenix_sema::checker::{DefaultValue, DerivedField, EndpointInfo, QueryParamInfo};
 use phoenix_sema::types::Type;
+
+/// The error variant a failed body `Validate()` maps to. Used both as the lookup
+/// key into the endpoint's declared errors and as the fallback name/status when
+/// the endpoint declares no such variant — kept as a single source so the three
+/// uses can never drift.
+const VALIDATION_ERROR_VARIANT: &str = "ValidationError";
+/// Status used for [`VALIDATION_ERROR_VARIANT`] when the endpoint declares no
+/// matching error variant (a client-input error → HTTP 400).
+const VALIDATION_ERROR_FALLBACK_STATUS: i64 = 400;
 
 /// The output of Go code generation: four file contents.
 pub struct GoFiles {
@@ -266,8 +275,10 @@ impl<'a> GoGenerator<'a> {
     /// Emits a Go struct with JSON tags for a Phoenix struct.
     fn emit_struct(&mut self, s: &StructDecl) {
         if let Some(ref doc) = s.doc_comment {
-            self.types_out
-                .push_str(&format!("// {} is {}.\n", s.name, doc.to_lowercase()));
+            self.types_out.push_str(&render_line_comment(
+                "// ",
+                &format!("{} is {}.", s.name, doc.to_lowercase()),
+            ));
         }
         let rows: Vec<(String, String, String)> = self
             .check_result
@@ -297,8 +308,10 @@ impl<'a> GoGenerator<'a> {
         }
 
         if let Some(ref doc) = e.doc_comment {
-            self.types_out
-                .push_str(&format!("// {} is {}.\n", e.name, doc.to_lowercase()));
+            self.types_out.push_str(&render_line_comment(
+                "// ",
+                &format!("{} is {}.", e.name, doc.to_lowercase()),
+            ));
         }
         self.types_out
             .push_str(&format!("type {} string\n\n", e.name));
@@ -337,11 +350,7 @@ impl<'a> GoGenerator<'a> {
             .fields
             .iter()
             .map(|f| {
-                let go_type = if f.optional {
-                    format!("*{}", type_to_go(&f.ty))
-                } else {
-                    type_to_go(&f.ty)
-                };
+                let (go_type, _) = derived_field_go_type(f);
                 let omitempty = if f.optional { ",omitempty" } else { "" };
                 (
                     to_pascal_case(&f.name),
@@ -351,55 +360,78 @@ impl<'a> GoGenerator<'a> {
             })
             .collect();
         self.types_out.push_str(&render_struct(&type_name, &rows));
+
+        self.emit_body_validate_method(ep, &type_name);
+    }
+
+    /// Emits a `Validate() error` method on a derived body type if any of its
+    /// fields carry a constraint inherited from the source struct.
+    ///
+    /// Constraints propagate from the source struct's `where` clauses through the
+    /// `omit`/`pick`/`partial` modifier chain (the sema layer already records the
+    /// surviving constraint on each [`DerivedField`]). Pointer-ness comes from
+    /// [`derived_field_go_type`] — the single source of truth shared with
+    /// [`GoGenerator::emit_derived_type`], so a `partial`-applied `Option<T>`
+    /// collapses to one `*T` (never `**T`) and the nil-guard here can never
+    /// disagree with the rendered field type. The actual emission is shared with
+    /// the source-struct validator via [`render_validate_fn`].
+    fn emit_body_validate_method(&mut self, ep: &EndpointInfo, type_name: &str) {
+        let Some(ref body) = ep.body else { return };
+        let fields: Vec<(&str, &Expr, bool)> = body
+            .fields
+            .iter()
+            .filter_map(|f| {
+                f.constraint
+                    .as_ref()
+                    .map(|c| (f.name.as_str(), c, derived_field_go_type(f).1))
+            })
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        render_validate_fn(
+            ValidateSink {
+                out: &mut self.types_out,
+                needs_fmt: &mut self.types_needs_fmt,
+                needs_strings: &mut self.types_needs_strings,
+            },
+            type_name,
+            &fields,
+        );
     }
 
     // ── validation emission ────────────────────────────────────────
 
     /// Emits a `Validate() error` method on a Go struct if any of its fields
-    /// have `where` constraints.
+    /// have `where` constraints. An `Option<T>` field is rendered as `*T`, so its
+    /// check is nil-guarded and dereferenced; the actual emission is shared with
+    /// the derived-body validator via [`render_validate_fn`].
     fn emit_validate_method(&mut self, s: &StructDecl) {
         let Some(info) = self.check_result.module.struct_info_by_name(&s.name) else {
             return;
         };
-        if !info.fields.iter().any(|f| f.constraint.is_some()) {
+        let fields: Vec<(&str, &Expr, bool)> = info
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                f.constraint
+                    .as_ref()
+                    .map(|c| (f.name.as_str(), c, is_option))
+            })
+            .collect();
+        if fields.is_empty() {
             return;
         }
-
-        self.types_needs_fmt = true;
-
-        self.types_out.push_str(&format!(
-            "// Validate checks all field constraints for {}.\n",
-            s.name
-        ));
-        self.types_out
-            .push_str(&format!("func (s {}) Validate() error {{\n", s.name));
-
-        for f in &info.fields {
-            if let Some(ref constraint) = f.constraint {
-                if constraint_needs_strings(constraint) {
-                    self.types_needs_strings = true;
-                }
-                let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
-                let go_expr = constraint_expr_to_go(constraint, &f.name, is_option);
-                // `constraint_expr_to_go` already wraps binary expressions in
-                // parentheses; strip the redundant outer pair so the `!(...)`
-                // guard matches gofmt's canonical output (no doubled parens).
-                let go_expr = strip_outer_parens(&go_expr);
-                if is_option {
-                    self.types_out.push_str(&format!(
-                        "\tif s.{} != nil && !({}) {{\n\t\treturn fmt.Errorf(\"{}: constraint violated\")\n\t}}\n",
-                        to_pascal_case(&f.name), go_expr, f.name
-                    ));
-                } else {
-                    self.types_out.push_str(&format!(
-                        "\tif !({}) {{\n\t\treturn fmt.Errorf(\"{}: constraint violated\")\n\t}}\n",
-                        go_expr, f.name
-                    ));
-                }
-            }
-        }
-
-        self.types_out.push_str("\treturn nil\n}\n\n");
+        render_validate_fn(
+            ValidateSink {
+                out: &mut self.types_out,
+                needs_fmt: &mut self.types_needs_fmt,
+                needs_strings: &mut self.types_needs_strings,
+            },
+            &s.name,
+            &fields,
+        );
     }
 
     // ── client.go emission ──────────────────────────────────────────
@@ -432,8 +464,11 @@ impl<'a> GoGenerator<'a> {
         };
 
         if let Some(ref doc) = ep.doc_comment {
-            self.client_out
-                .push_str(&format!("\n// {} {}.\n", method_name, doc.to_lowercase()));
+            self.client_out.push('\n');
+            self.client_out.push_str(&render_line_comment(
+                "// ",
+                &format!("{} {}.", method_name, doc.to_lowercase()),
+            ));
         }
         self.client_out.push_str(&format!(
             "func (c *ApiClient) {}({}) {} {{\n",
@@ -586,8 +621,10 @@ impl<'a> GoGenerator<'a> {
         };
 
         if let Some(ref doc) = ep.doc_comment {
-            self.handlers_out
-                .push_str(&format!("\t// {} {}.\n", method_name, doc.to_lowercase()));
+            self.handlers_out.push_str(&render_line_comment(
+                "\t// ",
+                &format!("{} {}.", method_name, doc.to_lowercase()),
+            ));
         }
         self.handlers_out.push_str(&format!(
             "\t{}({}) {}\n",
@@ -618,13 +655,31 @@ impl<'a> GoGenerator<'a> {
         }
 
         // Parse body
-        if ep.body.is_some() {
+        if let Some(ref body) = ep.body {
             self.server_needs_json = true;
             let body_type = format!("{}Body", capitalize(&ep.name));
             self.server_out.push_str(&format!(
                 "\t\tvar body {}\n\t\tif err := json.NewDecoder(r.Body).Decode(&body); err != nil {{\n\t\t\thttp.Error(w, err.Error(), http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n",
                 body_type
             ));
+            // Validate the decoded body against the constraints inherited from the
+            // source struct. Only emitted when the body type actually has a
+            // `Validate()` (i.e. at least one constrained field). A failure is a
+            // client-input error: map it to the endpoint's declared
+            // `ValidationError` variant — honoring that variant's declared status,
+            // exactly like the handler error mapping below — and fall back to a
+            // 400 `ValidationError` when the endpoint declares no such variant.
+            if body.fields.iter().any(|f| f.constraint.is_some()) {
+                let (name, code) = ep
+                    .errors
+                    .iter()
+                    .find(|(name, _)| name == VALIDATION_ERROR_VARIANT)
+                    .map(|(name, code)| (name.as_str(), *code))
+                    .unwrap_or((VALIDATION_ERROR_VARIANT, VALIDATION_ERROR_FALLBACK_STATUS));
+                self.server_out.push_str(&format!(
+                    "\t\tif err := body.Validate(); err != nil {{\n\t\t\thttp.Error(w, \"{name}\", {code})\n\t\t\treturn\n\t\t}}\n",
+                ));
+            }
         }
 
         // Parse query params. Required params parse into a value type; optional
@@ -796,6 +851,102 @@ impl<'a> GoGenerator<'a> {
 // ── Helper functions ─────────────────────────────────────────────────
 
 /// Converts a Phoenix `Type` to a Go type string.
+/// Renders `body` as one or more Go line comments, each prefixed with `prefix`
+/// (e.g. `"// "` or `"\t// "`). A multi-line doc comment (the lexer joins its
+/// lines with `\n`) gets EVERY line prefixed, so continuation lines stay
+/// commented instead of leaking into the file as code. Trailing whitespace is
+/// trimmed per line so an empty line renders as a bare `//` (gofmt-clean).
+fn render_line_comment(prefix: &str, body: &str) -> String {
+    let mut out = String::new();
+    for line in body.split('\n') {
+        out.push_str(format!("{prefix}{line}").trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Renders the Go type for a derived body field and reports whether it is a
+/// nil-able pointer.
+///
+/// A `partial`-applied field becomes a pointer so it can be omitted, but an
+/// already-`Option<T>` field is *already* rendered as `*T` by [`type_to_go`], so
+/// applying `partial` to it must NOT produce `**T`. Centralizing this here keeps
+/// the struct-field rendering ([`GoGenerator::emit_derived_type`]) and the body
+/// `Validate()` deref/nil-guard ([`GoGenerator::emit_body_validate_method`]) in
+/// lock-step — the pointer-ness they each compute can never drift.
+fn derived_field_go_type(f: &DerivedField) -> (String, bool) {
+    let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+    let is_ptr = f.optional || is_option;
+    // `type_to_go` already renders `Option<T>` as `*T`; only add a pointer for a
+    // `partial`-applied non-Option field so an optional Option stays a single `*T`.
+    let go_type = if f.optional && !is_option {
+        format!("*{}", type_to_go(&f.ty))
+    } else {
+        type_to_go(&f.ty)
+    };
+    (go_type, is_ptr)
+}
+
+/// The output sinks [`render_validate_fn`] writes through: the buffer it appends
+/// the `Validate()` method to, plus the two import flags it raises — `fmt` always
+/// (the error path uses `fmt.Errorf`) and `strings` only when some constraint
+/// calls a `strings` helper. Bundling what were three positional `&mut` params
+/// into one named handle keeps the call sites readable and labels the two
+/// otherwise-interchangeable `&mut bool` flags. Held as three disjoint
+/// `&mut self.field` borrows at the call site, so it coexists with the immutable
+/// borrow `emit_validate_method` keeps on `self.check_result` via `fields`.
+struct ValidateSink<'a> {
+    out: &'a mut String,
+    needs_fmt: &'a mut bool,
+    needs_strings: &'a mut bool,
+}
+
+/// Renders a `func (s {type_name}) Validate() error` whose body checks every
+/// constrained field, then `return nil`. `fields` lists each constrained field
+/// as `(name, constraint, is_ptr)`: an `is_ptr` field is rendered as a Go
+/// pointer (either `partial`-applied or already `Option<T>`, both `*T`), so its
+/// check is nil-guarded and `self` is dereferenced inside the constraint
+/// expression; a plain field is checked directly. Shared by the source-struct
+/// validator ([`GoGenerator::emit_validate_method`]) and the derived-body
+/// validator ([`GoGenerator::emit_body_validate_method`]) so the two can never
+/// drift. Callers must invoke this only with a non-empty `fields` — an empty
+/// `Validate()` would needlessly pull in the `fmt` import.
+fn render_validate_fn(sink: ValidateSink<'_>, type_name: &str, fields: &[(&str, &Expr, bool)]) {
+    let ValidateSink {
+        out,
+        needs_fmt,
+        needs_strings,
+    } = sink;
+    *needs_fmt = true;
+    out.push_str(&format!(
+        "// Validate checks all field constraints for {type_name}.\n"
+    ));
+    out.push_str(&format!("func (s {type_name}) Validate() error {{\n"));
+
+    for (name, constraint, is_ptr) in fields {
+        if constraint_needs_strings(constraint) {
+            *needs_strings = true;
+        }
+        // `constraint_expr_to_go` already wraps binary expressions in
+        // parentheses; strip the redundant outer pair so the `!(...)` guard
+        // matches gofmt's canonical output (no doubled parens).
+        let go_expr = strip_outer_parens(&constraint_expr_to_go(constraint, name, *is_ptr));
+        if *is_ptr {
+            out.push_str(&format!(
+                "\tif s.{} != nil && !({}) {{\n\t\treturn fmt.Errorf(\"{}: constraint violated\")\n\t}}\n",
+                to_pascal_case(name), go_expr, name
+            ));
+        } else {
+            out.push_str(&format!(
+                "\tif !({}) {{\n\t\treturn fmt.Errorf(\"{}: constraint violated\")\n\t}}\n",
+                go_expr, name
+            ));
+        }
+    }
+
+    out.push_str("\treturn nil\n}\n\n");
+}
+
 fn type_to_go(ty: &Type) -> String {
     match ty {
         Type::Int => "int64".to_string(),
@@ -1091,6 +1242,30 @@ mod tests {
     use phoenix_parser::parser;
     use phoenix_sema::checker;
 
+    /// An interior empty doc line renders as a bare `//` (trailing space trimmed)
+    /// so the output stays gofmt-clean. Guards the empty-line branch of
+    /// `render_line_comment`, which the doc-comment integration tests don't hit.
+    #[test]
+    fn render_line_comment_blanks_out_empty_lines() {
+        assert_eq!(
+            render_line_comment("// ", "first\n\nthird"),
+            "// first\n//\n// third\n"
+        );
+    }
+
+    /// The tab-indented prefix (used for handler doc comments) must keep its
+    /// leading tab on a blank line while still trimming the trailing space after
+    /// `//`, i.e. `"\t// "` → `"\t//"`. `trim_end` only strips trailing
+    /// whitespace, so the indent survives — but nothing else pins that, so guard
+    /// it explicitly.
+    #[test]
+    fn render_line_comment_keeps_indent_on_empty_lines() {
+        assert_eq!(
+            render_line_comment("\t// ", "first\n\nthird"),
+            "\t// first\n\t//\n\t// third\n"
+        );
+    }
+
     fn generate_from_source(source: &str) -> GoFiles {
         let tokens = tokenize(source, SourceId(0));
         let (program, parse_errors) = parser::parse(&tokens);
@@ -1189,6 +1364,38 @@ endpoint deleteUser: DELETE "/api/users/{id}" {
         insta::assert_snapshot!("go_void_server", files.server);
     }
 
+    /// A multi-line doc comment must have EVERY line prefixed with `//`, not just
+    /// the first — otherwise continuation lines leak into the file as invalid Go.
+    /// Regression guard for `render_line_comment`.
+    #[test]
+    fn multiline_doc_comment_is_fully_commented() {
+        let files = generate_from_source(
+            r#"
+struct Widget { Int id }
+/**
+ * Fetch a widget by id
+ * with extra detail on the second line
+ */
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#,
+        );
+        assert!(
+            files.client.contains(
+                "// GetWidget fetch a widget by id\n// with extra detail on the second line.\n"
+            ),
+            "every doc line must be commented:\n{}",
+            files.client
+        );
+        // The continuation line must never appear UNcommented (leaked as code).
+        assert!(
+            !files.client.contains("\nwith extra detail"),
+            "continuation doc line leaked as code:\n{}",
+            files.client
+        );
+    }
+
     #[test]
     fn multiple_endpoints() {
         let files = generate_from_source(
@@ -1264,6 +1471,82 @@ endpoint updateEmail: PATCH "/api/users/{id}" {
 "#,
         );
         insta::assert_snapshot!("go_pick_types", files.types);
+    }
+
+    /// A constrained `Option<T>` field carried into a body keeps `optional ==
+    /// false` (no `partial` applied) yet renders as a Go pointer, so the body's
+    /// `Validate()` must nil-guard and dereference it — exactly like the source
+    /// struct's own `Validate()`. Guards `emit_body_validate_method`'s pointer
+    /// detection against regressing to a bare `f.optional` check.
+    #[test]
+    fn body_validate_optional_constrained_field() {
+        let files = generate_from_source(
+            r#"
+struct Account {
+    Int id
+    Option<String> displayName where self.length <= 60
+}
+endpoint updateAccount: PATCH "/api/accounts/{id}" {
+    body Account omit { id }
+    response Account
+}
+"#,
+        );
+        assert!(
+            files
+                .types
+                .contains("func (s UpdateAccountBody) Validate() error {"),
+            "body type should have a Validate method:\n{}",
+            files.types
+        );
+        assert!(
+            files
+                .types
+                .contains("if s.DisplayName != nil && !(len(*s.DisplayName) <= 60) {"),
+            "Option body field must be nil-guarded and dereferenced:\n{}",
+            files.types
+        );
+    }
+
+    /// A constrained `Option<T>` field that ALSO gets `partial` applied must not
+    /// render as `**T`: `type_to_go` already maps `Option<T>` to `*T`, and
+    /// `partial` only marks it optional — it must stay a single pointer so both
+    /// the struct field and the body `Validate()` (single deref `*s.Field`) are
+    /// valid Go. Regression guard for the `derived_field_go_type` double-pointer
+    /// collapse.
+    #[test]
+    fn body_validate_partial_option_constrained_field() {
+        let files = generate_from_source(
+            r#"
+struct Account {
+    Int id
+    Option<String> displayName where self.length <= 60
+}
+endpoint patchAccount: PATCH "/api/accounts/{id}" {
+    body Account omit { id } partial { displayName }
+    response Account
+}
+"#,
+        );
+        assert!(
+            !files.types.contains("**"),
+            "an optional Option field must collapse to a single pointer, not **T:\n{}",
+            files.types
+        );
+        assert!(
+            files
+                .types
+                .contains("DisplayName *string `json:\"displayName,omitempty\"`"),
+            "partial Option field should render as a single *string:\n{}",
+            files.types
+        );
+        assert!(
+            files
+                .types
+                .contains("if s.DisplayName != nil && !(len(*s.DisplayName) <= 60) {"),
+            "partial Option body field must be nil-guarded and single-dereferenced:\n{}",
+            files.types
+        );
     }
 
     /// Map<K,V> and Bool fields in struct.

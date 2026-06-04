@@ -1,0 +1,17 @@
+# Pinned runtime deps for the Phoenix Gen Python round-trip driver.
+#
+# The harness creates a local `.venv` (gitignored, the analog of node_modules)
+# under this dir and runs `.venv/bin/python driver.py`. Versions match the
+# compile-and-lint scaffold (tests/scaffold/python/requirements-dev.txt) for
+# reproducibility.
+#
+# Setup:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# The driver is a plain script (no pytest / pytest-asyncio): it drives the
+# generated httpx client in-process against the generated FastAPI server via
+# httpx.ASGITransport and exits non-zero on the first failed contract case.
+fastapi==0.115.6
+httpx==0.28.1
+pydantic==2.10.4

@@ -15,8 +15,8 @@ export function setBaseUrl(url: string): void {
 export const api = {
   async searchUsers(opts: { term: string; page?: number }): Promise<User[]> {
     const params = new URLSearchParams();
-    if (opts?.term !== undefined) params.set("term", String(opts.term));
-    if (opts?.page !== undefined) params.set("page", String(opts.page));
+    params.set("term", String(opts.term));
+    if (opts.page !== undefined) params.set("page", String(opts.page));
     const query = params.toString();
     const response = await fetch(
       `${baseUrl}/api/users/search${query ? `?${query}` : ""}`,

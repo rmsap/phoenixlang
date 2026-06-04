@@ -181,7 +181,7 @@ impl<'a> PyGenerator<'a> {
     fn emit_model(&mut self, s: &StructDecl) {
         ensure_blank_lines(&mut self.models_out, 2);
         if let Some(ref doc) = s.doc_comment {
-            self.models_out.push_str(&format!("# {}\n", doc));
+            self.models_out.push_str(&render_hash_comment("", doc));
         }
         self.models_out
             .push_str(&format!("class {}(BaseModel):\n", s.name));
@@ -233,7 +233,7 @@ impl<'a> PyGenerator<'a> {
 
         ensure_blank_lines(&mut self.models_out, 2);
         if let Some(ref doc) = e.doc_comment {
-            self.models_out.push_str(&format!("# {}\n", doc));
+            self.models_out.push_str(&render_hash_comment("", doc));
         }
         self.models_out
             .push_str(&format!("class {}(str, Enum):\n", e.name));
@@ -384,7 +384,7 @@ impl<'a> PyGenerator<'a> {
 
         ensure_blank_lines(&mut self.client_out, 1);
         if let Some(ref doc) = ep.doc_comment {
-            self.client_out.push_str(&format!("    # {}\n", doc));
+            self.client_out.push_str(&render_hash_comment("    ", doc));
         }
 
         let sig = format_def_signature(
@@ -507,7 +507,8 @@ impl<'a> PyGenerator<'a> {
 
         ensure_blank_lines(&mut self.handlers_out, 1);
         if let Some(ref doc) = ep.doc_comment {
-            self.handlers_out.push_str(&format!("    # {}\n", doc));
+            self.handlers_out
+                .push_str(&render_hash_comment("    ", doc));
         }
         let sig = format_def_signature(
             "    ",
@@ -523,20 +524,30 @@ impl<'a> PyGenerator<'a> {
 
     /// Emits imports for the server file.
     fn emit_server_imports(&mut self) {
-        // `HTTPException` is only raised by the error-mapping branch, so import
-        // it only when some endpoint declares errors (else ruff F401 fires).
+        // Build the `fastapi` import list from what the routes actually use, so
+        // ruff F401 never fires on an unused name. `APIRouter` is always needed;
+        // `HTTPException` only when some endpoint maps errors; `Query` only when
+        // some query param needs an `alias=` (its wire name differs from the
+        // snake_case Python parameter — see `emit_server_route`).
         let needs_http_exception = self
             .check_result
             .endpoints
             .iter()
             .any(|ep| !ep.errors.is_empty());
+        let needs_query = self.check_result.endpoints.iter().any(|ep| {
+            ep.query_params
+                .iter()
+                .any(|qp| to_snake_case(&qp.name) != qp.name)
+        });
+        let mut names = vec!["APIRouter"];
         if needs_http_exception {
-            self.server_out
-                .push_str("from fastapi import APIRouter, HTTPException\n\n");
-        } else {
-            self.server_out
-                .push_str("from fastapi import APIRouter\n\n");
+            names.push("HTTPException");
         }
+        if needs_query {
+            names.push("Query");
+        }
+        self.server_out
+            .push_str(&format!("from fastapi import {}\n\n", names.join(", ")));
 
         let mut model_imports = BTreeSet::new();
         for ep in &self.check_result.endpoints {
@@ -578,35 +589,58 @@ impl<'a> PyGenerator<'a> {
             method, ep.path, status
         ));
 
-        // Build function params
-        let mut params = Vec::new();
+        // Build function params. Python requires every parameter WITHOUT a
+        // default to precede those WITH one, so we collect into two ordered
+        // groups and concatenate. Path params and the body never carry a
+        // default; query params land in `defaulted` when they render a `= ...`
+        // (optional params, and required-but-aliased params — see below).
+        let mut required = Vec::new();
+        let mut defaulted = Vec::new();
         for pp in &ep.path_params {
-            params.push(format!("{}: str", to_snake_case(pp)));
+            required.push(format!("{}: str", to_snake_case(pp)));
         }
         if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
-            params.push(format!("body: {body_type}"));
+            required.push(format!("body: {body_type}"));
         }
         for qp in &ep.query_params {
             let py_type = type_to_python(&qp.ty);
+            let snake = to_snake_case(&qp.name);
             let is_optional =
                 qp.has_default || matches!(&qp.ty, Type::Generic(name, _) if name == "Option");
+            // FastAPI matches query keys to the Python parameter name. The
+            // generated client sends the schema's original (camelCase) name, so
+            // when snake_case differs we must pin the wire key with an explicit
+            // `Query(default, alias="<wireName>")` — otherwise FastAPI never sees
+            // the value and silently falls back to the default. Single-word
+            // params (snake == wire) need no alias and stay plain.
+            let needs_alias = snake != qp.name;
             if is_optional {
                 let default = qp
                     .default_value
                     .as_ref()
                     .map(default_value_to_python)
                     .unwrap_or_else(|| "None".to_string());
-                params.push(format!(
-                    "{}: {} = {}",
-                    to_snake_case(&qp.name),
-                    py_type,
-                    default
-                ));
+                if needs_alias {
+                    defaulted.push(format!(
+                        "{snake}: {py_type} = Query({default}, alias=\"{}\")",
+                        qp.name
+                    ));
+                } else {
+                    defaulted.push(format!("{snake}: {py_type} = {default}"));
+                }
+            } else if needs_alias {
+                // A required aliased param renders `= Query(alias=...)`, which is
+                // a syntactic default, so it must sort after the non-defaulted
+                // params even though FastAPI still treats it as required (a
+                // `Query(...)` with no value sentinel is required regardless of
+                // position).
+                defaulted.push(format!("{snake}: {py_type} = Query(alias=\"{}\")", qp.name));
             } else {
-                params.push(format!("{}: {}", to_snake_case(&qp.name), py_type));
+                required.push(format!("{snake}: {py_type}"));
             }
         }
+        let params: Vec<String> = required.into_iter().chain(defaulted).collect();
 
         let sig = format_def_signature(
             "    ",
@@ -673,6 +707,21 @@ impl<'a> PyGenerator<'a> {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
+
+/// Renders `text` as one or more Python `#` comments, each prefixed with
+/// `indent`. A multi-line doc comment (the lexer joins its lines with `\n`) gets
+/// EVERY line prefixed, so continuation lines stay commented instead of leaking
+/// into the file as code. Trailing whitespace is trimmed per line, so an empty
+/// line renders as a bare `#` (no trailing space) — keeping `# ` block-comment
+/// linters (ruff E265/W291) happy — matching the Go `render_line_comment` helper.
+fn render_hash_comment(indent: &str, text: &str) -> String {
+    let mut out = String::new();
+    for line in text.split('\n') {
+        out.push_str(format!("{indent}# {line}").trim_end());
+        out.push('\n');
+    }
+    out
+}
 
 /// Converts a Phoenix `Type` to a Python type annotation string.
 fn type_to_python(ty: &Type) -> String {
@@ -883,6 +932,17 @@ mod tests {
     use phoenix_parser::parser;
     use phoenix_sema::checker;
 
+    /// An interior empty doc line renders as a bare `#` (no trailing space) so
+    /// ruff E265 stays happy. Guards the empty-line branch of
+    /// `render_hash_comment`, which the doc-comment integration tests don't hit.
+    #[test]
+    fn render_hash_comment_blanks_out_empty_lines() {
+        assert_eq!(
+            render_hash_comment("    ", "first\n\nthird"),
+            "    # first\n    #\n    # third\n"
+        );
+    }
+
     fn generate_from_source(source: &str) -> PythonFiles {
         let tokens = tokenize(source, SourceId(0));
         let (program, parse_errors) = parser::parse(&tokens);
@@ -983,6 +1043,36 @@ endpoint listUsers: GET "/api/users" {
         insta::assert_snapshot!("py_query_server", files.server);
     }
 
+    /// A required, camelCase query param renders `= Query(alias=...)` — a
+    /// syntactic default — so it must sort AFTER a required plain param, or the
+    /// generated server is invalid Python ("non-default argument follows default
+    /// argument"). Guards the parameter partitioning in `emit_server_route`.
+    #[test]
+    fn required_aliased_query_param_sorts_after_plain() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint searchUsers: GET "/api/users" {
+    query {
+        Int maxResults
+        Int page
+    }
+    response List<User>
+}
+"#,
+        );
+        let plain = files.server.find("page: int").expect("plain param present");
+        let aliased = files
+            .server
+            .find("max_results: int = Query(alias=\"maxResults\")")
+            .expect("aliased param present");
+        assert!(
+            plain < aliased,
+            "required plain param must precede the aliased (defaulted) one:\n{}",
+            files.server
+        );
+    }
+
     #[test]
     fn void_response() {
         let files = generate_from_source(
@@ -994,6 +1084,38 @@ endpoint deleteUser: DELETE "/api/users/{id}" {
         );
         insta::assert_snapshot!("py_void_client", files.client);
         insta::assert_snapshot!("py_void_server", files.server);
+    }
+
+    /// A multi-line doc comment must have EVERY line prefixed with `#`, not just
+    /// the first — otherwise continuation lines leak into the file as code.
+    /// Regression guard for `render_hash_comment`.
+    #[test]
+    fn multiline_doc_comment_is_fully_commented() {
+        let files = generate_from_source(
+            r#"
+struct Widget { Int id }
+/**
+ * Fetch a widget by id
+ * with extra detail on the second line
+ */
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+"#,
+        );
+        assert!(
+            files.client.contains(
+                "    # Fetch a widget by id\n    # with extra detail on the second line\n"
+            ),
+            "every doc line must be commented:\n{}",
+            files.client
+        );
+        // The continuation line must never appear UNcommented (leaked as code).
+        assert!(
+            !files.client.contains("\n    with extra detail"),
+            "continuation doc line leaked as code:\n{}",
+            files.client
+        );
     }
 
     #[test]

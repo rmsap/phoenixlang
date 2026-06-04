@@ -35,12 +35,9 @@
 //! not "correct."
 
 use std::path::Path;
-use std::process::Command;
 
-use phoenix_common::span::SourceId;
-use phoenix_lexer::lexer::tokenize;
-use phoenix_parser::parser;
-use phoenix_sema::checker;
+mod common;
+use common::{e2e_required, gate, missing_tools, parse_and_check, run, tool_available};
 
 /// The representative schema exercised end-to-end. Mirrors
 /// `tests/fixtures/gen_api.phx` (structs with constraints, an enum, optional
@@ -179,52 +176,49 @@ endpoint getDrawing: GET "/api/drawings/{id}" {
 }
 "#;
 
-// ── Toolchain gating ────────────────────────────────────────────────────
-
-/// Returns true if `name` is an invokable program on `PATH`.
-fn tool_available(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name}"))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// Targets two generator edge cases the other schemas never hit, both run
+/// through the Go and Python targets (the two affected generators):
+///
+///   * a **constrained `Option<T>` field carried into a body** (`displayName`):
+///     the source type is already optional, so Go renders it as a pointer even
+///     though no `partial` modifier applied. The body's `Validate()` must
+///     nil-guard and dereference it (`if s.DisplayName != nil && !(...)`), the
+///     same as the source struct's own `Validate()` — a regression guard for the
+///     body-validation pointer detection.
+///
+///   * **required query params whose camelCase name forces a `Query(alias=...)`
+///     ahead of a required plain param** (`maxResults` before `page`): a required
+///     aliased param renders a syntactic default, so it must sort AFTER the
+///     non-defaulted `page` or Python raises "non-default argument follows
+///     default argument". The main `SCHEMA`'s `searchPosts` has required aliased
+///     params too, but only in a *safe* order (no plain required param mixed in),
+///     so this schema is what uniquely guards the reordering hazard.
+const EDGE_SCHEMA: &str = r#"
+struct Account {
+    Int id
+    String handle where self.length > 0 && self.length <= 30
+    Option<String> displayName where self.length <= 60
 }
 
-/// Whether missing toolchains should hard-fail (CI) rather than skip (local).
-fn e2e_required() -> bool {
-    std::env::var("PHOENIX_GEN_E2E").as_deref() == Ok("1")
-}
-
-/// Skips or fails depending on `PHOENIX_GEN_E2E`. Returns true if the caller
-/// should bail out (tools missing, skip allowed).
-fn gate(missing: &[&str]) -> bool {
-    if missing.is_empty() {
-        return false;
+endpoint searchAccounts: GET "/api/accounts" {
+    query {
+        Int maxResults
+        Int page
     }
-    let msg = format!(
-        "required toolchain not found on PATH: {}",
-        missing.join(", ")
-    );
-    if e2e_required() {
-        panic!("PHOENIX_GEN_E2E=1 but {msg}");
-    }
-    eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
-    true
+    response List<Account>
 }
 
-// ── Pipeline ────────────────────────────────────────────────────────────
+endpoint updateAccount: PATCH "/api/accounts/{id}" {
+    body Account omit { id }
+    response Account
+}
+"#;
+
+// ── Toolchain gating + subprocess runner live in `common` (shared with
+//    roundtrip.rs), as does the schema → AST + analysis pipeline. ──
 
 fn generate_go_files(schema: &str) -> phoenix_codegen::GoFiles {
-    let tokens = tokenize(schema, SourceId(0));
-    let (program, parse_errors) = parser::parse(&tokens);
-    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-    let result = checker::check(&program);
-    assert!(
-        result.diagnostics.is_empty(),
-        "check errors: {:?}",
-        result.diagnostics
-    );
+    let (program, result) = parse_and_check(schema);
     phoenix_codegen::generate_go(&program, &result)
 }
 
@@ -284,18 +278,6 @@ fn check_go_output(files: &phoenix_codegen::GoFiles) {
     }
 }
 
-/// Runs a command in `dir`, returning (success, combined stdout+stderr).
-fn run(dir: &Path, program: &str, args: &[&str]) -> (bool, String) {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"));
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    (output.status.success(), combined)
-}
-
 /// Strict golangci-lint configuration written into each Go scaffold. Enables
 /// correctness/bug-oriented linters on top of the default set (which already
 /// includes staticcheck, govet, errcheck, ineffassign, unused, gosimple). These
@@ -319,13 +301,7 @@ linters:
 
 #[test]
 fn go_output_compiles_and_lints() {
-    let needed = ["go", "gofmt"];
-    let missing: Vec<&str> = needed
-        .iter()
-        .copied()
-        .filter(|t| !tool_available(t))
-        .collect();
-    if gate(&missing) {
+    if gate(&missing_tools(&["go", "gofmt"])) {
         return;
     }
 
@@ -339,6 +315,9 @@ fn go_output_compiles_and_lints() {
     check_go_output(&generate_go_files(WIDE_SCHEMA));
     check_go_output(&generate_go_files(WRAP_SCHEMA));
     check_go_output(&generate_go_files(FEATURE_SCHEMA));
+    // Constrained `Option<T>` body field — the body `Validate()` must nil-guard
+    // and deref the pointer (regression guard for body-validation detection).
+    check_go_output(&generate_go_files(EDGE_SCHEMA));
 }
 
 // ── OpenAPI target ───────────────────────────────────────────────────────
@@ -349,15 +328,7 @@ fn go_output_compiles_and_lints() {
 const REDOCLY_CONFIG: &str = include_str!("scaffold/openapi/redocly.yaml");
 
 fn generate_openapi_spec(schema: &str) -> String {
-    let tokens = tokenize(schema, SourceId(0));
-    let (program, parse_errors) = parser::parse(&tokens);
-    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-    let result = checker::check(&program);
-    assert!(
-        result.diagnostics.is_empty(),
-        "check errors: {:?}",
-        result.diagnostics
-    );
+    let (program, result) = parse_and_check(schema);
     phoenix_codegen::generate_openapi(&program, &result)
 }
 
@@ -383,12 +354,7 @@ fn check_openapi_output(label: &str, schema: &str) {
 #[test]
 fn openapi_output_lints() {
     // `npx` fetches `@redocly/cli` on first use; gate on `npx` being present.
-    let missing: Vec<&str> = ["npx"]
-        .iter()
-        .copied()
-        .filter(|t| !tool_available(t))
-        .collect();
-    if gate(&missing) {
+    if gate(&missing_tools(&["npx"])) {
         return;
     }
 
@@ -406,15 +372,7 @@ fn openapi_output_lints() {
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 fn generate_typescript_files(schema: &str) -> phoenix_codegen::GeneratedFiles {
-    let tokens = tokenize(schema, SourceId(0));
-    let (program, parse_errors) = parser::parse(&tokens);
-    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-    let result = checker::check(&program);
-    assert!(
-        result.diagnostics.is_empty(),
-        "check errors: {:?}",
-        result.diagnostics
-    );
+    let (program, result) = parse_and_check(schema);
     phoenix_codegen::generate_typescript(&program, &result)
 }
 
@@ -469,13 +427,7 @@ fn typescript_output_compiles_and_lints() {
     // checks IN that committed dir so they reuse its installed `node_modules`
     // (a tempdir copy would have none). Generated files go into the gitignored
     // `generated/` subdir, which we recreate fresh each run.
-    let needed = ["node", "npm", "npx"];
-    let missing: Vec<&str> = needed
-        .iter()
-        .copied()
-        .filter(|t| !tool_available(t))
-        .collect();
-    if gate(&missing) {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
         return;
     }
 
@@ -511,15 +463,7 @@ fn typescript_output_compiles_and_lints() {
 // ── Python target ──────────────────────────────────────────────────────────
 
 fn generate_python_files(schema: &str) -> phoenix_codegen::PythonFiles {
-    let tokens = tokenize(schema, SourceId(0));
-    let (program, parse_errors) = parser::parse(&tokens);
-    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-    let result = checker::check(&program);
-    assert!(
-        result.diagnostics.is_empty(),
-        "check errors: {:?}",
-        result.diagnostics
-    );
+    let (program, result) = parse_and_check(schema);
     phoenix_codegen::generate_python(&program, &result)
 }
 
@@ -578,12 +522,7 @@ fn python_output_compiles_and_lints() {
     // a local `.venv/` (the analog of node_modules). We run the checks IN that
     // committed dir so they reuse its installed deps. Generated files go into the
     // gitignored `generated/` subdir, recreated fresh each run.
-    let missing: Vec<&str> = ["python3"]
-        .iter()
-        .copied()
-        .filter(|t| !tool_available(t))
-        .collect();
-    if gate(&missing) {
+    if gate(&missing_tools(&["python3"])) {
         return;
     }
 
@@ -614,4 +553,8 @@ fn python_output_compiles_and_lints() {
     check_python_output(&scaffold, &venv_bin, &generate_python_files(WIDE_SCHEMA));
     check_python_output(&scaffold, &venv_bin, &generate_python_files(WRAP_SCHEMA));
     check_python_output(&scaffold, &venv_bin, &generate_python_files(FEATURE_SCHEMA));
+    // Required aliased query param ordering: a required `Query(alias=...)` param
+    // must sort after the required plain param, or the generated server is a
+    // Python syntax error (non-default argument follows default argument).
+    check_python_output(&scaffold, &venv_bin, &generate_python_files(EDGE_SCHEMA));
 }

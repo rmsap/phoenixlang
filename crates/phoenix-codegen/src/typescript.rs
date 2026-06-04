@@ -161,7 +161,7 @@ impl<'a> TsGenerator<'a> {
     /// Emits a TypeScript `export interface` for a Phoenix struct.
     fn emit_struct(&mut self, s: &StructDecl) {
         if let Some(ref doc) = s.doc_comment {
-            self.types_out.push_str(&format!("/** {} */\n", doc));
+            self.types_out.push_str(&render_jsdoc("", doc));
         }
         self.types_out
             .push_str(&format!("export interface {} {{\n", s.name));
@@ -210,26 +210,7 @@ impl<'a> TsGenerator<'a> {
         let vfields: Vec<ValidationField> = info
             .fields
             .iter()
-            .map(|f| {
-                let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
-                let inner_ty = if is_option {
-                    match &f.ty {
-                        Type::Generic(_, args) => &args[0],
-                        _ => &f.ty,
-                    }
-                } else {
-                    &f.ty
-                };
-                ValidationField {
-                    name: f.name.clone(),
-                    optional: is_option,
-                    ts_typeof: ts_typeof_of(inner_ty),
-                    constraint: f
-                        .constraint
-                        .as_ref()
-                        .map(|c| constraint_expr_to_ts(c, &f.name)),
-                }
-            })
+            .map(|f| validation_field(&f.name, &f.ty, f.constraint.as_ref(), false))
             .collect();
         emit_validation_body(&mut self.types_out, &vfields);
 
@@ -241,7 +222,7 @@ impl<'a> TsGenerator<'a> {
     /// Emits a TypeScript string union type for a Phoenix enum (simple variants only).
     fn emit_enum(&mut self, e: &EnumDecl) {
         if let Some(ref doc) = e.doc_comment {
-            self.types_out.push_str(&format!("/** {} */\n", doc));
+            self.types_out.push_str(&render_jsdoc("", doc));
         }
 
         let all_unit = e.variants.iter().all(|v| v.fields.is_empty());
@@ -354,15 +335,7 @@ impl<'a> TsGenerator<'a> {
         let vfields: Vec<ValidationField> = body
             .fields
             .iter()
-            .map(|f| ValidationField {
-                name: f.name.clone(),
-                optional: f.optional,
-                ts_typeof: ts_typeof_of(&f.ty),
-                constraint: f
-                    .constraint
-                    .as_ref()
-                    .map(|c| constraint_expr_to_ts(c, &f.name)),
-            })
+            .map(|f| validation_field(&f.name, &f.ty, f.constraint.as_ref(), f.optional))
             .collect();
         emit_validation_body(&mut self.types_out, &vfields);
 
@@ -439,6 +412,11 @@ impl<'a> TsGenerator<'a> {
             .map(type_to_ts)
             .unwrap_or_else(|| "void".to_string());
         let has_query = !ep.query_params.is_empty();
+        // `opts` is nullable (`opts?:`) only when EVERY query param is optional; a
+        // single required param makes it `opts:`. Computed once here so the
+        // signature prefix and the per-param `params.set` access logic below can
+        // never disagree about whether `opts` may be undefined.
+        let opts_nullable = ep.query_params.iter().all(is_query_param_optional);
 
         // Build function parameters
         let mut params: Vec<Param> = Vec::new();
@@ -462,8 +440,7 @@ impl<'a> TsGenerator<'a> {
                     }
                 })
                 .collect();
-            let all_optional = ep.query_params.iter().all(is_query_param_optional);
-            let prefix = if all_optional { "opts?: " } else { "opts: " };
+            let prefix = if opts_nullable { "opts?: " } else { "opts: " };
             params.push(Param::Object {
                 prefix: prefix.to_string(),
                 fields,
@@ -472,7 +449,7 @@ impl<'a> TsGenerator<'a> {
 
         // Doc comment
         if let Some(ref doc) = ep.doc_comment {
-            self.client_out.push_str(&format!("  /** {} */\n", doc));
+            self.client_out.push_str(&render_jsdoc("  ", doc));
         }
 
         // Function signature
@@ -485,8 +462,18 @@ impl<'a> TsGenerator<'a> {
         if has_query {
             self.client_out
                 .push_str("    const params = new URLSearchParams();\n");
+            // `opts_nullable` (computed once above) and each param's own
+            // optionality feed `emit_param_set` so it never emits an
+            // eslint-flagged redundant optional chain or `!== undefined` guard on
+            // an always-present value.
             for qp in &ep.query_params {
-                emit_param_set(&mut self.client_out, "    ", &qp.name);
+                emit_param_set(
+                    &mut self.client_out,
+                    "    ",
+                    &qp.name,
+                    is_query_param_optional(qp),
+                    opts_nullable,
+                );
             }
             self.client_out
                 .push_str("    const query = params.toString();\n");
@@ -611,7 +598,7 @@ impl<'a> TsGenerator<'a> {
         }
 
         if let Some(ref doc) = ep.doc_comment {
-            self.handlers_out.push_str(&format!("  /** {} */\n", doc));
+            self.handlers_out.push_str(&render_jsdoc("  ", doc));
         }
         let head = format!("  {}", ep.name);
         let tail = format!(": Promise<{response_type}>;");
@@ -910,6 +897,40 @@ fn default_value_to_ts(val: &DefaultValue) -> String {
     }
 }
 
+/// Builds a [`ValidationField`] for a field of resolved type `ty`, unwrapping
+/// `Option<T>` so the emitted `typeof` guard narrows the inner primitive (and the
+/// field is treated as skippable when absent). `extra_optional` folds in any
+/// *other* reason the field may be omitted — a `partial`-applied body field.
+///
+/// Shared by the struct validator ([`TsGenerator::emit_struct_validation`]) and
+/// the derived-body validator ([`TsGenerator::emit_validation_function`]) so
+/// their `Option` handling cannot drift. That drift is exactly what made the
+/// body validator emit a `.length` access on an un-narrowed `unknown`
+/// (TS18047 / TS2339) for a constrained `Option<T>` body field: it skipped the
+/// `typeof` narrowing the struct validator applies.
+fn validation_field(
+    name: &str,
+    ty: &Type,
+    constraint: Option<&phoenix_parser::ast::Expr>,
+    extra_optional: bool,
+) -> ValidationField {
+    let is_option = matches!(ty, Type::Generic(n, _) if n == "Option");
+    let inner_ty = if is_option {
+        match ty {
+            Type::Generic(_, args) => &args[0],
+            _ => ty,
+        }
+    } else {
+        ty
+    };
+    ValidationField {
+        name: name.to_string(),
+        optional: extra_optional || is_option,
+        ts_typeof: ts_typeof_of(inner_ty),
+        constraint: constraint.map(|c| constraint_expr_to_ts(c, name)),
+    }
+}
+
 /// Recursively converts a Phoenix constraint `Expr` to a TypeScript expression
 /// string, replacing `self` with `obj.{field_name}` for use in validation
 /// functions.
@@ -1001,6 +1022,28 @@ fn constraint_expr_prec(expr: &phoenix_parser::ast::Expr, field_name: &str) -> (
         }
         _ => ("true".to_string(), PREC_ATOM),
     }
+}
+
+/// Renders `text` as a JSDoc comment at `indent`. A single-line comment stays on
+/// one line (`/** text */`); a multi-line doc comment (the lexer joins its lines
+/// with `\n`) expands to the block form with each line on its own ` * ` row, so
+/// continuation lines stay inside the comment instead of leaking as code. Matches
+/// Prettier's JSDoc layout in both cases.
+fn render_jsdoc(indent: &str, text: &str) -> String {
+    if !text.contains('\n') {
+        return format!("{indent}/** {text} */\n");
+    }
+    let mut out = format!("{indent}/**\n");
+    for line in text.split('\n') {
+        // Trim per line so an empty (or whitespace-only) doc line renders as a
+        // bare ` *` row with no trailing space, matching Prettier — and matching
+        // the `trim_end` the Go (`render_line_comment`) and Python
+        // (`render_hash_comment`) sibling helpers use.
+        out.push_str(format!("{indent} * {line}").trim_end());
+        out.push('\n');
+    }
+    out.push_str(&format!("{indent} */\n"));
+    out
 }
 
 /// Converts a resolved Phoenix `Type` to a TypeScript type string.
@@ -1150,6 +1193,29 @@ mod tests {
     use phoenix_lexer::lexer::tokenize;
     use phoenix_parser::parser;
     use phoenix_sema::checker;
+
+    /// An interior empty doc line renders as a bare ` *` row (no trailing space)
+    /// inside the JSDoc block, matching Prettier. Guards the empty-line branch of
+    /// `render_jsdoc`, which the doc-comment integration tests don't hit.
+    #[test]
+    fn render_jsdoc_blanks_out_empty_lines() {
+        assert_eq!(
+            render_jsdoc("  ", "first\n\nthird"),
+            "  /**\n   * first\n   *\n   * third\n   */\n"
+        );
+    }
+
+    /// A whitespace-only doc line is trimmed to a bare ` *` row too (no trailing
+    /// space), exactly like a truly empty line — `render_jsdoc` trims per line,
+    /// matching the Go/Python sibling helpers rather than only special-casing the
+    /// `is_empty()` case.
+    #[test]
+    fn render_jsdoc_trims_whitespace_only_lines() {
+        assert_eq!(
+            render_jsdoc("  ", "first\n   \nthird"),
+            "  /**\n   * first\n   *\n   * third\n   */\n"
+        );
+    }
 
     /// Parses, type-checks, and generates TypeScript from a Phoenix source string.
     fn generate_from_source(source: &str) -> GeneratedFiles {
@@ -1382,6 +1448,38 @@ endpoint createUser: POST "/api/users" {
         insta::assert_snapshot!("doc_comments_types", files.types);
         insta::assert_snapshot!("doc_comments_client", files.client);
         insta::assert_snapshot!("doc_comments_handlers", files.handlers);
+    }
+
+    /// A multi-line doc comment must expand to a JSDoc block with every line on
+    /// its own ` * ` row, not a single `/** ... */` whose continuation lines
+    /// leak out of the comment as code. Regression guard for `render_jsdoc`.
+    #[test]
+    fn multiline_doc_comment_expands_to_jsdoc_block() {
+        let files = generate_from_source(
+            r#"
+/**
+ * Fetch a widget by id
+ * with extra detail on the second line
+ */
+endpoint getWidget: GET "/api/widgets/{id}" {
+    response Widget
+}
+struct Widget { Int id }
+"#,
+        );
+        assert!(
+            files
+                .client
+                .contains("   * Fetch a widget by id\n   * with extra detail on the second line\n"),
+            "multi-line doc must be a JSDoc block:\n{}",
+            files.client
+        );
+        // The continuation line must never appear outside the comment.
+        assert!(
+            !files.client.contains("\n  with extra detail"),
+            "continuation doc line leaked as code:\n{}",
+            files.client
+        );
     }
 
     #[test]
@@ -1828,6 +1926,46 @@ endpoint updateUser: PATCH "/api/users/{id}" {
 "#,
         );
         insta::assert_snapshot!("validation_optional_types", files.types);
+    }
+
+    /// A constrained `Option<T>` body field must be `typeof`-narrowed before its
+    /// constraint is checked, exactly like the source struct's validator — its
+    /// raw type is `Option<String>` (no primitive `typeof`), so without unwrapping
+    /// it the body validator emitted `!(obj.x.length …)` on an un-narrowed
+    /// `unknown`, which fails to compile (`tsc` TS18047 "possibly null" / TS2339
+    /// "no `length` on `{}`"). The field is also skippable when absent even though
+    /// no `partial` applied (Option ⇒ optional). Regression guard for the
+    /// struct/body validator `Option` drift fixed in [`validation_field`].
+    #[test]
+    fn validation_option_constrained_body_field() {
+        let files = generate_from_source(
+            r#"
+struct Account {
+    Int id
+    Option<String> displayName where self.length <= 60
+}
+endpoint updateAccount: PATCH "/api/accounts/{id}" {
+    body Account omit { id }
+    response Account
+}
+"#,
+        );
+        // The Option field is narrowed to `string` before the constraint runs,
+        // and skipped when absent (`!== undefined`) despite no `partial`.
+        assert!(
+            files.types.contains(
+                "if (obj.displayName !== undefined && typeof obj.displayName !== \"string\")"
+            ),
+            "Option body field must be typeof-narrowed and undefined-skipped:\n{}",
+            files.types
+        );
+        assert!(
+            files
+                .types
+                .contains("if (obj.displayName !== undefined && !(obj.displayName.length <= 60))"),
+            "Option body field constraint must be guarded + dereferenced:\n{}",
+            files.types
+        );
     }
 
     /// Multiple endpoints with constraints — only one ValidationError class.

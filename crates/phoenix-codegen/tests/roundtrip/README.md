@@ -1,0 +1,124 @@
+# Phoenix Gen round-trip drivers
+
+Behavioral round-trip suite: each target generates a client **and** a server
+from `tests/fixtures/gen_api.phx`, runs the generated client against the
+generated server over the shared `contract.json` fixtures, and asserts they
+agree on the wire. See `docs/phoenix-gen-roundtrip-design.md` for the rationale
+and `crates/phoenix-codegen/tests/roundtrip.rs` for the Rust harness that drives
+each target.
+
+```
+roundtrip/
+  contract.json        # language-agnostic interaction cases (THE shared contract)
+  README.md            # this file
+  go/                  # Go driver
+    roundtrip_test.go
+    go.mod.template
+  typescript/          # TypeScript driver (driver.ts + pinned npm project)
+  python/              # Python driver (driver.py + pinned venv)
+```
+
+## `contract.json` schema
+
+A JSON **array** of interaction cases. Every target driver parses this same
+file and conforms to it. Each case:
+
+```jsonc
+{
+  "name": "getPost_happy_path_param",     // unique test id (becomes the subtest name)
+  "endpoint": "getPost",                  // the generated client/handler method (camelCase)
+  "kind": "ok",                           // "ok" | "error" | "constraint"
+
+  "call": {                               // how the CLIENT is invoked
+    "path_params": { "id": "42" },        //   string path params (object, optional)
+    "query":       { "page": 3, ... },    //   query params as native JSON types (optional)
+    "body":        { "title": "...", ...} //   request body as a JSON object (optional)
+  },
+
+  "handler": {                            // how the STUB handler behaves
+    "expect_received": { ... },           //   assert the handler decoded exactly these args
+    "returns": { ... } | [ ... ],         //   canned success payload (ok cases) — object or array
+    "raises": "NotFound",                 //   variant name the handler signals (error cases)
+    "expect_not_called": true             //   assert the handler was NOT invoked (constraint cases)
+  },
+
+  "expect_client": {                      // what the CLIENT should observe
+    "ok": { ... } | [ ... ],              //   expected typed result (ok cases)
+    "error": {                            //   expected error (error / constraint cases)
+      "variant": "NotFound",              //     the logical variant name
+      "status_per_target": {              //     HTTP status each target maps it to
+        "go": 404, "typescript": 404, "python": 404
+      }
+    }
+  }
+}
+```
+
+### Case kinds
+
+| `kind`       | `handler`                          | `expect_client`        | What it proves |
+|--------------|------------------------------------|------------------------|----------------|
+| `ok`         | `expect_received` + `returns`      | `ok`                   | data round-trips both ways; args decoded/coerced correctly |
+| `error`      | `expect_received` + `raises`       | `error` (+ status)     | handler error-variant → server status mapping |
+| `constraint` | `expect_not_called: true`          | `error` (+ status)     | server rejects an invalid body BEFORE the handler runs |
+
+### Field-by-field rules drivers must follow
+
+- **`call.path_params`** — values are always JSON **strings** (the generated Go
+  `GetPost(id string)` takes a string; the contract keeps them stringly so every
+  target agrees). Substitute them into the client call positionally by name.
+- **`call.query`** — values are native JSON types (`number`, `bool`, `string`).
+  Drivers must pass them to the client *with the client's declared type* (e.g.
+  Go `page int64`, `minScore float64`, `featured bool`, `tag *string`). Missing
+  optional params are simply omitted (client uses its default / nil). This is the
+  case that catches **query-coercion bugs**: the handler asserts the decoded
+  server-side value via `expect_received`.
+- **`call.body`** — a JSON object the driver unmarshals into the generated body
+  type, then passes to the client method.
+- **`handler.expect_received`** — a map of arg-name → expected value. Drivers
+  compare the **decoded args the handler actually received** against these.
+  Numbers are compared numerically (don't assume int vs float). `null` means the
+  optional arg was absent (nil/None). Only listed keys are checked.
+- **`handler.returns`** — the canned success value the stub returns; the driver
+  unmarshals it into the generated response type and hands it to the framework
+  to serialize. Compared against `expect_client.ok` after the client decodes it.
+- **`handler.raises`** — the variant name the stub signals as an error. The
+  generated Go server maps it via `strings.Contains(err.Error(), "<variant>")`,
+  so the stub returns an error whose message **contains** this string. (TS/Python
+  drivers throw/raise an error carrying the variant name per the design doc.)
+- **`expect_client.error.status_per_target`** — the HTTP status each target's
+  server maps the variant to. **The Go client surfaces errors as
+  `fmt.Errorf("HTTP <status>")` — status only, no variant name** — so the Go
+  driver parses the integer out and compares to `status_per_target["go"]`. TS and
+  Python clients surface richer errors (see the design doc); those drivers assert
+  accordingly.
+
+### Documented per-target divergence (constraint cases)
+
+Constraint violations map to **different statuses per framework** — this is
+intrinsic, not a bug, so the contract makes it explicit via
+`status_per_target`:
+
+- **Go** — generated server calls `body.Validate()` → **400** `ValidationError`.
+- **TypeScript** — server validates the body → **400** `ValidationError`.
+- **Python** — pydantic `Field(...)` validates at parse time → **422** (FastAPI
+  default). This rejection only fires if the Python generator actually emits the
+  `Field(...)` constraints on the body model; if it ever stopped, the constraint
+  case would surface as "handler WAS called" rather than a direct "no validation"
+  message — the failure is still loud, but the coverage leans on that generator
+  behavior (which no unit test asserts in isolation).
+
+Each status is verified live by its target's round-trip test: Go (400) by
+`go_roundtrip`, TypeScript (400) by `typescript_roundtrip`, and Python (422) by
+`python_roundtrip`.
+
+## Adding a target driver
+
+1. Add a `<target>/` dir under `roundtrip/` with a driver that reads
+   `contract.json` and conforms to the rules above. The driver implements a
+   fixture-driven stub handler (records `expect_received`, returns `returns` or
+   signals `raises`, tracks whether it was called for `expect_not_called`).
+2. Add a `<target>_roundtrip` test in `roundtrip.rs` mirroring `go_roundtrip`:
+   generate the target's files, assemble a runnable project (tempdir or committed
+   scaffold), drop in the driver + `contract.json`, run the target's test runner,
+   assert exit 0. Gate on the target's toolchain via the shared `gate(..)`.

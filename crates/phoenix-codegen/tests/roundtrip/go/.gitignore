@@ -1,0 +1,7 @@
+# Local scratch only. The Rust harness assembles the runnable module in a
+# tempdir; nothing should be generated in this committed driver dir. These
+# entries exist only in case you assemble a scratch module here by hand.
+go.mod
+go.sum
+api/
+contract.json

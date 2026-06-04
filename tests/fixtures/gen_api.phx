@@ -6,7 +6,7 @@ struct Author {
     Int id
     String name where self.length > 0 && self.length <= 100
     String email where self.contains("@") && self.length > 3
-    Option<String> avatarUrl
+    Option<String> avatarUrl where self.length > 0
 }
 
 enum PostStatus { Draft  Published  Archived }
@@ -48,6 +48,19 @@ endpoint listPosts: GET "/api/posts" {
 endpoint getPost: GET "/api/posts/{id}" {
     response Post
     error { NotFound(404) }
+}
+
+/**
+ * Search posts by free-text query.
+ * Required, camelCase query params force a Query alias on the Python server,
+ * and this multi-line doc comment exercises multi-line comment rendering
+ */
+endpoint searchPosts: GET "/api/search" {
+    query {
+        Int maxResults
+        String sortField
+    }
+    response List<Post>
 }
 
 /** Create a new post (omit server-generated fields) */

@@ -1,0 +1,19 @@
+{
+  "name": "phoenix-gen-ts-roundtrip",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Behavioral round-trip driver for Phoenix Gen's TypeScript target. The harness drops the generated .ts files into generated/ and runs driver.ts (via tsx) against this project's pinned toolchain (express + tsx).",
+  "type": "module",
+  "scripts": {
+    "roundtrip": "tsx driver.ts"
+  },
+  "dependencies": {
+    "express": "5.0.1"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.0",
+    "@types/node": "22.10.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2"
+  }
+}

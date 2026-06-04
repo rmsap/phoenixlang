@@ -1,0 +1,10 @@
+# Local venv (the analog of node_modules) — recreated from requirements.txt.
+.venv/
+
+# Generated package + contract copy, dropped in fresh by the Rust harness.
+generated/
+contract.json
+
+# Python bytecode caches.
+__pycache__/
+*.pyc

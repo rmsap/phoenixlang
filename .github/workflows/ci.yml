@@ -131,6 +131,25 @@ jobs:
           PHOENIX_GEN_E2E: "1"
         run: cargo test -p phoenix-codegen --test compiles_and_lints
 
+      # The behavioral round-trip suite runs the generated client against the
+      # generated server per target. Its drivers use their OWN pinned dep sets
+      # (separate from the compile-and-lint scaffolds above): the TS driver is a
+      # committed npm project, the Python driver a committed venv. Install both
+      # so the round-trip harness's node_modules/.venv gates pass and the E2E
+      # gate stays enforced. Go needs no extra deps (stdlib httptest).
+      - name: Install TypeScript round-trip driver deps (npm ci)
+        working-directory: crates/phoenix-codegen/tests/roundtrip/typescript
+        run: npm ci
+      - name: Install Python round-trip driver deps (venv)
+        working-directory: crates/phoenix-codegen/tests/roundtrip/python
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+      - name: Round-trip generated client against generated server (all targets)
+        env:
+          PHOENIX_GEN_E2E: "1"
+        run: cargo test -p phoenix-codegen --test roundtrip
+
       # Parity guard: the standalone `phoenix-gen` binary and `phoenix gen`
       # must accept an identical option surface (roadmap §8).
       - name: Help parity (phoenix gen vs phoenix-gen)
