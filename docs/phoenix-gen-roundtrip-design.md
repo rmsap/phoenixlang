@@ -144,5 +144,5 @@ compile-and-lint: skip-with-log unless `PHOENIX_GEN_E2E=1`. For each target:
 generate into a tempdir (or the committed scaffold's gitignored `generated/`),
 drop in the committed driver + the shared `contract.json`, run the target's
 driver (`go test`, `tsx driver.ts`, and `python driver.py` — a plain script, no
-pytest), assert exit 0. CI: add to the existing `gen-compiles-and-lints` job
-(toolchains already installed).
+pytest), assert exit 0. CI: runs in the `gen-checks` job (toolchains already
+installed).

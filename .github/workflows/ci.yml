@@ -80,13 +80,14 @@ jobs:
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
 
-  # Phoenix Gen "the generated code actually compiles and lints" harness.
-  # Kept OFF the fast `check` job because it installs Go/Node/redocly
-  # toolchains (slow) and shells out to them. `PHOENIX_GEN_E2E=1` makes a
-  # missing toolchain a HARD failure instead of a silent skip, so this job
-  # cannot quietly stop exercising a target. See
-  # `crates/phoenix-codegen/tests/compiles_and_lints.rs`.
-  gen-compiles-and-lints:
+  # Phoenix Gen behavioral checks: the compile-and-lint harness (generated code
+  # compiles, type-checks, lints, is formatted) AND the round-trip harness
+  # (generated client ↔ generated server agree on the wire). Kept OFF the fast
+  # `check` job because it installs Go/Node/redocly toolchains (slow) and shells
+  # out to them. `PHOENIX_GEN_E2E=1` makes a missing toolchain a HARD failure
+  # instead of a silent skip, so this job cannot quietly stop exercising a
+  # target. See `crates/phoenix-codegen/tests/{compiles_and_lints,roundtrip}.rs`.
+  gen-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
