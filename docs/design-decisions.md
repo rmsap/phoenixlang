@@ -1045,6 +1045,68 @@ To make any layout change a build break instead, `crates/phoenix-runtime/src/lib
 
 All three are target-independent (they pin structural invariants, not absolute byte counts). On wasm32 `usize` is 4 bytes (struct is 8 bytes total); on x86_64 it's 8 (struct is 16). Each backend reads at offsets matching its own target's word size, so the wasm32 backend's "offset 4" hand-rolled loads are correct iff `size_of::<usize>() == 4` *and* the len-follows-ptr-with-no-padding invariant holds — which the second assert pins.
 
+#### I. wasm32-gc runtime architecture: codegen-emitted helpers, no Rust runtime crate
+
+**Decided:** 2026-06-04
+
+**Context.** PR 5 (the WASM GC backend) needed to settle how the existing `phoenix-runtime` crate — built around dlmalloc + a side-registry tracing GC + a flat `phx_*` symbol surface — interacts with the new target. Three candidate architectures were considered: (1) codegen-only, no runtime crate; (2) hybrid, runtime for WASI stubs only; (3) recompile the full runtime for wasm32-gc.
+
+**Structural blocker for "recompile the runtime".** Rust's wasm32 toolchains (`wasm32-unknown-unknown`, `wasm32-wasip1`, etc.) compile to **linear memory only.** There is no Rust target that emits `struct.new` / `array.new` — Rust's `Box<T>` lowers to `dlmalloc(sizeof(T)) → *mut T`, never to a `(ref (struct …))` managed reference. The literal interpretation of "recompile the runtime" would keep the Rust runtime running in linear memory; user code holds WASM-GC managed references; every runtime call therefore marshals **WASM-GC array → linear-memory ptr+len → runtime computation → linear-memory ptr+len → freshly-allocated WASM-GC object** at the FFI boundary — and the WASM-GC-side allocation on the return path has to be emitted by *codegen*, not by Rust, because Rust can't emit `struct.new`. That's strictly more work than option 1, not less.
+
+**Chosen: Codegen-emitted, no Rust runtime crate for wasm32-gc.**
+
+- The wasm32-gc codegen emits `struct.new` / `array.new` / `array.copy` / `call_ref` inline for all allocation, structure access, and dispatch.
+- Genuinely complex helpers — the hash-table probing/grow/tombstone logic of `phx_map_*`, the formatting of `phx_i64_to_str` / `phx_f64_to_str`, the string transform surface (`phx_str_trim` / case mapping) — ship as **wasm-encoder-emitted WASM functions synthesized from the codegen crate itself**, not as a separate Rust runtime artifact. Same shape as the synthesis of `_start` and the WASI print stubs before `phx_print_*` were merged in via `phoenix-runtime`: codegen owns its own helpers, written in WASM bytecode rather than Rust.
+- No `phoenix-runtime` recompile for wasm32-gc. No `embed-and-merge` step. No `phx_gc_alloc` / `phx_gc_set_root` calls — the host VM's GC handles tracing; shadow-stack emission is suppressed entirely on this target (already pinned by §2.3 decision A: *"Phase 2.4 (WASM GC) replaces native root-finding entirely with WASM GC's typed references."*).
+
+**Pros:**
+- No marshaling overhead at the runtime FFI boundary — user values stay as WASM-GC references the whole way through.
+- No duplicated allocator / GC implementation. The host's GC is the only memory manager.
+- Helpers grow incrementally and locally to the codegen crate; complexity sits where the layout decisions live.
+- Shadow-stack suppression is automatic (the runtime that *provides* `phx_gc_push_frame` etc. simply doesn't exist on this target — the call sites can't be emitted, so the missing helpers can't be the source of a regression).
+
+**Cons:**
+- Codegen carries more bytecode-emission work than the linear-memory backend. Hash tables and number formatting in particular are non-trivial wasm-encoder programs. The PR 5 MVP scope (decision J below) defers most of this; PR 6 grows helpers as fixtures demand them.
+- Two code paths for any helper that conceptually overlaps with the linear-memory runtime (string concat, list push, hash insert). Acceptable because the target ABIs diverge so completely (linear-memory + tagged GC vs. typed managed refs + host GC) that even a shared Rust implementation would have to fork at every meaningful method.
+
+**Alternatives considered (and rejected):**
+
+- **Hybrid runtime, WASI stubs only.** A tiny `phoenix-runtime-gc` crate that exposes only WASI print helpers (`phx_print_str` → `fd_write` wrapper), with all allocation inline. Rejected: the WASI helpers are themselves trivial wasm-encoder programs (memory.fill + fd_write); a whole crate-level dependency for ~30 lines of WASM bytecode is structurally heavier than emitting them from codegen.
+- **Recompile `phoenix-runtime` for wasm32-gc.** Rejected per the structural blocker above. Even if every internal Rust data structure stays in linear memory, the WASM-GC-side alloc on the return path of every runtime call still has to be emitted by codegen — so this option is "option 1 + extra marshaling + a runtime crate to maintain," strictly worse than chosen option alone.
+
+**File:** the wasm32-gc codegen lives under `crates/phoenix-cranelift/src/wasm/wasm_gc/` (decision K below); WASM-bytecode helpers ship as functions emitted by that module's own builder pass, not as a separate compilation unit.
+
+#### J. wasm32-gc MVP scope: hello + fibonacci + one struct
+
+**Decided:** 2026-06-04
+
+**Chosen.** PR 5 ships the minimum representative slice that proves the wasm32-gc pipeline end-to-end. To keep each merge small and reviewable, PR 5 is delivered in slices, each growing the op surface and carrying its own tests; the source-tree comments use the same "slice N" labels:
+
+- **Slice 1 (`tests/fixtures/hello.phx`)** — the current landed slice. The fixture is `let x: Int = 42; print(x)`, so it pins `Op::ConstI64` + the immutable-`let` lowering (`Op::Alloca` / `Op::Store` / `Op::Load`), `Op::BuiltinCall("print", Int)` routed through the inline WASI print synthesis from decision I (the synthesized `phx_print_i64` digit-conversion helper), and the `_start` / `main` plumbing. `Op::ConstString` materialization (data segment + `array.new_data`) and `print(String)` are deferred to the String slice, not exercised by `hello.phx`.
+- **Slice 2 (`tests/fixtures/fibonacci.phx`)** — pins direct function calls, integer arithmetic, control flow (loop+switch dispatch already shared with the linear backend per §2.4 decision G), value-returning user functions, and (via a negative result) the `phx_print_i64` sign path that slice 1 cannot yet reach.
+- **Slice 3 (one struct fixture** — `tests/fixtures/features.phx` subset, or a focused new fixture if `features.phx` reaches for ops beyond MVP scope) — pins `Op::StructAlloc` / `Op::StructGetField` / `Op::StructSetField` lowered as `struct.new` / `struct.get` / `struct.set`, and **the first concrete WASM-struct-type-per-Phoenix-struct decision** (a sub-decision under K below — every Phoenix struct gets its own named WASM struct type with named fields, mirroring the layout that's monomorphized into the IR module's `struct_layouts`). This is also the first slice that emits any WASM-GC type at all; slices 1–2 are structurally linear modules that merely validate under the GC proposal.
+
+**Out of MVP scope, deferred to PR 6:** closures, lists, maps, enums (including `Option`/`Result`), `dyn Trait` dispatch, builder types. Each carries its own type-mapping decision (closure-as-`(struct (ref func) cap0 …)` vs. via `funcref`; `(array T)` vs. struct-wrapped; etc.) that benefits from being settled one slice at a time inside PR 6 rather than locked in batch up front. The four-backend matrix expansion in PR 6 surfaces the corner cases each mapping has to handle.
+
+**Why not more?** Type-mapping decisions for collections / closures / `dyn` are independent of the core pipeline scaffolding (module builder, type interner, `_start` synthesis, struct ops). Surfacing them one at a time in PR 6 keeps each merge reviewable and lets the matrix gate each addition; locking them in at PR 5 design time would either be premature (we'd choose without the matrix's adversarial pressure) or would slip PR 5 by weeks.
+
+#### K. wasm32-gc codegen layout: parallel `wasm/wasm_gc/` module tree
+
+**Decided:** 2026-06-04
+
+**Chosen.** A new `crates/phoenix-cranelift/src/wasm/wasm_gc/` directory contains the wasm32-gc translator, mirroring the layout of the existing wasm32-linear tree (`crates/phoenix-cranelift/src/wasm/`). Slice 1 lands `mod.rs`, `module_builder.rs`, and `translate.rs`; the struct slice (decision J slice 3) adds `heap_layout.rs` once there is a concrete WASM-struct-type-per-Phoenix-struct layout to own. Shared scaffolding lives in the parent `wasm/` namespace and is imported by both targets:
+
+- `wasm/type_interner.rs` — function-signature dedup is target-independent.
+- `wasm/runtime_discovery.rs` and `wasm/runtime_merge.rs` — irrelevant for wasm32-gc per decision I (no runtime to merge), but unused imports are not added; wasm32-gc just doesn't reference these.
+
+Each target's `module_builder.rs` owns its own section-state struct because the section pipelines diverge (wasm32-gc declares type-section GC types; wasm32-linear merges a runtime). Each target's `translate.rs` owns its own per-op match.
+
+**Why not target-dispatched lowering inside `wasm/translate.rs`?** The two backends' allocation primitives (`phx_gc_alloc` vs. `struct.new` / `array.new`), heap representations (raw byte offsets + TypeTag tracking vs. typed managed refs), and signature shapes (env-pointer ABI through `closure_target_slot` vs. WASM GC's `funcref` / `call_ref`) diverge enough that target-dispatched `if/else` chains would dominate every match arm. Each arm of `Op::StructAlloc`, `Op::CallIndirect`, `Op::DynAlloc`, etc., would split into two essentially-disjoint emission blocks. Parallel trees keep each target's code linear-readable and let the file structure mirror the per-target mental model. The ~60% shared scaffolding (type interner, basic constants, error type) lives in the parent `wasm/` namespace where both trees can import it directly.
+
+**Why not a separate `phoenix-cranelift-wasm-gc` crate?** Crate boundaries are appropriate when the dependency graph diverges. The two WASM backends both depend on `phoenix-ir`, `phoenix-common`, and `wasm-encoder`; they share most of the type-mapping helpers; the only real divergence is the body emission and module-builder layout. A new crate adds Cargo manifest, workspace dependency wiring, and re-export plumbing for negligible isolation benefit.
+
+**File:** new module `crates/phoenix-cranelift/src/wasm/wasm_gc/mod.rs` with the parallel tree underneath. `crates/phoenix-cranelift/src/lib.rs::compile`'s `Target::Wasm32Gc` arm dispatches to `wasm_gc::compile_wasm_gc` (mirroring the existing `Target::Wasm32Linear` → `wasm::compile_wasm_linear` dispatch).
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)

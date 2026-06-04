@@ -87,12 +87,7 @@ pub fn compile(ir_module: &IrModule, target: Target) -> Result<Vec<u8>, CompileE
     match target {
         Target::Native => compile_native(ir_module),
         Target::Wasm32Linear => wasm::compile_wasm_linear(ir_module),
-        Target::Wasm32Gc => Err(CompileError::new(
-            "target `wasm32-gc` is not yet implemented; \
-             the WASM GC variant lands in Phase 2.4 PR 5+ (see \
-             docs/design-decisions.md §Phase 2.4 WebAssembly compilation \
-             for the per-target PR sequence)",
-        )),
+        Target::Wasm32Gc => wasm::compile_wasm_gc(ir_module),
     }
 }
 

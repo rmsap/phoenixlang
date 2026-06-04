@@ -84,6 +84,9 @@ mod runtime_discovery;
 mod runtime_merge;
 mod translate;
 mod type_interner;
+mod wasm_gc;
+
+pub(crate) use wasm_gc::compile_wasm_gc;
 
 use module_builder::ModuleBuilder;
 

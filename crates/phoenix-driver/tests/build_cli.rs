@@ -193,7 +193,13 @@ fn wasm32_linear_target_appends_wasm_suffix_when_output_omitted() {
 }
 
 #[test]
-fn wasm32_gc_target_reports_not_yet_implemented() {
+fn wasm32_gc_target_emits_a_wasm_artifact() {
+    // PR 5 slice 1 lifted the "not yet implemented" stub:
+    // `--target wasm32-gc` now produces a `.wasm` for `hello.phx`
+    // (per design-decisions.md §Phase 2.4 decision J's MVP scope).
+    // Op-surface beyond the slice-1 minimum (closures / lists /
+    // maps / strings / etc.) still errors, but `hello.phx` is on
+    // the supported path.
     let bin = temp_bin("wasm32_gc");
     let out = phoenix_bin()
         .args([
@@ -207,21 +213,23 @@ fn wasm32_gc_target_reports_not_yet_implemented() {
         .output()
         .expect("failed to spawn `phoenix build`");
     assert!(
-        !out.status.success(),
-        "wasm32-gc should still fail until Phase 2.4 PR 5+ lands GC codegen"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not yet implemented"),
-        "expected not-yet-implemented diagnostic, got stderr: {stderr}",
+        out.status.success(),
+        "wasm32-gc build of hello.phx should now succeed; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
     assert!(
-        stderr.contains("wasm32-gc"),
-        "expected stderr to name the requested target, got: {stderr}",
+        bin.0.exists(),
+        "`phoenix build --target wasm32-gc -o {}` should have written the artifact",
+        bin.0.display(),
     );
+    // The output is a real WASM module — at minimum it starts with
+    // the WASM magic bytes. Full structural validation lives in
+    // `crates/phoenix-cranelift/tests/compile_wasm_gc.rs`.
+    let bytes = std::fs::read(&bin.0).expect("read wasm artifact");
     assert!(
-        !bin.0.exists(),
-        "no artifact should be written when compile fails",
+        bytes.starts_with(b"\0asm"),
+        "expected WASM magic bytes at the start of the artifact"
     );
 }
 
