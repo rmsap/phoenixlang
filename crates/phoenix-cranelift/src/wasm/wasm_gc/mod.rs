@@ -100,6 +100,12 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // always exported as `memory`, and the upcoming String slice stages
     // literals there regardless of whether the program prints.
     let needs_print = translate::module_calls_print(ir_module);
+    // Declare every Phoenix struct's nominal WASM-GC type first, so
+    // any subsequent function signature whose params/returns include
+    // `IrType::StructRef(name, _)` can encode the right
+    // `HeapType::Concrete(struct_idx)` at intern time. See §Phase 2.4
+    // decision K.1.
+    builder.declare_phoenix_structs(ir_module)?;
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();

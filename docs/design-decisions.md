@@ -1107,6 +1107,35 @@ Each target's `module_builder.rs` owns its own section-state struct because the 
 
 **File:** new module `crates/phoenix-cranelift/src/wasm/wasm_gc/mod.rs` with the parallel tree underneath. `crates/phoenix-cranelift/src/lib.rs::compile`'s `Target::Wasm32Gc` arm dispatches to `wasm_gc::compile_wasm_gc` (mirroring the existing `Target::Wasm32Linear` → `wasm::compile_wasm_linear` dispatch).
 
+#### K.1. wasm32-gc struct-type mapping: one nominal WASM struct type per Phoenix struct
+
+**Decided:** 2026-06-05 (sub-decision under K, locked alongside PR 5 slice 3 — the first slice that emits a `(struct …)` type-section entry).
+
+**Context.** Slice 3 (decision J) is the first slice that has to commit to a concrete IR-type → WASM-type mapping. Slices 1–2 emitted structurally linear modules whose validity under `-W gc=y` was trivial (no GC types declared); slice 3's `Op::StructAlloc` / `Op::StructGetField` / `Op::StructSetField` cannot lower without a WASM struct type to reference. The sub-decision picks among the candidate mappings before any code lands so the question doesn't reopen each PR-6 slice that grows the surface (closures, lists, maps, enums each carry their own analogous sub-decision when they land).
+
+**Chosen.** Each Phoenix struct (post-monomorphization name — e.g. `Point`, `Container__i64`) gets one nominal WASM struct type, declared once in the type section before any function signature references it. Fields are declared in Phoenix source declaration order (matching `IrModule::struct_layouts`'s ordered `Vec<(String, IrType)>`), all marked mutable (Phoenix supports `p.x = 5` and has no syntax to declare a field immutable). Phoenix `IrType::StructRef(name, _)` lowers to `(ref null $name_struct_idx)`:
+
+- **Nullable** so `Op::Alloca(StructRef(...))`'s WASM-local default state (which WASM zero-initializes) is well-typed without an explicit init instruction. `Op::Store` then writes the post-`struct.new` non-nullable reference into the same slot (subtype: `(ref $T) <: (ref null $T)`).
+- **Field types**: Phoenix `Int` → WASM `i64`, `F64` → `f64`, `Bool` → `i32`. Nested `StructRef` lowers to `(ref null $other_struct_idx)` once cross-struct layouts ship — slice 3 itself errors on nested struct fields, since none of the slice's fixtures use them and a stub that pretends to handle them would mask a real layout gap. The error pushes the work to the slice where a fixture actually needs it.
+
+`struct.get`/`struct.set` resolve the WASM struct-type index by reading the *receiver value's* binding `ValType` (which carries `HeapType::Concrete(idx)`), so the get/set ops don't have to thread the struct name themselves — the type that the receiver was bound with is authoritative. Equivalent to threading the name, but avoids a parallel `ValueId → struct_name` map.
+
+**Why nominal (one WASM struct per Phoenix struct), not structural sharing.** WASM-GC's type system is nominal — even if two structs declare the same field shape, they are distinct types and a `(ref $A)` is not assignable to a `(ref $B)`. That property maps directly onto Phoenix's nominal structs (`Point { Int x, Int y }` and `Pixel { Int x, Int y }` are distinct in Phoenix too — assigning a `Point` into a `Pixel`-typed slot is a sema error). A structural-sharing scheme — "one WASM struct per distinct field layout, multiple Phoenix structs alias the same WASM type" — would be smaller (one declaration where two would be), but it'd require runtime tag bytes to distinguish the Phoenix-level types when they meet a `dyn Trait` or a pattern match, re-inventing the tagged-union machinery that the WASM GC target was supposed to elide. The size savings are real but small for MVP fixtures (one struct per fixture).
+
+**Why declare-before-any-function-signature.** Function signatures that take or return struct refs encode the struct's WASM type index inside their `ValType::Ref { heap_type: HeapType::Concrete(idx) }`. The WASM type section is a flat, position-indexed list; resolving the index requires the struct's declaration to precede the function signature in section order. The pipeline calls `declare_phoenix_structs(ir_module)` first, then the print-helper / function-signature declarations.
+
+**Alternatives considered:**
+
+- **Shared "boxed" struct (`(struct (field anyref … anyref))`)**. One WASM struct type with N anyref slots; every Phoenix field stored as boxed-anyref. Rejected: `i64`/`f64`/`bool` fields would need boxing/unboxing on every access — exactly the overhead WASM-GC's typed fields exist to eliminate. The "no tagged-union machinery" advantage above evaporates.
+- **i31ref tagging (one WASM type, distinguish Phoenix types via i31ref tag).** Rejected: same boxing overhead as the shared-boxed variant, plus an extra runtime tag check.
+- **Lazy declaration (declare a struct the first time `Op::StructAlloc(name)` is translated).** Considered. Would let us declare only structs actually instantiated. Rejected: function signatures may reference struct refs in params/returns before any allocation site is translated, so the index has to exist at signature-interning time anyway. Declaring eagerly from `struct_layouts` is simpler and emits at most a handful of dead types. One eager-declaration caveat: a struct that is *declared but never instantiated* is still walked, so if such a struct carries a field type the current slice doesn't support yet (a nested struct, list, string, etc.), `declare_phoenix_structs` errors even though no live code path touches it. For slice 3 that is the intended fail-closed behavior (an explicit per-field diagnostic beats a silently malformed module), but it means a dead struct is "free" only when all its fields are on the supported primitive surface — not unconditionally. Lazy declaration would have sidestepped that, at the cost of the signature-ordering problem above.
+
+**Implementation pointers:**
+- WASM struct declarations: [`crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs::declare_phoenix_structs`](../crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs).
+- `IrType::StructRef` → `ValType::Ref` mapping: [`crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs::wasm_valtypes_for`](../crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs).
+- `Op::StructAlloc` / `Op::StructGetField` / `Op::StructSetField` lowering: same `translate.rs`, under the `translate_instruction` match.
+- Fixture: `tests/fixtures/wasm_gc_struct.phx` (a focused fixture rather than carving down `features.phx`; per decision J slice 3, "or a focused new fixture if `features.phx` reaches for ops beyond MVP scope" — `features.phx` exercises strings, methods, enums, while-loops, for-loops, all of which are out of slice-3 scope, so a focused fixture is the right call).
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)

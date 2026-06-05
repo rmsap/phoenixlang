@@ -1,6 +1,6 @@
 //! Phoenix IR → WASM-GC function-body translation.
 //!
-//! Op surface as of PR 5 slice 2 (per design-decisions §Phase 2.4
+//! Op surface as of PR 5 slice 3 (per design-decisions §Phase 2.4
 //! decision J):
 //!
 //! - **Constants:** `Op::ConstI64`, `Op::ConstBool`.
@@ -15,15 +15,17 @@
 //! - **Calls:** `Op::Call(fid, [], args)` for direct user-function
 //!   calls (recursion included).
 //! - **Builtins:** `Op::BuiltinCall("print", Int)` only.
+//! - **Structs:** `Op::StructAlloc` / `Op::StructGetField` /
+//!   `Op::StructSetField` lowered as `struct.new` / `struct.get` /
+//!   `struct.set` against one nominal `(struct …)` declaration per
+//!   Phoenix struct (per §Phase 2.4 decision K.1).
 //! - **Multi-block control flow:** loop+switch dispatcher with
 //!   `Terminator::Return(Some/None)`, `Terminator::Jump`,
 //!   `Terminator::Branch`. Block-param locals are single-slot only
 //!   today; multi-slot params (`StringRef`, `DynRef`) land later.
 //!
-//! Subsequent slices add `Op::StructAlloc` / `Op::StructGetField` /
-//! `Op::StructSetField` lowered as `struct.new` / `struct.get` /
-//! `struct.set` (slice 3), then closures / lists / maps / enums / dyn
-//! across PR 6 in matrix-expansion increments.
+//! Subsequent slices add closures / lists / maps / enums / dyn /
+//! strings across PR 6 in matrix-expansion increments.
 //!
 //! Shadow-stack emission is suppressed entirely on this target — the
 //! host VM's GC handles tracing, so `phx_gc_push_frame` / `set_root` /
@@ -37,7 +39,7 @@ use phoenix_ir::instruction::{Op, ValueId};
 use phoenix_ir::module::{IrFunction, IrModule};
 use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
-use wasm_encoder::{BlockType, Function, Instruction, ValType};
+use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType};
 
 use super::module_builder::ModuleBuilder;
 use crate::error::CompileError;
@@ -66,18 +68,35 @@ pub(super) fn module_calls_print(ir_module: &IrModule) -> bool {
 
 /// Flatten a Phoenix `IrType` into the WASM `ValType` slot list used
 /// in function signatures and local declarations. MVP surface only —
-/// extended in PR 5 follow-up slices for struct / array / managed-ref
-/// types.
-pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileError> {
+/// extended in PR 5 follow-up slices for closure / list / map types.
+///
+/// `StructRef(name, _)` resolves via `b.require_phx_struct(name)` to a
+/// nullable concrete ref `(ref null $struct_idx)`. Nullability lets a
+/// freshly-allocated `Op::Alloca` slot for a struct type start in
+/// WASM's zero-init (`ref.null`) state; the first `Op::Store` then
+/// writes the post-`struct.new` non-nullable reference into it
+/// (subtype `(ref $T) <: (ref null $T)`). See §Phase 2.4 decision K.1.
+pub(super) fn wasm_valtypes_for(
+    ty: &IrType,
+    b: &ModuleBuilder,
+) -> Result<Vec<ValType>, CompileError> {
     match ty {
         IrType::I64 => Ok(vec![ValType::I64]),
         IrType::F64 => Ok(vec![ValType::F64]),
         IrType::Bool => Ok(vec![ValType::I32]),
         IrType::Void => Ok(Vec::new()),
+        IrType::StructRef(name, _) => {
+            let idx = b.require_phx_struct(name)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(idx),
+            })])
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
-             (Phase 2.4 PR 5 slice 1 covers Int / Bool / Float / Void; \
-              struct / list / string land in later slices)"
+             (Phase 2.4 PR 5 slices 1-3 cover Int / Bool / Float / Void / \
+              StructRef; closures / lists / maps / strings / enums / dyn \
+              land in PR 6)"
         ))),
     }
 }
@@ -88,18 +107,24 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
 /// otherwise a signature could be built with a multi-slot param that the
 /// body translator then rejects. Multi-slot types (`StringRef`,
 /// `DynRef`) land in a later slice, which relaxes both sides together.
-pub(super) fn flatten_param_types(params: &[IrType]) -> Result<Vec<ValType>, CompileError> {
+pub(super) fn flatten_param_types(
+    params: &[IrType],
+    b: &ModuleBuilder,
+) -> Result<Vec<ValType>, CompileError> {
     let mut out = Vec::with_capacity(params.len());
     for ty in params {
-        out.push(single_slot(ty, "function parameter")?);
+        out.push(single_slot(ty, b, "function parameter")?);
     }
     Ok(out)
 }
 
 /// Map a Phoenix function's return `IrType` to its WASM `ValType`s.
 /// `Void` → empty (the function pushes no operand-stack values).
-pub(super) fn wasm_return_valtypes(ty: &IrType) -> Result<Vec<ValType>, CompileError> {
-    wasm_valtypes_for(ty)
+pub(super) fn wasm_return_valtypes(
+    ty: &IrType,
+    b: &ModuleBuilder,
+) -> Result<Vec<ValType>, CompileError> {
+    wasm_valtypes_for(ty, b)
 }
 
 /// Per-function translation state. Tracks which WASM local index
@@ -154,14 +179,14 @@ struct DispatcherContext {
 }
 
 impl FuncCtx {
-    fn new(func: &IrFunction) -> Result<Self, CompileError> {
+    fn new(func: &IrFunction, b: &ModuleBuilder) -> Result<Self, CompileError> {
         let mut bindings = HashMap::new();
         let mut binding_types = HashMap::new();
         let mut next_local: u32 = 0;
         // Entry block's params bind to function-parameter locals.
         if let Some(entry) = func.blocks.first() {
             for (vid, ty) in &entry.params {
-                let slots = wasm_valtypes_for(ty)?;
+                let slots = wasm_valtypes_for(ty, b)?;
                 // MVP surface is single-slot only; multi-slot types
                 // (StringRef, DynRef) land in later slices.
                 if slots.len() != 1 {
@@ -247,7 +272,7 @@ impl FuncCtx {
     fn binding_of(&self, vid: ValueId) -> Result<u32, CompileError> {
         self.bindings.get(&vid).copied().ok_or_else(|| {
             CompileError::new(format!(
-                "wasm32-gc: unbound `ValueId({vid:?})` reached the translator \
+                "wasm32-gc: unbound `{vid:?}` reached the translator \
                  (internal compiler bug)"
             ))
         })
@@ -259,7 +284,7 @@ impl FuncCtx {
     fn binding_type_of(&self, vid: ValueId) -> Result<ValType, CompileError> {
         self.binding_types.get(&vid).copied().ok_or_else(|| {
             CompileError::new(format!(
-                "wasm32-gc: binding `ValueId({vid:?})` has no recorded WASM type \
+                "wasm32-gc: binding `{vid:?}` has no recorded WASM type \
                  (internal compiler bug)"
             ))
         })
@@ -289,7 +314,7 @@ pub(super) fn translate_function(
             func.name
         )));
     }
-    let mut ctx = FuncCtx::new(func)?;
+    let mut ctx = FuncCtx::new(func, b)?;
     if func.blocks.len() == 1 {
         let block = &func.blocks[0];
         for instr in &block.instructions {
@@ -364,7 +389,7 @@ fn translate_multi_block(
     // the target `BlockId` — stay correct independent of array order.
     for block in func.blocks.iter().skip(1) {
         for (vid, ty) in &block.params {
-            let wasm_ty = single_slot(ty, "non-entry block param")?;
+            let wasm_ty = single_slot(ty, b, "non-entry block param")?;
             let local = ctx.allocate_local(*vid, wasm_ty);
             ctx.register_block_param(block.id, local);
         }
@@ -411,9 +436,10 @@ fn translate_multi_block(
 fn translate_instruction(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
-    // Pre-threaded for later slices that consult the IR module (e.g.
-    // struct-type lookups in slice 3); unused by the slice-1/2 ops.
-    _ir_module: &IrModule,
+    // Consulted by `Op::StructAlloc` arity-checks against
+    // `IrModule::struct_layouts`; future slices will read it for
+    // `Op::ClosureAlloc` capture layouts, enum variant layouts, etc.
+    ir_module: &IrModule,
     instr: &phoenix_ir::instruction::Instruction,
 ) -> Result<(), CompileError> {
     match &instr.op {
@@ -439,7 +465,7 @@ fn translate_instruction(
         // Store writes into it, Load reads it back.
         Op::Alloca(ty) => {
             let vid = expect_result(instr, "Op::Alloca")?;
-            let wasm_ty = single_slot(ty, "Op::Alloca")?;
+            let wasm_ty = single_slot(ty, b, "Op::Alloca")?;
             ctx.allocate_local(vid, wasm_ty);
             // Initial value is zero/undefined; first Store sets it.
             Ok(())
@@ -447,7 +473,7 @@ fn translate_instruction(
         Op::Load(slot_vid) => {
             let vid = expect_result(instr, "Op::Load")?;
             let slot_local = ctx.binding_of(*slot_vid)?;
-            let wasm_ty = single_slot(&instr.result_type, "Op::Load")?;
+            let wasm_ty = single_slot(&instr.result_type, b, "Op::Load")?;
             ctx.emit(Instruction::LocalGet(slot_local));
             let local = ctx.allocate_local(vid, wasm_ty);
             ctx.emit(Instruction::LocalSet(local));
@@ -524,7 +550,7 @@ fn translate_instruction(
                      Void return type (internal compiler bug)"
                 ))),
                 (Some(vid), ty) => {
-                    let wasm_ty = single_slot(ty, "call result")?;
+                    let wasm_ty = single_slot(ty, b, "call result")?;
                     let local = ctx.allocate_local(vid, wasm_ty);
                     ctx.emit(Instruction::LocalSet(local));
                     Ok(())
@@ -537,13 +563,194 @@ fn translate_instruction(
             }
         }
         Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr),
+        // Struct ops — see §Phase 2.4 decision K.1. Each Phoenix struct
+        // has one nominal WASM-GC struct type (declared at module-build
+        // time by `declare_phoenix_structs`); the receiver value's
+        // binding `ValType` is `(ref null $struct_idx)`, from which
+        // get/set extract the struct's WASM type index without a
+        // parallel `ValueId → struct_name` map.
+        Op::StructAlloc(name, vals) => translate_struct_alloc(ctx, b, ir_module, name, vals, instr),
+        Op::StructGetField(obj, field_idx) => translate_struct_get(ctx, b, *obj, *field_idx, instr),
+        Op::StructSetField(obj, field_idx, val) => {
+            translate_struct_set(ctx, b, *obj, *field_idx, *val)
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR op `{other:?}` not yet supported \
-             (Phase 2.4 PR 5 slices 1-2 cover arithmetic / control \
-              flow / direct calls — struct ops land in slice 3, \
-              closures / lists / maps / strings in PR 6)"
+             (Phase 2.4 PR 5 slices 1-3 cover arithmetic / control \
+              flow / direct calls / struct ops — closures / lists / \
+              maps / strings / enums / dyn land in PR 6)"
         ))),
     }
+}
+
+/// Lower `Op::StructAlloc(name, vals)` to `struct.new $name`, arity-checking
+/// the field-value count against `IrModule::struct_layouts` first. The result
+/// is bound as the nullable `(ref null $struct_idx)` — `struct.new` yields the
+/// non-nullable `(ref $struct_idx)`, but the subtype `(ref $T) <: (ref null
+/// $T)` lets it settle (without a coercion) into a local typed to compose with
+/// null-defaulting `Op::Alloca` slots. See §Phase 2.4 decision K.1.
+fn translate_struct_alloc(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &IrModule,
+    name: &str,
+    vals: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "Op::StructAlloc")?;
+    let struct_idx = b.require_phx_struct(name)?;
+    let layout = require_struct_layout(ir_module, name)?;
+    if vals.len() != layout.len() {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `Op::StructAlloc({name:?})` has {} field \
+             values but the struct layout declares {} fields \
+             (IR verifier should have caught this)",
+            vals.len(),
+            layout.len(),
+        )));
+    }
+    for v in vals {
+        let local = ctx.binding_of(*v)?;
+        ctx.emit(Instruction::LocalGet(local));
+    }
+    ctx.emit(Instruction::StructNew(struct_idx));
+    let wasm_ty = ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(struct_idx),
+    });
+    let local = ctx.allocate_local(vid, wasm_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Lower `Op::StructGetField(obj, field_idx)` to `struct.get`. The
+/// struct-type index comes from the receiver binding's `ValType` (see
+/// [`struct_idx_of_binding`]) and the field index is bounds-checked first.
+/// The field's declared type is *not* checked against `instr.result_type`
+/// here — that agreement is trusted from sema and gated by the IR verifier;
+/// a mismatch would surface only as a `wasmparser` type error.
+fn translate_struct_get(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    obj: ValueId,
+    field_idx: u32,
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "Op::StructGetField")?;
+    let obj_local = ctx.binding_of(obj)?;
+    let struct_idx = struct_idx_of_binding(ctx, obj, "Op::StructGetField receiver")?;
+    check_field_index(b, struct_idx, field_idx, "Op::StructGetField")?;
+    ctx.emit(Instruction::LocalGet(obj_local));
+    // `struct.get` accepts nullable refs and traps on null — matching
+    // Phoenix's "no null structs" invariant: a null value can only appear
+    // in a slot that was Alloca'd but never Stored, which sema prohibits.
+    // No explicit null-check or ref.cast needed.
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: struct_idx,
+        field_index: field_idx,
+    });
+    let wasm_ty = single_slot(&instr.result_type, b, "Op::StructGetField result")?;
+    let local = ctx.allocate_local(vid, wasm_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Lower `Op::StructSetField(obj, field_idx, val)` to `struct.set`, the
+/// write sibling of [`translate_struct_get`] (same index recovery and
+/// bounds check; `val`'s type agreement with the field is likewise trusted
+/// from sema). The op has no result; a future IR change attaching one would
+/// need the verifier as the gate, not this translator.
+fn translate_struct_set(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    obj: ValueId,
+    field_idx: u32,
+    val: ValueId,
+) -> Result<(), CompileError> {
+    let obj_local = ctx.binding_of(obj)?;
+    let val_local = ctx.binding_of(val)?;
+    let struct_idx = struct_idx_of_binding(ctx, obj, "Op::StructSetField receiver")?;
+    check_field_index(b, struct_idx, field_idx, "Op::StructSetField")?;
+    ctx.emit(Instruction::LocalGet(obj_local));
+    ctx.emit(Instruction::LocalGet(val_local));
+    ctx.emit(Instruction::StructSet {
+        struct_type_index: struct_idx,
+        field_index: field_idx,
+    });
+    Ok(())
+}
+
+/// Look up the WASM-struct-type-section index a binding's
+/// `IrType::StructRef` resolved to. Reads the binding's recorded
+/// `ValType` (a `(ref null $idx)` for any StructRef value) and
+/// extracts the index. Errors clearly if the binding isn't a concrete
+/// ref — that's an internal compiler bug, since `Op::StructGetField` /
+/// `Op::StructSetField` are only emitted by IR lowering against
+/// StructRef-typed receivers.
+fn struct_idx_of_binding(ctx: &FuncCtx, vid: ValueId, label: &str) -> Result<u32, CompileError> {
+    let ty = ctx.binding_type_of(vid)?;
+    match ty {
+        ValType::Ref(RefType {
+            heap_type: HeapType::Concrete(idx),
+            ..
+        }) => Ok(idx),
+        other => Err(CompileError::new(format!(
+            "wasm32-gc: {label} `{vid:?}` is bound to WASM type \
+             `{other:?}`, not a concrete `(ref $struct_idx)` — \
+             struct ops require a StructRef-typed receiver (internal \
+             compiler bug)"
+        ))),
+    }
+}
+
+/// Bounds-check an IR field index against the receiver struct's
+/// declared field count before emitting a `struct.get` / `struct.set`.
+/// An out-of-range index would otherwise produce a module that only
+/// `wasmparser` rejects, deep in binary decoding — this surfaces the
+/// (internal-bug) mismatch with a precise diagnostic, mirroring the
+/// arity check on `Op::StructAlloc`.
+fn check_field_index(
+    b: &ModuleBuilder,
+    struct_idx: u32,
+    field_idx: u32,
+    label: &str,
+) -> Result<(), CompileError> {
+    let field_count = b.struct_field_count(struct_idx).ok_or_else(|| {
+        CompileError::new(format!(
+            "wasm32-gc: {label} references WASM struct type {struct_idx}, \
+             which `declare_phoenix_structs` recorded no field count for \
+             (internal compiler bug)"
+        ))
+    })?;
+    if field_idx >= field_count {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: {label} field index {field_idx} is out of range for \
+             WASM struct type {struct_idx}, which declares {field_count} \
+             field(s) (IR verifier should have caught this)"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a struct layout by name, erroring with a clear diagnostic
+/// (rather than panicking) if the name doesn't appear in
+/// `IrModule::struct_layouts`. Used to arity-check `Op::StructAlloc`
+/// before emitting the (silently wrong) WASM bytecode that an arity
+/// mismatch would produce.
+fn require_struct_layout<'a>(
+    ir_module: &'a IrModule,
+    name: &str,
+) -> Result<&'a [(String, IrType)], CompileError> {
+    ir_module
+        .struct_layouts
+        .get(name)
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: struct `{name}` is referenced by an `Op::StructAlloc` \
+                 but missing from `IrModule::struct_layouts` (internal compiler bug)"
+            ))
+        })
 }
 
 /// Emit a binary i64 → i64 op. Loads both operands, applies the
@@ -839,8 +1046,8 @@ fn expect_result(
     })
 }
 
-fn single_slot(ty: &IrType, label: &str) -> Result<ValType, CompileError> {
-    let slots = wasm_valtypes_for(ty)?;
+fn single_slot(ty: &IrType, b: &ModuleBuilder, label: &str) -> Result<ValType, CompileError> {
+    let slots = wasm_valtypes_for(ty, b)?;
     if slots.len() != 1 {
         return Err(CompileError::new(format!(
             "wasm32-gc MVP: `{label}` expected a single-slot type, got \

@@ -1,0 +1,12 @@
+struct Point {
+  Int x
+  Int y
+}
+
+function main() {
+  let mut p: Point = Point(3, 7)
+  print(p.x)
+  print(p.y)
+  p.x = 99
+  print(p.x)
+}

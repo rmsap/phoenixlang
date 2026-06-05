@@ -80,6 +80,58 @@ fn validate_gc_module(bytes: &[u8], label: &str) {
         .unwrap_or_else(|e| panic!("wasmparser rejected wasm32-gc {label}: {e}"));
 }
 
+/// Count the WASM-GC `struct.new` / `struct.get` / `struct.set`
+/// operators emitted across every function body in `bytes`, returned
+/// as `(new, get, set)`.
+///
+/// The struct tests pair this with [`assert_wasm_prints`] so that the
+/// presence of the three struct ops is asserted *structurally* —
+/// independent of whether the wasmtime execution tier runs. Structural
+/// validation alone only proves the module parses; in a wasmtime-less
+/// environment it would not catch a regression that dropped the
+/// `struct.set` lowering, since the field-mutation behavior is only
+/// observable at runtime. Counting the operators closes that gap.
+fn count_struct_ops(bytes: &[u8]) -> (usize, usize, usize) {
+    use wasmparser::{Operator, Parser, Payload};
+    let (mut new, mut get, mut set) = (0, 0, 0);
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::CodeSectionEntry(body) = payload.expect("parse wasm payload") {
+            let reader = body.get_operators_reader().expect("operators reader");
+            for op in reader {
+                match op.expect("decode operator") {
+                    Operator::StructNew { .. } => new += 1,
+                    Operator::StructGet { .. } => get += 1,
+                    Operator::StructSet { .. } => set += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (new, get, set)
+}
+
+/// Count the WASM-GC `(struct …)` type declarations in the module's
+/// type section. Used to assert §Phase 2.4 decision K.1's nominal
+/// mapping — *one distinct WASM struct type per Phoenix struct* — so a
+/// regression that deduped two same-shape structs into a single WASM
+/// type (structural sharing, which K.1 explicitly rejects) is caught.
+fn count_struct_type_decls(bytes: &[u8]) -> usize {
+    use wasmparser::{CompositeInnerType, Parser, Payload};
+    let mut structs = 0;
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::TypeSection(reader) = payload.expect("parse wasm payload") {
+            for rec_group in reader {
+                for sub_ty in rec_group.expect("rec group").types() {
+                    if matches!(sub_ty.composite_type.inner, CompositeInnerType::Struct(_)) {
+                        structs += 1;
+                    }
+                }
+            }
+        }
+    }
+    structs
+}
+
 /// Compile `source`, structurally validate it, and — when wasmtime is
 /// available — assert its stdout equals `expected`. Shared by the
 /// `print(Int)` digit-conversion cases.
@@ -678,6 +730,465 @@ fn main_returning_non_void_is_rejected() {
         msg.contains("main") && msg.contains("Void"),
         "expected a `main`/`Void` diagnostic, got: {msg}"
     );
+}
+
+/// PR 5 slice 3: structs land via `Op::StructAlloc` / `Op::StructGetField`
+/// / `Op::StructSetField` lowered to WASM-GC `struct.new` / `struct.get`
+/// / `struct.set`, against one nominal `(struct …)` type-section
+/// declaration per Phoenix struct (per §Phase 2.4 decision K.1).
+///
+/// The fixture covers all three ops in one program:
+///
+/// - **Construction (`Op::StructAlloc`).** `Point(3, 7)` pushes both
+///   field values, then `struct.new $Point` consumes them and produces
+///   a `(ref $Point)` that the surrounding `Op::Store` writes into the
+///   `let mut p` slot.
+/// - **Field read (`Op::StructGetField`).** `p.x` / `p.y` each emit a
+///   `local.get` on the slot followed by `struct.get $Point <idx>`.
+///   The receiver is the nullable `(ref null $Point)` form (the
+///   Alloca slot's WASM type); `struct.get` accepts nullable refs and
+///   would trap on null — Phoenix's "no null structs" invariant
+///   guarantees the store-before-read ordering that keeps this safe.
+/// - **Field write (`Op::StructSetField`).** `p.x = 99` emits
+///   `local.get $slot`, `local.get $val`, `struct.set $Point 0`.
+///   Phoenix struct fields are mutable by default, so the WASM-side
+///   `FieldType` is declared `mutable: true` for every field.
+///
+/// Also exercises the type-section ordering invariant: the struct must
+/// be declared *before* `main`'s signature is interned (so any future
+/// signature with a struct ref param/return encodes the right
+/// `HeapType::Concrete(idx)`). The pipeline calls
+/// `declare_phoenix_structs` before `declare_phoenix_functions`; a
+/// reordering would emit a signature referencing an unallocated type
+/// slot, which `wasmparser` would reject.
+///
+/// Expected stdout: `3\n7\n99\n`.
+#[test]
+fn struct_alloc_get_set_runs_under_wasmtime_gc() {
+    // Pulled from the canonical fixture at compile time (mirroring the
+    // linear backend's `include_str!` gate fixtures) so the test stays
+    // locked to whatever `wasm_gc_struct.phx` says rather than a drifting
+    // inline copy.
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/wasm_gc_struct.phx"
+    ));
+    let bytes = compile_to_wasm_gc(source);
+    // Assert the struct ops are actually emitted, independent of the
+    // wasmtime execution tier: structural validation alone would not
+    // notice a regression that dropped `struct.set`, but the field
+    // mutation it lowers (`p.x = 99` → `99`) is only observable at
+    // runtime. One `struct.new` (the `Point(3, 7)` construction), one
+    // `struct.set` (the `p.x = 99` write), and at least one
+    // `struct.get` (the three `p.x` / `p.y` reads — exact count depends
+    // on whether the IR reloads the slot per access).
+    let (new, get, set) = count_struct_ops(&bytes);
+    assert_eq!(new, 1, "expected exactly one struct.new, got {new}");
+    assert_eq!(set, 1, "expected exactly one struct.set, got {set}");
+    assert!(get >= 1, "expected at least one struct.get, got {get}");
+    assert_wasm_prints(&bytes, "struct_point_wasm_gc", b"3\n7\n99\n");
+}
+
+/// A struct field whose type isn't yet on the slice-3 surface (here a
+/// nested `StructRef`) must surface a clear per-slice diagnostic — not
+/// silently emit a partial declaration that later trips up
+/// `wasmparser` with an "unexpected field type" deep inside the binary
+/// format. The error keeps the slice from masking work that belongs to
+/// follow-up slices.
+#[test]
+fn struct_with_nested_struct_field_is_rejected_until_a_later_slice() {
+    let source = concat!(
+        "struct Inner {\n",
+        "  Int v\n",
+        "}\n",
+        "struct Outer {\n",
+        "  Inner inner\n",
+        "}\n",
+        "function main() {\n",
+        "  let o: Outer = Outer(Inner(1))\n",
+        "  print(o.inner.v)\n",
+        "}\n",
+    );
+    let ir_module = lower_to_ir(source);
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("nested struct fields are outside slice 3's MVP scope");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Outer") && msg.contains("inner"),
+        "expected a per-field diagnostic naming the unsupported field, got: {msg}"
+    );
+}
+
+/// `Op::StructGetField` / `Op::StructSetField` with a field index past
+/// the struct's declared field count must surface a clear per-op
+/// diagnostic, not emit a `struct.get`/`struct.set` that only
+/// `wasmparser` rejects deep in binary decoding. Built straight from IR
+/// (mirroring [`print_int_module`]): no Phoenix surface produces an
+/// out-of-range index, since sema resolves field *names* to in-range
+/// indices, so the guard is only reachable via a hand-built (or future
+/// buggy) IR.
+#[test]
+fn struct_field_index_out_of_range_is_rejected() {
+    let mut func = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = func.create_block();
+    let a = func.emit_value(entry, Op::ConstI64(1), IrType::I64, None);
+    let b = func.emit_value(entry, Op::ConstI64(2), IrType::I64, None);
+    let pair = func.emit_value(
+        entry,
+        Op::StructAlloc("Pair".to_string(), vec![a, b]),
+        IrType::StructRef("Pair".to_string(), Vec::new()),
+        None,
+    );
+    // `Pair` declares two fields; index 5 is out of range.
+    func.emit_value(entry, Op::StructGetField(pair, 5), IrType::I64, None);
+    func.set_terminator(entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    module.struct_layouts.insert(
+        "Pair".to_string(),
+        vec![
+            ("a".to_string(), IrType::I64),
+            ("b".to_string(), IrType::I64),
+        ],
+    );
+    module.push_concrete(func);
+
+    let err = compile(&module, Target::Wasm32Gc)
+        .expect_err("an out-of-range struct field index must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("out of range") && msg.contains("Op::StructGetField"),
+        "expected an out-of-range field-index diagnostic, got: {msg}"
+    );
+}
+
+/// Sibling of [`struct_field_index_out_of_range_is_rejected`] for the
+/// *write* path: `Op::StructSetField` shares the `check_field_index`
+/// guard, but routes a distinct `"Op::StructSetField"` label into the
+/// diagnostic. Pin that label so the set path can't silently regress to
+/// a `struct.set` that only `wasmparser` rejects deep in decoding.
+#[test]
+fn struct_set_field_index_out_of_range_is_rejected() {
+    let mut func = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = func.create_block();
+    let a = func.emit_value(entry, Op::ConstI64(1), IrType::I64, None);
+    let b = func.emit_value(entry, Op::ConstI64(2), IrType::I64, None);
+    let pair = func.emit_value(
+        entry,
+        Op::StructAlloc("Pair".to_string(), vec![a, b]),
+        IrType::StructRef("Pair".to_string(), Vec::new()),
+        None,
+    );
+    // `Pair` declares two fields; index 5 is out of range.
+    func.emit(entry, Op::StructSetField(pair, 5, a), IrType::Void, None);
+    func.set_terminator(entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    module.struct_layouts.insert(
+        "Pair".to_string(),
+        vec![
+            ("a".to_string(), IrType::I64),
+            ("b".to_string(), IrType::I64),
+        ],
+    );
+    module.push_concrete(func);
+
+    let err = compile(&module, Target::Wasm32Gc)
+        .expect_err("an out-of-range struct field index must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("out of range") && msg.contains("Op::StructSetField"),
+        "expected an out-of-range field-index diagnostic, got: {msg}"
+    );
+}
+
+/// Exercise `IrType::StructRef` in a *function signature* — the case
+/// the declare-before-any-signature ordering exists for. `get_x` takes
+/// a `Point` parameter and `make` returns one, so both signatures
+/// encode `(ref null $Point)` and must be interned *after* the struct's
+/// type-section declaration. The slice-3 fixture only uses a struct as
+/// a `main`-local, so without this test the param/return resolution in
+/// `wasm_valtypes_for` / `flatten_param_types` / `wasm_return_valtypes`
+/// is unexercised. Built straight from IR because no slice-3 Phoenix
+/// surface lowers struct-typed parameters yet.
+///
+/// Shape: `make()` allocates `Point(3, 7)` and returns it; `main` calls
+/// `make`, passes the result to `get_x`, and prints the `x` field.
+///
+/// Expected stdout: `3\n`.
+#[test]
+fn struct_in_function_signature_runs_under_wasmtime_gc() {
+    let point = || IrType::StructRef("Point".to_string(), Vec::new());
+
+    // `make() -> Point { Point(3, 7) }`
+    let mut make = IrFunction::new(
+        FuncId(1),
+        "make".to_string(),
+        Vec::new(),
+        Vec::new(),
+        point(),
+        None,
+    );
+    let mk_entry = make.create_block();
+    let a = make.emit_value(mk_entry, Op::ConstI64(3), IrType::I64, None);
+    let b = make.emit_value(mk_entry, Op::ConstI64(7), IrType::I64, None);
+    let pt = make.emit_value(
+        mk_entry,
+        Op::StructAlloc("Point".to_string(), vec![a, b]),
+        point(),
+        None,
+    );
+    make.set_terminator(mk_entry, Terminator::Return(Some(pt)));
+
+    // `get_x(p: Point) -> Int { p.x }`
+    let mut get_x = IrFunction::new(
+        FuncId(2),
+        "get_x".to_string(),
+        vec![point()],
+        vec!["p".to_string()],
+        IrType::I64,
+        None,
+    );
+    let gx_entry = get_x.create_block();
+    let p = get_x.add_block_param(gx_entry, point());
+    let x = get_x.emit_value(gx_entry, Op::StructGetField(p, 0), IrType::I64, None);
+    get_x.set_terminator(gx_entry, Terminator::Return(Some(x)));
+
+    // `main() { print(get_x(make())) }`
+    let mut main = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let m_entry = main.create_block();
+    let made = main.emit_value(
+        m_entry,
+        Op::Call(FuncId(1), Vec::new(), Vec::new()),
+        point(),
+        None,
+    );
+    let got = main.emit_value(
+        m_entry,
+        Op::Call(FuncId(2), Vec::new(), vec![made]),
+        IrType::I64,
+        None,
+    );
+    main.emit(
+        m_entry,
+        Op::BuiltinCall("print".to_string(), vec![got]),
+        IrType::Void,
+        None,
+    );
+    main.set_terminator(m_entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    module.struct_layouts.insert(
+        "Point".to_string(),
+        vec![
+            ("x".to_string(), IrType::I64),
+            ("y".to_string(), IrType::I64),
+        ],
+    );
+    module.push_concrete(main);
+    module.push_concrete(make);
+    module.push_concrete(get_x);
+
+    let bytes = compile(&module, Target::Wasm32Gc)
+        .unwrap_or_else(|e| panic!("wasm32-gc compile failed: {e}"));
+    assert_wasm_prints(&bytes, "struct_in_signature_wasm_gc", b"3\n");
+}
+
+/// Pin §Phase 2.4 decision K.1's *nominal* mapping: two Phoenix structs
+/// with an identical field shape (`Point { Int, Int }` /
+/// `Pixel { Int, Int }`) must each get their own WASM struct type, not
+/// share one structurally. The behavior is otherwise invisible at this
+/// slice's surface — both compile and run fine either way — so without a
+/// structural count a regression that deduped same-shape structs would
+/// pass every other test. Counting the type-section `(struct …)` entries
+/// asserts the two-distinct-types invariant directly.
+#[test]
+fn same_shape_structs_get_distinct_wasm_types() {
+    let source = concat!(
+        "struct Point {\n",
+        "  Int x\n",
+        "  Int y\n",
+        "}\n",
+        "struct Pixel {\n",
+        "  Int x\n",
+        "  Int y\n",
+        "}\n",
+        "function main() {\n",
+        "  let p: Point = Point(1, 2)\n",
+        "  let q: Pixel = Pixel(3, 4)\n",
+        "  print(p.x)\n",
+        "  print(q.x)\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    let decls = count_struct_type_decls(&bytes);
+    assert_eq!(
+        decls, 2,
+        "expected two distinct WASM struct types (one per Phoenix struct, \
+         per K.1's nominal mapping), got {decls}"
+    );
+    assert_wasm_prints(&bytes, "same_shape_structs_wasm_gc", b"1\n3\n");
+}
+
+/// `Op::StructAlloc` naming a struct absent from `IrModule::struct_layouts`
+/// must surface `require_phx_struct`'s missing-declaration diagnostic —
+/// the guard against a signature/alloc referencing a struct the
+/// `declare_phoenix_structs` pass never saw. No Phoenix surface produces
+/// this (sema resolves every constructor to a declared struct), so the
+/// path is only reachable via hand-built (or future buggy) IR, mirroring
+/// the out-of-range field-index tests.
+#[test]
+fn struct_alloc_for_undeclared_struct_is_rejected() {
+    let mut func = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = func.create_block();
+    // `Ghost` is deliberately never inserted into `struct_layouts` below.
+    func.emit_value(
+        entry,
+        Op::StructAlloc("Ghost".to_string(), Vec::new()),
+        IrType::StructRef("Ghost".to_string(), Vec::new()),
+        None,
+    );
+    func.set_terminator(entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    module.push_concrete(func);
+
+    let err = compile(&module, Target::Wasm32Gc)
+        .expect_err("a StructAlloc naming a struct absent from struct_layouts must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Ghost") && msg.contains("declare_phoenix_structs"),
+        "expected a missing-declaration diagnostic naming the struct, got: {msg}"
+    );
+}
+
+/// Exercise a `Bool` struct field end-to-end — the `Bool → i32` arm of
+/// `wasm_field_type_for`, plus a `struct.get` whose result slot is `i32`
+/// rather than `i64`. The fixture stores `true` into the field, reads it
+/// back, and branches on it; the read is observable because the taken
+/// arm prints a different `Int` than the untaken one. The slice-3
+/// fixture only has `Int` fields, so without this the bool field mapping
+/// (a swap to e.g. `i64` would push an i64 operand into an i32 field and
+/// `wasmparser` would reject `struct.new`) is unexercised.
+///
+/// Shape: `Flags { Bool on, Int n }`; `main` builds `Flags(true, 42)` and
+/// prints `n` iff `on`, else `0`.
+///
+/// Expected stdout: `42\n`.
+#[test]
+fn struct_bool_field_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "struct Flags {\n",
+        "  Bool on\n",
+        "  Int n\n",
+        "}\n",
+        "function main() {\n",
+        "  let f: Flags = Flags(true, 42)\n",
+        "  if f.on {\n",
+        "    print(f.n)\n",
+        "  } else {\n",
+        "    print(0)\n",
+        "  }\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    let (new, get, _set) = count_struct_ops(&bytes);
+    assert_eq!(new, 1, "expected exactly one struct.new, got {new}");
+    assert!(get >= 1, "expected at least one struct.get, got {get}");
+    assert_wasm_prints(&bytes, "struct_bool_field_wasm_gc", b"42\n");
+}
+
+/// Exercise an `F64` struct field — the `F64 → f64` arm of
+/// `wasm_field_type_for` and a `struct.new` / `struct.get` against an
+/// f64 field slot. Hand-built rather than source-driven because the GC
+/// backend lowers no f64-producing op (`Op::ConstF64` is outside the
+/// slice-3 surface, and there's no float arithmetic), so the only way to
+/// mint an f64 operand for `struct.new` is a function *parameter* of type
+/// `Float`. The `build` function is never called — `main` can't produce
+/// an f64 to pass it — but it is still a concrete function, so it is
+/// emitted and `wasmparser`-validated. A wrong `F64 → i32` mapping would
+/// push an i32-typed operand into an f64 field (or vice-versa) and
+/// validation would reject the `struct.new`; this pins the mapping
+/// structurally even though the execution tier can't reach the function.
+#[test]
+fn struct_f64_field_validates() {
+    // `build(x: Float) -> Float { HasFloat(x).f }`
+    let mut build = IrFunction::new(
+        FuncId(1),
+        "build".to_string(),
+        vec![IrType::F64],
+        vec!["x".to_string()],
+        IrType::F64,
+        None,
+    );
+    let b_entry = build.create_block();
+    let x = build.add_block_param(b_entry, IrType::F64);
+    let h = build.emit_value(
+        b_entry,
+        Op::StructAlloc("HasFloat".to_string(), vec![x]),
+        IrType::StructRef("HasFloat".to_string(), Vec::new()),
+        None,
+    );
+    let f = build.emit_value(b_entry, Op::StructGetField(h, 0), IrType::F64, None);
+    build.set_terminator(b_entry, Terminator::Return(Some(f)));
+
+    // `main()` is the entry point; it does nothing but anchor the module
+    // (it can't call `build` — no f64 value to pass).
+    let mut main = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let m_entry = main.create_block();
+    main.set_terminator(m_entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    module
+        .struct_layouts
+        .insert("HasFloat".to_string(), vec![("f".to_string(), IrType::F64)]);
+    module.push_concrete(main);
+    module.push_concrete(build);
+
+    let bytes = compile(&module, Target::Wasm32Gc)
+        .unwrap_or_else(|e| panic!("wasm32-gc compile failed: {e}"));
+    // `wasmparser` (GC features on) rejects a `struct.new` whose operand
+    // type disagrees with the declared field type, so validation is the
+    // assertion that `F64` mapped to an f64 field.
+    validate_gc_module(&bytes, "struct_f64_field_wasm_gc");
+    let (new, get, _set) = count_struct_ops(&bytes);
+    assert_eq!(new, 1, "expected exactly one struct.new, got {new}");
+    assert!(get >= 1, "expected at least one struct.get, got {get}");
 }
 
 /// Hand-build the IR for `function main() { print(n) }` with a literal

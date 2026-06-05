@@ -108,6 +108,24 @@ pub(super) struct ModuleBuilder {
     /// resolve to a concrete WASM `call` target before the called
     /// function's body has been emitted.
     phx_user_funcs: HashMap<FuncId, u32>,
+
+    /// Phoenix struct name (post-monomorphization, e.g. `Point` or
+    /// `Container__i64`) → WASM type-section index of the nominal
+    /// `(struct ...)` declaration. Populated by
+    /// [`Self::declare_phoenix_structs`]; consulted by `Op::StructAlloc`
+    /// lowering and by the `IrType::StructRef` → WASM `ValType` mapping
+    /// in `translate::wasm_valtypes_for`. See §Phase 2.4 decision K.1
+    /// for the one-WASM-struct-per-Phoenix-struct rationale.
+    phx_structs: HashMap<String, u32>,
+
+    /// WASM struct type-section index → declared field count. Lets
+    /// `Op::StructGetField` / `Op::StructSetField` bounds-check the IR
+    /// field index — recovered from the receiver's binding `ValType`,
+    /// which carries the WASM index but not the Phoenix struct name —
+    /// before emitting a `struct.get`/`struct.set`. An out-of-range
+    /// index would otherwise yield a module `wasmparser` only rejects
+    /// deep in binary decoding. Populated alongside [`Self::phx_structs`].
+    phx_struct_field_counts: HashMap<u32, u32>,
 }
 
 impl ModuleBuilder {
@@ -126,7 +144,78 @@ impl ModuleBuilder {
             start_idx: None,
             phx_main_idx: None,
             phx_user_funcs: HashMap::new(),
+            phx_structs: HashMap::new(),
+            phx_struct_field_counts: HashMap::new(),
         }
+    }
+
+    /// Declare one nominal WASM-GC struct type per Phoenix struct in
+    /// the IR module, in `struct_layouts` iteration order. Each
+    /// declaration takes the type-section index that the order assigns
+    /// and is recorded in [`Self::phx_structs`] so subsequent function
+    /// signatures (and `Op::StructAlloc` lowering) can reference the
+    /// index without re-walking the section.
+    ///
+    /// Must run *before* any function signature is interned, because
+    /// signatures that take or return a `(ref null $struct_idx)` encode
+    /// the index inline — declaring the struct after such a signature
+    /// would have the signature reference an unallocated type-section
+    /// slot. See §Phase 2.4 decision K.1.
+    ///
+    /// **Field-type restriction for slice 3.** Slice 3's fixtures only
+    /// exercise primitive-typed fields (`Int`, `Float`, `Bool`). Nested
+    /// struct fields, list / map / enum / closure fields, and string
+    /// fields all error here — they need follow-up slices that pin
+    /// their own type mappings before they can lower correctly. The
+    /// error keeps a fixture-driven slice from silently producing a
+    /// malformed module on inputs the slice hasn't been designed for.
+    pub(super) fn declare_phoenix_structs(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        // Iterate in sorted name order so the type-section layout is
+        // deterministic across runs (HashMap iteration is otherwise
+        // arbitrary, and a non-deterministic type section would make
+        // golden-byte diffs in tests untrustworthy).
+        let mut names: Vec<&String> = ir_module.struct_layouts.keys().collect();
+        names.sort();
+        for name in names {
+            let layout = &ir_module.struct_layouts[name];
+            let mut fields = Vec::with_capacity(layout.len());
+            for (field_name, field_ty) in layout {
+                fields.push(wasm_field_type_for(name, field_name, field_ty)?);
+            }
+            let idx = self.types.declare_struct(&fields);
+            self.phx_structs.insert(name.clone(), idx);
+            self.phx_struct_field_counts
+                .insert(idx, fields.len() as u32);
+        }
+        Ok(())
+    }
+
+    /// Look up the WASM type-section index of a Phoenix struct's
+    /// nominal `(struct …)` declaration. Used by `Op::StructAlloc`
+    /// lowering and by the `IrType::StructRef` → WASM `ValType`
+    /// mapping.
+    pub(super) fn require_phx_struct(&self, name: &str) -> Result<u32, CompileError> {
+        self.phx_structs.get(name).copied().ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: struct `{name}` was not declared by \
+                 `declare_phoenix_structs` — either an `Op::StructAlloc` / \
+                 `IrType::StructRef` references a struct missing from \
+                 `IrModule::struct_layouts`, or the pipeline declared a \
+                 function signature touching it before the struct itself \
+                 (internal compiler bug)"
+            ))
+        })
+    }
+
+    /// Number of fields declared for the WASM struct type at
+    /// `struct_idx`, or `None` if no struct was declared at that index.
+    /// Used by `Op::StructGetField` / `Op::StructSetField` to
+    /// bounds-check the IR field index.
+    pub(super) fn struct_field_count(&self, struct_idx: u32) -> Option<u32> {
+        self.phx_struct_field_counts.get(&struct_idx).copied()
     }
 
     /// Declare the WASI imports the synthesized helpers and `_start`
@@ -376,8 +465,8 @@ impl ModuleBuilder {
         ir_module: &IrModule,
     ) -> Result<(), CompileError> {
         for func in ir_module.concrete_functions() {
-            let params = translate::flatten_param_types(&func.param_types)?;
-            let returns = translate::wasm_return_valtypes(&func.return_type)?;
+            let params = translate::flatten_param_types(&func.param_types, self)?;
+            let returns = translate::wasm_return_valtypes(&func.return_type, self)?;
             let sig = self.types.intern(&params, &returns);
             let wasm_idx = self.add_local_function(sig);
             // A duplicate `FuncId` would silently overwrite the map
@@ -533,6 +622,42 @@ impl ModuleBuilder {
         module.section(&self.data);
         Ok(module.finish())
     }
+}
+
+/// Map one Phoenix field's `IrType` to a WASM-GC `FieldType` for the
+/// containing struct's nominal declaration. Slice 3 only supports
+/// primitive-typed fields (Int / Float / Bool); nested struct / list /
+/// map / enum / closure / string field types are rejected with a
+/// per-slice diagnostic — each needs its own follow-up sub-decision
+/// before the layout can be pinned (e.g. nested struct fields require
+/// the inner struct to be declared first in the type section; lists
+/// need the `(array T)` mapping settled). Mutability is unconditional:
+/// Phoenix supports `p.x = 5` and has no syntax to mark a field
+/// immutable. See §Phase 2.4 decision K.1.
+fn wasm_field_type_for(
+    struct_name: &str,
+    field_name: &str,
+    field_ty: &IrType,
+) -> Result<wasm_encoder::FieldType, CompileError> {
+    let val_type = match field_ty {
+        IrType::I64 => wasm_encoder::ValType::I64,
+        IrType::F64 => wasm_encoder::ValType::F64,
+        IrType::Bool => wasm_encoder::ValType::I32,
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc slice 3: struct `{struct_name}` field \
+                 `{field_name}` has type `{other:?}`, but the slice only \
+                 supports primitive fields (Int / Float / Bool). Nested \
+                 struct / list / map / enum / closure / string fields \
+                 land in follow-up slices (each carries its own \
+                 type-mapping sub-decision under §Phase 2.4 decision K)"
+            )));
+        }
+    };
+    Ok(wasm_encoder::FieldType {
+        element_type: wasm_encoder::StorageType::Val(val_type),
+        mutable: true,
+    })
 }
 
 /// Emit a `fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET); drop`
