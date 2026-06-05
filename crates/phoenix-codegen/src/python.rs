@@ -84,6 +84,7 @@ impl<'a> PyGenerator<'a> {
 
         for ep in &self.check_result.endpoints {
             self.emit_derived_model(ep);
+            self.emit_result_envelope(ep);
         }
 
         // ── client.py ───────────────────────────────────────────────
@@ -303,6 +304,47 @@ impl<'a> PyGenerator<'a> {
         }
     }
 
+    /// Emits the `<Endpoint>Result` typed envelope model for an endpoint that
+    /// declares response headers: the response body plus one typed field per
+    /// response header (snake_case local name). Endpoints without response
+    /// headers emit nothing here — they keep returning the bare response type.
+    fn emit_result_envelope(&mut self, ep: &EndpointInfo) {
+        if ep.response_headers.is_empty() {
+            return;
+        }
+        let type_name = format!("{}Result", capitalize(&ep.name));
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+
+        let body_type = ep
+            .response
+            .as_ref()
+            .map(type_to_python)
+            .unwrap_or_else(|| "None".to_string());
+
+        ensure_blank_lines(&mut self.models_out, 2);
+        self.models_out
+            .push_str(&format!("class {type_name}(BaseModel):\n"));
+        self.models_out
+            .push_str(&format!("    body: {body_type}\n"));
+        for hp in &ep.response_headers {
+            let snake = to_snake_case(&hp.name);
+            let py_type = type_to_python(&hp.ty);
+            // Response-header optionality is `Option<T>` ONLY. A `= default` on a
+            // response header is meaningless (sema ignores it; the handler sets
+            // the value), so a default must not flip the field to `T | None`.
+            let is_optional = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+            if is_optional {
+                self.models_out
+                    .push_str(&format!("    {snake}: {py_type} = None\n"));
+            } else {
+                self.models_out
+                    .push_str(&format!("    {snake}: {py_type}\n"));
+            }
+        }
+    }
+
     // ── client.py emission ──────────────────────────────────────────
 
     /// Emits imports for the client file.
@@ -329,6 +371,11 @@ impl<'a> PyGenerator<'a> {
             if let Some(ref resp) = ep.response {
                 collect_python_imports(resp, &mut imports);
             }
+            // Endpoints with response headers return the typed envelope, which
+            // lives in models.py and must be imported here.
+            if !ep.response_headers.is_empty() {
+                imports.insert(format!("{}Result", capitalize(&ep.name)));
+            }
         }
         if !imports.is_empty() {
             let joined: Vec<_> = imports.into_iter().collect();
@@ -342,11 +389,18 @@ impl<'a> PyGenerator<'a> {
     fn emit_client_method(&mut self, ep: &EndpointInfo) {
         let method = ep.method.as_lower_str();
         let fn_name = to_snake_case(&ep.name);
-        let response_type = ep
+        // The bare response body type; the method's return type becomes the typed
+        // `<Endpoint>Result` envelope when the endpoint declares response headers.
+        let body_type = ep
             .response
             .as_ref()
             .map(type_to_python)
             .unwrap_or_else(|| "None".to_string());
+        let response_type = if ep.response_headers.is_empty() {
+            body_type.clone()
+        } else {
+            format!("{}Result", capitalize(&ep.name))
+        };
 
         // Build parameter list
         let mut params = vec!["self".to_string()];
@@ -357,8 +411,8 @@ impl<'a> PyGenerator<'a> {
             let body_type = format!("{}Body", capitalize(&ep.name));
             params.push(format!("body: {body_type}"));
         }
-        // Query params as keyword-only
-        if !ep.query_params.is_empty() {
+        // Query params and request headers are keyword-only.
+        if !ep.query_params.is_empty() || !ep.headers.is_empty() {
             params.push("*".to_string());
             for qp in &ep.query_params {
                 let py_type = type_to_python(&qp.ty);
@@ -380,6 +434,26 @@ impl<'a> PyGenerator<'a> {
                     params.push(format!("{}: {}", to_snake_case(&qp.name), py_type));
                 }
             }
+            for hp in &ep.headers {
+                let py_type = type_to_python(&hp.ty);
+                let is_optional =
+                    hp.has_default || matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+                if is_optional {
+                    let default = hp
+                        .default_value
+                        .as_ref()
+                        .map(default_value_to_python)
+                        .unwrap_or_else(|| "None".to_string());
+                    params.push(format!(
+                        "{}: {} = {}",
+                        to_snake_case(&hp.name),
+                        py_type,
+                        default
+                    ));
+                } else {
+                    params.push(format!("{}: {}", to_snake_case(&hp.name), py_type));
+                }
+            }
         }
 
         ensure_blank_lines(&mut self.client_out, 1);
@@ -399,6 +473,7 @@ impl<'a> PyGenerator<'a> {
         // Build URL
         let url = build_python_url(&ep.path);
         let has_query = !ep.query_params.is_empty();
+        let has_headers = !ep.headers.is_empty();
 
         // Query params dict
         if has_query {
@@ -413,6 +488,45 @@ impl<'a> PyGenerator<'a> {
             }
         }
 
+        // Request headers dict. httpx wants `str` header values, so non-string
+        // types are stringified; optional headers are only set when present. The
+        // wire name is the exact HTTP header string (never recomputed here).
+        if has_headers {
+            self.client_out
+                .push_str("        headers: dict[str, str] = {}\n");
+            for hp in &ep.headers {
+                let snake = to_snake_case(&hp.name);
+                // Only an `Option<T>` header can actually be `None` at runtime, so
+                // only those are guarded. A header with a literal default is a
+                // non-None value (it defaults to that literal) and is sent
+                // unconditionally — guarding it would be an always-true check.
+                let is_nullable = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+                let value = match &unwrap_option(&hp.ty) {
+                    // `str` headers pass through untouched.
+                    Type::String => snake.clone(),
+                    // `bool` must serialize as lowercase `true`/`false` to match
+                    // every other path (Go `strconv.FormatBool`, TS `String(bool)`,
+                    // and this generator's own response-header set/read which use
+                    // lowercase). Python's `str(True)` would emit `"True"`, which
+                    // the TS server's `=== "true"` coercion rejects.
+                    Type::Bool => format!("(\"true\" if {snake} else \"false\")"),
+                    _ => format!("str({snake})"),
+                };
+                if is_nullable {
+                    // Only send the header when the caller provided a value.
+                    self.client_out.push_str(&format!(
+                        "        if {snake} is not None:\n            headers[\"{}\"] = {value}\n",
+                        hp.wire_name
+                    ));
+                } else {
+                    self.client_out.push_str(&format!(
+                        "        headers[\"{}\"] = {value}\n",
+                        hp.wire_name
+                    ));
+                }
+            }
+        }
+
         // HTTP call
         let mut call_args = vec![format!("f\"{{self.base_url}}{url}\"")];
         if ep.body.is_some() {
@@ -420,6 +534,9 @@ impl<'a> PyGenerator<'a> {
         }
         if has_query {
             call_args.push("params=params".to_string());
+        }
+        if has_headers {
+            call_args.push("headers=headers".to_string());
         }
         let call = format_call(
             "        ",
@@ -432,24 +549,56 @@ impl<'a> PyGenerator<'a> {
             .push_str("        response.raise_for_status()\n");
 
         // Return
-        if response_type != "None" {
-            let is_list = matches!(&ep.response, Some(Type::Generic(name, _)) if name == "List");
-            if is_list {
-                // Extract inner type for list deserialization
-                let inner = match &ep.response {
-                    Some(Type::Generic(_, args)) if !args.is_empty() => type_to_python(&args[0]),
-                    _ => "dict".to_string(),
-                };
-                self.client_out.push_str(&format!(
-                    "        return [{inner}(**item) for item in response.json()]\n"
-                ));
-            } else {
-                self.client_out.push_str(&format!(
-                    "        return {}(**response.json())\n",
-                    response_type
-                ));
-            }
+        if response_type == "None" {
+            return;
         }
+
+        // Parse the body into the bare response type (list or single model).
+        let is_list = matches!(&ep.response, Some(Type::Generic(name, _)) if name == "List");
+        let body_expr = if is_list {
+            let inner = match &ep.response {
+                Some(Type::Generic(_, args)) if !args.is_empty() => type_to_python(&args[0]),
+                _ => "dict".to_string(),
+            };
+            format!("[{inner}(**item) for item in response.json()]")
+        } else {
+            format!("{body_type}(**response.json())")
+        };
+
+        if ep.response_headers.is_empty() {
+            self.client_out
+                .push_str(&format!("        return {body_expr}\n"));
+            return;
+        }
+
+        // Typed envelope: read each response header off the httpx response and
+        // coerce to the declared type. Absent optional headers stay `None`;
+        // required headers are coerced directly (the raw `.get` is `str | None`,
+        // so the `<wire>` local carries that union and the coercion narrows it).
+        let mut result_args = vec![format!("body={body_expr}")];
+        for hp in &ep.response_headers {
+            let snake = to_snake_case(&hp.name);
+            // Response-header optionality is `Option<T>` ONLY (a `= default` is
+            // meaningless for a response header), matching the envelope field.
+            let is_optional = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+            let inner_ty = unwrap_option(&hp.ty);
+            self.client_out.push_str(&format!(
+                "        {snake}_raw = response.headers.get(\"{}\")\n",
+                hp.wire_name
+            ));
+            // `str` headers pass through untouched; other scalar types are parsed
+            // from the wire string. `int`/`float`/`bool` get a converter.
+            self.client_out
+                .push_str(&header_read_coercion(&inner_ty, &snake, is_optional));
+            result_args.push(format!("{snake}={snake}"));
+        }
+        let ret = format_call(
+            "        ",
+            &format!("return {response_type}"),
+            &result_args,
+            "",
+        );
+        self.client_out.push_str(&ret);
     }
 
     // ── handlers.py emission ────────────────────────────────────────
@@ -466,6 +615,10 @@ impl<'a> PyGenerator<'a> {
             if let Some(ref resp) = ep.response {
                 collect_python_imports(resp, &mut imports);
             }
+            // Endpoints with response headers return the typed envelope.
+            if !ep.response_headers.is_empty() {
+                imports.insert(format!("{}Result", capitalize(&ep.name)));
+            }
         }
         if !imports.is_empty() {
             let joined: Vec<_> = imports.into_iter().collect();
@@ -478,11 +631,14 @@ impl<'a> PyGenerator<'a> {
     /// Emits a single handler method signature.
     fn emit_handler_method(&mut self, ep: &EndpointInfo) {
         let fn_name = to_snake_case(&ep.name);
-        let response_type = ep
-            .response
-            .as_ref()
-            .map(type_to_python)
-            .unwrap_or_else(|| "None".to_string());
+        let response_type = if ep.response_headers.is_empty() {
+            ep.response
+                .as_ref()
+                .map(type_to_python)
+                .unwrap_or_else(|| "None".to_string())
+        } else {
+            format!("{}Result", capitalize(&ep.name))
+        };
 
         let mut params = vec!["self".to_string()];
         for pp in &ep.path_params {
@@ -492,7 +648,7 @@ impl<'a> PyGenerator<'a> {
             let body_type = format!("{}Body", capitalize(&ep.name));
             params.push(format!("body: {body_type}"));
         }
-        if !ep.query_params.is_empty() {
+        if !ep.query_params.is_empty() || !ep.headers.is_empty() {
             params.push("*".to_string());
             for qp in &ep.query_params {
                 let py_type = type_to_python(&qp.ty);
@@ -501,6 +657,19 @@ impl<'a> PyGenerator<'a> {
                     params.push(format!("{}: {} = None", to_snake_case(&qp.name), py_type));
                 } else {
                     params.push(format!("{}: {}", to_snake_case(&qp.name), py_type));
+                }
+            }
+            for hp in &ep.headers {
+                let py_type = type_to_python(&hp.ty);
+                // Mirrors query params: the handler only sees `= None` for an
+                // `Option<T>` header. A header with a literal default is resolved
+                // by the server (`Header(<default>, ...)`) before the handler is
+                // called, so it arrives as a plain required value here.
+                let is_option = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+                if is_option {
+                    params.push(format!("{}: {} = None", to_snake_case(&hp.name), py_type));
+                } else {
+                    params.push(format!("{}: {}", to_snake_case(&hp.name), py_type));
                 }
             }
         }
@@ -539,12 +708,32 @@ impl<'a> PyGenerator<'a> {
                 .iter()
                 .any(|qp| to_snake_case(&qp.name) != qp.name)
         });
+        // Request headers always bind via `Header(alias="<wire_name>")` — the
+        // exact HTTP header name (e.g. `Idempotency-Key`) is never a valid Python
+        // identifier — so any request header pulls in `Header`. Response headers
+        // are set on a `Response` param, so any of those pulls in `Response`.
+        let needs_header = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| !ep.headers.is_empty());
+        let needs_response = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| !ep.response_headers.is_empty());
         let mut names = vec!["APIRouter"];
+        if needs_header {
+            names.push("Header");
+        }
         if needs_http_exception {
             names.push("HTTPException");
         }
         if needs_query {
             names.push("Query");
+        }
+        if needs_response {
+            names.push("Response");
         }
         self.server_out
             .push_str(&format!("from fastapi import {}\n\n", names.join(", ")));
@@ -557,6 +746,8 @@ impl<'a> PyGenerator<'a> {
             if let Some(ref resp) = ep.response {
                 collect_python_imports(resp, &mut model_imports);
             }
+            // The route returns `result.body`, so the envelope type itself is not
+            // imported; only the body's component types (above) are referenced.
         }
         self.server_out.push_str("from .handlers import Handlers\n");
         if !model_imports.is_empty() {
@@ -640,6 +831,42 @@ impl<'a> PyGenerator<'a> {
                 required.push(format!("{snake}: {py_type}"));
             }
         }
+        // Request headers bind via FastAPI `Header(default, alias="<wire_name>")`.
+        // The wire name (e.g. `Idempotency-Key`) is never a valid Python
+        // identifier, so headers ALWAYS need the alias — there is no plain form.
+        // `Header(...)` is a syntactic default, so every header lands in
+        // `defaulted` (after the non-defaulted path/body/response params).
+        for hp in &ep.headers {
+            let py_type = type_to_python(&hp.ty);
+            let snake = to_snake_case(&hp.name);
+            let is_optional =
+                hp.has_default || matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+            if is_optional {
+                let default = hp
+                    .default_value
+                    .as_ref()
+                    .map(default_value_to_python)
+                    .unwrap_or_else(|| "None".to_string());
+                defaulted.push(format!(
+                    "{snake}: {py_type} = Header({default}, alias=\"{}\")",
+                    hp.wire_name
+                ));
+            } else {
+                // Required-but-aliased: `Header(alias=...)` (no value sentinel) is
+                // required regardless of position, mirroring the required `Query`
+                // alias form above.
+                defaulted.push(format!(
+                    "{snake}: {py_type} = Header(alias=\"{}\")",
+                    hp.wire_name
+                ));
+            }
+        }
+        // A `response: Response` param lets the route set response headers; it
+        // has no default, so it sorts with the other required params.
+        let has_response_headers = !ep.response_headers.is_empty();
+        if has_response_headers {
+            required.push("response: Response".to_string());
+        }
         let params: Vec<String> = required.into_iter().chain(defaulted).collect();
 
         let sig = format_def_signature(
@@ -676,14 +903,59 @@ impl<'a> PyGenerator<'a> {
             let snake = to_snake_case(&qp.name);
             handler_args.push(format!("{snake}={snake}"));
         }
+        for hp in &ep.headers {
+            let snake = to_snake_case(&hp.name);
+            handler_args.push(format!("{snake}={snake}"));
+        }
 
-        let prefix = if ep.response.is_some() {
-            format!("return await handlers.{fn_name}")
+        if has_response_headers {
+            // The handler returns the typed envelope; capture it, copy each
+            // response header onto the FastAPI `Response` (string-coerced, guarded
+            // for optional), then return the bare body for serialization.
+            let call = format_call(
+                indent,
+                &format!("result = await handlers.{fn_name}"),
+                &handler_args,
+                "",
+            );
+            self.server_out.push_str(&call);
+            for hp in &ep.response_headers {
+                let snake = to_snake_case(&hp.name);
+                // Response-header optionality is `Option<T>` ONLY (a `= default`
+                // is meaningless for a response header), matching the envelope.
+                let is_optional = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+                let inner = unwrap_option(&hp.ty);
+                // Stringify for the wire. `str` passes through; `bool` is emitted
+                // as lowercase `true`/`false` so it round-trips with the client's
+                // `== "true"` read (Python's `str(True)` would yield "True").
+                let value = match &inner {
+                    Type::String => format!("result.{snake}"),
+                    Type::Bool => format!("\"true\" if result.{snake} else \"false\""),
+                    _ => format!("str(result.{snake})"),
+                };
+                if is_optional {
+                    self.server_out.push_str(&format!(
+                        "{indent}if result.{snake} is not None:\n{indent}    response.headers[\"{}\"] = {value}\n",
+                        hp.wire_name
+                    ));
+                } else {
+                    self.server_out.push_str(&format!(
+                        "{indent}response.headers[\"{}\"] = {value}\n",
+                        hp.wire_name
+                    ));
+                }
+            }
+            self.server_out
+                .push_str(&format!("{indent}return result.body\n"));
         } else {
-            format!("await handlers.{fn_name}")
-        };
-        let call = format_call(indent, &prefix, &handler_args, "");
-        self.server_out.push_str(&call);
+            let prefix = if ep.response.is_some() {
+                format!("return await handlers.{fn_name}")
+            } else {
+                format!("await handlers.{fn_name}")
+            };
+            let call = format_call(indent, &prefix, &handler_args, "");
+            self.server_out.push_str(&call);
+        }
 
         // Error mapping
         if has_errors {
@@ -707,6 +979,64 @@ impl<'a> PyGenerator<'a> {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
+
+/// Strips a single `Option<T>` wrapper, returning the inner type; non-option
+/// types are returned unchanged. Used to find the scalar type carried by a
+/// response header so the client can coerce the wire string to it.
+fn unwrap_option(ty: &Type) -> Type {
+    match ty {
+        Type::Generic(name, args) if name == "Option" && args.len() == 1 => args[0].clone(),
+        other => other.clone(),
+    }
+}
+
+/// Emits the client-side coercion of a single response header from its raw
+/// `str | None` wire read (`<snake>_raw`) into the typed local `<snake>` the
+/// envelope expects.
+///
+/// `inner_ty` is the header type with any `Option<…>` stripped. Optional headers
+/// stay `None` when absent; required headers coerce directly, fabricating the
+/// type's zero value only to satisfy the type checker (a required response header
+/// is contractually always present on the wire).
+fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> String {
+    let raw = format!("{snake}_raw");
+    let rhs = if is_optional {
+        // None/empty reads as `None`; a present value is parsed to the inner
+        // scalar via a truthiness ternary (`is not None` would be longer).
+        match inner_ty {
+            Type::Int => format!("int({raw}) if {raw} else None"),
+            Type::Float => format!("float({raw}) if {raw} else None"),
+            Type::Bool => format!("({raw} == \"true\") if {raw} else None"),
+            // `str` (and any unmodeled scalar) passes through untouched.
+            _ => raw.clone(),
+        }
+    } else {
+        // A required response header is contractually present; the `or <zero>`
+        // fallback only narrows the `str | None` read to a non-None value for the
+        // type checker.
+        match inner_ty {
+            Type::Int => format!("int({raw} or 0)"),
+            Type::Float => format!("float({raw} or 0)"),
+            Type::Bool => format!("{raw} == \"true\""),
+            _ => format!("{raw} or \"\""),
+        }
+    };
+    emit_py_assignment("        ", snake, &rhs)
+}
+
+/// Renders a single `lhs = rhs` assignment, wrapping the RHS in parentheses one
+/// indent level deeper when the one-line form would exceed [`LINE_LENGTH`] — the
+/// layout black produces for an over-long assignment. Keeps generated coercions
+/// (whose `lhs`/`rhs` both embed the header's snake_case name, so a long name can
+/// push past 88 columns) formatter-clean. Returns the line(s) with a trailing
+/// newline.
+fn emit_py_assignment(indent: &str, lhs: &str, rhs: &str) -> String {
+    let one_line = format!("{indent}{lhs} = {rhs}");
+    if one_line.len() <= LINE_LENGTH {
+        return format!("{one_line}\n");
+    }
+    format!("{indent}{lhs} = (\n{indent}    {rhs}\n{indent})\n")
+}
 
 /// Renders `text` as one or more Python `#` comments, each prefixed with
 /// `indent`. A multi-line doc comment (the lexer joins its lines with `\n`) gets
@@ -1084,6 +1414,228 @@ endpoint deleteUser: DELETE "/api/users/{id}" {
         );
         insta::assert_snapshot!("py_void_client", files.client);
         insta::assert_snapshot!("py_void_server", files.server);
+    }
+
+    /// A request header with an auto-derived wire name (`idempotencyKey →
+    /// Idempotency-Key`) must: appear as a snake_case keyword-only client arg,
+    /// be sent on a `headers` dict keyed by the EXACT wire name, bind on the
+    /// server via `Header(alias="<wire_name>")`, and thread into the handler.
+    #[test]
+    fn request_header_auto_wire_name() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    headers { String idempotencyKey }
+    response User
+}
+"#,
+        );
+        insta::assert_snapshot!("py_req_header_client", files.client);
+        insta::assert_snapshot!("py_req_header_handler", files.handlers);
+        insta::assert_snapshot!("py_req_header_server", files.server);
+        // Client sends the exact wire name; server aliases to it.
+        assert!(
+            files
+                .client
+                .contains("headers[\"Idempotency-Key\"] = idempotency_key"),
+            "client must key the header dict on the wire name:\n{}",
+            files.client
+        );
+        assert!(
+            files.server.contains("Header(alias=\"Idempotency-Key\")"),
+            "server must alias the Header param to the wire name:\n{}",
+            files.server
+        );
+    }
+
+    /// An explicit `as "Exact-Wire-Name"` override pins the wire name verbatim,
+    /// overriding the auto Title-Kebab transform on both client and server.
+    #[test]
+    fn request_header_as_override() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    headers { String token as "X-Auth" }
+    response User
+}
+"#,
+        );
+        assert!(
+            files.client.contains("headers[\"X-Auth\"] = token"),
+            "client must use the override wire name:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .server
+                .contains("token: str = Header(alias=\"X-Auth\")"),
+            "server must alias to the override wire name:\n{}",
+            files.server
+        );
+    }
+
+    /// An optional request header renders `T | None = Header(None, alias=...)`
+    /// on the server, a defaulted keyword arg on the client, and is only added
+    /// to the wire dict when present.
+    #[test]
+    fn optional_request_header() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    headers { Option<String> traceId }
+    response User
+}
+"#,
+        );
+        assert!(
+            files
+                .server
+                .contains("trace_id: str | None = Header(None, alias=\"Trace-Id\")"),
+            "optional header must render Header(None, alias=...):\n{}",
+            files.server
+        );
+        assert!(
+            files.client.contains("trace_id: str | None = None"),
+            "optional header must be a defaulted client kwarg:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("if trace_id is not None:\n            headers[\"Trace-Id\"] = trace_id"),
+            "optional header must be guarded on the wire:\n{}",
+            files.client
+        );
+    }
+
+    /// A `Bool` request header must be serialized as lowercase `true`/`false` on
+    /// the wire — NOT Python's `str(True)` → `"True"`. This matches every other
+    /// path (Go `strconv.FormatBool`, TS `String(bool)`, and this generator's own
+    /// response-header set/read which use lowercase + `== "true"`), so a bool
+    /// header round-trips across languages. Regression guard for the capitalized
+    /// `str(...)` bug.
+    #[test]
+    fn bool_request_header_serializes_lowercase() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    headers { Bool debug }
+    response User
+}
+"#,
+        );
+        assert!(
+            files
+                .client
+                .contains("headers[\"Debug\"] = (\"true\" if debug else \"false\")"),
+            "bool header must serialize lowercase, not str(bool):\n{}",
+            files.client
+        );
+        assert!(
+            !files.client.contains("str(debug)"),
+            "bool header must not use str() (yields capitalized True/False):\n{}",
+            files.client
+        );
+    }
+
+    /// A request header with a literal default binds the default into both the
+    /// server `Header(<default>, alias=...)` and the client kwarg
+    /// (`max_stale: int = 60`). Per the documented "defaulted request headers"
+    /// gap, the client sends it unconditionally (no `Option<T>` guard).
+    #[test]
+    fn defaulted_request_header_binds_default() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    headers { Int maxStale = 60 }
+    response User
+}
+"#,
+        );
+        assert!(
+            files
+                .server
+                .contains("max_stale: int = Header(60, alias=\"Max-Stale\")"),
+            "server must bind the default into Header(...):\n{}",
+            files.server
+        );
+        assert!(
+            files.client.contains("max_stale: int = 60"),
+            "client must default the kwarg:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("headers[\"Max-Stale\"] = str(max_stale)"),
+            "client must send the defaulted header unconditionally:\n{}",
+            files.client
+        );
+    }
+
+    /// An endpoint with response headers returns a typed `<Endpoint>Result`
+    /// envelope: a pydantic model bundling `body` + each header (snake_case),
+    /// the handler returns it, the server sets headers on the `Response` and
+    /// returns `result.body`, and the client reads headers off the response.
+    #[test]
+    fn response_header_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }
+}
+"#,
+        );
+        insta::assert_snapshot!("py_resp_header_models", files.models);
+        insta::assert_snapshot!("py_resp_header_client", files.client);
+        insta::assert_snapshot!("py_resp_header_handler", files.handlers);
+        insta::assert_snapshot!("py_resp_header_server", files.server);
+        // Envelope shape.
+        assert!(
+            files.models.contains(
+                "class GetPostResult(BaseModel):\n    body: Post\n    ratelimit_remaining: int\n"
+            ),
+            "envelope model must bundle body + typed header:\n{}",
+            files.models
+        );
+        // Handler returns the envelope.
+        assert!(
+            files.handlers.contains("-> GetPostResult: ..."),
+            "handler must return the envelope:\n{}",
+            files.handlers
+        );
+        // Server sets the header off the result and returns the body.
+        assert!(
+            files.server.contains(
+                "response.headers[\"X-RateLimit-Remaining\"] = str(result.ratelimit_remaining)"
+            ),
+            "server must set the response header from the result:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("return result.body\n"),
+            "server must return the bare body:\n{}",
+            files.server
+        );
+        // Client reads the header into the envelope it returns.
+        assert!(
+            files.client.contains(
+                "ratelimit_remaining_raw = response.headers.get(\"X-RateLimit-Remaining\")"
+            ),
+            "client must read the response header off the wire:\n{}",
+            files.client
+        );
+        assert!(
+            files.client.contains("return GetPostResult("),
+            "client must return the typed envelope:\n{}",
+            files.client
+        );
     }
 
     /// A multi-line doc comment must have EVERY line prefixed with `#`, not just

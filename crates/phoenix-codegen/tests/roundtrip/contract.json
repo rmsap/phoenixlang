@@ -285,5 +285,104 @@
         "status_per_target": { "go": 400, "typescript": 400, "python": 422 }
       }
     }
+  },
+  {
+    "name": "getPostMetered_request_and_response_headers",
+    "endpoint": "getPostMetered",
+    "kind": "ok",
+    "_note": "Request headers reach the handler as args (asserted via expect_received, exactly like query/path params): authorization (auto wire name Authorization), requestId (override X-Request-Id), ifNoneMatch (optional, OMITTED here -> handler sees null), maxStale (a defaulted header; the generated client always sends it as a value, so the driver supplies the default 60 explicitly — see the 'defaulted request headers' note in README). Response is a typed envelope: body + response headers (ratelimitRemaining via X-RateLimit-Remaining, etag optional). returns_headers are the values the stub sets; ok_headers are what the client must read back off the response.",
+    "call": {
+      "path_params": { "id": "77" },
+      "headers": {
+        "authorization": "Bearer tok123",
+        "requestId": "req-abc",
+        "maxStale": 60
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "77",
+        "authorization": "Bearer tok123",
+        "requestId": "req-abc",
+        "ifNoneMatch": null,
+        "maxStale": 60
+      },
+      "returns": {
+        "id": 77,
+        "title": "Metered Post",
+        "body": "body text",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Published",
+        "tags": ["m"]
+      },
+      "returns_headers": {
+        "ratelimitRemaining": 42,
+        "etag": "v7"
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "id": 77,
+        "title": "Metered Post",
+        "body": "body text",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Published",
+        "tags": ["m"]
+      },
+      "ok_headers": {
+        "ratelimitRemaining": 42,
+        "etag": "v7"
+      }
+    }
+  },
+  {
+    "name": "getPostMetered_optional_request_header_present",
+    "endpoint": "getPostMetered",
+    "kind": "ok",
+    "_note": "Optional request header ifNoneMatch IS supplied this time, and maxStale is explicitly sent (non-default), proving optional + defaulted request headers round-trip. Response etag is OMITTED by the stub -> client reads it back as null/absent.",
+    "call": {
+      "path_params": { "id": "88" },
+      "headers": {
+        "authorization": "Bearer tok456",
+        "requestId": "req-def",
+        "ifNoneMatch": "etag-xyz",
+        "maxStale": 5
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "88",
+        "authorization": "Bearer tok456",
+        "requestId": "req-def",
+        "ifNoneMatch": "etag-xyz",
+        "maxStale": 5
+      },
+      "returns": {
+        "id": 88,
+        "title": "Another",
+        "body": "more",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Draft",
+        "tags": []
+      },
+      "returns_headers": {
+        "ratelimitRemaining": 99,
+        "etag": null
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "id": 88,
+        "title": "Another",
+        "body": "more",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Draft",
+        "tags": []
+      },
+      "ok_headers": {
+        "ratelimitRemaining": 99,
+        "etag": null
+      }
+    }
   }
 ]

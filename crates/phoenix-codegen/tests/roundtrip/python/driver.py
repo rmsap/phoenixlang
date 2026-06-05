@@ -166,6 +166,39 @@ class Stub:
         self._maybe_raise()
         return m.Author(**self._returns())
 
+    async def get_post_metered(
+        self,
+        id: str,
+        *,
+        authorization: str,
+        request_id: str,
+        if_none_match: str | None = None,
+        max_stale: int,
+    ) -> m.GetPostMeteredResult:
+        # Request headers reach the handler as ordinary keyword args, asserted
+        # via expect_received exactly like path/query params. The contract keys
+        # are camelCase (authorization, requestId, ifNoneMatch, maxStale); record
+        # them under those names so the existing snake-agnostic comparison lines
+        # up — _values_equal compares the contract's camelCase keys against the
+        # keys recorded here, so we record using the SAME camelCase the contract
+        # uses (requestId/ifNoneMatch/maxStale) rather than the Python snake_case
+        # param names.
+        self.hit = True
+        self.received = {
+            "id": id,
+            "authorization": authorization,
+            "requestId": request_id,
+            "ifNoneMatch": if_none_match,
+            "maxStale": max_stale,
+        }
+        self._maybe_raise()
+        returns_headers = self.case["handler"].get("returns_headers", {})
+        return m.GetPostMeteredResult(
+            body=m.Post(**self._returns()),
+            ratelimit_remaining=returns_headers["ratelimitRemaining"],
+            etag=returns_headers.get("etag"),
+        )
+
     # Unused endpoints — present to satisfy the Protocol; loud if ever routed.
     async def update_post(self, id: str, body: m.UpdatePostBody) -> m.Post:
         raise AssertionError("unexpected call to update_post")
@@ -255,6 +288,20 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
             call["path_params"]["id"], body
         )
 
+    if endpoint == "getPostMetered":
+        headers = call.get("headers", {})
+        kwargs: dict[str, Any] = {
+            "authorization": headers["authorization"],
+            "request_id": headers["requestId"],
+            # maxStale is a defaulted request header; both cases supply it.
+            "max_stale": headers["maxStale"],
+        }
+        # ifNoneMatch is optional — pass it only when present (else the client's
+        # `| None = None` default applies and the header is omitted on the wire).
+        if "ifNoneMatch" in headers and headers["ifNoneMatch"] is not None:
+            kwargs["if_none_match"] = headers["ifNoneMatch"]
+        return await client.get_post_metered(call["path_params"]["id"], **kwargs)
+
     raise DriverError(f"driver has no invoke mapping for endpoint {endpoint!r}")
 
 
@@ -340,6 +387,30 @@ def assert_ok(case: dict[str, Any], result: Any) -> None:
         )
 
 
+def assert_ok_headers(case: dict[str, Any], result: Any) -> None:
+    """Compare the response-header fields the client read off the typed envelope
+    against expect_client.ok_headers. The contract uses camelCase header keys
+    (ratelimitRemaining, etag); the generated Python envelope exposes snake_case
+    attributes (ratelimit_remaining, etag). ratelimitRemaining is a required int
+    compared numerically; etag is an optional string that must equal the expected
+    value or be None when the contract value is JSON null."""
+    want = case["expect_client"].get("ok_headers")
+    if not want:
+        return
+    for key, expected in want.items():
+        if key == "ratelimitRemaining":
+            got = result.ratelimit_remaining
+        elif key == "etag":
+            got = result.etag
+        else:
+            raise DriverError(f"[{case['name']}] unknown ok_header {key!r}")
+        if not _values_equal(expected, got):
+            raise DriverError(
+                f"[{case['name']}] ok_header {key!r}: got {got!r}, "
+                f"want {expected!r}"
+            )
+
+
 def assert_error_status(case: dict[str, Any], err: Exception | None) -> None:
     if err is None:
         raise DriverError(f"[{case['name']}] expected an error, got success")
@@ -401,7 +472,14 @@ async def run_case(case: dict[str, Any]) -> None:
             raise DriverError(
                 f"[{case['name']}] handler was never called for ok case"
             )
-        assert_ok(case, result)
+        # Header endpoints return a typed envelope (body + response headers);
+        # compare the body against expect_client.ok and the response headers
+        # against expect_client.ok_headers separately.
+        if "ok_headers" in case["expect_client"]:
+            assert_ok(case, result.body)
+            assert_ok_headers(case, result)
+        else:
+            assert_ok(case, result)
     elif kind == "error":
         if not stub.hit:
             raise DriverError(

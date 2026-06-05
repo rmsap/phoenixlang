@@ -136,6 +136,28 @@ fn build_operation(ep: &EndpointInfo) -> Value {
         }));
     }
 
+    // Request headers: emit one `in: header` parameter per declared request
+    // header, keyed by its exact wire name. Optionality mirrors query params
+    // (an `Option<T>` type or a default makes the header optional).
+    for hp in &ep.headers {
+        let is_option = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+        let required = !hp.has_default && !is_option;
+        let mut schema = type_to_json_schema(&hp.ty);
+
+        if let Some(ref default) = hp.default_value
+            && let Some(schema_map) = schema.as_object_mut()
+        {
+            schema_map.insert("default".to_string(), default_to_json(default));
+        }
+
+        parameters.push(json!({
+            "name": hp.wire_name,
+            "in": "header",
+            "required": required,
+            "schema": schema
+        }));
+    }
+
     if !parameters.is_empty() {
         op.insert("parameters".to_string(), Value::Array(parameters));
     }
@@ -161,19 +183,49 @@ fn build_operation(ep: &EndpointInfo) -> Value {
     // Responses
     let mut responses: Map<String, Value> = Map::new();
 
-    if let Some(ref resp_type) = ep.response {
-        responses.insert(
-            "200".to_string(),
-            json!({
-                "description": "Successful response",
-                "content": {
-                    "application/json": {
-                        "schema": type_to_json_schema(resp_type)
-                    }
-                }
-            }),
-        );
+    // Response headers: a map of wire name → header object, attached to the
+    // 200 success response. The grammar only allows response headers via an
+    // inline `response <Type> headers { ... }` block, so they can never occur
+    // without a response body — the bodyless 204 branch below never sees them.
+    // Only present when the endpoint declares response headers.
+    let response_headers = if ep.response_headers.is_empty() {
+        None
     } else {
+        let mut headers_map: Map<String, Value> = Map::new();
+        for hp in &ep.response_headers {
+            // Mirror the request-header `required` computation. Response headers
+            // carry no default (sema rejects one), so optionality is `Option<T>`
+            // only: a bare type is a header the server always sets (required),
+            // an `Option<T>` is one it may omit.
+            let is_option = matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
+            headers_map.insert(
+                hp.wire_name.clone(),
+                json!({
+                    "required": !is_option,
+                    "schema": type_to_json_schema(&hp.ty)
+                }),
+            );
+        }
+        Some(Value::Object(headers_map))
+    };
+
+    if let Some(ref resp_type) = ep.response {
+        let mut success = json!({
+            "description": "Successful response",
+            "content": {
+                "application/json": {
+                    "schema": type_to_json_schema(resp_type)
+                }
+            }
+        });
+        if let Some(ref headers) = response_headers
+            && let Some(obj) = success.as_object_mut()
+        {
+            obj.insert("headers".to_string(), headers.clone());
+        }
+        responses.insert("200".to_string(), success);
+    } else {
+        // No body → 204, and (per the grammar) no response headers to attach.
         responses.insert("204".to_string(), json!({ "description": "No content" }));
     }
 
@@ -686,5 +738,112 @@ endpoint getUser: GET "/api/users/{id}" {
 "#,
         );
         insta::assert_snapshot!("openapi_path_params_errors", spec);
+    }
+
+    // ── header tests ───────────────────────────────────────────────
+
+    #[test]
+    fn endpoint_with_request_header() {
+        // A required request header emits an `in: header` parameter keyed by its
+        // auto-derived wire name (idempotencyKey → Idempotency-Key) with
+        // required: true.
+        let spec = generate_from_source(
+            r#"
+struct Order { Int id }
+endpoint createOrder: POST "/api/orders" {
+    headers {
+        String idempotencyKey
+    }
+    response Order
+}
+"#,
+        );
+        insta::assert_snapshot!("openapi_request_header", spec);
+    }
+
+    #[test]
+    fn endpoint_with_request_header_as_override() {
+        // An explicit `as "..."` override pins the exact wire name verbatim.
+        let spec = generate_from_source(
+            r#"
+struct Order { Int id }
+endpoint createOrder: POST "/api/orders" {
+    headers {
+        String rateLimit as "X-RateLimit-Limit"
+    }
+    response Order
+}
+"#,
+        );
+        insta::assert_snapshot!("openapi_request_header_as_override", spec);
+    }
+
+    #[test]
+    fn endpoint_with_optional_and_required_request_headers() {
+        // Optionality mirrors query params: Option<T> or a default → optional
+        // (required: false); a bare required type → required: true.
+        let spec = generate_from_source(
+            r#"
+struct Order { Int id }
+endpoint createOrder: POST "/api/orders" {
+    headers {
+        String idempotencyKey
+        Option<String> traceId
+    }
+    response Order
+}
+"#,
+        );
+        insta::assert_snapshot!("openapi_request_headers_optional_required", spec);
+    }
+
+    #[test]
+    fn endpoint_with_response_header() {
+        // A response header attaches a `headers` map (keyed by wire name) to the
+        // success (200) response object.
+        let spec = generate_from_source(
+            r#"
+struct Post { Int id }
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }
+}
+"#,
+        );
+        insta::assert_snapshot!("openapi_response_header", spec);
+    }
+
+    #[test]
+    fn endpoint_with_defaulted_request_header() {
+        // A request header with a literal default carries `required: false` and a
+        // `default` baked into its schema (the `default_to_json` insertion path).
+        let spec = generate_from_source(
+            r#"
+struct Order { Int id }
+endpoint createOrder: POST "/api/orders" {
+    headers { Int maxStale = 60 }
+    response Order
+}
+"#,
+        );
+        let parsed: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+        let params = parsed["paths"]["/api/orders"]["post"]["parameters"]
+            .as_array()
+            .expect("operation has parameters");
+        let header = params
+            .iter()
+            .find(|p| p["in"] == json!("header") && p["name"] == json!("Max-Stale"))
+            .expect("Max-Stale header parameter present");
+        assert_eq!(
+            header["required"],
+            json!(false),
+            "a defaulted header is not required:\n{}",
+            spec
+        );
+        assert_eq!(
+            header["schema"]["default"],
+            json!(60),
+            "the default must be baked into the schema:\n{}",
+            spec
+        );
     }
 }

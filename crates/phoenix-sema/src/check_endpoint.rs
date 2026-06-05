@@ -4,11 +4,13 @@
 //! correct.  Produces [`EndpointInfo`] with all types resolved.
 
 use crate::checker::{
-    Checker, DefaultValue, DerivedField, EndpointInfo, QueryParamInfo, ResolvedDerivedType,
+    Checker, DefaultValue, DerivedField, EndpointInfo, HeaderParamInfo, QueryParamInfo,
+    ResolvedDerivedType, header_wire_name,
 };
 use crate::types::Type;
 use phoenix_parser::ast::{
-    DerivedType, EndpointDecl, Expr, HttpMethod, Literal, LiteralKind, TypeExpr, TypeModifier,
+    DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, TypeExpr,
+    TypeModifier,
 };
 
 impl Checker {
@@ -25,6 +27,11 @@ impl Checker {
     /// - Error status codes are in the 400–599 range
     /// - Query parameter types resolve successfully
     /// - Query parameter default values match their declared types
+    /// - Request-header default values match their declared types
+    /// - Response headers do not declare a default value
+    /// - Request-header local names do not collide with path/query params or each other
+    /// - Response-header local names do not collide with each other or the `body` field
+    /// - No two headers in the same direction resolve to the same wire name
     pub(crate) fn check_endpoint(&mut self, ep: &EndpointDecl) {
         // Check for duplicate endpoint names
         if self.endpoints.iter().any(|e| e.name == ep.name) {
@@ -125,17 +132,185 @@ impl Checker {
             })
             .collect();
 
+        // Resolve request and response headers. The per-header rules differ
+        // slightly: request headers may carry a default; response headers may
+        // not (they are set by the handler, never received — see `resolve_header`).
+        let headers: Vec<HeaderParamInfo> = ep
+            .headers
+            .iter()
+            .map(|h| self.resolve_header(ep, h, false))
+            .collect();
+        let response_headers: Vec<HeaderParamInfo> = ep
+            .response_headers
+            .iter()
+            .map(|h| self.resolve_header(ep, h, true))
+            .collect();
+
+        // Request headers share the generated parameter scope with path and
+        // query params, so a duplicate local name would emit two parameters of
+        // the same name (a compile error in the generated Go/TS/Python). Check
+        // each request header against the path/query names and the other headers.
+        let mut input_names: std::collections::HashSet<&str> =
+            path_params.iter().map(String::as_str).collect();
+        for qp in &ep.query_params {
+            input_names.insert(qp.name.as_str());
+        }
+        for h in &ep.headers {
+            if !input_names.insert(h.name.as_str()) {
+                self.error(
+                    format!(
+                        "endpoint `{}`: request header `{}` collides with another endpoint input (path param, query param, or header) of the same name",
+                        ep.name, h.name
+                    ),
+                    h.span,
+                );
+            }
+        }
+
+        // Response header local names become fields on the generated
+        // `<Endpoint>Result` envelope (alongside the envelope's `body` field), so
+        // they must be distinct from each other. (They cannot collide with `body`
+        // itself: `body` is a reserved keyword and so cannot be a header name.)
+        let mut response_field_names: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for h in &ep.response_headers {
+            if !response_field_names.insert(h.name.as_str()) {
+                self.error(
+                    format!(
+                        "endpoint `{}`: response header `{}` is declared more than once",
+                        ep.name, h.name
+                    ),
+                    h.span,
+                );
+            }
+        }
+
+        // Two headers that resolve to the same on-the-wire name (auto-derived or
+        // explicit) would silently overwrite each other on send and read the same
+        // value on parse. HTTP header names are case-insensitive, so collisions
+        // are checked case-insensitively. Request and response headers are
+        // different directions and share no namespace, so each is checked alone.
+        self.check_header_wire_name_uniqueness(&ep.name, &headers, &ep.headers, "request");
+        self.check_header_wire_name_uniqueness(
+            &ep.name,
+            &response_headers,
+            &ep.response_headers,
+            "response",
+        );
+
         self.endpoints.push(EndpointInfo {
             name: ep.name.clone(),
             method: ep.method,
             path: ep.path.clone(),
             path_params,
             query_params,
+            headers,
             body,
             response,
+            response_headers,
             errors,
             doc_comment: ep.doc_comment.clone(),
         });
+    }
+
+    /// Resolves a single endpoint header into a [`HeaderParamInfo`].
+    ///
+    /// Computes the on-the-wire HTTP header name: the explicit `as "..."`
+    /// override when present, otherwise the Title-Case-Kebab auto-transform of
+    /// the identifier (see [`header_wire_name`]).
+    ///
+    /// `is_response` selects the default-value rule. A **request** header may
+    /// carry a default (applied when the request omits it); its value is
+    /// type-checked against the declared type, mirroring query-param checking. A
+    /// **response** header is *set by the handler*, never received, so a default
+    /// is meaningless — it is rejected with a diagnostic and dropped, rather than
+    /// silently ignored.
+    fn resolve_header(
+        &mut self,
+        ep: &EndpointDecl,
+        h: &HeaderParam,
+        is_response: bool,
+    ) -> HeaderParamInfo {
+        let ty = self.resolve_type_expr(&h.type_annotation);
+
+        let wire_name = h
+            .wire_name
+            .clone()
+            .unwrap_or_else(|| header_wire_name(&h.name));
+
+        if is_response {
+            if h.default_value.is_some() {
+                self.error(
+                    format!(
+                        "endpoint `{}`: response header `{}` cannot have a default value (response headers are set by the handler, never received)",
+                        ep.name, h.name
+                    ),
+                    h.span,
+                );
+            }
+            return HeaderParamInfo {
+                name: h.name.clone(),
+                wire_name,
+                ty,
+                has_default: false,
+                default_value: None,
+            };
+        }
+
+        let default_value = h.default_value.as_ref().and_then(extract_default_value);
+
+        if let Some(ref default) = default_value {
+            let default_matches = matches!(
+                (default, &ty),
+                (DefaultValue::Int(_), Type::Int)
+                    | (DefaultValue::Float(_), Type::Float)
+                    | (DefaultValue::String(_), Type::String)
+                    | (DefaultValue::Bool(_), Type::Bool)
+            );
+            if !default_matches && !ty.is_error() {
+                self.error(
+                    format!(
+                        "endpoint `{}`: default value for header `{}` does not match type `{}`",
+                        ep.name, h.name, ty
+                    ),
+                    h.span,
+                );
+            }
+        }
+
+        HeaderParamInfo {
+            name: h.name.clone(),
+            wire_name,
+            ty,
+            has_default: h.default_value.is_some(),
+            default_value,
+        }
+    }
+
+    /// Reports a diagnostic when two headers in the same direction resolve to the
+    /// same on-the-wire name. `resolved` and `ast` are the parallel resolved/AST
+    /// header lists (same order, 1:1); the AST entry supplies the span. HTTP
+    /// header names are case-insensitive, so the comparison is too. `direction`
+    /// is `"request"` or `"response"` for the message.
+    fn check_header_wire_name_uniqueness(
+        &mut self,
+        ep_name: &str,
+        resolved: &[HeaderParamInfo],
+        ast: &[HeaderParam],
+        direction: &str,
+    ) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (info, h) in resolved.iter().zip(ast.iter()) {
+            if !seen.insert(info.wire_name.to_ascii_lowercase()) {
+                self.error(
+                    format!(
+                        "endpoint `{}`: {} header wire name `{}` is declared by more than one header",
+                        ep_name, direction, info.wire_name
+                    ),
+                    h.span,
+                );
+            }
+        }
     }
 
     /// Resolves a derived type (base type + omit/pick/partial modifiers) into
@@ -352,6 +527,19 @@ mod tests {
     fn assert_no_errors(source: &str) {
         let errors = check_source(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    }
+
+    /// Lex/parse/check `source` and return the first endpoint's resolved info.
+    fn first_endpoint(source: &str) -> crate::checker::EndpointInfo {
+        let tokens = tokenize(source, SourceId(0));
+        let (program, parse_errors) = parser::parse(&tokens);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let result = check(&program);
+        result
+            .endpoints
+            .into_iter()
+            .next()
+            .expect("expected at least one endpoint")
     }
 
     fn assert_has_error(source: &str, expected_fragment: &str) {
@@ -710,6 +898,247 @@ mod tests {
                 response User
             }
             "#,
+        );
+    }
+
+    #[test]
+    fn header_wire_name_auto_transform() {
+        // Auto-derived wire names: camelCase identifier -> Title-Case-Kebab.
+        let ep = first_endpoint(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    String authorization
+                    String idempotencyKey
+                    Option<String> xRequestId
+                }
+                response User
+            }
+            "#,
+        );
+        let wire: Vec<(&str, &str)> = ep
+            .headers
+            .iter()
+            .map(|h| (h.name.as_str(), h.wire_name.as_str()))
+            .collect();
+        assert_eq!(
+            wire,
+            vec![
+                ("authorization", "Authorization"),
+                ("idempotencyKey", "Idempotency-Key"),
+                ("xRequestId", "X-Request-Id"),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_wire_name_explicit_override() {
+        // An `as "..."` override is taken verbatim, bypassing the transform.
+        let ep = first_endpoint(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    String rateLimit as "X-RateLimit-Limit"
+                    String etag as "ETag"
+                }
+                response User
+            }
+            "#,
+        );
+        let wire: Vec<(&str, &str)> = ep
+            .headers
+            .iter()
+            .map(|h| (h.name.as_str(), h.wire_name.as_str()))
+            .collect();
+        assert_eq!(
+            wire,
+            vec![("rateLimit", "X-RateLimit-Limit"), ("etag", "ETag")]
+        );
+    }
+
+    #[test]
+    fn response_headers_resolved() {
+        let ep = first_endpoint(
+            r#"
+            struct Post { Int id }
+            endpoint getPost: GET "/api/posts/{id}" {
+                response Post headers {
+                    Int ratelimitRemaining as "X-RateLimit-Remaining"
+                }
+            }
+            "#,
+        );
+        assert_eq!(ep.headers.len(), 0);
+        assert_eq!(ep.response_headers.len(), 1);
+        assert_eq!(ep.response_headers[0].name, "ratelimitRemaining");
+        assert_eq!(ep.response_headers[0].wire_name, "X-RateLimit-Remaining");
+    }
+
+    #[test]
+    fn header_default_type_mismatch() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    Int retries = "nope"
+                }
+                response User
+            }
+            "#,
+            "default value for header `retries` does not match type",
+        );
+    }
+
+    #[test]
+    fn response_header_default_rejected() {
+        // A response header is set by the handler, never received, so a `= default`
+        // is meaningless and rejected (not silently ignored).
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                response User headers {
+                    Int ratelimitRemaining = 100
+                }
+            }
+            "#,
+            "response header `ratelimitRemaining` cannot have a default value",
+        );
+    }
+
+    #[test]
+    fn request_header_wire_name_collision() {
+        // Two request headers resolving to the same wire name (here an auto-derived
+        // `X-Request-Id` and an explicit override of the same) would silently
+        // overwrite each other on the wire.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    String xRequestId
+                    String tracing as "X-Request-Id"
+                }
+                response User
+            }
+            "#,
+            "request header wire name `X-Request-Id` is declared by more than one header",
+        );
+    }
+
+    #[test]
+    fn request_header_wire_name_collision_case_insensitive() {
+        // HTTP header names are case-insensitive, so `X-Trace` and `x-trace`
+        // collide.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    String a as "X-Trace"
+                    String b as "x-trace"
+                }
+                response User
+            }
+            "#,
+            "is declared by more than one header",
+        );
+    }
+
+    #[test]
+    fn response_header_wire_name_collision() {
+        // The wire-name uniqueness check runs per direction; this exercises the
+        // RESPONSE branch with two distinct local names colliding on the same
+        // wire name (case-insensitively, since HTTP header names are). Two
+        // response headers resolving to the same wire name would overwrite each
+        // other on send and read the same value on parse.
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            endpoint getPost: GET "/api/posts/{id}" {
+                response Post headers {
+                    Int rateLimit as "X-Limit"
+                    Int ceiling as "x-limit"
+                }
+            }
+            "#,
+            // The diagnostic names the colliding (second) header's wire name verbatim.
+            "response header wire name `x-limit` is declared by more than one header",
+        );
+    }
+
+    #[test]
+    fn request_header_collides_with_path_param() {
+        // A request header local name that duplicates a path param would emit two
+        // generated parameters of the same name.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    String id as "X-Id"
+                }
+                response User
+            }
+            "#,
+            "request header `id` collides with another endpoint input",
+        );
+    }
+
+    #[test]
+    fn request_header_collides_with_query_param() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint listUsers: GET "/api/users" {
+                query {
+                    Option<String> trace
+                }
+                headers {
+                    String trace as "X-Trace"
+                }
+                response User
+            }
+            "#,
+            "request header `trace` collides with another endpoint input",
+        );
+    }
+
+    #[test]
+    fn request_header_duplicate_local_name() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    String token as "X-A"
+                    String token as "X-B"
+                }
+                response User
+            }
+            "#,
+            "request header `token` collides with another endpoint input",
+        );
+    }
+
+    #[test]
+    fn response_header_duplicate_local_name() {
+        // Two response headers with the same local name would emit two envelope
+        // fields of the same name.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                response User headers {
+                    Int rate as "X-A"
+                    Int rate as "X-B"
+                }
+            }
+            "#,
+            "response header `rate` is declared more than once",
         );
     }
 

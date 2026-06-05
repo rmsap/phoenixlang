@@ -251,6 +251,73 @@ pub(crate) fn emit_param_set(
     }
 }
 
+/// Emits a request header's `requestHeaders.set(...)` line for the client.
+///
+/// `target` is the `Headers` instance variable (`requestHeaders`); `local` is
+/// the camelCase field on the `headers` param the value is read from; `wire` is
+/// the exact HTTP header name. The value is stringified via `String(...)`.
+///
+/// A **required** header is set unconditionally (the `headers` param is
+/// non-nullable and the field is always present); emitting a `!== undefined`
+/// guard or `headers?.` chain there would trip eslint's
+/// `no-unnecessary-condition`. An **optional** header keeps the
+/// `if (… !== undefined)` guard, accessing via `headers?.` only when the
+/// `headers` param itself is nullable (every header optional) and a plain
+/// `headers.` otherwise. Matches Prettier's wrapping as the line lengthens.
+pub(crate) fn emit_header_set(
+    out: &mut String,
+    indent: &str,
+    target: &str,
+    local: &str,
+    wire: &str,
+    optional: bool,
+    headers_nullable: bool,
+) {
+    let arg0 = format!("\"{wire}\"");
+    let arg1 = format!("String(headers.{local})");
+
+    if !optional {
+        let one_line = format!("{indent}{target}.set({arg0}, {arg1});");
+        if one_line.len() <= PRINT_WIDTH {
+            out.push_str(&one_line);
+            out.push('\n');
+        } else {
+            out.push_str(&format!("{indent}{target}.set(\n"));
+            out.push_str(&format!("{indent}  {arg0},\n"));
+            out.push_str(&format!("{indent}  {arg1},\n"));
+            out.push_str(&format!("{indent});\n"));
+        }
+        return;
+    }
+
+    let access = if headers_nullable {
+        format!("headers?.{local}")
+    } else {
+        format!("headers.{local}")
+    };
+    let cond = format!("{access} !== undefined");
+
+    let one_line = format!("{indent}if ({cond}) {target}.set({arg0}, {arg1});");
+    if one_line.len() <= PRINT_WIDTH {
+        out.push_str(&one_line);
+        out.push('\n');
+        return;
+    }
+
+    out.push_str(&format!("{indent}if ({cond})\n"));
+    let stmt_indent = format!("{indent}  ");
+    let set_line = format!("{stmt_indent}{target}.set({arg0}, {arg1});");
+    if set_line.len() <= PRINT_WIDTH {
+        out.push_str(&set_line);
+        out.push('\n');
+    } else {
+        out.push_str(&format!("{stmt_indent}{target}.set(\n"));
+        out.push_str(&format!("{stmt_indent}  {arg0},\n"));
+        out.push_str(&format!("{stmt_indent}  {arg1},\n"));
+        out.push_str(&format!("{stmt_indent});\n"));
+    }
+}
+
 /// Emits `const response = await fetch(url, { ...init });`, matching Prettier's
 /// two layouts: the init object's braces break in place when the opening
 /// `fetch(url, {` line fits, otherwise the whole call breaks one argument per
@@ -342,9 +409,24 @@ pub(crate) fn format_signature(
     }
 
     // Break the parameter list, one parameter per line with a trailing comma.
+    // An `Object` param whose own inline line would overflow has its braces
+    // expanded in place (members one per line), matching how Prettier breaks a
+    // wide object-type parameter inside an already-broken parameter list.
     let mut out = format!("{head}(\n");
     for p in params {
-        out.push_str(&format!("{base_indent}  {},\n", p.inline()));
+        let inline_line = format!("{base_indent}  {},", p.inline());
+        match p {
+            Param::Object { prefix, fields } if inline_line.len() > PRINT_WIDTH => {
+                out.push_str(&format!("{base_indent}  {prefix}{{\n"));
+                for f in fields {
+                    out.push_str(&format!("{base_indent}    {f};\n"));
+                }
+                out.push_str(&format!("{base_indent}  }},\n"));
+            }
+            _ => {
+                out.push_str(&format!("{inline_line}\n"));
+            }
+        }
     }
     out.push_str(&format!("{base_indent}){tail}\n"));
     out

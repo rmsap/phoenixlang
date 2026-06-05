@@ -143,3 +143,26 @@ endpoint updateAuthorProfile: PATCH "/api/authors/{id}" {
         Unauthorized(401)
     }
 }
+
+// ── Headers (request + response) ──────────────────────────────
+
+/**
+ * Fetch a post with request + response headers.
+ * Exercises: an auto-derived wire name (`authorization` -> Authorization), an
+ * explicit `as` override (X-Request-Id), an optional request header, a request
+ * header with a default, and a response-header envelope (a required Int + an
+ * optional String response header, one of which uses an `as` override).
+ */
+endpoint getPostMetered: GET "/api/posts/{id}/metered" {
+    headers {
+        String authorization
+        String requestId as "X-Request-Id"
+        Option<String> ifNoneMatch
+        Int maxStale = 60
+    }
+    response Post headers {
+        Int ratelimitRemaining as "X-RateLimit-Remaining"
+        Option<String> etag
+    }
+    error { NotFound(404) }
+}

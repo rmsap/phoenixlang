@@ -1,12 +1,26 @@
 use crate::ast::{
     Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
-    FieldDecl, FunctionDecl, HttpMethod, ImplBlock, ImportDecl, ImportItem, ImportItems,
-    InlineTraitImpl, NamedType, Param, Program, QueryParam, SchemaDecl, SchemaTable, StructDecl,
-    TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
+    FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock, ImportDecl, ImportItem,
+    ImportItems, InlineTraitImpl, NamedType, Param, Program, QueryParam, SchemaDecl, SchemaTable,
+    StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
 };
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::{SourceId, Span};
 use phoenix_lexer::token::{Token, TokenKind};
+
+/// Strips the single surrounding double-quote pair from a string-literal token's
+/// raw text (e.g. `"X-Request-Id"` → `X-Request-Id`).
+///
+/// Uses `strip_prefix`/`strip_suffix` rather than `trim_matches('"')` so a value
+/// that legitimately ends in an escaped quote (`"say \""` → `say \"`) is not
+/// over-trimmed: `trim_matches` would greedily eat the trailing escaped quote
+/// too. Inner escape sequences are otherwise left intact (the lexer keeps them).
+fn strip_string_literal_quotes(text: &str) -> String {
+    text.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(text)
+        .to_string()
+}
 
 /// Returns a human-readable name for a [`TokenKind`], suitable for use in
 /// user-facing error messages.
@@ -45,6 +59,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Pick => "'pick'",
         TokenKind::Partial => "'partial'",
         TokenKind::Query => "'query'",
+        TokenKind::Headers => "'headers'",
         TokenKind::Where => "'where'",
         TokenKind::Schema => "'schema'",
         TokenKind::Get => "'GET'",
@@ -1100,16 +1115,20 @@ impl<'src> Parser<'src> {
         // Parse URL path
         let path_token = self.expect(TokenKind::StringLiteral)?;
         // Strip surrounding quotes from the string literal
-        let path = path_token.text.trim_matches('"').to_string();
+        let path = strip_string_literal_quotes(&path_token.text);
 
         self.expect(TokenKind::LBrace)?;
         self.skip_newlines();
 
         let mut query_params = Vec::new();
+        let mut headers = Vec::new();
+        let mut response_headers = Vec::new();
         let mut body = None;
         let mut response = None;
         let mut errors = Vec::new();
         let mut has_query = false;
+        let mut has_headers = false;
+        let mut has_response_headers = false;
         let mut has_body = false;
         let mut has_response = false;
         let mut has_error = false;
@@ -1125,6 +1144,13 @@ impl<'src> Parser<'src> {
                     has_query = true;
                     query_params = self.parse_query_block();
                 }
+                TokenKind::Headers => {
+                    if has_headers {
+                        self.error_at_current("duplicate `headers` section in endpoint");
+                    }
+                    has_headers = true;
+                    headers = self.parse_headers_block();
+                }
                 TokenKind::Body => {
                     if has_body {
                         self.error_at_current("duplicate `body` section in endpoint");
@@ -1139,7 +1165,38 @@ impl<'src> Parser<'src> {
                     has_response = true;
                     self.advance();
                     self.skip_newlines();
-                    response = self.parse_type_expr();
+                    // `response headers { ... }` with no response type: response
+                    // headers are bundled with the body into a typed envelope, so
+                    // they require a response type. Catch this here (before
+                    // `parse_type_expr` reports a generic "expected type name")
+                    // with a targeted message, and consume the block to recover
+                    // cleanly so its entries don't re-dispatch as a request
+                    // section.
+                    if self.peek().kind == TokenKind::Headers {
+                        self.error_at_current(
+                            "response headers require a response type (write `response <Type> headers { ... }`)",
+                        );
+                        let _ = self.parse_headers_block();
+                    } else {
+                        response = self.parse_type_expr();
+                        // Optional inline response-headers block: `response Type headers { ... }`.
+                        // The `headers` keyword must immediately follow the response type on
+                        // the SAME line to bind here. A `headers` block on a new line is the
+                        // standalone request section (handled by the top-level dispatch arm),
+                        // so we deliberately do NOT skip newlines before this check — that
+                        // keeps section ordering free: a request `headers` block placed after
+                        // `response` stays a request header instead of silently rebinding to
+                        // the response.
+                        if self.peek().kind == TokenKind::Headers {
+                            if has_response_headers {
+                                self.error_at_current(
+                                    "duplicate response `headers` section in endpoint",
+                                );
+                            }
+                            has_response_headers = true;
+                            response_headers = self.parse_headers_block();
+                        }
+                    }
                 }
                 TokenKind::ErrorKw => {
                     if has_error {
@@ -1149,7 +1206,9 @@ impl<'src> Parser<'src> {
                     errors = self.parse_error_block();
                 }
                 _ => {
-                    self.error_at_current("expected `query`, `body`, `response`, `error`, or `}`");
+                    self.error_at_current(
+                        "expected `query`, `headers`, `body`, `response`, `error`, or `}`",
+                    );
                     self.advance();
                 }
             }
@@ -1163,8 +1222,10 @@ impl<'src> Parser<'src> {
             method,
             path,
             query_params,
+            headers,
             body,
             response,
+            response_headers,
             errors,
             doc_comment,
             span: start.merge(end),
@@ -1368,6 +1429,81 @@ impl<'src> Parser<'src> {
                 params.push(QueryParam {
                     type_annotation: type_expr,
                     name: name_tok.text.clone(),
+                    default_value,
+                    span: pstart.merge(pend),
+                });
+            }
+            self.skip_newlines();
+        }
+        let _ = self.expect(TokenKind::RBrace);
+        params
+    }
+
+    /// Parses a `headers { ... }` block, used for both request and response
+    /// headers (the grammar is identical).
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// headers {
+    ///     String authorization
+    ///     String rateLimit as "X-RateLimit-Limit"
+    ///     String contentType as "Content-Type" = "application/json"
+    /// }
+    /// ```
+    ///
+    /// Each entry is `Type name [as "Wire-Name"] [= default]`. The `as "..."`
+    /// clause records an explicit wire-name override (quotes stripped); when
+    /// absent the wire name is auto-derived later in sema. The `= default`
+    /// clause is meaningful only for request headers but is accepted for both.
+    ///
+    /// Mirrors [`parse_query_block`](Self::parse_query_block); the leading
+    /// `headers` keyword is consumed here. Malformed entries are skipped after a
+    /// diagnostic, matching the query-block recovery strategy.
+    fn parse_headers_block(&mut self) -> Vec<HeaderParam> {
+        let mut params = Vec::new();
+        if self.expect(TokenKind::Headers).is_none() {
+            return params;
+        }
+        if self.expect(TokenKind::LBrace).is_none() {
+            return params;
+        }
+        self.skip_newlines();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            let pstart = self.peek().span;
+            if let Some(type_expr) = self.parse_type_expr()
+                && let Some(name_tok) = self.expect(TokenKind::Ident)
+            {
+                let name = name_tok.text.clone();
+                let name_span = name_tok.span;
+
+                // Optional explicit wire-name override: `as "Wire-Name"`.
+                let mut wire_name = None;
+                let mut wire_span = None;
+                if self.peek().kind == TokenKind::As {
+                    self.advance();
+                    if let Some(lit) = self.expect(TokenKind::StringLiteral) {
+                        wire_name = Some(strip_string_literal_quotes(&lit.text));
+                        wire_span = Some(lit.span);
+                    }
+                }
+
+                // Optional default value: `= <expr>`.
+                let default_value = if self.eat(TokenKind::Eq) {
+                    self.parse_expr()
+                } else {
+                    None
+                };
+
+                let pend = default_value
+                    .as_ref()
+                    .map(|e| e.span())
+                    .or(wire_span)
+                    .unwrap_or(name_span);
+                params.push(HeaderParam {
+                    type_annotation: type_expr,
+                    name,
+                    wire_name,
                     default_value,
                     span: pstart.merge(pend),
                 });
@@ -4124,6 +4260,233 @@ schema db {
             "should report duplicate error: {:?}",
             diagnostics
         );
+    }
+
+    // ── Header tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_endpoint_request_headers() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            headers {
+                String authorization
+                String idempotencyKey
+            }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.headers.len(), 2);
+                assert_eq!(ep.headers[0].name, "authorization");
+                assert!(ep.headers[0].wire_name.is_none());
+                assert!(ep.headers[0].default_value.is_none());
+                match &ep.headers[0].type_annotation {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "String"),
+                    other => panic!("expected Named(String), got {:?}", other),
+                }
+                assert_eq!(ep.headers[1].name, "idempotencyKey");
+                assert!(ep.headers[1].wire_name.is_none());
+                assert!(ep.response_headers.is_empty());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_header_wire_override() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            headers {
+                String rateLimit as "X-RateLimit-Limit"
+            }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.headers.len(), 1);
+                assert_eq!(ep.headers[0].name, "rateLimit");
+                assert_eq!(
+                    ep.headers[0].wire_name.as_deref(),
+                    Some("X-RateLimit-Limit")
+                );
+                assert!(ep.headers[0].default_value.is_none());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_header_override_and_default() {
+        let source = r#"endpoint createUser: POST "/api/users" {
+            headers {
+                String contentType as "Content-Type" = "application/json"
+            }
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.headers.len(), 1);
+                assert_eq!(ep.headers[0].name, "contentType");
+                assert_eq!(ep.headers[0].wire_name.as_deref(), Some("Content-Type"));
+                match &ep.headers[0].default_value {
+                    Some(Expr::Literal(Literal {
+                        kind: LiteralKind::String(s),
+                        ..
+                    })) => assert_eq!(s, "application/json"),
+                    other => panic!(
+                        "expected default String(\"application/json\"), got {:?}",
+                        other
+                    ),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_response_headers() {
+        let source = r#"endpoint getPost: GET "/api/posts/{id}" {
+            response Post headers {
+                Int ratelimitRemaining as "X-RateLimit-Remaining"
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                // Response type is still the bare body type.
+                match ep.response.as_ref().expect("should have response") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "Post"),
+                    other => panic!("expected Named(Post), got {:?}", other),
+                }
+                assert!(ep.headers.is_empty(), "no request headers expected");
+                assert_eq!(ep.response_headers.len(), 1);
+                assert_eq!(ep.response_headers[0].name, "ratelimitRemaining");
+                assert_eq!(
+                    ep.response_headers[0].wire_name.as_deref(),
+                    Some("X-RateLimit-Remaining")
+                );
+                match &ep.response_headers[0].type_annotation {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "Int"),
+                    other => panic!("expected Named(Int), got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_request_and_response_headers() {
+        let source = r#"endpoint getPost: GET "/api/posts/{id}" {
+            headers {
+                String authorization
+            }
+            response Post headers {
+                Int ratelimitRemaining as "X-RateLimit-Remaining"
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.headers.len(), 1, "request headers go to `headers`");
+                assert_eq!(ep.headers[0].name, "authorization");
+                assert_eq!(
+                    ep.response_headers.len(),
+                    1,
+                    "response headers go to `response_headers`"
+                );
+                assert_eq!(ep.response_headers[0].name, "ratelimitRemaining");
+                match ep.response.as_ref().expect("should have response") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "Post"),
+                    other => panic!("expected Named(Post), got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_duplicate_headers() {
+        let source = r#"endpoint listUsers: GET "/api/users" {
+            headers { String authorization }
+            headers { String idempotencyKey }
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate `headers`")),
+            "should report duplicate headers: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_request_headers_after_response() {
+        // A `headers` block on its OWN line (not immediately after the response
+        // type) is the standalone REQUEST section, even when it textually follows
+        // `response`. Only `response Type headers { ... }` on the same line binds
+        // as response headers — this keeps section ordering free and prevents a
+        // request header from silently rebinding to the response.
+        let source = r#"endpoint getPost: GET "/api/posts/{id}" {
+            response Post
+            headers {
+                String authorization
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(
+                    ep.headers.len(),
+                    1,
+                    "a `headers` block on a new line is a request header"
+                );
+                assert_eq!(ep.headers[0].name, "authorization");
+                assert!(
+                    ep.response_headers.is_empty(),
+                    "must not rebind to response headers"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_response_headers_without_type_errors() {
+        // Response headers are bundled with the body into an envelope, so a bare
+        // `response headers { ... }` with no type is rejected with a targeted
+        // message (not a generic "expected type name"), and must not leave a
+        // dangling response-headers section behind.
+        let source = r#"endpoint ping: GET "/api/ping" {
+            response headers {
+                Int ratelimitRemaining as "X-RateLimit-Remaining"
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("response headers require a response type")),
+            "should report missing response type: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert!(ep.response.is_none(), "no response type was given");
+                assert!(
+                    ep.response_headers.is_empty(),
+                    "the malformed block must be consumed, not bound as response headers"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
     }
 
     // ── Field doc comment tests ───────────────────────────────────────

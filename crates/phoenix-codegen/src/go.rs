@@ -13,7 +13,9 @@ use std::collections::BTreeSet;
 
 use phoenix_parser::ast::{Declaration, EnumDecl, Expr, Program, StructDecl};
 use phoenix_sema::Analysis;
-use phoenix_sema::checker::{DefaultValue, DerivedField, EndpointInfo, QueryParamInfo};
+use phoenix_sema::checker::{
+    DefaultValue, DerivedField, EndpointInfo, HeaderParamInfo, QueryParamInfo,
+};
 use phoenix_sema::types::Type;
 
 /// The error variant a failed body `Validate()` maps to. Used both as the lookup
@@ -118,6 +120,7 @@ impl<'a> GoGenerator<'a> {
 
         for ep in &self.check_result.endpoints {
             self.emit_derived_type(ep);
+            self.emit_response_envelope(ep);
         }
 
         // Compose types.go with header and conditional imports
@@ -364,6 +367,38 @@ impl<'a> GoGenerator<'a> {
         self.emit_body_validate_method(ep, &type_name);
     }
 
+    /// Emits the generated `<Endpoint>Result` envelope struct for an endpoint
+    /// that declares response headers: a `Body` field of the response type plus
+    /// one typed field per response header (PascalCase name, `*T` when optional).
+    /// Endpoints WITHOUT response headers emit nothing — the common case returns
+    /// the bare body unchanged. The handler returns this type and the client
+    /// reconstructs it; the field names here are the single source the
+    /// server/client wiring reads/writes.
+    fn emit_response_envelope(&mut self, ep: &EndpointInfo) {
+        if ep.response_headers.is_empty() {
+            return;
+        }
+        let type_name = header_result_type_name(ep);
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+        let body_type = ep
+            .response
+            .as_ref()
+            .map(type_to_go)
+            .unwrap_or_else(|| "interface{}".to_string());
+        let mut rows: Vec<(String, String, String)> =
+            vec![("Body".to_string(), body_type, "`json:\"-\"`".to_string())];
+        for h in &ep.response_headers {
+            rows.push((
+                to_pascal_case(&h.name),
+                type_to_go(&h.ty),
+                "`json:\"-\"`".to_string(),
+            ));
+        }
+        self.types_out.push_str(&render_struct(&type_name, &rows));
+    }
+
     /// Emits a `Validate() error` method on a derived body type if any of its
     /// fields carry a constraint inherited from the source struct.
     ///
@@ -441,6 +476,10 @@ impl<'a> GoGenerator<'a> {
         let method_name = to_pascal_case(&ep.name);
         let http_method = ep.method.as_upper_str();
         let response_type = ep.response.as_ref().map(type_to_go);
+        // Endpoints that declare response headers return a typed envelope
+        // `<Endpoint>Result` (body + each header) instead of the bare body.
+        let has_resp_headers = !ep.response_headers.is_empty();
+        let result_type = header_result_type_name(ep);
 
         // Build parameter list
         let mut params = Vec::new();
@@ -455,12 +494,26 @@ impl<'a> GoGenerator<'a> {
             let go_type = type_to_go(&qp.ty);
             params.push(format!("{} {}", to_camel(&qp.name), go_type));
         }
+        // Request headers follow query params, same optional `*T` convention.
+        for h in &ep.headers {
+            params.push(format!("{} {}", to_camel(&h.name), type_to_go(&h.ty)));
+        }
         let params_str = params.join(", ");
 
-        // Return type
-        let return_sig = match &response_type {
-            Some(rt) => format!("(*{}, error)", rt),
-            None => "error".to_string(),
+        // Whether the method returns a value (and thus a `(T, error)` pair rather
+        // than a bare `error`): true with response headers (→ envelope) or a bare
+        // response type. The error-return prefix below must match this exactly.
+        let returns_value = has_resp_headers || response_type.is_some();
+
+        // Return type. With response headers the method returns the envelope
+        // pointer; otherwise the bare response (unchanged).
+        let return_sig = if has_resp_headers {
+            format!("(*{}, error)", result_type)
+        } else {
+            match &response_type {
+                Some(rt) => format!("(*{}, error)", rt),
+                None => "error".to_string(),
+            }
         };
 
         if let Some(ref doc) = ep.doc_comment {
@@ -567,8 +620,29 @@ impl<'a> GoGenerator<'a> {
             ));
         }
 
+        // Request headers. Non-string types are stringified the same way query
+        // params are; optionals (`*T`) are guarded and dereferenced. The exact
+        // wire name from sema is the single source of truth — never recomputed.
+        for h in &ep.headers {
+            let name = to_camel(&h.name);
+            let (optional, inner) = query_param_shape(&h.ty);
+            let value_expr = if optional {
+                format!("*{name}")
+            } else {
+                name.clone()
+            };
+            let str_expr = header_string_expr(inner, &value_expr, &mut self.client_needs_strconv);
+            let set_expr = format!("req.Header.Set(\"{}\", {})", h.wire_name, str_expr);
+            if optional {
+                self.client_out
+                    .push_str(&format!("\tif {name} != nil {{\n\t\t{set_expr}\n\t}}\n"));
+            } else {
+                self.client_out.push_str(&format!("\t{set_expr}\n"));
+            }
+        }
+
         // Execute
-        let err_ret = if response_type.is_some() { "nil, " } else { "" };
+        let err_ret = if returns_value { "nil, " } else { "" };
         self.client_out
             .push_str("\tresp, err := c.Client.Do(req)\n");
         self.client_out.push_str(&format!(
@@ -581,8 +655,20 @@ impl<'a> GoGenerator<'a> {
             err_ret
         ));
 
-        // Decode response
-        if let Some(ref rt) = response_type {
+        // Decode response. With response headers, decode the body into the
+        // envelope's `Body` field, then read each header from `resp.Header`.
+        if has_resp_headers {
+            self.client_needs_json = true;
+            self.client_out
+                .push_str(&format!("\tvar result {}\n", result_type));
+            self.client_out.push_str(
+                "\tif err := json.NewDecoder(resp.Body).Decode(&result.Body); err != nil {\n\t\treturn nil, err\n\t}\n",
+            );
+            for h in &ep.response_headers {
+                self.emit_client_response_header_read(h);
+            }
+            self.client_out.push_str("\treturn &result, nil\n");
+        } else if let Some(ref rt) = response_type {
             self.client_out.push_str(&format!("\tvar result {}\n", rt));
             self.client_out.push_str(&format!(
                 "\tif err := json.NewDecoder(resp.Body).Decode(&result); err != nil {{\n\t\treturn {}err\n\t}}\n",
@@ -594,6 +680,80 @@ impl<'a> GoGenerator<'a> {
         }
 
         self.client_out.push_str("}\n");
+    }
+
+    /// Emits client-side parsing of one response header from `resp.Header` into
+    /// the envelope field `result.<PascalName>`. String headers are assigned
+    /// directly; numeric/bool are parsed; optional (`Option<T>`) headers parse
+    /// into a `*T` left nil when the header is absent — mirroring the server-side
+    /// request-header parse and the query-param parse.
+    fn emit_client_response_header_read(&mut self, h: &HeaderParamInfo) {
+        let field = to_pascal_case(&h.name);
+        let wire = &h.wire_name;
+        let (optional, inner) = query_param_shape(&h.ty);
+        let body = if optional {
+            match inner {
+                Type::Int => {
+                    self.client_needs_strconv = true;
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif n, err := strconv.ParseInt(v, 10, 64); err == nil {{\n\t\t\tresult.{field} = &n\n\t\t}}\n\t}}\n"
+                    )
+                }
+                Type::Float => {
+                    self.client_needs_strconv = true;
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif n, err := strconv.ParseFloat(v, 64); err == nil {{\n\t\t\tresult.{field} = &n\n\t\t}}\n\t}}\n"
+                    )
+                }
+                Type::Bool => {
+                    self.client_needs_strconv = true;
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif b, err := strconv.ParseBool(v); err == nil {{\n\t\t\tresult.{field} = &b\n\t\t}}\n\t}}\n"
+                    )
+                }
+                Type::String => {
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field} = &v\n\t}}\n"
+                    )
+                }
+                other => {
+                    let go_type = type_to_go(other);
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tcv := {go_type}(v)\n\t\tresult.{field} = &cv\n\t}}\n"
+                    )
+                }
+            }
+        } else {
+            match inner {
+                Type::Int => {
+                    self.client_needs_strconv = true;
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field}, _ = strconv.ParseInt(v, 10, 64)\n\t}}\n"
+                    )
+                }
+                Type::Float => {
+                    self.client_needs_strconv = true;
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field}, _ = strconv.ParseFloat(v, 64)\n\t}}\n"
+                    )
+                }
+                Type::Bool => {
+                    self.client_needs_strconv = true;
+                    format!(
+                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field}, _ = strconv.ParseBool(v)\n\t}}\n"
+                    )
+                }
+                Type::String => {
+                    format!("result.{field} = resp.Header.Get(\"{wire}\")\n")
+                }
+                other => {
+                    let go_type = type_to_go(other);
+                    format!("result.{field} = {go_type}(resp.Header.Get(\"{wire}\"))\n")
+                }
+            }
+        };
+        self.client_out.push('\t');
+        self.client_out.push_str(&body);
     }
 
     // ── handlers.go emission ────────────────────────────────────────
@@ -613,11 +773,21 @@ impl<'a> GoGenerator<'a> {
         for qp in &ep.query_params {
             params.push(format!("{} {}", to_camel(&qp.name), type_to_go(&qp.ty)));
         }
+        // Request headers follow query params (same optional `*T` convention).
+        for h in &ep.headers {
+            params.push(format!("{} {}", to_camel(&h.name), type_to_go(&h.ty)));
+        }
         let params_str = params.join(", ");
 
-        let return_type = match ep.response.as_ref().map(type_to_go) {
-            Some(rt) => format!("(*{}, error)", rt),
-            None => "error".to_string(),
+        // With response headers the handler returns the typed envelope; otherwise
+        // the bare response type (unchanged for the common case).
+        let return_type = if !ep.response_headers.is_empty() {
+            format!("(*{}, error)", header_result_type_name(ep))
+        } else {
+            match ep.response.as_ref().map(type_to_go) {
+                Some(rt) => format!("(*{}, error)", rt),
+                None => "error".to_string(),
+            }
         };
 
         if let Some(ref doc) = ep.doc_comment {
@@ -689,6 +859,11 @@ impl<'a> GoGenerator<'a> {
             self.emit_query_param_parse(qp);
         }
 
+        // Parse request headers (parallel to query params, off `r.Header.Get`).
+        for h in &ep.headers {
+            self.emit_header_param_parse(h);
+        }
+
         // Call handler
         let mut args = Vec::new();
         for pp in &ep.path_params {
@@ -700,9 +875,13 @@ impl<'a> GoGenerator<'a> {
         for qp in &ep.query_params {
             args.push(to_camel(&qp.name));
         }
+        for h in &ep.headers {
+            args.push(to_camel(&h.name));
+        }
         let args_str = args.join(", ");
 
         let handler_name = to_pascal_case(&ep.name);
+        let has_resp_headers = !ep.response_headers.is_empty();
 
         // Error mapping uses `strings.Contains`; encoding a response uses
         // `encoding/json`. Record both so the import block stays minimal.
@@ -725,10 +904,21 @@ impl<'a> GoGenerator<'a> {
             self.server_out
                 .push_str("\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n");
             self.server_out.push_str("\t\t\treturn\n\t\t}\n");
+            // Response headers: set each on `w.Header()` (stringified, optional
+            // guarded) before the body is encoded. With an envelope the body
+            // lives in `result.Body`; otherwise `result` is the body itself.
+            for h in &ep.response_headers {
+                self.emit_response_header_set(h);
+            }
             self.server_out
                 .push_str("\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n");
+            let encode_target = if has_resp_headers {
+                "result.Body"
+            } else {
+                "result"
+            };
             self.server_out
-                .push_str("\t\tjson.NewEncoder(w).Encode(result)\n");
+                .push_str(&format!("\t\tjson.NewEncoder(w).Encode({encode_target})\n"));
         } else {
             self.server_out
                 .push_str(&format!("\t\terr := h.{}({})\n", handler_name, args_str));
@@ -845,6 +1035,119 @@ impl<'a> GoGenerator<'a> {
 
         self.server_out.push_str("\t\t");
         self.server_out.push_str(&body);
+    }
+
+    /// Emits server-side parsing for a single REQUEST header into a local whose
+    /// Go type matches the handler signature, parallel to [`Self::emit_query_param_parse`]
+    /// but reading from `r.Header.Get("<wire_name>")` (the exact wire name from
+    /// sema — never recomputed). Required headers parse into a value (declared
+    /// default else Go zero value); optional `Option<T>` headers parse into a
+    /// `*T` that stays nil when the header is absent or malformed.
+    fn emit_header_param_parse(&mut self, h: &HeaderParamInfo) {
+        let camel = to_camel(&h.name);
+        let wire = &h.wire_name;
+        let (optional, inner) = query_param_shape(&h.ty);
+
+        let body = if optional {
+            match inner {
+                Type::Int => {
+                    self.server_needs_strconv = true;
+                    format!(
+                        "var {camel} *int64\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tif n, err := strconv.ParseInt(v, 10, 64); err == nil {{\n\t\t\t\t{camel} = &n\n\t\t\t}}\n\t\t}}\n"
+                    )
+                }
+                Type::Float => {
+                    self.server_needs_strconv = true;
+                    format!(
+                        "var {camel} *float64\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tif n, err := strconv.ParseFloat(v, 64); err == nil {{\n\t\t\t\t{camel} = &n\n\t\t\t}}\n\t\t}}\n"
+                    )
+                }
+                Type::Bool => {
+                    self.server_needs_strconv = true;
+                    format!(
+                        "var {camel} *bool\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tif b, err := strconv.ParseBool(v); err == nil {{\n\t\t\t\t{camel} = &b\n\t\t\t}}\n\t\t}}\n"
+                    )
+                }
+                Type::String => {
+                    format!(
+                        "var {camel} *string\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel} = &v\n\t\t}}\n"
+                    )
+                }
+                other => {
+                    let go_type = type_to_go(other);
+                    format!(
+                        "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\t{camel} = &cv\n\t\t}}\n"
+                    )
+                }
+            }
+        } else {
+            let default = |fallback: &str| {
+                h.default_value
+                    .as_ref()
+                    .map(default_value_to_go)
+                    .unwrap_or_else(|| fallback.to_string())
+            };
+            match inner {
+                Type::Int => {
+                    self.server_needs_strconv = true;
+                    let default = default("0");
+                    format!(
+                        "{camel} := int64({default})\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel}, _ = strconv.ParseInt(v, 10, 64)\n\t\t}}\n"
+                    )
+                }
+                Type::Float => {
+                    self.server_needs_strconv = true;
+                    let default = default("0");
+                    format!(
+                        "{camel} := float64({default})\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel}, _ = strconv.ParseFloat(v, 64)\n\t\t}}\n"
+                    )
+                }
+                Type::Bool => {
+                    self.server_needs_strconv = true;
+                    let default = default("false");
+                    format!(
+                        "{camel} := {default}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel}, _ = strconv.ParseBool(v)\n\t\t}}\n"
+                    )
+                }
+                Type::String => {
+                    let default = default("\"\"");
+                    format!(
+                        "{camel} := {default}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel} = v\n\t\t}}\n"
+                    )
+                }
+                other => {
+                    let go_type = type_to_go(other);
+                    format!("{camel} := {go_type}(r.Header.Get(\"{wire}\"))\n")
+                }
+            }
+        };
+
+        self.server_out.push_str("\t\t");
+        self.server_out.push_str(&body);
+    }
+
+    /// Emits server-side writing of one RESPONSE header from the envelope field
+    /// `result.<PascalName>` onto `w.Header()`. Non-string values are stringified
+    /// like query params; optional (`*T`) headers are nil-guarded and
+    /// dereferenced. Uses the exact wire name from sema.
+    fn emit_response_header_set(&mut self, h: &HeaderParamInfo) {
+        let field = to_pascal_case(&h.name);
+        let wire = &h.wire_name;
+        let (optional, inner) = query_param_shape(&h.ty);
+        let value_expr = if optional {
+            format!("*result.{field}")
+        } else {
+            format!("result.{field}")
+        };
+        let str_expr = header_string_expr(inner, &value_expr, &mut self.server_needs_strconv);
+        let set_expr = format!("w.Header().Set(\"{wire}\", {str_expr})");
+        if optional {
+            self.server_out.push_str(&format!(
+                "\t\tif result.{field} != nil {{\n\t\t\t{set_expr}\n\t\t}}\n"
+            ));
+        } else {
+            self.server_out.push_str(&format!("\t\t{set_expr}\n"));
+        }
     }
 }
 
@@ -1052,6 +1355,39 @@ fn query_param_shape(ty: &Type) -> (bool, &Type) {
     match ty {
         Type::Generic(name, args) if name == "Option" && args.len() == 1 => (true, &args[0]),
         other => (false, other),
+    }
+}
+
+/// The generated envelope type name for an endpoint that declares response
+/// headers: `<PascalEndpoint>Result` (e.g. `getPost` → `GetPostResult`). Used
+/// for the types.go struct, the handler return, and the client return. Headers
+/// reuse the query-param `query_param_shape` for optionality (`Option<T>` →
+/// `*T`), so the wire/stringify logic is shared between query params and headers.
+fn header_result_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Result", to_pascal_case(&ep.name))
+}
+
+/// Renders a Go expression that stringifies a header value for the wire,
+/// mirroring how query params convert `int64`/`float64`/`bool` to `string`.
+/// `value_expr` is the already-dereferenced value (e.g. `*x` for an optional).
+/// Returns the string expression; sets `needs_strconv` when a `strconv` helper
+/// is used. Named (enum) types are string-backed, so `string(v)` suffices.
+fn header_string_expr(inner: &Type, value_expr: &str, needs_strconv: &mut bool) -> String {
+    match inner {
+        Type::Int => {
+            *needs_strconv = true;
+            format!("strconv.FormatInt({value_expr}, 10)")
+        }
+        Type::Float => {
+            *needs_strconv = true;
+            format!("strconv.FormatFloat({value_expr}, 'f', -1, 64)")
+        }
+        Type::Bool => {
+            *needs_strconv = true;
+            format!("strconv.FormatBool({value_expr})")
+        }
+        Type::String => value_expr.to_string(),
+        _ => format!("string({value_expr})"),
     }
 }
 
@@ -1749,5 +2085,155 @@ struct User { Int id  String name }
     #[test]
     fn dyn_type_erases_to_trait_name() {
         assert_eq!(type_to_go(&Type::Dyn("Drawable".to_string())), "Drawable");
+    }
+
+    // ── Headers ─────────────────────────────────────────────────────
+
+    /// A required request header with an auto-derived wire name
+    /// (`idempotencyKey` → `Idempotency-Key`) threads through the client param
+    /// list, the `req.Header.Set` call, the handler signature, and the
+    /// server-side `r.Header.Get` parse.
+    #[test]
+    fn request_header_auto_wire_name() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    body User omit { id }
+    headers {
+        String idempotencyKey
+    }
+    response User
+}
+"#,
+        );
+        insta::assert_snapshot!("go_req_header_client", files.client);
+        insta::assert_snapshot!("go_req_header_handlers", files.handlers);
+        insta::assert_snapshot!("go_req_header_server", files.server);
+    }
+
+    /// An explicit `as "..."` override pins the wire name verbatim (used on the
+    /// client `Set` and the server `Get`), while the local/param stays camelCase.
+    #[test]
+    fn request_header_as_override() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint getUser: GET "/api/users/{id}" {
+    headers {
+        String authToken as "X-Auth-Token"
+    }
+    response User
+}
+"#,
+        );
+        insta::assert_snapshot!("go_req_header_override_client", files.client);
+        insta::assert_snapshot!("go_req_header_override_server", files.server);
+    }
+
+    /// An optional request header is a `*string` param, sent only behind a nil
+    /// guard on the client and parsed into a nil-able `*string` on the server.
+    #[test]
+    fn optional_request_header() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint getUser: GET "/api/users/{id}" {
+    headers {
+        Option<String> traceId
+    }
+    response User
+}
+"#,
+        );
+        insta::assert_snapshot!("go_opt_header_client", files.client);
+        insta::assert_snapshot!("go_opt_header_server", files.server);
+    }
+
+    /// A `Bool` request header serializes via `strconv.FormatBool`, which emits
+    /// lowercase `true`/`false` — the cross-language wire convention every
+    /// backend must agree on (TS `String(bool)`, Python `"true"/"false"`), so a
+    /// bool header round-trips. Locks the convention on the Go side.
+    #[test]
+    fn bool_request_header_serializes_lowercase() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint getUser: GET "/api/users/{id}" {
+    headers {
+        Bool debug
+    }
+    response User
+}
+"#,
+        );
+        assert!(
+            files
+                .client
+                .contains("req.Header.Set(\"Debug\", strconv.FormatBool(debug))"),
+            "bool header must serialize via strconv.FormatBool (lowercase):\n{}",
+            files.client
+        );
+    }
+
+    /// A request header with a literal default seeds the server-side local with
+    /// that default (`maxStale := int64(60)`) before the optional `r.Header.Get`
+    /// overwrite, so an absent header lands on the declared default rather than
+    /// the Go zero value. Per the documented "defaulted request headers" gap, the
+    /// generated client still takes it as a required positional arg.
+    #[test]
+    fn defaulted_request_header_seeds_server_default() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint getUser: GET "/api/users/{id}" {
+    headers {
+        Int maxStale = 60
+    }
+    response User
+}
+"#,
+        );
+        assert!(
+            files.server.contains("maxStale := int64(60)"),
+            "server must seed the local with the declared default:\n{}",
+            files.server
+        );
+        assert!(
+            files
+                .server
+                .contains("if v := r.Header.Get(\"Max-Stale\"); v != \"\""),
+            "server must still overwrite from the header when present:\n{}",
+            files.server
+        );
+        assert!(
+            files.client.contains("maxStale int64"),
+            "client must take the defaulted header as a required positional arg:\n{}",
+            files.client
+        );
+    }
+
+    /// A response header produces the `<Endpoint>Result` envelope: the handler
+    /// and client return `*GetPostResult` (body + typed header), the server
+    /// writes the header via `w.Header().Set` and encodes `result.Body`, and the
+    /// client reads it back from `resp.Header`. Covers a required `int64` header
+    /// (numeric stringify/parse both directions) and an optional one.
+    #[test]
+    fn response_header_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post headers {
+        Int ratelimitRemaining
+        Option<String> requestId as "X-Request-Id"
+    }
+}
+"#,
+        );
+        insta::assert_snapshot!("go_resp_header_types", files.types);
+        insta::assert_snapshot!("go_resp_header_client", files.client);
+        insta::assert_snapshot!("go_resp_header_handlers", files.handlers);
+        insta::assert_snapshot!("go_resp_header_server", files.server);
     }
 }

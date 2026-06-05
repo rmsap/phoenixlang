@@ -119,6 +119,13 @@ pub enum TokenKind {
     ///
     /// Appears as `query { Type name [= default], ... }`.
     Query,
+    /// The `headers` keyword, introducing a header block inside an endpoint.
+    ///
+    /// Request headers appear as a top-level endpoint section
+    /// `headers { Type name [as "Wire-Name"] [= default], ... }`; response
+    /// headers appear immediately after a response type as
+    /// `response TypeExpr headers { ... }`.
+    Headers,
     /// The `where` keyword, introducing a constraint clause on a struct field.
     ///
     /// Appears as `Type name where <expr>` inside a struct body. The constraint

@@ -105,6 +105,9 @@ impl<'a> TsGenerator<'a> {
             self.emit_endpoint_derived_type(ep);
         }
         for ep in &self.check_result.endpoints {
+            self.emit_endpoint_result_type(ep);
+        }
+        for ep in &self.check_result.endpoints {
             self.emit_endpoint_error_types(ep);
         }
 
@@ -272,6 +275,37 @@ impl<'a> TsGenerator<'a> {
             .push_str(&format!("export type {} = {};\n\n", type_name, ts_type));
     }
 
+    /// Emits the response-header envelope type for an endpoint that declares
+    /// response headers (e.g. `interface GetPostResult { body: Post;
+    /// ratelimitRemaining: number; }`). Endpoints without response headers emit
+    /// nothing here and keep returning their bare response type.
+    fn emit_endpoint_result_type(&mut self, ep: &EndpointInfo) {
+        if ep.response_headers.is_empty() {
+            return;
+        }
+        let name = result_type_name(ep);
+        let body_type = ep
+            .response
+            .as_ref()
+            .map(type_to_ts)
+            .unwrap_or_else(|| "void".to_string());
+
+        self.types_out
+            .push_str(&format!("export interface {name} {{\n"));
+        self.types_out.push_str(&format!("  body: {body_type};\n"));
+        for h in &ep.response_headers {
+            let ts_ty = type_to_ts(&h.ty);
+            if is_header_option(h) {
+                self.types_out
+                    .push_str(&format!("  {}?: {};\n", h.name, ts_ty));
+            } else {
+                self.types_out
+                    .push_str(&format!("  {}: {};\n", h.name, ts_ty));
+            }
+        }
+        self.types_out.push_str("}\n\n");
+    }
+
     /// Emits error type definitions for an endpoint's error variants.
     ///
     /// For an endpoint with `error { NotFound(404), Conflict(409) }`, produces:
@@ -355,6 +389,14 @@ impl<'a> TsGenerator<'a> {
             if ep.body.is_some() {
                 type_imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
+            if !ep.response_headers.is_empty() {
+                // The method returns the envelope type, so import it — AND fall
+                // through to import the bare body type too: the client still
+                // casts the decoded JSON to it (`(await response.json()) as
+                // <Body>`) before wrapping it in the envelope, so both names are
+                // referenced in this file.
+                type_imports.insert(result_type_name(ep));
+            }
             if let Some(ref resp) = ep.response {
                 collect_import_names(resp, &mut type_imports);
             }
@@ -406,12 +448,26 @@ impl<'a> TsGenerator<'a> {
     /// parameter construction, body serialization, and typed error handling.
     fn emit_client_function(&mut self, ep: &EndpointInfo) {
         let method = ep.method.as_upper_str();
-        let response_type = ep
+        let has_resp_headers = !ep.response_headers.is_empty();
+        let body_type = ep
             .response
             .as_ref()
             .map(type_to_ts)
             .unwrap_or_else(|| "void".to_string());
+        // The method's declared return type: the bare body when there are no
+        // response headers (the common case, unchanged), otherwise the typed
+        // envelope bundling the body + each response header.
+        let response_type = if has_resp_headers {
+            result_type_name(ep)
+        } else {
+            body_type.clone()
+        };
         let has_query = !ep.query_params.is_empty();
+        let has_req_headers = !ep.headers.is_empty();
+        // The request-header object param is nullable (`headers?:`) only when
+        // EVERY request header is client-optional (default or `Option<T>`); a
+        // single required header makes it `headers:`. Mirrors `opts_nullable`.
+        let req_headers_nullable = ep.headers.iter().all(is_header_client_optional);
         // `opts` is nullable (`opts?:`) only when EVERY query param is optional; a
         // single required param makes it `opts:`. Computed once here so the
         // signature prefix and the per-param `params.set` access logic below can
@@ -441,6 +497,29 @@ impl<'a> TsGenerator<'a> {
                 })
                 .collect();
             let prefix = if opts_nullable { "opts?: " } else { "opts: " };
+            params.push(Param::Object {
+                prefix: prefix.to_string(),
+                fields,
+            });
+        }
+        if has_req_headers {
+            let fields: Vec<String> = ep
+                .headers
+                .iter()
+                .map(|h| {
+                    let ts_ty = type_to_ts(&h.ty);
+                    if is_header_client_optional(h) {
+                        format!("{}?: {}", h.name, ts_ty)
+                    } else {
+                        format!("{}: {}", h.name, ts_ty)
+                    }
+                })
+                .collect();
+            let prefix = if req_headers_nullable {
+                "headers?: "
+            } else {
+                "headers: "
+            };
             params.push(Param::Object {
                 prefix: prefix.to_string(),
                 fields,
@@ -487,9 +566,34 @@ impl<'a> TsGenerator<'a> {
             format!("`${{baseUrl}}{url_expr}`")
         };
 
-        // Build the fetch init object body.
+        // Build the fetch init object body. When the endpoint declares request
+        // headers we build a `Headers` instance (so Content-Type and the typed
+        // request headers coexist) and reference it from the init; otherwise the
+        // common cases stay byte-for-byte unchanged.
         let mut init_lines: Vec<String> = vec![format!("method: \"{method}\"")];
-        if ep.body.is_some() {
+        if has_req_headers {
+            self.client_out
+                .push_str("    const requestHeaders = new Headers();\n");
+            if ep.body.is_some() {
+                self.client_out
+                    .push_str("    requestHeaders.set(\"Content-Type\", \"application/json\");\n");
+            }
+            for h in &ep.headers {
+                emit_header_set(
+                    &mut self.client_out,
+                    "    ",
+                    "requestHeaders",
+                    &h.name,
+                    &h.wire_name,
+                    is_header_client_optional(h),
+                    req_headers_nullable,
+                );
+            }
+            init_lines.push("headers: requestHeaders".to_string());
+            if ep.body.is_some() {
+                init_lines.push("body: JSON.stringify(body)".to_string());
+            }
+        } else if ep.body.is_some() {
             init_lines.push("headers: { \"Content-Type\": \"application/json\" }".to_string());
             init_lines.push("body: JSON.stringify(body)".to_string());
         }
@@ -522,7 +626,23 @@ impl<'a> TsGenerator<'a> {
         // Return. `response.json()` is typed `any`; assert the declared response
         // type so callers get a typed result and strict lint rules (no-unsafe-*)
         // are satisfied.
-        if response_type != "void" {
+        if has_resp_headers {
+            // Typed envelope: body read as today, each response header read from
+            // the fetch `Response.headers` and coerced into its typed field.
+            self.client_out.push_str("    return {\n");
+            self.client_out.push_str(&format!(
+                "      body: (await response.json()) as {body_type},\n"
+            ));
+            for h in &ep.response_headers {
+                emit_object_property(
+                    &mut self.client_out,
+                    "      ",
+                    &h.name,
+                    &response_header_coercion(h),
+                );
+            }
+            self.client_out.push_str("    };\n");
+        } else if response_type != "void" {
             self.client_out.push_str(&format!(
                 "    return (await response.json()) as {response_type};\n"
             ));
@@ -542,7 +662,10 @@ impl<'a> TsGenerator<'a> {
             if ep.body.is_some() {
                 imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if let Some(ref resp) = ep.response {
+            if !ep.response_headers.is_empty() {
+                // Handler returns the envelope, which already bundles the body.
+                imports.insert(result_type_name(ep));
+            } else if let Some(ref resp) = ep.response {
                 collect_import_names(resp, &mut imports);
             }
         }
@@ -561,11 +684,16 @@ impl<'a> TsGenerator<'a> {
     /// typed parameter, and query params as a required object (the server
     /// framework applies defaults before calling the handler).
     fn emit_handler_method(&mut self, ep: &EndpointInfo) {
-        let response_type = ep
-            .response
-            .as_ref()
-            .map(type_to_ts)
-            .unwrap_or_else(|| "void".to_string());
+        // With response headers the handler resolves the typed envelope; without
+        // them it resolves the bare response type (unchanged common case).
+        let response_type = if !ep.response_headers.is_empty() {
+            result_type_name(ep)
+        } else {
+            ep.response
+                .as_ref()
+                .map(type_to_ts)
+                .unwrap_or_else(|| "void".to_string())
+        };
 
         let mut params: Vec<Param> = Vec::new();
         for pp in &ep.path_params {
@@ -593,6 +721,26 @@ impl<'a> TsGenerator<'a> {
                 .collect();
             params.push(Param::Object {
                 prefix: "query: ".to_string(),
+                fields,
+            });
+        }
+        if !ep.headers.is_empty() {
+            let fields: Vec<String> = ep
+                .headers
+                .iter()
+                .map(|h| {
+                    let ts_ty = type_to_ts(&h.ty);
+                    // As with query: Option<T> headers are optional; others are
+                    // required (the server applies defaults before the handler).
+                    if is_header_option(h) {
+                        format!("{}?: {}", h.name, ts_ty)
+                    } else {
+                        format!("{}: {}", h.name, ts_ty)
+                    }
+                })
+                .collect();
+            params.push(Param::Object {
+                prefix: "headers: ".to_string(),
                 fields,
             });
         }
@@ -752,8 +900,53 @@ impl<'a> TsGenerator<'a> {
             args.push("query".to_string());
         }
 
+        // Request headers: read each from req.header("<wire>"), coerce, apply
+        // defaults. express's `req.header()` is case-insensitive, so the exact
+        // wire name is safe to pass verbatim.
+        if !ep.headers.is_empty() {
+            body.push_str(&format!("{si}const headers = {{\n"));
+            for h in &ep.headers {
+                emit_object_property(
+                    &mut body,
+                    &format!("{si}  "),
+                    &h.name,
+                    &request_header_coercion(h),
+                );
+            }
+            body.push_str(&format!("{si}}};\n"));
+            args.push("headers".to_string());
+        }
+
+        let has_resp_headers = !ep.response_headers.is_empty();
+
         // Call the handler (breaking the argument list when it overflows).
-        if ep.response.is_some() {
+        if has_resp_headers {
+            // Handler returns the envelope: set each response header from the
+            // typed field (guard optional), then send the body.
+            emit_call_stmt(
+                &mut body,
+                si,
+                &format!("const result = await handlers.{}", ep.name),
+                &args,
+                ";",
+            );
+            for h in &ep.response_headers {
+                let set_args = vec![
+                    format!("\"{}\"", h.wire_name),
+                    format!("String(result.{})", h.name),
+                ];
+                if is_header_option(h) {
+                    // Guard the optional header, then emit the (possibly wrapped)
+                    // `res.setHeader(...)` call one level deeper.
+                    body.push_str(&format!("{si}if (result.{} !== undefined) {{\n", h.name));
+                    emit_call_stmt(&mut body, ni, "res.setHeader", &set_args, ";");
+                    body.push_str(&format!("{si}}}\n"));
+                } else {
+                    emit_call_stmt(&mut body, si, "res.setHeader", &set_args, ";");
+                }
+            }
+            body.push_str(&format!("{si}res.json(result.body);\n"));
+        } else if ep.response.is_some() {
             emit_call_stmt(
                 &mut body,
                 si,
@@ -1175,6 +1368,109 @@ fn collect_import_names(ty: &Type, imports: &mut BTreeSet<String>) {
 /// signature (either it has a default value or its type is `Option<T>`).
 fn is_query_param_optional(qp: &phoenix_sema::checker::QueryParamInfo) -> bool {
     qp.has_default || matches!(&qp.ty, Type::Generic(name, _) if name == "Option")
+}
+
+/// Returns whether a request header is `Option<T>` (i.e. an optional field on
+/// the wire and in the handler signature). Defaults make the *client* field
+/// optional too, but the handler always receives a value once the server
+/// applies the default — mirroring query-param handling.
+fn is_header_option(h: &phoenix_sema::checker::HeaderParamInfo) -> bool {
+    matches!(&h.ty, Type::Generic(name, _) if name == "Option")
+}
+
+/// Returns whether a request header should be optional in the *client* method
+/// signature (either it has a default value or its type is `Option<T>`).
+fn is_header_client_optional(h: &phoenix_sema::checker::HeaderParamInfo) -> bool {
+    h.has_default || is_header_option(h)
+}
+
+/// The TypeScript name of the response-header envelope type for an endpoint
+/// (e.g. `getPost` → `GetPostResult`). Only emitted/used when the endpoint
+/// declares response headers.
+fn result_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Result", capitalize(&ep.name))
+}
+
+/// Generates an expression coercing a request header read server-side
+/// (`req.header("Wire-Name")`, typed `string | undefined`) to its typed value,
+/// applying the default when the header is absent. Mirrors
+/// [`query_param_coercion`].
+fn request_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> String {
+    let raw = format!("req.header(\"{}\")", h.wire_name);
+    let is_option = is_header_option(h);
+
+    let coerced = match &h.ty {
+        Type::Int | Type::Float => format!("Number({raw})"),
+        Type::Bool => format!("{raw} === \"true\""),
+        Type::String => format!("{raw} as string"),
+        Type::Generic(name, args) if name == "Option" && !args.is_empty() => match &args[0] {
+            Type::Int | Type::Float => {
+                format!("{raw} !== undefined ? Number({raw}) : undefined")
+            }
+            Type::Bool => format!("{raw} !== undefined ? {raw} === \"true\" : undefined"),
+            // `req.header(...)` is already typed `string | undefined`, so an
+            // `as string | undefined` cast would be flagged by eslint's
+            // no-unnecessary-type-assertion; use the raw read.
+            _ => raw.clone(),
+        },
+        _ => format!("{raw} as string"),
+    };
+
+    if is_option {
+        return coerced;
+    }
+    if let Some(ref default) = h.default_value {
+        let default_ts = default_value_to_ts(default);
+        format!("{raw} !== undefined ? {coerced} : {default_ts}")
+    } else {
+        coerced
+    }
+}
+
+/// Generates an expression reading a response header on the client side from a
+/// fetch `Response` (`response.headers.get("Wire-Name")`, typed
+/// `string | null`) and coercing it to its typed value. Optional headers map a
+/// missing value (`null`) to `undefined`; required headers assume the header is
+/// present (the matching server always sets it).
+fn response_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> String {
+    let raw = format!("response.headers.get(\"{}\")", h.wire_name);
+    let is_option = is_header_option(h);
+    let inner = if is_option {
+        match &h.ty {
+            Type::Generic(_, args) if !args.is_empty() => &args[0],
+            other => other,
+        }
+    } else {
+        &h.ty
+    };
+
+    if is_option {
+        match inner {
+            Type::Int | Type::Float => {
+                format!("{raw} !== null ? Number({raw}) : undefined")
+            }
+            Type::Bool => format!("{raw} !== null ? {raw} === \"true\" : undefined"),
+            // `response.headers.get(...)` is already typed `string | null`, so a
+            // cast would be an unnecessary-type-assertion; `?? undefined` maps the
+            // missing case (null) to undefined for the optional field.
+            _ => format!("{raw} ?? undefined"),
+        }
+    } else {
+        // Required: the header is contractually present (a generated server
+        // always sets a non-`Option` response header — the envelope field is
+        // type-required, so the handler must supply it). The coercions below
+        // therefore don't special-case a `null` read. NOTE: if a *non-conforming*
+        // (e.g. third-party) server omits it, the string branch yields a runtime
+        // `null` typed as `string`, where Go/Python fall back to `""`. This
+        // cross-language divergence is unreachable against a generated server and
+        // is left as-is rather than fabricating an empty-string default that would
+        // mask the contract violation.
+        match inner {
+            Type::Int | Type::Float => format!("Number({raw})"),
+            Type::Bool => format!("{raw} === \"true\""),
+            _ => format!("{raw} as string"),
+        }
+    }
 }
 
 /// Builds a URL template expression with path parameter substitution.
@@ -2061,5 +2357,191 @@ struct User { Int id  String name }
             span: Span::BUILTIN,
         });
         assert_eq!(type_expr_to_ts(&te), "Drawable");
+    }
+
+    // ── header tests ─────────────────────────────────────────────────
+
+    /// A required request header with an auto-derived wire name
+    /// (`idempotencyKey` → `Idempotency-Key`): added to the client `headers`
+    /// param and the handler `headers` arg, sent via a `Headers` instance, and
+    /// read server-side with `req.header(...)` and the exact wire name.
+    #[test]
+    fn request_header_auto_wire_name() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint createUser: POST "/api/users" {
+    headers { String idempotencyKey }
+    body User
+    response User
+}
+"#,
+        );
+        insta::assert_snapshot!("request_header_auto_client", files.client);
+        insta::assert_snapshot!("request_header_auto_handlers", files.handlers);
+        insta::assert_snapshot!("request_header_auto_server", files.server);
+    }
+
+    /// An `as "..."` override pins the wire name verbatim on both the client
+    /// send (`requestHeaders.set("X-Api-Key", ...)`) and the server read
+    /// (`req.header("X-Api-Key")`), while the idiomatic camelCase local
+    /// (`apiKey`) names the field.
+    #[test]
+    fn request_header_as_override() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint listUsers: GET "/api/users" {
+    headers { String apiKey as "X-Api-Key" }
+    response List<User>
+}
+"#,
+        );
+        insta::assert_snapshot!("request_header_override_client", files.client);
+        insta::assert_snapshot!("request_header_override_server", files.server);
+    }
+
+    /// An optional (`Option<T>`) request header: the client `headers` param and
+    /// field are optional, the send is guarded with `!== undefined`, and the
+    /// server coercion maps a missing header to `undefined`.
+    #[test]
+    fn request_header_optional() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint listUsers: GET "/api/users" {
+    headers { Option<String> traceId }
+    response List<User>
+}
+"#,
+        );
+        insta::assert_snapshot!("request_header_optional_client", files.client);
+        insta::assert_snapshot!("request_header_optional_handlers", files.handlers);
+        insta::assert_snapshot!("request_header_optional_server", files.server);
+    }
+
+    /// A `Bool` request header serializes via `String(...)`, which emits
+    /// lowercase `true`/`false` — the cross-language wire convention every
+    /// backend agrees on (Go `strconv.FormatBool`, Python `"true"/"false"`), and
+    /// the server reads it back with `=== "true"`. Locks the convention on the
+    /// TS side (and proves the send/read pair is internally consistent).
+    #[test]
+    fn bool_request_header_serializes_lowercase() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint listUsers: GET "/api/users" {
+    headers { Bool debug }
+    response List<User>
+}
+"#,
+        );
+        assert!(
+            files
+                .client
+                .contains("requestHeaders.set(\"Debug\", String(headers.debug));"),
+            "bool header must serialize via String(...) (lowercase true/false):\n{}",
+            files.client
+        );
+        assert!(
+            files.server.contains("req.header(\"Debug\") === \"true\""),
+            "server must read the bool header with a lowercase `=== \"true\"` check:\n{}",
+            files.server
+        );
+    }
+
+    /// A request header with a literal default is a client-optional field
+    /// (`maxStale?: number`); the server coercion applies the default when the
+    /// header is absent (`req.header(...) !== undefined ? Number(...) : 60`).
+    #[test]
+    fn defaulted_request_header_applies_server_default() {
+        let files = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint listUsers: GET "/api/users" {
+    headers { Int maxStale = 60 }
+    response List<User>
+}
+"#,
+        );
+        assert!(
+            files.client.contains("maxStale?: number"),
+            "defaulted header must be an optional client field:\n{}",
+            files.client
+        );
+        // Prettier may wrap the ternary across lines, so check the pieces rather
+        // than a single-line form: the absent-header guard, the coercion, and the
+        // default applied in the else branch.
+        assert!(
+            files
+                .server
+                .contains("req.header(\"Max-Stale\") !== undefined"),
+            "server must guard on the header being absent:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("Number(req.header(\"Max-Stale\"))"),
+            "server must coerce the present header to a number:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains(": 60"),
+            "server must apply the default in the else branch:\n{}",
+            files.server
+        );
+    }
+
+    /// A response header produces a `<Endpoint>Result` envelope: the type bundles
+    /// `body` + the typed header; the client returns the envelope (reading the
+    /// header off `response.headers`); the handler resolves it; and the server
+    /// sets the header before `res.json(result.body)`.
+    #[test]
+    fn response_header_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post headers {
+        Int ratelimitRemaining as "X-RateLimit-Remaining"
+        Option<String> requestId
+    }
+}
+"#,
+        );
+        insta::assert_snapshot!("response_header_envelope_types", files.types);
+        insta::assert_snapshot!("response_header_envelope_client", files.client);
+        insta::assert_snapshot!("response_header_envelope_handlers", files.handlers);
+        insta::assert_snapshot!("response_header_envelope_server", files.server);
+    }
+
+    /// Regression guard: an endpoint with response headers returns the envelope
+    /// but the client STILL casts the decoded JSON to the bare body type
+    /// (`(await response.json()) as Post`), so the client must import BOTH the
+    /// envelope and the body type. The bug this guards against imported only the
+    /// envelope, leaving `Post` undefined — invisible whenever another endpoint
+    /// happens to import the body type, so it must be exercised in isolation
+    /// (this endpoint is the sole user of `Post`).
+    #[test]
+    fn response_header_envelope_imports_body_type() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }
+}
+"#,
+        );
+        assert!(
+            files.client.contains("(await response.json()) as Post"),
+            "client must cast the body to the bare response type:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("import type { GetPostResult, Post } from \"./types\";"),
+            "client must import BOTH the envelope and the body type it casts to:\n{}",
+            files.client
+        );
     }
 }

@@ -62,6 +62,33 @@ file and conforms to it. Each case:
 | `error`      | `expect_received` + `raises`       | `error` (+ status)     | handler error-variant → server status mapping |
 | `constraint` | `expect_not_called: true`          | `error` (+ status)     | server rejects an invalid body BEFORE the handler runs |
 
+### Header fields (optional; for endpoints that declare headers)
+
+Request and response headers are exercised with three optional fields. Header
+names in the contract use the Phoenix identifier (camelCase); each driver maps to
+its idiomatic local name (Go/TS camelCase, Python snake_case) just as it does for
+query params.
+
+- **`call.headers`** — object of request-header name → JSON value the client
+  sends. The driver passes these to the client in its generated header-input
+  shape (Go positional args, TS/Python a `headers` object / kwargs). Request
+  headers arrive at the handler as args, so they are asserted via the existing
+  **`handler.expect_received`** (a `null` value means an optional header was
+  omitted → handler sees nil/None/undefined). NOTE: a request header with a
+  *default* is generated as a client-required value (always sent) — see the
+  "defaulted request headers" open question in `docs/design-decisions.md`; the
+  contract supplies such headers explicitly rather than relying on the server
+  default.
+- **`handler.returns_headers`** — object of response-header name → value the stub
+  sets on the returned **envelope** (`<Endpoint>Result`). A `null` value leaves an
+  optional response header unset (server omits it).
+- **`expect_client.ok_headers`** — object of response-header name → value the
+  client must read back off the response. The driver compares the envelope's
+  response-header fields against this (`null` = the header was absent on the
+  wire). For `ok` cases with `ok_headers`, the body is compared against
+  `expect_client.ok` and the headers against `ok_headers` separately (the result
+  is an envelope, not a bare body).
+
 ### Field-by-field rules drivers must follow
 
 - **`call.path_params`** — values are always JSON **strings** (the generated Go

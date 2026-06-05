@@ -18,6 +18,25 @@ Recoverable function-exit paths match across all three backends. The behavior sp
 
 **Target phase:** None — no fix planned. Revisit if defers ever become load-bearing for cleanup that must run on hard panic (e.g. unwinding-style destructors).
 
+### Defaulted request and query inputs diverge per target and mostly can't trigger the server default
+
+A Phoenix Gen endpoint input with a default — a query param (`Int page = 1`) or a request header (`Int maxStale = 60`) — does not produce a uniform generated **client** shape across targets, and on two of three targets the server's default branch is unreachable through the generated client:
+
+- **Go:** a **required** value arg (`page int64` / `maxStale int64`), always written to the wire. The server's "if absent → apply default" branch is dead code via the generated client.
+- **Python:** a kwarg with the default baked in (`max_stale: int = 60`), sent **unconditionally** (only `Option<T>` inputs are send-guarded). Likewise always on the wire.
+- **TypeScript:** an **optional** field (`maxStale?: number`) whose send is guarded by `!== undefined`. A caller that omits it sends nothing, so the server default genuinely **does** fire. This is the only target where omit→default works end-to-end through the generated client.
+
+The server-side default is still meaningful for **external / non-Phoenix callers** that omit the input, so the default is not useless — it's just not elicitable by the Go/Python generated clients. The round-trip contract therefore sends defaulted inputs explicitly (asserting a real wire value rather than a server default two of three clients can't produce); the divergence above is consequently not exercised by the round-trip suite.
+
+**Why this is a limitation, not a bug to "fix" now:** it is a single, consistent convention (a defaulted-but-not-`Option` input is client-required on Go/Python), it predates headers (query params behave identically), and making it uniform is a cross-cutting change, not a headers patch.
+
+**Planned fix (if pursued):** decide whether a defaulted input should be client-*optional* uniformly — emit `*T` / `| None` / `?` on every target and omit it from the wire when the caller doesn't supply it, so the server default applies everywhere. The change must be made in lockstep for **query params AND headers**, with a round-trip case per target proving the omit→default path.
+
+**File:** the defaulted-input emission in each generator — `phoenix-codegen/src/{go,python,typescript}.rs` (client request-header and query-param send sites).
+**Tripwire:** a defaulted request header / query param where you expect the generated client to omit it and let the server fill the default — it won't, on Go or Python.
+**Workaround:** pass the value explicitly from the caller (which is what the round-trip contract does).
+**Target phase:** demand-triggered — revisit if a real consumer needs omit→default through the generated client uniformly, or alongside any broader rework of input optionality. Surfaced 2026-06-04 while building the headers round-trip suite.
+
 ---
 
 ## Bugs

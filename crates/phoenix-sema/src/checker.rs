@@ -329,6 +329,77 @@ pub struct QueryParamInfo {
     pub default_value: Option<DefaultValue>,
 }
 
+/// Information about a resolved endpoint header (request or response).
+///
+/// Headers are the transport-level analog of query parameters: typed leaf
+/// values carried in the HTTP header section. Each carries the Phoenix
+/// identifier (`name`, used for the idiomatic local variable in each target),
+/// the resolved type, optionality via a default, and — critically — the
+/// `wire_name`: the exact on-the-wire HTTP header name. The wire name is the
+/// single source of truth for the request/response wire AND the OpenAPI
+/// `in: header` parameter name; each generator aliases its idiomatic local name
+/// to it (the same pattern the Python `Query(alias=...)` fix established).
+#[derive(Debug, Clone)]
+pub struct HeaderParamInfo {
+    /// The Phoenix identifier (e.g. `idempotencyKey`). Each target derives its
+    /// idiomatic local name from this (Go/TS camelCase, Python snake_case).
+    pub name: String,
+    /// The exact HTTP header name on the wire (e.g. `Idempotency-Key`). Either
+    /// auto-derived from `name` via [`header_wire_name`] (Title-Case-Kebab) or
+    /// taken verbatim from an explicit `as "..."` override in the schema.
+    pub wire_name: String,
+    /// The resolved type.
+    pub ty: Type,
+    /// Whether the header has a default value.
+    pub has_default: bool,
+    /// The literal default value, if provided (request headers only).
+    pub default_value: Option<DefaultValue>,
+}
+
+/// Derives the default on-the-wire HTTP header name from a Phoenix identifier,
+/// when no explicit `as "..."` override is given.
+///
+/// Maps a camelCase identifier to `Title-Case-Kebab`, the idiomatic HTTP header
+/// convention: `authorization → Authorization`,
+/// `idempotencyKey → Idempotency-Key`, `xRequestId → X-Request-Id`. Each
+/// camelCase word boundary becomes a `-`, and each word is capitalized.
+///
+/// The split is purely on case boundaries, so an embedded acronym is broken at
+/// every capital: `xRequestID → X-Request-I-D`, `rateLimitURL → Rate-Limit-U-R-L`.
+/// When the desired wire name doesn't follow this transform — acronyms, fixed
+/// external casing like `ETag` or `X-RateLimit-Limit` — use the explicit
+/// `as "Exact-Wire-Name"` override instead of relying on this auto-derivation.
+///
+/// This is centralized here so every code generator agrees on the wire name —
+/// the client sender, the server parser, and the OpenAPI spec must all use the
+/// identical string, or headers silently fail to round-trip.
+pub fn header_wire_name(ident: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in ident.chars() {
+        if ch.is_uppercase() && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+        .iter()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Resolved information about an endpoint declaration, produced during
 /// semantic analysis.
 ///
@@ -348,10 +419,17 @@ pub struct EndpointInfo {
     pub path_params: Vec<String>,
     /// Resolved query parameters.
     pub query_params: Vec<QueryParamInfo>,
+    /// Resolved request headers (sent by the client, parsed by the server into
+    /// handler args). Empty if the endpoint declares no `headers { ... }` block.
+    pub headers: Vec<HeaderParamInfo>,
     /// The resolved body type with modifiers applied, if present.
     pub body: Option<ResolvedDerivedType>,
     /// The resolved response type, if declared.
     pub response: Option<Type>,
+    /// Resolved response headers (set by the handler, read by the client).
+    /// Empty unless the endpoint declares `response <T> headers { ... }`. When
+    /// non-empty, generators bundle the body + these into a typed envelope.
+    pub response_headers: Vec<HeaderParamInfo>,
     /// Error variants: (name, status_code).
     pub errors: Vec<(String, i64)>,
     /// Doc comment attached to this endpoint.

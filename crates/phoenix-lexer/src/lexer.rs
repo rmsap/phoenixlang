@@ -12,8 +12,8 @@ use phoenix_common::span::{SourceId, Span};
 /// `tests::keywords_const_matches_lexer_recognition`.
 pub const KEYWORDS: &[&str] = &[
     "as", "body", "break", "continue", "defer", "dyn", "else", "endpoint", "enum", "error",
-    "false", "for", "function", "if", "impl", "import", "in", "let", "match", "mut", "omit",
-    "partial", "pick", "public", "query", "response", "return", "schema", "self", "struct",
+    "false", "for", "function", "headers", "if", "impl", "import", "in", "let", "match", "mut",
+    "omit", "partial", "pick", "public", "query", "response", "return", "schema", "self", "struct",
     "trait", "true", "type", "where", "while",
 ];
 
@@ -355,6 +355,7 @@ impl<'src> Lexer<'src> {
             "pick" => TokenKind::Pick,
             "partial" => TokenKind::Partial,
             "query" => TokenKind::Query,
+            "headers" => TokenKind::Headers,
             "where" => TokenKind::Where,
             "schema" => TokenKind::Schema,
             "GET" => TokenKind::Get,

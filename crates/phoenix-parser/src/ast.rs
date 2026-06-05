@@ -750,6 +750,40 @@ pub struct QueryParam {
     pub span: Span,
 }
 
+/// A single header entry, used for both request and response headers.
+///
+/// Header entries share the grammar of [`QueryParam`] but add an optional
+/// explicit wire-name override via `as "Wire-Name"`. Optionality is expressed
+/// through `Option<T>` in the type, exactly like query parameters.
+///
+/// ```text
+/// headers {
+///     String authorization
+///     String rateLimit as "X-RateLimit-Limit"
+///     String contentType as "Content-Type" = "application/json"
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct HeaderParam {
+    /// The declared type of the header (e.g. `String`, `Option<String>`).
+    pub type_annotation: TypeExpr,
+    /// The header's local identifier as written in the schema (e.g.
+    /// `"authorization"`). The on-the-wire HTTP header name is derived from this
+    /// in a later (sema) pass unless overridden by [`wire_name`](Self::wire_name).
+    pub name: String,
+    /// An optional explicit wire-name override from `as "Wire-Name"`. The stored
+    /// string has its surrounding quotes stripped. `None` means the wire name is
+    /// auto-derived later in sema from [`name`](Self::name).
+    pub wire_name: Option<String>,
+    /// An optional default value expression, used when the header is omitted from
+    /// the request. Meaningful only for request headers; the grammar is shared, so
+    /// it is *parsed* for response headers too, but sema rejects a default on a
+    /// response header (they are set by the handler, never received).
+    pub default_value: Option<Expr>,
+    /// Source span covering the entire header declaration.
+    pub span: Span,
+}
+
 /// An endpoint declaration describing a single HTTP API endpoint.
 ///
 /// Endpoint declarations are a Phoenix Gen feature that enables code generation
@@ -761,9 +795,12 @@ pub struct QueryParam {
 /// /** Creates a new user account. */
 /// endpoint createUser: POST "/api/users" {
 ///     body User omit { id }
-///     response User
+///     response User headers { Int rateLimit as "X-RateLimit-Limit" }
 ///     query {
 ///         Bool notify = true
+///     }
+///     headers {
+///         String idempotencyKey
 ///     }
 ///     error {
 ///         Conflict(409)
@@ -771,8 +808,10 @@ pub struct QueryParam {
 /// }
 /// ```
 ///
-/// All inner sections (`body`, `response`, `query`, `error`) are optional and
-/// may appear in any order within the endpoint block.
+/// All inner sections (`body`, `response`, `query`, `headers`, `error`) are
+/// optional and may appear in any order within the endpoint block. Response
+/// headers are declared inline immediately after the `response` type via a
+/// trailing `headers { ... }` block.
 #[derive(Debug, Clone, Serialize)]
 pub struct EndpointDecl {
     /// The endpoint name, used as an identifier in generated code
@@ -788,12 +827,18 @@ pub struct EndpointDecl {
     /// Query parameters declared in an optional `query { ... }` block.
     /// Empty if no query block is present.
     pub query_params: Vec<QueryParam>,
+    /// Request headers declared in an optional top-level `headers { ... }` block.
+    /// Empty if no request-headers block is present.
+    pub headers: Vec<HeaderParam>,
     /// The request body type with optional derivation modifiers, parsed from
     /// the `body` section. `None` if the endpoint has no body (e.g. `GET`).
     pub body: Option<DerivedType>,
     /// The response type, parsed from the `response` section.
     /// `None` if the endpoint does not declare a response type.
     pub response: Option<TypeExpr>,
+    /// Response headers declared inline after the response type via a trailing
+    /// `headers { ... }` block (`response Type headers { ... }`). Empty if none.
+    pub response_headers: Vec<HeaderParam>,
     /// Error variants with HTTP status codes, parsed from the `error { ... }`
     /// block. Empty if no error block is present.
     pub errors: Vec<EndpointErrorVariant>,

@@ -1115,3 +1115,114 @@ The [Phoenix Gen roadmap](phoenix-gen-roadmap.md) §9 listed several open decisi
 
 1. **v1.0 server-framework list (locked)** → TypeScript: Express + Fastify; Python: FastAPI; Go: `net/http` + chi. Rationale: a small, popular set covers most users while bounding maintenance cost; lock it before beta.
 2. **Pagination shape** → Support **both** cursor and offset pagination, selected via an explicit annotation on the response type. Rationale: it is the most common API shape and forcing a single style would push teams to reinvent the other.
+
+---
+
+## Phoenix Gen — headers feature design (2026-06-04)
+
+Adds request **and** response headers to the endpoint schema. Request headers are
+the close analog of `query` params (typed endpoint inputs threaded into the
+client signature, sent on the wire, parsed server-side into handler args).
+Response headers are new shape: the handler *sets* them and the client *reads*
+them. Locked decisions:
+
+1. **Grammar — a `headers { ... }` block** parallel to `query { ... }`, holding
+   request headers, plus response headers declared on the response (see §5). New
+   reserved keyword: `headers` — a **breaking change** to the surface language:
+   any existing schema using `headers` as an identifier (struct field, param,
+   binding) will no longer parse. Accepted pre-1.0; no in-tree fixture used the
+   name (verified by running the full suite when the keyword landed). Each entry:
+   `Type name [as "Wire-Name"] [= default]`.
+   Optionality via `Option<T>` (same as query). No `where` constraints (headers
+   are leaf values, like query params).
+
+2. **Wire naming — hybrid (auto-transform + explicit override).**
+   - **Default (auto):** the camelCase identifier maps to a `Title-Case-Kebab`
+     HTTP header name: `authorization → Authorization`,
+     `idempotencyKey → Idempotency-Key`, `xRequestId → X-Request-Id`. This is the
+     trivial-case ergonomic path and adds zero per-field syntax.
+   - **Override (explicit):** `Type name as "Exact-Wire-Name"` pins the wire name
+     verbatim for headers whose casing is externally fixed (e.g.
+     `rateLimit as "X-RateLimit-Limit"`, `etag as "ETag"`). Reuses the existing
+     `as` keyword — no new reserved word — and keeps `=` free for the default
+     value. Order: `Type name [as "..."] [= default]`.
+   - The wire name (auto or override) is the single source of truth for BOTH
+     directions and for the OpenAPI `in: header` parameter name. Internally each
+     target still uses its idiomatic local name (Go camelCase, Python snake_case,
+     TS camelCase) and aliases to the wire name — exactly the pattern the Python
+     `Query(alias=...)` fix established, now generalized to headers.
+
+3. **Request headers** behave like query params per target: client method input,
+   sent via the framework's header API (`req.Header.Set` / `headers={}` /
+   fetch `headers`), parsed server-side (`r.Header.Get` / FastAPI `Header(alias=)`
+   / express `req.header(...)`) into the handler signature.
+   - **Scalar wire encoding (cross-language contract).** Non-string headers are
+     stringified for the wire identically across every target so a header
+     round-trips regardless of which client talks to which server. In particular
+     `Bool` is always lowercase `true`/`false` (Go `strconv.FormatBool`, TS
+     `String(bool)`, Python an explicit `"true"/"false"`) and is read back with a
+     lowercase `== "true"` / `ParseBool` check. Python's `str(True)` → `"True"`
+     is deliberately NOT used — the TS server's `=== "true"` read would reject it.
+
+4. **Response headers — typed envelope.** An endpoint that declares response
+   headers returns a generated wrapper type bundling the body + each response
+   header (typed); endpoints WITHOUT response headers keep returning the bare
+   body unchanged (no churn for the common case). Example (Go): an endpoint with
+   response header `ratelimitRemaining` →
+   `GetPost(id string) (*GetPostResult, error)` where
+   `GetPostResult { Body Post; RatelimitRemaining int64 }` (the field types are
+   the targets' resolved scalar types — Go `Int` → `int64`); an endpoint without →
+   `GetUser(id string) (*User, error)` unchanged. Chosen over a mutable
+   setter/out-param because it preserves the pure-function handler shape and is
+   symmetric across client/server. The envelope type name is derived from the
+   endpoint (e.g. `<Endpoint>Result`). A response header may NOT carry a `= default`
+   (the handler sets it; a default is meaningless) — sema rejects it rather than
+   silently dropping it. Optionality is `Option<T>` only.
+
+5. **Response-header declaration site.** Response headers attach to the response,
+   distinct from the request `headers { }` block. Finalized surface:
+   `response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }`,
+   where the `headers` keyword must appear **on the same line as the response
+   type** to bind as response headers. A `headers` block on its own line is always
+   the standalone request section, regardless of whether it comes before or after
+   `response` — so section ordering stays free and a request header cannot
+   silently rebind to the response. (The parser deliberately does not skip
+   newlines between the response type and an inline `headers` block.)
+
+6. **Scope of the first increment:** request + response headers, all four targets
+   (TS/Python/Go/OpenAPI), proven by BOTH harnesses (compile-and-lint +
+   round-trip). Constraint/validation behavior on headers is out of scope for v1
+   (no `where`); auth remains middleware-shaped per roadmap §4 — headers are the
+   transport, not an auth model.
+
+7. **Framework-managed response headers (caveat).** Some server frameworks set
+   transport headers automatically (Express's auto-`ETag`, `Content-Length`,
+   etc.). Because HTTP header names are case-insensitive, a response header whose
+   wire name collides with one of these (e.g. an `etag` header → `Etag`) can be
+   overwritten by the framework's value before the client reads it. The generated
+   code emits only a router/handler factory, not the full app, so disabling the
+   framework default is the caller's responsibility (e.g. `app.set("etag", false)`
+   for Express — the round-trip harness does exactly this). Documented here so the
+   collision is explicit rather than a silent surprise; a future increment may
+   warn at codegen time when a response-header wire name shadows a known
+   framework-managed header.
+
+8. **Header validation (sema).** Because headers add identifiers to the generated
+   parameter scope and to the wire, sema rejects the collisions that would
+   otherwise surface as a generated-code compile error or a silent wire bug:
+   - A **request header** local name may not collide with a path param, a query
+     param, or another request header (they share one generated parameter list).
+   - A **response header** local name may not collide with another response header
+     or the reserved `body` field of the `<Endpoint>Result` envelope.
+   - No two headers in the **same direction** may resolve to the same wire name
+     (checked case-insensitively, since HTTP header names are). Request and
+     response headers are different directions and share no namespace.
+
+**Known limitation (defaulted inputs).** A defaulted request header (`Int maxStale
+= 60`) does not produce a uniform client shape across targets — it inherits each
+target's existing defaulted *query*-param behavior, which itself diverges (Go/Python
+always send it, TypeScript omits it when unset). This is a pre-existing,
+cross-cutting generator convention question, not a headers-specific decision, so it
+is tracked as a limitation in
+[known-issues.md](known-issues.md#defaulted-request-and-query-inputs-diverge-per-target-and-mostly-cant-trigger-the-server-default),
+not here.

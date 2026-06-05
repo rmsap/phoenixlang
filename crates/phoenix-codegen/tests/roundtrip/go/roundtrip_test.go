@@ -54,18 +54,21 @@ type callSpec struct {
 	PathParams map[string]string      `json:"path_params"`
 	Query      map[string]interface{} `json:"query"`
 	Body       json.RawMessage        `json:"body"`
+	Headers    map[string]interface{} `json:"headers"`
 }
 
 type handlerSpec struct {
 	ExpectReceived  map[string]interface{} `json:"expect_received"`
 	Returns         json.RawMessage        `json:"returns"`
+	ReturnsHeaders  map[string]interface{} `json:"returns_headers"`
 	Raises          string                 `json:"raises"`
 	ExpectNotCalled bool                   `json:"expect_not_called"`
 }
 
 type expectSpec struct {
-	OK    json.RawMessage `json:"ok"`
-	Error *errorExpect    `json:"error"`
+	OK        json.RawMessage        `json:"ok"`
+	OKHeaders map[string]interface{} `json:"ok_headers"`
+	Error     *errorExpect           `json:"error"`
 }
 
 type errorExpect struct {
@@ -124,6 +127,31 @@ func (s *stub) GetPost(id string) (*api.Post, error) {
 	}
 	var out api.Post
 	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
+	return &out, nil
+}
+
+// GetPostMetered exercises request + response headers. Request headers reach the
+// handler as ordinary args (asserted via expect_received like path/query params):
+// authorization (required), requestId (required), ifNoneMatch (optional *string),
+// maxStale (defaulted int64). The response is a typed envelope: a Post body plus
+// response headers the stub sets from handler.returns_headers.
+func (s *stub) GetPostMetered(id string, authorization string, requestId string, ifNoneMatch *string, maxStale int64) (*api.GetPostMeteredResult, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"id":            id,
+		"authorization": authorization,
+		"requestId":     requestId,
+		"ifNoneMatch":   derefStr(ifNoneMatch),
+		"maxStale":      maxStale,
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	var out api.GetPostMeteredResult
+	mustUnmarshal(s.t, s.c.Handler.Returns, &out.Body)
+	out.RatelimitRemaining = headerInt(s.c.Handler.ReturnsHeaders, "ratelimitRemaining")
+	out.Etag = headerOptStr(s.c.Handler.ReturnsHeaders, "etag")
 	return &out, nil
 }
 
@@ -293,6 +321,26 @@ func invoke(t *testing.T, client *api.ApiClient, c contractCase) error {
 		assertOK(t, c, got)
 		return nil
 
+	case "getPostMetered":
+		// Request headers come from call.headers with the client's declared types.
+		// authorization/requestId are required strings; ifNoneMatch is optional
+		// (*string, nil when absent). maxStale is a defaulted int64 — note the
+		// generated Go client takes it as a *required* value and ALWAYS writes the
+		// Max-Stale header (see client.go), so the driver must supply a value. When
+		// the case omits maxStale we pass the server-side default (60) so the
+		// handler observes 60, matching expect_received.
+		authorization := headerStr(c.Call.Headers, "authorization")
+		requestId := headerStr(c.Call.Headers, "requestId")
+		ifNoneMatch := headerOptStr(c.Call.Headers, "ifNoneMatch")
+		maxStale := headerIntDefault(c.Call.Headers, "maxStale", 60)
+		got, err := client.GetPostMetered(c.Call.PathParams["id"], authorization, requestId, ifNoneMatch, maxStale)
+		if err != nil {
+			return err
+		}
+		assertOK(t, c, &got.Body)
+		assertOKHeaders(t, c, got)
+		return nil
+
 	case "createPost":
 		var body api.CreatePostBody
 		mustUnmarshal(t, c.Call.Body, &body)
@@ -345,6 +393,26 @@ func assertOK(t *testing.T, c contractCase, got interface{}) {
 	}
 	if !jsonEqual(t, gotJSON, wantJSON) {
 		t.Fatalf("[%s] client result mismatch:\n got: %s\nwant: %s", c.Name, gotJSON, wantJSON)
+	}
+}
+
+// assertOKHeaders compares the response-header fields the client read off the
+// envelope against expect_client.ok_headers. ratelimitRemaining is a required
+// int; etag is an optional string (nil when the expected value is JSON null).
+func assertOKHeaders(t *testing.T, c contractCase, got *api.GetPostMeteredResult) {
+	for k, want := range c.Expect.OKHeaders {
+		switch k {
+		case "ratelimitRemaining":
+			if !valueEqual(want, got.RatelimitRemaining) {
+				t.Fatalf("[%s] ok_header %q: got %#v, want %#v", c.Name, k, got.RatelimitRemaining, want)
+			}
+		case "etag":
+			if !valueEqual(want, derefStr(got.Etag)) {
+				t.Fatalf("[%s] ok_header %q: got %#v, want %#v", c.Name, k, derefStr(got.Etag), want)
+			}
+		default:
+			t.Fatalf("[%s] unknown ok_header %q", c.Name, k)
+		}
 	}
 }
 
@@ -514,6 +582,44 @@ func queryOptFloat(c contractCase, key string) *float64 {
 		}
 	}
 	return nil
+}
+
+// ── header helpers (read typed values from a generic header map) ────────────
+
+// headerStr reads a required string header value (empty string when absent).
+func headerStr(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok && v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// headerOptStr reads an optional string header value (nil when absent or JSON null).
+func headerOptStr(m map[string]interface{}, key string) *string {
+	if v, ok := m[key]; ok && v != nil {
+		if s, ok := v.(string); ok {
+			return &s
+		}
+	}
+	return nil
+}
+
+// headerInt reads a numeric header value as int64 (0 when absent).
+func headerInt(m map[string]interface{}, key string) int64 {
+	return headerIntDefault(m, key, 0)
+}
+
+// headerIntDefault reads a numeric header value as int64, falling back to def
+// when the key is absent or JSON null.
+func headerIntDefault(m map[string]interface{}, key string, def int64) int64 {
+	if v, ok := m[key]; ok && v != nil {
+		if f, ok := v.(float64); ok {
+			return int64(f)
+		}
+	}
+	return def
 }
 
 // ── json helpers ────────────────────────────────────────────────────────────

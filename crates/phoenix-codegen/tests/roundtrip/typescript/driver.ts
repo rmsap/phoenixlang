@@ -40,6 +40,7 @@ import { api, setBaseUrl, ApiError } from "./generated/client";
 import type {
   Author,
   CreatePostBody,
+  GetPostMeteredResult,
   Post,
   UpdateAuthorProfileBody,
 } from "./generated/types";
@@ -56,15 +57,18 @@ interface ContractCase {
     path_params?: Record<string, string>;
     query?: Record<string, unknown>;
     body?: Record<string, unknown>;
+    headers?: Record<string, unknown>;
   };
   handler: {
     expect_received?: Record<string, unknown>;
     returns?: unknown;
+    returns_headers?: Record<string, unknown>;
     raises?: string;
     expect_not_called?: boolean;
   };
   expect_client: {
     ok?: unknown;
+    ok_headers?: Record<string, unknown>;
     error?: {
       variant: string;
       status_per_target: Record<string, number>;
@@ -123,6 +127,32 @@ function makeStub(c: ContractCase, state: CaseState): Handlers {
       state.hit = true;
       state.received = { id };
       return signal<Post>(c);
+    },
+    // getPostMetered exercises request + response headers. Request headers reach
+    // the handler as a single `headers` object arg (authorization/requestId
+    // required, ifNoneMatch optional → undefined when absent, maxStale defaulted
+    // to 60 server-side). Record each header flattened into `received` (mapping
+    // absent ifNoneMatch to null) so expect_received compares like path/query
+    // params. The response is a typed envelope: the Post body plus response
+    // headers set from handler.returns_headers (ratelimitRemaining required Int;
+    // etag optional String, left undefined when its returns_headers value is
+    // null).
+    async getPostMetered(id, headers) {
+      state.hit = true;
+      state.received = {
+        id,
+        authorization: headers.authorization,
+        requestId: headers.requestId,
+        ifNoneMatch: headers.ifNoneMatch ?? null,
+        maxStale: headers.maxStale,
+      };
+      const rh = c.handler.returns_headers ?? {};
+      const etag = rh.etag;
+      return {
+        body: c.handler.returns as Post,
+        ratelimitRemaining: rh.ratelimitRemaining as number,
+        etag: etag === null || etag === undefined ? undefined : (etag as string),
+      } satisfies GetPostMeteredResult;
     },
     async createPost(body) {
       state.hit = true;
@@ -188,6 +218,22 @@ async function invoke(c: ContractCase): Promise<unknown> {
         sortField: q.sortField as string,
       });
     }
+    case "getPostMetered": {
+      const id = c.call.path_params?.id;
+      assert.ok(id !== undefined, `${c.name}: missing path_params.id`);
+      const h = c.call.headers ?? {};
+      // Build the client's headers object: authorization/requestId required,
+      // maxStale supplied by both cases; ifNoneMatch only when present.
+      const headers: Parameters<typeof api.getPostMetered>[1] = {
+        authorization: h.authorization as string,
+        requestId: h.requestId as string,
+        maxStale: h.maxStale as number,
+      };
+      if (h.ifNoneMatch !== undefined && h.ifNoneMatch !== null) {
+        headers.ifNoneMatch = h.ifNoneMatch as string;
+      }
+      return api.getPostMetered(id, headers);
+    }
     case "createPost": {
       const body = c.call.body as unknown as CreatePostBody;
       return api.createPost(body);
@@ -218,6 +264,46 @@ function assertReceived(c: ContractCase, got: Record<string, unknown>): void {
       w,
       `[${c.name}] handler arg ${k}: got ${JSON.stringify(got[k])}, want ${JSON.stringify(w)}`,
     );
+  }
+}
+
+// assertOkHeaders checks the response-header fields the client read off the
+// envelope against expect_client.ok_headers: ratelimitRemaining is a required
+// number (numeric equality); etag is an optional string that must equal the
+// expected string, or be undefined/absent when the expected value is JSON null.
+function assertOkHeaders(
+  c: ContractCase,
+  got: GetPostMeteredResult,
+): void {
+  const want = c.expect_client.ok_headers;
+  if (want === undefined) return;
+  for (const [k, w] of Object.entries(want)) {
+    switch (k) {
+      case "ratelimitRemaining":
+        assert.strictEqual(
+          got.ratelimitRemaining,
+          w,
+          `[${c.name}] ok_header ${k}: got ${String(got.ratelimitRemaining)}, want ${String(w)}`,
+        );
+        break;
+      case "etag":
+        if (w === null) {
+          assert.strictEqual(
+            got.etag,
+            undefined,
+            `[${c.name}] ok_header etag: expected absent, got ${String(got.etag)}`,
+          );
+        } else {
+          assert.strictEqual(
+            got.etag,
+            w,
+            `[${c.name}] ok_header etag: got ${String(got.etag)}, want ${String(w)}`,
+          );
+        }
+        break;
+      default:
+        throw new Error(`[${c.name}] unknown ok_header ${k}`);
+    }
   }
 }
 
@@ -252,6 +338,11 @@ function assertErrorStatus(c: ContractCase, thrown: unknown): void {
 async function runCase(c: ContractCase): Promise<void> {
   const state: CaseState = { hit: false, received: {} };
   const app = express();
+  // Disable Express's automatic ETag generation: it would set a response
+  // `ETag` header on `res.json()` even when the generated server leaves the
+  // typed `etag` response header unset, which would leak into the client's
+  // observed `etag` envelope field and break the null/absent-etag contract case.
+  app.set("etag", false);
   app.use(express.json());
   app.use(createRouter(makeStub(c, state)));
 
@@ -277,11 +368,23 @@ async function runCase(c: ContractCase): Promise<void> {
         );
         assert.ok(state.hit, `[${c.name}] handler was never called (ok case)`);
         assertReceived(c, state.received);
-        assert.deepStrictEqual(
-          result,
-          c.expect_client.ok,
-          `[${c.name}] client result mismatch`,
-        );
+        if (c.endpoint === "getPostMetered") {
+          // The client returns a typed envelope: compare its `.body` against
+          // expect_client.ok and its response-header fields against ok_headers.
+          const env = result as GetPostMeteredResult;
+          assert.deepStrictEqual(
+            env.body,
+            c.expect_client.ok,
+            `[${c.name}] client result body mismatch`,
+          );
+          assertOkHeaders(c, env);
+        } else {
+          assert.deepStrictEqual(
+            result,
+            c.expect_client.ok,
+            `[${c.name}] client result mismatch`,
+          );
+        }
         break;
       }
       case "error": {

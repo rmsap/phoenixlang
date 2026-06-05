@@ -214,6 +214,44 @@ endpoint updateAccount: PATCH "/api/accounts/{id}" {
 }
 "#;
 
+/// Headers-focused schema covering the generator branches the main `SCHEMA`'s
+/// `getPostMetered` (a *mix* of required + optional request headers) cannot
+/// reach:
+///
+///   * **all request headers optional** → the TS client's `headers` param itself
+///     becomes nullable (`headers?: { … }`), so the per-header send guard accesses
+///     it via the optional chain (`if (headers?.x !== undefined) …`). This is the
+///     one shape that exercises the `headers_nullable` access path in
+///     `emit_header_set`, and it must type-check under `tsc` strict (the access of
+///     `headers.x` inside the guard relies on TypeScript narrowing the optional
+///     chain) AND lint clean under `eslint` strict-type-checked (no
+///     `no-unnecessary-condition` complaint). The Go/Python equivalents (`*T`
+///     params, `| None` kwargs) ride the same all-optional path.
+///   * **all response headers optional** → every `<Endpoint>Result` envelope field
+///     is optional (`*T` / `| None` / `?`), and the client read maps an absent
+///     header to nil/None/undefined for each.
+const HEADER_SCHEMA: &str = r#"
+struct Thing {
+    Int id
+    String name
+}
+
+endpoint listThings: GET "/api/things" {
+    headers {
+        Option<String> traceId
+        Option<Int> maxResults
+    }
+    response List<Thing>
+}
+
+endpoint getThing: GET "/api/things/{id}" {
+    response Thing headers {
+        Option<String> etag
+        Option<Int> ratelimitRemaining
+    }
+}
+"#;
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    roundtrip.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -318,6 +356,9 @@ fn go_output_compiles_and_lints() {
     // Constrained `Option<T>` body field — the body `Validate()` must nil-guard
     // and deref the pointer (regression guard for body-validation detection).
     check_go_output(&generate_go_files(EDGE_SCHEMA));
+    // All-optional request + response headers (the `*T` param / nil-guarded
+    // send / nil-able envelope-field paths).
+    check_go_output(&generate_go_files(HEADER_SCHEMA));
 }
 
 // ── OpenAPI target ───────────────────────────────────────────────────────
@@ -367,6 +408,7 @@ fn openapi_output_lints() {
     check_openapi_output("WIDE_SCHEMA", WIDE_SCHEMA);
     check_openapi_output("WRAP_SCHEMA", WRAP_SCHEMA);
     check_openapi_output("FEATURE_SCHEMA", FEATURE_SCHEMA);
+    check_openapi_output("HEADER_SCHEMA", HEADER_SCHEMA);
 }
 
 // ── TypeScript target ─────────────────────────────────────────────────────
@@ -458,6 +500,10 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(FEATURE_SCHEMA));
     // Tagged-union enums are a TypeScript-only feature (see TAGGED_ENUM_SCHEMA).
     check_typescript_output(&scaffold, &generate_typescript_files(TAGGED_ENUM_SCHEMA));
+    // All-optional request headers force the nullable `headers?:` param and its
+    // optional-chain send guard — the `emit_header_set` path the mixed-header
+    // `getPostMetered` in SCHEMA never reaches.
+    check_typescript_output(&scaffold, &generate_typescript_files(HEADER_SCHEMA));
 }
 
 // ── Python target ──────────────────────────────────────────────────────────
@@ -557,4 +603,7 @@ fn python_output_compiles_and_lints() {
     // must sort after the required plain param, or the generated server is a
     // Python syntax error (non-default argument follows default argument).
     check_python_output(&scaffold, &venv_bin, &generate_python_files(EDGE_SCHEMA));
+    // All-optional request + response headers (all-`| None` kwargs, guarded
+    // sends, and an all-optional envelope).
+    check_python_output(&scaffold, &venv_bin, &generate_python_files(HEADER_SCHEMA));
 }
