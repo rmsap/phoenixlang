@@ -789,6 +789,141 @@ fn struct_alloc_get_set_runs_under_wasmtime_gc() {
     assert_wasm_prints(&bytes, "struct_point_wasm_gc", b"3\n7\n99\n");
 }
 
+/// PR 6 slice 1: strings on wasm32-gc. Exercises every op the slice
+/// adds, in one fixture so a regression in any of them shows up here:
+///
+/// - **`Op::ConstString`** — `"hello"` (and the literals inside the
+///   interpolation) materialize via passive data segments +
+///   `array.new_data` + `struct.new $string`. The DataCount section
+///   has to declare the segment count up front, or wasmparser rejects
+///   the module before any test value is printed.
+/// - **`print(String)`** — dispatches through `translate_print` to the
+///   synthesized `phx_print_str` helper, which copies bytes from the
+///   `(array i8)` into a linear-memory scratch buffer, appends `'\n'`,
+///   and calls `fd_write`.
+/// - **`Op::StringConcat`** — interpolation `"hello, {name}"` lowers to
+///   a chain of `Op::StringConcat` calls that resolve to
+///   `phx_str_concat`. Each call allocates a fresh `$bytes` of combined
+///   length and does two `array.copy`s honoring source `$offset`.
+/// - **`BuiltinCall("String.length")`** — `greeting.length()` lowers
+///   inline as `struct.get $string $len(2)` + `i64.extend_i32_u`. No
+///   helper needed.
+/// - **`Op::StringEq` / `Op::StringNe`** — `greeting == "hello"` /
+///   `greeting != "world"` / `"abc" != "abd"` route through
+///   `phx_str_eq`'s length-check + byte loop with offset arithmetic.
+///   The three cases cover, respectively: a full byte-match returning
+///   equal, the length-mismatch fast path, and the same-length
+///   byte-by-byte mismatch path. `Op::StringNe` adds an `i32.eqz` to
+///   flip the helper's 0/1 result.
+///
+/// COVERAGE GAP — nonzero `$offset`: every string reachable here has
+/// `$offset == 0` (literals from `Op::ConstString` start at 0, and
+/// `phx_str_concat` produces results at offset 0). The `offset + i`
+/// arithmetic in `phx_str_eq` / `phx_print_str` and the `$offset`-
+/// honoring `array.copy` in `phx_str_concat` are therefore exercised
+/// only with offset 0. The first op that produces a nonzero offset is
+/// substring (decision K.3, a follow-up slice); the fixture that lands
+/// it must add a substring-then-{print,eq,concat} case to cover the
+/// offset path. Until then a regression that dropped the offset term
+/// would not be caught here.
+///
+/// Expected stdout: `hello\nhello, world\n5\neq-yes\nne-yes\ndiff-yes\n`.
+#[test]
+fn string_ops_run_under_wasmtime_gc() {
+    // Pulled from the canonical fixture at compile time (mirroring
+    // `struct_alloc_get_set_runs_under_wasmtime_gc`) so the test stays
+    // locked to `wasm_gc_string.phx` rather than a drifting inline copy.
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/wasm_gc_string.phx"
+    ));
+    assert_prints(
+        source,
+        "string_ops_wasm_gc",
+        b"hello\nhello, world\n5\neq-yes\nne-yes\ndiff-yes\n",
+    );
+}
+
+/// A program with no strings must carry no `$bytes` / `$string` types
+/// and no string helpers — `scan_helper_needs` is the gate, and a
+/// regression that wired the declarations unconditionally would
+/// silently grow every module. The check leans on wasmparser: a module
+/// declared as using `array.new_data` requires a `DataCount` section,
+/// so emitting one for a string-free module would now reject in
+/// validation. (Strictly the assertion is by-absence; the structural
+/// validation in `assert_prints` is the proxy that catches it.)
+#[test]
+fn string_helpers_omitted_when_unused() {
+    assert_prints(
+        "function main() {\n  print(42)\n}\n",
+        "no_strings_wasm_gc",
+        b"42\n",
+    );
+}
+
+/// Empty-string edge cases for the slice-1 string ops. The zero-length
+/// string is the boundary case for every length/offset arithmetic in
+/// the helpers, so each op is exercised with an empty operand:
+///
+/// - **`Op::ConstString("")`** — a zero-byte `array.new_data` +
+///   `struct.new $string` with `$len == 0`. `print` of it copies zero
+///   bytes, writes only the trailing newline (so stdout sees a bare
+///   blank line), and the iovec length is `1`.
+/// - **`String.length()` on `""`** — `struct.get $string $len` reads
+///   `0`.
+/// - **`Op::StringConcat` with empty operands** — `"{e}{h}{e}"`
+///   concatenates an empty left operand, then an empty right operand,
+///   so both `array.copy`s run with a zero `size` and the result is
+///   exactly `"hi"`.
+/// - **`Op::StringEq` on two empties** — lengths match at `0`, the
+///   compare loop's `i >= len` guard fires immediately, returns equal.
+/// - **`Op::StringNe` empty vs non-empty** — the length-mismatch fast
+///   path (`0 != 2`) returns not-equal, which `i32.eqz` flips to true.
+///
+/// Expected stdout: `\n0\nhi\nempty-eq\nempty-ne\n`.
+#[test]
+fn empty_string_ops_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let e: String = \"\"\n",
+        "  print(e)\n",
+        "  print(e.length())\n",
+        "  let h: String = \"hi\"\n",
+        "  print(\"{e}{h}{e}\")\n",
+        "  if e == \"\" {\n",
+        "    print(\"empty-eq\")\n",
+        "  }\n",
+        "  if e != h {\n",
+        "    print(\"empty-ne\")\n",
+        "  }\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "empty_string_ops_wasm_gc",
+        b"\n0\nhi\nempty-eq\nempty-ne\n",
+    );
+}
+
+/// `phx_print_str` hard-rejects strings whose `$len` exceeds its
+/// fixed-size linear-memory scratch buffer (`PRINT_STR_MAX_LEN`, 4095
+/// bytes) by emitting `unreachable` rather than writing past the buffer
+/// and smashing the iovec staging area below it. A 5000-byte literal
+/// clears that bound, so running the module must trap. Structural
+/// validation alone can't prove the guard fires — `unreachable` is a
+/// perfectly valid instruction — so this leans on the wasmtime
+/// execution tier (degrades to validation-only when wasmtime is absent,
+/// like [`assert_traps`]'s other callers).
+#[test]
+fn print_str_oversized_traps_under_wasmtime_gc() {
+    // 5000 > PRINT_STR_MAX_LEN (4095). The constant is `pub(super)` and
+    // not reachable from this integration test, so the threshold is
+    // restated here; if it ever grows past 5000 this literal must too.
+    let big = "x".repeat(5000);
+    let source = format!("function main() {{\n  print(\"{big}\")\n}}\n");
+    assert_traps(&source, "print_str_oversized_wasm_gc");
+}
+
 /// A struct field whose type isn't yet on the slice-3 surface (here a
 /// nested `StructRef`) must surface a clear per-slice diagnostic — not
 /// silently emit a partial declaration that later trips up

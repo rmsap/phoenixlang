@@ -1136,6 +1136,74 @@ Each target's `module_builder.rs` owns its own section-state struct because the 
 - `Op::StructAlloc` / `Op::StructGetField` / `Op::StructSetField` lowering: same `translate.rs`, under the `translate_instruction` match.
 - Fixture: `tests/fixtures/wasm_gc_struct.phx` (a focused fixture rather than carving down `features.phx`; per decision J slice 3, "or a focused new fixture if `features.phx` reaches for ops beyond MVP scope" — `features.phx` exercises strings, methods, enums, while-loops, for-loops, all of which are out of slice-3 scope, so a focused fixture is the right call).
 
+#### K.2. wasm32-gc string mapping: three-field struct over a mutable byte array
+
+**Decided:** 2026-06-05 (sub-decision under K, locked alongside PR 6's first slice — strings on wasm32-gc).
+
+**Context.** PR 6 (the WASM-GC matrix expansion, per [decision J](#j-wasm32-gc-mvp-scope-hello--fibonacci--one-struct)) opens with the String slice because strings are pervasive across the fixture corpus (most printing fixtures interpolate or compare strings) and the print-Bool / print-Float / print-String carve-outs in the existing wasm32-gc test surface (`print_bool_is_rejected_until_a_later_slice` and friends) cannot lift without a `IrType::StringRef` → WASM-type mapping in place. As with K.1, the sub-decision is recorded *before* code lands so the representation choice isn't relitigated each time a follow-up slice grows the string op surface (concat is slice 1; substring, trim, case mapping, format, etc. each land in their own slice — and each reads bytes from whatever shape this decision locks).
+
+**The "what about substring / string builder" pivot.** An earlier draft of this decision recommended a bare `(ref (array (mut i8)))` representation on the grounds that WASM-GC arrays already track their length intrinsically, so wrapping them in a struct just to "have a String type" duplicates information. That framing was structurally incomplete: it treated zero-copy substring and zero-copy `StringBuilder.finalize()` as hypothetical future requirements when they are in fact both on the Phoenix roadmap (substring is a core string operation in every language Phoenix benchmarks against, and a string builder is the Phase 2.7 [`ListBuilder` / `MapBuilder` analog](#phase-27-benchmarking) that Phoenix will need once string-heavy workloads come into perf scope). Once those requirements are first-class, the bare-array shape forces both operations to be O(n) (substring copies bytes, builder finalize copies the assembled payload into a right-sized array). The right shape supports both as O(1) view-style operations — and that shape has to be chosen *now*, because changing the WASM type of `IrType::StringRef` later would require rewriting every concat / equality / format / interpolation / print site that emits string ops, and the language ecosystem (any downstream WASM-GC consumer that links against a Phoenix module's exports) would face an ABI break.
+
+**Chosen — the three-field shape, labelled (b') below** (a prime extension of the two-field alternative (b), adding an explicit `$offset`; the per-op cost table and the alternatives list further down both reference this label). `IrType::StringRef` lowers to `(ref null $string)` where `$string` is the nominal WASM-GC type:
+
+```
+(type $bytes  (array (mut i8)))
+(type $string (struct
+  (field $data   (ref $bytes))
+  (field $offset i32)
+  (field $len    i32)))
+```
+
+Three fields:
+
+- **`$data`** — a non-null reference to the underlying mutable byte array. The array's WASM-level length (`array.len $data`) is the *capacity* — for an immutable Phoenix-level string it equals `$len`, but for a `StringBuilder.finalize()`-derived string it may exceed `$len`. For a substring view it may exceed `$offset + $len` by an even larger margin.
+- **`$offset`** — the byte index inside `$data` where this string starts. For a freshly-allocated string (`Op::ConstString`, `Op::StringConcat`) `$offset` is `0`. For a substring view it is the start index passed to `substring(s, start, end)`. Carrying `$offset` explicitly is what makes substring an O(1) struct.new rather than an O(n) array allocation + copy.
+- **`$len`** — the byte length of this logical string. `String.length()` is a single `struct.get $string $len` (no helper needed, no walk of the bytes).
+
+The `$bytes` array is declared with **mutable** cells (`(array (mut i8))`) — Phoenix-level immutability is enforced by sema (no IR op writes to `$bytes` after the string-producing op finishes), but the WASM-level mutability is required so the eventual `StringBuilder` can grow its array in place (append-byte path) without needing a separate mutable array type that wouldn't be assignable to `$string`'s `$data` field. The WASM-GC type system has no array-mutability subtyping that would let a `(array i8)` flow into a `(ref (array (mut i8)))` slot; choosing `(mut i8)` uniformly avoids the migration.
+
+**`IrType::StringRef` → WASM `ValType`.** Nullable concrete ref `(ref null $string)`, same nullability rationale as K.1's `StructRef` mapping: `Op::Alloca(StringRef)` slots default to `ref.null` so the WASM-local zero-init is well-typed; the first `Op::Store` writes a non-nullable `(ref $string)` from `Op::ConstString` / `Op::StringConcat` / etc. into the slot (subtype `(ref $T) <: (ref null $T)`).
+
+**Op-by-op cost under (b'):**
+
+| Op | Lowering | Cost vs. bare-array `(a)` |
+|---|---|---|
+| `Op::ConstString("hi")` | `array.new_data $bytes $data_seg <off> <len>`; `i32.const 0`; `i32.const len`; `struct.new $string` | +1 alloc (struct), +2 const pushes |
+| `String.length()` | `struct.get $string $len` | Same (1 instruction) |
+| `Op::StringConcat(a, b)` | Read each side's `$len` + `$offset` via `struct.get`; `array.new_default $bytes (a_len + b_len)`; two `array.copy` honoring source `$offset`; `struct.new $string` wrapping with `offset=0` | +1 alloc (struct), ~6 extra instructions for offset arithmetic |
+| `Op::StringEq(a, b)` | Length check via `struct.get $len`; loop reading `array.get_u $bytes (offset + i)` on each side | +1 `i32.add` per byte iteration |
+| `print(String)` | `phx_print_str` helper copies `$len` bytes starting at `$offset` from `$data` into the linear-memory iovec staging area, then `fd_write` | +1 `i32.add` per byte in the copy loop |
+| **Future** `Op::Substring(s, start, end)` | `struct.new $string s.$data (s.$offset + start) (end - start)` — zero bytes copied | O(1) vs. O(n) under (a) |
+| **Future** `StringBuilder.finalize()` | `struct.new $string builder.$data 0 builder.$len` — zero bytes copied | O(1) vs. O(n) under (a) |
+
+The per-op cost is a small bounded constant in the present, and the substring / builder savings are unbounded by string length in the future. The asymmetry is what makes (b') the right tradeoff.
+
+**Why the array stays `(array (mut i8))`, not a packed-bytes structural alternative.** WASM-GC offers `array i8` (packed i8 storage, accessed via `array.get_s` / `array.get_u`) but not a "packed bytes array of fixed length" type. The `(array i8)` form is the only available shape. The mutability question is orthogonal — chosen `mut` for StringBuilder reuse per above.
+
+**Alternatives considered:**
+
+- **(a) Bare `(ref null (array (mut i8)))`**. Simplest type declaration (1 entry), `length` is `array.len`. Rejected for the substring / builder asymmetry above — both operations would be O(n) under this shape, and migrating later would re-cost every string-touching op site.
+- **(b) Two-field struct `(struct (ref $bytes) (field $len i32))`**. Length-separation enables zero-copy StringBuilder finalize but NOT zero-copy substring (substring needs `$offset` as well). Rejected: the increment from (b) to (b') is one extra field for a substantial future benefit; if we're paying for any struct wrapping at all, paying for the three-field shape is dominantly cheaper than the two-then-three migration cost.
+- **(c) Single-field wrapper `(struct (ref $bytes))`**. Nominal wrapper as a forward-compatibility stepping stone to (b) or (b'). Rejected: the migration to (b') is a localized codegen change in any starting shape (one helper rewrite + per-op-site updates), so the wrapper's "easier migration" benefit is small. Meanwhile (c) pays an extra `struct.get $data` on every byte access today with no current upside.
+- **`String` as `(ref null (array i8))` with `$bytes` immutable.** Rejected: forces StringBuilder to use a different array type internally (a mutable `(ref (array (mut i8)))`) with no WASM-GC casting path that would let the builder's array flow into the finalized String's `$data` slot. Builder finalize would have to allocate a fresh immutable array and copy — defeating the purpose.
+- **`i31ref`-encoded short strings + heap fallback for long ones.** Would let strings ≤ 4 bytes live in 32-bit values without allocation. Rejected for slice 1: real complexity (every read site has to test the i31 tag), unclear payoff under realistic workloads, and the dispatch tax is paid on *every* string operation forever. Reopens as a Phase 4-ish perf optimization if profiling identifies short-string allocation as a bottleneck.
+
+**PR 6 slice 1 op surface (locked alongside this decision):**
+
+- `Op::ConstString` — data-segment materialization + `array.new_data` + `struct.new`.
+- `Op::BuiltinCall("print", String)` — synthesized `phx_print_str` helper that copies `$len` bytes from `$data + $offset` into the linear-memory iovec staging area, appends a newline, and calls `fd_write`. Mirrors the existing `phx_print_i64` synthesis pattern (see `module_builder::synthesize_print_i64_helper`).
+- `Op::StringConcat` — synthesized `phx_str_concat` helper that allocates `$bytes` of combined length, `array.copy` from each operand honoring its `$offset`, then `struct.new` the result.
+- `Op::StringEq` / `Op::StringNe` — synthesized `phx_str_eq` helper (length-equal check + byte loop with offset arithmetic on both sides). `StringNe` lowers as `phx_str_eq` + `i32.eqz`.
+- `Op::BuiltinCall("String.length", _)` — inline `struct.get $string $len`, no helper.
+
+**Deferred to follow-up slices:** substring (carries the substring decision K.3, locked when the slice lands), `String.trim()` / case mapping (each its own helper), interpolation (already lowers to `Op::StringConcat`-chains today, but multi-arg concat may want its own optimized helper rather than N-1 chained `phx_str_concat` calls — open question for the slice), `print(Bool)` / `print(Float)` (separate primitive-to-string conversion helpers), `Op::StringLt` / `Op::StringLe` / `Op::StringGt` / `Op::StringGe` (lexicographic comparison helpers).
+
+**Implementation pointers (slice 1):**
+- `$string` and `$bytes` declarations: `crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs::declare_string_types` (new) — called in `compile_wasm_gc` after `declare_phoenix_structs` and before `declare_imports` so the type-section indices are stable for any function signature that mentions `StringRef`.
+- `IrType::StringRef` → `ValType::Ref` mapping: `crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs::wasm_valtypes_for`, alongside the K.1 `StructRef` arm.
+- Synthesized helpers (`phx_print_str`, `phx_str_concat`, `phx_str_eq`): `crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs` (each helper's instruction emission), dispatched by `module_builder::ModuleBuilder::declare_string_helpers`, which decides which to emit and records their indices. Mirrors the `synthesize_print_i64_helper` pattern in `module_builder.rs`.
+- Fixture: `tests/fixtures/wasm_gc_string.phx` — focused fixture exercising literal printing, concat (interpolation), equality (both directions), and length.
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)

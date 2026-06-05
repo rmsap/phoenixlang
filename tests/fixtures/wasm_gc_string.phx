@@ -1,0 +1,25 @@
+function main() {
+  let greeting: String = "hello"
+  print(greeting)
+
+  // Concat via interpolation lowers to Op::StringConcat-chains.
+  let name: String = "world"
+  print("hello, {name}")
+
+  // String.length returns Int.
+  print(greeting.length())
+
+  // Equality and inequality. The length-mismatch fast path (`!=
+  // "world"`, different length) and the same-length byte-by-byte
+  // mismatch path (`"abc" != "abd"`) are both exercised so a
+  // regression in either branch of `phx_str_eq` shows up here.
+  if greeting == "hello" {
+    print("eq-yes")
+  }
+  if greeting != "world" {
+    print("ne-yes")
+  }
+  if "abc" != "abd" {
+    print("diff-yes")
+  }
+}

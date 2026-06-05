@@ -92,11 +92,25 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(idx),
             })])
         }
+        IrType::StringRef => {
+            // Nullable concrete ref. Same nullability rationale as
+            // K.1's `StructRef` mapping: `Op::Alloca(StringRef)` slots
+            // default to `ref.null` (WASM's zero-init for ref-typed
+            // locals), and the first `Op::Store` writes a non-nullable
+            // `(ref $string)` from `Op::ConstString` / `Op::StringConcat`
+            // into the slot via the `(ref $T) <: (ref null $T)`
+            // subtype. See §Phase 2.4 decision K.2.
+            let idx = b.require_string_type_idx()?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(idx),
+            })])
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
-             (Phase 2.4 PR 5 slices 1-3 cover Int / Bool / Float / Void / \
-              StructRef; closures / lists / maps / strings / enums / dyn \
-              land in PR 6)"
+             (Phase 2.4 PR 5 slices 1-3 + PR 6 slice 1 cover Int / Bool / \
+              Float / Void / StructRef / StringRef; closures / lists / \
+              maps / enums / dyn land in PR 6 follow-up slices)"
         ))),
     }
 }
@@ -571,6 +585,88 @@ fn translate_instruction(
         // parallel `ValueId → struct_name` map.
         Op::StructAlloc(name, vals) => translate_struct_alloc(ctx, b, ir_module, name, vals, instr),
         Op::StructGetField(obj, field_idx) => translate_struct_get(ctx, b, *obj, *field_idx, instr),
+        // String ops — see §Phase 2.4 decision K.2. `$string` is a
+        // 3-field struct over a mutable `$bytes` array; ConstString
+        // emits a passive data segment + `array.new_data` + `struct.new`,
+        // concat / equality dispatch to synthesized helpers, length
+        // lowers inline as `struct.get $string $len`.
+        Op::ConstString(s) => {
+            let vid = expect_result(instr, "Op::ConstString")?;
+            let string_idx = b.require_string_type_idx()?;
+            let bytes_idx = b.require_bytes_type_idx()?;
+            let bytes = s.as_bytes();
+            let seg_idx = b.reserve_string_data(bytes);
+            // `array.new_data` allocates a fresh `(ref $bytes)` of
+            // length `bytes.len()` and copies `bytes.len()` bytes from
+            // segment `seg_idx` starting at offset 0. The bytes live in
+            // both the data segment (read-only at runtime) and the
+            // heap array; this duplication is the WASM-GC convention
+            // for literal materialization — there's no "borrow from
+            // data segment" pattern for managed-ref arrays.
+            ctx.emit(Instruction::I32Const(0)); // data segment offset
+            ctx.emit(Instruction::I32Const(bytes.len() as i32)); // size
+            ctx.emit(Instruction::ArrayNewData {
+                array_type_index: bytes_idx,
+                array_data_index: seg_idx,
+            });
+            // Wrap with $offset = 0, $len = bytes.len(). Newly
+            // constructed strings start at offset 0 of their own
+            // freshly-allocated byte array.
+            ctx.emit(Instruction::I32Const(0));
+            ctx.emit(Instruction::I32Const(bytes.len() as i32));
+            ctx.emit(Instruction::StructNew(string_idx));
+            let wasm_ty = ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(string_idx),
+            });
+            let local = ctx.allocate_local(vid, wasm_ty);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        Op::StringConcat(a, b_vid) => {
+            let vid = expect_result(instr, "Op::StringConcat")?;
+            let string_idx = b.require_string_type_idx()?;
+            let concat_idx = b.require_str_concat_idx()?;
+            let a_local = ctx.binding_of(*a)?;
+            let b_local = ctx.binding_of(*b_vid)?;
+            ctx.emit(Instruction::LocalGet(a_local));
+            ctx.emit(Instruction::LocalGet(b_local));
+            ctx.emit(Instruction::Call(concat_idx));
+            let wasm_ty = ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(string_idx),
+            });
+            let local = ctx.allocate_local(vid, wasm_ty);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        Op::StringEq(a, b_vid) => {
+            let vid = expect_result(instr, "Op::StringEq")?;
+            let eq_idx = b.require_str_eq_idx()?;
+            let a_local = ctx.binding_of(*a)?;
+            let b_local = ctx.binding_of(*b_vid)?;
+            ctx.emit(Instruction::LocalGet(a_local));
+            ctx.emit(Instruction::LocalGet(b_local));
+            ctx.emit(Instruction::Call(eq_idx));
+            let local = ctx.allocate_local(vid, ValType::I32);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        Op::StringNe(a, b_vid) => {
+            let vid = expect_result(instr, "Op::StringNe")?;
+            let eq_idx = b.require_str_eq_idx()?;
+            let a_local = ctx.binding_of(*a)?;
+            let b_local = ctx.binding_of(*b_vid)?;
+            ctx.emit(Instruction::LocalGet(a_local));
+            ctx.emit(Instruction::LocalGet(b_local));
+            ctx.emit(Instruction::Call(eq_idx));
+            // NE = !EQ — flip the helper's 0/1 result with i32.eqz
+            // (0 → 1, 1 → 0).
+            ctx.emit(Instruction::I32Eqz);
+            let local = ctx.allocate_local(vid, ValType::I32);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
         Op::StructSetField(obj, field_idx, val) => {
             translate_struct_set(ctx, b, *obj, *field_idx, *val)
         }
@@ -818,20 +914,58 @@ fn translate_builtin_call(
     b: &mut ModuleBuilder,
     name: &str,
     args: &[ValueId],
-    _instr: &phoenix_ir::instruction::Instruction,
+    instr: &phoenix_ir::instruction::Instruction,
 ) -> Result<(), CompileError> {
     match name {
         "print" => translate_print(ctx, b, args),
+        "String.length" => translate_string_length(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: builtin `{other}` not yet supported \
-             (PR 5 slice 1 covers `print(Int)` only)"
+             (PR 5 slice 1 covers `print(Int)`; PR 6 slice 1 adds \
+              `print(String)` and `String.length`)"
         ))),
     }
 }
 
+/// `String.length(s) -> Int` — inline as `struct.get $string $len(2)`,
+/// then `i64.extend_i32_u` so the result is the i64 Phoenix `Int`
+/// expects. No helper; the cost is two instructions plus a 32→64
+/// extension.
+fn translate_string_length(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "BuiltinCall(\"String.length\")")?;
+    if args.len() != 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `BuiltinCall(\"String.length\")` requires 1 arg \
+             (the string), got {} (internal compiler bug — IR verifier \
+             should have caught this)",
+            args.len()
+        )));
+    }
+    let string_idx = b.require_string_type_idx()?;
+    let recv_local = ctx.binding_of(args[0])?;
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: string_idx,
+        field_index: 2,
+    });
+    // Phoenix `Int` is i64; widen the i32 length unsigned (lengths are
+    // non-negative — a negative value here would indicate a corrupt
+    // string struct, which our codegen never produces).
+    ctx.emit(Instruction::I64ExtendI32U);
+    let local = ctx.allocate_local(vid, ValType::I64);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
 /// `print(value)` — dispatch on the value's Phoenix `IrType` to the
-/// matching synthesized helper. MVP supports `Int` only; other types
-/// land in subsequent slices.
+/// matching synthesized helper. Supports `Int` (PR 5 slice 1) and
+/// `String` (PR 6 slice 1); `Bool` and `Float` land in follow-up
+/// slices.
 fn translate_print(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
@@ -842,26 +976,36 @@ fn translate_print(
             "wasm32-gc: `print(...)` requires 1 argument (internal compiler bug)".to_string(),
         )
     })?;
-    // Dispatch on the binding's WASM `ValType`, which is unambiguous
-    // because every supported scalar (`Int`, `Bool`, `Float`) occupies
-    // a distinct `ValType`. Slice 1 only synthesizes `phx_print_i64`,
-    // so anything other than `i64` (e.g. a `Bool`, which sema's
-    // unconstrained `print` does accept) must error here rather than
-    // silently emit a `Call` against a mismatched signature — that
-    // would produce a structurally invalid module.
+    // Dispatch on the binding's WASM `ValType`. `i64` → `phx_print_i64`;
+    // a concrete struct ref with `HeapType::Concrete(idx)` matching the
+    // `$string` index → `phx_print_str`. Anything else (Bool, Float,
+    // user struct, list, etc.) errors with a per-slice diagnostic —
+    // silently emitting a `Call` against a mismatched signature would
+    // produce a structurally invalid module.
     let arg_local = ctx.binding_of(arg_vid)?;
     let arg_ty = ctx.binding_type_of(arg_vid)?;
-    if arg_ty != ValType::I64 {
-        return Err(CompileError::new(format!(
-            "wasm32-gc MVP: `print(...)` supports `Int` arguments only in PR 5 \
-             slice 1 (got a value lowered to WASM `{arg_ty:?}`); `Bool` / `Float` \
-             / `String` printing lands in later slices"
-        )));
+    if arg_ty == ValType::I64 {
+        let print_i64_idx = b.require_print_i64_idx()?;
+        ctx.emit(Instruction::LocalGet(arg_local));
+        ctx.emit(Instruction::Call(print_i64_idx));
+        return Ok(());
     }
-    let print_i64_idx = b.require_print_i64_idx()?;
-    ctx.emit(Instruction::LocalGet(arg_local));
-    ctx.emit(Instruction::Call(print_i64_idx));
-    Ok(())
+    if let ValType::Ref(RefType {
+        heap_type: HeapType::Concrete(idx),
+        ..
+    }) = arg_ty
+        && Some(idx) == b.string_type_idx_if_set()
+    {
+        let print_str_idx = b.require_print_str_idx()?;
+        ctx.emit(Instruction::LocalGet(arg_local));
+        ctx.emit(Instruction::Call(print_str_idx));
+        return Ok(());
+    }
+    Err(CompileError::new(format!(
+        "wasm32-gc: `print(...)` supports `Int` and `String` arguments \
+         (got a value lowered to WASM `{arg_ty:?}`); `Bool` / `Float` \
+         printing land in follow-up slices"
+    )))
 }
 
 /// Translate a basic-block terminator. `dispatcher` is `Some` for

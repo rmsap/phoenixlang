@@ -11,26 +11,34 @@
 //!   surface.
 //! - **Synthesized helpers.** The codegen crate ships its own print
 //!   helpers as WASM bytecode (function indices assigned during
-//!   [`Self::declare_print_helper`]). Slice 1 synthesizes
-//!   `phx_print_i64`; user-side `print(Int)` call sites resolve to that
-//!   function index, not to a merged runtime symbol. The `String`
-//!   helper (`phx_print_str`) is deferred to a later slice.
-//! - **Small linear memory.** Only used for WASI iovec staging and
-//!   user string literals during the MVP phase. No GC heap lives
-//!   here; the host VM manages WASM-GC objects.
+//!   [`Self::declare_print_helper`]). PR 5 introduced `phx_print_i64`;
+//!   PR 6 slice 1 adds `phx_print_str`, `phx_str_concat`, and
+//!   `phx_str_eq`. Each is synthesized only when the IR module
+//!   actually needs it (a `BuiltinCall("print", String)` site for
+//!   `phx_print_str`, an `Op::StringConcat` for `phx_str_concat`, etc.)
+//!   — a module that uses no strings carries no string helpers and no
+//!   `$bytes` / `$string` type declarations.
+//! - **Small linear memory.** WASI's `fd_write` only reads linear
+//!   memory, so `phx_print_str` copies the source string's bytes out of
+//!   its WASM-GC `(array i8)` into a linear-memory scratch buffer
+//!   before calling `fd_write`. The buffer sizes are sized for typical
+//!   fixture output; oversized strings are rejected up-front rather
+//!   than silently truncated.
 //!
 //! Section emission order follows the WASM spec: type → import →
 //! function → table → memory → global → export → code → data.
 
 use std::collections::HashMap;
 
-use phoenix_ir::instruction::FuncId;
+use phoenix_ir::instruction::{FuncId, Op, ValueId};
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
+use wasm_encoder::ValType;
 
 use crate::error::CompileError;
 
 use super::super::type_interner::TypeInterner;
+use super::string_helpers;
 use super::translate;
 
 /// Linear-memory layout used by the synthesized print helper. Sizes
@@ -47,7 +55,7 @@ use super::translate;
 /// User string literals (`Op::ConstString`) will claim a region above
 /// the scratch buffer once the `String` slice lands; that slice adds
 /// the data cursor and the reservation helper back.
-const IOVEC_OFFSET: u32 = 8;
+pub(super) const IOVEC_OFFSET: u32 = 8;
 const NWRITTEN_OFFSET: u32 = 16;
 /// Scratch buffer for `phx_print_i64`'s digit conversion. 32 bytes
 /// holds the worst case i64 string representation (sign byte, 19
@@ -56,11 +64,26 @@ const NWRITTEN_OFFSET: u32 = 16;
 /// writes from the end backward.
 const PRINT_I64_BUF_START: u32 = 32;
 const PRINT_I64_BUF_END: u32 = PRINT_I64_BUF_START + 32;
+/// Scratch buffer for `phx_print_str`'s array → linear-memory copy.
+/// `fd_write` only reads linear memory, so the helper must copy the
+/// source string's bytes out of its `(array i8)` before staging the
+/// iovec. 4096 bytes is more than any fixture's printed line needs
+/// — fixtures print short labels and interpolated values, never
+/// multi-KiB blobs — and the helper hard-rejects strings whose `len + 1`
+/// (newline) would overflow the buffer rather than silently truncating.
+pub(super) const PRINT_STR_BUF_START: u32 = PRINT_I64_BUF_END;
+const PRINT_STR_BUF_END: u32 = PRINT_STR_BUF_START + 4096;
+/// Largest string `phx_print_str` accepts in one call. Equal to the
+/// buffer size minus one byte for the trailing newline. Sized to fit
+/// inside one WASM page (alongside the iovec / nwritten staging and
+/// the `phx_print_i64` scratch).
+pub(super) const PRINT_STR_MAX_LEN: u32 = PRINT_STR_BUF_END - PRINT_STR_BUF_START - 1;
 
-/// Memory pages declared for the module. One 64-KiB page is far more
-/// than the MVP needs (`hello.phx` writes ~14 bytes of literal text
-/// plus 12 bytes of iovec staging) but matches the minimum a host
-/// can deliver without extra `memory.grow` calls.
+/// Memory pages declared for the module. One 64-KiB page is more than
+/// enough for the iovec staging (12 bytes), the `phx_print_i64`
+/// scratch (32 bytes), and the `phx_print_str` scratch (4096 bytes)
+/// combined. Grows in a later slice if a longer-lines requirement
+/// emerges.
 const MEMORY_PAGES: u64 = 1;
 
 pub(super) struct ModuleBuilder {
@@ -126,6 +149,50 @@ pub(super) struct ModuleBuilder {
     /// index would otherwise yield a module `wasmparser` only rejects
     /// deep in binary decoding. Populated alongside [`Self::phx_structs`].
     phx_struct_field_counts: HashMap<u32, u32>,
+
+    /// WASM type-section index of `(array (mut i8))` — the byte storage
+    /// array for Phoenix strings. Populated by
+    /// [`Self::declare_string_types`] when the module uses any string
+    /// ops; consulted by `Op::ConstString` lowering (via
+    /// `array.new_data`) and by the synthesized string helpers.
+    /// See §Phase 2.4 decision K.2.
+    bytes_type_idx: Option<u32>,
+
+    /// WASM type-section index of `(struct (ref $bytes) (field $offset
+    /// i32) (field $len i32))` — the nominal Phoenix `String` type.
+    /// Populated by [`Self::declare_string_types`]; consulted by the
+    /// `IrType::StringRef` → WASM `ValType` mapping and by every
+    /// string op site.
+    string_type_idx: Option<u32>,
+
+    /// WASM function index of the synthesized `phx_print_str` helper
+    /// — copies a string's bytes from `$data + $offset` for `$len`
+    /// bytes into the linear-memory iovec scratch buffer, appends a
+    /// newline, and calls `fd_write`. Populated by
+    /// [`Self::declare_string_helpers`] when the IR module calls
+    /// `print` with a String argument.
+    print_str_idx: Option<u32>,
+
+    /// WASM function index of the synthesized `phx_str_concat` helper
+    /// — allocates a fresh `$bytes` of combined length, `array.copy`s
+    /// from each operand honoring `$offset`, and `struct.new`s the
+    /// result. Populated by [`Self::declare_string_helpers`] when the
+    /// IR module emits `Op::StringConcat`.
+    str_concat_idx: Option<u32>,
+
+    /// WASM function index of the synthesized `phx_str_eq` helper —
+    /// length-equal check followed by a byte-by-byte loop with
+    /// offset arithmetic on each side. Returns `1` if equal, `0`
+    /// otherwise. Populated by [`Self::declare_string_helpers`] when
+    /// the IR module emits `Op::StringEq` or `Op::StringNe`.
+    str_eq_idx: Option<u32>,
+
+    /// Count of passive data segments emitted so far. Required up
+    /// front for the WASM `DataCount` section, which the validator
+    /// reads to know how many data segments exist before it sees the
+    /// data section itself — `array.new_data` instructions need that
+    /// count for validation. Bumped by [`Self::reserve_string_data`].
+    data_segment_count: u32,
 }
 
 impl ModuleBuilder {
@@ -146,7 +213,118 @@ impl ModuleBuilder {
             phx_user_funcs: HashMap::new(),
             phx_structs: HashMap::new(),
             phx_struct_field_counts: HashMap::new(),
+            bytes_type_idx: None,
+            string_type_idx: None,
+            print_str_idx: None,
+            str_concat_idx: None,
+            str_eq_idx: None,
+            data_segment_count: 0,
         }
+    }
+
+    /// Declare the two nominal WASM-GC types that back Phoenix's
+    /// `String`: `(array (mut i8))` for byte storage and
+    /// `(struct (ref $bytes) (field $offset i32) (field $len i32))` for
+    /// the three-field wrapper.  See §Phase 2.4 decision K.2 for the
+    /// shape rationale (substring views + StringBuilder.finalize() as
+    /// O(1) struct.new operations).
+    ///
+    /// Must run *before* any function signature is interned, because
+    /// a signature whose param or return is `IrType::StringRef` encodes
+    /// `HeapType::Concrete($string_idx)` inline — declaring the string
+    /// types afterwards would have the signature reference an
+    /// unallocated type-section slot. (The struct types declared by
+    /// `declare_phoenix_structs` are still emitted first, so the type
+    /// section reads: Phoenix structs → `$bytes` → `$string` → function
+    /// signatures.)
+    pub(super) fn declare_string_types(&mut self) {
+        debug_assert!(
+            self.bytes_type_idx.is_none() && self.string_type_idx.is_none(),
+            "wasm32-gc: `declare_string_types` called twice"
+        );
+        // `$bytes` — mutable byte array. Mutability is required so the
+        // future `StringBuilder` can grow its array in place; sema
+        // enforces Phoenix-level immutability of finalized strings.
+        let bytes_field = wasm_encoder::FieldType {
+            element_type: wasm_encoder::StorageType::I8,
+            mutable: true,
+        };
+        let bytes_idx = self.types.declare_array(bytes_field);
+        self.bytes_type_idx = Some(bytes_idx);
+        // `$string` — (ref $bytes, $offset i32, $len i32). Phoenix-level
+        // immutability of a finalized String is a sema invariant, not a
+        // WASM one: no IR op emits `struct.set` against a `$string` (even
+        // StringBuilder.finalize() produces a fresh struct), so the WASM
+        // field mutability is free to choose. Pick `mutable: true`
+        // uniformly so the shape mirrors the structs declared by K.1 and
+        // a future builder-finalize that reuses the slot works without
+        // retyping.
+        let data_field = wasm_encoder::FieldType {
+            element_type: wasm_encoder::StorageType::Val(wasm_encoder::ValType::Ref(
+                wasm_encoder::RefType {
+                    nullable: false,
+                    heap_type: wasm_encoder::HeapType::Concrete(bytes_idx),
+                },
+            )),
+            mutable: true,
+        };
+        let i32_field = wasm_encoder::FieldType {
+            element_type: wasm_encoder::StorageType::Val(wasm_encoder::ValType::I32),
+            mutable: true,
+        };
+        let string_idx = self
+            .types
+            .declare_struct(&[data_field, i32_field, i32_field]);
+        self.string_type_idx = Some(string_idx);
+    }
+
+    /// Non-erroring peek at the `$string` type-section index. Used by
+    /// `translate_print`'s WASM-`ValType`-based dispatch: it matches
+    /// the receiver's `HeapType::Concrete(idx)` against this, falling
+    /// through to a generic "unsupported print arg" diagnostic for
+    /// any other ref type. Returns `None` if the module never declared
+    /// the string types (i.e. doesn't use strings).
+    pub(super) fn string_type_idx_if_set(&self) -> Option<u32> {
+        self.string_type_idx
+    }
+
+    /// WASM type-section index of the `$bytes` array. Required by
+    /// `Op::ConstString` (for the `array.new_data` instruction) and by
+    /// every string-helper synthesizer.
+    pub(super) fn require_bytes_type_idx(&self) -> Result<u32, CompileError> {
+        self.bytes_type_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `$bytes` type requested before \
+                 `declare_string_types` ran — the IR module uses strings \
+                 but the helper-needs scan missed it (internal compiler bug)",
+            )
+        })
+    }
+
+    /// WASM type-section index of the `$string` struct. Required by
+    /// `IrType::StringRef` → WASM ValType mapping and by every
+    /// string-producing op.
+    pub(super) fn require_string_type_idx(&self) -> Result<u32, CompileError> {
+        self.string_type_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `$string` type requested before \
+                 `declare_string_types` ran — the IR module uses strings \
+                 but the helper-needs scan missed it (internal compiler bug)",
+            )
+        })
+    }
+
+    /// Reserve a passive data segment carrying `bytes`, return its
+    /// segment index. `Op::ConstString` lowering then emits
+    /// `array.new_data $bytes_type_idx $segment_idx` which allocates a
+    /// fresh array and copies bytes from the segment into it.
+    /// One segment per literal — no interning of identical strings
+    /// in the MVP; revisit if module-size pressure surfaces.
+    pub(super) fn reserve_string_data(&mut self, bytes: &[u8]) -> u32 {
+        let idx = self.data_segment_count;
+        self.data.passive(bytes.iter().copied());
+        self.data_segment_count += 1;
+        idx
     }
 
     /// Declare one nominal WASM-GC struct type per Phoenix struct in
@@ -453,6 +631,27 @@ impl ModuleBuilder {
         idx
     }
 
+    /// Intern a function signature and return its type-section index.
+    /// Exposed so the string-helper synthesizers in
+    /// [`super::string_helpers`] can declare their own signatures
+    /// without reaching into the private [`TypeInterner`].
+    pub(super) fn intern_signature(&mut self, params: &[ValType], returns: &[ValType]) -> u32 {
+        self.types.intern(params, returns)
+    }
+
+    /// Append an immediate-emit helper: declare a function with
+    /// signature `sig` in the function section, emit `body` into the
+    /// code section, and return the helper's WASM function index. The
+    /// function/code parallelism that [`Self::finish`] guards holds as
+    /// long as callers emit the body in the same call that declares the
+    /// signature — which this method enforces. Exposed for
+    /// [`super::string_helpers`].
+    pub(super) fn add_and_emit_function(&mut self, sig: u32, body: &wasm_encoder::Function) -> u32 {
+        let idx = self.add_local_function(sig);
+        self.code.function(body);
+        idx
+    }
+
     /// Declare every concrete Phoenix function (assign it a WASM
     /// function index + a type-section signature) and record `main`'s
     /// index for `_start` to call. MVP scope: every Phoenix function's
@@ -591,6 +790,83 @@ impl ModuleBuilder {
         })
     }
 
+    /// Index of the synthesized `phx_print_str` helper.
+    pub(super) fn require_print_str_idx(&self) -> Result<u32, CompileError> {
+        self.print_str_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_print_str` helper index requested before \
+                 `declare_string_helpers` ran with `needs_print_str = true` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `print(String)` call site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_str_concat` helper.
+    pub(super) fn require_str_concat_idx(&self) -> Result<u32, CompileError> {
+        self.str_concat_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_str_concat` helper index requested before \
+                 `declare_string_helpers` ran with `needs_str_concat = true` \
+                 (internal compiler bug — `scan_helper_needs` missed an \
+                 `Op::StringConcat` site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_str_eq` helper.
+    pub(super) fn require_str_eq_idx(&self) -> Result<u32, CompileError> {
+        self.str_eq_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_str_eq` helper index requested before \
+                 `declare_string_helpers` ran with `needs_str_eq = true` \
+                 (internal compiler bug — `scan_helper_needs` missed an \
+                 `Op::StringEq` / `Op::StringNe` site)",
+            )
+        })
+    }
+
+    /// Synthesize whichever string helpers `needs` flags. Each helper
+    /// is emitted in dependency order: `phx_print_str` and
+    /// `phx_str_concat` are independent of each other but both depend
+    /// on the `$bytes` / `$string` types being declared (so
+    /// [`Self::declare_string_types`] must run first). The function
+    /// indices are stored on `self` for the translator to look up at
+    /// call sites.
+    ///
+    /// **Helper synthesis order matters** because the function /
+    /// code-section invariant (every immediate-emit helper precedes
+    /// every declare-now / emit-later function) requires helpers to
+    /// land before `declare_phoenix_functions` and `declare_start`.
+    /// All four string helpers are declare-and-emit-in-one-call, so
+    /// the order among them is free; pick a consistent one for stable
+    /// diffs.
+    ///
+    /// The instruction-level synthesis lives in
+    /// [`super::string_helpers`]; this method is the thin dispatcher
+    /// that decides which helpers to emit and records their indices.
+    pub(super) fn declare_string_helpers(
+        &mut self,
+        needs: HelperNeeds,
+    ) -> Result<(), CompileError> {
+        if needs.print_str {
+            let fd_write_idx = self.fd_write_idx.ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-gc: `phx_print_str` needs `fd_write`, but \
+                     `declare_imports` did not run (internal compiler bug)",
+                )
+            })?;
+            self.print_str_idx = Some(string_helpers::synthesize_print_str(self, fd_write_idx)?);
+        }
+        if needs.str_concat {
+            self.str_concat_idx = Some(string_helpers::synthesize_str_concat(self)?);
+        }
+        if needs.str_eq {
+            self.str_eq_idx = Some(string_helpers::synthesize_str_eq(self)?);
+        }
+        Ok(())
+    }
+
     /// Finalize the module and return the raw bytes. Section order
     /// follows the WASM spec.
     pub(super) fn finish(self) -> Result<Vec<u8>, CompileError> {
@@ -618,10 +894,134 @@ impl ModuleBuilder {
         module.section(&self.functions);
         module.section(&self.memories);
         module.section(&self.exports);
+        // The DataCount section is REQUIRED by WASM validation when
+        // any instruction references a data segment (`array.new_data`,
+        // `memory.init`, `data.drop`). Validators read DataCount
+        // up-front so they can verify segment-index operands before
+        // they encounter the Data section itself. Emit only when we
+        // actually have data segments — a module with no string
+        // literals carries none.
+        if self.data_segment_count > 0 {
+            module.section(&wasm_encoder::DataCountSection {
+                count: self.data_segment_count,
+            });
+        }
         module.section(&self.code);
         module.section(&self.data);
         Ok(module.finish())
     }
+}
+
+/// What string helpers / type declarations a given IR module needs.
+/// Populated by [`scan_helper_needs`]. The fields are strict subsets
+/// — `print_str` implies `string_types`, `str_concat` implies
+/// `string_types`, etc. — so the field-by-field check at synthesis
+/// time stays simple (each helper checks only its own flag) and the
+/// scanner is the single place that knows the dependency graph.
+#[derive(Default, Clone, Copy)]
+pub(super) struct HelperNeeds {
+    /// True iff `$bytes` and `$string` must be declared. Set whenever
+    /// any `IrType::StringRef` appears anywhere in the module — as an
+    /// instruction's `result_type`, a function param/return, or a
+    /// block param.
+    pub(super) string_types: bool,
+    /// True iff at least one `BuiltinCall("print", args)` site has an
+    /// `args[0]` whose IR type is `StringRef`.
+    pub(super) print_str: bool,
+    /// True iff at least one `Op::StringConcat` appears.
+    pub(super) str_concat: bool,
+    /// True iff at least one `Op::StringEq` or `Op::StringNe` appears.
+    pub(super) str_eq: bool,
+}
+
+/// Scan the IR module to determine which string helpers and types
+/// need to be emitted. Walks every concrete function once and flips the
+/// relevant flag for each op kind encountered.
+///
+/// Resolving a `print(String)` site's argument type needs a
+/// `ValueId → IrType` map for the function, but most functions never
+/// print (and many never touch strings at all), so the map is built
+/// lazily — only the first `print(...)` call site in a function pays
+/// for it, via [`build_vid_type_map`].
+///
+/// A module that doesn't use strings returns `HelperNeeds::default()`
+/// — all fields `false` — which the pipeline reads as "skip all
+/// string-related declarations entirely" so a string-free module
+/// carries no `$bytes` / `$string` types and no dead helper bodies.
+pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
+    let mut needs = HelperNeeds::default();
+    for func in ir_module.concrete_functions() {
+        // Built on first use (see the lazy `get_or_insert_with` below).
+        let mut vid_types: Option<HashMap<ValueId, IrType>> = None;
+        // Function-level signatures contribute too: if a function takes
+        // or returns a `StringRef`, the string types have to be
+        // declared so the signature can encode them.
+        if func.return_type == IrType::StringRef || func.param_types.contains(&IrType::StringRef) {
+            needs.string_types = true;
+        }
+        for block in &func.blocks {
+            if block.params.iter().any(|(_, t)| *t == IrType::StringRef) {
+                needs.string_types = true;
+            }
+            for instr in &block.instructions {
+                if instr.result_type == IrType::StringRef {
+                    needs.string_types = true;
+                }
+                match &instr.op {
+                    Op::ConstString(_) => {
+                        needs.string_types = true;
+                    }
+                    Op::StringConcat(_, _) => {
+                        needs.string_types = true;
+                        needs.str_concat = true;
+                    }
+                    Op::StringEq(_, _) | Op::StringNe(_, _) => {
+                        needs.string_types = true;
+                        needs.str_eq = true;
+                    }
+                    Op::BuiltinCall(name, args) if name == "print" => {
+                        let vid_types = vid_types.get_or_insert_with(|| build_vid_type_map(func));
+                        if let Some(arg_vid) = args.first()
+                            && vid_types.get(arg_vid) == Some(&IrType::StringRef)
+                        {
+                            needs.string_types = true;
+                            needs.print_str = true;
+                        }
+                    }
+                    Op::BuiltinCall(name, _) if name == "String.length" => {
+                        // `String.length` lowers inline as `struct.get
+                        // $string $len` — no helper, but it does need
+                        // the `$string` type declared.
+                        needs.string_types = true;
+                    }
+                    _ => {}
+                }
+            }
+            // Block-params and per-block scanning above covers all
+            // value-producing sites; terminators carry no types.
+        }
+    }
+    needs
+}
+
+/// Build a `ValueId → IrType` map for one function by combining (a)
+/// entry-block params (which alias function parameters), (b)
+/// non-entry block params, and (c) every instruction's `result_type`.
+/// SSA guarantees each ValueId is defined exactly once, so the map
+/// is unambiguous.
+fn build_vid_type_map(func: &phoenix_ir::module::IrFunction) -> HashMap<ValueId, IrType> {
+    let mut map = HashMap::new();
+    for block in &func.blocks {
+        for (vid, ty) in &block.params {
+            map.insert(*vid, ty.clone());
+        }
+        for instr in &block.instructions {
+            if let Some(vid) = instr.result {
+                map.insert(vid, instr.result_type.clone());
+            }
+        }
+    }
+    map
 }
 
 /// Map one Phoenix field's `IrType` to a WASM-GC `FieldType` for the
@@ -662,9 +1062,9 @@ fn wasm_field_type_for(
 
 /// Emit a `fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET); drop`
 /// sequence onto `func`. Factored out so the staging-area constants and
-/// the `drop`-of-result convention live in one place; the `phx_print_str`
-/// helper will share it when the String slice lands.
-fn emit_fd_write_call(func: &mut wasm_encoder::Function, fd_write_idx: u32) {
+/// the `drop`-of-result convention live in one place; shared by
+/// `phx_print_i64` here and `phx_print_str` in [`super::string_helpers`].
+pub(super) fn emit_fd_write_call(func: &mut wasm_encoder::Function, fd_write_idx: u32) {
     func.instruction(&wasm_encoder::Instruction::I32Const(1)); // stdout
     func.instruction(&wasm_encoder::Instruction::I32Const(IOVEC_OFFSET as i32));
     func.instruction(&wasm_encoder::Instruction::I32Const(1));

@@ -63,9 +63,10 @@ use phoenix_ir::module::IrModule;
 use crate::error::CompileError;
 
 mod module_builder;
+mod string_helpers;
 mod translate;
 
-use module_builder::ModuleBuilder;
+use module_builder::{ModuleBuilder, scan_helper_needs};
 
 /// Compile a Phoenix IR module to a WASM-GC WebAssembly module.
 ///
@@ -100,17 +101,37 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // always exported as `memory`, and the upcoming String slice stages
     // literals there regardless of whether the program prints.
     let needs_print = translate::module_calls_print(ir_module);
+    let string_needs = scan_helper_needs(ir_module);
     // Declare every Phoenix struct's nominal WASM-GC type first, so
     // any subsequent function signature whose params/returns include
     // `IrType::StructRef(name, _)` can encode the right
     // `HeapType::Concrete(struct_idx)` at intern time. See §Phase 2.4
     // decision K.1.
+    //
+    // String types (`$bytes` + `$string`) come right after — same
+    // ordering constraint, with the user-program structs preceding so
+    // their declarations don't need to forward-reference `$string` (no
+    // struct in slice 1 has a String field; the cross-cutting case is
+    // a follow-up slice). See §Phase 2.4 decision K.2.
     builder.declare_phoenix_structs(ir_module)?;
+    if string_needs.string_types {
+        builder.declare_string_types();
+    }
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();
         builder.declare_print_helper()?;
     }
+    // String helpers depend on the imports (only `phx_print_str` needs
+    // `fd_write`, but `declare_string_helpers` checks per-flag). The
+    // `fd_write` lookup inside `declare_string_helpers` is safe to rely
+    // on because `print_str` can only be set by a `print(...)` call
+    // site, which `module_calls_print` also detects — so
+    // `string_needs.print_str` implies `needs_print`, which means
+    // `declare_imports` ran just above and `fd_write_idx` is populated.
+    // The lookup still errors (rather than panics) if that invariant is
+    // ever broken by a change to `module_calls_print`.
+    builder.declare_string_helpers(string_needs)?;
 
     // Declare Phoenix user functions (so call sites can resolve their
     // WASM function indices before any body is emitted), then emit

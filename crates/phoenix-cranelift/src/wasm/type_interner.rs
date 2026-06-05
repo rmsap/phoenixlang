@@ -84,4 +84,19 @@ impl TypeInterner {
         self.section.ty().struct_(fields.iter().cloned());
         idx
     }
+
+    /// Declare a nominal WASM-GC array type with the given element
+    /// `FieldType` (element storage + mutability) and return its
+    /// type-section index. Like [`Self::declare_struct`], no dedup —
+    /// WASM-GC's type system is nominal; two `(array (mut i8))`
+    /// declarations are distinct types. Only used by the wasm32-gc
+    /// backend (the `$bytes` array under Phoenix's `String` mapping,
+    /// per §Phase 2.4 decision K.2).
+    pub(super) fn declare_array(&mut self, element: FieldType) -> u32 {
+        let idx = self.section.len();
+        self.section
+            .ty()
+            .array(&element.element_type, element.mutable);
+        idx
+    }
 }
