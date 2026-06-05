@@ -1,16 +1,29 @@
 //! Phoenix IR → WASM-GC function-body translation.
 //!
-//! Minimal MVP surface (per design-decisions §Phase 2.4 decision J):
-//! `Op::ConstI64`, `Op::BuiltinCall("print", Int)`, `Op::Alloca` /
-//! `Op::Load` / `Op::Store` (the *mutable* `let mut` lowering uses these;
-//! an immutable `let` binds its initializer's SSA value directly, so
-//! `hello.phx` never reaches this trio — see `print_int_module` and the
-//! `let mut` test in the integration suite), and `Op::Return(None)` —
-//! enough for `hello.phx`. The op surface
-//! grows incrementally in subsequent PR 5 slices (fibonacci → adds
-//! arithmetic and control flow; struct fixture → adds `Op::StructAlloc`
-//! / `Op::StructGetField` / `Op::StructSetField` lowered as
-//! `struct.new` / `struct.get` / `struct.set`).
+//! Op surface as of PR 5 slice 2 (per design-decisions §Phase 2.4
+//! decision J):
+//!
+//! - **Constants:** `Op::ConstI64`, `Op::ConstBool`.
+//! - **`let mut` lowering:** `Op::Alloca` / `Op::Load` / `Op::Store`
+//!   (immutable `let` binds its initializer's SSA value directly and
+//!   never walks these).
+//! - **Arithmetic (Int):** `Op::IAdd`, `Op::ISub`, `Op::IMul`,
+//!   `Op::IDiv`, `Op::IMod`, `Op::INeg`.
+//! - **Comparison (Int → Bool):** `Op::IEq`, `Op::INe`, `Op::ILt`,
+//!   `Op::ILe`, `Op::IGt`, `Op::IGe`.
+//! - **Bool ops:** `Op::BoolEq`, `Op::BoolNe`, `Op::BoolNot`.
+//! - **Calls:** `Op::Call(fid, [], args)` for direct user-function
+//!   calls (recursion included).
+//! - **Builtins:** `Op::BuiltinCall("print", Int)` only.
+//! - **Multi-block control flow:** loop+switch dispatcher with
+//!   `Terminator::Return(Some/None)`, `Terminator::Jump`,
+//!   `Terminator::Branch`. Block-param locals are single-slot only
+//!   today; multi-slot params (`StringRef`, `DynRef`) land later.
+//!
+//! Subsequent slices add `Op::StructAlloc` / `Op::StructGetField` /
+//! `Op::StructSetField` lowered as `struct.new` / `struct.get` /
+//! `struct.set` (slice 3), then closures / lists / maps / enums / dyn
+//! across PR 6 in matrix-expansion increments.
 //!
 //! Shadow-stack emission is suppressed entirely on this target — the
 //! host VM's GC handles tracing, so `phx_gc_push_frame` / `set_root` /
@@ -19,12 +32,12 @@
 
 use std::collections::HashMap;
 
-use phoenix_ir::block::BlockId;
+use phoenix_ir::block::{BasicBlock, BlockId};
 use phoenix_ir::instruction::{Op, ValueId};
 use phoenix_ir::module::{IrFunction, IrModule};
 use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
-use wasm_encoder::{Function, Instruction, ValType};
+use wasm_encoder::{BlockType, Function, Instruction, ValType};
 
 use super::module_builder::ModuleBuilder;
 use crate::error::CompileError;
@@ -119,6 +132,25 @@ struct FuncCtx {
     pending_locals: Vec<(u32, ValType)>,
     /// Next free WASM local index (past the function-param locals).
     next_local: u32,
+    /// Per-block destination locals for non-entry blocks, in param
+    /// declaration order. `Jump` / `Branch` lowering reads this to find
+    /// where to copy arg values when control transfers to the block.
+    /// Entry-block params are NOT listed here — they bind to function-
+    /// parameter locals at [`Self::new`] time. Single-slot only for the
+    /// MVP; multi-slot params will need a `Vec<Vec<u32>>` (one slot run
+    /// per param) when `StringRef` / `DynRef` block params land.
+    block_param_locals: HashMap<BlockId, Vec<u32>>,
+}
+
+/// Codegen-side metadata shared between the multi-block dispatcher
+/// and the terminator translator. `depth_to_loop` is the WASM label
+/// depth from the current emission point to the outer `(loop $L)` so
+/// `Jump` / `Branch` can issue `br <depth>` to re-enter the dispatch.
+/// `dispatch_local` holds the "next block ID" the `br_table` reads.
+#[derive(Debug, Clone, Copy)]
+struct DispatcherContext {
+    depth_to_loop: u32,
+    dispatch_local: u32,
 }
 
 impl FuncCtx {
@@ -153,7 +185,43 @@ impl FuncCtx {
             binding_types,
             pending_locals: Vec::new(),
             next_local,
+            block_param_locals: HashMap::new(),
         })
+    }
+
+    /// Allocate the `i32` "next block ID" dispatch local. Stable
+    /// position relative to function params guarantees an `i32.const
+    /// 0` init isn't needed — WASM zero-initializes all locals, and
+    /// `BlockId(0)` (the entry block) is the desired initial dispatch
+    /// target.
+    fn allocate_dispatch_local(&mut self) -> u32 {
+        let idx = self.next_local;
+        self.push_local_decl(ValType::I32);
+        self.next_local += 1;
+        idx
+    }
+
+    /// Register `local` as one block-param destination for the given
+    /// non-entry block. `Jump` / `Branch` lowering reads these (in
+    /// declaration order) to find where to copy arg values when control
+    /// transfers to the block. Single-slot only for the MVP; a future
+    /// multi-slot expansion stores one `Vec<u32>` slot run per param.
+    fn register_block_param(&mut self, block: BlockId, local: u32) {
+        self.block_param_locals
+            .entry(block)
+            .or_default()
+            .push(local);
+    }
+
+    /// Return the block's parameter destination locals (in declaration
+    /// order), or an empty slice if none have been registered. Empty
+    /// for the entry block (whose params alias function-parameter
+    /// locals).
+    fn block_param_locals_of(&self, block: BlockId) -> &[u32] {
+        self.block_param_locals
+            .get(&block)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn allocate_local(&mut self, vid: ValueId, wasm_ty: ValType) -> u32 {
@@ -206,11 +274,13 @@ impl FuncCtx {
     }
 }
 
-/// Translate one Phoenix function into a WASM `Function` body. MVP
-/// surface assumes a single block (no Jump / Branch terminators yet).
+/// Translate one Phoenix function into a WASM `Function` body.
+/// Single-block functions emit straight-line bodies; multi-block
+/// functions route through the loop+switch dispatcher (mirroring the
+/// wasm32-linear backend's shape per §Phase 2.4 decision G).
 pub(super) fn translate_function(
     b: &mut ModuleBuilder,
-    _ir_module: &IrModule,
+    ir_module: &IrModule,
     func: &IrFunction,
 ) -> Result<Function, CompileError> {
     if func.blocks.is_empty() {
@@ -219,28 +289,131 @@ pub(super) fn translate_function(
             func.name
         )));
     }
-    if func.blocks.len() > 1 {
-        return Err(CompileError::new(format!(
-            "wasm32-gc MVP: function `{}` has {} blocks — multi-block \
-             control flow lands in a later slice (PR 5 slice 2)",
-            func.name,
-            func.blocks.len()
-        )));
-    }
     let mut ctx = FuncCtx::new(func)?;
-    let block = &func.blocks[0];
-    for instr in &block.instructions {
-        translate_instruction(&mut ctx, b, instr)?;
+    if func.blocks.len() == 1 {
+        let block = &func.blocks[0];
+        for instr in &block.instructions {
+            translate_instruction(&mut ctx, b, ir_module, instr)?;
+        }
+        translate_terminator(&mut ctx, &block.terminator, &func.return_type, None)?;
+    } else {
+        translate_multi_block(&mut ctx, b, ir_module, func)?;
     }
-    translate_terminator(&block.terminator, &func.return_type, BlockId(0))?;
     // Every WASM function body needs an explicit `end`.
     ctx.emit(Instruction::End);
     Ok(ctx.into_function())
 }
 
+/// Emit the loop+switch dispatcher for a multi-block function.
+///
+/// Structure (for 3 blocks, bb_0..bb_2):
+///
+/// ```text
+/// loop $L                              ;; outermost
+///   block $bb_2                        ;; depth N-1
+///     block $bb_1                      ;; depth N-2
+///       block $bb_0                    ;; innermost
+///         local.get $dispatch
+///         br_table 0 1 2 0             ;; default = bb_0 (unreachable)
+///       end                            ;; close $bb_0
+///       ;; bb_0 body + terminator
+///     end                              ;; close $bb_1
+///     ;; bb_1 body + terminator
+///   end                                ;; close $bb_2
+///   ;; bb_2 body + terminator
+/// end                                  ;; close $L
+/// unreachable
+/// ```
+///
+/// Each block's terminator (`Jump` / `Branch`) writes the next
+/// `BlockId` into the dispatch local and `br $L`s back to the
+/// dispatcher; `Return` exits the function and skips the loop
+/// re-entry. The `unreachable` sentinel after the loop satisfies
+/// wasm-encoder's "function body must terminate every path" rule —
+/// in a well-formed program every block's terminator either re-enters
+/// the loop or returns, so the bytecode beyond `end $L` is genuinely
+/// dead.
+fn translate_multi_block(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &IrModule,
+    func: &IrFunction,
+) -> Result<(), CompileError> {
+    let n_blocks = func.blocks.len();
+    debug_assert!(n_blocks > 1, "translate_multi_block called with <= 1 block");
+
+    // Validate the `func.blocks[i].id == BlockId(i)` invariant up front,
+    // before any bytecode is emitted. The `br_table` dispatches by array
+    // position while `Jump` / `Branch` set the dispatch local to a
+    // `BlockId` value, so a mismatch would route control to the wrong
+    // block; checking it as a precondition keeps the emission loop below
+    // free of the concern.
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        require_block_id_matches_index(block, block_idx)?;
+    }
+
+    // Allocate the dispatch local first so its index is stable
+    // before any block-param locals get assigned. Zero-initialized,
+    // which matches the entry block (`BlockId(0)`) — no init needed.
+    let dispatch_local = ctx.allocate_dispatch_local();
+
+    // Allocate locals for non-entry block params. Entry-block params
+    // alias function-parameter locals (already bound in
+    // `FuncCtx::new`). Records are keyed by the block's own `id` (not
+    // its array position), so `Jump` / `Branch` lookups — which use
+    // the target `BlockId` — stay correct independent of array order.
+    for block in func.blocks.iter().skip(1) {
+        for (vid, ty) in &block.params {
+            let wasm_ty = single_slot(ty, "non-entry block param")?;
+            let local = ctx.allocate_local(*vid, wasm_ty);
+            ctx.register_block_param(block.id, local);
+        }
+    }
+
+    // Open the outer loop, then N labeled blocks (deepest-first so
+    // bb_0 ends up at depth 0).
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    for _ in 0..n_blocks {
+        ctx.emit(Instruction::Block(BlockType::Empty));
+    }
+    // br_table identity vector: $bb_i sits at depth i (innermost
+    // first), default = 0 (= $bb_0).
+    ctx.emit(Instruction::LocalGet(dispatch_local));
+    let table_targets: Vec<u32> = (0..n_blocks as u32).collect();
+    ctx.emit(Instruction::BrTable(
+        std::borrow::Cow::Owned(table_targets),
+        0,
+    ));
+
+    // Emit each block's body + terminator. Between consecutive
+    // bodies, close the corresponding labeled block (so the next
+    // br target's label index naturally decreases).
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        ctx.emit(Instruction::End); // close the labeled block whose body follows
+        let depth_to_loop = (n_blocks - 1 - block_idx) as u32;
+        let dispatcher = Some(DispatcherContext {
+            depth_to_loop,
+            dispatch_local,
+        });
+        for instr in &block.instructions {
+            translate_instruction(ctx, b, ir_module, instr)?;
+        }
+        translate_terminator(ctx, &block.terminator, &func.return_type, dispatcher)?;
+    }
+    // Close the outer loop. Every block ends with a terminator
+    // (`return` or `br $L`), so falling off here is impossible — emit
+    // `unreachable` to satisfy wasm-encoder's path-terminator rule.
+    ctx.emit(Instruction::End);
+    ctx.emit(Instruction::Unreachable);
+    Ok(())
+}
+
 fn translate_instruction(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
+    // Pre-threaded for later slices that consult the IR module (e.g.
+    // struct-type lookups in slice 3); unused by the slice-1/2 ops.
+    _ir_module: &IrModule,
     instr: &phoenix_ir::instruction::Instruction,
 ) -> Result<(), CompileError> {
     match &instr.op {
@@ -287,14 +460,150 @@ fn translate_instruction(
             ctx.emit(Instruction::LocalSet(slot_local));
             Ok(())
         }
+        // Integer arithmetic. Phoenix `Int` is signed i64; for `IDiv`
+        // and `IMod` we emit `i64.div_s` / `i64.rem_s`. Per the WASM
+        // spec their trap behavior differs: `div_s` traps on a zero
+        // divisor *and* on the signed-overflow case `i64::MIN / -1`,
+        // while `rem_s` traps *only* on a zero divisor — `i64::MIN %
+        // -1` does not trap and is defined to yield `0`. This mirrors
+        // the wasm32-linear backend's lowering (see its `IDiv`/`IMod`
+        // comment) and §2.2 decision *Numeric error semantics*.
+        Op::IAdd(a, b_) => emit_i64_binop(ctx, instr, *a, *b_, Instruction::I64Add),
+        Op::ISub(a, b_) => emit_i64_binop(ctx, instr, *a, *b_, Instruction::I64Sub),
+        Op::IMul(a, b_) => emit_i64_binop(ctx, instr, *a, *b_, Instruction::I64Mul),
+        Op::IDiv(a, b_) => emit_i64_binop(ctx, instr, *a, *b_, Instruction::I64DivS),
+        Op::IMod(a, b_) => emit_i64_binop(ctx, instr, *a, *b_, Instruction::I64RemS),
+        Op::INeg(a) => {
+            let vid = expect_result(instr, "Op::INeg")?;
+            let a_local = ctx.binding_of(*a)?;
+            // Two's-complement negation: 0 - x.
+            ctx.emit(Instruction::I64Const(0));
+            ctx.emit(Instruction::LocalGet(a_local));
+            ctx.emit(Instruction::I64Sub);
+            let local = ctx.allocate_local(vid, ValType::I64);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        // Integer comparisons. Result is `Bool` (i32 0/1).
+        Op::IEq(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64Eq),
+        Op::INe(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64Ne),
+        Op::ILt(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64LtS),
+        Op::ILe(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64LeS),
+        Op::IGt(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64GtS),
+        Op::IGe(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64GeS),
+        // Bool ops. `Bool` is i32 0/1 — comparison emits `i32.eq` /
+        // `i32.ne`; `not` flips via `i32.eqz` (1 → 0, 0 → 1).
+        Op::BoolEq(a, b_) => emit_i32_cmp(ctx, instr, *a, *b_, Instruction::I32Eq),
+        Op::BoolNe(a, b_) => emit_i32_cmp(ctx, instr, *a, *b_, Instruction::I32Ne),
+        Op::BoolNot(a) => {
+            let vid = expect_result(instr, "Op::BoolNot")?;
+            let a_local = ctx.binding_of(*a)?;
+            ctx.emit(Instruction::LocalGet(a_local));
+            ctx.emit(Instruction::I32Eqz);
+            let local = ctx.allocate_local(vid, ValType::I32);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        // Direct user-function call. After monomorphization,
+        // `type_args` is always empty.
+        Op::Call(func_id, type_args, args) => {
+            debug_assert!(
+                type_args.is_empty(),
+                "wasm32-gc: `Op::Call({func_id:?})` reached codegen with \
+                 unresolved type args {type_args:?}"
+            );
+            let target_idx = b.require_phx_user_func(*func_id)?;
+            for arg in args {
+                let local = ctx.binding_of(*arg)?;
+                ctx.emit(Instruction::LocalGet(local));
+            }
+            ctx.emit(Instruction::Call(target_idx));
+            match (instr.result, &instr.result_type) {
+                (Some(_), IrType::Void) => Err(CompileError::new(format!(
+                    "wasm32-gc: `Op::Call({func_id:?})` has a result binding but a \
+                     Void return type (internal compiler bug)"
+                ))),
+                (Some(vid), ty) => {
+                    let wasm_ty = single_slot(ty, "call result")?;
+                    let local = ctx.allocate_local(vid, wasm_ty);
+                    ctx.emit(Instruction::LocalSet(local));
+                    Ok(())
+                }
+                (None, IrType::Void) => Ok(()),
+                (None, ty) => Err(CompileError::new(format!(
+                    "wasm32-gc: `Op::Call({func_id:?})` returns `{ty:?}` but has \
+                     no result binding (internal compiler bug)"
+                ))),
+            }
+        }
         Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR op `{other:?}` not yet supported \
-             (Phase 2.4 PR 5 slice 1 covers `Op::ConstI64`, `Op::Alloca` / \
-              `Op::Load` / `Op::Store`, `Op::BuiltinCall(\"print\", Int)`, \
-              and `Op::Return(None)` — enough for hello.phx)"
+             (Phase 2.4 PR 5 slices 1-2 cover arithmetic / control \
+              flow / direct calls — struct ops land in slice 3, \
+              closures / lists / maps / strings in PR 6)"
         ))),
     }
+}
+
+/// Emit a binary i64 → i64 op. Loads both operands, applies the
+/// supplied WASM instruction, stores the result into a fresh i64
+/// local bound to `instr.result`.
+fn emit_i64_binop(
+    ctx: &mut FuncCtx,
+    instr: &phoenix_ir::instruction::Instruction,
+    a: ValueId,
+    b: ValueId,
+    op: Instruction<'static>,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "i64 binop")?;
+    let a_local = ctx.binding_of(a)?;
+    let b_local = ctx.binding_of(b)?;
+    ctx.emit(Instruction::LocalGet(a_local));
+    ctx.emit(Instruction::LocalGet(b_local));
+    ctx.emit(op);
+    let local = ctx.allocate_local(vid, ValType::I64);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Emit a binary i64 → Bool comparison (i64 inputs, i32 0/1 result).
+fn emit_i64_cmp(
+    ctx: &mut FuncCtx,
+    instr: &phoenix_ir::instruction::Instruction,
+    a: ValueId,
+    b: ValueId,
+    op: Instruction<'static>,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "i64 cmp")?;
+    let a_local = ctx.binding_of(a)?;
+    let b_local = ctx.binding_of(b)?;
+    ctx.emit(Instruction::LocalGet(a_local));
+    ctx.emit(Instruction::LocalGet(b_local));
+    ctx.emit(op);
+    let local = ctx.allocate_local(vid, ValType::I32);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Emit a binary i32 → Bool comparison. Used for `BoolEq` / `BoolNe`
+/// where both operands are already i32 0/1.
+fn emit_i32_cmp(
+    ctx: &mut FuncCtx,
+    instr: &phoenix_ir::instruction::Instruction,
+    a: ValueId,
+    b: ValueId,
+    op: Instruction<'static>,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "i32 cmp")?;
+    let a_local = ctx.binding_of(a)?;
+    let b_local = ctx.binding_of(b)?;
+    ctx.emit(Instruction::LocalGet(a_local));
+    ctx.emit(Instruction::LocalGet(b_local));
+    ctx.emit(op);
+    let local = ctx.allocate_local(vid, ValType::I32);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
 }
 
 fn translate_builtin_call(
@@ -348,37 +657,175 @@ fn translate_print(
     Ok(())
 }
 
-// No `FuncCtx` parameter yet: slice 1's only accepted terminator is
-// `Return(None)`, which emits nothing (the implicit return at the
-// function's `end` covers it). Slice 2 re-threads `ctx` here when
-// value-returning / branch terminators need to emit instructions.
+/// Translate a basic-block terminator. `dispatcher` is `Some` for
+/// multi-block functions and `None` for single-block (which can fall
+/// through to the function-level `end` for void return, or emit a
+/// plain `return` for value-returning).
 fn translate_terminator(
+    ctx: &mut FuncCtx,
     term: &Terminator,
     _return_type: &IrType,
-    _block_id: BlockId,
+    dispatcher: Option<DispatcherContext>,
 ) -> Result<(), CompileError> {
     match term {
         Terminator::Return(None) => {
-            // A void function returns implicitly when control reaches the
-            // closing `end` that `translate_function` appends, so no
-            // explicit `return` is emitted — it would only add dead
-            // bytecode before `end`. This is sound for slice 1 because the
-            // body is a single block whose terminator *is* the last thing
-            // before `end`. Slice 2's multi-block control flow revisits
-            // this: a `Return(None)` that is not the final block will need
-            // an explicit `return`.
+            // Always emit an explicit `return`. For single-block void
+            // functions the function-level closing `end` would cover
+            // it, but in a multi-block function an inner block's
+            // `Return(None)` is *not* the last byte before that
+            // closing `end` (there are sibling blocks afterwards),
+            // and falling through to them would mis-execute the
+            // dispatch fall-through. Emit unconditionally so both
+            // shapes are correct.
+            ctx.emit(Instruction::Return);
             Ok(())
         }
-        Terminator::Return(Some(_v)) => Err(CompileError::new(
-            "wasm32-gc MVP: value-returning `Return` lands in PR 5 slice 2 \
-             (fibonacci needs it; hello.phx is Void-returning)"
+        Terminator::Return(Some(v)) => {
+            let local = ctx.binding_of(*v)?;
+            ctx.emit(Instruction::LocalGet(local));
+            ctx.emit(Instruction::Return);
+            Ok(())
+        }
+        Terminator::Jump { target, args } => {
+            let d = require_dispatcher(dispatcher)?;
+            emit_block_param_copies(ctx, *target, args)?;
+            ctx.emit(Instruction::I32Const(target.0 as i32));
+            ctx.emit(Instruction::LocalSet(d.dispatch_local));
+            ctx.emit(Instruction::Br(d.depth_to_loop));
+            Ok(())
+        }
+        Terminator::Branch {
+            condition,
+            true_block,
+            true_args,
+            false_block,
+            false_args,
+        } => {
+            let d = require_dispatcher(dispatcher)?;
+            let cond_local = ctx.binding_of(*condition)?;
+            ctx.emit(Instruction::LocalGet(cond_local));
+            ctx.emit(Instruction::If(BlockType::Empty));
+            // Then-branch: copy args to true_block's params + set
+            // dispatch local.
+            emit_block_param_copies(ctx, *true_block, true_args)?;
+            ctx.emit(Instruction::I32Const(true_block.0 as i32));
+            ctx.emit(Instruction::LocalSet(d.dispatch_local));
+            ctx.emit(Instruction::Else);
+            emit_block_param_copies(ctx, *false_block, false_args)?;
+            ctx.emit(Instruction::I32Const(false_block.0 as i32));
+            ctx.emit(Instruction::LocalSet(d.dispatch_local));
+            ctx.emit(Instruction::End); // close if/else
+            // Both arms set the dispatch local; one `br $L` after the
+            // if/else closes covers both paths. WASM's `If`/`End`
+            // doesn't increase the visible label depth past the
+            // closing `End`, so the dispatcher's recorded
+            // `depth_to_loop` stays correct.
+            ctx.emit(Instruction::Br(d.depth_to_loop));
+            Ok(())
+        }
+        Terminator::Unreachable => {
+            ctx.emit(Instruction::Unreachable);
+            Ok(())
+        }
+        Terminator::Switch { .. } => Err(CompileError::new(
+            "wasm32-gc: `Switch` terminator not yet emitted by IR lowering \
+             — if it becomes reachable, extend the wasm32-gc terminator \
+             translator alongside the IR change"
                 .to_string(),
         )),
-        other => Err(CompileError::new(format!(
-            "wasm32-gc MVP: terminator `{other:?}` not yet supported \
-             (PR 5 slice 1 is single-block; multi-block lands in slice 2)"
-        ))),
+        Terminator::None => Err(CompileError::new(
+            "wasm32-gc: encountered `Terminator::None` (placeholder for blocks \
+             under construction) — IR verifier should have caught this"
+                .to_string(),
+        )),
     }
+}
+
+/// Copy each arg's local into the target block's matching param
+/// local. The block-param locals were allocated up-front in
+/// [`translate_multi_block`]'s pre-pass; this just emits the copy.
+///
+/// The copy is performed parallel-copy-safe: every source is pushed
+/// onto the operand stack *before* any destination is written, then the
+/// destinations are popped in reverse so dst_i receives src_i. Reading
+/// all sources before writing any destination means a jump whose args
+/// permute the target's params (e.g. a back edge that swaps two
+/// loop-carried values) lowers correctly — no source is clobbered by an
+/// earlier destination write. Today's fixtures don't exercise the swap
+/// case (join blocks take zero or one param), but the pattern costs
+/// nothing extra and removes the hazard for future loop lowerings.
+///
+/// LIMITATION: a `Jump` / `Branch` back to the **entry block**
+/// (`BlockId(0)`) with args is not handled. Entry-block params alias
+/// function-parameter locals and are deliberately *not* registered in
+/// `block_param_locals` (see [`FuncCtx::new`] and the pre-pass in
+/// [`translate_multi_block`]), so such a jump would fall into the
+/// arity-mismatch arm below and report "target has 0 params" — a
+/// misleading message for what is really "the dispatcher can't re-enter
+/// the entry block." No current lowering emits a back-edge to the entry
+/// (recursion calls the function afresh rather than jumping); loop
+/// lowering, which could, lands in a later slice and must register the
+/// entry's param destinations (or route loops through a dedicated header
+/// block) before relying on this path.
+fn emit_block_param_copies(
+    ctx: &mut FuncCtx,
+    target: BlockId,
+    args: &[ValueId],
+) -> Result<(), CompileError> {
+    let dest_locals: Vec<u32> = ctx.block_param_locals_of(target).to_vec();
+    if dest_locals.len() != args.len() {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: jump to {target:?} has {} args but the target has \
+             {} params (IR verifier should have caught this)",
+            args.len(),
+            dest_locals.len()
+        )));
+    }
+    // Push every source value first...
+    for arg in args {
+        let src_local = ctx.binding_of(*arg)?;
+        ctx.emit(Instruction::LocalGet(src_local));
+    }
+    // ...then drain into destinations in reverse (stack is LIFO, so the
+    // last source pushed pops into the last destination).
+    for dest_local in dest_locals.iter().rev() {
+        ctx.emit(Instruction::LocalSet(*dest_local));
+    }
+    Ok(())
+}
+
+/// Enforce the dispatcher's `func.blocks[i].id == BlockId(i)`
+/// invariant. The `br_table` dispatches by array position while
+/// `Jump`/`Branch` set the dispatch local to a `BlockId` value, so a
+/// mismatch would route control to the wrong block. Returns an error
+/// (rather than a `debug_assert`) so release builds fail loudly
+/// instead of emitting silently-wrong bytecode.
+fn require_block_id_matches_index(
+    block: &BasicBlock,
+    block_idx: usize,
+) -> Result<(), CompileError> {
+    let expected = BlockId(block_idx as u32);
+    if block.id != expected {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: block at array index {block_idx} has id {:?}, expected \
+             {expected:?} (dispatcher requires `func.blocks[i].id == BlockId(i)`)",
+            block.id
+        )));
+    }
+    Ok(())
+}
+
+fn require_dispatcher(
+    dispatcher: Option<DispatcherContext>,
+) -> Result<DispatcherContext, CompileError> {
+    dispatcher.ok_or_else(|| {
+        CompileError::new(
+            "wasm32-gc: `Jump` / `Branch` reached in a single-block function \
+             — the IR builder should never emit cross-block control flow \
+             in a function with one block (internal compiler bug)"
+                .to_string(),
+        )
+    })
 }
 
 fn expect_result(

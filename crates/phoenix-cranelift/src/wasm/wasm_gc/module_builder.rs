@@ -22,6 +22,9 @@
 //! Section emission order follows the WASM spec: type → import →
 //! function → table → memory → global → export → code → data.
 
+use std::collections::HashMap;
+
+use phoenix_ir::instruction::FuncId;
 use phoenix_ir::module::IrModule;
 use phoenix_ir::types::IrType;
 
@@ -98,6 +101,13 @@ pub(super) struct ModuleBuilder {
     /// [`Self::declare_phoenix_functions`] on encountering a function
     /// named `main`.
     phx_main_idx: Option<u32>,
+
+    /// Phoenix [`FuncId`] → merged-module WASM function index, populated
+    /// by [`Self::declare_phoenix_functions`]. Consulted by
+    /// `Op::Call` lowering so direct calls (including recursion) can
+    /// resolve to a concrete WASM `call` target before the called
+    /// function's body has been emitted.
+    phx_user_funcs: HashMap<FuncId, u32>,
 }
 
 impl ModuleBuilder {
@@ -115,6 +125,7 @@ impl ModuleBuilder {
             print_i64_idx: None,
             start_idx: None,
             phx_main_idx: None,
+            phx_user_funcs: HashMap::new(),
         }
     }
 
@@ -369,6 +380,20 @@ impl ModuleBuilder {
             let returns = translate::wasm_return_valtypes(&func.return_type)?;
             let sig = self.types.intern(&params, &returns);
             let wasm_idx = self.add_local_function(sig);
+            // A duplicate `FuncId` would silently overwrite the map
+            // entry, so `Op::Call` lowering would resolve recursion /
+            // direct calls to the wrong WASM target. This invariant
+            // is as load-bearing as the dispatcher's
+            // `blocks[i].id == BlockId(i)` check.
+            if let Some(prev_idx) = self.phx_user_funcs.insert(func.id, wasm_idx) {
+                return Err(CompileError::new(format!(
+                    "wasm32-gc: duplicate FuncId {:?} declared (WASM indices \
+                     {prev_idx} and {wasm_idx}) — `declare_phoenix_functions` \
+                     expects each concrete function exactly once (internal \
+                     compiler bug)",
+                    func.id
+                )));
+            }
             if func.name == "main" {
                 // The synthesized `_start` (typed `[] -> []`) calls
                 // `main` with no arguments and discards no result, so
@@ -453,6 +478,18 @@ impl ModuleBuilder {
         func.instruction(&wasm_encoder::Instruction::End);
         self.code.function(&func);
         Ok(())
+    }
+
+    /// Look up the WASM function index of a Phoenix user function by
+    /// its [`FuncId`]. Used by `Op::Call` lowering.
+    pub(super) fn require_phx_user_func(&self, id: FuncId) -> Result<u32, CompileError> {
+        self.phx_user_funcs.get(&id).copied().ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: `Op::Call({id:?})` references an unknown user function \
+                 (internal compiler bug — `declare_phoenix_functions` should have \
+                 registered every concrete function before any body is emitted)"
+            ))
+        })
     }
 
     /// Index of the synthesized `phx_print_i64` helper.
