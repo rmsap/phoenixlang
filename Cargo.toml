@@ -11,6 +11,24 @@ repository = "https://github.com/rmsap/phoenixlang"
 [profile.test]
 debug = 0
 
+# The shipped binaries (release.yml builds with `cargo build --release`) keep
+# integer-overflow checks ON. Rust's default release profile *wraps* on
+# overflow; for a compiler doing layout math, offsets, and IR indexing, a
+# silent wrap is a miscompile that produces a wrong artifact rather than a loud
+# failure. This is the production safety net for arithmetic bugs the test suite
+# doesn't cover. Note: this only affects the Rust compiler + `phoenix-runtime`,
+# NOT the arithmetic in end-users' compiled Phoenix programs (that is
+# Cranelift-generated and governed separately). Because `phoenix-runtime`
+# ships as `libphoenix_runtime.a` linked into end-user programs, this DOES
+# change runtime behavior for them: an internal overflow in a runtime helper
+# now panics (aborts the user program with a message) rather than wrapping
+# silently — the intended safety posture, surfacing a runtime bug loudly
+# instead of corrupting data. It also means `cargo test --release` inherits
+# overflow checking, so the release-profile CI gates below actually detect
+# overflow rather than silently wrapping past it.
+[profile.release]
+overflow-checks = true
+
 [workspace.dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }

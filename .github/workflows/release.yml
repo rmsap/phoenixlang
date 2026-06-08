@@ -12,7 +12,31 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # Gate: the suite must pass compiled with the SAME profile we ship
+  # (`--release`) before any artifact is built or published. ci.yml runs the
+  # suite in debug on every push; this is the last line of defense so a release
+  # binary cannot go out untested in its shipping configuration (debug_assert
+  # stripping, overflow-check, and opt-level differences all bite only here).
+  #
+  # Runs on the host arch only — the cross-compiled targets in `build` can't be
+  # executed in CI, so logic correctness is validated here on x86_64-linux and
+  # the matrix below is trusted to cross-compile the same validated source.
+  #
+  # The wasm tiers soft-skip (no wasmtime installed here): the shipped
+  # artifacts are the native `phoenix` / `phoenix-lsp` / `libphoenix_runtime.a`,
+  # not a wasm binary, so the native release suite is the artifact gate. If the
+  # wasm tier ever ships, mirror ci.yml's wasmtime install + REQUIRE gates here.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test in the release profile (the configuration we ship)
+        run: cargo test --workspace --release
+
   build:
+    needs: test
     strategy:
       matrix:
         include:

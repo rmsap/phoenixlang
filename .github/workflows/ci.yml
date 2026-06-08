@@ -80,6 +80,28 @@ jobs:
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
 
+  # Shift-left release gate: the `check` job above runs the suite in debug, but
+  # the binaries we ship are built `--release`, where `debug_assert!` is
+  # stripped, integer overflow is checked (see `[profile.release]` in
+  # Cargo.toml), and the optimizer runs. Run the suite in that profile too so a
+  # release-only divergence surfaces on the PR, not at `git tag` time. The
+  # release pipeline (release.yml) has its own hard gate; this is the early
+  # warning.
+  #
+  # Scoped to PRs and pushes to `main` (not every feature-branch push) so the
+  # second full compile doesn't tax routine pushes. Wasm tiers soft-skip here,
+  # same rationale as release.yml's `test` job — the debug `check` job is the
+  # wasm-tier gate; this job validates native release-config correctness.
+  release-test:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test in the release profile (matches shipped binaries)
+        run: cargo test --workspace --release
+
   # Phoenix Gen behavioral checks: the compile-and-lint harness (generated code
   # compiles, type-checks, lints, is formatted) AND the round-trip harness
   # (generated client ↔ generated server agree on the wire). Kept OFF the fast

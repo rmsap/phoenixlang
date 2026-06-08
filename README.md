@@ -3,7 +3,7 @@
 **A strict, statically typed programming language for full-stack web development.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-3%2C000%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-3%2C300%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Phoenix combines functional and object-oriented programming with a clean, familiar syntax and a focus on safe concurrency, async-first design, and developer productivity. Programs run on a tree-walk interpreter (`phoenix run`) or compile to native binaries via Cranelift (`phoenix build`), and API schemas can be code-generated to TypeScript, Python, Go, or OpenAPI.

@@ -174,7 +174,17 @@ impl TypeLayout {
         slot_offset: usize,
         vals: &[Value],
     ) {
-        debug_assert_eq!(
+        // Always-on (not `debug_assert_eq!`): a mismatch here means codegen is
+        // about to emit stores that write the wrong number of slots — too many
+        // walks off the object into adjacent heap memory, too few leaves slots
+        // (including GC pointers) uninitialized. Both produce a memory-unsafe
+        // *compiled artifact* with no diagnostic, the worst failure mode a
+        // compiler has. Stripping the check in release buys nothing (the cost
+        // is one comparison per store-site at compile time, zero cost in
+        // generated code), so it stays a hard `assert_eq!`. Unlike the
+        // `debug_assert!` in `map_methods` — which has a correct release
+        // fallback — there is no safe degraded behavior here.
+        assert_eq!(
             vals.len(),
             self.cl_types.len(),
             "TypeLayout::store: vals.len() ({}) must equal cl_types().len() ({})",
@@ -393,7 +403,9 @@ mod tests {
         builder.seal_block(block);
         let base = builder.ins().iconst(cl::I64, 0);
         let v = builder.ins().iconst(cl::I64, 1);
-        // StringRef wants 2 values; pass 1 → debug_assert_eq! trips.
+        // StringRef wants 2 values; pass 1 → assert_eq! trips (always-on,
+        // including release — this invariant guards against memory-unsafe
+        // codegen, so it is never stripped).
         TypeLayout::of(&IrType::StringRef).store(&mut builder, base, 0, &[v]);
     }
 }
