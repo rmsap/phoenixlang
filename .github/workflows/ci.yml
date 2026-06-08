@@ -127,8 +127,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Build the runtime static lib (uplifted to target/release/, where the
+      # release `phoenix` binary discovers it) so the native integration tests
+      # actually RUN in release profile — that's the point of this job, and
+      # native GC/codegen behavior under overflow-checks/opt is its main value.
+      # The wasm tier still soft-skips (no wasm runtime / wasmtime here); it's
+      # gated by the debug `check` job. `PHOENIX_REQUIRE_RUNTIME_LIB=1` turns a
+      # missing/undiscoverable lib into a hard failure rather than a silent skip.
+      - run: cargo build -p phoenix-runtime --release
       - name: Test in the release profile (matches shipped binaries)
         run: cargo test --workspace --release
+        env:
+          PHOENIX_REQUIRE_RUNTIME_LIB: "1"
 
   # Phoenix Gen behavioral checks: the compile-and-lint harness (generated code
   # compiles, type-checks, lints, is formatted) AND the round-trip harness

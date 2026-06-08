@@ -247,18 +247,65 @@ pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), LinkError
 #[cfg(not(target_os = "windows"))]
 fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Result<(), LinkError> {
     let platform_args = platform_link_args()?;
-    let status = std::process::Command::new("cc")
+    let output = std::process::Command::new("cc")
         .arg("-o")
         .arg(exe_path)
         .arg(obj_path)
         .arg(runtime_archive)
         .args(platform_args)
-        .status()
+        .output()
         .map_err(LinkError::SpawnLinker)?;
-    if !status.success() {
-        return Err(LinkError::LinkerFailed(status));
+    report_linker_result(output)
+}
+
+/// Check a linker invocation's result, surfacing the linker's own
+/// diagnostics. Capturing the output and re-emitting it via `eprintln!`
+/// (rather than letting the child inherit the fd) means the messages —
+/// e.g. MSVC `LNK2019` unresolved-external lines or `ld`'s messages —
+/// show up in `phoenix build`'s stderr *and* in libtest's per-test
+/// capture, instead of being written past the capture boundary.
+///
+/// Diagnostics are surfaced whether or not the link succeeded: a clean
+/// link can still emit warnings (`ld: warning: …`, duplicate-symbol
+/// notes) that the user should see — capturing the streams must not turn
+/// into silently swallowing them on success.
+///
+/// Both captured streams are re-emitted on *our* stderr, so a linker that
+/// wrote to its stdout (`cc`/`ld` rarely do; MSVC `link.exe` routinely
+/// does) lands on stderr here. That's intentional: these are diagnostics,
+/// stderr is where they belong, and it keeps them off any stdout a caller
+/// might be parsing.
+fn report_linker_result(output: std::process::Output) -> Result<(), LinkError> {
+    for line in linker_diagnostics(&output) {
+        eprintln!("{line}");
     }
-    Ok(())
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(LinkError::LinkerFailed(output.status))
+    }
+}
+
+/// Collect the linker's diagnostic streams into the lines worth echoing to
+/// the user, stderr first then stdout, skipping streams that are empty or
+/// whitespace-only. Split out from [`report_linker_result`] so the
+/// stream-selection logic is unit-testable without capturing process
+/// stderr: the `eprintln!` side effect lives in the caller, the decision of
+/// *what* to emit lives here.
+///
+/// stdout is included because MSVC's `link.exe` writes its diagnostics
+/// there rather than to stderr.
+fn linker_diagnostics(output: &std::process::Output) -> Vec<String> {
+    let mut lines = Vec::new();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        lines.push(stderr.trim_end().to_string());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        lines.push(stdout.trim_end().to_string());
+    }
+    lines
 }
 
 /// Windows: locate MSVC `link.exe` via [`cc::windows_registry`] — the same
@@ -267,10 +314,11 @@ fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Resul
 /// Developer Command Prompt, then link the object + `phoenix_runtime.lib`
 /// into a console `.exe`.
 ///
-/// The Rust-produced runtime static lib carries `/DEFAULTLIB` directives for
-/// the CRT and system libraries it needs, so that list is not hand-maintained
-/// here; the CRT also supplies `mainCRTStartup`, which calls the emitted
-/// `main`. VS Build Tools is a prerequisite (`docs/windows-native-link.md`).
+/// The object and runtime staticlib don't pull in std's system dependencies
+/// on their own, so they're appended explicitly from [`WINDOWS_SYSTEM_LIBS`]
+/// (which also selects the CRT supplying `mainCRTStartup`, the entry point
+/// that calls the emitted `main`). VS Build Tools is a prerequisite
+/// (`docs/windows-native-link.md`).
 #[cfg(target_os = "windows")]
 fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Result<(), LinkError> {
     let target = host_msvc_target();
@@ -283,19 +331,39 @@ fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Resul
     for (key, value) in tool.env() {
         command.env(key, value);
     }
-    let status = command
+    let output = command
         .arg("/NOLOGO")
         .arg("/SUBSYSTEM:CONSOLE")
         .arg(format!("/OUT:{}", exe_path.display()))
         .arg(obj_path)
         .arg(runtime_archive)
-        .status()
+        .args(WINDOWS_SYSTEM_LIBS)
+        .output()
         .map_err(LinkError::SpawnLinker)?;
-    if !status.success() {
-        return Err(LinkError::LinkerFailed(status));
-    }
-    Ok(())
+    report_linker_result(output)
 }
+
+/// System libraries a consumer must link alongside the Rust-built
+/// `phoenix_runtime.lib` on windows-msvc — the Windows analog of the Unix
+/// `-lpthread -ldl -lm` in [`SUPPORTED_PLATFORMS`]. The Cranelift-emitted
+/// object carries no `/DEFAULTLIB` directives and the Rust staticlib does not
+/// embed these, so std's references (Nt* syscalls, sockets, user profile,
+/// backtrace symbolization) would otherwise be unresolved (LNK2019/LNK1120).
+/// `/defaultlib:msvcrt` selects the dynamic CRT (supplying `mainCRTStartup`),
+/// matching how `phoenix_runtime.lib` is built.
+///
+/// Sourced from `rustc --print native-static-libs` for
+/// `x86_64-pc-windows-msvc`; regenerate with that command if a future
+/// toolchain or runtime change adds std dependencies.
+#[cfg(target_os = "windows")]
+const WINDOWS_SYSTEM_LIBS: &[&str] = &[
+    "kernel32.lib",
+    "ntdll.lib",
+    "userenv.lib",
+    "ws2_32.lib",
+    "dbghelp.lib",
+    "/defaultlib:msvcrt",
+];
 
 /// The MSVC target triple for the current Windows host, e.g.
 /// `x86_64-pc-windows-msvc`. Drives [`cc::windows_registry`] tool lookup so
@@ -771,5 +839,88 @@ mod tests {
     fn find_runtime_lib_respects_env_var() {
         let result = find_runtime_lib_resolved(Some("/custom/runtime/dir"), None);
         assert_eq!(result.as_deref(), Some("/custom/runtime/dir"));
+    }
+
+    /// Construct a synthetic `ExitStatus` for a given exit `code` so the
+    /// diagnostic-routing tests can build `std::process::Output` values
+    /// without shelling out. Construction is platform-specific: Unix
+    /// `from_raw` takes a wait-status (the exit code lives in the high
+    /// byte), Windows `from_raw` takes the raw exit code directly.
+    #[cfg(unix)]
+    fn synthetic_exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    fn synthetic_exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    fn output_with(stdout: &str, stderr: &str, code: i32) -> std::process::Output {
+        std::process::Output {
+            status: synthetic_exit_status(code),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// `linker_diagnostics` decides *which* of the linker's streams reach
+    /// the user. Covers each shape independently of the `eprintln!` side
+    /// effect: stderr-only (the `ld`/`cc` case), stdout-only (MSVC
+    /// `link.exe` writes diagnostics there), both (stderr first), and
+    /// whitespace-only streams (suppressed so a clean link prints nothing).
+    #[test]
+    fn linker_diagnostics_surfaces_nonempty_streams() {
+        // stderr only — the `ld` / `cc` case.
+        let out = output_with("", "ld: warning: something fishy\n", 0);
+        assert_eq!(
+            linker_diagnostics(&out),
+            vec!["ld: warning: something fishy".to_string()]
+        );
+
+        // stdout only — MSVC `link.exe` writes diagnostics to stdout.
+        let out = output_with("trivial.obj : error LNK2019: unresolved external\n", "", 1);
+        assert_eq!(
+            linker_diagnostics(&out),
+            vec!["trivial.obj : error LNK2019: unresolved external".to_string()]
+        );
+
+        // Both streams populated — stderr is emitted before stdout.
+        let out = output_with("on stdout\n", "on stderr\n", 1);
+        assert_eq!(
+            linker_diagnostics(&out),
+            vec!["on stderr".to_string(), "on stdout".to_string()]
+        );
+
+        // Whitespace-only streams are suppressed entirely.
+        let out = output_with("   \n", "\n\t\n", 0);
+        assert!(
+            linker_diagnostics(&out).is_empty(),
+            "whitespace-only streams should produce no diagnostic lines"
+        );
+    }
+
+    /// `report_linker_result` maps exit status to `Ok`/`LinkerFailed`
+    /// independently of whether diagnostics were present. The key
+    /// regression guard is the success-with-output case: capturing the
+    /// linker's streams must surface warnings, not swallow them, while
+    /// still returning `Ok` for a successful link.
+    #[test]
+    fn report_linker_result_maps_status_with_diagnostics_present() {
+        // Clean link that nonetheless emitted a warning still succeeds
+        // (and the warning is echoed via `eprintln!`, visible in capture).
+        let out = output_with("", "ld: warning: harmless noise\n", 0);
+        assert!(
+            report_linker_result(out).is_ok(),
+            "a successful link with warnings must return Ok, not swallow or fail"
+        );
+
+        // Non-zero exit maps to LinkerFailed even with diagnostics present.
+        let out = output_with("error LNK1120: 1 unresolved externals\n", "", 1);
+        match report_linker_result(out) {
+            Err(LinkError::LinkerFailed(_)) => {}
+            other => panic!("expected LinkerFailed, got {other:?}"),
+        }
     }
 }

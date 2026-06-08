@@ -35,8 +35,16 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Build the runtime static lib (uplifted to target/release/) so the
+      # native integration tests RUN in release profile rather than failing on
+      # a missing lib. The wasm tier still soft-skips here (no wasm runtime /
+      # wasmtime); it's gated by ci.yml's `check`. `PHOENIX_REQUIRE_RUNTIME_LIB`
+      # makes a missing lib a hard failure, not a silent skip.
+      - run: cargo build -p phoenix-runtime --release
       - name: Test in the release profile (the configuration we ship)
         run: cargo test --workspace --release
+        env:
+          PHOENIX_REQUIRE_RUNTIME_LIB: "1"
 
   build:
     needs: test

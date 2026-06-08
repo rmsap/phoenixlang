@@ -27,14 +27,25 @@ risks; the original scope is kept below for context.
   `smoke-test` matrix builds and runs `hello.phx` natively on windows-latest
   from the shipped artifact.
 
+## System libraries
+
+The Cranelift object carries no `/DEFAULTLIB` directives and `phoenix_runtime.lib`
+does not embed all of std's native deps, so the Windows arm passes them
+explicitly (the analog of Unix's `-lpthread -ldl -lm`) — `WINDOWS_SYSTEM_LIBS`
+in `link.rs`: `kernel32 ntdll userenv ws2_32 dbghelp` + `/defaultlib:msvcrt`.
+This list comes from `rustc --print native-static-libs` for
+`x86_64-pc-windows-msvc`; regenerate with that command if a future toolchain or
+runtime change adds std dependencies (the symptom of drift is a fresh
+LNK2019/LNK1120 unresolved-external at the link step).
+
 ## Residual risks (watch on first real release)
 
-- **System-lib resolution** relies on the `/DEFAULTLIB` directives Rust embeds
-  in `phoenix_runtime.lib`; if some symbol isn't covered, the fix is adding a
-  specific lib to the Windows arm — surfaced by the smoke-test link step.
-- **CRT flavor / ABI:** `default_call_conv()` should match the runtime's
-  `extern "C"` Win64 ABI; the smoke + `windows-check` end-to-end run is what
-  proves it on a real host (linux cross-`check` only type-checks).
+- **ABI:** `default_call_conv()` should match the runtime's `extern "C"` Win64
+  ABI; the smoke + `windows-check` end-to-end run is what proves it on a real
+  host (linux cross-`check` only type-checks).
+- **native-static-libs drift:** the explicit lib list is pinned to the current
+  stable toolchain; a std-dependency change would surface as a new unresolved
+  external (see above).
 
 ---
 
