@@ -1,0 +1,92 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: spec
+---
+{
+  "components": {
+    "schemas": {
+      "AvatarUpload": {
+        "properties": {
+          "alt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "avatar": {
+            "format": "binary",
+            "type": "string"
+          },
+          "caption": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "avatar",
+          "caption"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/avatar": {
+      "post": {
+        "operationId": "uploadAvatar",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "alt": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "avatar": {
+                    "format": "binary",
+                    "type": "string"
+                  },
+                  "caption": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "avatar",
+                  "caption"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "No content"
+          }
+        },
+        "summary": "uploadAvatar"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
+}

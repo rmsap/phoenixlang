@@ -199,6 +199,55 @@ class Stub:
             etag=returns_headers.get("etag"),
         )
 
+    async def upload_avatar(
+        self,
+        id: str,
+        avatar: Any,
+        caption: str,
+        rotation: int,
+        crop: bool,
+        thumbnail: Any | None = None,
+    ) -> m.Author:
+        # avatar / thumbnail arrive as FastAPI UploadFile objects (the server
+        # parses the multipart body). Read each file's bytes asynchronously and
+        # decode to UTF-8 for the contract comparison; record the filename too.
+        # The scalar fields (caption/rotation/crop) arrive already coerced to
+        # their declared types by FastAPI's Form(...) binding — rotation as int,
+        # crop as bool — which is exactly what we assert against.
+        # The contract's expect_received keys for files are already snake_case
+        # (avatar_content / avatar_filename / thumbnail_content), matched
+        # literally by the existing snake-agnostic comparison.
+        self.hit = True
+        avatar_bytes = await avatar.read()
+        thumbnail_content = None
+        thumbnail_filename = None
+        if thumbnail is not None:
+            thumbnail_content = (await thumbnail.read()).decode()
+            thumbnail_filename = thumbnail.filename
+        self.received = {
+            "id": id,
+            "avatar_content": avatar_bytes.decode(),
+            "avatar_filename": avatar.filename,
+            "caption": caption,
+            "rotation": rotation,
+            "crop": crop,
+            "thumbnail_content": thumbnail_content,
+            "thumbnail_filename": thumbnail_filename,
+        }
+        self._maybe_raise()
+        # The contract's returns uses camelCase keys (avatarUrl); the generated
+        # Author model uses snake_case fields with no alias, so map keys before
+        # constructing (same divergence handled in updateAuthorProfile's invoke).
+        returns = {_to_snake(k): v for k, v in self._returns().items()}
+        return m.Author(**returns)
+
+    async def download_avatar(self, id: str) -> bytes:
+        # Binary download: stream back the contract's returns_file as raw bytes.
+        self.hit = True
+        self.received = {"id": id}
+        self._maybe_raise()
+        return self.case["handler"]["returns_file"].encode()
+
     # Unused endpoints — present to satisfy the Protocol; loud if ever routed.
     async def update_post(self, id: str, body: m.UpdatePostBody) -> m.Post:
         raise AssertionError("unexpected call to update_post")
@@ -302,6 +351,37 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
             kwargs["if_none_match"] = headers["ifNoneMatch"]
         return await client.get_post_metered(call["path_params"]["id"], **kwargs)
 
+    if endpoint == "uploadAvatar":
+        multipart = call["multipart"]
+        files = multipart.get("files", {})
+        fields = multipart.get("fields", {})
+        # The generated client's file params are typed `m.FileUpload` (filename +
+        # content bytes); it forwards `(upload.filename, upload.content)` into
+        # httpx's `files=` mapping, so the contract filename travels on the wire
+        # and reaches the handler as avatar.filename. Scalar form fields are
+        # passed as plain kwargs.
+        # Scalar fields arrive JSON-typed (caption str, rotation int, crop bool)
+        # and are passed straight through to the typed client params; the client
+        # stringifies them into httpx's `data=` form mapping.
+        kwargs: dict[str, Any] = {
+            "caption": fields["caption"],
+            "rotation": fields["rotation"],
+            "crop": fields["crop"],
+        }
+        avatar = files["avatar"]
+        kwargs["avatar"] = m.FileUpload(
+            filename=avatar["filename"], content=avatar["content"].encode()
+        )
+        if "thumbnail" in files:
+            thumb = files["thumbnail"]
+            kwargs["thumbnail"] = m.FileUpload(
+                filename=thumb["filename"], content=thumb["content"].encode()
+            )
+        return await client.upload_avatar(call["path_params"]["id"], **kwargs)
+
+    if endpoint == "downloadAvatar":
+        return await client.download_avatar(call["path_params"]["id"])
+
     raise DriverError(f"driver has no invoke mapping for endpoint {endpoint!r}")
 
 
@@ -384,6 +464,22 @@ def assert_ok(case: dict[str, Any], result: Any) -> None:
             f"[{case['name']}] client result mismatch:\n"
             f" got: {json.dumps(got)}\n"
             f"want: {json.dumps(want)}"
+        )
+
+
+def assert_download(case: dict[str, Any], result: Any) -> None:
+    """Compare the bytes the client read off a binary response (decoded as
+    UTF-8) against expect_client.expect_download."""
+    want = case["expect_client"]["expect_download"]
+    if not isinstance(result, (bytes, bytearray)):
+        raise DriverError(
+            f"[{case['name']}] expected bytes from client, got "
+            f"{type(result).__name__}"
+        )
+    got = result.decode()
+    if got != want:
+        raise DriverError(
+            f"[{case['name']}] download mismatch: got {got!r}, want {want!r}"
         )
 
 
@@ -472,10 +568,14 @@ async def run_case(case: dict[str, Any]) -> None:
             raise DriverError(
                 f"[{case['name']}] handler was never called for ok case"
             )
+        # Binary download endpoints return raw bytes (no JSON model); compare
+        # the decoded bytes against expect_client.expect_download.
+        if "expect_download" in case["expect_client"]:
+            assert_download(case, result)
         # Header endpoints return a typed envelope (body + response headers);
         # compare the body against expect_client.ok and the response headers
         # against expect_client.ok_headers separately.
-        if "ok_headers" in case["expect_client"]:
+        elif "ok_headers" in case["expect_client"]:
             assert_ok(case, result.body)
             assert_ok_headers(case, result)
         else:

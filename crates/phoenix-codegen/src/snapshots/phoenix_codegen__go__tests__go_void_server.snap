@@ -16,8 +16,7 @@ func NewRouter(h Handlers) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("DELETE /api/users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		err := h.DeleteUser(id)
-		if err != nil {
+		if err := h.DeleteUser(id); err != nil {
 			if strings.Contains(err.Error(), "NotFound") {
 				http.Error(w, "NotFound", 404)
 				return

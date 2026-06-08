@@ -29,6 +29,8 @@ package roundtrip_test
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http/httptest"
 	"os"
 	"reflect"
@@ -55,20 +57,35 @@ type callSpec struct {
 	Query      map[string]interface{} `json:"query"`
 	Body       json.RawMessage        `json:"body"`
 	Headers    map[string]interface{} `json:"headers"`
+	Multipart  *multipartSpec         `json:"multipart"`
+}
+
+// multipartSpec mirrors call.multipart: file parts (filename + UTF-8 content the
+// driver encodes to bytes) plus scalar form fields. `Fields` values are
+// JSON-typed (string/number/bool); the invoke case coerces each into the
+// generated body's typed field (e.g. an Int field → int64).
+type multipartSpec struct {
+	Files map[string]struct {
+		Filename string `json:"filename"`
+		Content  string `json:"content"`
+	} `json:"files"`
+	Fields map[string]interface{} `json:"fields"`
 }
 
 type handlerSpec struct {
 	ExpectReceived  map[string]interface{} `json:"expect_received"`
 	Returns         json.RawMessage        `json:"returns"`
 	ReturnsHeaders  map[string]interface{} `json:"returns_headers"`
+	ReturnsFile     string                 `json:"returns_file"`
 	Raises          string                 `json:"raises"`
 	ExpectNotCalled bool                   `json:"expect_not_called"`
 }
 
 type expectSpec struct {
-	OK        json.RawMessage        `json:"ok"`
-	OKHeaders map[string]interface{} `json:"ok_headers"`
-	Error     *errorExpect           `json:"error"`
+	OK             json.RawMessage        `json:"ok"`
+	OKHeaders      map[string]interface{} `json:"ok_headers"`
+	ExpectDownload *string                `json:"expect_download"`
+	Error          *errorExpect           `json:"error"`
 }
 
 type errorExpect struct {
@@ -206,6 +223,54 @@ func (s *stub) UpdateAuthorProfile(id string, body api.UpdateAuthorProfileBody) 
 	var out api.Author
 	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
 	return &out, nil
+}
+
+// UploadAvatar exercises a multipart/form-data request: the generated server
+// parses the form into UploadAvatarBody, where each file part is a
+// *multipart.FileHeader (opened via .Open() then read to bytes) and scalar
+// fields are plain Go values. The stub records each file's decoded content +
+// filename and the scalar fields (caption/rotation/crop) so expect_received can
+// assert them; the optional thumbnail is recorded as nil content when absent.
+func (s *stub) UploadAvatar(id string, body api.UploadAvatarBody) (*api.Author, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"id":              id,
+		"avatar_content":  readFileHeader(s.t, s.c, body.Avatar),
+		"avatar_filename": fileHeaderName(body.Avatar),
+		"caption":         body.Caption,
+		"rotation":        body.Rotation,
+		"crop":            body.Crop,
+		"thumbnail_content": func() interface{} {
+			if body.Thumbnail == nil {
+				return nil
+			}
+			return readFileHeader(s.t, s.c, body.Thumbnail)
+		}(),
+		"thumbnail_filename": func() interface{} {
+			if body.Thumbnail == nil {
+				return nil
+			}
+			return fileHeaderName(body.Thumbnail)
+		}(),
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	var out api.Author
+	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
+	return &out, nil
+}
+
+// DownloadAvatar streams a binary response body: the stub returns an io.Reader
+// over handler.returns_file (the UTF-8 content the server writes as raw bytes).
+func (s *stub) DownloadAvatar(id string) (io.Reader, error) {
+	s.hit = true
+	assertReceived(s.t, s.c, map[string]interface{}{"id": id})
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	return strings.NewReader(s.c.Handler.ReturnsFile), nil
 }
 
 // Unused endpoints — present to satisfy the interface; loud if ever routed.
@@ -361,9 +426,61 @@ func invoke(t *testing.T, client *api.ApiClient, c contractCase) error {
 		assertOK(t, c, got)
 		return nil
 
+	case "uploadAvatar":
+		// Build the client-side multipart body from call.multipart: the required
+		// avatar file (filename + a reader over its UTF-8 content), the scalar
+		// fields (caption/rotation/crop, coerced from their JSON types into the
+		// body's typed fields), and the optional thumbnail (nil when absent).
+		mp := c.Call.Multipart
+		if mp == nil {
+			t.Fatalf("[%s] uploadAvatar case has no call.multipart", c.Name)
+		}
+		avatar := mp.Files["avatar"]
+		body := api.UploadAvatarClientBody{
+			Avatar:  api.FileUpload{Filename: avatar.Filename, Content: strings.NewReader(avatar.Content)},
+			Caption: mp.Fields["caption"].(string),
+			// JSON numbers decode into float64 through interface{}; the generated
+			// body field is int64, so narrow it here.
+			Rotation: int64(mp.Fields["rotation"].(float64)),
+			Crop:     mp.Fields["crop"].(bool),
+		}
+		if thumb, ok := mp.Files["thumbnail"]; ok {
+			body.Thumbnail = &api.FileUpload{Filename: thumb.Filename, Content: strings.NewReader(thumb.Content)}
+		}
+		got, err := client.UploadAvatar(c.Call.PathParams["id"], body)
+		if err != nil {
+			return err
+		}
+		assertOK(t, c, got)
+		return nil
+
+	case "downloadAvatar":
+		rc, err := client.DownloadAvatar(c.Call.PathParams["id"])
+		if err != nil {
+			return err
+		}
+		assertDownload(t, c, rc)
+		return nil
+
 	default:
 		t.Fatalf("driver has no invoke mapping for endpoint %q", c.Endpoint)
 		return nil
+	}
+}
+
+// assertDownload reads the client's binary response body fully and compares the
+// decoded UTF-8 bytes against expect_client.expect_download.
+func assertDownload(t *testing.T, c contractCase, rc io.ReadCloser) {
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("[%s] read download body: %v", c.Name, err)
+	}
+	if c.Expect.ExpectDownload == nil {
+		t.Fatalf("[%s] case has no expect_client.expect_download", c.Name)
+	}
+	if string(b) != *c.Expect.ExpectDownload {
+		t.Fatalf("[%s] download mismatch:\n got: %q\nwant: %q", c.Name, string(b), *c.Expect.ExpectDownload)
 	}
 }
 
@@ -526,6 +643,34 @@ func derefStrSlice(p *[]string) interface{} {
 		out[i] = x
 	}
 	return out
+}
+
+// ── multipart helpers ────────────────────────────────────────────────────────
+
+// readFileHeader opens a *multipart.FileHeader the generated server decoded from
+// the request, reads it fully, and returns the bytes as a string for comparison
+// against expect_received's <field>_content.
+func readFileHeader(t *testing.T, c contractCase, fh *multipart.FileHeader) string {
+	if fh == nil {
+		t.Fatalf("[%s] expected a file part but got nil header", c.Name)
+	}
+	f, err := fh.Open()
+	if err != nil {
+		t.Fatalf("[%s] open file part: %v", c.Name, err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("[%s] read file part: %v", c.Name, err)
+	}
+	return string(b)
+}
+
+func fileHeaderName(fh *multipart.FileHeader) interface{} {
+	if fh == nil {
+		return nil
+	}
+	return fh.Filename
 }
 
 // ── query helpers (read typed values from the generic call.query map) ───────

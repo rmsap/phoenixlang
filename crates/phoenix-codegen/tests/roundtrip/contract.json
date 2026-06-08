@@ -384,5 +384,121 @@
         "etag": null
       }
     }
+  },
+  {
+    "name": "uploadAvatar_multipart_file_and_fields",
+    "endpoint": "uploadAvatar",
+    "kind": "ok",
+    "_note": "Multipart upload. call.multipart carries file parts (content as a UTF-8 string the driver encodes to bytes) and scalar form fields. Scalar `fields` are JSON-typed (string caption, Int rotation, Bool crop) so the round-trip exercises each target's scalar coercion end-to-end (client stringification — notably bool → \"true\"/\"false\" — and server parse back to the typed value). The handler asserts it received the file bytes + filename and each scalar via expect_received: files are checked by their decoded UTF-8 content under <field>_content; the optional thumbnail is omitted here (handler sees it absent/null). Response is a normal JSON struct (Author).",
+    "call": {
+      "path_params": { "id": "7" },
+      "multipart": {
+        "files": {
+          "avatar": { "filename": "a.png", "content": "PNGDATA-avatar" }
+        },
+        "fields": {
+          "caption": "my avatar",
+          "rotation": 90,
+          "crop": true
+        }
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "7",
+        "avatar_content": "PNGDATA-avatar",
+        "avatar_filename": "a.png",
+        "caption": "my avatar",
+        "rotation": 90,
+        "crop": true,
+        "thumbnail_content": null
+      },
+      "returns": {
+        "id": 7,
+        "name": "Ada",
+        "email": "ada@example.com",
+        "avatarUrl": "/api/authors/7/avatar"
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "id": 7,
+        "name": "Ada",
+        "email": "ada@example.com",
+        "avatarUrl": "/api/authors/7/avatar"
+      }
+    }
+  },
+  {
+    "name": "uploadAvatar_multipart_optional_thumbnail_present",
+    "endpoint": "uploadAvatar",
+    "kind": "ok",
+    "_note": "Multipart upload that SUPPLIES the optional thumbnail file (companion to uploadAvatar_multipart_file_and_fields, which omits it). Exercises the client's optional-file-present branch (it appends the second file part) and the server's optional-file assign-on-success branch. Uses crop=false (the companion uses crop=true) so both Bool wire encodings are exercised. The handler asserts both files' decoded content and filename plus the scalars; thumbnail_filename is unobservable in the TS target (Blob carries no filename) and is skipped there.",
+    "call": {
+      "path_params": {
+        "id": "7"
+      },
+      "multipart": {
+        "files": {
+          "avatar": {
+            "filename": "a.png",
+            "content": "PNGDATA-avatar"
+          },
+          "thumbnail": {
+            "filename": "thumb.png",
+            "content": "PNGDATA-thumb"
+          }
+        },
+        "fields": {
+          "caption": "my avatar",
+          "rotation": 180,
+          "crop": false
+        }
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "7",
+        "avatar_content": "PNGDATA-avatar",
+        "avatar_filename": "a.png",
+        "caption": "my avatar",
+        "rotation": 180,
+        "crop": false,
+        "thumbnail_content": "PNGDATA-thumb",
+        "thumbnail_filename": "thumb.png"
+      },
+      "returns": {
+        "id": 7,
+        "name": "Ada",
+        "email": "ada@example.com",
+        "avatarUrl": "/api/authors/7/avatar"
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "id": 7,
+        "name": "Ada",
+        "email": "ada@example.com",
+        "avatarUrl": "/api/authors/7/avatar"
+      }
+    }
+  },
+  {
+    "name": "downloadAvatar_binary_response",
+    "endpoint": "downloadAvatar",
+    "kind": "ok",
+    "_note": "Binary download. The response body is raw bytes (not JSON). handler.returns_file is the UTF-8 content the stub streams back; expect_download is what the client must read off the response body. No JSON response struct is involved.",
+    "call": {
+      "path_params": { "id": "7" }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "7"
+      },
+      "returns_file": "AVATAR-BINARY-BYTES"
+    },
+    "expect_client": {
+      "expect_download": "AVATAR-BINARY-BYTES"
+    }
   }
 ]

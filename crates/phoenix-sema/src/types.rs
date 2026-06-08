@@ -18,6 +18,14 @@ pub enum Type {
     String,
     /// A boolean type (`true` or `false`).
     Bool,
+    /// A binary file type, valid **only** in Phoenix Gen endpoint request/response
+    /// bodies (multipart uploads / binary downloads). A struct field of type
+    /// `File` makes its containing struct a body-only, non-JSON transport type;
+    /// sema rejects `File` in any other position. Because endpoints are
+    /// compile-time-only, `File` never reaches IR/runtime — `lower_type` has an
+    /// `unreachable!` arm. The restriction is liftable when the language later
+    /// gains real file-handle semantics (a non-breaking relaxation).
+    File,
     /// The unit type, used for functions that do not return a value.
     Void,
     /// A named type that hasn't been resolved yet or is user-defined.
@@ -59,16 +67,18 @@ pub enum Type {
 impl Type {
     /// Resolve a type-name string to a [`Type`].
     ///
-    /// The five built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
-    /// `"Void"`) are matched **case-sensitively** and mapped to the
+    /// The six built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
+    /// `"File"`, `"Void"`) are matched **case-sensitively** and mapped to the
     /// corresponding variant.  Any other name is wrapped in
-    /// [`Type::Named`].
+    /// [`Type::Named`].  (`File` is only *legal* in endpoint-body position —
+    /// that restriction is enforced in sema, not here.)
     pub fn from_name(name: &str) -> Type {
         match name {
             "Int" => Type::Int,
             "Float" => Type::Float,
             "String" => Type::String,
             "Bool" => Type::Bool,
+            "File" => Type::File,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
         }
@@ -177,6 +187,7 @@ impl std::fmt::Display for Type {
             Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),
             Type::Bool => write!(f, "Bool"),
+            Type::File => write!(f, "File"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {

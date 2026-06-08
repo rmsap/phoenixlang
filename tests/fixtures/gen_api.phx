@@ -166,3 +166,40 @@ endpoint getPostMetered: GET "/api/posts/{id}/metered" {
     }
     error { NotFound(404) }
 }
+
+// ── File upload / download (multipart + binary) ───────────────
+
+/** A multipart avatar upload: a binary file plus scalar form fields.
+ *
+ * `rotation` (Int) and `crop` (Bool) exercise the per-target scalar coercion
+ * paths end-to-end — client `data`/FormData stringification (notably bool →
+ * `"true"`/`"false"`) and server `strconv.ParseInt`/`ParseBool` (Go),
+ * `Form(...)` (Python), `Number(...)`/`=== "true"` (TS). */
+struct AvatarUpload {
+    File avatar
+    String caption where self.length > 0
+    Int rotation
+    Bool crop
+    Option<File> thumbnail
+}
+
+/** A pure binary download body (exactly one File field). */
+struct FileDownload {
+    File data
+}
+
+/** Upload an avatar via multipart/form-data (file + caption + optional thumbnail). */
+endpoint uploadAvatar: POST "/api/authors/{id}/avatar" {
+    body AvatarUpload
+    response Author
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}
+
+/** Download an author's avatar as a binary stream. */
+endpoint downloadAvatar: GET "/api/authors/{id}/avatar" {
+    response FileDownload
+    error { NotFound(404) }
+}

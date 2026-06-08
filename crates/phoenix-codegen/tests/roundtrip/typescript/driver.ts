@@ -32,6 +32,19 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import express from "express";
+// `multer` (memory storage) is the standard Express multipart/form-data parser.
+// The generated server reads the upload off a `MultipartRequest` shape
+// (`req.body: Record<string,string>` for scalar fields, `req.files:
+// Record<string,Blob>` for file parts) — it casts `req as unknown as
+// MultipartRequest` and assumes some middleware populated those. multer gives us
+// `req.body` (scalars) for free and `req.files` as arrays of `{ buffer: Buffer,
+// originalname, ... }`; the `multipartToBlobFiles` middleware below flattens
+// that into the `Record<string,Blob>` the generated server expects (wrapping
+// each Buffer as a Blob — note the original filename is therefore dropped, see
+// the avatar_filename note in the upload stub). This makes the round-trip
+// exercise real multipart over the wire rather than a hand-rolled stand-in.
+import multer from "multer";
+import type { Request as ExpressRequest, Response as ExpressResponse, NextFunction } from "express";
 import type { AddressInfo } from "node:net";
 
 import { createRouter } from "./generated/server";
@@ -43,6 +56,7 @@ import type {
   GetPostMeteredResult,
   Post,
   UpdateAuthorProfileBody,
+  UploadAvatarBody,
 } from "./generated/types";
 
 const target = "typescript" as const;
@@ -58,17 +72,31 @@ interface ContractCase {
     query?: Record<string, unknown>;
     body?: Record<string, unknown>;
     headers?: Record<string, unknown>;
+    // multipart/file-upload body (mutually exclusive with `body`): each file
+    // part carries a UTF-8 `content` string the driver wraps in a Blob, plus
+    // scalar form `fields`. The generated client builds its own FormData from
+    // the typed UploadAvatarBody we construct from this.
+    multipart?: {
+      files: Record<string, { filename: string; content: string }>;
+      fields: Record<string, unknown>;
+    };
   };
   handler: {
     expect_received?: Record<string, unknown>;
     returns?: unknown;
     returns_headers?: Record<string, unknown>;
+    // binary download: the UTF-8 content the stub streams back as the raw
+    // (non-JSON) response body (returned from the handler as a Buffer).
+    returns_file?: string;
     raises?: string;
     expect_not_called?: boolean;
   };
   expect_client: {
     ok?: unknown;
     ok_headers?: Record<string, unknown>;
+    // binary download: the UTF-8 content the client must read off the Blob
+    // response body (present instead of `ok`).
+    expect_download?: string;
     error?: {
       variant: string;
       status_per_target: Record<string, number>;
@@ -176,6 +204,38 @@ function makeStub(c: ContractCase, state: CaseState): Handlers {
       };
       return signal<Author>(c);
     },
+    // uploadAvatar receives the decoded UploadAvatarBody (avatar/thumbnail as
+    // Blobs, caption as a string, rotation/crop coerced from the form strings by
+    // the generated server — `Number(...)` / `=== "true"`). Record the file
+    // *contents* (via Blob.text()) and the scalars; thumbnail-absent is recorded
+    // as null. NOTE: the generated server delivers files as `Record<string,Blob>`,
+    // and a Blob carries no filename — so the handler structurally CANNOT observe
+    // the original `avatar_filename` (unlike Go's FileHeader). We therefore do not
+    // record an avatar_filename key; assertReceived only checks keys the driver
+    // records, so the contract's avatar_filename sub-assertion is skipped for TS
+    // (this is an intrinsic per-target limitation, documented in the driver report).
+    async uploadAvatar(id, body) {
+      state.hit = true;
+      state.received = {
+        id,
+        avatar_content: await body.avatar.text(),
+        caption: body.caption,
+        rotation: body.rotation,
+        crop: body.crop,
+        thumbnail_content:
+          body.thumbnail === undefined ? null : await body.thumbnail.text(),
+      };
+      return signal<Author>(c);
+    },
+    // downloadAvatar streams raw bytes back: the stub returns a Buffer built
+    // from the contract's returns_file UTF-8 string. The generated server sends
+    // it with Content-Type application/octet-stream; the client reads it as a
+    // Blob.
+    async downloadAvatar(id) {
+      state.hit = true;
+      state.received = { id };
+      return Buffer.from(c.handler.returns_file ?? "");
+    },
     updatePost: () => unexpected("updatePost"),
     patchPost: () => unexpected("patchPost"),
     deletePost: () => unexpected("deletePost"),
@@ -244,6 +304,39 @@ async function invoke(c: ContractCase): Promise<unknown> {
       const body = c.call.body as unknown as UpdateAuthorProfileBody;
       return api.updateAuthorProfile(id, body);
     }
+    case "uploadAvatar": {
+      const id = c.call.path_params?.id;
+      assert.ok(id !== undefined, `${c.name}: missing path_params.id`);
+      const mp = c.call.multipart;
+      assert.ok(mp !== undefined, `${c.name}: missing call.multipart`);
+      // Construct the typed UploadAvatarBody the generated client expects; it
+      // builds its own FormData (appends avatar/thumbnail Blobs + stringified
+      // scalars) and sends it over the wire. Each file's `content` becomes a
+      // Blob; the filename is supplied to new Blob() metadata but, per the
+      // limitation above, does not survive to the server's Record<string,Blob>
+      // shape. The scalars are passed JSON-typed (rotation number, crop boolean);
+      // the client's `String(...)` stringifies them onto the form.
+      const avatarFile = mp.files.avatar;
+      assert.ok(avatarFile !== undefined, `${c.name}: multipart has no avatar file`);
+      const body: UploadAvatarBody = {
+        avatar: new Blob([avatarFile.content]),
+        caption: mp.fields.caption as string,
+        rotation: mp.fields.rotation as number,
+        crop: mp.fields.crop as boolean,
+        thumbnail:
+          mp.files.thumbnail === undefined
+            ? undefined
+            : new Blob([mp.files.thumbnail.content]),
+      };
+      return api.uploadAvatar(id, body);
+    }
+    case "downloadAvatar": {
+      const id = c.call.path_params?.id;
+      assert.ok(id !== undefined, `${c.name}: missing path_params.id`);
+      // Client returns a Blob; the runCase ok branch reads it via Blob.text()
+      // and compares to expect_client.expect_download.
+      return api.downloadAvatar(id);
+    }
     default:
       throw new Error(`driver has no invoke mapping for endpoint ${c.endpoint}`);
   }
@@ -254,10 +347,24 @@ async function invoke(c: ContractCase): Promise<unknown> {
 // assertReceived checks every key in expect_received against the decoded args
 // the handler actually saw. Numbers compare numerically; only listed keys are
 // checked. `null` in the contract means the optional arg was absent.
+// UNOBSERVABLE_KEYS: keys present in the contract's expect_received that this
+// target structurally cannot observe, so the driver skips their sub-assertion.
+// `avatar_filename`: the generated TS server delivers multipart files as
+// `Record<string,Blob>`, and a Blob carries no filename — unlike Go's
+// multipart.FileHeader, the original filename is lost before it reaches the
+// handler. The README explicitly permits a driver to omit checking a key it
+// cannot observe ("only listed keys are checked"); the content + caption +
+// thumbnail-absent assertions still fully exercise the multipart round-trip.
+const UNOBSERVABLE_KEYS = new Set<string>([
+  "avatar_filename",
+  "thumbnail_filename",
+]);
+
 function assertReceived(c: ContractCase, got: Record<string, unknown>): void {
   const want = c.handler.expect_received;
   if (want === undefined) return;
   for (const [k, w] of Object.entries(want)) {
+    if (UNOBSERVABLE_KEYS.has(k)) continue;
     assert.ok(k in got, `[${c.name}] handler did not receive arg ${k}`);
     assert.deepStrictEqual(
       got[k],
@@ -344,6 +451,40 @@ async function runCase(c: ContractCase): Promise<void> {
   // observed `etag` envelope field and break the null/absent-etag contract case.
   app.set("etag", false);
   app.use(express.json());
+  // Multipart parsing for the upload route. multer (memory storage) populates
+  // `req.body` (scalar fields) and `req.files` (file parts as arrays of
+  // { buffer, originalname, ... }). The generated server, however, expects
+  // `req.files` to be a Record<string,Blob>, so `multipartToBlobFiles` flattens
+  // multer's per-field arrays into single Blobs keyed by field name (each
+  // Buffer wrapped as a Blob). The filename is intentionally dropped here — the
+  // generated server's Blob shape has no place for it (see upload-stub note).
+  // We only enable multer for routes that actually carry multipart, so the
+  // JSON/header routes are unaffected.
+  const upload = multer({ storage: multer.memoryStorage() }).fields([
+    { name: "avatar", maxCount: 1 },
+    { name: "thumbnail", maxCount: 1 },
+  ]);
+  const multipartToBlobFiles = (
+    req: ExpressRequest,
+    _res: ExpressResponse,
+    next: NextFunction,
+  ): void => {
+    const multerFiles = req.files as
+      | Record<string, Express.Multer.File[]>
+      | undefined;
+    const blobFiles: Record<string, Blob> = {};
+    if (multerFiles) {
+      for (const [field, parts] of Object.entries(multerFiles)) {
+        const part = parts[0];
+        if (part) blobFiles[field] = new Blob([part.buffer]);
+      }
+    }
+    // Overwrite req.files with the Record<string,Blob> the generated server
+    // casts to. (`req.body` already holds the scalar fields from multer.)
+    (req as unknown as { files: Record<string, Blob> }).files = blobFiles;
+    next();
+  };
+  app.post("/api/authors/:id/avatar", upload, multipartToBlobFiles);
   app.use(createRouter(makeStub(c, state)));
 
   const server = app.listen(0);
@@ -378,6 +519,18 @@ async function runCase(c: ContractCase): Promise<void> {
             `[${c.name}] client result body mismatch`,
           );
           assertOkHeaders(c, env);
+        } else if (c.expect_client.expect_download !== undefined) {
+          // Binary download: the client returns a Blob; read its bytes as UTF-8
+          // and compare to expect_client.expect_download. Keyed on the
+          // expect_download field (not the endpoint name) so any binary-download
+          // case routes here — mirroring the Go/Python drivers.
+          const blob = result as Blob;
+          const text = await blob.text();
+          assert.strictEqual(
+            text,
+            c.expect_client.expect_download,
+            `[${c.name}] downloaded body mismatch: got ${JSON.stringify(text)}, want ${JSON.stringify(c.expect_client.expect_download)}`,
+          );
         } else {
           assert.deepStrictEqual(
             result,

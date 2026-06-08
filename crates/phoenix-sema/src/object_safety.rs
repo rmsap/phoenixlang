@@ -55,6 +55,7 @@ fn contains_self(ty: &Type) -> bool {
         | Type::Float
         | Type::String
         | Type::Bool
+        | Type::File
         | Type::Void
         | Type::TypeVar(_)
         | Type::Error => false,

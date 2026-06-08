@@ -1,0 +1,63 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: spec
+---
+{
+  "components": {
+    "schemas": {
+      "Doc": {
+        "properties": {
+          "data": {
+            "format": "binary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/doc/{id}": {
+      "get": {
+        "operationId": "downloadDoc",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "summary": "downloadDoc"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
+}

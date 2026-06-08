@@ -367,6 +367,7 @@ impl<'src> Lexer<'src> {
             "Float" => TokenKind::FloatType,
             "String" => TokenKind::StringType,
             "Bool" => TokenKind::BoolType,
+            "File" => TokenKind::FileType,
             "Void" => TokenKind::Void,
             _ => TokenKind::Ident,
         };
@@ -1042,6 +1043,13 @@ mod tests {
     fn type_keyword_token() {
         let kinds = token_kinds("type");
         assert_eq!(kinds, vec![Type, Eof]);
+    }
+
+    #[test]
+    fn file_type_token() {
+        // `File` is a built-in primitive type name (Phoenix Gen endpoint bodies).
+        let kinds = token_kinds("File");
+        assert_eq!(kinds, vec![FileType, Eof]);
     }
 
     #[test]

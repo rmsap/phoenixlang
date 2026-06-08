@@ -74,6 +74,17 @@ impl<'a> PyGenerator<'a> {
             .push_str("from __future__ import annotations\n\n");
         self.emit_models_imports(program);
 
+        // The client-side `FileUpload` helper (filename + content bytes) is shared
+        // by every multipart endpoint, so emit it once up front when any exists.
+        if self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart)
+        {
+            self.emit_file_upload_dataclass();
+        }
+
         for decl in &program.declarations {
             match decl {
                 Declaration::Struct(s) => self.emit_model(s),
@@ -146,6 +157,9 @@ impl<'a> PyGenerator<'a> {
             match decl {
                 Declaration::Struct(s) => {
                     if let Some(info) = self.check_result.module.struct_info_by_name(&s.name)
+                        // File-bearing structs emit no model (see `emit_model`),
+                        // so their constraints never reference `Field`.
+                        && !info.is_file_bearing
                         && info.fields.iter().any(|f| f.constraint.is_some())
                     {
                         needs_field = true;
@@ -155,31 +169,115 @@ impl<'a> PyGenerator<'a> {
                 _ => {}
             }
         }
-        // Check derived types for constraints too
+        // Check derived types for constraints too. Multipart bodies emit no model.
         for ep in &self.check_result.endpoints {
-            if let Some(ref body) = ep.body
+            if !ep.body_is_multipart
+                && let Some(ref body) = ep.body
                 && body.fields.iter().any(|f| f.constraint.is_some())
             {
                 needs_field = true;
             }
         }
 
+        // Whether the schema involves `File` anywhere (a file-bearing struct, a
+        // multipart body, or a binary response). When it does NOT, the import
+        // logic stays byte-for-byte as before (BaseModel always emitted) so no
+        // pre-existing JSON snapshot shifts. Only File-bearing schemas — where a
+        // skipped file-bearing struct can leave BaseModel unused — recompute it.
+        let involves_file = program.declarations.iter().any(|decl| {
+            matches!(decl, Declaration::Struct(s)
+                if self
+                    .check_result
+                    .module
+                    .struct_info_by_name(&s.name)
+                    .is_some_and(|info| info.is_file_bearing))
+        }) || self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart || ep.response_is_binary);
+
+        // A `BaseModel` subclass is emitted for any non-file-bearing struct, any
+        // non-multipart derived body, or any response-header envelope. Enums use
+        // `Enum`, not `BaseModel`. In a File-involving schema, importing
+        // `BaseModel` when nothing subclasses it (e.g. a binary-download-only
+        // schema whose sole struct is file-bearing and emits no model) trips ruff
+        // F401, so gate the import on actual use.
+        let needs_base_model = !involves_file
+            || program.declarations.iter().any(|decl| {
+                matches!(decl, Declaration::Struct(s)
+                    if self
+                        .check_result
+                        .module
+                        .struct_info_by_name(&s.name)
+                        .is_none_or(|info| !info.is_file_bearing))
+            })
+            || self.check_result.endpoints.iter().any(|ep| {
+                (!ep.body_is_multipart && ep.body.is_some()) || !ep.response_headers.is_empty()
+            });
+
+        // A multipart endpoint pulls in the client-side `FileUpload` dataclass
+        // (emitted into models.py by `emit_file_upload_dataclass`), which needs
+        // `@dataclass`.
+        let needs_dataclass = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart);
+
         // Import groups, in isort order: standard library, then third party.
         // (`from __future__ import annotations` is emitted separately first.)
+        // `dataclasses` sorts before `enum` within the stdlib group.
+        let mut stdlib: Vec<&str> = Vec::new();
+        if needs_dataclass {
+            stdlib.push("from dataclasses import dataclass");
+        }
         if needs_enum {
-            self.models_out.push_str("from enum import Enum\n\n");
+            stdlib.push("from enum import Enum");
+        }
+        if !stdlib.is_empty() {
+            self.models_out.push_str(&stdlib.join("\n"));
+            self.models_out.push_str("\n\n");
         }
         if needs_field {
             self.models_out
                 .push_str("from pydantic import BaseModel, Field\n");
-        } else {
+        } else if needs_base_model {
             self.models_out.push_str("from pydantic import BaseModel\n");
         }
         self.models_out.push('\n');
     }
 
+    /// Emits the shared `FileUpload` dataclass into models.py: the client-side
+    /// representation of a file part in a multipart request body — the upload
+    /// filename plus the contents as `bytes`. The client passes
+    /// `(upload.filename, upload.content)` to httpx's `files=` mapping so the
+    /// caller-supplied filename travels on the wire (parity with Go's
+    /// `FileUpload{Filename, Content}` and a TS `File`/`Blob`). It is a plain
+    /// dataclass, not a pydantic model — it is never JSON-(de)serialized.
+    fn emit_file_upload_dataclass(&mut self) {
+        ensure_blank_lines(&mut self.models_out, 2);
+        self.models_out.push_str(
+            "@dataclass\n\
+             class FileUpload:\n    \
+             \"\"\"A client-side file part for a multipart upload (filename + content bytes).\"\"\"\n\n    \
+             filename: str\n    \
+             content: bytes\n",
+        );
+    }
+
     /// Emits a Pydantic BaseModel class for a Phoenix struct.
     fn emit_model(&mut self, s: &StructDecl) {
+        // A file-bearing struct is body-only transport: as a multipart request it
+        // is exploded into per-field `File`/`Form` params, and as a binary
+        // response it is streamed as raw bytes. It is never (de)serialized as a
+        // pydantic model, and `UploadFile` is not importable in models.py, so we
+        // emit no class for it.
+        if let Some(info) = self.check_result.module.struct_info_by_name(&s.name)
+            && info.is_file_bearing
+        {
+            return;
+        }
         ensure_blank_lines(&mut self.models_out, 2);
         if let Some(ref doc) = s.doc_comment {
             self.models_out.push_str(&render_hash_comment("", doc));
@@ -250,6 +348,12 @@ impl<'a> PyGenerator<'a> {
     /// Emits a derived Pydantic model for an endpoint body type.
     fn emit_derived_model(&mut self, ep: &EndpointInfo) {
         let Some(ref body) = ep.body else { return };
+        // A multipart body is exploded into per-field FastAPI params rather than a
+        // pydantic model — and would reference the unimportable `UploadFile` here
+        // — so no `XBody` class is emitted.
+        if ep.body_is_multipart {
+            return;
+        }
         let type_name = format!("{}Body", capitalize(&ep.name));
 
         if !self.emitted_derived_types.insert(type_name.clone()) {
@@ -349,13 +453,15 @@ impl<'a> PyGenerator<'a> {
 
     /// Emits imports for the client file.
     fn emit_client_imports(&mut self) {
-        // `Any` is only referenced by the `params: dict[str, Any]` dict that
-        // query-bearing endpoints emit; importing it otherwise trips ruff F401.
+        // `Any` is referenced by the `params: dict[str, Any]` dict that
+        // query-bearing endpoints emit, and by the `data: dict[str, Any]` form
+        // dict that multipart endpoints emit; importing it otherwise trips ruff
+        // F401.
         let needs_any = self
             .check_result
             .endpoints
             .iter()
-            .any(|ep| !ep.query_params.is_empty());
+            .any(|ep| !ep.query_params.is_empty() || ep.body_is_multipart);
         if needs_any {
             self.client_out
                 .push_str("from typing import Any\n\nimport httpx\n");
@@ -364,11 +470,25 @@ impl<'a> PyGenerator<'a> {
         }
 
         let mut imports = BTreeSet::new();
+        // A multipart client method takes its file fields as the shared
+        // `FileUpload` dataclass (emitted into models.py), so import it.
+        if self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart)
+        {
+            imports.insert("FileUpload".to_string());
+        }
         for ep in &self.check_result.endpoints {
-            if ep.body.is_some() {
+            // A multipart body is sent as `files=`/`data=` (no `XBody` model). A
+            // binary download returns `bytes` (no response struct constructed).
+            if ep.body.is_some() && !ep.body_is_multipart {
                 imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if let Some(ref resp) = ep.response {
+            if let Some(ref resp) = ep.response
+                && !ep.response_is_binary
+            {
                 collect_python_imports(resp, &mut imports);
             }
             // Endpoints with response headers return the typed envelope, which
@@ -390,12 +510,16 @@ impl<'a> PyGenerator<'a> {
         let method = ep.method.as_lower_str();
         let fn_name = to_snake_case(&ep.name);
         // The bare response body type; the method's return type becomes the typed
-        // `<Endpoint>Result` envelope when the endpoint declares response headers.
-        let body_type = ep
-            .response
-            .as_ref()
-            .map(type_to_python)
-            .unwrap_or_else(|| "None".to_string());
+        // `<Endpoint>Result` envelope when the endpoint declares response headers,
+        // or `bytes` for a binary download.
+        let body_type = if ep.response_is_binary {
+            "bytes".to_string()
+        } else {
+            ep.response
+                .as_ref()
+                .map(type_to_python)
+                .unwrap_or_else(|| "None".to_string())
+        };
         let response_type = if ep.response_headers.is_empty() {
             body_type.clone()
         } else {
@@ -407,7 +531,47 @@ impl<'a> PyGenerator<'a> {
         for pp in &ep.path_params {
             params.push(format!("{}: str", to_snake_case(pp)));
         }
-        if ep.body.is_some() {
+        if ep.body_is_multipart {
+            // Multipart: each body field is a client param. `File` fields take a
+            // `FileUpload` (filename + content bytes); optional files are
+            // `FileUpload | None`. Scalars use their normal Python type. Required
+            // params sort before optional ones (which carry `= None`).
+            let body = ep
+                .body
+                .as_ref()
+                .expect("multipart body has resolved fields");
+            let mut required = Vec::new();
+            let mut optional = Vec::new();
+            for f in &body.fields {
+                let snake = to_snake_case(&f.name);
+                let is_file = matches!(&f.ty, Type::File);
+                let is_opt_file = matches!(
+                    &f.ty,
+                    Type::Generic(name, args)
+                        if name == "Option" && matches!(args.first(), Some(Type::File))
+                );
+                let already_optional = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                // A `File` field relaxed by `partial` (`f.optional`) is an
+                // optional upload, exactly like `Option<File>`.
+                if is_file && !f.optional {
+                    required.push(format!("{snake}: FileUpload"));
+                } else if is_opt_file || is_file {
+                    optional.push(format!("{snake}: FileUpload | None = None"));
+                } else if f.optional || already_optional {
+                    let py_type = type_to_python(&f.ty);
+                    let ty = if f.optional && !already_optional {
+                        format!("{py_type} | None")
+                    } else {
+                        py_type
+                    };
+                    optional.push(format!("{snake}: {ty} = None"));
+                } else {
+                    required.push(format!("{snake}: {}", type_to_python(&f.ty)));
+                }
+            }
+            params.extend(required);
+            params.extend(optional);
+        } else if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
             params.push(format!("body: {body_type}"));
         }
@@ -508,8 +672,10 @@ impl<'a> PyGenerator<'a> {
                     // every other path (Go `strconv.FormatBool`, TS `String(bool)`,
                     // and this generator's own response-header set/read which use
                     // lowercase). Python's `str(True)` would emit `"True"`, which
-                    // the TS server's `=== "true"` coercion rejects.
-                    Type::Bool => format!("(\"true\" if {snake} else \"false\")"),
+                    // the TS server's `=== "true"` coercion rejects. No surrounding
+                    // parens: the value lands on the RHS of a `headers[...] = `
+                    // assignment, where black strips redundant parentheses.
+                    Type::Bool => format!("\"true\" if {snake} else \"false\""),
                     _ => format!("str({snake})"),
                 };
                 if is_nullable {
@@ -527,9 +693,75 @@ impl<'a> PyGenerator<'a> {
             }
         }
 
+        // Multipart: build the `files` (binary) and `data` (scalar) dicts httpx
+        // sends as `multipart/form-data`. File fields keyed by the wire name carry
+        // an `(filename, content)` tuple — httpx's file shape that pins the
+        // upload filename; optional files/scalars are only added when provided.
+        // The keys are the schema's original field names so the server's
+        // `File`/`Form` params (aliased when snake-cased) match.
+        if ep.body_is_multipart {
+            let body = ep
+                .body
+                .as_ref()
+                .expect("multipart body has resolved fields");
+            self.client_out
+                .push_str("        files: dict[str, tuple[str, bytes]] = {}\n");
+            self.client_out
+                .push_str("        data: dict[str, Any] = {}\n");
+            for f in &body.fields {
+                let snake = to_snake_case(&f.name);
+                let is_file = matches!(&f.ty, Type::File);
+                let is_opt_file = matches!(
+                    &f.ty,
+                    Type::Generic(name, args)
+                        if name == "Option" && matches!(args.first(), Some(Type::File))
+                );
+                let is_optional =
+                    f.optional || matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                let (target, value) = if is_file || is_opt_file {
+                    ("files", format!("({snake}.filename, {snake}.content)"))
+                } else {
+                    // Multipart form values are text on the wire. A bool left as
+                    // a Python value would be rendered by httpx's form encoder as
+                    // "True"/"False" (Python's default bool formatting); coerce it
+                    // to canonical lowercase "true"/"false" instead so it matches
+                    // every target's server parse uniformly — notably the
+                    // generated TS server, which compares `=== "true"` (strict
+                    // lowercase) and would read "True" as false. (Other scalars
+                    // need no special-casing — httpx stringifies int/float as-is.)
+                    let inner = match &f.ty {
+                        Type::Generic(name, args) if name == "Option" && !args.is_empty() => {
+                            &args[0]
+                        }
+                        other => other,
+                    };
+                    // No surrounding parens: the value lands on the RHS of a
+                    // `data[...] = ` assignment, where black strips redundant ones.
+                    let value = if matches!(inner, Type::Bool) {
+                        format!("\"true\" if {snake} else \"false\"")
+                    } else {
+                        snake.clone()
+                    };
+                    ("data", value)
+                };
+                if is_optional {
+                    self.client_out.push_str(&format!(
+                        "        if {snake} is not None:\n            {target}[\"{}\"] = {value}\n",
+                        f.name
+                    ));
+                } else {
+                    self.client_out
+                        .push_str(&format!("        {target}[\"{}\"] = {value}\n", f.name));
+                }
+            }
+        }
+
         // HTTP call
         let mut call_args = vec![format!("f\"{{self.base_url}}{url}\"")];
-        if ep.body.is_some() {
+        if ep.body_is_multipart {
+            call_args.push("files=files".to_string());
+            call_args.push("data=data".to_string());
+        } else if ep.body.is_some() {
             call_args.push("json=body.model_dump()".to_string());
         }
         if has_query {
@@ -550,6 +782,13 @@ impl<'a> PyGenerator<'a> {
 
         // Return
         if response_type == "None" {
+            return;
+        }
+
+        // Binary download: return the raw response bytes (no JSON parsing).
+        if ep.response_is_binary {
+            self.client_out
+                .push_str("        return response.content\n");
             return;
         }
 
@@ -607,12 +846,27 @@ impl<'a> PyGenerator<'a> {
     fn emit_handler_imports(&mut self) {
         self.handlers_out.push_str("from typing import Protocol\n");
 
+        // A multipart handler receives `UploadFile` params, imported from fastapi.
+        let needs_upload_file = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart);
+        if needs_upload_file {
+            self.handlers_out
+                .push_str("\nfrom fastapi import UploadFile\n");
+        }
+
         let mut imports = BTreeSet::new();
         for ep in &self.check_result.endpoints {
-            if ep.body.is_some() {
+            // A multipart body is delivered as per-field params (no `XBody`
+            // model). A binary download returns `bytes` (no response struct).
+            if ep.body.is_some() && !ep.body_is_multipart {
                 imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if let Some(ref resp) = ep.response {
+            if let Some(ref resp) = ep.response
+                && !ep.response_is_binary
+            {
                 collect_python_imports(resp, &mut imports);
             }
             // Endpoints with response headers return the typed envelope.
@@ -631,7 +885,11 @@ impl<'a> PyGenerator<'a> {
     /// Emits a single handler method signature.
     fn emit_handler_method(&mut self, ep: &EndpointInfo) {
         let fn_name = to_snake_case(&ep.name);
-        let response_type = if ep.response_headers.is_empty() {
+        // A binary download handler returns the raw `bytes`; the server wraps
+        // them in a FastAPI `Response`.
+        let response_type = if ep.response_is_binary {
+            "bytes".to_string()
+        } else if ep.response_headers.is_empty() {
             ep.response
                 .as_ref()
                 .map(type_to_python)
@@ -644,7 +902,47 @@ impl<'a> PyGenerator<'a> {
         for pp in &ep.path_params {
             params.push(format!("{}: str", to_snake_case(pp)));
         }
-        if ep.body.is_some() {
+        if ep.body_is_multipart {
+            // Multipart: each body field becomes a handler param. `File` fields
+            // are typed `UploadFile` (`UploadFile | None` when optional); scalars
+            // use their normal Python type. Required fields sort before optional
+            // ones (which carry `= None`) so no non-default follows a default.
+            let body = ep
+                .body
+                .as_ref()
+                .expect("multipart body has resolved fields");
+            let mut required = Vec::new();
+            let mut optional = Vec::new();
+            for f in &body.fields {
+                let snake = to_snake_case(&f.name);
+                let is_file = matches!(&f.ty, Type::File);
+                let is_opt_file = matches!(
+                    &f.ty,
+                    Type::Generic(name, args)
+                        if name == "Option" && matches!(args.first(), Some(Type::File))
+                );
+                let already_optional = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                // A `File` field relaxed by `partial` (`f.optional`) is an
+                // optional upload, exactly like `Option<File>`.
+                if is_file && !f.optional {
+                    required.push(format!("{snake}: UploadFile"));
+                } else if is_opt_file || is_file {
+                    optional.push(format!("{snake}: UploadFile | None = None"));
+                } else if f.optional || already_optional {
+                    let py_type = type_to_python(&f.ty);
+                    let ty = if f.optional && !already_optional {
+                        format!("{py_type} | None")
+                    } else {
+                        py_type
+                    };
+                    optional.push(format!("{snake}: {ty} = None"));
+                } else {
+                    required.push(format!("{snake}: {}", type_to_python(&f.ty)));
+                }
+            }
+            params.extend(required);
+            params.extend(optional);
+        } else if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
             params.push(format!("body: {body_type}"));
         }
@@ -717,12 +1015,67 @@ impl<'a> PyGenerator<'a> {
             .endpoints
             .iter()
             .any(|ep| !ep.headers.is_empty());
+        // A multipart request body explodes into per-field params. The exact
+        // fastapi imports depend on which field shapes appear:
+        //  - any multipart body has ≥1 `File` field → `UploadFile` (param type);
+        //  - a `File` field whose snake_case name differs from the wire name binds
+        //    `Annotated[UploadFile, File(alias=...)]` → `File` + `Annotated`;
+        //  - any scalar field binds `Form(...)`/`Form(None)` → `Form`.
+        // A non-aliased file is a bare `UploadFile` (no `File()` call), avoiding
+        // ruff B008 (which exempts `Query`/`Header`/`Form` but NOT `File`).
+        let needs_multipart = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart);
+        let multipart_fields = || {
+            self.check_result
+                .endpoints
+                .iter()
+                .filter(|ep| ep.body_is_multipart)
+                .filter_map(|ep| ep.body.as_ref())
+                .flat_map(|body| body.fields.iter())
+        };
+        let needs_file = multipart_fields().any(|f| {
+            let is_file = matches!(&f.ty, Type::File);
+            let is_opt_file = matches!(
+                &f.ty,
+                Type::Generic(name, args)
+                    if name == "Option" && matches!(args.first(), Some(Type::File))
+            );
+            (is_file || is_opt_file) && to_snake_case(&f.name) != f.name
+        });
+        let needs_annotated = needs_file;
+        let needs_form = multipart_fields().any(|f| {
+            let is_file = matches!(&f.ty, Type::File);
+            let is_opt_file = matches!(
+                &f.ty,
+                Type::Generic(name, args)
+                    if name == "Option" && matches!(args.first(), Some(Type::File))
+            );
+            !is_file && !is_opt_file
+        });
+        // A binary download response, or any endpoint with response headers,
+        // needs FastAPI's `Response` (the former returns `Response(content=...)`,
+        // the latter sets headers on an injected `Response` param).
         let needs_response = self
             .check_result
             .endpoints
             .iter()
-            .any(|ep| !ep.response_headers.is_empty());
+            .any(|ep| !ep.response_headers.is_empty() || ep.response_is_binary);
+        // The `Annotated[...]` file-alias form lives in the typing import group,
+        // emitted before the third-party fastapi group (isort order).
+        if needs_annotated {
+            self.server_out.push_str("from typing import Annotated\n\n");
+        }
+        // Keep this list alphabetical so it satisfies ruff's isort (I) ordering.
         let mut names = vec!["APIRouter"];
+        if needs_file {
+            names.push("File");
+        }
+        if needs_form {
+            names.push("Form");
+        }
         if needs_header {
             names.push("Header");
         }
@@ -735,15 +1088,24 @@ impl<'a> PyGenerator<'a> {
         if needs_response {
             names.push("Response");
         }
+        if needs_multipart {
+            names.push("UploadFile");
+        }
         self.server_out
             .push_str(&format!("from fastapi import {}\n\n", names.join(", ")));
 
         let mut model_imports = BTreeSet::new();
         for ep in &self.check_result.endpoints {
-            if ep.body.is_some() {
+            // A multipart body is exploded into per-field FastAPI params, so the
+            // `XBody` pydantic model is never referenced by the route.
+            if ep.body.is_some() && !ep.body_is_multipart {
                 model_imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if let Some(ref resp) = ep.response {
+            // A binary download returns `Response(content=bytes)`; the response
+            // struct is never constructed, so its type is not imported.
+            if let Some(ref resp) = ep.response
+                && !ep.response_is_binary
+            {
                 collect_python_imports(resp, &mut model_imports);
             }
             // The route returns `result.body`, so the envelope type itself is not
@@ -761,11 +1123,17 @@ impl<'a> PyGenerator<'a> {
     fn emit_server_route(&mut self, ep: &EndpointInfo) {
         let method = ep.method.as_lower_str();
         let fn_name = to_snake_case(&ep.name);
-        let response_type = ep
-            .response
-            .as_ref()
-            .map(type_to_python)
-            .unwrap_or_else(|| "None".to_string());
+        // A binary download route returns a FastAPI `Response` (the raw bytes
+        // wrapped with `media_type="application/octet-stream"`), not the pydantic
+        // model; all other routes return the modelled response type.
+        let response_type = if ep.response_is_binary {
+            "Response".to_string()
+        } else {
+            ep.response
+                .as_ref()
+                .map(type_to_python)
+                .unwrap_or_else(|| "None".to_string())
+        };
 
         // FastAPI path: {id} stays as {id} (FastAPI uses same syntax)
         let status = if ep.response.is_none() {
@@ -790,7 +1158,81 @@ impl<'a> PyGenerator<'a> {
         for pp in &ep.path_params {
             required.push(format!("{}: str", to_snake_case(pp)));
         }
-        if ep.body.is_some() {
+        if ep.body_is_multipart {
+            // Multipart: explode the body struct into per-field FastAPI params.
+            //
+            // FILE fields: FastAPI auto-detects an `UploadFile`-typed param as a
+            // multipart file, so a non-aliased file needs NO marker — bare
+            // `UploadFile` (required, no default → `required`) / `UploadFile |
+            // None = None` (optional → `defaulted`). This deliberately avoids a
+            // `File(...)` default: ruff's B008 immutable-call allowlist covers
+            // `Query`/`Header`/`Form` but NOT `fastapi.File`, so `File(...)` as a
+            // default trips B008. When the wire name differs from the snake_case
+            // param we still need an alias; that goes in the *annotation* via
+            // `Annotated[UploadFile, File(alias="<wire>")]` — a call inside an
+            // annotation, not in default position, so B008 never fires.
+            //
+            // SCALAR fields: bind via `Form(...)`/`Form(None)` (FastAPI's
+            // form-field marker, on ruff's B008 allowlist), with `alias=` when the
+            // wire name differs — mirroring the query/header path. Both are
+            // syntactic defaults, so they sort into `defaulted`.
+            let body = ep
+                .body
+                .as_ref()
+                .expect("multipart body has resolved fields");
+            for f in &body.fields {
+                let snake = to_snake_case(&f.name);
+                let needs_alias = snake != f.name;
+                let alias = if needs_alias {
+                    format!("alias=\"{}\"", f.name)
+                } else {
+                    String::new()
+                };
+                let is_file = matches!(&f.ty, Type::File);
+                let is_opt_file = matches!(
+                    &f.ty,
+                    Type::Generic(name, args)
+                        if name == "Option" && matches!(args.first(), Some(Type::File))
+                );
+                // A `File` field relaxed by `partial` (`f.optional`) is an
+                // optional upload, exactly like `Option<File>`.
+                if is_file && !f.optional {
+                    let ann = if needs_alias {
+                        format!("Annotated[UploadFile, File({alias})]")
+                    } else {
+                        "UploadFile".to_string()
+                    };
+                    required.push(format!("{snake}: {ann}"));
+                } else if is_opt_file || is_file {
+                    let ann = if needs_alias {
+                        format!("Annotated[UploadFile | None, File({alias})]")
+                    } else {
+                        "UploadFile | None".to_string()
+                    };
+                    defaulted.push(format!("{snake}: {ann} = None"));
+                } else {
+                    let py_type = type_to_python(&f.ty);
+                    // `partial`/`Option<T>` scalar form fields are optional.
+                    let already_optional =
+                        matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                    let alias_arg = if needs_alias {
+                        format!(", {alias}")
+                    } else {
+                        String::new()
+                    };
+                    if f.optional || already_optional {
+                        let ty = if f.optional && !already_optional {
+                            format!("{py_type} | None")
+                        } else {
+                            py_type
+                        };
+                        defaulted.push(format!("{snake}: {ty} = Form(None{alias_arg})"));
+                    } else {
+                        defaulted.push(format!("{snake}: {py_type} = Form(...{alias_arg})"));
+                    }
+                }
+            }
+        } else if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
             required.push(format!("body: {body_type}"));
         }
@@ -896,7 +1338,17 @@ impl<'a> PyGenerator<'a> {
             let snake = to_snake_case(pp);
             handler_args.push(format!("{snake}={snake}"));
         }
-        if ep.body.is_some() {
+        if ep.body_is_multipart {
+            // Pass each exploded multipart field through to the handler by name.
+            let body = ep
+                .body
+                .as_ref()
+                .expect("multipart body has resolved fields");
+            for f in &body.fields {
+                let snake = to_snake_case(&f.name);
+                handler_args.push(format!("{snake}={snake}"));
+            }
+        } else if ep.body.is_some() {
             handler_args.push("body=body".to_string());
         }
         for qp in &ep.query_params {
@@ -947,6 +1399,21 @@ impl<'a> PyGenerator<'a> {
             }
             self.server_out
                 .push_str(&format!("{indent}return result.body\n"));
+        } else if ep.response_is_binary {
+            // Binary download: the handler returns the raw `bytes`; wrap them in a
+            // FastAPI `Response` with an octet-stream media type. (A binary
+            // response struct is exactly one `File` field — never combined with
+            // response headers — so this branch is independent of those.)
+            let call = format_call(
+                indent,
+                &format!("data = await handlers.{fn_name}"),
+                &handler_args,
+                "",
+            );
+            self.server_out.push_str(&call);
+            self.server_out.push_str(&format!(
+                "{indent}return Response(content=data, media_type=\"application/octet-stream\")\n"
+            ));
         } else {
             let prefix = if ep.response.is_some() {
                 format!("return await handlers.{fn_name}")
@@ -1060,6 +1527,10 @@ fn type_to_python(ty: &Type) -> String {
         Type::Float => "float".to_string(),
         Type::String => "str".to_string(),
         Type::Bool => "bool".to_string(),
+        // A `File` body field is a binary upload/download. FastAPI's server-side
+        // type is `UploadFile`; multipart param wiring (`= File(...)`) and binary
+        // responses live in the body-codegen path. This is the field type.
+        Type::File => "UploadFile".to_string(),
         Type::Void => "None".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
@@ -1531,7 +2002,7 @@ endpoint createUser: POST "/api/users" {
         assert!(
             files
                 .client
-                .contains("headers[\"Debug\"] = (\"true\" if debug else \"false\")"),
+                .contains("headers[\"Debug\"] = \"true\" if debug else \"false\""),
             "bool header must serialize lowercase, not str(bool):\n{}",
             files.client
         );
@@ -1634,6 +2105,449 @@ endpoint getPost: GET "/api/posts/{id}" {
         assert!(
             files.client.contains("return GetPostResult("),
             "client must return the typed envelope:\n{}",
+            files.client
+        );
+    }
+
+    // ── Multipart upload / binary download ──────────────────────────
+
+    /// A request body containing a `File` field is `multipart/form-data`: the
+    /// server explodes it into `<f>: UploadFile = File(...)` + `<s>: <T> =
+    /// Form(...)` params (importing File/Form/UploadFile from fastapi), the
+    /// handler takes `UploadFile`/scalar params, and the client sends `files=`/
+    /// `data=` with the file field typed `bytes`. No `XBody` model is emitted.
+    #[test]
+    fn multipart_request_body() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+struct UploadResult { String url }
+endpoint uploadAvatar: POST "/api/avatar" {
+    body AvatarUpload
+    response UploadResult
+}
+"#,
+        );
+        insta::assert_snapshot!("py_multipart_models", files.models);
+        insta::assert_snapshot!("py_multipart_client", files.client);
+        insta::assert_snapshot!("py_multipart_handler", files.handlers);
+        insta::assert_snapshot!("py_multipart_server", files.server);
+        // Server: a non-aliased file is a bare `UploadFile` param (FastAPI
+        // auto-detects it; avoids ruff B008 on a `File(...)` default), scalars use
+        // `Form(...)`. Only `Form` + `UploadFile` are imported (no `File`, since no
+        // file needs an alias here).
+        assert!(
+            files
+                .server
+                .contains("from fastapi import APIRouter, Form, UploadFile"),
+            "server must import Form/UploadFile from fastapi:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("avatar: UploadFile,"),
+            "non-aliased File field must be a bare UploadFile param:\n{}",
+            files.server
+        );
+        assert!(
+            !files.server.contains("File("),
+            "non-aliased File field must not emit a File(...) default (ruff B008):\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("caption: str = Form(...)"),
+            "scalar field must bind via Form(...):\n{}",
+            files.server
+        );
+        // No XBody model emitted for a multipart body.
+        assert!(
+            !files.models.contains("UploadAvatarBody"),
+            "multipart body must not emit an XBody model:\n{}",
+            files.models
+        );
+        // Client sends files=/data=, file field typed `FileUpload`.
+        assert!(
+            files.client.contains("avatar: FileUpload"),
+            "client file field must be typed FileUpload:\n{}",
+            files.client
+        );
+        assert!(
+            files.client.contains("files=files") && files.client.contains("data=data"),
+            "client must send files=/data=:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("files[\"avatar\"] = (avatar.filename, avatar.content)"),
+            "client must put the file in the files dict (filename, content) by wire name:\n{}",
+            files.client
+        );
+        // The shared FileUpload dataclass is emitted into models.py and imported.
+        assert!(
+            files.models.contains("class FileUpload:"),
+            "models must emit the FileUpload dataclass:\n{}",
+            files.models
+        );
+        assert!(
+            files.client.contains("from .models import") && files.client.contains("FileUpload"),
+            "client must import FileUpload:\n{}",
+            files.client
+        );
+        // Handler takes UploadFile + scalar.
+        assert!(
+            files.handlers.contains("avatar: UploadFile"),
+            "handler must take UploadFile param:\n{}",
+            files.handlers
+        );
+    }
+
+    /// An `Option<File>` body field is an optional upload: server renders
+    /// `UploadFile | None = File(None)`, client `bytes | None = None` only added
+    /// to the files dict when present, handler `UploadFile | None = None`.
+    #[test]
+    fn multipart_optional_file() {
+        let files = generate_from_source(
+            r#"
+struct MaybeUpload { Option<File> avatar  String caption }
+endpoint upload: POST "/api/maybe" {
+    body MaybeUpload
+}
+"#,
+        );
+        insta::assert_snapshot!("py_multipart_optional_client", files.client);
+        insta::assert_snapshot!("py_multipart_optional_handler", files.handlers);
+        insta::assert_snapshot!("py_multipart_optional_server", files.server);
+        assert!(
+            files.server.contains("avatar: UploadFile | None = None"),
+            "optional non-aliased file must render a bare UploadFile | None = None:\n{}",
+            files.server
+        );
+        assert!(
+            files.client.contains("avatar: FileUpload | None = None"),
+            "optional file client param must default None:\n{}",
+            files.client
+        );
+        assert!(
+            files.client.contains(
+                "if avatar is not None:\n            files[\"avatar\"] = (avatar.filename, avatar.content)"
+            ),
+            "optional file must be guarded before adding to files:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("avatar: UploadFile | None = None"),
+            "optional file handler param:\n{}",
+            files.handlers
+        );
+    }
+
+    /// A camelCase `File` field needs the wire name pinned. Since a `File(...)`
+    /// default trips ruff B008 (unlike `Form`/`Query`/`Header`), the alias is
+    /// carried in the *annotation* — `Annotated[UploadFile, File(alias="<wire>")]`
+    /// — not in default position, pulling in `Annotated` + `File` imports.
+    #[test]
+    fn multipart_aliased_file_uses_annotated() {
+        let files = generate_from_source(
+            r#"
+struct Upload { File avatarImage  String caption }
+endpoint upload: POST "/api/upload" {
+    body Upload
+}
+"#,
+        );
+        insta::assert_snapshot!("py_multipart_aliased_server", files.server);
+        assert!(
+            files.server.contains("from typing import Annotated"),
+            "aliased file must import Annotated:\n{}",
+            files.server
+        );
+        assert!(
+            files
+                .server
+                .contains("from fastapi import APIRouter, File, Form, UploadFile"),
+            "aliased file must import File (for the alias):\n{}",
+            files.server
+        );
+        assert!(
+            files
+                .server
+                .contains("avatar_image: Annotated[UploadFile, File(alias=\"avatarImage\")]"),
+            "aliased file must use Annotated[..., File(alias=...)]:\n{}",
+            files.server
+        );
+        // Client keys the files dict by the wire name.
+        assert!(
+            files
+                .client
+                .contains("files[\"avatarImage\"] = (avatar_image.filename, avatar_image.content)"),
+            "client must key the file by the wire name:\n{}",
+            files.client
+        );
+    }
+
+    /// A response whose type is a single-`File` struct is a binary download: the
+    /// server returns `Response(content=..., media_type="application/octet-stream")`,
+    /// the handler returns `bytes`, the client returns `response.content`. No
+    /// response model is emitted and the response struct is not imported.
+    #[test]
+    fn binary_response_download() {
+        let files = generate_from_source(
+            r#"
+struct Doc { File data }
+endpoint download: GET "/api/doc/{id}" {
+    response Doc
+}
+"#,
+        );
+        insta::assert_snapshot!("py_binary_models", files.models);
+        insta::assert_snapshot!("py_binary_client", files.client);
+        insta::assert_snapshot!("py_binary_handler", files.handlers);
+        insta::assert_snapshot!("py_binary_server", files.server);
+        // Server returns a Response with octet-stream media type.
+        assert!(
+            files
+                .server
+                .contains("from fastapi import APIRouter, Response"),
+            "server must import Response:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("-> Response:"),
+            "binary route must return Response:\n{}",
+            files.server
+        );
+        assert!(
+            files
+                .server
+                .contains("return Response(content=data, media_type=\"application/octet-stream\")"),
+            "server must wrap bytes in an octet-stream Response:\n{}",
+            files.server
+        );
+        // Handler returns bytes; client returns response.content.
+        assert!(
+            files.handlers.contains("-> bytes: ..."),
+            "handler must return bytes:\n{}",
+            files.handlers
+        );
+        assert!(
+            files.client.contains("-> bytes:") && files.client.contains("return response.content"),
+            "client must return response.content as bytes:\n{}",
+            files.client
+        );
+        // No model emitted for the file-bearing response struct.
+        assert!(
+            !files.models.contains("class Doc"),
+            "file-bearing response struct must not emit a model:\n{}",
+            files.models
+        );
+        assert!(
+            !files.client.contains("UploadFile"),
+            "client must not reference UploadFile:\n{}",
+            files.client
+        );
+    }
+
+    /// A schema whose only model-relevant declaration is a multipart body (a
+    /// file-bearing struct emits no model) with no response model: models.py
+    /// emits just the `FileUpload` dataclass under `from dataclasses import
+    /// dataclass`, and NO `from pydantic import BaseModel`. Guards the import
+    /// block + spacing for the dataclass-only branch (`needs_base_model == false`).
+    #[test]
+    fn multipart_only_no_response_emits_dataclass_only() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+endpoint upload: POST "/api/upload" { body AvatarUpload }
+"#,
+        );
+        assert!(
+            files.models.contains("from dataclasses import dataclass"),
+            "the FileUpload dataclass needs the dataclasses import:\n{}",
+            files.models
+        );
+        assert!(
+            !files.models.contains("from pydantic import BaseModel"),
+            "no pydantic BaseModel is needed when the only struct is a multipart body:\n{}",
+            files.models
+        );
+        assert!(
+            files.models.contains("class FileUpload:"),
+            "FileUpload dataclass must be emitted:\n{}",
+            files.models
+        );
+        assert!(
+            !files.models.contains("class AvatarUpload"),
+            "file-bearing body struct must not emit a model:\n{}",
+            files.models
+        );
+        insta::assert_snapshot!("py_multipart_only_models", files.models);
+    }
+
+    /// A multipart endpoint with a path param: the generated FastAPI route must
+    /// order params as path param(s) → required `UploadFile` → defaulted
+    /// `Form(...)`. Python forbids a non-default param after a defaulted one, so
+    /// the relative order is load-bearing (a required `UploadFile` must precede
+    /// every `Form(...)` scalar). The handler call forwards each field by name.
+    #[test]
+    fn multipart_with_path_param_orders_route_params() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+struct UploadResult { String url }
+endpoint uploadAvatar: POST "/api/authors/{id}/avatar" {
+    body AvatarUpload
+    response UploadResult
+}
+"#,
+        );
+        let id_pos = files.server.find("id: str").expect("id param in route");
+        let avatar_pos = files
+            .server
+            .find("avatar: UploadFile")
+            .expect("avatar param in route");
+        let caption_pos = files
+            .server
+            .find("caption: str = Form(...)")
+            .expect("caption param in route");
+        assert!(
+            id_pos < avatar_pos && avatar_pos < caption_pos,
+            "route params must order path → UploadFile → Form(...):\n{}",
+            files.server
+        );
+        // Each exploded field is forwarded to the handler by name.
+        for frag in ["id=id", "avatar=avatar", "caption=caption"] {
+            assert!(
+                files.server.contains(frag),
+                "route must forward `{frag}` to the handler:\n{}",
+                files.server
+            );
+        }
+    }
+
+    /// A `File` field relaxed by `partial` is an OPTIONAL upload, exactly like
+    /// `Option<File>`: the client/handler params become `FileUpload | None = None`
+    /// / `UploadFile | None = None` and the server binds a bare `UploadFile | None
+    /// = None` (no `File(...)` default). Regression guard for the `partial`-over-a-
+    /// multipart-body parity fix (the `is_file` branch must honor `f.optional`).
+    #[test]
+    fn multipart_partial_file_is_optional() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+endpoint uploadAvatar: POST "/api/avatar" {
+    body AvatarUpload partial { avatar }
+}
+"#,
+        );
+        assert!(
+            files.client.contains("avatar: FileUpload | None = None"),
+            "partial-relaxed file client param must be optional:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("avatar: UploadFile | None = None"),
+            "partial-relaxed file handler param must be optional:\n{}",
+            files.handlers
+        );
+        assert!(
+            files.server.contains("avatar: UploadFile | None = None"),
+            "partial-relaxed file server param must be a bare optional UploadFile:\n{}",
+            files.server
+        );
+        // The optional file must be guarded before being added to the files dict.
+        assert!(
+            files.client.contains("if avatar is not None:"),
+            "partial-relaxed file must be guarded on the client:\n{}",
+            files.client
+        );
+    }
+
+    /// A multipart body with `Int`/`Bool` scalars: the client `data` dict
+    /// stringifies them onto the form. A `bool` serializes as canonical lowercase
+    /// `"true"`/`"false"` (the TS server compares `=== "true"`), and the ternary
+    /// is emitted WITHOUT surrounding parens — it lands on the RHS of a
+    /// `data[...] = ` assignment, where `black` strips redundant parentheses, so
+    /// the wrapped form would fail `black --check`. Regression guard for that
+    /// (caught by the multipart round-trip's `crop` field).
+    #[test]
+    fn multipart_scalar_bool_data_line_is_paren_free() {
+        let files = generate_from_source(
+            r#"
+struct Upload { File avatar  Int rotation  Bool crop }
+endpoint upload: POST "/api/upload" { body Upload }
+"#,
+        );
+        assert!(
+            files
+                .client
+                .contains("data[\"crop\"] = \"true\" if crop else \"false\""),
+            "multipart bool must serialize lowercase with no wrapping parens (black strips them):\n{}",
+            files.client
+        );
+        assert!(
+            files.client.contains("data[\"rotation\"] = rotation"),
+            "multipart int is passed through to the form data dict as-is:\n{}",
+            files.client
+        );
+    }
+
+    /// An endpoint that is BOTH a multipart upload AND a binary download
+    /// (`body_is_multipart` + `response_is_binary`): the server route explodes
+    /// the body into `UploadFile`/`Form(...)` params yet still returns a
+    /// `Response` (the binary branch), the handler takes the exploded params and
+    /// returns `bytes`, and the client sends `files=`/`data=` while returning
+    /// `response.content`. Guards that the multipart-param and binary-response
+    /// branches compose in one route without conflicting.
+    #[test]
+    fn multipart_upload_with_binary_response() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+struct Thumbnail { File data }
+endpoint convertAvatar: POST "/api/avatar/convert" {
+    body AvatarUpload
+    response Thumbnail
+}
+"#,
+        );
+        // Server: multipart params + a Response return + octet-stream wrap.
+        assert!(
+            files
+                .server
+                .contains("from fastapi import APIRouter, Form, Response, UploadFile"),
+            "server must import Form/Response/UploadFile:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("avatar: UploadFile,")
+                && files.server.contains("caption: str = Form(...)")
+                && files.server.contains("-> Response:"),
+            "server route must explode the body yet return Response:\n{}",
+            files.server
+        );
+        assert!(
+            files
+                .server
+                .contains("data = await handlers.convert_avatar(")
+                && files.server.contains(
+                    "return Response(content=data, media_type=\"application/octet-stream\")"
+                ),
+            "server must call the handler with the exploded args and wrap the bytes:\n{}",
+            files.server
+        );
+        // Handler takes the exploded params and returns bytes.
+        assert!(
+            files.handlers.contains("avatar: UploadFile")
+                && files.handlers.contains("-> bytes: ..."),
+            "handler must take UploadFile + return bytes:\n{}",
+            files.handlers
+        );
+        // Client sends files=/data= and returns the raw response bytes.
+        assert!(
+            files.client.contains("files=files")
+                && files.client.contains("data=data")
+                && files.client.contains("return response.content"),
+            "client must send multipart and return response.content:\n{}",
             files.client
         );
     }

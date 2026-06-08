@@ -35,9 +35,13 @@ pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
         }
     }
 
-    // Emit derived body schemas for endpoints
+    // Emit derived body schemas for endpoints. A multipart (file-upload) body is
+    // inlined into the operation as a `multipart/form-data` schema rather than
+    // referenced as a component, so it gets no `{name}Body` component schema.
     for ep in &check_result.endpoints {
-        if let Some(ref body) = ep.body {
+        if let Some(ref body) = ep.body
+            && !ep.body_is_multipart
+        {
             let type_name = format!("{}Body", capitalize(&ep.name));
             schemas.insert(type_name, derived_type_to_schema(body));
         }
@@ -162,21 +166,23 @@ fn build_operation(ep: &EndpointInfo) -> Value {
         op.insert("parameters".to_string(), Value::Array(parameters));
     }
 
-    // Request body
-    if ep.body.is_some() {
-        let body_type = format!("{}Body", capitalize(&ep.name));
+    // Request body. A multipart (file-upload) body emits an inline
+    // `multipart/form-data` object schema (File fields → `format: binary`);
+    // a plain JSON body references its `{name}Body` component schema.
+    if let Some(ref body) = ep.body {
+        let content = if ep.body_is_multipart {
+            json!({ "multipart/form-data": { "schema": derived_type_to_schema(body) } })
+        } else {
+            let body_type = format!("{}Body", capitalize(&ep.name));
+            json!({
+                "application/json": {
+                    "schema": { "$ref": format!("#/components/schemas/{}", body_type) }
+                }
+            })
+        };
         op.insert(
             "requestBody".to_string(),
-            json!({
-                "required": true,
-                "content": {
-                    "application/json": {
-                        "schema": {
-                            "$ref": format!("#/components/schemas/{}", body_type)
-                        }
-                    }
-                }
-            }),
+            json!({ "required": true, "content": content }),
         );
     }
 
@@ -210,13 +216,21 @@ fn build_operation(ep: &EndpointInfo) -> Value {
     };
 
     if let Some(ref resp_type) = ep.response {
+        // A binary download (single-`File` response struct) streams raw bytes:
+        // `application/octet-stream` with a `format: binary` schema. Otherwise the
+        // success body is the JSON-serialized response type.
+        let content = if ep.response_is_binary {
+            json!({
+                "application/octet-stream": {
+                    "schema": { "type": "string", "format": "binary" }
+                }
+            })
+        } else {
+            json!({ "application/json": { "schema": type_to_json_schema(resp_type) } })
+        };
         let mut success = json!({
             "description": "Successful response",
-            "content": {
-                "application/json": {
-                    "schema": type_to_json_schema(resp_type)
-                }
-            }
+            "content": content
         });
         if let Some(ref headers) = response_headers
             && let Some(obj) = success.as_object_mut()
@@ -259,6 +273,10 @@ fn type_to_json_schema(ty: &Type) -> Value {
         Type::Float => json!({ "type": "number" }),
         Type::String => json!({ "type": "string" }),
         Type::Bool => json!({ "type": "boolean" }),
+        // A `File` body field is binary content: OpenAPI represents it as a
+        // string with `format: binary` (used inside `multipart/form-data` request
+        // bodies and binary responses, wired up in the body-codegen path).
+        Type::File => json!({ "type": "string", "format": "binary" }),
         Type::Void => json!({}),
         Type::Named(name) => json!({ "$ref": format!("#/components/schemas/{}", name) }),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
@@ -354,6 +372,9 @@ fn derived_type_to_schema(body: &phoenix_sema::checker::ResolvedDerivedType) -> 
     let mut required = Vec::new();
 
     for f in &body.fields {
+        // A field is optional if `partial` made it so (`f.optional`) or its type is
+        // `Option<T>`; only genuinely required fields land in the `required` array.
+        let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
         let mut field_schema = type_to_json_schema(&f.ty);
         if let Some(ref constraint) = f.constraint
             && let Some(obj) = field_schema.as_object_mut()
@@ -361,7 +382,7 @@ fn derived_type_to_schema(body: &phoenix_sema::checker::ResolvedDerivedType) -> 
             extract_schema_constraints(constraint, obj);
         }
         properties.insert(f.name.clone(), field_schema);
-        if !f.optional {
+        if !f.optional && !is_option {
             required.push(json!(f.name));
         }
     }
@@ -657,6 +678,31 @@ endpoint createUser: POST "/api/users" {
         insta::assert_snapshot!("openapi_derived_body_omit", spec);
     }
 
+    #[test]
+    fn derived_type_body_option_field_not_required() {
+        // An `Option<T>` field of a (plain JSON) request body must NOT land in the
+        // schema's `required` array — only genuinely required fields do. Regression
+        // guard for the `is_option` exclusion in `derived_type_to_schema`.
+        let spec = generate_from_source(
+            r#"
+struct Note { String title  Option<String> body  Int priority }
+endpoint createNote: POST "/api/notes" {
+    body Note
+    response Note
+}
+"#,
+        );
+        // The body schema requires `title` and `priority` but not the optional `body`.
+        let v: serde_json::Value = serde_json::from_str(&spec).unwrap();
+        let required = &v["components"]["schemas"]["CreateNoteBody"]["required"];
+        assert_eq!(
+            required,
+            &serde_json::json!(["title", "priority"]),
+            "Option field must be excluded from required:\n{spec}"
+        );
+        insta::assert_snapshot!("openapi_derived_body_option_field", spec);
+    }
+
     // ── default_to_json tests ──────────────────────────────────────
 
     #[test]
@@ -845,5 +891,44 @@ endpoint createOrder: POST "/api/orders" {
             "the default must be baked into the schema:\n{}",
             spec
         );
+    }
+
+    // ── multipart / file-upload + binary download tests ────────────
+
+    #[test]
+    fn endpoint_with_multipart_request_body() {
+        // A request body whose struct contains a `File` field is multipart: the
+        // request body emits an inline `multipart/form-data` object schema (the
+        // File field as `type: string, format: binary`, scalars normally, with a
+        // `required` array), and no `{name}Body` component schema is generated.
+        let spec = generate_from_source(
+            r#"
+struct AvatarUpload {
+    File avatar
+    String caption
+    Option<String> alt
+}
+endpoint uploadAvatar: POST "/api/avatar" {
+    body AvatarUpload
+}
+"#,
+        );
+        insta::assert_snapshot!("openapi_multipart_request_body", spec);
+    }
+
+    #[test]
+    fn endpoint_with_binary_response() {
+        // A response whose struct is a single `File` field is a binary download:
+        // the 200 response content becomes `application/octet-stream` with a
+        // `format: binary` schema instead of `application/json`.
+        let spec = generate_from_source(
+            r#"
+struct Doc { File data }
+endpoint downloadDoc: GET "/api/doc/{id}" {
+    response Doc
+}
+"#,
+        );
+        insta::assert_snapshot!("openapi_binary_response", spec);
     }
 }

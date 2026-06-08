@@ -72,6 +72,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::FloatType => "Float",
         TokenKind::StringType => "String",
         TokenKind::BoolType => "Bool",
+        TokenKind::FileType => "File",
         TokenKind::Void => "Void",
         TokenKind::Plus => "'+'",
         TokenKind::Minus => "'-'",

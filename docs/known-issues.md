@@ -18,6 +18,67 @@ Recoverable function-exit paths match across all three backends. The behavior sp
 
 **Target phase:** None — no fix planned. Revisit if defers ever become load-bearing for cleanup that must run on hard panic (e.g. unwinding-style destructors).
 
+### Multipart upload filename is not observable in the TypeScript target
+
+For a `File` field in a multipart request body, the original upload **filename**
+reaches the handler in Go (`*multipart.FileHeader.Filename`) and Python
+(`UploadFile.filename`), but is **structurally lost in the TypeScript target**.
+The generated express server delivers files to the handler as
+`Record<string, Blob>`, and a `Blob` (unlike Go's `FileHeader` or Python's
+`UploadFile`) carries no filename. So a TS handler can read the file *bytes* and
+content type but never the client-supplied name.
+
+This surfaced in the round-trip suite: the multipart case asserts
+`avatar_filename` for Go and Python, but the TS driver must skip that one
+sub-assertion (it asserts file content, scalar fields, and optional-file-absent,
+which are all observable). It is a generated-code shape limitation, not a driver
+bug.
+
+**Why not fixed now:** carrying the filename through to a TS handler means
+changing the request shape the generated server hands the handler — e.g. a
+`{ data: Blob; filename: string }` wrapper per file field, or a richer
+`MultipartFile` type — which is a cross-cutting body-codegen change (it alters the
+handler signature for every TS multipart endpoint) and would diverge the TS
+handler shape from the Go/Python `File`-field shape. Deferred until a real
+consumer needs the filename server-side in TS.
+
+**File:** `phoenix-codegen/src/typescript.rs` (multipart server body extraction +
+the `MultipartRequest` interface). **Workaround:** pass the filename as a separate
+scalar form field (`String filename`) alongside the `File`. **Target phase:**
+demand-triggered. Surfaced 2026-06-05 building the multipart round-trip suite.
+
+### Multipart body field constraints are validated only in the Go target
+
+A scalar field of a multipart request body may carry a `where` constraint (e.g.
+`String caption where self.length > 0`). On a **JSON** body every target enforces
+that constraint server-side; on a **multipart** body only **Go** does (it
+assembles the `<Endpoint>Body` struct from the parsed form, then calls
+`body.Validate()`, exactly like the JSON path). **Python and TypeScript silently
+skip it:**
+
+- **Python/FastAPI** explodes the multipart body into per-field `Form(...)`
+  params and emits no pydantic model, so the model-level constraint (a pydantic
+  `Field(...)` on the JSON path) is never materialized.
+- **TypeScript** assembles the body object field-by-field from the multipart
+  request and does not call the `validate<Endpoint>Body` function (whose
+  generated `typeof` checks are not designed for `Blob`-typed `File` fields).
+
+So an out-of-range scalar on a multipart upload is a 400 in Go but is accepted in
+Python/TS. The `uploadAvatar` round-trip fixture carries such a constraint
+(`caption ... where self.length > 0`); the round-trip suite sends only valid
+input, so the divergence is not exercised.
+
+**Why not fixed now:** closing it means translating arbitrary Phoenix constraint
+expressions into FastAPI `Form(...)` validators (Python) and teaching the TS
+validator generator to handle `Blob` fields (TypeScript) — both are real
+features, larger than this slice, and orthogonal to the multipart transport
+itself. Removing Go's validation to force uniformity would instead discard a
+working safety check.
+
+**File:** `phoenix-codegen/src/python.rs` and `phoenix-codegen/src/typescript.rs`
+(multipart server routes). **Workaround:** validate the constrained field inside
+the handler. **Target phase:** demand-triggered. Surfaced 2026-06-05.
+
 ### Defaulted request and query inputs diverge per target and mostly can't trigger the server default
 
 A Phoenix Gen endpoint input with a default — a query param (`Int page = 1`) or a request header (`Int maxStale = 60`) — does not produce a uniform generated **client** shape across targets, and on two of three targets the server's default branch is unreachable through the generated client:

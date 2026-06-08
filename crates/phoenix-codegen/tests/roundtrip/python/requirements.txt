@@ -15,3 +15,7 @@
 fastapi==0.115.6
 httpx==0.28.1
 pydantic==2.10.4
+# Required by FastAPI to parse multipart/form-data (File/Form) request bodies,
+# exercised by the uploadAvatar round-trip case. FastAPI raises at runtime if a
+# route declares File/Form and python-multipart is not installed.
+python-multipart==0.0.20

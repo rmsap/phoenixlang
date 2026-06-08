@@ -278,6 +278,39 @@ impl Checker {
         );
     }
 
+    /// Returns `true` if a struct-field type counts as carrying a `File`:
+    /// either a direct `File` or an `Option<File>` (optional file upload). Used
+    /// to compute [`crate::checker::StructInfo::is_file_bearing`].
+    pub(crate) fn field_type_is_file(ty: &crate::types::Type) -> bool {
+        use crate::types::Type;
+        match ty {
+            Type::File => true,
+            Type::Generic(name, args) => {
+                name == "Option" && args.len() == 1 && matches!(args[0], Type::File)
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if a field type is legal in a multipart (file-upload)
+    /// request body: a `File`, a form-encodable scalar (`Int`/`Float`/`Bool`/
+    /// `String`), or an `Option` of either. A `multipart/form-data` part is
+    /// text (or a file) on the wire, so a `List`, `Map`, nested struct, or enum
+    /// field has no form encoding and is rejected by `check_endpoint`.
+    pub(crate) fn is_multipart_field_type(ty: &crate::types::Type) -> bool {
+        use crate::types::Type;
+        let is_scalar = |t: &Type| {
+            matches!(
+                t,
+                Type::Int | Type::Float | Type::Bool | Type::String | Type::File
+            )
+        };
+        match ty {
+            Type::Generic(name, args) if name == "Option" && args.len() == 1 => is_scalar(&args[0]),
+            other => is_scalar(other),
+        }
+    }
+
     /// Registers a struct declaration, resolving its field types and storing
     /// them in the struct table for use during constructor and field-access
     /// checking.  Also registers any inline methods and trait implementations.
@@ -308,7 +341,16 @@ impl Checker {
                 s.fields
                     .iter()
                     .map(|f| {
+                        // `File` (and `Option<File>`) is legal as the *direct*
+                        // type of a struct field — that is what makes the
+                        // struct a body-only/multipart type. Permit it for this
+                        // one resolution; `resolve_type_expr` clears the flag
+                        // before recursing into generic args, so `List<File>`,
+                        // `Map<String, File>`, etc. are still rejected.
+                        let prev_file = this.file_field_allowed;
+                        this.file_field_allowed = true;
                         let ty = this.resolve_type_expr(&f.type_annotation);
+                        this.file_field_allowed = prev_file;
 
                         // Validate constraint expression if present: bind `self` to
                         // the field type, type-check the expression, verify it is Bool.
@@ -352,6 +394,9 @@ impl Checker {
             crate::checker::SymbolKind::Struct,
             s.name.clone(),
         );
+        // A struct is "file-bearing" (body-only) if any direct field is a
+        // `File` or `Option<File>`. See `Checker::field_type_is_file`.
+        let is_file_bearing = fields.iter().any(|f| Self::field_type_is_file(&f.ty));
         self.structs.insert(
             qualified,
             StructInfo {
@@ -360,6 +405,7 @@ impl Checker {
                 fields,
                 visibility: s.visibility,
                 def_module: self.current_module.clone(),
+                is_file_bearing,
             },
         );
 

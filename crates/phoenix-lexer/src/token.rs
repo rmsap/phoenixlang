@@ -158,6 +158,8 @@ pub enum TokenKind {
     StringType,
     /// The `Bool` type name.
     BoolType,
+    /// The `File` type name (Phoenix Gen endpoint-body binary uploads/downloads).
+    FileType,
     /// The `Void` type name (used as a return type).
     Void,
 

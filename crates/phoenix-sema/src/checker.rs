@@ -7,7 +7,7 @@ use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     Block, CaptureInfo, Declaration, ElseBranch, Expr, FunctionDecl, IfExpr, ImplBlock,
-    InlineTraitImpl, MethodCallExpr, Param, Program, Statement, Visibility,
+    InlineTraitImpl, MethodCallExpr, Param, Program, Statement, TypeExpr, Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -169,6 +169,13 @@ pub struct StructInfo {
     pub visibility: Visibility,
     /// Module path of the file declaring this struct.
     pub def_module: ModulePath,
+    /// `true` when this struct has at least one direct field of type
+    /// [`Type::File`]. Such a struct is "body-only": it carries non-JSON binary
+    /// transport data and is legal ONLY in endpoint `body`/`response` position.
+    /// Sema rejects its use as a function param/return, `let` type, nested
+    /// struct field, enum payload, generic arg, or type-alias target. Computed
+    /// in `register_struct`. See `docs/design-decisions.md` (multipart section).
+    pub is_file_bearing: bool,
 }
 
 /// Information about a registered enum definition (variants and generic params).
@@ -278,6 +285,10 @@ pub struct DerivedField {
     pub optional: bool,
     /// Constraint inherited from the base struct field's `where` clause.
     pub constraint: Option<phoenix_parser::ast::Expr>,
+    /// Source span of the originating base-struct field declaration, used to
+    /// point field-level endpoint diagnostics (e.g. an illegal multipart field
+    /// type) at the field rather than the whole endpoint.
+    pub span: Span,
 }
 
 /// A resolved derived type for an endpoint body, with all modifiers applied.
@@ -354,6 +365,22 @@ pub struct HeaderParamInfo {
     pub has_default: bool,
     /// The literal default value, if provided (request headers only).
     pub default_value: Option<DefaultValue>,
+}
+
+/// Reports whether a raw field type annotation is `File` or `Option<File>` —
+/// the two shapes that make a struct "file-bearing" (body-only). This works on
+/// the unresolved [`TypeExpr`] (not a resolved [`Type`]) so it can be evaluated
+/// in `pre_register_type_names`, before any field types are resolved, giving
+/// every struct a correct `is_file_bearing` flag independent of declaration
+/// order. The resolved-type counterpart is [`Checker::field_type_is_file`].
+fn type_expr_is_file(te: &TypeExpr) -> bool {
+    match te {
+        TypeExpr::Named(n) => n.name == "File",
+        TypeExpr::Generic(g) => {
+            g.name == "Option" && g.type_args.len() == 1 && type_expr_is_file(&g.type_args[0])
+        }
+        _ => false,
+    }
 }
 
 /// Derives the default on-the-wire HTTP header name from a Phoenix identifier,
@@ -434,6 +461,16 @@ pub struct EndpointInfo {
     pub errors: Vec<(String, i64)>,
     /// Doc comment attached to this endpoint.
     pub doc_comment: Option<String>,
+    /// `true` when the request `body`, after omit/pick/partial, contains at
+    /// least one `File` (or `Option<File>`) field — i.e. the body is
+    /// `multipart/form-data` rather than JSON. Computed in `check_endpoint`;
+    /// consumed by the per-target multipart codegen. See
+    /// `docs/design-decisions.md` (multipart section).
+    pub body_is_multipart: bool,
+    /// `true` when the `response` type is a file-bearing struct holding exactly
+    /// one `File` field — i.e. a pure binary download. Computed in
+    /// `check_endpoint`; consumed by the per-target download codegen.
+    pub response_is_binary: bool,
 }
 
 /// Information about a registered type alias.
@@ -521,6 +558,27 @@ pub struct Checker {
     pub(crate) current_type_params: Vec<String>,
     /// Trait bounds for the current function's type parameters.
     pub(crate) current_type_param_bounds: Vec<(String, Vec<String>)>,
+    /// When `true`, a bare `Type::File` is permitted as the result of
+    /// [`Checker::resolve_type_expr`]. `File` is an endpoint-transport-only
+    /// primitive: it is legal ONLY as the *direct* type of a struct field
+    /// (which makes that struct a body-only/multipart type). This flag is set
+    /// `true` solely while resolving a struct field's direct type annotation in
+    /// `register_struct`, and is cleared before recursing into generic/function
+    /// type arguments — so `List<File>`, `Option<File>` (per the decision
+    /// below), `Map<String, File>`, function params/returns, `let` bindings,
+    /// query params, headers, enum payloads, and type-alias targets all reject
+    /// `File`. Default `false`. See the "multipart / file-upload" section of
+    /// `docs/design-decisions.md`.
+    pub(crate) file_field_allowed: bool,
+    /// When `true`, a `Type::Named(S)` where `S` is a file-bearing (body-only)
+    /// struct is permitted as the result of [`Checker::resolve_type_expr`].
+    /// A file-bearing struct may appear ONLY in endpoint `body`/`response`
+    /// position; everywhere else (function param/return, `let`, nested struct
+    /// field, enum payload, generic arg, type-alias target) it is rejected.
+    /// The request `body` path goes through `resolve_derived_type`, which looks
+    /// the struct up by name without calling `resolve_type_expr`, so only the
+    /// `response` resolution site sets this flag. Default `false`.
+    pub(crate) file_bearing_struct_allowed: bool,
     /// Resolved type for each expression, keyed by source span.
     pub(crate) expr_types: HashMap<Span, Type>,
     /// Symbol references collected during checking.
@@ -611,6 +669,8 @@ impl Checker {
             loop_depth: 0,
             current_type_params: Vec::new(),
             current_type_param_bounds: Vec::new(),
+            file_field_allowed: false,
+            file_bearing_struct_allowed: false,
             expr_types: HashMap::new(),
             symbol_references: HashMap::new(),
             call_type_args: HashMap::new(),
@@ -847,12 +907,27 @@ impl Checker {
                         continue;
                     }
                     let qualified = module_qualify(&self.current_module, &s.name);
+                    // `is_file_bearing` is computed here from the raw field
+                    // annotations (not the resolved types) so it is correct on
+                    // the placeholder BEFORE any struct's `register_struct` runs.
+                    // The body-only position checks in `resolve_type_expr` look
+                    // this flag up on referenced structs during field/param
+                    // resolution, which happens in source order — a struct
+                    // forward-referencing a `File`-bearing struct declared later
+                    // would otherwise read a stale `false` placeholder and slip
+                    // past the rejection. `register_struct` later overwrites this
+                    // slot with the same value derived from resolved fields.
+                    let is_file_bearing = s
+                        .fields
+                        .iter()
+                        .any(|f| type_expr_is_file(&f.type_annotation));
                     self.structs.entry(qualified).or_insert_with(|| StructInfo {
                         definition_span: s.name_span,
                         type_params: s.type_params.clone(),
                         fields: Vec::new(),
                         visibility: s.visibility,
                         def_module: self.current_module.clone(),
+                        is_file_bearing,
                     });
                 }
                 Declaration::Enum(e) => {

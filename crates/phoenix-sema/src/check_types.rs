@@ -143,6 +143,26 @@ impl Checker {
                 let ty = Type::from_name(&named.name);
                 if let Type::Named(ref name) = ty {
                     if self.lookup_struct(name).is_some() || self.lookup_enum(name).is_some() {
+                        // Body-only (file-bearing) structs are legal ONLY in
+                        // endpoint body/response position. Reject everywhere
+                        // else. (The request-body path resolves the struct via
+                        // `resolve_derived_type`, not here, so this only fires
+                        // for misuse and for the response position — which sets
+                        // `file_bearing_struct_allowed`.)
+                        if !self.file_bearing_struct_allowed
+                            && self
+                                .lookup_struct(name)
+                                .is_some_and(|si| si.is_file_bearing)
+                        {
+                            self.error(
+                                format!(
+                                    "struct `{}` contains a `File` field, so it is a body-only type usable only in endpoint `body`/`response` position",
+                                    named.name
+                                ),
+                                named.span,
+                            );
+                            return Type::Error;
+                        }
                         // Carry the *qualified* key so downstream
                         // comparisons (sema's type-equality checks
                         // against enum-variant Types, IR's
@@ -158,25 +178,69 @@ impl Checker {
                     }
                     self.error(format!("unknown type `{}`", name), named.span);
                     Type::Error
+                } else if ty == Type::File && !self.file_field_allowed {
+                    // `File` is endpoint-transport-only: legal only as the
+                    // direct type of a struct field (set via
+                    // `file_field_allowed` in `register_struct`). Reject it in
+                    // function params/returns, `let` bindings, query params,
+                    // headers, enum payloads, nested generics, and type-alias
+                    // targets. See `docs/design-decisions.md` (multipart).
+                    self.error(
+                        "`File` is only allowed as a field of an endpoint request/response body struct".to_string(),
+                        named.span,
+                    );
+                    Type::Error
                 } else {
                     ty
                 }
             }
             TypeExpr::Function(ft) => {
+                // A function type never makes a struct body-only; `File` is
+                // illegal inside a function signature, so clear the allowance
+                // before recursing into param/return types. Likewise a
+                // file-bearing struct may not be nested inside a function type,
+                // so clear the response-position allowance too.
+                let prev_file = self.file_field_allowed;
+                let prev_bearing = self.file_bearing_struct_allowed;
+                self.file_field_allowed = false;
+                self.file_bearing_struct_allowed = false;
                 let params: Vec<Type> = ft
                     .param_types
                     .iter()
                     .map(|t| self.resolve_type_expr(t))
                     .collect();
                 let ret = self.resolve_type_expr(&ft.return_type);
+                self.file_field_allowed = prev_file;
+                self.file_bearing_struct_allowed = prev_bearing;
                 Type::Function(params, Box::new(ret))
             }
             TypeExpr::Generic(gt) => {
+                // `File` is illegal inside a generic argument — `List<File>`,
+                // `Map<String, File>`, etc. are rejected — with ONE exception:
+                // `Option<File>` as a struct field is an optional file upload,
+                // permitted per `docs/design-decisions.md` (multipart). So
+                // propagate the field allowance only into `Option`'s single
+                // argument; clear it for every other generic.
+                //
+                // A file-bearing struct is *never* permitted nested inside a
+                // generic, even in response position: `response List<Doc>` /
+                // `response Option<Doc>` (where `Doc` is file-bearing) must be
+                // rejected, not silently treated as a JSON response of an
+                // unserializable `File`. So always clear
+                // `file_bearing_struct_allowed` before recursing into args —
+                // the allowance applies only to the *direct* response type.
+                let prev_file = self.file_field_allowed;
+                let prev_bearing = self.file_bearing_struct_allowed;
+                let arg_file_allowed = prev_file && gt.name == "Option";
+                self.file_field_allowed = arg_file_allowed;
+                self.file_bearing_struct_allowed = false;
                 let type_args: Vec<Type> = gt
                     .type_args
                     .iter()
                     .map(|t| self.resolve_type_expr(t))
                     .collect();
+                self.file_field_allowed = prev_file;
+                self.file_bearing_struct_allowed = prev_bearing;
                 // Check if it's a generic type alias (e.g. `StringResult<Int>`)
                 if let Some(alias_info) = self.lookup_type_alias(&gt.name)
                     && !alias_info.type_params.is_empty()

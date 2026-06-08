@@ -52,9 +52,17 @@ impl Checker {
             );
         }
 
-        // Resolve response type
+        // Resolve response type. A response struct may be a file-bearing
+        // (body-only) struct — that is a binary download — so the response
+        // position permits it (`file_bearing_struct_allowed`). Rule 3 then
+        // requires such a response struct to hold EXACTLY one field, of type
+        // `File`, and nothing else (a binary stream cannot be multiplexed with
+        // JSON fields). See `docs/design-decisions.md` (multipart).
         let response = ep.response.as_ref().map(|te| {
+            let prev = self.file_bearing_struct_allowed;
+            self.file_bearing_struct_allowed = true;
             let ty = self.resolve_type_expr(te);
+            self.file_bearing_struct_allowed = prev;
             if ty == Type::Error {
                 self.error(
                     format!("endpoint `{}`: unknown response type", ep.name),
@@ -64,11 +72,66 @@ impl Checker {
             ty
         });
 
-        // Resolve body type with modifiers
+        // Rule 3 (response/download): a file-bearing response struct must be a
+        // pure binary download — exactly one field, of type `File`.
+        let mut response_is_binary = false;
+        if let Some(Type::Named(name)) = &response
+            && let Some(si) = self.lookup_struct(name)
+            && si.is_file_bearing
+        {
+            let only_one_file =
+                si.fields.len() == 1 && si.fields.first().is_some_and(|f| f.ty == Type::File);
+            if only_one_file {
+                response_is_binary = true;
+            } else {
+                self.error(
+                    format!(
+                        "endpoint `{}`: a `File`-bearing response struct (`{}`) must contain exactly one field of type `File` and nothing else (binary download)",
+                        ep.name, name
+                    ),
+                    ep.span,
+                );
+            }
+        }
+
+        // Resolve body type with modifiers. The request-body path looks the
+        // base struct up by name (it does not call `resolve_type_expr`), so a
+        // file-bearing body struct is accepted here without the
+        // `file_bearing_struct_allowed` gate. A request body may mix `File`
+        // fields with scalars (multipart/form-data); see the field-type rule
+        // below for what a multipart body's *non-file* fields may be.
         let body = ep
             .body
             .as_ref()
             .and_then(|dt| self.resolve_derived_type(&ep.name, dt));
+
+        // The request body is multipart iff, after omit/pick/partial, any
+        // surviving field carries a `File`. Type-determined, not a heuristic —
+        // a `File` cannot be JSON-serialized.
+        let body_is_multipart = body
+            .as_ref()
+            .is_some_and(|b| b.fields.iter().any(|f| Self::field_type_is_file(&f.ty)));
+
+        // Rule (multipart bodies): a `multipart/form-data` part is text on the
+        // wire, so every *non-file* field of a multipart body must be a scalar
+        // (`Int`/`Float`/`Bool`/`String`) or `Option<scalar>`. A `List`, `Map`,
+        // nested struct, or enum field cannot be form-encoded and would emit
+        // broken client/server code (httpx `data=` / FastAPI `Form(...)` /
+        // `FormData`), so reject it here rather than mis-generate. See
+        // `docs/design-decisions.md` (multipart section).
+        if body_is_multipart && let Some(b) = body.as_ref() {
+            for f in &b.fields {
+                if !Self::is_multipart_field_type(&f.ty) {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: field `{}` of a multipart (file-upload) body must be a `File`, a scalar (`Int`/`Float`/`Bool`/`String`), or an `Option` of one of those — `{}` cannot be sent as a form field",
+                            ep.name, f.name, f.ty
+                        ),
+                        f.span,
+                    );
+                }
+            }
+        }
 
         // Validate error variants
         let mut seen_errors = std::collections::HashSet::new();
@@ -146,6 +209,21 @@ impl Checker {
             .map(|h| self.resolve_header(ep, h, true))
             .collect();
 
+        // A binary download streams raw bytes as its whole response body; the
+        // generated targets return a stream/blob/`Response` for it, with no
+        // `<Endpoint>Result` envelope to carry typed response-header fields.
+        // Combining the two has no coherent generated shape (and produces
+        // contradictory codegen), so reject it here rather than emit broken code.
+        if response_is_binary && let Some(first) = ep.response_headers.first() {
+            self.error(
+                format!(
+                    "endpoint `{}`: a binary-download response (a single-`File` response struct) cannot also declare response headers — the response body is the raw file stream, with no envelope to carry header fields",
+                    ep.name
+                ),
+                first.span,
+            );
+        }
+
         // Request headers share the generated parameter scope with path and
         // query params, so a duplicate local name would emit two parameters of
         // the same name (a compile error in the generated Go/TS/Python). Check
@@ -210,6 +288,8 @@ impl Checker {
             response_headers,
             errors,
             doc_comment: ep.doc_comment.clone(),
+            body_is_multipart,
+            response_is_binary,
         });
     }
 
@@ -355,6 +435,7 @@ impl Checker {
                 ty: f.ty.clone(),
                 optional: false,
                 constraint: f.constraint.clone(),
+                span: f.definition_span,
             })
             .collect();
 
@@ -1305,6 +1386,400 @@ mod tests {
                 }
             }
             "#,
+        );
+    }
+
+    // ── File primitive: body-only / multipart / binary-download rules ────
+    //
+    // `File` is an endpoint-transport-only type: legal ONLY as the direct
+    // field of a struct used as an endpoint request/response body. See
+    // `docs/design-decisions.md` (multipart / file-upload section).
+
+    // ACCEPT: request body mixing a File + scalars (multipart upload).
+    #[test]
+    fn file_accept_request_body_mixed() {
+        assert_no_errors(
+            r#"
+            struct AvatarUpload { File avatar  String caption }
+            struct UploadResult { String url }
+            endpoint uploadAvatar: POST "/api/avatar" {
+                body AvatarUpload
+                response UploadResult
+            }
+            "#,
+        );
+    }
+
+    // ACCEPT: response body that is a single-File struct (binary download).
+    #[test]
+    fn file_accept_response_single_file() {
+        assert_no_errors(
+            r#"
+            struct Doc { File data }
+            endpoint download: GET "/api/doc/{id}" {
+                response Doc
+            }
+            "#,
+        );
+    }
+
+    // ACCEPT: `Option<File>` as a struct field (optional file upload).
+    #[test]
+    fn file_accept_optional_file_field() {
+        assert_no_errors(
+            r#"
+            struct MaybeUpload { Option<File> avatar  String caption }
+            endpoint upload: POST "/api/maybe" {
+                body MaybeUpload
+            }
+            "#,
+        );
+    }
+
+    // FLAGS: request body with a File field is multipart.
+    #[test]
+    fn file_flag_body_is_multipart() {
+        let ep = first_endpoint(
+            r#"
+            struct AvatarUpload { File avatar  String caption }
+            endpoint uploadAvatar: POST "/api/avatar" {
+                body AvatarUpload
+            }
+            "#,
+        );
+        assert!(ep.body_is_multipart, "body should be multipart");
+        assert!(!ep.response_is_binary);
+    }
+
+    // FLAGS: omitting the File field makes the body plain JSON again.
+    #[test]
+    fn file_flag_body_multipart_cleared_by_omit() {
+        let ep = first_endpoint(
+            r#"
+            struct AvatarUpload { File avatar  String caption }
+            endpoint uploadAvatar: POST "/api/avatar" {
+                body AvatarUpload omit { avatar }
+            }
+            "#,
+        );
+        assert!(
+            !ep.body_is_multipart,
+            "omitting the only File field clears multipart"
+        );
+    }
+
+    // FLAGS: single-File response struct is a binary download.
+    #[test]
+    fn file_flag_response_is_binary() {
+        let ep = first_endpoint(
+            r#"
+            struct Doc { File data }
+            endpoint download: GET "/api/doc/{id}" {
+                response Doc
+            }
+            "#,
+        );
+        assert!(ep.response_is_binary, "response should be binary");
+        assert!(!ep.body_is_multipart);
+    }
+
+    // FLAGS: Option<File> body field still counts as multipart.
+    #[test]
+    fn file_flag_optional_file_body_is_multipart() {
+        let ep = first_endpoint(
+            r#"
+            struct MaybeUpload { Option<File> avatar  String caption }
+            endpoint upload: POST "/api/maybe" {
+                body MaybeUpload
+            }
+            "#,
+        );
+        assert!(ep.body_is_multipart);
+    }
+
+    // REJECT: File as a function parameter.
+    #[test]
+    fn file_reject_function_param() {
+        assert_has_error(
+            r#"
+            function f(x: File) -> Int { return 0 }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File as a function return type.
+    #[test]
+    fn file_reject_function_return() {
+        assert_has_error(
+            r#"
+            function g() -> File { return 0 }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File as a `let` binding type.
+    #[test]
+    fn file_reject_let_binding() {
+        assert_has_error(
+            r#"
+            function h() -> Int {
+                let x: File = 0
+                return 0
+            }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File as a query parameter type.
+    #[test]
+    fn file_reject_query_param() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                query {
+                    File f
+                }
+                response User
+            }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File as a header type.
+    #[test]
+    fn file_reject_header() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/api/users/{id}" {
+                headers {
+                    File token
+                }
+                response User
+            }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File as an enum variant payload.
+    #[test]
+    fn file_reject_enum_variant_payload() {
+        assert_has_error(
+            r#"
+            enum Wrapper { Holds(File)  Empty }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File inside a generic argument (`List<File>`) — even as a field.
+    #[test]
+    fn file_reject_list_of_file_field() {
+        assert_has_error(
+            r#"
+            struct Gallery { List<File> photos }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File inside `Map<String, File>` as a field.
+    #[test]
+    fn file_reject_map_of_file_field() {
+        assert_has_error(
+            r#"
+            struct Bucket { Map<String, File> blobs }
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: File as a type-alias target.
+    #[test]
+    fn file_reject_type_alias_target() {
+        assert_has_error(
+            r#"
+            type Blob = File
+            "#,
+            "`File` is only allowed",
+        );
+    }
+
+    // REJECT: a file-bearing struct used as a regular function parameter.
+    #[test]
+    fn file_reject_bearing_struct_as_param() {
+        assert_has_error(
+            r#"
+            struct AvatarUpload { File avatar  String caption }
+            function f(a: AvatarUpload) -> Int { return 0 }
+            "#,
+            "body-only type",
+        );
+    }
+
+    // REJECT: a file-bearing struct nested as a field of another struct.
+    #[test]
+    fn file_reject_bearing_struct_nested() {
+        assert_has_error(
+            r#"
+            struct AvatarUpload { File avatar }
+            struct Profile { AvatarUpload upload  String name }
+            "#,
+            "body-only type",
+        );
+    }
+
+    // REJECT: same, but the file-bearing struct is declared AFTER the struct that
+    // nests it. `is_file_bearing` is computed in the pre-registration pass from
+    // the raw field annotations, so the rejection does not depend on declaration
+    // order (a stale `false` placeholder would otherwise let this slip through).
+    #[test]
+    fn file_reject_bearing_struct_nested_forward_ref() {
+        assert_has_error(
+            r#"
+            struct Profile { AvatarUpload upload  String name }
+            struct AvatarUpload { File avatar }
+            "#,
+            "body-only type",
+        );
+    }
+
+    // REJECT: same ordering hazard for a function param typed as a file-bearing
+    // struct declared later in the file.
+    #[test]
+    fn file_reject_bearing_struct_as_param_forward_ref() {
+        assert_has_error(
+            r#"
+            function f(a: AvatarUpload) -> Int { return 0 }
+            struct AvatarUpload { File avatar  String caption }
+            "#,
+            "body-only type",
+        );
+    }
+
+    // REJECT: a RESPONSE that is a file-bearing struct mixing File + scalars.
+    #[test]
+    fn file_reject_response_mixed_body() {
+        assert_has_error(
+            r#"
+            struct Bad { File data  String name }
+            endpoint download: GET "/api/bad/{id}" {
+                response Bad
+            }
+            "#,
+            "exactly one field of type `File`",
+        );
+    }
+
+    // REJECT: a RESPONSE file-bearing struct with multiple File fields.
+    #[test]
+    fn file_reject_response_multiple_files() {
+        assert_has_error(
+            r#"
+            struct TwoFiles { File a  File b }
+            endpoint download: GET "/api/two/{id}" {
+                response TwoFiles
+            }
+            "#,
+            "exactly one field of type `File`",
+        );
+    }
+
+    // REJECT: a binary download (single-`File` response struct) that also
+    // declares response headers. A binary response body is the raw file stream
+    // with no `<Endpoint>Result` envelope to carry typed header fields, so the
+    // two cannot be combined — the per-target codegen has no coherent shape for
+    // it. See `docs/design-decisions.md` (multipart, direction asymmetry).
+    #[test]
+    fn file_reject_binary_response_with_response_headers() {
+        assert_has_error(
+            r#"
+            struct Doc { File data }
+            endpoint download: GET "/api/doc/{id}" {
+                response Doc headers {
+                    String etag as "ETag"
+                }
+            }
+            "#,
+            "cannot also declare response headers",
+        );
+    }
+
+    // REJECT: a file-bearing struct nested inside a generic in RESPONSE position
+    // (`List<Doc>`). The response-position allowance must not leak through
+    // generic args — a `File` cannot be JSON-serialized inside a list.
+    #[test]
+    fn file_reject_bearing_struct_in_list_response() {
+        assert_has_error(
+            r#"
+            struct Doc { File data }
+            endpoint download: GET "/api/docs" {
+                response List<Doc>
+            }
+            "#,
+            "body-only type",
+        );
+    }
+
+    // REJECT: same leak via `Option<Doc>` in response position.
+    #[test]
+    fn file_reject_bearing_struct_in_option_response() {
+        assert_has_error(
+            r#"
+            struct Doc { File data }
+            endpoint download: GET "/api/docs/{id}" {
+                response Option<Doc>
+            }
+            "#,
+            "body-only type",
+        );
+    }
+
+    // ACCEPT: a multipart body whose non-file fields are scalars / Option<scalar>.
+    #[test]
+    fn file_accept_multipart_scalar_fields() {
+        assert_no_errors(
+            r#"
+            struct Upload { File avatar  Int rotation  Bool crop  Option<String> caption }
+            endpoint upload: POST "/api/upload" {
+                body Upload
+            }
+            "#,
+        );
+    }
+
+    // REJECT: a multipart body with a `List<String>` field (no form encoding).
+    #[test]
+    fn file_reject_multipart_list_field() {
+        assert_has_error(
+            r#"
+            struct Upload { File avatar  List<String> tags }
+            endpoint upload: POST "/api/upload" {
+                body Upload
+            }
+            "#,
+            "cannot be sent as a form field",
+        );
+    }
+
+    // REJECT: a multipart body with a nested-struct field (no form encoding).
+    #[test]
+    fn file_reject_multipart_nested_struct_field() {
+        assert_has_error(
+            r#"
+            struct Meta { String key }
+            struct Upload { File avatar  Meta meta }
+            endpoint upload: POST "/api/upload" {
+                body Upload
+            }
+            "#,
+            "cannot be sent as a form field",
         );
     }
 }

@@ -153,6 +153,14 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
         Type::Bool => IrType::Bool,
         Type::String => IrType::StringRef,
         Type::Void => IrType::Void,
+        Type::File => {
+            // `File` is a Phoenix Gen endpoint-transport type only. Endpoints are
+            // compile-time-only (never lowered to IR), and sema forbids `File`
+            // anywhere a value could reach the runtime, so this is unreachable —
+            // same contract as `Type::Error` below. Lift this when the language
+            // gains real file-handle semantics.
+            unreachable!("Type::File reached IR lowering — File is endpoint-transport-only")
+        }
         Type::Named(name) => {
             if check_result.struct_by_name.contains_key(name) {
                 // `Type::Named` has no generic args by construction (that

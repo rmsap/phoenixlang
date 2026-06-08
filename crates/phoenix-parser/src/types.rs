@@ -22,6 +22,7 @@ impl<'src> Parser<'src> {
             | TokenKind::FloatType
             | TokenKind::StringType
             | TokenKind::BoolType
+            | TokenKind::FileType
             | TokenKind::Void
             | TokenKind::Ident => {
                 let token = self.advance();
@@ -103,6 +104,7 @@ impl<'src> Parser<'src> {
                 | TokenKind::FloatType
                 | TokenKind::StringType
                 | TokenKind::BoolType
+                | TokenKind::FileType
                 | TokenKind::Void
                 | TokenKind::Ident
                 | TokenKind::LParen

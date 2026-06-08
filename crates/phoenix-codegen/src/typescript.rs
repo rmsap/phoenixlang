@@ -87,15 +87,27 @@ impl<'a> TsGenerator<'a> {
 
         for decl in &program.declarations {
             match decl {
+                // A file-bearing (body-only) struct never appears as a normal TS
+                // value: as a multipart request body it is exploded into the
+                // derived `<Endpoint>Body` (its `File` fields read off a
+                // `Record<string, Blob>`), and as a binary response it is streamed
+                // as a `Buffer`/`Blob`. Emitting a bare `interface` for it would be
+                // dead, exported surface, so skip it — matching the Go/Python
+                // generators, which likewise skip the file-bearing base struct.
+                Declaration::Struct(s) if self.struct_is_file_bearing(&s.name) => {}
                 Declaration::Struct(s) => self.emit_struct(s),
                 Declaration::Enum(e) => self.emit_enum(e),
                 _ => {}
             }
         }
 
-        // Emit struct-level validation functions
+        // Emit struct-level validation functions (skip file-bearing structs: no
+        // interface is emitted for them, and their constraints are validated on
+        // the derived body path, not here).
         for decl in &program.declarations {
-            if let Declaration::Struct(s) = decl {
+            if let Declaration::Struct(s) = decl
+                && !self.struct_is_file_bearing(&s.name)
+            {
                 self.emit_struct_validation(s);
             }
         }
@@ -160,6 +172,17 @@ impl<'a> TsGenerator<'a> {
     }
 
     // ── Type emission ────────────────────────────────────────────────
+
+    /// Whether the named struct is file-bearing (body-only): it has a direct
+    /// `File`/`Option<File>` field and so is legal only in endpoint
+    /// `body`/`response` position. Such a struct emits no standalone interface or
+    /// validator (see the type-emission loop in `generate`).
+    fn struct_is_file_bearing(&self, name: &str) -> bool {
+        self.check_result
+            .module
+            .struct_info_by_name(name)
+            .is_some_and(|si| si.is_file_bearing)
+    }
 
     /// Emits a TypeScript `export interface` for a Phoenix struct.
     fn emit_struct(&mut self, s: &StructDecl) {
@@ -397,7 +420,11 @@ impl<'a> TsGenerator<'a> {
                 // referenced in this file.
                 type_imports.insert(result_type_name(ep));
             }
-            if let Some(ref resp) = ep.response {
+            // A binary-download response is returned as a `Blob`, so the response
+            // struct's name is never referenced in the client — don't import it.
+            if !ep.response_is_binary
+                && let Some(ref resp) = ep.response
+            {
                 collect_import_names(resp, &mut type_imports);
             }
         }
@@ -456,8 +483,11 @@ impl<'a> TsGenerator<'a> {
             .unwrap_or_else(|| "void".to_string());
         // The method's declared return type: the bare body when there are no
         // response headers (the common case, unchanged), otherwise the typed
-        // envelope bundling the body + each response header.
-        let response_type = if has_resp_headers {
+        // envelope bundling the body + each response header. A binary-download
+        // response (a single-`File` response struct) is read as a `Blob`.
+        let response_type = if ep.response_is_binary {
+            "Blob".to_string()
+        } else if has_resp_headers {
             result_type_name(ep)
         } else {
             body_type.clone()
@@ -566,6 +596,20 @@ impl<'a> TsGenerator<'a> {
             format!("`${{baseUrl}}{url_expr}`")
         };
 
+        // For a multipart body (a body field is a `File`/`Option<File>`), build a
+        // `FormData` BEFORE the fetch call: append each file field (the Blob/File
+        // value) and each scalar field (`String(...)`). The runtime sets the
+        // multipart boundary on `Content-Type` automatically, so we MUST NOT set
+        // Content-Type ourselves (doing so breaks the boundary).
+        let body_is_multipart = ep.body_is_multipart;
+        if body_is_multipart && let Some(ref ep_body) = ep.body {
+            self.client_out
+                .push_str("    const formData = new FormData();\n");
+            for f in &ep_body.fields {
+                emit_form_data_append(&mut self.client_out, "    ", &f.name, &f.ty, f.optional);
+            }
+        }
+
         // Build the fetch init object body. When the endpoint declares request
         // headers we build a `Headers` instance (so Content-Type and the typed
         // request headers coexist) and reference it from the init; otherwise the
@@ -574,7 +618,9 @@ impl<'a> TsGenerator<'a> {
         if has_req_headers {
             self.client_out
                 .push_str("    const requestHeaders = new Headers();\n");
-            if ep.body.is_some() {
+            // Only JSON bodies get an explicit Content-Type; multipart bodies let
+            // the runtime set the boundary.
+            if ep.body.is_some() && !body_is_multipart {
                 self.client_out
                     .push_str("    requestHeaders.set(\"Content-Type\", \"application/json\");\n");
             }
@@ -591,11 +637,19 @@ impl<'a> TsGenerator<'a> {
             }
             init_lines.push("headers: requestHeaders".to_string());
             if ep.body.is_some() {
-                init_lines.push("body: JSON.stringify(body)".to_string());
+                if body_is_multipart {
+                    init_lines.push("body: formData".to_string());
+                } else {
+                    init_lines.push("body: JSON.stringify(body)".to_string());
+                }
             }
         } else if ep.body.is_some() {
-            init_lines.push("headers: { \"Content-Type\": \"application/json\" }".to_string());
-            init_lines.push("body: JSON.stringify(body)".to_string());
+            if body_is_multipart {
+                init_lines.push("body: formData".to_string());
+            } else {
+                init_lines.push("headers: { \"Content-Type\": \"application/json\" }".to_string());
+                init_lines.push("body: JSON.stringify(body)".to_string());
+            }
         }
         emit_fetch_call(&mut self.client_out, "    ", &url_arg, &init_lines);
 
@@ -626,7 +680,11 @@ impl<'a> TsGenerator<'a> {
         // Return. `response.json()` is typed `any`; assert the declared response
         // type so callers get a typed result and strict lint rules (no-unsafe-*)
         // are satisfied.
-        if has_resp_headers {
+        if ep.response_is_binary {
+            // Binary download: read the raw bytes as a Blob rather than JSON.
+            self.client_out
+                .push_str("    return await response.blob();\n");
+        } else if has_resp_headers {
             // Typed envelope: body read as today, each response header read from
             // the fetch `Response.headers` and coerced into its typed field.
             self.client_out.push_str("    return {\n");
@@ -662,11 +720,15 @@ impl<'a> TsGenerator<'a> {
             if ep.body.is_some() {
                 imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if !ep.response_headers.is_empty() {
-                // Handler returns the envelope, which already bundles the body.
-                imports.insert(result_type_name(ep));
-            } else if let Some(ref resp) = ep.response {
-                collect_import_names(resp, &mut imports);
+            // A binary download handler returns a `Buffer` (a Node global), so
+            // the response struct's name is never referenced — skip its import.
+            if !ep.response_is_binary {
+                if !ep.response_headers.is_empty() {
+                    // Handler returns the envelope, which already bundles the body.
+                    imports.insert(result_type_name(ep));
+                } else if let Some(ref resp) = ep.response {
+                    collect_import_names(resp, &mut imports);
+                }
             }
         }
 
@@ -685,8 +747,12 @@ impl<'a> TsGenerator<'a> {
     /// framework applies defaults before calling the handler).
     fn emit_handler_method(&mut self, ep: &EndpointInfo) {
         // With response headers the handler resolves the typed envelope; without
-        // them it resolves the bare response type (unchanged common case).
-        let response_type = if !ep.response_headers.is_empty() {
+        // them it resolves the bare response type (unchanged common case). A
+        // binary-download response is produced by the handler as a `Buffer`
+        // (Node's idiomatic byte container; the server writes it to the wire).
+        let response_type = if ep.response_is_binary {
+            "Buffer".to_string()
+        } else if !ep.response_headers.is_empty() {
             result_type_name(ep)
         } else {
             ep.response
@@ -765,10 +831,13 @@ impl<'a> TsGenerator<'a> {
         self.server_out
             .push_str("import type { Handlers } from \"./handlers\";\n");
 
-        // Import validation functions for endpoints with constrained bodies
+        // Import validation functions for endpoints with constrained bodies. A
+        // multipart body skips validate (it is assembled field-by-field from the
+        // request), so it never imports the validate function — only its type.
         let mut validate_imports: Vec<String> = Vec::new();
         for ep in &self.check_result.endpoints {
             if let Some(ref body) = ep.body
+                && !ep.body_is_multipart
                 && body.fields.iter().any(|f| f.constraint.is_some())
             {
                 let type_name = format!("{}Body", capitalize(&ep.name));
@@ -780,13 +849,13 @@ impl<'a> TsGenerator<'a> {
             emit_import(&mut self.server_out, "import", &validate_imports, "./types");
         }
 
-        // Import the body *type* for endpoints whose body has no constraints: the
-        // route casts `req.body as XBody` (there is no validate function whose
-        // return type would otherwise supply it).
+        // Import the body *type* for endpoints whose body is cast/assembled
+        // directly (no validate fn supplies it): JSON bodies without constraints
+        // (`req.body as XBody`) and every multipart body (`const body: XBody`).
         let mut body_type_imports: Vec<String> = Vec::new();
         for ep in &self.check_result.endpoints {
             if let Some(ref body) = ep.body
-                && !body.fields.iter().any(|f| f.constraint.is_some())
+                && (ep.body_is_multipart || !body.fields.iter().any(|f| f.constraint.is_some()))
             {
                 body_type_imports.push(format!("{}Body", capitalize(&ep.name)));
             }
@@ -801,6 +870,37 @@ impl<'a> TsGenerator<'a> {
         }
 
         self.server_out.push('\n');
+
+        // When any endpoint has a multipart body, emit a minimal interface
+        // describing the shape an upstream multipart middleware (multer, busboy,
+        // …) adds to the request: parsed scalar fields on `body`, uploaded files
+        // as `Blob` values on `files` (keyed by field name). This adds NO runtime
+        // dependency — the user mounts the middleware; we only type the contract.
+        if self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.body_is_multipart)
+        {
+            self.server_out.push_str(
+                "// A multipart middleware (multer, busboy, …) must be mounted upstream; it\n\
+                 // populates these fields on the request. Scalar form fields arrive on\n\
+                 // `body`; each uploaded file is expected as a `Blob` on `files`, keyed by\n\
+                 // field name. NOTE: standard parsers do not produce `Blob`s directly —\n\
+                 // multer's memory storage, for example, yields `{ buffer, originalname }`\n\
+                 // per field — so mount a tiny adapter that maps each parsed file to a\n\
+                 // `Blob`, e.g.:\n\
+                 //   const blobFiles: Record<string, Blob> = {};\n\
+                 //   for (const [field, parts] of Object.entries(req.files ?? {}))\n\
+                 //     blobFiles[field] = new Blob([parts[0].buffer]);\n\
+                 //   (req as unknown as MultipartRequest).files = blobFiles;\n\
+                 // (The original filename is not carried on a `Blob`; see the project docs.)\n\
+                 interface MultipartRequest {\n\
+                 \x20 body: Record<string, string>;\n\
+                 \x20 files: Record<string, Blob>;\n\
+                 }\n\n",
+            );
+        }
     }
 
     /// Emits an Express-compatible `createRouter` function that wires each
@@ -869,9 +969,28 @@ impl<'a> TsGenerator<'a> {
 
         // Body: parse from req.body, with validation if constraints exist
         if let Some(ref ep_body) = ep.body {
-            let has_constraints = ep_body.fields.iter().any(|f| f.constraint.is_some());
-            if has_constraints {
-                let type_name = format!("{}Body", capitalize(&ep.name));
+            let type_name = format!("{}Body", capitalize(&ep.name));
+            if ep.body_is_multipart {
+                // multipart/form-data body. A multipart middleware (multer,
+                // busboy, …) must be mounted upstream: it exposes parsed scalar
+                // fields on `req.body` and the uploaded files as `Blob` values on
+                // `req.files` (keyed by field name). We read against the minimal
+                // `MultipartRequest` interface (emitted once below) — no runtime
+                // dependency is added; the user wires the middleware.
+                body.push_str(&format!(
+                    "{si}const multipart = req as unknown as MultipartRequest;\n"
+                ));
+                body.push_str(&format!("{si}const body: {type_name} = {{\n"));
+                for f in &ep_body.fields {
+                    emit_object_property(
+                        &mut body,
+                        &format!("{si}  "),
+                        &f.name,
+                        &multipart_field_extraction(&f.name, &f.ty, f.optional),
+                    );
+                }
+                body.push_str(&format!("{si}}};\n"));
+            } else if ep_body.fields.iter().any(|f| f.constraint.is_some()) {
                 body.push_str(&format!(
                     "{si}const body = validate{type_name}(req.body);\n"
                 ));
@@ -879,7 +998,6 @@ impl<'a> TsGenerator<'a> {
                 // No constraints to validate, but `req.body` is `any`; cast to
                 // the body type so the handler call is type-safe (and strict
                 // `no-unsafe-*` lint rules are satisfied).
-                let type_name = format!("{}Body", capitalize(&ep.name));
                 body.push_str(&format!("{si}const body = req.body as {type_name};\n"));
             }
             args.push("body".to_string());
@@ -920,7 +1038,22 @@ impl<'a> TsGenerator<'a> {
         let has_resp_headers = !ep.response_headers.is_empty();
 
         // Call the handler (breaking the argument list when it overflows).
-        if has_resp_headers {
+        if ep.response_is_binary {
+            // Binary download: the handler returns a `Buffer`; stream it to the
+            // wire with a generic binary content type (the handler may override
+            // via response headers in a future slice).
+            emit_call_stmt(
+                &mut body,
+                si,
+                &format!("const result = await handlers.{}", ep.name),
+                &args,
+                ";",
+            );
+            body.push_str(&format!(
+                "{si}res.setHeader(\"Content-Type\", \"application/octet-stream\");\n"
+            ));
+            body.push_str(&format!("{si}res.send(result);\n"));
+        } else if has_resp_headers {
             // Handler returns the envelope: set each response header from the
             // typed field (guard optional), then send the body.
             emit_call_stmt(
@@ -1037,6 +1170,70 @@ impl<'a> TsGenerator<'a> {
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
+
+/// Whether a body field's resolved type is `Option<File>` (an optional upload).
+fn field_ty_is_optional_file(ty: &Type) -> bool {
+    matches!(ty, Type::Generic(name, args) if name == "Option" && args.len() == 1 && matches!(args[0], Type::File))
+}
+
+/// Emits a client-side `formData.append(...)` for one multipart body field.
+///
+/// File fields append the `Blob`/`File` value directly; scalar fields are
+/// stringified (multipart form values are always text on the wire). Any
+/// optional field — `Option<T>`, or a `partial`-relaxed field (`optional`) — is
+/// guarded so a missing value is omitted entirely rather than appended as the
+/// literal string `"undefined"` (which the server would then coerce to `NaN`,
+/// `false`, or store verbatim).
+fn emit_form_data_append(out: &mut String, indent: &str, name: &str, ty: &Type, optional: bool) {
+    // `optional` covers `partial`-relaxed fields; `Option<T>`/`Option<File>` is
+    // detected from the type itself.
+    let is_optional = optional
+        || field_ty_is_optional_file(ty)
+        || matches!(ty, Type::Generic(n, _) if n == "Option");
+    let value = if matches!(ty, Type::File) || field_ty_is_optional_file(ty) {
+        format!("body.{name}")
+    } else {
+        format!("String(body.{name})")
+    };
+    if is_optional {
+        out.push_str(&format!("{indent}if (body.{name} !== undefined) {{\n"));
+        out.push_str(&format!(
+            "{indent}  formData.append(\"{name}\", {value});\n"
+        ));
+        out.push_str(&format!("{indent}}}\n"));
+    } else {
+        out.push_str(&format!("{indent}formData.append(\"{name}\", {value});\n"));
+    }
+}
+
+/// Server-side expression extracting one multipart field into its typed body
+/// value. File fields read the parsed `Blob` from `multipart.files`; scalar
+/// fields read the string from `multipart.body` and coerce to the field type.
+///
+/// `optional` is true for a `partial`-relaxed or `Option<T>` scalar: an absent
+/// value stays `undefined` rather than coercing to `NaN`/`false`, matching the
+/// `T | undefined` shape of the optional field in the generated body type.
+fn multipart_field_extraction(name: &str, ty: &Type, optional: bool) -> String {
+    if matches!(ty, Type::File) || field_ty_is_optional_file(ty) {
+        return format!("multipart.files.{name}");
+    }
+    let is_option = matches!(ty, Type::Generic(n, _) if n == "Option");
+    let inner = match ty {
+        Type::Generic(n, args) if n == "Option" && args.len() == 1 => &args[0],
+        _ => ty,
+    };
+    let raw = format!("multipart.body.{name}");
+    let coerced = match inner {
+        Type::Int | Type::Float => format!("Number({raw})"),
+        Type::Bool => format!("{raw} === \"true\""),
+        _ => raw.clone(),
+    };
+    if optional || is_option {
+        format!("{raw} !== undefined ? {coerced} : undefined")
+    } else {
+        coerced
+    }
+}
 
 /// Generates a TypeScript expression that extracts and coerces a query
 /// parameter from `req.query`, applying the default value if the parameter
@@ -1245,6 +1442,11 @@ fn type_to_ts(ty: &Type) -> String {
         Type::Int | Type::Float => "number".to_string(),
         Type::String => "string".to_string(),
         Type::Bool => "boolean".to_string(),
+        // A `File` field in a body type is a binary upload/download. In TS the
+        // wire value is a `Blob` (FormData entry / fetch body). Multipart request
+        // assembly and binary response handling live in the body-codegen path
+        // (branched on "body contains a File"); this is the field type.
+        Type::File => "Blob".to_string(),
         Type::Void => "void".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
@@ -2542,6 +2744,255 @@ endpoint getPost: GET "/api/posts/{id}" {
                 .contains("import type { GetPostResult, Post } from \"./types\";"),
             "client must import BOTH the envelope and the body type it casts to:\n{}",
             files.client
+        );
+    }
+
+    // ── multipart / binary tests ────────────────────────────────────
+
+    /// Multipart upload (a `File` field + a scalar): client builds FormData and
+    /// omits Content-Type; server reads files/scalars from the multipart request;
+    /// the handler body param stays the body type (File field typed `Blob`).
+    #[test]
+    fn multipart_upload_client_server_handlers() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+struct UploadResult { String url }
+endpoint uploadAvatar: POST "/api/avatar" {
+    body AvatarUpload
+    response UploadResult
+}
+"#,
+        );
+        // Client: FormData built, no Content-Type, body: formData.
+        assert!(
+            files.client.contains("const formData = new FormData();"),
+            "client must build FormData:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("formData.append(\"avatar\", body.avatar);"),
+            "client must append the file field:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("formData.append(\"caption\", String(body.caption));"),
+            "client must stringify scalar fields:\n{}",
+            files.client
+        );
+        assert!(
+            !files.client.contains("JSON.stringify(body)"),
+            "multipart client must not JSON.stringify:\n{}",
+            files.client
+        );
+        assert!(
+            !files.client.contains("\"Content-Type\""),
+            "multipart client must not set Content-Type:\n{}",
+            files.client
+        );
+        insta::assert_snapshot!("multipart_upload_client", files.client);
+        insta::assert_snapshot!("multipart_upload_server", files.server);
+        insta::assert_snapshot!("multipart_upload_handlers", files.handlers);
+    }
+
+    /// Optional-file upload (`Option<File>`): the FormData append is guarded.
+    #[test]
+    fn multipart_optional_file_upload() {
+        let files = generate_from_source(
+            r#"
+struct MaybeUpload { Option<File> avatar  String caption }
+endpoint upload: POST "/api/maybe" { body MaybeUpload }
+"#,
+        );
+        assert!(
+            files.client.contains("if (body.avatar !== undefined) {"),
+            "optional file append must be guarded:\n{}",
+            files.client
+        );
+        insta::assert_snapshot!("multipart_optional_client", files.client);
+        insta::assert_snapshot!("multipart_optional_server", files.server);
+    }
+
+    /// An optional scalar in a multipart body (`Option<String>`): the server
+    /// must read it as `undefined` when absent rather than coercing the missing
+    /// form value to `NaN`/`false` — so an `Option<Int>` reads through a
+    /// `!== undefined ? Number(...) : undefined` guard.
+    #[test]
+    fn multipart_optional_scalar_guarded() {
+        let files = generate_from_source(
+            r#"
+struct Upload { File avatar  Option<Int> rotation }
+endpoint upload: POST "/api/upload" { body Upload }
+"#,
+        );
+        // The formatter may wrap the ternary across lines, so assert on its
+        // distinctive fragments rather than a single-line spelling.
+        assert!(
+            files
+                .server
+                .contains("multipart.body.rotation !== undefined")
+                && files.server.contains("Number(multipart.body.rotation)")
+                && files.server.contains(": undefined"),
+            "optional multipart scalar must stay undefined when absent:\n{}",
+            files.server
+        );
+        // The CLIENT must likewise guard the optional scalar: appending
+        // `String(undefined)` would send the literal "undefined" string (which
+        // the server then coerces to `NaN`). The required `avatar` file is
+        // appended unconditionally.
+        assert!(
+            files.client.contains("if (body.rotation !== undefined) {")
+                && files
+                    .client
+                    .contains("formData.append(\"rotation\", String(body.rotation));"),
+            "optional multipart scalar must be guarded on the client:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("formData.append(\"avatar\", body.avatar);"),
+            "required file must be appended unconditionally:\n{}",
+            files.client
+        );
+        insta::assert_snapshot!("multipart_optional_scalar_client", files.client);
+        insta::assert_snapshot!("multipart_optional_scalar_server", files.server);
+    }
+
+    /// Binary download (single-`File` response struct): client reads a Blob;
+    /// server sends a Buffer with an octet-stream content type; handler returns
+    /// `Buffer`. The response struct is NOT imported anywhere.
+    #[test]
+    fn binary_download_client_server_handlers() {
+        let files = generate_from_source(
+            r#"
+struct Doc { File data }
+endpoint download: GET "/api/doc/{id}" { response Doc }
+"#,
+        );
+        assert!(
+            files.client.contains("): Promise<Blob> {"),
+            "client returns Promise<Blob>:\n{}",
+            files.client
+        );
+        assert!(
+            files.client.contains("return await response.blob();"),
+            "client reads response.blob():\n{}",
+            files.client
+        );
+        assert!(
+            !files.client.contains("Doc"),
+            "binary client must not reference the response struct:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("Promise<Buffer>"),
+            "handler returns Promise<Buffer>:\n{}",
+            files.handlers
+        );
+        assert!(
+            !files.handlers.contains("Doc"),
+            "binary handler must not import the response struct:\n{}",
+            files.handlers
+        );
+        assert!(
+            files
+                .server
+                .contains("res.setHeader(\"Content-Type\", \"application/octet-stream\");"),
+            "server sets octet-stream:\n{}",
+            files.server
+        );
+        assert!(
+            files.server.contains("res.send(result);"),
+            "server sends the buffer:\n{}",
+            files.server
+        );
+        insta::assert_snapshot!("binary_download_client", files.client);
+        insta::assert_snapshot!("binary_download_server", files.server);
+        insta::assert_snapshot!("binary_download_handlers", files.handlers);
+    }
+
+    /// Regression: an ordinary JSON endpoint in a schema that ALSO has a
+    /// multipart endpoint keeps its JSON body path (Content-Type + JSON.stringify
+    /// + req.body cast) untouched.
+    #[test]
+    fn json_endpoint_unaffected_by_multipart_sibling() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+struct Note { Int id  String text }
+endpoint uploadAvatar: POST "/api/avatar" { body AvatarUpload }
+endpoint createNote: POST "/api/notes" { body Note  response Note }
+"#,
+        );
+        assert!(
+            files
+                .client
+                .contains("headers: { \"Content-Type\": \"application/json\" }"),
+            "JSON sibling keeps its Content-Type:\n{}",
+            files.client
+        );
+        assert!(
+            files.client.contains("body: JSON.stringify(body)"),
+            "JSON sibling keeps JSON.stringify:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .server
+                .contains("const body = req.body as CreateNoteBody;"),
+            "JSON sibling keeps req.body cast:\n{}",
+            files.server
+        );
+    }
+
+    /// An endpoint that is BOTH a multipart upload AND a binary download
+    /// (`body_is_multipart` + `response_is_binary`): the client builds FormData
+    /// for the request yet reads the response as a `Blob`; the server assembles
+    /// the body from the multipart request yet streams a `Buffer` back. Guards
+    /// that the multipart-body and binary-response branches compose in one route.
+    #[test]
+    fn multipart_upload_with_binary_response() {
+        let files = generate_from_source(
+            r#"
+struct AvatarUpload { File avatar  String caption }
+struct Thumbnail { File data }
+endpoint convertAvatar: POST "/api/avatar/convert" {
+    body AvatarUpload
+    response Thumbnail
+}
+"#,
+        );
+        // Client: builds FormData for the request, returns a Blob for the response.
+        assert!(
+            files.client.contains("const formData = new FormData();")
+                && files.client.contains("body: formData")
+                && files.client.contains("): Promise<Blob> {")
+                && files.client.contains("return await response.blob();"),
+            "client must send FormData and read a Blob:\n{}",
+            files.client
+        );
+        // Server: reads the multipart request, then streams a Buffer back.
+        assert!(
+            files
+                .server
+                .contains("const multipart = req as unknown as MultipartRequest;")
+                && files
+                    .server
+                    .contains("res.setHeader(\"Content-Type\", \"application/octet-stream\");")
+                && files.server.contains("res.send(result);"),
+            "server must assemble from multipart and stream the buffer:\n{}",
+            files.server
+        );
+        // Handler takes the body type and returns a Buffer.
+        assert!(
+            files.handlers.contains("Promise<Buffer>"),
+            "handler must return Promise<Buffer>:\n{}",
+            files.handlers
         );
     }
 }

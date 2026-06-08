@@ -102,6 +102,26 @@ query params.
   server-side value via `expect_received`.
 - **`call.body`** — a JSON object the driver unmarshals into the generated body
   type, then passes to the client method.
+- **`call.multipart`** — a multipart/file-upload request body (mutually exclusive
+  with `call.body`). Shape: `{ "files": { "<field>": { "filename": "...",
+  "content": "<utf8>" } }, "fields": { "<scalar>": <value> } }`. The driver
+  encodes each file's `content` string to bytes and supplies it to the generated
+  client's file-input shape (Go `FileUpload{Filename, Content}`, TS `Blob`,
+  Python `FileUpload(filename, content)`). Scalar `fields` are JSON-typed
+  (`String` → string, `Int` → number, `Bool` → boolean); each driver coerces a
+  field into the generated body's typed slot (e.g. Go narrows a JSON number to
+  `int64`) so the round-trip exercises each target's scalar coercion — including
+  the bool wire encoding (`"true"`/`"false"`) — end-to-end. The handler asserts
+  what it received via `expect_received`, where each file is checked as
+  `<field>_content` (decoded UTF-8) and `<field>_filename`; an omitted optional
+  file is asserted absent via `<field>_content: null`.
+- **`handler.returns_file`** — for a binary **download** (`response_is_binary`):
+  the UTF-8 content the stub streams back as the raw response body. The driver
+  encodes it to bytes and returns it from the handler in the target's binary
+  shape (Go `io.Reader`, TS `Buffer`, Python `bytes`).
+- **`expect_client.expect_download`** — for a binary download: the bytes the
+  client must read off the (non-JSON) response body, compared as decoded UTF-8.
+  Present instead of `expect_client.ok`.
 - **`handler.expect_received`** — a map of arg-name → expected value. Drivers
   compare the **decoded args the handler actually received** against these.
   Numbers are compared numerically (don't assume int vs float). `null` means the

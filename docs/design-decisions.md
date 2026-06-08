@@ -1368,3 +1368,159 @@ cross-cutting generator convention question, not a headers-specific decision, so
 is tracked as a limitation in
 [known-issues.md](known-issues.md#defaulted-request-and-query-inputs-diverge-per-target-and-mostly-cant-trigger-the-server-default),
 not here.
+
+---
+
+## Phoenix Gen — multipart / file-upload (and download) design (2026-06-05)
+
+Adds a `File` primitive type so endpoints can carry binary uploads (multipart
+request bodies) and downloads (binary response bodies). Locked decisions
+(language-designer calls):
+
+1. **`File` is a new primitive `Type` variant** (alongside Int/Float/String/Bool/
+   Void), recognized as a built-in type name via `Type::from_name`
+   (`phoenix-sema/src/types.rs`). It needs the usual lexer token + parser
+   type-name recognition + `Display` (`"File"`).
+
+2. **Implicit multipart — no new body grammar.** A multipart/binary body is a
+   normal struct that *contains* a `File` field; there is NO dedicated
+   `multipart { }` block. `struct AvatarUpload { File avatar  String caption }` +
+   `body AvatarUpload` IS the multipart upload. Rationale: matches the type-driven
+   model of every target (OpenAPI `format: binary`, FastAPI `UploadFile`, Go
+   `multipart.FileHeader`), composes with the existing derived-body machinery
+   (omit/pick/partial, the `resolve_derived_type` struct path — bodies are always
+   struct-derived today), and adds the minimum to the frozen grammar. The
+   load-bearing invariant: **a `File` cannot be JSON-serialized, so a body
+   containing a `File` is *necessarily* multipart/binary** — detection is
+   type-determined, not a heuristic.
+
+3. **Direction asymmetry (request vs response).**
+   - **Request body** (upload): may freely mix one-or-more `File` fields with
+     scalar fields → `multipart/form-data`. (That is exactly what multipart is
+     for.)
+   - **Response body** (download): a struct used as a response body containing a
+     `File` must contain **exactly one `File` and no other fields** — a binary
+     stream cannot be multiplexed with JSON fields in one response body. Sema
+     rejects a mixed response body. The generated client reads a stream/blob; the
+     server streams the file; OpenAPI marks the response content binary.
+
+4. **`File` scope — endpoint bodies only (for now), restriction liftable.** `File`
+   is valid only in a field of a struct used as an endpoint request or response
+   body. Sema rejects `File` elsewhere (function params, variables, regular struct
+   data, query params, headers). Because endpoints are compile-time-only (never
+   lowered to IR — confirmed: `Declaration::Endpoint` is a no-op in
+   interpreter/IR/cranelift/wasm), `File` never reaches the execution pipeline;
+   `lower_type` gets a `Type::File => unreachable!("File is endpoint-transport-only")`
+   arm, mirroring the existing `Type::Error` unreachable arm.
+   - **Transitive rule:** a struct that contains a `File` (directly) is
+     "body-only" — sema forbids using it as a regular runtime value
+     (instantiation in normal code, function param/return, variable). It is legal
+     only in `body`/`response` position.
+   - **Forward-compat:** when the language eventually gains real file-handle
+     semantics (far off — see roadmap), this is a *relaxation*: drop the sema
+     restriction and replace the `unreachable!` with real lowering. Relaxing a
+     restriction is non-breaking — every schema valid today stays valid, and a
+     File-containing struct simply becomes a normal struct usable everywhere. The
+     body-meaning ("File in a request body = the uploaded file; in a response body
+     = the downloaded file") stays true and unifies with the future handle type.
+     The name `File` is chosen deliberately for this continuity.
+
+5. **Per-target codegen** (parallel to the JSON body path, branched on "body
+   contains a File"):
+   - **TypeScript**: client builds `FormData` (append files + scalar fields),
+     omits explicit `Content-Type` (browser/runtime sets the boundary); server
+     uses multipart parsing (multer/busboy) instead of `req.body` JSON. Download:
+     client reads `response.blob()`/stream; server streams the file.
+   - **Python/FastAPI**: server params become `UploadFile = File(...)` +
+     `Form(...)` for scalars; the client takes each file field as a `FileUpload`
+     dataclass (filename + content bytes) and sends `(upload.filename,
+     upload.content)` in httpx's `files=` (so the caller-supplied filename
+     travels on the wire — parity with Go's `FileUpload` and a TS `File`/`Blob`),
+     scalars via `data=`. Download: `Response`/`StreamingResponse`; client reads
+     `response.content`.
+   - **Go**: client builds `multipart.Writer` (CreateFormFile + WriteField),
+     sets `FormDataContentType()`; server uses `r.ParseMultipartForm` +
+     `r.FormFile`. Download: `io.Copy` to the `ResponseWriter`; client reads
+     `resp.Body`.
+   - **OpenAPI**: request body `multipart/form-data` with file fields as
+     `type: string, format: binary`; response content binary for downloads.
+
+   **Buffering (all targets, this slice):** uploads and downloads are fully
+   buffered in memory, not streamed — the client holds the file bytes
+   (`FileUpload.content` / a `Blob`), and the server reads/returns whole-body
+   bytes (`response.content`, `Response(content=...)`, `io.Copy` over the full
+   body). This keeps the generated code simple and uniform across targets; true
+   streaming (`StreamingResponse`, chunked `io.Reader` plumbing, `ReadableStream`)
+   is a demand-triggered follow-up if large-payload endpoints need it.
+
+6. **Scope of this slice:** the `File` primitive + multipart request bodies
+   (uploads) + binary response bodies (downloads), all four targets, proven by
+   BOTH harnesses (compile-and-lint + round-trip). The round-trip contract gains
+   non-JSON-body support (a small binary fixture). If downloads prove to carry
+   enough per-target streaming nuance to balloon the slice, they split into a
+   clean follow-up — flagged at that point, not assumed.
+
+### Sema enforcement of the `File` scope rules (implementation)
+
+The restrictions above are enforced in `phoenix-sema` via a context-flag
+mechanism threaded through the single type-resolution choke point
+(`Checker::resolve_type_expr`), rather than a separate post-registration walk —
+`let`-binding and lambda-param types are resolved in function bodies, never
+registered, so only the resolver sees every `File`-bearing position.
+
+- `Checker::file_field_allowed` (default `false`) is set `true` *only* while
+  resolving a struct field's direct type annotation (`register_struct`). The
+  resolver clears it before recursing into generic/function arguments, so
+  `File` is accepted *only* as a direct struct field and is rejected in
+  function params/returns, `let`/variable types, query params, headers, enum
+  variant payloads, type-alias targets, and nested generics.
+- **`Option<File>` is ALLOWED as a struct field** (optional file upload): the
+  resolver propagates the field allowance into `Option`'s single argument only.
+  **`List<File>`, `Map<String, File>`, and every other generic over `File` are
+  REJECTED** — multiple-file arrays add per-target complexity and are deferred
+  (known limitation; liftable later). `StructInfo::is_file_bearing` and the
+  `body_is_multipart` flag both treat `Option<File>` as carrying a `File`.
+- **Transitive body-only rule.** A struct with a `File` (or `Option<File>`)
+  field is flagged `StructInfo::is_file_bearing`. `Checker::file_bearing_struct_allowed`
+  (default `false`) gates use of such a struct by name; it is set `true` *only*
+  at the endpoint `response`-resolution site, and applies only to the **direct**
+  response type. The resolver clears it before recursing into generic/function
+  arguments (mirroring `file_field_allowed`), so `response List<Doc>` /
+  `response Option<Doc>` (where `Doc` is file-bearing) are rejected — a `File`
+  cannot be JSON-serialized inside a list/option. The request `body` path
+  resolves its struct by name through `resolve_derived_type` (never
+  `resolve_type_expr`), so it is accepted without the flag; every other position
+  (function param/return, `let`, nested struct field, enum payload, generic arg,
+  type alias) rejects a file-bearing struct.
+- **Direction asymmetry.** Request bodies may mix `File` + scalar fields
+  (multipart). A `File`-bearing *response* struct must contain exactly one
+  field, of type `File`, and nothing else (pure binary download) — checked at
+  the response-resolution site in `check_endpoint`.
+- **Binary download excludes response headers.** A binary download's response
+  body is the raw file stream; there is no `<Endpoint>Result` envelope to carry
+  typed response-header fields (every target returns a stream/blob/`Response`
+  for it). A binary-download endpoint that also declares `headers { … }` on its
+  response therefore has no coherent generated shape, so `check_endpoint`
+  rejects the combination rather than letting it reach the per-target codegen
+  (where it would otherwise silently drop the headers or emit contradictory
+  code).
+- **Multipart fields are scalar-or-file.** A `multipart/form-data` part is text
+  (or a file) on the wire, so every *non-file* field of a multipart request body
+  must be a scalar (`Int`/`Float`/`Bool`/`String`) or `Option<scalar>`. A
+  `List`, `Map`, nested struct, or enum field has no form encoding and is
+  rejected in `check_endpoint` (`Checker::is_multipart_field_type`) rather than
+  emitted as broken client/server code. (A non-multipart JSON body keeps its
+  full type freedom — this rule fires only once a body contains a `File`.)
+- **Codegen-facing flags.** `EndpointInfo` gains `body_is_multipart: bool`
+  (request body, after omit/pick/partial, contains a `File` field) and
+  `response_is_binary: bool` (response is a single-`File` struct), computed in
+  `check_endpoint` and consumed by the per-target multipart/download codegen.
+- **OpenAPI `required` now excludes `Option<T>` body fields (behavior change).**
+  While wiring multipart schemas, `derived_type_to_schema` started excluding
+  `Option<T>` fields from a body schema's `required` array (previously only the
+  `partial`-derived `optional` flag did). This also corrects *plain JSON* bodies:
+  an `Option<String>` body field is no longer emitted as `required`. The fix is
+  correct (an optional field is not required) but it changes pre-existing
+  JSON-body OpenAPI output — a consumer that relied on the old (incorrect)
+  `required` set will see the field drop out. Covered by
+  `derived_type_body_option_field_not_required`.
