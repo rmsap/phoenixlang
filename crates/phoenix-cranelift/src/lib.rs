@@ -61,7 +61,9 @@ mod types;
 mod wasm;
 
 pub use error::{CompileError, CompileErrorKind};
-pub use link::{LinkError, RUNTIME_LIB_NAME, find_runtime_lib, link_executable};
+pub use link::{
+    LinkError, RUNTIME_LIB_NAME, find_runtime_lib, find_runtime_lib_near, link_executable,
+};
 pub use target::Target;
 
 /// Whether the prebuilt `phoenix_runtime.wasm` artifact is discoverable

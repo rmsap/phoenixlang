@@ -51,6 +51,21 @@ fn require(var: &str) -> bool {
     std::env::var(var).as_deref() == Ok("1")
 }
 
+/// Whether the `phoenix` binary under test will find the runtime static
+/// library. Probes `$PHOENIX_RUNTIME_LIB` (which the binary honors) and
+/// otherwise the binary's *own* exe-relative search — NOT this test
+/// binary's. The test binary lives in `target/<profile>/deps/`, so a
+/// `find_runtime_lib()` here would see a `deps/libphoenix_runtime.a` that
+/// the spawned binary (in `target/<profile>/`) never searches — making the
+/// skip decision disagree with the build the test then runs.
+fn runtime_lib_visible_to_phoenix() -> bool {
+    if std::env::var_os("PHOENIX_RUNTIME_LIB").is_some() {
+        return true;
+    }
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_phoenix"));
+    phoenix_cranelift::find_runtime_lib_near(&bin).is_some()
+}
+
 /// Soft-skip the native build tier when `libphoenix_runtime.a` isn't
 /// on any search path: the CLI link step would hard-error, but linking
 /// is profile-independent and is already gated in the debug `check` job
@@ -63,7 +78,7 @@ fn require(var: &str) -> bool {
 /// when the caller should early-return (skip).
 #[must_use]
 fn skip_if_no_runtime_lib(label: &str) -> bool {
-    if phoenix_cranelift::find_runtime_lib().is_some() {
+    if runtime_lib_visible_to_phoenix() {
         return false;
     }
     assert!(

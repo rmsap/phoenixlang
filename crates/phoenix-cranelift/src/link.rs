@@ -31,16 +31,44 @@ pub const RUNTIME_LIB_NAME: &str = "libphoenix_runtime.a";
 /// Returns `None` if the library cannot be found, allowing the caller to
 /// produce an actionable error message.
 pub fn find_runtime_lib() -> Option<String> {
-    // 1. Environment variable — trust the user.
-    if let Ok(dir) = std::env::var("PHOENIX_RUNTIME_LIB") {
-        return Some(dir);
-    }
+    let env = std::env::var("PHOENIX_RUNTIME_LIB").ok();
+    let exe = std::env::current_exe().ok();
+    find_runtime_lib_resolved(env.as_deref(), exe.as_deref())
+}
 
-    // 2–4. Search relative to the current executable.
-    let exe = std::env::current_exe().ok()?;
+/// Resolve the runtime-lib directory from an explicit `$PHOENIX_RUNTIME_LIB`
+/// value (`env`) and executable path (`exe`): the env value wins as-is
+/// (trusted — step 1), otherwise fall back to the exe-relative walk
+/// ([`find_runtime_lib_near`] — steps 2–4).
+///
+/// Taking both inputs as parameters rather than reading process globals lets
+/// the env-precedence unit test exercise step 1 *without* mutating
+/// `std::env`, which races other tests that read `$PHOENIX_RUNTIME_LIB` (the
+/// `cc::windows_registry`-style injectable shape the wasm side already uses).
+fn find_runtime_lib_resolved(env: Option<&str>, exe: Option<&Path>) -> Option<String> {
+    if let Some(dir) = env {
+        return Some(dir.to_string());
+    }
+    find_runtime_lib_near(exe?)
+}
+
+/// Search for the runtime static library relative to a specific executable
+/// `exe`, using the same exe-dir → parent → parent/`lib` walk as
+/// [`find_runtime_lib`] (steps 2–4), but **without** the
+/// `$PHOENIX_RUNTIME_LIB` override.
+///
+/// Exposed so tests can probe discovery *from the perspective of the
+/// `phoenix` binary they spawn* rather than their own. A test binary lives
+/// in `target/<profile>/deps/`, so its `current_exe()` sees `deps/`
+/// artifacts (e.g. a `libphoenix_runtime.a` cargo dropped there during a
+/// `--workspace` build) that the shipped binary in `target/<profile>/` never
+/// searches. Probing from the real binary's path keeps a test's skip
+/// decision in lockstep with what `phoenix build` will actually find,
+/// instead of skipping/running based on a lib only the test can see.
+pub fn find_runtime_lib_near(exe: &Path) -> Option<String> {
     let exe_dir = exe.parent()?;
 
-    // exe_dir itself (cargo build: target/debug/)
+    // exe_dir itself (cargo build: target/debug/; install: bin/)
     if exe_dir.join(RUNTIME_LIB_NAME).exists() {
         return Some(dir_to_string(exe_dir));
     }
@@ -559,13 +587,17 @@ mod tests {
         .unwrap();
 
         // Compile to .obj with cl.exe (/c = compile only, /Fo = output path),
-        // applying the toolchain env so the C headers resolve.
+        // applying the toolchain env so the C headers resolve. `/MD` selects
+        // the dynamic CRT to match the Rust-built `phoenix_runtime.lib`
+        // (windows-msvc defaults to the dynamic CRT), avoiding a CRT-flavor
+        // mismatch at link time.
         let mut cl_cmd = cl.to_command();
         for (key, value) in cl.env() {
             cl_cmd.env(key, value);
         }
         let cl_status = cl_cmd
             .arg("/nologo")
+            .arg("/MD")
             .arg("/c")
             .arg(&src_path)
             .arg(format!("/Fo{}", obj_path.display()))
@@ -728,23 +760,16 @@ mod tests {
         }
     }
 
-    /// `find_runtime_lib` should respect the `$PHOENIX_RUNTIME_LIB`
-    /// environment variable as the highest-priority search path.
+    /// An explicit `$PHOENIX_RUNTIME_LIB` value is honored as-is and wins
+    /// over the exe-relative walk (passing `exe: None` proves the walk is
+    /// not consulted). Exercised through the pure resolver so the test does
+    /// not mutate the process-global env var — doing so previously raced
+    /// other tests that read it (`find_runtime_lib_succeeds_in_cargo_test`,
+    /// the `link_executable_*` tests), a flake that surfaced on narrower
+    /// parallel runs like the Windows CI job's `--lib link::` filter.
     #[test]
     fn find_runtime_lib_respects_env_var() {
-        let key = "PHOENIX_RUNTIME_LIB";
-        // Temporarily set the env var to a custom value.
-        // SAFETY: this test is the only writer to this specific env var
-        // and cargo test runs each test in its own thread but we accept
-        // the race here since the key is test-specific.
-        let prev = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, "/custom/runtime/dir") };
-        let result = find_runtime_lib();
-        // Restore.
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        let result = find_runtime_lib_resolved(Some("/custom/runtime/dir"), None);
         assert_eq!(result.as_deref(), Some("/custom/runtime/dir"));
     }
 }
