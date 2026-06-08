@@ -62,6 +62,7 @@ use phoenix_ir::module::IrModule;
 
 use crate::error::CompileError;
 
+mod enums;
 mod module_builder;
 mod string_helpers;
 mod translate;
@@ -117,6 +118,11 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     if string_needs.string_types {
         builder.declare_string_types();
     }
+    // Declare every Phoenix enum's parent + per-variant subtypes after
+    // structs and string types (so enum variant fields of those types
+    // can encode their indices) and before function signatures or the
+    // memory declaration. See §Phase 2.4 decision K.4.
+    builder.declare_phoenix_enums(ir_module)?;
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();

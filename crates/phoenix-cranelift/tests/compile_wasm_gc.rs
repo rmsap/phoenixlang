@@ -132,6 +132,68 @@ fn count_struct_type_decls(bytes: &[u8]) -> usize {
     structs
 }
 
+/// Count the §Phase 2.4 K.4 enum type declarations by their subtype
+/// role, returning `(parents, variants)`. Lets the enum gates assert
+/// the parent + per-variant hierarchy was emitted *structurally* —
+/// independent of whether the wasmtime execution tier runs. The
+/// `TypeInterner` encodes the three struct flavors distinctly:
+/// - **enum parent** — `(sub (struct …))`, non-final, no supertype;
+/// - **enum variant** — final struct *with* a supertype (its parent);
+/// - **regular struct / `$string`** — final struct, no supertype.
+///
+/// So a struct with a supertype is a variant, a non-final struct
+/// without one is a parent, and everything else (plain structs,
+/// `$string`) falls into neither bucket. A regression that dropped the
+/// variant subtypes or flattened the hierarchy changes these counts
+/// even on a machine with no wasmtime.
+fn count_enum_type_decls(bytes: &[u8]) -> (usize, usize) {
+    use wasmparser::{CompositeInnerType, Parser, Payload};
+    let (mut parents, mut variants) = (0, 0);
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::TypeSection(reader) = payload.expect("parse wasm payload") {
+            for rec_group in reader {
+                for sub_ty in rec_group.expect("rec group").types() {
+                    if !matches!(sub_ty.composite_type.inner, CompositeInnerType::Struct(_)) {
+                        continue;
+                    }
+                    if sub_ty.supertype_idx.is_some() {
+                        variants += 1;
+                    } else if !sub_ty.is_final {
+                        parents += 1;
+                    }
+                }
+            }
+        }
+    }
+    (parents, variants)
+}
+
+/// Count `ref.cast` (non-null) operators across every function body.
+/// On wasm32-gc only `Op::EnumGetField` emits a `ref.cast` (it narrows
+/// the parent-typed receiver to the concrete variant before the field
+/// load; struct field reads use the binding's concrete type directly,
+/// no cast). So a non-zero count proves the `EnumGetField` lowering is
+/// present even when wasmtime isn't available to observe the field
+/// value — closing the same gap `count_struct_ops` closes for structs.
+fn count_ref_cast_ops(bytes: &[u8]) -> usize {
+    use wasmparser::{Operator, Parser, Payload};
+    let mut casts = 0;
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::CodeSectionEntry(body) = payload.expect("parse wasm payload") {
+            let reader = body.get_operators_reader().expect("operators reader");
+            for op in reader {
+                if matches!(
+                    op.expect("decode operator"),
+                    Operator::RefCastNonNull { .. }
+                ) {
+                    casts += 1;
+                }
+            }
+        }
+    }
+    casts
+}
+
 /// Compile `source`, structurally validate it, and — when wasmtime is
 /// available — assert its stdout equals `expected`. Shared by the
 /// `print(Int)` digit-conversion cases.
@@ -918,6 +980,238 @@ fn string_substring_lex_cmp_and_print_bool_run_under_wasmtime_gc() {
         source,
         "string_slice2_wasm_gc",
         b"true\nfalse\ntrue\na-lt-b\nb-gt-a\na-le-apple\nb-ge-banana\nprefix-lt\nhello\nworld\n\n\n\nhell\n\xc3\xa9l\n5\n5\norl\nw-gt-e\n2\n",
+    );
+}
+
+/// PR 6 slice 3: enums on wasm32-gc. Exercises every op the slice
+/// adds, plus the heterogeneous-variant case (Result) and a nullary
+/// variant. Per §Phase 2.4 decision K.4, each Phoenix enum gets a
+/// parent type holding `$tag` and one final variant subtype per
+/// variant; `EnumAlloc` is one `struct.new` against the variant,
+/// `EnumDiscriminant` reads `$tag` through the parent without a
+/// `ref.cast`, `EnumGetField` `ref.cast`s to the concrete variant
+/// before the field load.
+///
+/// - **Custom 3-variant enum (`Shape`)** — covers nullary
+///   (`Square`), single-field (`Circle(Int)`), and multi-field
+///   (`Rect(Int, Int)`) variants. Match arms exercise field reads
+///   on the multi-field variant.
+/// - **`Option<Int>`** — generic enum with a single type parameter.
+///   Monomorphizes to one `Option__i64` enum with `Some` and `None`
+///   variants.
+/// - **`Result<Int, String>`** — the heterogeneous variant case.
+///   `Ok.0` is `Int`, `Err.0` is `String` — under the subtype
+///   hierarchy each variant carries its field at the natural WASM
+///   type (no boxing). If a regression flipped representation to
+///   flat-max (decision B), this fixture would either fail at
+///   `Op::EnumAlloc` (boxing not yet implemented) or silently
+///   truncate the string field through a wrong slot type.
+///
+/// Expected stdout:
+/// ```
+/// 48
+/// 15
+/// 1
+/// circle
+/// rect
+/// square
+/// 42
+/// 99
+/// 7
+/// oops
+/// ```
+#[test]
+fn enum_ops_run_under_wasmtime_gc() {
+    // Pulled from the canonical fixture at compile time (mirroring the
+    // sibling struct/string gates above) so the test stays locked to
+    // whatever `wasm_gc_enum.phx` says rather than a drifting inline copy.
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/wasm_gc_enum.phx"
+    ));
+    let bytes = compile_to_wasm_gc(source);
+    // Structural gate (runs even without wasmtime): the three enums —
+    // `Shape` (3 variants), `Option<Int>` (2), `Result<Int, String>`
+    // (2) — must each emit one parent + one subtype per variant, per
+    // §Phase 2.4 K.4. So 3 parents and 3 + 2 + 2 = 7 variant subtypes.
+    // A regression that flattened the hierarchy or dropped a variant
+    // changes these counts regardless of the execution tier.
+    let (parents, variants) = count_enum_type_decls(&bytes);
+    assert_eq!(parents, 3, "expected 3 enum parent types, got {parents}");
+    assert_eq!(
+        variants, 7,
+        "expected 7 enum variant subtypes, got {variants}"
+    );
+    // `EnumGetField` is the only wasm32-gc op that emits `ref.cast`;
+    // `area`'s field reads (`Circle(r)`, `Rect(w, h)`) guarantee at
+    // least one. Asserting its presence catches a dropped field-read
+    // lowering that a valid-but-wrong module would otherwise hide when
+    // wasmtime is absent.
+    let casts = count_ref_cast_ops(&bytes);
+    assert!(
+        casts >= 1,
+        "expected at least one ref.cast from EnumGetField, got {casts}"
+    );
+    assert_wasm_prints(
+        &bytes,
+        "enum_ops_wasm_gc",
+        b"48\n15\n1\ncircle\nrect\nsquare\n42\n99\n7\noops\n",
+    );
+}
+
+/// PR 6 slice 3, reference-typed variant fields. `enum_ops` covers
+/// primitive and `StringRef` payloads; this fixture drives the two
+/// arms of `wasm_enum_field_type_for` it doesn't reach:
+///
+/// - **`Holder.Wrap(Point)`** — a `StructRef` variant field. Allocates
+///   a struct, stuffs it into the variant, then `EnumGetField`
+///   `ref.cast`s back and reads both struct fields (`p.x + p.y` → 10).
+/// - **`IntList.Cons(Int, IntList)`** — a self-recursive `EnumRef`
+///   variant field. The design doc (§Phase 2.4 K.4) claims recursive
+///   enums work without special handling because all parent types are
+///   declared before any variant struct; `sum` walking a 3-element
+///   list (→ 6) is the gate on that claim.
+///
+/// The middle line (`-1`) exercises a nullary variant of a multi-variant
+/// enum whose other variant carries a reference payload.
+///
+/// Expected stdout: `10\n-1\n6\n`.
+#[test]
+fn enum_reference_variant_fields_run_under_wasmtime_gc() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/wasm_gc_enum_nested.phx"
+    ));
+    let bytes = compile_to_wasm_gc(source);
+    // Structural gate (runs even without wasmtime): `Holder` (Wrap,
+    // Empty) and `IntList` (Cons, Nil) are two enums of two variants
+    // each → 2 parents, 4 variant subtypes. The `Point` struct is a
+    // plain (final, no-supertype) struct and counts in neither bucket,
+    // confirming the counter distinguishes enum subtypes from regular
+    // structs. See §Phase 2.4 K.4.
+    let (parents, variants) = count_enum_type_decls(&bytes);
+    assert_eq!(parents, 2, "expected 2 enum parent types, got {parents}");
+    assert_eq!(
+        variants, 4,
+        "expected 4 enum variant subtypes, got {variants}"
+    );
+    // `Wrap(p)` reads the struct payload and `Cons(head, tail)` reads
+    // both recursive-enum fields, so the `EnumGetField` → `ref.cast`
+    // lowering must appear.
+    let casts = count_ref_cast_ops(&bytes);
+    assert!(
+        casts >= 1,
+        "expected at least one ref.cast from EnumGetField, got {casts}"
+    );
+    assert_wasm_prints(&bytes, "enum_nested_wasm_gc", b"10\n-1\n6\n");
+}
+
+/// PR 6 slice 3, `Float` variant-field declaration. `Float` is the one
+/// slice-3 field type (§Phase 2.4 K.4) that the run-under-wasmtime
+/// fixtures can't reach end-to-end: wasm32-gc can't yet *produce* a
+/// `Float` value (no `ConstF64` / float-arith lowering, and `print(Float)`
+/// is deferred), so no float can flow into a variant via construction.
+/// But the `F64` arm of `wasm_enum_field_type_for` runs at type-*declaration*
+/// time, independent of whether any float is ever materialized. This gates
+/// it: `Pulse.Tick(Float)` forces the F64 arm to encode an `f64` variant
+/// field, while `main` only ever constructs the nullary `Quiet` variant —
+/// so the module compiles, declares the parent + both variant subtypes, and
+/// runs. A regression in the F64 arm (wrong slot type, or routing `Float`
+/// to the out-of-slice catch-all) breaks the compile or the type counts.
+///
+/// Expected stdout: `0\n` (`classify(Quiet)` returns 0).
+#[test]
+fn enum_float_variant_field_declares_and_runs() {
+    let source = concat!(
+        "enum Pulse {\n",
+        "  Tick(Float)\n",
+        "  Quiet\n",
+        "}\n",
+        "function classify(p: Pulse) -> Int {\n",
+        "  match p {\n",
+        "    Tick(f) -> 1\n",
+        "    Quiet -> 0\n",
+        "  }\n",
+        "}\n",
+        "function main() {\n",
+        // Only the nullary variant is constructed — no `Float` literal is
+        // needed, yet `Tick(Float)` is still declared (its parent is
+        // reachable through `classify`'s param type).
+        "  let q: Pulse = Quiet\n",
+        "  print(classify(q))\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    // Structural gate (runs even without wasmtime): one enum, two variants.
+    let (parents, variants) = count_enum_type_decls(&bytes);
+    assert_eq!(parents, 1, "expected 1 enum parent type, got {parents}");
+    assert_eq!(
+        variants, 2,
+        "expected 2 enum variant subtypes, got {variants}"
+    );
+    assert_wasm_prints(&bytes, "enum_float_field_wasm_gc", b"0\n");
+}
+
+/// PR 6 slice 3 error path: a variant field whose type is out of slice
+/// scope (here `List<Int>`) must be rejected at codegen with the
+/// per-slice diagnostic, not emitted as a structurally-invalid module.
+/// The front-end accepts the program; the rejection happens in
+/// `wasm_enum_field_type_for`'s catch-all arm, so this asserts on the
+/// `compile` `Err` rather than going through `assert_prints`.
+#[test]
+fn enum_variant_field_out_of_slice_scope_errors() {
+    let source = concat!(
+        "enum Bag {\n",
+        "  Items(List<Int>)\n",
+        "  Empty\n",
+        "}\n",
+        "function main() {\n",
+        "  let b: Bag = Items([1, 2, 3])\n",
+        "  match b {\n",
+        "    Items(xs) -> print(42)\n",
+        "    Empty -> print(0)\n",
+        "  }\n",
+        "}\n",
+    );
+    let ir_module = lower_to_ir(source);
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("a List-typed enum variant field is out of slice-3 scope");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("out of slice scope") && msg.contains("ListRef"),
+        "expected an out-of-slice-scope diagnostic naming the list type, got: {msg}"
+    );
+}
+
+/// PR 6 slice 3 known limitation: a user-defined generic enum (here
+/// `Wrapper<T>`, with both a directly-generic `Bare(T)` field and a
+/// nested-generic `W(Option<T>)` field) can't be resolved by the
+/// position-counting substitution heuristic. It must surface as a clear
+/// Known-limitation diagnostic (§Phase 2.4 K.4), not the misleading
+/// out-of-scope-`TypeVar` / "struct `__generic` missing" message it
+/// produced before the placeholder guard in `wasm_enum_field_type_for`.
+#[test]
+fn enum_nested_generic_variant_field_reports_known_limitation() {
+    let source = concat!(
+        "enum Wrapper<T> {\n",
+        "  W(Option<T>)\n",
+        "  Bare(T)\n",
+        "}\n",
+        "function main() {\n",
+        "  let x: Wrapper<Int> = Bare(5)\n",
+        "  match x {\n",
+        "    W(o) -> print(1)\n",
+        "    Bare(v) -> print(v)\n",
+        "  }\n",
+        "}\n",
+    );
+    let ir_module = lower_to_ir(source);
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("a user-defined generic enum variant field is the K.4 known limitation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unresolved generic type") && msg.contains("Known limitation"),
+        "expected the generic known-limitation diagnostic, got: {msg}"
     );
 }
 

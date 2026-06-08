@@ -106,6 +106,25 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(idx),
             })])
         }
+        IrType::EnumRef(name, type_args) => {
+            // Enum-typed values flow through the parent (`(sub (struct
+            // (field $tag i32)))`) at all SSA boundaries — locals,
+            // function params, block params, struct/list/enum fields.
+            // `Op::EnumAlloc` produces a `(ref $variant)` which upcasts
+            // to `(ref null $parent)` via WASM-GC subtype subsumption.
+            // `Op::EnumDiscriminant` reads `$tag` through the parent
+            // without a `ref.cast`. `Op::EnumGetField` `ref.cast`s
+            // down to the concrete variant before the field load.
+            // The `type_args` distinguish concrete instantiations (per
+            // K.4 codegen-time monomorphization — `Option<Int>` and
+            // `Option<String>` get separate WASM enums).
+            // See §Phase 2.4 decision K.4.
+            let idx = b.require_enum_parent_idx(name, type_args)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(idx),
+            })])
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
              (Phase 2.4 PR 5 slices 1-3 + PR 6 slice 1 cover Int / Bool / \
@@ -585,6 +604,20 @@ fn translate_instruction(
         // parallel `ValueId → struct_name` map.
         Op::StructAlloc(name, vals) => translate_struct_alloc(ctx, b, ir_module, name, vals, instr),
         Op::StructGetField(obj, field_idx) => translate_struct_get(ctx, b, *obj, *field_idx, instr),
+        // Enum ops — see §Phase 2.4 decision K.4. Each Phoenix enum
+        // has a parent type holding `$tag` and one final variant
+        // subtype per variant. EnumAlloc builds the concrete variant
+        // (which upcasts to the parent automatically); Discriminant
+        // reads `$tag` via the parent without a cast; GetField
+        // `ref.cast`s down to the concrete variant before the field
+        // load.
+        Op::EnumAlloc(name, variant_idx, vals) => {
+            translate_enum_alloc(ctx, b, ir_module, name, *variant_idx, vals, instr)
+        }
+        Op::EnumDiscriminant(value) => translate_enum_discriminant(ctx, b, *value, instr),
+        Op::EnumGetField(obj, variant_idx, field_idx) => {
+            translate_enum_get_field(ctx, b, ir_module, *obj, *variant_idx, *field_idx, instr)
+        }
         // String ops — see §Phase 2.4 decision K.2. `$string` is a
         // 3-field struct over a mutable `$bytes` array; ConstString
         // emits a passive data segment + `array.new_data` + `struct.new`,
@@ -786,6 +819,218 @@ fn translate_struct_set(
         field_index: field_idx,
     });
     Ok(())
+}
+
+/// Lower `Op::EnumAlloc(name, variant_idx, fields)` to `struct.new`
+/// against the variant's WASM-GC subtype. Pushes the discriminant
+/// constant followed by each field value, then `struct.new`. The
+/// result is bound at the WASM type of the **parent**, not the
+/// variant — every Phoenix SSA enum value flows through the parent
+/// type at locals / params / block params (`(ref null $enum_parent)`),
+/// and the concrete variant `(ref $enum_Var)` upcasts to it via
+/// subtype subsumption. See §Phase 2.4 decision K.4.
+fn translate_enum_alloc(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &IrModule,
+    name: &str,
+    variant_idx: u32,
+    vals: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "Op::EnumAlloc")?;
+    // The IR carries just the template name on `Op::EnumAlloc`, but
+    // the instruction's `result_type` is `EnumRef(name, type_args)` —
+    // we read the concrete instantiation from there and look up the
+    // monomorphized WASM enum.
+    let type_args = match &instr.result_type {
+        IrType::EnumRef(rname, args) if rname == name => args.clone(),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc: `Op::EnumAlloc({name:?})` has `result_type` \
+                 `{other:?}`, expected `EnumRef({name:?}, _)` (internal \
+                 compiler bug — IR verifier should have caught this)"
+            )));
+        }
+    };
+    let parent_idx = b.require_enum_parent_idx(name, &type_args)?;
+    let variant_struct_idx = b.require_enum_variant_idx(name, &type_args, variant_idx)?;
+    // Arity check against the IR enum layout — IR verifier should
+    // have caught a mismatch, but a wrong arity here would emit a
+    // structurally invalid `struct.new` that wasmparser would only
+    // reject deep in binary decoding.
+    let expected = b
+        .enum_variant_field_count(ir_module, name, variant_idx)
+        .ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: `Op::EnumAlloc({name:?}, {variant_idx})` references \
+                 an unknown variant (IR verifier should have caught this)"
+            ))
+        })?;
+    if vals.len() != expected as usize {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `Op::EnumAlloc({name:?}, {variant_idx})` has {} field \
+             values but the variant declares {expected} fields (IR verifier \
+             should have caught this)",
+            vals.len(),
+        )));
+    }
+    // Push discriminant first (slot 0 of the variant struct, which
+    // matches the parent's `$tag`), then payload fields in IR order.
+    ctx.emit(Instruction::I32Const(variant_idx as i32));
+    for v in vals {
+        let local = ctx.binding_of(*v)?;
+        ctx.emit(Instruction::LocalGet(local));
+    }
+    ctx.emit(Instruction::StructNew(variant_struct_idx));
+    // Bind the result at the PARENT type. This way the same
+    // `ValueId` can be passed to any enum-typed slot (function param,
+    // block param, struct field, another enum variant field) without
+    // a type mismatch, since all those slots are typed at the parent.
+    let wasm_ty = ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(parent_idx),
+    });
+    let local = ctx.allocate_local(vid, wasm_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Lower `Op::EnumDiscriminant(value)` to `struct.get $parent 0` +
+/// `i64.extend_i32_u`. The discriminant lives at slot 0 of every
+/// variant struct (inherited from the parent), so reading through the
+/// parent type is well-typed — no `ref.cast` needed. Phoenix `Int` is
+/// i64, so the i32 tag widens unsigned. See §Phase 2.4 decision K.4.
+fn translate_enum_discriminant(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    value: ValueId,
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "Op::EnumDiscriminant")?;
+    let value_local = ctx.binding_of(value)?;
+    let parent_idx = enum_parent_idx_of_binding(ctx, value, "Op::EnumDiscriminant receiver")?;
+    // Confirm the binding's concrete type index is actually a recorded
+    // enum parent before reading `$tag` through it. Symmetric with the
+    // `enum_by_parent_idx` check `Op::EnumGetField` already performs:
+    // `enum_parent_idx_of_binding` accepts any `(ref $concrete)` binding
+    // (a struct ref looks identical), so without this guard a
+    // mis-typed receiver would emit a `struct.get <idx> 0` that reads
+    // some struct's first field as a discriminant instead of erroring.
+    if b.enum_by_parent_idx(parent_idx).is_none() {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `Op::EnumDiscriminant` receiver `ValueId({value:?})` \
+             is bound to type index {parent_idx}, which is not a recorded \
+             enum parent — the receiver must be an enum value (internal \
+             compiler bug)"
+        )));
+    }
+    ctx.emit(Instruction::LocalGet(value_local));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: parent_idx,
+        field_index: 0,
+    });
+    ctx.emit(Instruction::I64ExtendI32U);
+    let local = ctx.allocate_local(vid, ValType::I64);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Lower `Op::EnumGetField(obj, variant_idx, field_idx)` to a
+/// `ref.cast` followed by `struct.get`. The IR field index is
+/// shifted by 1 in the variant struct because slot 0 of the variant
+/// is the inherited `$tag`. See §Phase 2.4 decision K.4.
+fn translate_enum_get_field(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    ir_module: &IrModule,
+    obj: ValueId,
+    variant_idx: u32,
+    field_idx: u32,
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "Op::EnumGetField")?;
+    let obj_local = ctx.binding_of(obj)?;
+    let parent_idx = enum_parent_idx_of_binding(ctx, obj, "Op::EnumGetField receiver")?;
+    // Recover the enum's Phoenix name from the parent index so we can
+    // look up the variant's struct index — the receiver's binding
+    // carries the parent type only, not the variant, by design (so
+    // SSA enum values are uniformly typed).
+    let ((enum_name, _type_args), variant_indices) =
+        b.enum_by_parent_idx(parent_idx).ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: `Op::EnumGetField` receiver `ValueId({obj:?})` is \
+                 bound to enum-parent type index {parent_idx} that has no \
+                 recorded enum (internal compiler bug)"
+            ))
+        })?;
+    let enum_name = enum_name.clone();
+    if (variant_idx as usize) >= variant_indices.len() {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `Op::EnumGetField({enum_name:?}, {variant_idx})` is out \
+             of range — the enum has {} variants (IR verifier should have \
+             caught this)",
+            variant_indices.len()
+        )));
+    }
+    let variant_struct_idx = variant_indices[variant_idx as usize];
+    // Bounds-check the field index against the IR variant layout
+    // (excluding the inherited `$tag` at slot 0).
+    let expected_fields = b
+        .enum_variant_field_count(ir_module, &enum_name, variant_idx)
+        .ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: `Op::EnumGetField({enum_name:?}, {variant_idx})` \
+                 references an unknown variant (internal compiler bug)"
+            ))
+        })?;
+    if field_idx >= expected_fields {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `Op::EnumGetField({enum_name:?}, {variant_idx}, \
+             {field_idx})` is out of range — the variant declares {expected_fields} \
+             fields (IR verifier should have caught this)"
+        )));
+    }
+    ctx.emit(Instruction::LocalGet(obj_local));
+    // ref.cast narrows from (ref null $parent) to (ref $variant).
+    // wasmtime treats this as an inline check against the runtime
+    // type tag — cheap.
+    ctx.emit(Instruction::RefCastNonNull(HeapType::Concrete(
+        variant_struct_idx,
+    )));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: variant_struct_idx,
+        // +1 because slot 0 is the inherited `$tag`.
+        field_index: field_idx + 1,
+    });
+    let wasm_ty = single_slot(&instr.result_type, b, "Op::EnumGetField result")?;
+    let local = ctx.allocate_local(vid, wasm_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Look up the WASM enum-parent-type-section index a binding's
+/// `IrType::EnumRef` resolved to. Symmetric with
+/// [`struct_idx_of_binding`]: enum values are bound at their parent
+/// type, so the binding's `ValType` carries
+/// `HeapType::Concrete(parent_idx)` directly.
+fn enum_parent_idx_of_binding(
+    ctx: &FuncCtx,
+    vid: ValueId,
+    label: &str,
+) -> Result<u32, CompileError> {
+    let ty = ctx.binding_type_of(vid)?;
+    match ty {
+        ValType::Ref(RefType {
+            heap_type: HeapType::Concrete(idx),
+            ..
+        }) => Ok(idx),
+        other => Err(CompileError::new(format!(
+            "wasm32-gc: {label} `ValueId({vid:?})` is bound to WASM type \
+             `{other:?}`, not a concrete `(ref $enum_parent)` — enum ops \
+             require an EnumRef-typed receiver (internal compiler bug)"
+        ))),
+    }
 }
 
 /// Look up the WASM-struct-type-section index a binding's

@@ -1,0 +1,62 @@
+// Custom enum exercising nullary, single-field, and multi-field variants.
+enum Shape {
+  Circle(Int)         // radius
+  Rect(Int, Int)      // width, height
+  Square
+}
+
+function area(s: Shape) -> Int {
+  match s {
+    Circle(r) -> r * r * 3
+    Rect(w, h) -> w * h
+    Square -> 1
+  }
+}
+
+function describe(s: Shape) -> String {
+  match s {
+    Circle(r) -> "circle"
+    Rect(w, h) -> "rect"
+    Square -> "square"
+  }
+}
+
+function main() {
+  // Custom enum — exercises EnumAlloc / EnumDiscriminant / EnumGetField
+  // across nullary, single-field, and multi-field variants.
+  let c: Shape = Circle(4)
+  let r: Shape = Rect(3, 5)
+  let sq: Shape = Square
+  print(area(c))            // 48 (4 * 4 * 3)
+  print(area(r))            // 15 (3 * 5)
+  print(area(sq))           // 1
+  print(describe(c))        // circle
+  print(describe(r))        // rect
+  print(describe(sq))       // square
+
+  // Option<Int> — single generic parameter, two variants.
+  let some_val: Option<Int> = Some(42)
+  let none_val: Option<Int> = None
+  match some_val {
+    Some(n) -> print(n)     // 42
+    None -> print(0)
+  }
+  match none_val {
+    Some(n) -> print(n)
+    None -> print(99)       // 99
+  }
+
+  // Result<Int, String> — the heterogeneous-variant case (Int vs String at
+  // the same payload position). Under the subtype hierarchy, each variant
+  // carries its field at its natural WASM type — no boxing.
+  let ok_val: Result<Int, String> = Ok(7)
+  let err_val: Result<Int, String> = Err("oops")
+  match ok_val {
+    Ok(n) -> print(n)       // 7
+    Err(msg) -> print(msg)
+  }
+  match err_val {
+    Ok(n) -> print(n)
+    Err(msg) -> print(msg)  // oops
+  }
+}

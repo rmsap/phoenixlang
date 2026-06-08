@@ -99,4 +99,50 @@ impl TypeInterner {
             .array(&element.element_type, element.mutable);
         idx
     }
+
+    /// Declare a non-final, no-parent WASM-GC struct type that subtypes
+    /// can later extend. Returns its type-section index. Used by the
+    /// wasm32-gc enum mapping (§Phase 2.4 decision K.4) for the
+    /// per-enum parent type that holds only the discriminant; variant
+    /// structs subtype this parent via [`Self::declare_subtype_struct`].
+    pub(super) fn declare_open_struct(&mut self, fields: &[FieldType]) -> u32 {
+        let idx = self.section.len();
+        self.section.ty().subtype(&wasm_encoder::SubType {
+            is_final: false,
+            supertype_idx: None,
+            composite_type: wasm_encoder::CompositeType {
+                inner: wasm_encoder::CompositeInnerType::Struct(wasm_encoder::StructType {
+                    fields: fields.to_vec().into_boxed_slice(),
+                }),
+                shared: false,
+                descriptor: None,
+                describes: None,
+            },
+        });
+        idx
+    }
+
+    /// Declare a final WASM-GC struct subtype with the given fields,
+    /// extending the parent at `super_idx`. Returns its type-section
+    /// index. The variant struct's `fields` must start with all of
+    /// the parent's fields in order (a WASM-GC subtype requirement),
+    /// followed by the variant's added fields. Used by the wasm32-gc
+    /// enum mapping (§Phase 2.4 decision K.4) for per-variant subtypes
+    /// of an enum parent.
+    pub(super) fn declare_subtype_struct(&mut self, fields: &[FieldType], super_idx: u32) -> u32 {
+        let idx = self.section.len();
+        self.section.ty().subtype(&wasm_encoder::SubType {
+            is_final: true,
+            supertype_idx: Some(super_idx),
+            composite_type: wasm_encoder::CompositeType {
+                inner: wasm_encoder::CompositeInnerType::Struct(wasm_encoder::StructType {
+                    fields: fields.to_vec().into_boxed_slice(),
+                }),
+                shared: false,
+                descriptor: None,
+                describes: None,
+            },
+        });
+        idx
+    }
 }

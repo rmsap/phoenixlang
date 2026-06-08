@@ -1,0 +1,46 @@
+// Enum variant fields that are themselves heap references — the cases
+// the primitive/string `wasm_gc_enum.phx` fixture doesn't reach:
+//   - `Holder.Wrap(Point)` exercises the StructRef arm of
+//     `wasm_enum_field_type_for` (a struct-typed payload).
+//   - `IntList.Cons(Int, IntList)` exercises the EnumRef arm, including
+//     the self-recursive case the design doc (§Phase 2.4 K.4) claims
+//     works without special handling.
+struct Point {
+  Int x
+  Int y
+}
+
+enum Holder {
+  Wrap(Point)
+  Empty
+}
+
+enum IntList {
+  Cons(Int, IntList)
+  Nil
+}
+
+function sum(xs: IntList) -> Int {
+  match xs {
+    Cons(head, tail) -> head + sum(tail)
+    Nil -> 0
+  }
+}
+
+function main() {
+  // Struct-typed variant field: read both fields back out.
+  let h: Holder = Wrap(Point(3, 7))
+  match h {
+    Wrap(p) -> print(p.x + p.y)   // 10
+    Empty -> print(0)
+  }
+  // Nullary variant of the same enum.
+  let empty: Holder = Empty
+  match empty {
+    Wrap(p) -> print(p.x)
+    Empty -> print(0 - 1)         // -1
+  }
+  // Self-recursive enum-typed variant field.
+  let list: IntList = Cons(1, Cons(2, Cons(3, Nil)))
+  print(sum(list))                // 6
+}

@@ -38,6 +38,7 @@ use wasm_encoder::ValType;
 use crate::error::CompileError;
 
 use super::super::type_interner::TypeInterner;
+use super::enums::{self, EnumInstantiationKey};
 use super::string_helpers;
 use super::translate;
 
@@ -219,6 +220,31 @@ pub(super) struct ModuleBuilder {
     /// Populated when `HelperNeeds::str_length` is set.
     str_length_idx: Option<u32>,
 
+    /// Concrete-Phoenix-enum-instantiation `(template_name, type_args)`
+    /// → `(parent_type_idx, variant_type_indices)`. Each entry is one
+    /// distinct concrete enum (`Option<Int>` and `Option<String>` are
+    /// separate entries, even though their template `Option` is shared).
+    /// `parent_type_idx` is the open `(sub (struct (field $tag i32)))`
+    /// that holds only the discriminant; `variant_type_indices[i]` is
+    /// the WASM type index for the i-th variant. Populated by
+    /// [`Self::declare_phoenix_enums`] after a codegen-time
+    /// monomorphization pass collects every concrete instantiation
+    /// used in the IR. Consulted by `Op::EnumAlloc` (via the alloc
+    /// result type's `EnumRef(name, args)`), `Op::EnumDiscriminant` /
+    /// `Op::EnumGetField` (via the receiver binding's parent_idx →
+    /// reverse-lookup), and the `IrType::EnumRef` → `ValType` mapping
+    /// (via the field type's `(name, args)`). See §Phase 2.4 decision K.4.
+    phx_enums: HashMap<EnumInstantiationKey, (u32, Vec<u32>)>,
+
+    /// Reverse index `parent_type_idx → instantiation key`, kept in
+    /// lockstep with [`Self::phx_enums`] by [`Self::record_enum`]. Lets
+    /// [`Self::enum_by_parent_idx`] resolve `Op::EnumGetField`'s
+    /// parent-typed receiver back to its instantiation in O(1) rather
+    /// than scanning every `phx_enums` entry per field read. Parent
+    /// indices are unique (one `declare_open_struct` per instantiation),
+    /// so the map is injective.
+    phx_enum_parent_to_key: HashMap<u32, EnumInstantiationKey>,
+
     /// True once [`Self::declare_bool_data`] has emitted the
     /// `"true\n"` / `"false\n"` active data segments. The inline
     /// `print(Bool)` lowering in `translate.rs` stages iovecs at the
@@ -267,6 +293,8 @@ impl ModuleBuilder {
             str_cmp_idx: None,
             str_substring_idx: None,
             str_length_idx: None,
+            phx_enums: HashMap::new(),
+            phx_enum_parent_to_key: HashMap::new(),
             bool_data_declared: false,
             data_segment_count: 0,
         }
@@ -488,6 +516,164 @@ impl ModuleBuilder {
     /// bounds-check the IR field index.
     pub(super) fn struct_field_count(&self, struct_idx: u32) -> Option<u32> {
         self.phx_struct_field_counts.get(&struct_idx).copied()
+    }
+
+    /// Declare WASM-GC types for every Phoenix enum in the IR module
+    /// per §Phase 2.4 decision K.4. Thin wrapper over [`enums::declare`]
+    /// — the collection / monomorphization / declaration machinery lives
+    /// in [`super::enums`]; this method is the builder-side entry point
+    /// the pipeline in `mod.rs` calls, mirroring how
+    /// [`Self::declare_string_helpers`] dispatches to
+    /// [`super::string_helpers`].
+    ///
+    /// Must run *after* [`Self::declare_phoenix_structs`] and
+    /// [`Self::declare_string_types`] (so variant fields of those types
+    /// can encode their indices) and *before* any function signature
+    /// touching `IrType::EnumRef` is interned (so the signature can
+    /// encode the parent's `HeapType::Concrete(idx)`).
+    pub(super) fn declare_phoenix_enums(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        enums::declare(self, ir_module)
+    }
+
+    /// Declare an enum's open parent struct — `(sub (struct (field $tag
+    /// i32)))`, non-final so variants can subtype it — and return its
+    /// type-section index. Narrow wrapper over the private
+    /// [`TypeInterner`] so [`enums::declare`] can emit parent types
+    /// without reaching into the interner directly (same pattern as
+    /// [`Self::intern_signature`]). See §Phase 2.4 decision K.4.
+    pub(super) fn declare_enum_parent_struct(&mut self, fields: &[wasm_encoder::FieldType]) -> u32 {
+        self.types.declare_open_struct(fields)
+    }
+
+    /// Declare an enum's final variant struct subtyping the parent at
+    /// `parent_idx`, and return its type-section index. `fields` must
+    /// start with the parent's `$tag` field (a WASM-GC subtype
+    /// requirement) followed by the variant's payload. Narrow wrapper
+    /// over the private [`TypeInterner`] for [`enums::declare`].
+    pub(super) fn declare_enum_variant_struct(
+        &mut self,
+        fields: &[wasm_encoder::FieldType],
+        parent_idx: u32,
+    ) -> u32 {
+        self.types.declare_subtype_struct(fields, parent_idx)
+    }
+
+    /// Record a fully-declared enum instantiation: its parent
+    /// type-section index and the per-variant type indices. Keeps
+    /// [`Self::phx_enums`] and the [`Self::phx_enum_parent_to_key`]
+    /// reverse index in lockstep so the query accessors stay
+    /// consistent. Called once per instantiation by [`enums::declare`].
+    pub(super) fn record_enum(
+        &mut self,
+        key: EnumInstantiationKey,
+        parent_idx: u32,
+        variant_indices: Vec<u32>,
+    ) {
+        self.phx_enum_parent_to_key.insert(parent_idx, key.clone());
+        self.phx_enums.insert(key, (parent_idx, variant_indices));
+    }
+
+    /// Read-only view of the Phoenix-struct-name → WASM-type-index map.
+    /// Used by [`enums::declare`] to resolve `StructRef` variant fields
+    /// to the struct's already-declared type index.
+    pub(super) fn phx_struct_indices(&self) -> &HashMap<String, u32> {
+        &self.phx_structs
+    }
+
+    /// WASM type-section index of the parent type for the concrete
+    /// enum instantiation `(name, type_args)`. Used by
+    /// `Op::EnumDiscriminant` (reads `$tag` through this type) and by
+    /// the `IrType::EnumRef` → WASM `ValType` mapping. Different
+    /// `type_args` for the same template are *separate* WASM enums
+    /// per K.4 codegen-time monomorphization.
+    pub(super) fn require_enum_parent_idx(
+        &self,
+        name: &str,
+        type_args: &[IrType],
+    ) -> Result<u32, CompileError> {
+        let key = (name.to_string(), type_args.to_vec());
+        self.phx_enums
+            .get(&key)
+            .map(|(parent, _)| *parent)
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: enum instantiation `{name}{type_args:?}` was \
+                     not declared by `declare_phoenix_enums` — either an \
+                     `Op::EnumAlloc` / `IrType::EnumRef` references an enum \
+                     missing from `IrModule::enum_layouts`, or the \
+                     enum-collection pass missed this instantiation \
+                     (internal compiler bug)"
+                ))
+            })
+    }
+
+    /// WASM type-section index of a variant struct for the concrete
+    /// enum instantiation `(name, type_args)`. Used by
+    /// `Op::EnumAlloc` (the `struct.new` target) and
+    /// `Op::EnumGetField` (the `ref.cast` target before the field load).
+    pub(super) fn require_enum_variant_idx(
+        &self,
+        name: &str,
+        type_args: &[IrType],
+        variant_idx: u32,
+    ) -> Result<u32, CompileError> {
+        let key = (name.to_string(), type_args.to_vec());
+        let (_, variants) = self.phx_enums.get(&key).ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: enum instantiation `{name}{type_args:?}` was not \
+                 declared by `declare_phoenix_enums` (internal compiler bug)"
+            ))
+        })?;
+        variants.get(variant_idx as usize).copied().ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: enum `{name}{type_args:?}` has {} variants but \
+                     variant index {variant_idx} was requested (IR verifier \
+                     should have caught this)",
+                variants.len()
+            ))
+        })
+    }
+
+    /// Reverse-lookup the `(name, type_args)` instantiation and the
+    /// variant-index list from a WASM parent type-section index. Used
+    /// by `Op::EnumGetField`: the receiver's binding `ValType` carries
+    /// the parent index, so the field-read path recovers the
+    /// instantiation from that without needing the IR to thread the
+    /// `(name, args)` tuple through the op.
+    ///
+    /// O(1) via the [`Self::phx_enum_parent_to_key`] reverse index
+    /// (built by [`Self::record_enum`]) rather than a scan over every
+    /// declared enum per field read. Returns `None` if `parent_idx`
+    /// isn't a recorded enum parent (e.g. it's a plain struct index).
+    pub(super) fn enum_by_parent_idx(
+        &self,
+        parent_idx: u32,
+    ) -> Option<(&EnumInstantiationKey, &[u32])> {
+        let key = self.phx_enum_parent_to_key.get(&parent_idx)?;
+        let (_, variants) = self.phx_enums.get(key)?;
+        Some((key, variants.as_slice()))
+    }
+
+    /// Number of fields (excluding the inherited `$tag`) in the
+    /// variant at `variant_idx` of the enum named `name`. The
+    /// template's variant arity is type-arg-independent (each
+    /// instantiation has the same number of fields per variant; only
+    /// the field types differ), so this consults `enum_layouts`
+    /// directly without needing the `type_args`.
+    pub(super) fn enum_variant_field_count(
+        &self,
+        ir_module: &IrModule,
+        name: &str,
+        variant_idx: u32,
+    ) -> Option<u32> {
+        ir_module
+            .enum_layouts
+            .get(name)
+            .and_then(|variants| variants.get(variant_idx as usize))
+            .map(|(_, fields)| fields.len() as u32)
     }
 
     /// Declare the WASI imports the synthesized helpers and `_start`

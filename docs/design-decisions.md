@@ -1249,6 +1249,116 @@ Empty-result fast-path (`start >= end` after clamp) is the same `struct.new` wit
 - `BuiltinCall("String.substring")` lowering: same file, `translate_string_substring`.
 - Fixture additions: `tests/fixtures/wasm_gc_string.phx` extended (or a sibling fixture) to cover substring on both ASCII and multi-byte UTF-8 strings, lex compare across `<` / `<=` / `>` / `>=`, and `print(true)` / `print(false)`.
 
+#### K.4. wasm32-gc enum mapping: subtype hierarchy (parent + per-variant subtypes)
+
+**Decided:** 2026-06-05 (sub-decision under K, locked alongside PR 6 slice 3 — enums on wasm32-gc).
+
+**Context.** Phoenix enums are pervasive — `Option<T>` and `Result<T, E>` appear in nearly every non-trivial fixture (collection methods return `Option`, parse returns `Result`, error propagation runs through `Result`), plus user-defined enums show up in pattern-matched AST shapes, state machines, and bench fixtures. The representation choice ripples through every enum-touching site (alloc, discriminant read, field read, recursive references) and is hard to revisit later because changing it would re-cost the entire matrix.
+
+Phoenix's IR carries three enum ops, all surfaced by `lower_match` / `lower_expr`:
+
+- `Op::EnumAlloc(name, variant_idx, fields)` — construct an instance of variant `variant_idx` with `fields` payload values.
+- `Op::EnumDiscriminant(value)` — return the variant index as `Int` (i64). Emitted at every match-arm dispatch site.
+- `Op::EnumGetField(value, variant_idx, field_idx)` — read field `field_idx` from variant `variant_idx`. Always emitted *inside* a match arm that has already confirmed the variant via discriminant test, so it's safe to assume the variant.
+
+Match expressions lower to `Op::EnumDiscriminant` + chained `Op::IEq` + `Terminator::Branch` against the discriminant — *not* `Terminator::Switch` — so this slice doesn't need to extend the terminator surface beyond what slices 1–2 already covered.
+
+**Alternatives considered (full comparison locked here so a future contributor proposing a switch doesn't re-derive the analysis).**
+
+| Property | A. Subtype (chosen) | B. Flat-max | C. Tagged-outer + payload |
+|---|---|---|---|
+| Type declarations per Phoenix enum | N+1 (parent + N variant subtypes) | 1 (single struct with max-arity fields) | N+1 (outer + N variant structs) |
+| `EnumAlloc` allocations | 1 `struct.new` | 1 `struct.new` (plus boxing allocations for heterogeneous fields) | 2 `struct.new`s (variant payload + outer wrapper) |
+| `EnumDiscriminant` cost | `struct.get $parent 0` — 1 instruction, no cast | `struct.get $enum 0` — 1 instruction | `struct.get $enum 0` — 1 instruction |
+| `EnumGetField` cost | `ref.cast (ref $variant)` + `struct.get $variant (i+1)` — 2 instructions | `struct.get $enum (i+1)` if homogeneous; `ref.cast` + unbox if heterogeneous — 1–4 instructions | `struct.get $enum 1` (payload) + `ref.cast` + `struct.get $variant i` — 3 instructions |
+| Memory: `Option<Int>.None` | header + tag (4B) | header + tag + 8B unused `Some` slot | 2 headers + tag + payload-ref + empty payload struct |
+| Memory: `Result<Int, String>.Ok(42)` | header + tag + 8B `i64` | header + tag + boxed `i64` (separate heap alloc for the box, since `Int` doesn't fit in `i31ref` for values ≥ 2³¹) | 2 headers + tag + payload-ref + 8B `i64` |
+| Heterogeneous-variant handling (`Result<T, E>` with `T ≠ E`) | natural — each variant typed independently | forces field-slot type to `anyref` plus per-access boxing/unboxing | natural — each variant struct typed independently |
+| Industry precedent | canonical WASM-GC sum-type shape (OCaml-on-WASM-GC, Scheme-to-WASM-GC, Kotlin/WASM) | uncommon | seen in some early ports, less common today |
+
+**Why B (flat-max) was the closest runner-up but still rejected.** The flat-max layout looks attractive because it produces a single WASM type per Phoenix enum (smaller type section) and skips the `ref.cast` on homogeneous-variant field reads. But realistic Phoenix programs lean heavily on heterogeneous variants — `Result<Int, String>`, AST node enums where `BinOp(Expr, Expr)` and `Literal(i64)` coexist, error enums where each variant carries a different payload — and under B, every one of those pays a permanent boxing tax. The boxing tax compounds: every primitive field in a heterogeneous slot needs `ref.i31` (for small ints) or a heap box (for `Int` values ≥ 2³¹ and for `Float`); every read needs the inverse unwrap. For a `Result<Int, _>` returned from a hot-path function, that's two boxing operations per call. The B-vs-A type-section savings (one type per enum vs. N+1) are real but small for the realistic enum count in a Phoenix module (tens of enums, not thousands).
+
+**Why C (tagged outer + payload) was rejected.** C's main appeal is conceptual cleanness — separating "enum-level identity (tag)" from "variant payload (data)" — and it would let Phoenix mutate a value's variant in place (`e = e.with_other_variant()`) by replacing only the payload pointer. Phoenix has no such pattern today and no roadmap for one. The structural cost — two heap allocations per `EnumAlloc`, four instructions per `EnumGetField` — is paid forever for a feature the language doesn't use.
+
+**Chosen.** For each Phoenix enum (post-monomorphization name — e.g. `Color`, `Option__i64`, `Result__i64__StringRef`), declare:
+
+- One **parent** struct type `(sub (struct (field $tag i32)))` — *not* final, so variants can subtype it. The parent holds only the discriminant. `IrType::EnumRef(name, _)` lowers to `(ref null $enum_parent)` — every SSA enum value flows through the parent type at locals, function params, block params, struct/list/enum fields.
+- For each variant in declaration order: one **variant** struct type `(sub $enum_parent (struct (field $tag i32) (field $f0 …) (field $f1 …) …))` — final. The variant struct's first field is `$tag` (required by WASM-GC, which mandates subtypes start with all the supertype's fields in order). Subsequent fields are the variant's payload in Phoenix declaration order.
+
+**Op lowering.**
+
+- **`Op::EnumAlloc(variant_name, fields)`**:
+  ```
+  i32.const <variant_idx>
+  <each field value pushed in order>
+  struct.new $enum_VariantName
+  ```
+  Produces `(ref $enum_VariantName)` which upcasts to `(ref null $enum_parent)` via subtype subsumption for storage into a Phoenix enum-typed slot. One heap allocation.
+
+- **`Op::EnumDiscriminant(value)`**:
+  ```
+  local.get value
+  struct.get $enum_parent 0    ;; reads $tag via the parent type
+  i64.extend_i32_u             ;; widen to Phoenix Int
+  ```
+  No `ref.cast` — reading through the parent type is well-typed because every concrete variant IS-A parent. This is the key property the subtype hierarchy buys: the discriminant test that drives every match dispatch costs nothing.
+
+- **`Op::EnumGetField(value, variant_idx, field_idx)`**:
+  ```
+  local.get value
+  ref.cast (ref $enum_VariantName)
+  struct.get $enum_VariantName (field_idx + 1)
+  ```
+  The `+ 1` offset accounts for the `$tag` field occupying slot 0 of the variant struct. The `ref.cast` is structurally cheap in production WASM-GC VMs (wasmtime, V8) — it's an inline check against the runtime type tag carried in the object's header, a few cycles.
+
+**Heterogeneous variants are naturally handled.** For `Result<Int, String>`:
+```
+(type $Result_int_string      (sub (struct (field $tag i32))))
+(type $Result_int_string_Ok   (sub $Result_int_string (struct (field $tag i32) (field $f0 i64))))
+(type $Result_int_string_Err  (sub $Result_int_string (struct (field $tag i32) (field $f0 (ref null $string)))))
+```
+`Ok.f0` is `i64`, `Err.f0` is a string ref. No boxing — each variant carries its field at its natural WASM type.
+
+**Recursive enums** (e.g. `enum Tree { Node(Tree, Tree), Leaf(Int) }`) work without special handling. The parent type is declared first; variants reference `(ref null $Tree_parent)` for `Tree`-typed fields. Forward reference is safe because all enum parent types are declared before any variant struct is declared.
+
+**Field-type restriction for slice 3.** Variant fields can be: `Int` (i64), `F64` (f64), `Bool` (i32), `StringRef` (`(ref null $string)`), `StructRef` (`(ref null $struct_idx)`), `EnumRef` (`(ref null $other_enum_parent)` — including self-recursive). Lists, maps, closures, and `dyn Trait` as variant fields error with a per-slice diagnostic — each lands in the slice that pins its own type mapping (K.5 / K.6 / etc.).
+
+**Generic monomorphization at codegen time.** Phoenix's IR does *not* monomorphize enum layouts — `enum_layouts` stores templates with `__generic` placeholder fields (e.g., `enum_layouts["Option"] = [("Some", [StructRef("__generic")]), ("None", [])]`), and concrete type arguments live only on `EnumRef(name, args)` at use sites. The wasm32-linear backend handles this dynamically per call site (no static enum types). For wasm32-gc with statically-declared WASM types, the layouts have to be fully concrete at declaration time, so the type-decl pass *itself* runs a codegen-time monomorphization step:
+
+1. **Collect.** Walk every function (signatures, block params, instruction `result_type`s) and every struct/enum field type recursively, collecting every distinct `EnumRef(name, args)` tuple. Each tuple is one concrete instantiation that needs its own WASM enum declaration.
+2. **Substitute.** For each `(template_name, type_args)` tuple, take the template's `enum_layouts` entry and substitute `__generic` placeholders in field-type position using the position-counting heuristic: walk all variant fields in declaration order, treating each `__generic` placeholder as consuming the next slot of `type_args`. This matches the substitution wasm32-linear's `lower_match_enum` already uses to type field accesses at match sites, and works correctly for `Option<T>` (one type param, one placeholder) and `Result<T, E>` (two type params, one placeholder per variant in Phoenix-declaration-order).
+3. **Declare.** For each concrete instantiation, declare a parent + per-variant subtypes as described above, indexed by the `(name, args)` tuple. `IrType::EnumRef(name, args)` → `(ref null $parent_for_that_tuple)`. The same enum template with different type args yields *different* WASM enum types — `Option<Int>` and `Option<String>` are separate parent + variant subtypes in the type section, no shared declarations.
+
+**Known limitation (inherited from the wasm32-linear lowering).** The position-counting substitution heuristic is correct iff every type parameter of a generic enum appears at most once across all variants combined, in the same Phoenix declaration order as the type-parameter list. For Phoenix's stdlib generic enums:
+
+- `Option<T>` — one type param `T`, one placeholder in `Some([T])` — correct.
+- `Result<T, E>` — two type params in order `[T, E]`, one placeholder each in `Ok([T])` and `Err([E])`, variants declared in `Ok, Err` order — correct.
+
+A *user-defined* generic enum like `enum Pair<T, U> { Both(T, U), Single(T) }` would mis-substitute: `Both` consumes type_args at positions 0 and 1 (correct: `T`, `U`); `Single` consumes position 2 (out of range) instead of position 0 (`T`). The same limitation is flagged in `crates/phoenix-ir/src/lower_match.rs` for the match-side path — fixing it properly requires storing per-placeholder type-parameter-name metadata in `enum_layouts` (architecture item A5 in that file's notes). For PR 6 slice 3, both wasm32 backends carry the same limitation; user-defined generic enums where type params repeat across variants error with a clear per-slice diagnostic when the position counter runs past `type_args.len()`. Non-generic user-defined enums and the stdlib `Option` / `Result` work correctly.
+
+**Type-section ordering.** All enum *parent* types must be declared before any variant struct (so variants can subtype them) and before any function signature touching `IrType::EnumRef` (so signatures can encode the parent index). Variant structs are declared right after the parents, in (enum name × variant index) sorted order for determinism. The pipeline:
+
+1. `declare_phoenix_structs` (K.1)
+2. `declare_string_types` (K.2)
+3. `declare_phoenix_enums` (K.4) — parents first, then variants
+4. `declare_imports` / `declare_print_helper` / `declare_string_helpers`
+5. `declare_phoenix_functions`
+6. `declare_start`
+7. emission
+
+**Why parent-first within K.4.** A variant references its parent by type-section index in its `supertype_idx`; the parent must already exist. Within the parents-then-variants order, both passes iterate enums in sorted name order for deterministic byte output.
+
+**Implementation pointers:**
+- Enum type declarations: `crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs::declare_phoenix_enums` (new).
+- Parent/variant index lookup: `require_enum_parent_idx(name)` / `require_enum_variant_idx(name, variant_idx)` accessors.
+- `IrType::EnumRef` → `ValType::Ref` mapping: `wasm_valtypes_for` in `translate.rs` (alongside K.1 / K.2 arms).
+- Op arms (`EnumAlloc` / `EnumDiscriminant` / `EnumGetField`): `translate.rs::translate_instruction`.
+- `TypeInterner::declare_subtype_struct(fields, super_idx) -> u32` — new method that emits a `SubType` with `supertype_idx = Some(super_idx)`, alongside the existing `declare_struct` (which is the non-subtype form used by K.1).
+- Fixtures: `tests/fixtures/wasm_gc_enum.phx` exercising Option, Result (heterogeneous), and a custom 3-variant enum (covers nullary variants, multi-field variants, and the multi-arity case); `tests/fixtures/wasm_gc_enum_nested.phx` exercising reference-typed variant fields — a `StructRef` payload and a self-recursive `EnumRef` payload. Both are loaded via `include_str!` from `compile_wasm_gc.rs`.
+- Nested-generic guard: `wasm_enum_field_type_for` rejects any variant field that still contains a `__generic` placeholder (an `EnumRef`/`StructRef` whose type args are unresolved, e.g. `enum Wrapper<T> { W(Option<T>) }`) with the Known-limitation diagnostic below, rather than letting it fall through to a misleading "missing struct" error. `collect_enum_instantiations` likewise skips placeholder-bearing `EnumRef`s so no junk parent types are emitted.
+
+**Deferred to follow-up slices:** list/map/closure/`dyn` as variant field types (each needs its own type-mapping decision), pattern matching with struct destructuring (orthogonal to enum representation), `Option`/`Result` builtin methods (`.unwrap()`, `.map()`, etc. — orthogonal, share the same enum lowering).
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)
