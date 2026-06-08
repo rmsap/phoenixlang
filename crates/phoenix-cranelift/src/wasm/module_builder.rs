@@ -674,21 +674,21 @@ impl ModuleBuilder {
         &mut self,
         ir_module: &IrModule,
     ) -> Result<(), CompileError> {
-        if !ir_module.concrete_functions().any(|f| f.name == "main") {
-            return Err(CompileError::new("no main function found"));
-        }
-
+        // `main` existence and shape are owned solely by
+        // `validate::validate`, which `compile_wasm_linear` runs before
+        // the runtime merge (so the diagnostic doesn't depend on the
+        // runtime artifact). By the time we get here those checks have
+        // already passed, so re-running them would be dead code. The
+        // duplicate-`main` guard below, by contrast, *must* live here:
+        // it needs `phx_main_idx`, which only exists post-merge.
         for func in ir_module.concrete_functions() {
-            if func.name == "main" {
-                Self::validate_main_shape(func)?;
-                if self.phx_main_idx.is_some() {
-                    return Err(CompileError::new(
-                        "wasm32-linear: more than one `main` function found \
-                         (internal compiler bug — sema should reject duplicate \
-                         top-level function names)"
-                            .to_string(),
-                    ));
-                }
+            if func.name == "main" && self.phx_main_idx.is_some() {
+                return Err(CompileError::new(
+                    "wasm32-linear: more than one `main` function found \
+                     (internal compiler bug — sema should reject duplicate \
+                     top-level function names)"
+                        .to_string(),
+                ));
             }
 
             // See `translate::flatten_param_types` for the multi-slot
@@ -978,7 +978,13 @@ impl ModuleBuilder {
         Ok(offset)
     }
 
-    fn validate_main_shape(func: &phoenix_ir::module::IrFunction) -> Result<(), CompileError> {
+    /// The single source of truth for the `main`/`_start` shape
+    /// contract (no params, returns void). Called only by
+    /// [`super::validate::validate`], which runs before the runtime
+    /// merge so the rejection doesn't depend on the runtime artifact.
+    pub(super) fn validate_main_shape(
+        func: &phoenix_ir::module::IrFunction,
+    ) -> Result<(), CompileError> {
         if !func.param_types.is_empty() {
             return Err(CompileError::new(format!(
                 "wasm32-linear: `main` must take no parameters \

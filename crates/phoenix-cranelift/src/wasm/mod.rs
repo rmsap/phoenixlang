@@ -84,6 +84,7 @@ mod runtime_discovery;
 mod runtime_merge;
 mod translate;
 mod type_interner;
+mod validate;
 mod wasm_gc;
 
 pub(crate) use wasm_gc::compile_wasm_gc;
@@ -107,6 +108,15 @@ use module_builder::ModuleBuilder;
 /// `crates/phoenix-cranelift/tests/compile_wasm_linear.rs` exercises
 /// both.
 pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, CompileError> {
+    // Validate the IR *before* locating the runtime artifact. The
+    // structural rejections (no `main`, bad `main` shape, unsupported
+    // op, layout-unstable `EnumAlloc`) depend only on the IR, so firing
+    // them here makes the diagnostic independent of whether
+    // `phoenix_runtime.wasm` is present — otherwise a missing artifact's
+    // `RuntimeWasmNotFound` (from the merge below) would preempt them.
+    // See `validate` and the `rejects_*` integration tests.
+    validate::validate(ir_module)?;
+
     // Locate the pre-built runtime. The `RuntimeWasmNotFound → CompileError`
     // conversion (impl in `runtime_discovery`) tags the error with
     // `CompileErrorKind::RuntimeWasmNotFound` so integration tests can

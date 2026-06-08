@@ -192,6 +192,76 @@ pub(super) fn reject_placeholder_field_type(
     Ok(())
 }
 
+/// The canonical "this IR op has no wasm32-linear lowering yet"
+/// diagnostic. Single-sourced here so the up-front validation pass
+/// ([`super::validate`], which rejects the deferred-op families
+/// *before* the runtime artifact is even located) and the
+/// `translate_instruction` catch-all (the authoritative backstop for
+/// any op the validation pass doesn't pre-screen) word it identically.
+/// A regression in the wording surfaces in `rejects_unsupported_ir_op`.
+pub(super) fn unsupported_op_error(op: &Op) -> CompileError {
+    CompileError::new(format!(
+        "wasm32-linear: IR op `{op:?}` not yet supported \
+         (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4 \
+         for the linear-memory port's full op coverage)"
+    ))
+}
+
+/// Validate an `Op::EnumAlloc` against its declared enum layout: the
+/// variant index is in range, the field-value count matches the
+/// declared field count, and the variant is layout-stable (no
+/// multi-field variant carries a placeholder-typed declared field —
+/// alloc/get offset walks can disagree otherwise; see
+/// `heap_layout.rs::EnumLayout`). Only fully-concrete variants or
+/// single-field placeholder variants (`Option<T>::Some(T)`,
+/// `Result<T,_>::Ok(T)`) are layout-stable.
+///
+/// Single-sourced here so the up-front validation pass
+/// ([`super::validate`]) and the `Op::EnumAlloc` translation arm apply
+/// the *same* rejection — the validation pass fires it before the
+/// runtime merge so the diagnostic doesn't depend on the runtime
+/// artifact being present (see `rejects_enum_alloc_with_*`).
+pub(super) fn check_enum_alloc_layout_stable(
+    declared_layout: &EnumLayout,
+    name: &str,
+    variant_idx: u32,
+    given_field_count: usize,
+) -> Result<(), CompileError> {
+    let v_idx = variant_idx as usize;
+    if v_idx >= declared_layout.variant_field_types.len() {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
+             references variant index out of range (enum has {} variants)",
+            declared_layout.variant_field_types.len(),
+        )));
+    }
+    let declared_field_count = declared_layout.variant_field_types[v_idx].len();
+    if declared_field_count != given_field_count {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
+             was given {given_field_count} field values but the variant declares \
+             {declared_field_count} fields",
+        )));
+    }
+    let declared_placeholder_count = declared_layout.variant_field_types[v_idx]
+        .iter()
+        .filter(|ty| ty.is_generic_placeholder())
+        .count();
+    if declared_placeholder_count > 0 && declared_field_count > 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
+             targets a multi-field variant ({declared_field_count} fields) with \
+             {declared_placeholder_count} placeholder-typed declared field(s); the \
+             alloc-side layout (from value-vid types) and the later \
+             `Op::EnumGetField` layout (from declared types) can disagree on \
+             other-position offsets when any field is a placeholder. Only \
+             single-field placeholder variants (e.g. `Option<T>`) are supported \
+             by the current enum layout."
+        )));
+    }
+    Ok(())
+}
+
 /// Emit a load of the field of type `ty` at `field_offset` from the
 /// allocation whose base pointer is in `base_ptr_local`. Single-slot
 /// types push one value onto the operand stack; `StringRef` pushes
@@ -1524,45 +1594,16 @@ fn translate_instruction(
         Op::EnumAlloc(name, variant_idx, field_values) => {
             let vid = expect_result(instr, "Op::EnumAlloc")?;
             let declared_layout = ctx.cached_enum_layout(ir_module, name)?;
-            let v_idx = *variant_idx as usize;
-            if v_idx >= declared_layout.variant_field_types.len() {
-                return Err(CompileError::new(format!(
-                    "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
-                     references variant index out of range (enum has {} variants)",
-                    declared_layout.variant_field_types.len(),
-                )));
-            }
-            let declared_field_count = declared_layout.variant_field_types[v_idx].len();
-            if declared_field_count != field_values.len() {
-                return Err(CompileError::new(format!(
-                    "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
-                     was given {} field values but the variant declares {} fields",
-                    field_values.len(),
-                    declared_field_count,
-                )));
-            }
-            // Reject multi-field variants with any placeholder-typed
-            // declared field — alloc/get offset walks can disagree
-            // otherwise (see heap_layout.rs::EnumLayout). Only fully-
-            // concrete variants or single-field placeholder variants
-            // (`Option<T>::Some(T)`, `Result<T,_>::Ok(T)`) are layout-
-            // stable.
-            let declared_placeholder_count = declared_layout.variant_field_types[v_idx]
-                .iter()
-                .filter(|ty| ty.is_generic_placeholder())
-                .count();
-            if declared_placeholder_count > 0 && declared_field_count > 1 {
-                return Err(CompileError::new(format!(
-                    "wasm32-linear: `Op::EnumAlloc({name}, variant={variant_idx})` \
-                     targets a multi-field variant ({declared_field_count} fields) with \
-                     {declared_placeholder_count} placeholder-typed declared field(s); the \
-                     alloc-side layout (from value-vid types) and the later \
-                     `Op::EnumGetField` layout (from declared types) can disagree on \
-                     other-position offsets when any field is a placeholder. Only \
-                     single-field placeholder variants (e.g. `Option<T>`) are supported \
-                     by the current enum layout."
-                )));
-            }
+            // Layout-stability rejections (variant range, field-count
+            // match, multi-field placeholder). Single-sourced with the
+            // up-front validation pass so the same diagnostic fires
+            // whether the runtime artifact is present or not.
+            check_enum_alloc_layout_stable(
+                &declared_layout,
+                name,
+                *variant_idx,
+                field_values.len(),
+            )?;
             // Walk value vids' actual types — placeholder declared
             // fields are tolerated here because the layout follows the
             // values' types. The rejection above caps the shapes to
@@ -2188,11 +2229,12 @@ fn translate_instruction(
         }
 
         other => {
-            return Err(CompileError::new(format!(
-                "wasm32-linear: IR op `{other:?}` not yet supported \
-                 (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4 \
-                 for the linear-memory port's full op coverage)"
-            )));
+            // Authoritative backstop. The up-front validation pass
+            // ([`super::validate`]) pre-rejects the known deferred-op
+            // families (float arithmetic/comparison, string comparison)
+            // before the runtime merge, but any op it doesn't screen
+            // still lands here.
+            return Err(unsupported_op_error(other));
         }
     }
     // Shadow-stack rooting: if this instruction produced a ref-typed

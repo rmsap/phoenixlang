@@ -2911,6 +2911,16 @@ fn parallel_copy_back_edge_swap_runs_under_wasmtime() {
 /// backend is expected to reject. Locks the error-message shape so
 /// PR 3 lifting these restrictions has a visible diff point rather
 /// than silently changing wording downstream tooling may grep.
+///
+/// Every caller exercises a rejection the up-front `validate` pass
+/// hoists ahead of the runtime merge (no-`main`, bad `main` shape,
+/// unsupported op), so a `RuntimeWasmNotFound` here is a *failure*, not
+/// a skip: it means the structural rejection was preempted by the merge
+/// (i.e. the validate pass was reordered after runtime discovery, or
+/// the check stopped being hoisted). Panicking on it pins the ordering
+/// the same way `assert_enum_alloc_placeholder_rejection` does — so the
+/// guarantee holds on hosts that *do* have the artifact, not just on
+/// the artifact-missing release-CI job.
 fn expect_wasm_compile_error(source: &str) -> String {
     let ir_module = lower_to_ir(source);
     match phoenix_cranelift::compile(&ir_module, Target::Wasm32Linear) {
@@ -2918,6 +2928,13 @@ fn expect_wasm_compile_error(source: &str) -> String {
             "expected wasm32-linear compile to fail for source:\n{source}\n\
              (PR 3 may have lifted the restriction — relocate this test \
              or replace the fixture)"
+        ),
+        Err(e) if e.kind == CompileErrorKind::RuntimeWasmNotFound => panic!(
+            "unexpected RuntimeWasmNotFound for source:\n{source}\n\
+             — this rejection is hoisted into the up-front `validate` pass \
+             and must fire before the runtime merge. A regression that \
+             reordered the phases (or stopped hoisting the check) would \
+             surface here."
         ),
         Err(e) => e.to_string(),
     }
@@ -2974,19 +2991,51 @@ fn rejects_unsupported_ir_op() {
     // diagnostic must cite the PR-3 follow-up so a regression in the
     // deferred-error wording is visible.
     let src = "function main() {\n  let a: Float = 1.5\n  let b: Float = 2.5\n  let c: Float = a + b\n  print(c)\n}\n";
+    assert_unsupported_op_rejection(src, "FAdd");
+}
+
+/// Helper shared by the deferred-op-family rejection tests. Asserts the
+/// source is rejected with the canonical `unsupported_op_error`
+/// diagnostic (and, via [`expect_wasm_compile_error`], that the
+/// rejection fires *before* the runtime merge — so it holds on
+/// artifact-missing hosts too).
+fn assert_unsupported_op_rejection(src: &str, family: &str) {
     let err = expect_wasm_compile_error(src);
-    // Pin the *path* — `IR op` only appears in the per-op rejection
-    // arm of `translate_instruction`, so this rules out a spurious
-    // type-rep rejection (`IR type \`F64\``) firing first and masking
-    // a regression in the op-coverage check.
+    // Pin the *path* — `IR op` only appears in `unsupported_op_error`
+    // (shared by `validate`'s up-front op screen and the
+    // `translate_instruction` catch-all), so this rules out a spurious
+    // type-rep rejection (`IR type \`F64\``) firing first and masking a
+    // regression in the op-coverage check.
     assert!(
         err.contains("IR op") && err.contains("not yet supported"),
-        "expected `IR op ... not yet supported` op error, got: {err}"
+        "expected `IR op ... not yet supported` op error for {family}, got: {err}"
     );
     assert!(
         err.contains("PR 3"),
-        "expected error to cite the PR 3 follow-up, got: {err}"
+        "expected {family} error to cite the PR 3 follow-up, got: {err}"
     );
+}
+
+/// Companion to [`rejects_unsupported_ir_op`] for the *float
+/// comparison* family of `validate`'s deferred-op screen. Without a
+/// test per family, dropping (say) `Op::FLt` from the reject-list in
+/// `validate.rs` would go uncaught on artifact-present hosts (the
+/// `translate_instruction` catch-all still rejects it) while silently
+/// weakening the artifact-independent diagnostic on the release-CI job.
+#[test]
+fn rejects_float_comparison_op() {
+    let src = "function main() {\n  let a: Float = 1.5\n  let b: Float = 2.5\n  let c: Bool = a < b\n  print(c)\n}\n";
+    assert_unsupported_op_rejection(src, "FLt");
+}
+
+/// Companion to [`rejects_unsupported_ir_op`] for the *string
+/// comparison* family. String construction/concatenation *is* a
+/// supported linear-backend op, so the only deferred op the fixture
+/// exercises is the `==` (which lowers to `Op::StringEq`).
+#[test]
+fn rejects_string_comparison_op() {
+    let src = "function main() {\n  let a: String = \"x\"\n  let b: String = \"y\"\n  let c: Bool = a == b\n  print(c)\n}\n";
+    assert_unsupported_op_rejection(src, "StringEq");
 }
 
 /// Shared "compile from source and expect Ok" helper used by the
