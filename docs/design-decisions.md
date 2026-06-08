@@ -1169,7 +1169,7 @@ The `$bytes` array is declared with **mutable** cells (`(array (mut i8))`) — P
 | Op | Lowering | Cost vs. bare-array `(a)` |
 |---|---|---|
 | `Op::ConstString("hi")` | `array.new_data $bytes $data_seg <off> <len>`; `i32.const 0`; `i32.const len`; `struct.new $string` | +1 alloc (struct), +2 const pushes |
-| `String.length()` | `struct.get $string $len` | Same (1 instruction) |
+| `String.length()` | call to `phx_str_length` helper (code-point-start walk) | One Call vs. one `struct.get` |
 | `Op::StringConcat(a, b)` | Read each side's `$len` + `$offset` via `struct.get`; `array.new_default $bytes (a_len + b_len)`; two `array.copy` honoring source `$offset`; `struct.new $string` wrapping with `offset=0` | +1 alloc (struct), ~6 extra instructions for offset arithmetic |
 | `Op::StringEq(a, b)` | Length check via `struct.get $len`; loop reading `array.get_u $bytes (offset + i)` on each side | +1 `i32.add` per byte iteration |
 | `print(String)` | `phx_print_str` helper copies `$len` bytes starting at `$offset` from `$data` into the linear-memory iovec staging area, then `fd_write` | +1 `i32.add` per byte in the copy loop |
@@ -1194,7 +1194,7 @@ The per-op cost is a small bounded constant in the present, and the substring / 
 - `Op::BuiltinCall("print", String)` — synthesized `phx_print_str` helper that copies `$len` bytes from `$data + $offset` into the linear-memory iovec staging area, appends a newline, and calls `fd_write`. Mirrors the existing `phx_print_i64` synthesis pattern (see `module_builder::synthesize_print_i64_helper`).
 - `Op::StringConcat` — synthesized `phx_str_concat` helper that allocates `$bytes` of combined length, `array.copy` from each operand honoring its `$offset`, then `struct.new` the result.
 - `Op::StringEq` / `Op::StringNe` — synthesized `phx_str_eq` helper (length-equal check + byte loop with offset arithmetic on both sides). `StringNe` lowers as `phx_str_eq` + `i32.eqz`.
-- `Op::BuiltinCall("String.length", _)` — inline `struct.get $string $len`, no helper.
+- `Op::BuiltinCall("String.length", _)` — calls a synthesized `phx_str_length` helper that walks code-point starts. **Correction note (2026-06-05):** an earlier draft of this entry claimed length lowered as a single `struct.get $string $len` and called it "1 instruction." That was structurally incorrect — Phoenix's `String.length()` returns the **char count** (code-point count), not the byte count, as established by [`phoenix-runtime/src/string_methods.rs::phx_str_length`](../crates/phoenix-runtime/src/string_methods.rs)'s `s.chars().count()` shape. Returning `$len` (the byte length) would silently diverge from every other backend's semantics on any non-ASCII string. Slice 1 shipped with the byte-length bug latent (its fixture was pure-ASCII so the bug didn't surface in the tests); slice 2 ships the corrected helper. The K.2 cost table above is updated alongside this note.
 
 **Deferred to follow-up slices:** substring (carries the substring decision K.3, locked when the slice lands), `String.trim()` / case mapping (each its own helper), interpolation (already lowers to `Op::StringConcat`-chains today, but multi-arg concat may want its own optimized helper rather than N-1 chained `phx_str_concat` calls — open question for the slice), `print(Bool)` / `print(Float)` (separate primitive-to-string conversion helpers), `Op::StringLt` / `Op::StringLe` / `Op::StringGt` / `Op::StringGe` (lexicographic comparison helpers).
 
@@ -1203,6 +1203,51 @@ The per-op cost is a small bounded constant in the present, and the substring / 
 - `IrType::StringRef` → `ValType::Ref` mapping: `crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs::wasm_valtypes_for`, alongside the K.1 `StructRef` arm.
 - Synthesized helpers (`phx_print_str`, `phx_str_concat`, `phx_str_eq`): `crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs` (each helper's instruction emission), dispatched by `module_builder::ModuleBuilder::declare_string_helpers`, which decides which to emit and records their indices. Mirrors the `synthesize_print_i64_helper` pattern in `module_builder.rs`.
 - Fixture: `tests/fixtures/wasm_gc_string.phx` — focused fixture exercising literal printing, concat (interpolation), equality (both directions), and length.
+
+#### K.3. wasm32-gc substring lowering: O(char_count) view via a `phx_str_substring` helper
+
+**Decided:** 2026-06-05 (sub-decision under K.2, locked alongside PR 6 slice 2 — substring + lex compare + print(Bool) on wasm32-gc).
+
+**Context.** K.2 sold the three-field `$string` shape on the premise that substring is "O(1) struct.new — zero bytes copied." That framing was structurally incomplete: Phoenix's existing `substring` semantics, established in [the substring-clamps decision](#substring-clamps-out-of-range-indices-silently) and implemented in `phoenix-runtime/src/string_methods.rs::phx_str_substring`, are **char-indexed, not byte-indexed**. `"héllo".substring(1, 3)` returns `"él"` (two code points), whose bytes happen to form a contiguous slice of the parent (`é` is 2 bytes, `l` is 1, total 3 bytes starting at byte offset 1) — but *finding* those byte boundaries requires walking the parent's UTF-8 bytes counting code-point boundaries until `start` chars are consumed, then `(end - start)` more. The walk is unavoidable; the language semantic dictates it.
+The "O(1) substring" promise from K.2 therefore softens to:
+
+- **For pure-ASCII strings** (which both byte-indexed and char-indexed semantics treat identically), substring on wasm32-gc IS O(1) on the byte-walk side — `start_byte = start_char`, `end_byte = end_char`, no walk needed in principle. We still walk in the helper to keep one code path; a fast-path could be added later if profiling identifies it as a bottleneck.
+- **For UTF-8 strings with multi-byte chars**, substring is O(char_count) for the walk plus O(1) for the `struct.new`. The byte-array is still shared with the parent — zero bytes are copied — so the substring's runtime cost is *bounded by char count*, not byte count, and dominated only by the walk itself.
+
+The byte-array sharing is what survives from K.2. The "O(1) substring" claim was the part that needed correction. `StringBuilder.finalize()`'s O(1) promise from K.2 is unaffected — the builder produces ASCII / known-boundary output and hands its byte array directly to the finalized `$string` wrapper without a walk.
+
+**Chosen.** A single synthesized `phx_str_substring(s: (ref null $string), start: i64, end: i64) -> (ref $string)` helper. Mirrors the synthesis pattern used by `phx_str_concat` and `phx_str_eq`. The helper:
+
+1. Walks bytes from `s.$offset` counting UTF-8 code-point starts (a byte is a code-point start iff its top two bits aren't `0b10` — i.e., `byte & 0xC0 != 0x80`) until `start` code points are consumed. Records the resulting byte offset as `byte_start`.
+2. Continues walking, counting `(end - start)` more code-point starts. Records the byte offset as `byte_end`.
+3. Clamps both bounds: `start.max(0).min(char_count)` and `end.max(start).min(char_count)`. Clamping happens *during* the walk — when the walk hits `s.$offset + s.$len` (end of the parent's logical bytes), it stops, and any remaining "advance" requests degenerate to no-ops, naturally producing the clamped result.
+4. Returns `struct.new $string s.$data (s.$offset + byte_start) (byte_end - byte_start)` — a view into the parent's byte array.
+
+Empty-result fast-path (`start >= end` after clamp) is the same `struct.new` with `$len = 0`; we don't bother with the runtime's `empty_phx_str` static-pointer optimization because wasm32-gc has no equivalent of a process-static byte address and a 16-byte `struct.new` allocation is cheap.
+
+**Why a helper, not inline lowering.** UTF-8 boundary detection is ~10 instructions of WASM (loop header, byte fetch, mask, conditional decrement of remaining-count, advance), and the loop wraps a clamping check on each iteration. Inlining at every call site would duplicate that block per call — call density isn't huge today, but each duplication is real bytes in the module. The helper keeps the surface bounded and matches how the existing slice-1 string helpers are organized.
+
+**Why not byte-indexed substring.** Considered briefly: byte-indexed substring is O(1) in both walk and struct.new (you can directly index into `$data`). Rejected because it diverges from the existing language semantics that every other backend (native, wasm32-linear, interpreter) already implements char-indexed, and changing the semantic would (a) break user programs that depend on it and (b) require updating the wasm32-linear backend's runtime call too. A wasm32-gc-only divergence is the worst of both worlds: silent divergence between backends. If Phoenix later decides byte-indexed substring is the right language choice, that's its own design-decision pivot and the helper here gets simplified to a single `struct.new`.
+
+**Lex compare (`Op::StringLt` / `StringLe` / `StringGt` / `StringGe`)** is bundled into the same slice (not a separate sub-decision because the design space is narrow): a single `phx_str_cmp(a: ref $string, b: ref $string) -> i32` helper returns negative / zero / positive (lexicographic byte compare on offset-adjusted spans). Each of the four ops then dispatches as `Call $phx_str_cmp` followed by `i32.const 0` and the corresponding signed i32 cmp (`i32.lt_s` / `le_s` / `gt_s` / `ge_s`). One helper rather than four parallel ones because the body is identical except for the final comparison.
+
+**print(Bool)** lowers inline, not as a helper. Two **active** data segments — `"true\n"` (5 bytes) and `"false\n"` (6 bytes) — are emitted at fixed linear-memory offsets above `PRINT_STR_BUF_END`, and the WASM module instantiation auto-copies them into memory at module load. Each `print(Bool)` site emits a 5-instruction `if/else` that stages the iovec at one of the two pre-populated offsets and calls `fd_write`. No new function declaration, no `phx_print_bool` helper. The trade-off here is "module size grows ~11 bytes once (the segment payloads) + ~10 instructions per call site" vs. "one helper function + one Call per site"; for the realistic call density (a `print(true)` here and there) the inline shape is smaller.
+
+**Slice 2 op surface (locked alongside this decision):**
+
+- `BuiltinCall("String.substring", [s, start, end])` — calls `phx_str_substring`.
+- `Op::StringLt` / `Op::StringLe` / `Op::StringGt` / `Op::StringGe` — each calls `phx_str_cmp` + signed-i32 cmp against 0.
+- `BuiltinCall("print", Bool)` — inline two-segment if/else (no helper).
+
+**Deferred to follow-up slices:** `print(Float)` (its own slice with the f64-formatter design — Ryu vs. lossy fixed-precision vs. host-delegated), `String.trim()` / case mapping / `replace` (each carries its own follow-up — `trim` walks both ends for whitespace and produces a view; case mapping must allocate; `replace` is its own algorithm).
+
+**Implementation pointers:**
+- `phx_str_substring` synth: `crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs::synthesize_str_substring`.
+- `phx_str_cmp` synth: same file, `synthesize_str_cmp`.
+- Bool data segments: new constants `BOOL_TRUE_OFFSET` / `BOOL_FALSE_OFFSET` in `crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs`, written via active data segments declared by `declare_bool_data`.
+- `Op::StringLt`/`Le`/`Gt`/`Ge` lowering: `crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs`, under `translate_instruction`.
+- `BuiltinCall("String.substring")` lowering: same file, `translate_string_substring`.
+- Fixture additions: `tests/fixtures/wasm_gc_string.phx` extended (or a sibling fixture) to cover substring on both ASCII and multi-byte UTF-8 strings, lex compare across `<` / `<=` / `>` / `>=`, and `print(true)` / `print(false)`.
 
 ---
 

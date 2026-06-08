@@ -41,7 +41,7 @@ use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
 use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType};
 
-use super::module_builder::ModuleBuilder;
+use super::module_builder::{self, ModuleBuilder};
 use crate::error::CompileError;
 
 /// Does any concrete function call the `print` builtin? The `fd_write`
@@ -652,6 +652,18 @@ fn translate_instruction(
             ctx.emit(Instruction::LocalSet(local));
             Ok(())
         }
+        Op::StringLt(a, b_vid) => {
+            translate_str_lex_op(ctx, b, instr, *a, *b_vid, Instruction::I32LtS)
+        }
+        Op::StringLe(a, b_vid) => {
+            translate_str_lex_op(ctx, b, instr, *a, *b_vid, Instruction::I32LeS)
+        }
+        Op::StringGt(a, b_vid) => {
+            translate_str_lex_op(ctx, b, instr, *a, *b_vid, Instruction::I32GtS)
+        }
+        Op::StringGe(a, b_vid) => {
+            translate_str_lex_op(ctx, b, instr, *a, *b_vid, Instruction::I32GeS)
+        }
         Op::StringNe(a, b_vid) => {
             let vid = expect_result(instr, "Op::StringNe")?;
             let eq_idx = b.require_str_eq_idx()?;
@@ -919,18 +931,55 @@ fn translate_builtin_call(
     match name {
         "print" => translate_print(ctx, b, args),
         "String.length" => translate_string_length(ctx, b, args, instr),
+        "String.substring" => translate_string_substring(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: builtin `{other}` not yet supported \
              (PR 5 slice 1 covers `print(Int)`; PR 6 slice 1 adds \
-              `print(String)` and `String.length`)"
+              `print(String)` / `String.length`; PR 6 slice 2 adds \
+              `String.substring` and `print(Bool)`)"
         ))),
     }
 }
 
-/// `String.length(s) -> Int` — inline as `struct.get $string $len(2)`,
-/// then `i64.extend_i32_u` so the result is the i64 Phoenix `Int`
-/// expects. No helper; the cost is two instructions plus a 32→64
-/// extension.
+/// `String.substring(s, start, end) -> String` — dispatch to the
+/// synthesized `phx_str_substring` helper. The helper walks code-point
+/// boundaries and clamps in-line (see [`super::string_helpers::synthesize_str_substring`]).
+fn translate_string_substring(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "BuiltinCall(\"String.substring\")")?;
+    if args.len() != 3 {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `BuiltinCall(\"String.substring\")` requires 3 args \
+             (string, start, end), got {} (internal compiler bug — IR \
+             verifier should have caught this)",
+            args.len()
+        )));
+    }
+    let string_idx = b.require_string_type_idx()?;
+    let substring_idx = b.require_str_substring_idx()?;
+    for arg in args {
+        let local = ctx.binding_of(*arg)?;
+        ctx.emit(Instruction::LocalGet(local));
+    }
+    ctx.emit(Instruction::Call(substring_idx));
+    let wasm_ty = ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(string_idx),
+    });
+    let local = ctx.allocate_local(vid, wasm_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `String.length(s) -> Int` — calls the `phx_str_length` helper,
+/// which walks code-point starts to return the char count (matching
+/// Phoenix's char-indexed semantics and the runtime's
+/// `s.chars().count()`). See the K.2 correction note for why this is a
+/// helper rather than a `struct.get $len`.
 fn translate_string_length(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
@@ -946,26 +995,25 @@ fn translate_string_length(
             args.len()
         )));
     }
-    let string_idx = b.require_string_type_idx()?;
+    let length_idx = b.require_str_length_idx()?;
     let recv_local = ctx.binding_of(args[0])?;
     ctx.emit(Instruction::LocalGet(recv_local));
-    ctx.emit(Instruction::StructGet {
-        struct_type_index: string_idx,
-        field_index: 2,
-    });
-    // Phoenix `Int` is i64; widen the i32 length unsigned (lengths are
-    // non-negative — a negative value here would indicate a corrupt
-    // string struct, which our codegen never produces).
-    ctx.emit(Instruction::I64ExtendI32U);
+    ctx.emit(Instruction::Call(length_idx));
     let local = ctx.allocate_local(vid, ValType::I64);
     ctx.emit(Instruction::LocalSet(local));
     Ok(())
 }
 
 /// `print(value)` — dispatch on the value's Phoenix `IrType` to the
-/// matching synthesized helper. Supports `Int` (PR 5 slice 1) and
-/// `String` (PR 6 slice 1); `Bool` and `Float` land in follow-up
-/// slices.
+/// matching synthesized helper (or inline emission for `Bool`).
+/// Supports `Int`, `String`, and `Bool`; `Float` lands in a follow-up
+/// slice.
+///
+/// Dispatch shape: `i64` → `phx_print_i64` helper. `(ref null $string)`
+/// → `phx_print_str` helper. `i32` carrying the Phoenix `Bool` lowers
+/// inline (no helper) via an if/else that stages the iovec at one of
+/// two pre-populated linear-memory regions. See §Phase 2.4 decisions
+/// K.2 (string helper) and K.3 (Bool inline shape).
 fn translate_print(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
@@ -976,12 +1024,6 @@ fn translate_print(
             "wasm32-gc: `print(...)` requires 1 argument (internal compiler bug)".to_string(),
         )
     })?;
-    // Dispatch on the binding's WASM `ValType`. `i64` → `phx_print_i64`;
-    // a concrete struct ref with `HeapType::Concrete(idx)` matching the
-    // `$string` index → `phx_print_str`. Anything else (Bool, Float,
-    // user struct, list, etc.) errors with a per-slice diagnostic —
-    // silently emitting a `Call` against a mismatched signature would
-    // produce a structurally invalid module.
     let arg_local = ctx.binding_of(arg_vid)?;
     let arg_ty = ctx.binding_type_of(arg_vid)?;
     if arg_ty == ValType::I64 {
@@ -1001,11 +1043,107 @@ fn translate_print(
         ctx.emit(Instruction::Call(print_str_idx));
         return Ok(());
     }
+    if arg_ty == ValType::I32 {
+        // Treat `i32` as `Bool` — Phoenix's only `i32`-valued operand
+        // type today is `Bool`. (Bool comparisons, BoolNot, etc. all
+        // produce i32; struct/list refs are concrete refs and were
+        // matched above.) When `Float` printing lands in a follow-up
+        // slice, an `f64` arm joins this dispatch.
+        emit_print_bool_inline(ctx, b, arg_local)?;
+        return Ok(());
+    }
     Err(CompileError::new(format!(
-        "wasm32-gc: `print(...)` supports `Int` and `String` arguments \
-         (got a value lowered to WASM `{arg_ty:?}`); `Bool` / `Float` \
-         printing land in follow-up slices"
+        "wasm32-gc: `print(...)` supports `Int`, `String`, and `Bool` \
+         arguments (got a value lowered to WASM `{arg_ty:?}`); `Float` \
+         printing lands in the next slice"
     )))
+}
+
+/// Inline emission for `print(Bool)`. Stages an iovec at
+/// `IOVEC_OFFSET` pointing at either the pre-populated `"true\n"` or
+/// `"false\n"` region, then calls `fd_write(1, IOVEC_OFFSET, 1,
+/// NWRITTEN_OFFSET); drop`. Five instructions per arm of the if/else.
+/// No helper call; the two data segments are emitted at module-build
+/// time by `ModuleBuilder::declare_bool_data`.
+fn emit_print_bool_inline(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    bool_local: u32,
+) -> Result<(), CompileError> {
+    // The two `"true\n"` / `"false\n"` segments this lowering reads from
+    // are emitted by `declare_bool_data`, gated on `scan_helper_needs`
+    // having flagged a `print(Bool)` site. Refuse to stage iovecs at
+    // their offsets unless that ran — otherwise a scan/translate
+    // divergence would emit a valid module that prints uninitialized
+    // memory.
+    b.require_bool_data()?;
+    let fd_write_idx = b.require_fd_write_idx()?;
+    let i32_memarg = wasm_encoder::MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    };
+    // iovec.iov_ptr = (cond ? BOOL_TRUE_OFFSET : BOOL_FALSE_OFFSET)
+    ctx.emit(Instruction::I32Const(module_builder::IOVEC_OFFSET as i32));
+    ctx.emit(Instruction::I32Const(
+        module_builder::BOOL_TRUE_OFFSET as i32,
+    ));
+    ctx.emit(Instruction::I32Const(
+        module_builder::BOOL_FALSE_OFFSET as i32,
+    ));
+    ctx.emit(Instruction::LocalGet(bool_local));
+    ctx.emit(Instruction::Select);
+    ctx.emit(Instruction::I32Store(i32_memarg));
+    // iovec.iov_len = (cond ? len("true\n") : len("false\n"))
+    ctx.emit(Instruction::I32Const(
+        module_builder::IOVEC_OFFSET as i32 + 4,
+    ));
+    ctx.emit(Instruction::I32Const(
+        module_builder::BOOL_TRUE_BYTES.len() as i32
+    ));
+    ctx.emit(Instruction::I32Const(
+        module_builder::BOOL_FALSE_BYTES.len() as i32,
+    ));
+    ctx.emit(Instruction::LocalGet(bool_local));
+    ctx.emit(Instruction::Select);
+    ctx.emit(Instruction::I32Store(i32_memarg));
+    // fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET); drop
+    ctx.emit(Instruction::I32Const(1)); // stdout
+    ctx.emit(Instruction::I32Const(module_builder::IOVEC_OFFSET as i32));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Const(
+        module_builder::NWRITTEN_OFFSET as i32,
+    ));
+    ctx.emit(Instruction::Call(fd_write_idx));
+    ctx.emit(Instruction::Drop);
+    Ok(())
+}
+
+/// Lower one of `Op::StringLt` / `Le` / `Gt` / `Ge`: call
+/// `phx_str_cmp(a, b)`, push `i32.const 0`, and apply the supplied
+/// signed-i32 comparison. The helper returns negative / zero /
+/// positive, so the four comparisons against zero pick out the
+/// matching strict-or-loose ordering. See §Phase 2.4 decision K.3.
+fn translate_str_lex_op(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    instr: &phoenix_ir::instruction::Instruction,
+    a: ValueId,
+    b_vid: ValueId,
+    cmp_op: Instruction<'static>,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "lex str cmp")?;
+    let cmp_idx = b.require_str_cmp_idx()?;
+    let a_local = ctx.binding_of(a)?;
+    let b_local = ctx.binding_of(b_vid)?;
+    ctx.emit(Instruction::LocalGet(a_local));
+    ctx.emit(Instruction::LocalGet(b_local));
+    ctx.emit(Instruction::Call(cmp_idx));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(cmp_op);
+    let local = ctx.allocate_local(vid, ValType::I32);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
 }
 
 /// Translate a basic-block terminator. `dispatcher` is `Some` for

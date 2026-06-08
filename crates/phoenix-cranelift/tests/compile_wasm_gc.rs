@@ -665,21 +665,27 @@ fn mutable_let_runs_under_wasmtime_gc() {
     );
 }
 
-/// `print(Bool)` is accepted by sema (the `print` built-in is
-/// type-unconstrained) but slice 1 only synthesizes `phx_print_i64`.
-/// The backend must reject a non-`Int` argument with a clear diagnostic
-/// rather than emit a `Call` against a mismatched signature — which
-/// would produce a structurally invalid module. Locks in the
-/// `translate_print` type guard.
+/// Float values aren't yet a supported op surface on wasm32-gc at all
+/// (`ConstF64` itself errors before we even reach `translate_print`), so
+/// the carve-out here is broader than just "print": the whole f64 path
+/// — constants, arithmetic, comparison, print — lands together when
+/// the Float slice opens. Slice 1 / slice 2's parallel test for
+/// `print(Bool)` was dropped when slice 2 added the inline two-segment
+/// lowering; this is the remaining carve-out.
+///
+/// The assertion looks for `F64` (the IR-level Float marker name) in
+/// the diagnostic — when ConstF64 lands and we reach `translate_print`,
+/// the assertion still holds because `translate_print`'s Bool-fallback
+/// path's error message mentions `Float`.
 #[test]
-fn print_bool_is_rejected_until_a_later_slice() {
-    let ir_module = lower_to_ir("function main() {\n  print(true)\n}\n");
+fn print_float_is_rejected_until_a_later_slice() {
+    let ir_module = lower_to_ir("function main() {\n  print(1.5)\n}\n");
     let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("print(Bool) should not compile under wasm32-gc slice 1");
+        .expect_err("print(Float) should not compile until the f64 slice lands");
     let msg = err.to_string();
     assert!(
-        msg.contains("print") && msg.contains("Int"),
-        "expected a print/Int diagnostic, got: {msg}"
+        msg.contains("F64") || msg.contains("Float"),
+        "expected an F64/Float diagnostic, got: {msg}"
     );
 }
 
@@ -841,6 +847,77 @@ fn string_ops_run_under_wasmtime_gc() {
         source,
         "string_ops_wasm_gc",
         b"hello\nhello, world\n5\neq-yes\nne-yes\ndiff-yes\n",
+    );
+}
+
+/// PR 6 slice 2: substring + lex compare + print(Bool). Exercises
+/// every op the slice adds, in one fixture:
+///
+/// - **`print(Bool)`** — inline two-segment if/else lowering. The two
+///   active data segments (`"true\n"` / `"false\n"`) materialize into
+///   linear memory at module instantiation; each call site stages an
+///   iovec at one of the two pre-populated offsets and calls
+///   `fd_write`. No `phx_print_bool` helper.
+/// - **`Op::StringLt` / `Le` / `Gt` / `Ge`** — each dispatches through
+///   `phx_str_cmp` (lex byte compare with offset arithmetic) + a
+///   signed-i32 cmp against 0. Covers strict, loose, prefix-vs-
+///   longer-string ordering (the natural `a` is a prefix of `apple` so
+///   `a < apple` case), and the equal-strings case where the strict
+///   ops must be false (negative assertion — `BUG-*` sentinels that
+///   must not appear in stdout).
+/// - **`BuiltinCall("String.substring")`** — calls `phx_str_substring`,
+///   which char-walks UTF-8 boundaries, clamps start/end, and returns
+///   a view `struct.new`. Tests cover ASCII (where char index = byte
+///   index), out-of-range clamping in both directions, indices past
+///   `i32::MAX` (which must saturate, not wrap), and multi-byte UTF-8
+///   (where the char walk actually has to skip continuation bytes).
+/// - **Offset arithmetic on views** — `length`, `substring`, and lex
+///   compare are re-run against substring *views* (non-zero `$offset`)
+///   so the helpers' offset handling is actually exercised, not just
+///   the offset-0 literal path.
+///
+/// Pulled from the canonical fixture at compile time (mirroring
+/// `string_ops_run_under_wasmtime_gc`) so the test stays locked to
+/// `wasm_gc_string_2.phx` rather than a drifting inline copy.
+///
+/// Expected stdout:
+/// ```text
+/// true
+/// false
+/// true
+/// a-lt-b
+/// b-gt-a
+/// a-le-apple
+/// b-ge-banana
+/// prefix-lt
+/// hello
+/// world
+///
+///
+///
+/// hell
+/// él
+/// 5
+/// 5
+/// orl
+/// w-gt-e
+/// 2
+/// ```
+///
+/// The three blank lines come from the empty-result substrings
+/// (`substring(0, 0)`, `substring(100, 200)`, and the past-`i32::MAX`
+/// `substring(4294967296, 4294967300)` — all clamp to an empty span
+/// and print() adds a newline).
+#[test]
+fn string_substring_lex_cmp_and_print_bool_run_under_wasmtime_gc() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/wasm_gc_string_2.phx"
+    ));
+    assert_prints(
+        source,
+        "string_slice2_wasm_gc",
+        b"true\nfalse\ntrue\na-lt-b\nb-gt-a\na-le-apple\nb-ge-banana\nprefix-lt\nhello\nworld\n\n\n\nhell\n\xc3\xa9l\n5\n5\norl\nw-gt-e\n2\n",
     );
 }
 

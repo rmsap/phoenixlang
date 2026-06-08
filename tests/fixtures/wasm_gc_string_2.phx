@@ -1,0 +1,59 @@
+function main() {
+  // print(Bool) — inline two-segment if/else lowering.
+  print(true)
+  print(false)
+  let cond: Bool = 1 < 2
+  print(cond)
+
+  // Lexicographic comparison — exercises Op::StringLt / Le / Gt / Ge
+  // via the phx_str_cmp helper.
+  let a: String = "apple"
+  let b: String = "banana"
+  if a < b { print("a-lt-b") }
+  if b > a { print("b-gt-a") }
+  if a <= "apple" { print("a-le-apple") }
+  if b >= "banana" { print("b-ge-banana") }
+  // Prefix case: "app" < "apple" because shorter is less when one is
+  // a prefix of the other.
+  if "app" < "apple" { print("prefix-lt") }
+  // Strict ops on equal strings must be false (phx_str_cmp returns 0,
+  // and `0 < 0` / `0 > 0` are both false). These branches print
+  // nothing; the value is the negative assertion — if the cmp helper
+  // mis-ordered equal strings, the sentinels would appear in stdout
+  // and the exact-match test below would fail.
+  if "eq" < "eq" { print("BUG-lt-eq") }
+  if "eq" > "eq" { print("BUG-gt-eq") }
+
+  // ASCII substring — char-walk is trivially byte-walk here.
+  let greeting: String = "hello, world"
+  print(greeting.substring(0, 5))
+  print(greeting.substring(7, 12))
+  print(greeting.substring(0, 0))
+  // Out-of-range clamping: start beyond length returns "", end beyond
+  // length clamps to length, negative bounds clamp to 0, and indices
+  // past i32::MAX saturate (not wrap) so they also clamp to empty —
+  // a wrapping i32 cast would alias 2^32+N onto N and slice from
+  // there. All three of these print an empty line.
+  print(greeting.substring(100, 200))
+  print(greeting.substring(4294967296, 4294967300))
+  print(greeting.substring(-3, 4))
+
+  // Multi-byte UTF-8 substring — "héllo" has é spanning two bytes,
+  // so substring(1, 3) walks code-point boundaries to find bytes
+  // [1, 4) returning "él".
+  let utf: String = "héllo"
+  print(utf.substring(1, 3))
+  print(utf.length())
+
+  // Offset arithmetic: operations on substring *views* must honor the
+  // view's non-zero $offset. `w` is a view into `greeting` starting at
+  // byte 7 ("world"); `e` starts at byte 1 ("ell"); `el` is a
+  // multi-byte view into `utf` starting at byte 1 ("él").
+  let w: String = greeting.substring(7, 12)
+  print(w.length())          // 5 — phx_str_length walks from offset 7
+  print(w.substring(1, 4))   // "orl" — substring of a view (offset 8)
+  let e: String = greeting.substring(1, 4)
+  if w > e { print("w-gt-e") } // phx_str_cmp with both offsets non-zero
+  let el: String = utf.substring(1, 3)
+  print(el.length())         // 2 — char-count of a multi-byte view
+}

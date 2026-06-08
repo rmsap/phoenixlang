@@ -132,6 +132,14 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // The lookup still errors (rather than panics) if that invariant is
     // ever broken by a change to `module_calls_print`.
     builder.declare_string_helpers(string_needs)?;
+    // `print(Bool)` lowers inline — no helper to synthesize — but the
+    // two `"true\n"` / `"false\n"` active data segments still have to
+    // be declared (and counted toward the `DataCount` section) before
+    // the function-body translation can stage iovecs at their fixed
+    // offsets. See §Phase 2.4 decision K.3.
+    if string_needs.print_bool {
+        builder.declare_bool_data();
+    }
 
     // Declare Phoenix user functions (so call sites can resolve their
     // WASM function indices before any body is emitted), then emit

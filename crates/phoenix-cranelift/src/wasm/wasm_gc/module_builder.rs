@@ -51,12 +51,13 @@ use super::translate;
 /// - `[NWRITTEN_OFFSET, NWRITTEN_OFFSET + 4)` — i32 storage for
 ///   `fd_write`'s `nwritten` out-pointer.
 /// - `[PRINT_I64_BUF_START, PRINT_I64_BUF_END)` — digit scratch.
-///
-/// User string literals (`Op::ConstString`) will claim a region above
-/// the scratch buffer once the `String` slice lands; that slice adds
-/// the data cursor and the reservation helper back.
+/// - `[PRINT_STR_BUF_START, PRINT_STR_BUF_END)` — `phx_print_str`'s
+///   array → linear-memory copy scratch.
+/// - `[BOOL_TRUE_OFFSET, BOOL_FALSE_OFFSET + 6)` — the `"true\n"` /
+///   `"false\n"` payloads pre-populated by `print(Bool)`'s active data
+///   segments (see [`Self::declare_bool_data`]).
 pub(super) const IOVEC_OFFSET: u32 = 8;
-const NWRITTEN_OFFSET: u32 = 16;
+pub(super) const NWRITTEN_OFFSET: u32 = 16;
 /// Scratch buffer for `phx_print_i64`'s digit conversion. 32 bytes
 /// holds the worst case i64 string representation (sign byte, 19
 /// digits, trailing newline — 21 chars total) with comfortable
@@ -79,11 +80,21 @@ const PRINT_STR_BUF_END: u32 = PRINT_STR_BUF_START + 4096;
 /// the `phx_print_i64` scratch).
 pub(super) const PRINT_STR_MAX_LEN: u32 = PRINT_STR_BUF_END - PRINT_STR_BUF_START - 1;
 
+/// Fixed linear-memory offsets where `"true\n"` / `"false\n"` are
+/// pre-populated by active data segments at module instantiation.
+/// `translate_print`'s Bool arm emits a 5-instruction if/else that
+/// stages an iovec at one of these offsets and calls `fd_write`. No
+/// runtime allocation, no helper function — see §Phase 2.4 decision K.3.
+pub(super) const BOOL_TRUE_OFFSET: u32 = PRINT_STR_BUF_END;
+pub(super) const BOOL_TRUE_BYTES: &[u8] = b"true\n";
+pub(super) const BOOL_FALSE_OFFSET: u32 = BOOL_TRUE_OFFSET + BOOL_TRUE_BYTES.len() as u32;
+pub(super) const BOOL_FALSE_BYTES: &[u8] = b"false\n";
+
 /// Memory pages declared for the module. One 64-KiB page is more than
 /// enough for the iovec staging (12 bytes), the `phx_print_i64`
-/// scratch (32 bytes), and the `phx_print_str` scratch (4096 bytes)
-/// combined. Grows in a later slice if a longer-lines requirement
-/// emerges.
+/// scratch (32 bytes), the `phx_print_str` scratch (4096 bytes), and
+/// the `"true\n"` / `"false\n"` bool payloads (11 bytes) combined.
+/// Grows in a later slice if a longer-lines requirement emerges.
 const MEMORY_PAGES: u64 = 1;
 
 pub(super) struct ModuleBuilder {
@@ -187,11 +198,46 @@ pub(super) struct ModuleBuilder {
     /// the IR module emits `Op::StringEq` or `Op::StringNe`.
     str_eq_idx: Option<u32>,
 
+    /// WASM function index of the synthesized `phx_str_cmp` helper —
+    /// signed-i32 lexicographic byte compare returning negative if
+    /// `a < b`, zero if equal, positive if `a > b`. The four lex ops
+    /// `Op::StringLt` / `Le` / `Gt` / `Ge` lower to a `Call` here
+    /// followed by `i32.const 0` and the matching signed-i32 cmp.
+    /// Populated when `HelperNeeds::str_cmp` is set. See §Phase 2.4
+    /// decision K.3.
+    str_cmp_idx: Option<u32>,
+
+    /// WASM function index of the synthesized `phx_str_substring`
+    /// helper — char-boundary walk over the receiver's bytes,
+    /// clamping start/end, then `struct.new $string` returning a view
+    /// into the parent's `$bytes`. Populated when
+    /// `HelperNeeds::str_substring` is set.
+    str_substring_idx: Option<u32>,
+
+    /// WASM function index of the synthesized `phx_str_length` helper
+    /// — code-point-start walk returning the char count as i64.
+    /// Populated when `HelperNeeds::str_length` is set.
+    str_length_idx: Option<u32>,
+
+    /// True once [`Self::declare_bool_data`] has emitted the
+    /// `"true\n"` / `"false\n"` active data segments. The inline
+    /// `print(Bool)` lowering in `translate.rs` stages iovecs at the
+    /// fixed offsets those segments populate, so it must refuse to emit
+    /// unless this is set — see [`Self::require_bool_data`]. Guards the
+    /// `scan_helper_needs` (keys off `IrType::Bool`) ↔ `translate_print`
+    /// (keys off `ValType::I32`) coupling: if a future i32-lowered type
+    /// is ever printed without `scan_helper_needs` declaring the
+    /// segments, this turns a silent garbage-print into a loud error.
+    bool_data_declared: bool,
+
     /// Count of passive data segments emitted so far. Required up
     /// front for the WASM `DataCount` section, which the validator
     /// reads to know how many data segments exist before it sees the
     /// data section itself — `array.new_data` instructions need that
-    /// count for validation. Bumped by [`Self::reserve_string_data`].
+    /// count for validation. Bumped by [`Self::reserve_string_data`]
+    /// and by [`Self::declare_bool_data`]. Active segments (used by
+    /// the bool data path) and passive segments (used by string
+    /// literals) both count.
     data_segment_count: u32,
 }
 
@@ -218,7 +264,55 @@ impl ModuleBuilder {
             print_str_idx: None,
             str_concat_idx: None,
             str_eq_idx: None,
+            str_cmp_idx: None,
+            str_substring_idx: None,
+            str_length_idx: None,
+            bool_data_declared: false,
             data_segment_count: 0,
+        }
+    }
+
+    /// Emit the two active data segments backing `print(Bool)` —
+    /// `"true\n"` at [`BOOL_TRUE_OFFSET`] and `"false\n"` at
+    /// [`BOOL_FALSE_OFFSET`]. Active segments self-materialize into
+    /// linear memory at module instantiation, so the per-call cost is
+    /// just an iovec stage + `fd_write`. See §Phase 2.4 decision K.3.
+    ///
+    /// Bumps `data_segment_count` for the validator's `DataCount`
+    /// section — active segments count alongside the passive segments
+    /// used by string literals.
+    pub(super) fn declare_bool_data(&mut self) {
+        let true_expr = wasm_encoder::ConstExpr::i32_const(BOOL_TRUE_OFFSET as i32);
+        self.data
+            .active(0, &true_expr, BOOL_TRUE_BYTES.iter().copied());
+        let false_expr = wasm_encoder::ConstExpr::i32_const(BOOL_FALSE_OFFSET as i32);
+        self.data
+            .active(0, &false_expr, BOOL_FALSE_BYTES.iter().copied());
+        self.data_segment_count += 2;
+        self.bool_data_declared = true;
+    }
+
+    /// Assert that the `print(Bool)` data segments were declared before
+    /// the inline lowering stages an iovec at their offsets. Errors
+    /// (rather than silently emitting a module that reads an
+    /// unpopulated linear-memory region) if `scan_helper_needs` did not
+    /// set `print_bool` for a value `translate_print` is treating as a
+    /// `Bool` — the two predicates key off different type
+    /// representations (`IrType::Bool` vs. `ValType::I32`) and this is
+    /// the guard that keeps them honest. Mirrors the `require_*_idx`
+    /// helpers' defensive pattern.
+    pub(super) fn require_bool_data(&self) -> Result<(), CompileError> {
+        if self.bool_data_declared {
+            Ok(())
+        } else {
+            Err(CompileError::new(
+                "wasm32-gc: `print(Bool)` lowering reached before \
+                 `declare_bool_data` ran (internal compiler bug — \
+                 `scan_helper_needs` did not set `print_bool` for a value \
+                 lowered to WASM `i32`; the inline lowering and the data-\
+                 segment scan must agree on what counts as a printable \
+                 Bool)",
+            ))
         }
     }
 
@@ -780,6 +874,20 @@ impl ModuleBuilder {
         })
     }
 
+    /// WASM function index of the WASI `fd_write` import. Used by the
+    /// inline `print(Bool)` lowering in `translate.rs` to call
+    /// `fd_write` directly without going through a synthesized helper.
+    pub(super) fn require_fd_write_idx(&self) -> Result<u32, CompileError> {
+        self.fd_write_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `fd_write` index requested before \
+                 `declare_imports` ran (internal compiler bug — the \
+                 pipeline must call `declare_imports` for any module that \
+                 prints, including `print(Bool)`)",
+            )
+        })
+    }
+
     /// Index of the synthesized `phx_print_i64` helper.
     pub(super) fn require_print_i64_idx(&self) -> Result<u32, CompileError> {
         self.print_i64_idx.ok_or_else(|| {
@@ -810,6 +918,45 @@ impl ModuleBuilder {
                  `declare_string_helpers` ran with `needs_str_concat = true` \
                  (internal compiler bug — `scan_helper_needs` missed an \
                  `Op::StringConcat` site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_str_cmp` helper. Returns
+    /// negative / zero / positive (lex byte compare with offsets).
+    pub(super) fn require_str_cmp_idx(&self) -> Result<u32, CompileError> {
+        self.str_cmp_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_str_cmp` helper index requested before \
+                 `declare_string_helpers` ran with `needs_str_cmp = true` \
+                 (internal compiler bug — `scan_helper_needs` missed an \
+                 `Op::StringLt` / `Le` / `Gt` / `Ge` site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_str_substring` helper.
+    pub(super) fn require_str_substring_idx(&self) -> Result<u32, CompileError> {
+        self.str_substring_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_str_substring` helper index requested before \
+                 `declare_string_helpers` ran with `needs_str_substring = true` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `BuiltinCall(\"String.substring\")` site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_str_length` helper — returns the
+    /// char count (code-point count) as i64. See the K.2 correction
+    /// note for why this is a helper, not an inline `struct.get`.
+    pub(super) fn require_str_length_idx(&self) -> Result<u32, CompileError> {
+        self.str_length_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_str_length` helper index requested before \
+                 `declare_string_helpers` ran with `needs_str_length = true` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `BuiltinCall(\"String.length\")` site)",
             )
         })
     }
@@ -863,6 +1010,15 @@ impl ModuleBuilder {
         }
         if needs.str_eq {
             self.str_eq_idx = Some(string_helpers::synthesize_str_eq(self)?);
+        }
+        if needs.str_cmp {
+            self.str_cmp_idx = Some(string_helpers::synthesize_str_cmp(self)?);
+        }
+        if needs.str_substring {
+            self.str_substring_idx = Some(string_helpers::synthesize_str_substring(self)?);
+        }
+        if needs.str_length {
+            self.str_length_idx = Some(string_helpers::synthesize_str_length(self)?);
         }
         Ok(())
     }
@@ -932,6 +1088,23 @@ pub(super) struct HelperNeeds {
     pub(super) str_concat: bool,
     /// True iff at least one `Op::StringEq` or `Op::StringNe` appears.
     pub(super) str_eq: bool,
+    /// True iff at least one `Op::StringLt` / `Le` / `Gt` / `Ge`
+    /// appears. Drives synthesis of `phx_str_cmp`. See §Phase 2.4
+    /// decision K.3.
+    pub(super) str_cmp: bool,
+    /// True iff at least one `BuiltinCall("String.substring", _)`
+    /// appears. Drives synthesis of `phx_str_substring`.
+    pub(super) str_substring: bool,
+    /// True iff at least one `BuiltinCall("String.length", _)` appears.
+    /// Drives synthesis of `phx_str_length` (char-count walk — matches
+    /// the runtime's char-indexed length semantics; see the K.2
+    /// correction note).
+    pub(super) str_length: bool,
+    /// True iff at least one `BuiltinCall("print", args)` site has an
+    /// `args[0]` whose IR type is `Bool`. Drives emission of the
+    /// `"true\n"` / `"false\n"` active data segments and gates the
+    /// inline if/else lowering in `translate_print`.
+    pub(super) print_bool: bool,
 }
 
 /// Scan the IR module to determine which string helpers and types
@@ -979,20 +1152,41 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
                         needs.string_types = true;
                         needs.str_eq = true;
                     }
+                    Op::StringLt(_, _)
+                    | Op::StringLe(_, _)
+                    | Op::StringGt(_, _)
+                    | Op::StringGe(_, _) => {
+                        needs.string_types = true;
+                        needs.str_cmp = true;
+                    }
                     Op::BuiltinCall(name, args) if name == "print" => {
                         let vid_types = vid_types.get_or_insert_with(|| build_vid_type_map(func));
-                        if let Some(arg_vid) = args.first()
-                            && vid_types.get(arg_vid) == Some(&IrType::StringRef)
-                        {
-                            needs.string_types = true;
-                            needs.print_str = true;
+                        if let Some(arg_vid) = args.first() {
+                            match vid_types.get(arg_vid) {
+                                Some(IrType::StringRef) => {
+                                    needs.string_types = true;
+                                    needs.print_str = true;
+                                }
+                                Some(IrType::Bool) => {
+                                    needs.print_bool = true;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     Op::BuiltinCall(name, _) if name == "String.length" => {
-                        // `String.length` lowers inline as `struct.get
-                        // $string $len` — no helper, but it does need
-                        // the `$string` type declared.
+                        // `String.length` returns the code-point count
+                        // (Phoenix's char-indexed semantics, matching
+                        // the runtime's `s.chars().count()`), so it
+                        // needs the walk helper, not the field load.
+                        // See the K.2 correction note in
+                        // docs/design-decisions.md.
                         needs.string_types = true;
+                        needs.str_length = true;
+                    }
+                    Op::BuiltinCall(name, _) if name == "String.substring" => {
+                        needs.string_types = true;
+                        needs.str_substring = true;
                     }
                     _ => {}
                 }
