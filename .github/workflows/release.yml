@@ -22,10 +22,13 @@ jobs:
   # executed in CI, so logic correctness is validated here on x86_64-linux and
   # the matrix below is trusted to cross-compile the same validated source.
   #
-  # The wasm tiers soft-skip (no wasmtime installed here): the shipped
-  # artifacts are the native `phoenix` / `phoenix-lsp` / `libphoenix_runtime.a`,
-  # not a wasm binary, so the native release suite is the artifact gate. If the
-  # wasm tier ever ships, mirror ci.yml's wasmtime install + REQUIRE gates here.
+  # The wasm tiers soft-skip here (no wasm runtime built / no wasmtime
+  # installed in this job): this job is the release-PROFILE logic gate
+  # (overflow-checks, debug_assert stripping, opt-level). The wasm tier's
+  # release-config logic is covered by ci.yml's `check` job, and the SHIPPED
+  # wasm artifact (now bundled — `lib/phoenix_runtime.wasm`, see `build`) is
+  # proven end-to-end by the `smoke-test` job below, which builds and runs a
+  # wasm32-linear program under wasmtime from the installed layout.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -63,7 +66,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          # wasm32-wasip1 alongside the native target: the wasm32-linear
+          # backend embeds a prebuilt `phoenix_runtime.wasm`, which we ship
+          # in the tarball so a downloaded Phoenix can compile to wasm.
+          targets: ${{ matrix.target }}, wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -80,6 +86,12 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      # The wasm runtime is host-independent (a WebAssembly module), so the
+      # same `phoenix_runtime.wasm` is built and shipped on every matrix row.
+      # It's what the wasm32-linear backend embeds into compiled output.
+      - name: Build wasm runtime (for wasm32-linear)
+        run: cargo build -p phoenix-runtime --target wasm32-wasip1 --release
+
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -87,6 +99,7 @@ jobs:
           cp target/${{ matrix.target }}/release/phoenix dist/
           cp target/${{ matrix.target }}/release/phoenix-lsp dist/
           cp target/${{ matrix.target }}/release/libphoenix_runtime.a dist/lib/
+          cp target/wasm32-wasip1/release/phoenix_runtime.wasm dist/lib/
           tar czf phoenix-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
 
       - name: Package (Windows)
@@ -98,6 +111,7 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/phoenix.exe dist/
           Copy-Item target/${{ matrix.target }}/release/phoenix-lsp.exe dist/
           Copy-Item target/${{ matrix.target }}/release/phoenix_runtime.lib dist/lib/
+          Copy-Item target/wasm32-wasip1/release/phoenix_runtime.wasm dist/lib/
           Compress-Archive -Path dist/* -DestinationPath phoenix-${{ github.ref_name }}-${{ matrix.target }}.zip
 
       - name: Upload artifact
@@ -105,6 +119,121 @@ jobs:
         with:
           name: phoenix-${{ matrix.target }}
           path: phoenix-${{ github.ref_name }}-${{ matrix.target }}.*
+
+  # Artifact gate: prove the thing a user actually downloads works on EVERY
+  # shipped platform, not just the in-tree build. The `test` job above runs
+  # the suite against the `target/` build (dev-tree discovery paths); this
+  # downloads each SHIPPED archive and runs it on a NATIVE runner for that
+  # arch (all free standard runners on a public repo — incl. arm64 Linux and
+  # both macOS arches), so the per-platform Cranelift ISA, object format,
+  # linker invocation, and runtime ABI are actually exercised — coverage
+  # cross-compilation alone cannot give. Each row unpacks into the layout
+  # `install.sh` produces (`bin/` + `lib/`) and builds `hello.phx` with
+  # $PHOENIX_RUNTIME_LIB / $PHOENIX_RUNTIME_WASM unset, forcing the
+  # `bin/../lib/` install-layout discovery a real install relies on:
+  #   - native: every platform. Unix links via `cc`; Windows links via MSVC
+  #     `link.exe` (`link.rs` `run_linker`), which windows-latest provides.
+  #   - wasm32-linear: every platform, run under `wasmtime` (the wasm path
+  #     never touches the system linker).
+  # `release` gates on this, so a broken artifact on any platform blocks
+  # publishing instead of shipping. `fail-fast: false` so one platform's
+  # failure still lets the others report.
+  smoke-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            wasmtime_platform: x86_64-linux
+            wasmtime_archive: tar.xz
+            native: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            wasmtime_platform: aarch64-linux
+            wasmtime_archive: tar.xz
+            native: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            wasmtime_platform: x86_64-macos
+            wasmtime_archive: tar.xz
+            native: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            wasmtime_platform: aarch64-macos
+            wasmtime_archive: tar.xz
+            native: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            wasmtime_platform: x86_64-windows
+            wasmtime_archive: zip
+            # windows-latest ships VS Build Tools, so the MSVC link path
+            # (link.rs `run_linker`) can both link and run the produced .exe.
+            native: true
+    runs-on: ${{ matrix.os }}
+    # bash on every runner (Git Bash on Windows) so one script shape works
+    # cross-platform; `tar` is bsdtar on Windows/macOS and extracts .zip and
+    # .tar.xz alike, and msys appends `.exe` when resolving `$PHX`/`$WASMTIME`.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download the ${{ matrix.target }} release artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: phoenix-${{ matrix.target }}
+          path: artifact
+      - name: Install wasmtime (to execute the wasm32-linear artifact)
+        # Mirrors ci.yml: `.wasmtime-version` is the single source of truth.
+        run: |
+          version="$(tr -d '[:space:]' < .wasmtime-version)"
+          plat="${{ matrix.wasmtime_platform }}"
+          url="https://github.com/bytecodealliance/wasmtime/releases/download/${version}/wasmtime-${version}-${plat}.${{ matrix.wasmtime_archive }}"
+          echo "Downloading $url"
+          curl -fsSL "$url" -o wasmtime-archive
+          mkdir -p wasmtime-install
+          tar xf wasmtime-archive -C wasmtime-install
+          echo "WASMTIME=wasmtime-install/wasmtime-${version}-${plat}/wasmtime" >> "$GITHUB_ENV"
+      - name: Install into a prefix matching install.sh's bin/ + lib/ layout
+        run: |
+          mkdir -p unpacked prefix/bin prefix/lib
+          tar xf artifact/phoenix-* -C unpacked
+          # Copy the binaries (phoenix[.exe], phoenix-lsp[.exe]) and the whole
+          # shipped lib/ (libphoenix_runtime.{a,lib} + phoenix_runtime.wasm).
+          cp unpacked/phoenix* prefix/bin/
+          cp unpacked/lib/* prefix/lib/
+          chmod +x prefix/bin/* 2>/dev/null || true
+          echo "PHX=prefix/bin/phoenix" >> "$GITHUB_ENV"
+      - name: Build and run hello.phx (native)
+        # $PHOENIX_RUNTIME_LIB unset forces discovery to the `bin/../lib/`
+        # install path (link.rs path 4) that installed Phoenix uses. Explicit
+        # -o is taken verbatim, so add the `.exe` suffix ourselves on Windows.
+        if: matrix.native
+        run: |
+          unset PHOENIX_RUNTIME_LIB
+          out=./out-native
+          [ "$RUNNER_OS" = Windows ] && out=./out-native.exe
+          "$PHX" build tests/fixtures/hello.phx --target native -o "$out"
+          actual="$("$out" | tr -d '[:space:]')"
+          if [ "$actual" != "42" ]; then
+            echo "::error::artifact produced '$actual' (native on ${{ matrix.target }}), expected 42"
+            exit 1
+          fi
+          echo "OK native ${{ matrix.target }}: $actual"
+      - name: Build and run hello.phx (wasm32-linear)
+        # $PHOENIX_RUNTIME_WASM unset forces the wasm runtime to resolve via
+        # the shipped `bin/../lib/phoenix_runtime.wasm` install layout.
+        run: |
+          unset PHOENIX_RUNTIME_WASM
+          "$PHX" build tests/fixtures/hello.phx --target wasm32-linear -o ./out.wasm
+          actual="$("$WASMTIME" ./out.wasm | tr -d '[:space:]')"
+          if [ "$actual" != "42" ]; then
+            echo "::error::artifact produced '$actual' (wasm32-linear on ${{ matrix.target }}), expected 42"
+            exit 1
+          fi
+          echo "OK wasm32-linear ${{ matrix.target }}: $actual"
 
   changelog:
     runs-on: ubuntu-latest
@@ -195,7 +324,7 @@ jobs:
           path: editors/vscode/phoenixlang-*.vsix
 
   release:
-    needs: [build, changelog, vscode-extension]
+    needs: [build, smoke-test, changelog, vscode-extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

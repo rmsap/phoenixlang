@@ -137,7 +137,11 @@ pub enum ConfigError {
     /// The config file could not be read from disk.
     ReadError(PathBuf, std::io::Error),
     /// The config file contains invalid TOML or unexpected fields.
-    ParseError(PathBuf, toml::de::Error),
+    /// `toml::de::Error` is boxed to keep `ConfigError` (and every
+    /// `Result<_, ConfigError>` it appears in) small — it exceeds the
+    /// `clippy::result_large_err` threshold unboxed on some targets
+    /// (notably windows-msvc).
+    ParseError(PathBuf, Box<toml::de::Error>),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -166,8 +170,8 @@ impl PhoenixConfig {
             if candidate.is_file() {
                 let contents = std::fs::read_to_string(&candidate)
                     .map_err(|e| ConfigError::ReadError(candidate.clone(), e))?;
-                let config: PhoenixConfig =
-                    toml::from_str(&contents).map_err(|e| ConfigError::ParseError(candidate, e))?;
+                let config: PhoenixConfig = toml::from_str(&contents)
+                    .map_err(|e| ConfigError::ParseError(candidate, Box::new(e)))?;
                 return Ok(Some(config));
             }
             if !dir.pop() {

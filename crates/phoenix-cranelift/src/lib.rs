@@ -64,6 +64,19 @@ pub use error::{CompileError, CompileErrorKind};
 pub use link::{LinkError, RUNTIME_LIB_NAME, find_runtime_lib, link_executable};
 pub use target::Target;
 
+/// Whether the prebuilt `phoenix_runtime.wasm` artifact is discoverable
+/// on the current search path. The wasm-tier analogue of
+/// [`find_runtime_lib`]: integration tests that drive the
+/// `wasm32-linear` backend through the CLI use this to soft-skip when
+/// the artifact hasn't been built (`cargo build -p phoenix-runtime
+/// --target wasm32-wasip1 --release`), mirroring the in-crate skip gate
+/// in `wasm/runtime_discovery.rs`. Discovery honors `$PHOENIX_RUNTIME_WASM`
+/// and then walks upward from the current executable, so a probe from a
+/// test binary sees the same artifact the spawned `phoenix` would.
+pub fn runtime_wasm_available() -> bool {
+    wasm::runtime_discovery::find_runtime_wasm_or_diagnostic().is_ok()
+}
+
 use context::CompileContext;
 use phoenix_ir::module::IrModule;
 

@@ -54,6 +54,14 @@ if [ -f "$TMP/lib/libphoenix_runtime.a" ]; then
     RUNTIME_INSTALLED=true
 fi
 
+# Install the wasm runtime (needed by `phoenix build --target wasm32-linear`).
+# Discovery finds it via the `bin/../lib/` install layout, same as the static
+# lib above.
+if [ -f "$TMP/lib/phoenix_runtime.wasm" ]; then
+    cp "$TMP/lib/phoenix_runtime.wasm" "$LIB_DIR/phoenix_runtime.wasm"
+    WASM_RUNTIME_INSTALLED=true
+fi
+
 # Clean up
 rm -rf "$TMP"
 
@@ -62,6 +70,11 @@ if [ "$RUNTIME_INSTALLED" = true ]; then
     echo "Installed libphoenix_runtime.a to $LIB_DIR"
 else
     echo "Warning: libphoenix_runtime.a not found in release archive (phoenix build will not work)"
+fi
+if [ "$WASM_RUNTIME_INSTALLED" = true ]; then
+    echo "Installed phoenix_runtime.wasm to $LIB_DIR"
+else
+    echo "Warning: phoenix_runtime.wasm not found in release archive (phoenix build --target wasm32-linear will not work)"
 fi
 echo ""
 echo "Make sure $INSTALL_DIR is in your PATH, then run:"

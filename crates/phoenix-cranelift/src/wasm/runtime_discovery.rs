@@ -11,7 +11,11 @@
 //!
 //! 1. `$PHOENIX_RUNTIME_WASM` environment variable — trusted as-is
 //!    (caller's responsibility to point at a valid .wasm file).
-//! 2. Cargo target directories relative to the current executable:
+//! 2. Install layout: `<exe_dir>/../lib/phoenix_runtime.wasm` — the
+//!    `bin/` + `../lib/` shape shipped by the release tarball and placed
+//!    by `install.sh`, mirroring [`crate::link::find_runtime_lib`]'s
+//!    native `bin/../lib/` arm.
+//! 3. Cargo target directories relative to the current executable:
 //!    `target/wasm32-wasip1/{release,debug}/phoenix_runtime.wasm` walked
 //!    upward from the executable directory until found or root is hit.
 //!
@@ -52,12 +56,27 @@ fn find_runtime_wasm_with(env_value: Option<&str>, start_dir: Option<&Path>) -> 
         }
     }
 
-    // 2. Walk upward from the start directory looking for the
+    let start = start_dir?;
+
+    // 2. Install layout: `<exe_dir>/../lib/phoenix_runtime.wasm`. This is
+    //    the `bin/` + `../lib/` shape the release tarball + `install.sh`
+    //    produce, mirroring `link::find_runtime_lib`'s native arm so a
+    //    downloaded Phoenix finds its shipped wasm runtime the same way it
+    //    finds `libphoenix_runtime.a`. Checked before the cargo walk so an
+    //    install never accidentally resolves a stale dev-tree artifact.
+    if let Some(parent) = start.parent() {
+        let candidate = parent.join("lib").join(RUNTIME_WASM_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
+    // 3. Walk upward from the start directory looking for the
     //    canonical cargo-build layout. We look for both `release` and
     //    `debug` profiles — `release` is preferred for the runtime
     //    (smaller, faster), but a developer with only `debug` built
     //    should still work.
-    let mut dir: &Path = start_dir?;
+    let mut dir: &Path = start;
     loop {
         for profile in ["release", "debug"] {
             let candidate = dir
@@ -92,12 +111,15 @@ impl std::fmt::Display for RuntimeWasmNotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "could not find {RUNTIME_WASM_FILENAME}; \
-             build it with `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` \
+            "could not find {RUNTIME_WASM_FILENAME}; it ships in Phoenix's `lib/` \
+             directory — reinstall with the install script, set $PHOENIX_RUNTIME_WASM \
+             to a built copy, or — for in-tree development — build it with \
+             `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` \
              (or `--debug` for unoptimized builds), then re-run. \
-             Searched: $PHOENIX_RUNTIME_WASM env var{}, then upward from \
-             the current executable for `target/wasm32-wasip1/{{release,debug}}/{RUNTIME_WASM_FILENAME}`. \
-             Make sure `rustup target add wasm32-wasip1` has been run.",
+             Searched: $PHOENIX_RUNTIME_WASM env var{}, then `<exe_dir>/../lib/{RUNTIME_WASM_FILENAME}` \
+             (install layout), then upward from the current executable for \
+             `target/wasm32-wasip1/{{release,debug}}/{RUNTIME_WASM_FILENAME}`. \
+             For in-tree builds, make sure `rustup target add wasm32-wasip1` has been run.",
             match &self.env_var_value {
                 Some(v) => format!(" (currently `{v}`)"),
                 None => " (unset)".to_string(),
@@ -195,6 +217,46 @@ mod tests {
         let env = file_path.to_string_lossy().into_owned();
         let found = find_runtime_wasm_with(Some(&env), None).expect("env var should be honored");
         assert_eq!(found, env);
+    }
+
+    #[test]
+    fn install_layout_lib_dir_is_discovered() {
+        // Replicate the shipped layout: `<prefix>/bin/phoenix` alongside
+        // `<prefix>/lib/phoenix_runtime.wasm`. With `start_dir` = the
+        // `bin/` directory and no env var, discovery must resolve the
+        // runtime via the `../lib` arm — the path a downloaded Phoenix
+        // relies on. No `target/` tree exists in the tempdir, so a match
+        // here proves the install arm, not the cargo walk.
+        let prefix = tempfile::tempdir().expect("tempdir");
+        let bin_dir = prefix.path().join("bin");
+        let lib_dir = prefix.path().join("lib");
+        std::fs::create_dir_all(&bin_dir).expect("create bin/");
+        std::fs::create_dir_all(&lib_dir).expect("create lib/");
+        let wasm_path = lib_dir.join(RUNTIME_WASM_FILENAME);
+        std::fs::write(&wasm_path, b"\0asm\x01\0\0\0").expect("write fake wasm");
+
+        let found = find_runtime_wasm_with(None, Some(&bin_dir))
+            .expect("install-layout `../lib` arm should resolve the runtime");
+        assert_eq!(found, wasm_path.to_string_lossy());
+    }
+
+    #[test]
+    fn diagnostic_names_install_layout() {
+        // The downloaded-binary story: the diagnostic must point users at
+        // the shipped `lib/` directory and the reinstall path, not only
+        // the in-tree cargo command.
+        let msg = RuntimeWasmNotFound {
+            env_var_value: None,
+        }
+        .to_string();
+        assert!(
+            msg.contains("lib/"),
+            "diagnostic should mention the install `lib/` directory: {msg}"
+        );
+        assert!(
+            msg.contains("install script"),
+            "diagnostic should mention reinstalling via the install script: {msg}"
+        );
     }
 
     #[test]

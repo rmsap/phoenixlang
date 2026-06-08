@@ -25,6 +25,13 @@ target-lexicon = { workspace = true }
 wasm-encoder = { workspace = true }
 wasmparser = { workspace = true }
 
+# `cc::windows_registry` locates the MSVC `link.exe` plus its LIB/INCLUDE
+# environment the way rustc does, so native Windows linking works without a
+# Developer Command Prompt (VS Build Tools is the only prerequisite). Windows
+# hosts only — used by `link.rs`'s `run_linker`; see `docs/windows-native-link.md`.
+[target.'cfg(windows)'.dependencies]
+cc = "1"
+
 [dev-dependencies]
 phoenix-common = { path = "../phoenix-common" }
 phoenix-lexer = { path = "../phoenix-lexer" }

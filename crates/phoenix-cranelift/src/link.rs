@@ -65,21 +65,23 @@ fn dir_to_string(p: &Path) -> String {
     p.to_string_lossy().to_string()
 }
 
-/// Platforms on which [`link_executable`] knows how to invoke `cc`,
-/// each paired with the system libraries that get appended to the
-/// linker command line.
+/// `cc`-driven Unix platforms, each paired with the system libraries
+/// appended to the linker command line. (Windows links via MSVC `link.exe`
+/// in [`run_linker`], not `cc`, so it is not listed here.)
 ///
-/// This is the **single source of truth** for the supported-OS list:
-/// [`link_executable`] consults it to dispatch flags, [`LinkError::UnsupportedPlatform`]'s
-/// `Display` derives the "currently supported" list from it, and a
-/// future Windows / FreeBSD entry only needs to be added here.
+/// This is the **single source of truth** for the `cc`-supported OS list:
+/// [`run_linker`] consults it for flags, [`LinkError::UnsupportedPlatform`]'s
+/// `Display` derives the "currently supported" list from it, and a future
+/// FreeBSD entry only needs to be added here.
 const SUPPORTED_PLATFORMS: &[(&str, &[&str])] = &[
     ("linux", &["-lpthread", "-ldl", "-lm"]),
     ("macos", &["-lpthread", "-lm"]),
 ];
 
 /// Look up the system-library flags for the current target OS, or
-/// produce an [`LinkError::UnsupportedPlatform`] naming it.
+/// produce an [`LinkError::UnsupportedPlatform`] naming it. Unix-only:
+/// the Windows linker path in [`run_linker`] never consults this.
+#[cfg(not(target_os = "windows"))]
 fn platform_link_args() -> Result<&'static [&'static str], LinkError> {
     let os = std::env::consts::OS;
     SUPPORTED_PLATFORMS
@@ -103,16 +105,21 @@ pub enum LinkError {
     /// is missing from every search path; the user must build it or
     /// set `$PHOENIX_RUNTIME_LIB`.
     RuntimeLibNotFound,
-    /// `cc` could not be spawned (PATH lookup or exec failure). The
-    /// inner error is the OS-level cause.
+    /// The linker (`cc` on Unix, `link.exe` on Windows) could not be
+    /// spawned (PATH lookup or exec failure). The inner error is the
+    /// OS-level cause.
     SpawnLinker(std::io::Error),
-    /// `cc` ran to completion but exited non-zero.
+    /// The linker ran to completion but exited non-zero.
     LinkerFailed(std::process::ExitStatus),
-    /// The host platform is not in [`SUPPORTED_PLATFORMS`]. The
-    /// inner string is the unsupported target-os string from
-    /// `std::env::consts::OS`. Today this includes Windows and
-    /// every BSD; see [`link_executable`] for context.
+    /// The host platform is not in [`SUPPORTED_PLATFORMS`] and is not
+    /// Windows. The inner string is the unsupported target-os string
+    /// from `std::env::consts::OS` (e.g. a BSD). Windows links via
+    /// [`LinkError::MsvcToolchainNotFound`]'s path, not this one.
     UnsupportedPlatform(&'static str),
+    /// Windows only: MSVC `link.exe` could not be located via
+    /// `cc::windows_registry`. Phoenix requires VS Build Tools for native
+    /// Windows linking, the same toolchain Rust uses.
+    MsvcToolchainNotFound,
 }
 
 impl std::fmt::Display for LinkError {
@@ -125,7 +132,20 @@ impl std::fmt::Display for LinkError {
                  reinstall Phoenix with the install script, or — for in-tree \
                  development — run `cargo build -p phoenix-runtime` first"
             ),
-            Self::SpawnLinker(e) => write!(f, "could not invoke `cc`: {e} (install gcc or clang)"),
+            Self::SpawnLinker(e) => {
+                #[cfg(target_os = "windows")]
+                {
+                    write!(
+                        f,
+                        "could not invoke the MSVC linker (link.exe): {e} \
+                         (install Visual Studio Build Tools)"
+                    )
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    write!(f, "could not invoke `cc`: {e} (install gcc or clang)")
+                }
+            }
             Self::LinkerFailed(s) => write!(f, "linker exited with {s}"),
             Self::UnsupportedPlatform(os) => {
                 write!(
@@ -141,8 +161,18 @@ impl std::fmt::Display for LinkError {
                     write!(f, "{name}")?;
                     first = false;
                 }
-                Ok(())
+                // Windows is supported but lives outside `SUPPORTED_PLATFORMS`
+                // (it links via MSVC `link.exe` in `run_linker`, not `cc`), so
+                // it's appended here rather than derived from the list.
+                write!(f, ", windows")
             }
+            Self::MsvcToolchainNotFound => write!(
+                f,
+                "could not find the MSVC linker (link.exe); install Visual Studio \
+                 Build Tools with the \"Desktop development with C++\" workload — \
+                 Phoenix requires it for native Windows builds, the same toolchain \
+                 Rust uses"
+            ),
         }
     }
 }
@@ -165,29 +195,35 @@ impl std::error::Error for LinkError {
 /// choose between "clean up on success" (the driver) and "keep
 /// artifacts for debugging" (the benches).
 ///
-/// Supported targets live in [`SUPPORTED_PLATFORMS`]. Calling on any
-/// other host returns [`LinkError::UnsupportedPlatform`] up front
-/// rather than producing an opaque linker error: a real Windows path
-/// (link.exe + ucrt + the right runtime libs) and a real FreeBSD
-/// path (`-lpthread` / `-lm`, no `-ldl`) are each their own follow-up
-/// and belong in [`SUPPORTED_PLATFORMS`] rather than at each call site.
+/// On Unix the system `cc` is driven directly; on Windows the MSVC
+/// `link.exe` is located via [`cc::windows_registry`] and driven instead
+/// (VS Build Tools is the prerequisite — see `docs/windows-native-link.md`).
+/// On any other host (e.g. a BSD not yet wired into [`SUPPORTED_PLATFORMS`])
+/// this returns [`LinkError::UnsupportedPlatform`] up front rather than
+/// producing an opaque linker error.
 pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), LinkError> {
-    let platform_args = platform_link_args()?;
     let runtime_dir = find_runtime_lib().ok_or(LinkError::RuntimeLibNotFound)?;
-
-    // Pass the static archive by full path. `-lphoenix_runtime` would
-    // pick the companion cdylib (`.so` / `.dylib`) cargo now emits
-    // alongside the archive (see `phoenix-runtime/Cargo.toml` for the
-    // `crate-type = ["cdylib"]` rationale), which would then need an
-    // `LD_LIBRARY_PATH` nothing sets. Full path works on Linux and
-    // macOS; `-l:libphoenix_runtime.a` would also work but is
-    // GNU-ld-only.
     let runtime_archive = std::path::PathBuf::from(&runtime_dir).join(RUNTIME_LIB_NAME);
+    run_linker(obj_path, exe_path, &runtime_archive)
+}
+
+/// Drive the system `cc` to combine the Cranelift object with the runtime
+/// archive (and the platform's system libraries) into an executable.
+///
+/// Pass the static archive by full path. `-lphoenix_runtime` would pick the
+/// companion cdylib (`.so` / `.dylib`) cargo now emits alongside the archive
+/// (see `phoenix-runtime/Cargo.toml` for the `crate-type = ["cdylib"]`
+/// rationale), which would then need an `LD_LIBRARY_PATH` nothing sets. Full
+/// path works on Linux and macOS; `-l:libphoenix_runtime.a` would also work
+/// but is GNU-ld-only.
+#[cfg(not(target_os = "windows"))]
+fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Result<(), LinkError> {
+    let platform_args = platform_link_args()?;
     let status = std::process::Command::new("cc")
         .arg("-o")
         .arg(exe_path)
         .arg(obj_path)
-        .arg(&runtime_archive)
+        .arg(runtime_archive)
         .args(platform_args)
         .status()
         .map_err(LinkError::SpawnLinker)?;
@@ -195,6 +231,56 @@ pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), LinkError
         return Err(LinkError::LinkerFailed(status));
     }
     Ok(())
+}
+
+/// Windows: locate MSVC `link.exe` via [`cc::windows_registry`] — the same
+/// vswhere-based discovery rustc uses — apply the toolchain's `LIB`/`PATH`
+/// environment so the CRT and Windows SDK import libraries resolve without a
+/// Developer Command Prompt, then link the object + `phoenix_runtime.lib`
+/// into a console `.exe`.
+///
+/// The Rust-produced runtime static lib carries `/DEFAULTLIB` directives for
+/// the CRT and system libraries it needs, so that list is not hand-maintained
+/// here; the CRT also supplies `mainCRTStartup`, which calls the emitted
+/// `main`. VS Build Tools is a prerequisite (`docs/windows-native-link.md`).
+#[cfg(target_os = "windows")]
+fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Result<(), LinkError> {
+    let target = host_msvc_target();
+    let tool = cc::windows_registry::find_tool(&target, "link.exe")
+        .ok_or(LinkError::MsvcToolchainNotFound)?;
+    let mut command = tool.to_command();
+    // Apply the toolchain environment (LIB / PATH / INCLUDE) so link.exe
+    // finds the CRT and SDK import libs. Re-applying values to_command may
+    // already carry is harmless.
+    for (key, value) in tool.env() {
+        command.env(key, value);
+    }
+    let status = command
+        .arg("/NOLOGO")
+        .arg("/SUBSYSTEM:CONSOLE")
+        .arg(format!("/OUT:{}", exe_path.display()))
+        .arg(obj_path)
+        .arg(runtime_archive)
+        .status()
+        .map_err(LinkError::SpawnLinker)?;
+    if !status.success() {
+        return Err(LinkError::LinkerFailed(status));
+    }
+    Ok(())
+}
+
+/// The MSVC target triple for the current Windows host, e.g.
+/// `x86_64-pc-windows-msvc`. Drives [`cc::windows_registry`] tool lookup so
+/// the right architecture's linker is selected (future arm64-windows too).
+#[cfg(target_os = "windows")]
+fn host_msvc_target() -> String {
+    let arch = match std::env::consts::ARCH {
+        // `std::env::consts::ARCH` reports "x86"; the triple spells it "i686".
+        "x86" => "i686",
+        // "x86_64", "aarch64", … already match the triple's arch field.
+        other => other,
+    };
+    format!("{arch}-pc-windows-msvc")
 }
 
 #[cfg(test)]
@@ -222,6 +308,9 @@ mod tests {
 
     /// Outcome of the cc + runtime-lib precondition check shared by
     /// every test that actually drives `link_executable` end-to-end.
+    /// Unix-only: the `cc`-based precheck below gates the `#[cfg(unix)]`
+    /// link tests; Windows tests use the MSVC toolchain probe instead.
+    #[cfg(unix)]
     enum SkipReason {
         NoCc,
         NoRuntimeLib,
@@ -234,6 +323,7 @@ mod tests {
     /// `label` argument is the test name, embedded in the skip/panic
     /// message so a CI log unambiguously identifies which test
     /// short-circuited.
+    #[cfg(unix)]
     fn precheck_link_environment(label: &str) -> Result<(), SkipReason> {
         if std::process::Command::new("cc")
             .arg("--version")
@@ -419,6 +509,87 @@ mod tests {
         );
     }
 
+    /// Windows counterpart of `link_executable_pulls_in_runtime_library`:
+    /// compile a trivial `main` that calls a real runtime symbol with MSVC
+    /// `cl.exe`, then link it via `link_executable` (which drives `link.exe`)
+    /// and run it. Proves the Windows `run_linker` path, the `LIB` env
+    /// application, and the `phoenix_runtime.lib` resolution end-to-end.
+    ///
+    /// Skipped (with a visible warning) when the MSVC toolchain or the
+    /// runtime lib isn't present; `PHOENIX_REQUIRE_RUNTIME_LIB=1` turns the
+    /// skip into a hard failure, mirroring the Unix gate.
+    #[cfg(windows)]
+    #[test]
+    fn link_executable_links_and_runs_with_msvc() {
+        let target = super::host_msvc_target();
+        let cl = match (
+            cc::windows_registry::find_tool(&target, "cl.exe"),
+            cc::windows_registry::find_tool(&target, "link.exe"),
+            find_runtime_lib(),
+        ) {
+            (Some(cl), Some(_link), Some(_lib)) => cl,
+            _ => {
+                eprintln!(
+                    "warning: skipping link_executable_links_and_runs_with_msvc — MSVC \
+                     toolchain or runtime lib unavailable (set PHOENIX_REQUIRE_RUNTIME_LIB=1 \
+                     to fail instead; install VS Build Tools and run `cargo build -p \
+                     phoenix-runtime` to fix)"
+                );
+                if env_flag_enabled("PHOENIX_REQUIRE_RUNTIME_LIB") {
+                    panic!(
+                        "PHOENIX_REQUIRE_RUNTIME_LIB=1 set but the MSVC toolchain or runtime \
+                         lib is unavailable"
+                    );
+                }
+                return;
+            }
+        };
+
+        let dir = std::env::temp_dir().join(format!("phoenix_link_win_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = TempDirGuard(dir.clone());
+        let src_path = dir.join("calls_runtime.c");
+        let obj_path = dir.join("calls_runtime.obj");
+        let exe_path = dir.join("calls_runtime.exe");
+        std::fs::write(
+            &src_path,
+            b"extern void phx_gc_shutdown(void);\n\
+              int main(void) { phx_gc_shutdown(); return 0; }\n",
+        )
+        .unwrap();
+
+        // Compile to .obj with cl.exe (/c = compile only, /Fo = output path),
+        // applying the toolchain env so the C headers resolve.
+        let mut cl_cmd = cl.to_command();
+        for (key, value) in cl.env() {
+            cl_cmd.env(key, value);
+        }
+        let cl_status = cl_cmd
+            .arg("/nologo")
+            .arg("/c")
+            .arg(&src_path)
+            .arg(format!("/Fo{}", obj_path.display()))
+            .status()
+            .expect("cl.exe spawn failed");
+        assert!(
+            cl_status.success(),
+            "cl /c calls_runtime.c failed: {cl_status}"
+        );
+
+        let result = link_executable(&obj_path, &exe_path);
+        assert!(
+            result.is_ok(),
+            "link_executable failed on Windows for an object that references the runtime: {result:?}"
+        );
+        let run_status = std::process::Command::new(&exe_path)
+            .status()
+            .expect("spawning linked binary failed");
+        assert!(
+            run_status.success(),
+            "linked runtime-using binary exited non-zero: {run_status}"
+        );
+    }
+
     /// `link_executable` should surface a `LinkerFailed` error when `cc`
     /// runs to completion but exits non-zero. We drive that path by
     /// handing it bytes that aren't a valid object file — `cc` reports
@@ -491,13 +662,40 @@ mod tests {
             "no such file",
         ))
         .to_string();
+        // The SpawnLinker hint names the host's linker/toolchain.
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                spawn.contains("cc"),
+                "SpawnLinker should name the linker: {spawn}"
+            );
+            assert!(
+                spawn.contains("gcc") || spawn.contains("clang"),
+                "SpawnLinker should hint at an installable compiler: {spawn}"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                spawn.contains("link.exe"),
+                "SpawnLinker should name the MSVC linker: {spawn}"
+            );
+            assert!(
+                spawn.contains("Build Tools"),
+                "SpawnLinker should hint at installing VS Build Tools: {spawn}"
+            );
+        }
+
+        // `MsvcToolchainNotFound` exists (and its `Display` compiles) on every
+        // platform; assert it points users at the right Windows toolchain.
+        let msvc = LinkError::MsvcToolchainNotFound.to_string();
         assert!(
-            spawn.contains("cc"),
-            "SpawnLinker should name the linker: {spawn}"
+            msvc.contains("link.exe"),
+            "MsvcToolchainNotFound should name the MSVC linker: {msvc}"
         );
         assert!(
-            spawn.contains("gcc") || spawn.contains("clang"),
-            "SpawnLinker should hint at an installable compiler: {spawn}"
+            msvc.contains("Build Tools"),
+            "MsvcToolchainNotFound should mention VS Build Tools: {msvc}"
         );
 
         let unsupported = LinkError::UnsupportedPlatform("freebsd").to_string();

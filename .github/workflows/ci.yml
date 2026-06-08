@@ -73,12 +73,40 @@ jobs:
       # are provisioned above, so a skip here means a real regression.
       - run: cargo test -p phoenix-driver
         env:
+          PHOENIX_REQUIRE_RUNTIME_LIB: "1"
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
       - run: cargo test -p phoenix-cranelift
         env:
+          PHOENIX_REQUIRE_RUNTIME_LIB: "1"
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
+
+  # Native Windows gate. The `check` job runs on Ubuntu and never compiles the
+  # `#[cfg(target_os = "windows")]` MSVC link path in
+  # `phoenix-cranelift/src/link.rs`, so a Windows-only regression would
+  # otherwise surface only at release time. windows-latest ships VS Build Tools,
+  # so this both lints the Windows cfg (clippy `-D warnings` across all targets)
+  # and exercises the real `link.exe` path end-to-end — the link tests compile a
+  # trivial object with `cl.exe`, link it via `link_executable`, and run the
+  # result. Free on public repos (standard runner). `PHOENIX_REQUIRE_RUNTIME_LIB`
+  # makes a missing `phoenix_runtime.lib` a hard failure rather than a silent
+  # skip, since the build step below provisions it.
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build -p phoenix-runtime
+      - name: Native MSVC link tests
+        run: |
+          cargo test -p phoenix-cranelift --lib link::
+        env:
+          PHOENIX_REQUIRE_RUNTIME_LIB: "1"
 
   # Shift-left release gate: the `check` job above runs the suite in debug, but
   # the binaries we ship are built `--release`, where `debug_assert!` is

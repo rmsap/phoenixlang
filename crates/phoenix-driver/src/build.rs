@@ -65,8 +65,11 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
 
     // Determine output path. For WASM targets without an explicit
     // --output, append `.wasm` so the artifact has the extension that
-    // every WASM consumer (wasmtime, browsers, Node loaders) expects.
-    // Explicit --output is taken verbatim — caller's choice wins.
+    // every WASM consumer (wasmtime, browsers, Node loaders) expects;
+    // for native targets append the platform executable suffix
+    // (`.exe` on Windows, empty elsewhere) so the default-named output
+    // is directly runnable. Explicit --output is taken verbatim —
+    // caller's choice wins (including on Windows).
     let out_path: PathBuf = match output {
         Some(p) => PathBuf::from(p),
         None => {
@@ -78,7 +81,7 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
             if target.is_wasm() {
                 PathBuf::from(format!("{stem}.wasm"))
             } else {
-                PathBuf::from(stem)
+                PathBuf::from(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
             }
         }
     };

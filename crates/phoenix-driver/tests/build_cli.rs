@@ -45,8 +45,67 @@ fn temp_bin(name: &str) -> TempBin {
     TempBin(path)
 }
 
+/// `$VAR` is set to exactly `1`. The opt-in shape shared by every
+/// `PHOENIX_REQUIRE_*` gate in the repo.
+fn require(var: &str) -> bool {
+    std::env::var(var).as_deref() == Ok("1")
+}
+
+/// Soft-skip the native build tier when `libphoenix_runtime.a` isn't
+/// on any search path: the CLI link step would hard-error, but linking
+/// is profile-independent and is already gated in the debug `check` job
+/// (which builds the lib and sets `PHOENIX_REQUIRE_RUNTIME_LIB=1`) and
+/// proven end-to-end by release.yml's install smoke test. Here the
+/// `release-test` / release `test` jobs run `cargo test --release`
+/// without building the lib, so without this gate they fail spuriously.
+/// `PHOENIX_REQUIRE_RUNTIME_LIB=1` turns the skip into a hard failure —
+/// same shape as `link.rs`'s in-crate `precheck` gate. Returns `true`
+/// when the caller should early-return (skip).
+#[must_use]
+fn skip_if_no_runtime_lib(label: &str) -> bool {
+    if phoenix_cranelift::find_runtime_lib().is_some() {
+        return false;
+    }
+    assert!(
+        !require("PHOENIX_REQUIRE_RUNTIME_LIB"),
+        "PHOENIX_REQUIRE_RUNTIME_LIB=1 set but libphoenix_runtime.a is not on any \
+         search path — run `cargo build -p phoenix-runtime` or set $PHOENIX_RUNTIME_LIB"
+    );
+    eprintln!(
+        "warning: skipping {label} — libphoenix_runtime.a not built \
+         (set PHOENIX_REQUIRE_RUNTIME_LIB=1 to fail instead; \
+         `cargo build -p phoenix-runtime` to fix)"
+    );
+    true
+}
+
+/// Wasm-tier counterpart of [`skip_if_no_runtime_lib`], gated by
+/// `PHOENIX_REQUIRE_RUNTIME_WASM=1`. Mirrors the skip plumbing in
+/// `phoenix-cranelift/tests/compile_wasm_linear.rs`. Returns `true`
+/// when the caller should early-return (skip).
+#[must_use]
+fn skip_if_no_runtime_wasm(label: &str) -> bool {
+    if phoenix_cranelift::runtime_wasm_available() {
+        return false;
+    }
+    assert!(
+        !require("PHOENIX_REQUIRE_RUNTIME_WASM"),
+        "PHOENIX_REQUIRE_RUNTIME_WASM=1 set but phoenix_runtime.wasm is not on any \
+         search path — run `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` first"
+    );
+    eprintln!(
+        "warning: skipping {label} — phoenix_runtime.wasm not built \
+         (set PHOENIX_REQUIRE_RUNTIME_WASM=1 to fail instead; \
+         `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` to fix)"
+    );
+    true
+}
+
 #[test]
 fn explicit_native_target_builds_and_runs() {
+    if skip_if_no_runtime_lib("explicit_native_target_builds_and_runs") {
+        return;
+    }
     let bin = temp_bin("native");
     let build = phoenix_bin()
         .args([
@@ -69,6 +128,52 @@ fn explicit_native_target_builds_and_runs() {
     let run = Command::new(&bin.0)
         .output()
         .expect("failed to run compiled binary");
+    assert!(run.status.success(), "compiled binary exited non-zero");
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+}
+
+#[test]
+fn native_target_appends_exe_suffix_when_output_omitted() {
+    // Implicit native output: with no `-o`, `build.rs` derives the
+    // filename from the input stem and appends `std::env::consts::EXE_SUFFIX`
+    // (`.exe` on Windows, empty elsewhere) so the default-named artifact is
+    // directly runnable. On Unix the suffix is empty so this pins the
+    // implicit-native branch; on Windows it specifically proves the `.exe`
+    // append — the one path the smoke-test's explicit `-o ...exe` can't
+    // exercise. Runs in a fresh tempdir so the inferred path is contained.
+    if skip_if_no_runtime_lib("native_target_appends_exe_suffix_when_output_omitted") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let fixture_src = workspace_root().join("tests/fixtures/hello.phx");
+    let fixture_dst = dir.path().join("hello.phx");
+    std::fs::copy(&fixture_src, &fixture_dst).expect("copy hello.phx fixture into the tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_phoenix"))
+        .current_dir(dir.path())
+        .args(["build", "hello.phx", "--target", "native"])
+        .output()
+        .expect("failed to spawn `phoenix build`");
+    assert!(
+        out.status.success(),
+        "`phoenix build --target native` exited non-zero\n  stdout: {}\n  stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let inferred = dir
+        .path()
+        .join(format!("hello{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        inferred.exists(),
+        "expected inferred native artifact at {} (EXE_SUFFIX = {:?})",
+        inferred.display(),
+        std::env::consts::EXE_SUFFIX,
+    );
+
+    let run = Command::new(&inferred)
+        .output()
+        .expect("failed to run inferred native binary");
     assert!(run.status.success(), "compiled binary exited non-zero");
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
 }
@@ -113,6 +218,9 @@ fn wasm32_linear_target_emits_wasm_module_with_explicit_output() {
     // suffix inference. Pinning this branch separately from the
     // implicit-suffix branch below catches regressions in either
     // side of `build.rs`'s output-path logic.
+    if skip_if_no_runtime_wasm("wasm32_linear_target_emits_wasm_module_with_explicit_output") {
+        return;
+    }
     let bin = temp_bin("wasm32_linear_explicit.wasm");
     let out = phoenix_bin()
         .args([
@@ -146,6 +254,9 @@ fn wasm32_linear_target_appends_wasm_suffix_when_output_omitted() {
     // WASM targets. Run inside a fresh tempdir so the inferred path
     // doesn't collide with other tests' output and so the RAII
     // cleanup is contained.
+    if skip_if_no_runtime_wasm("wasm32_linear_target_appends_wasm_suffix_when_output_omitted") {
+        return;
+    }
     let dir = tempfile::tempdir().expect("create tempdir");
     let fixture_src = workspace_root().join("tests/fixtures/hello.phx");
     let fixture_dst = dir.path().join("hello.phx");
