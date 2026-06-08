@@ -8,6 +8,7 @@ use crate::checker::{
     ResolvedDerivedType, header_wire_name,
 };
 use crate::types::Type;
+use phoenix_parser::api_version::normalize_api_version;
 use phoenix_parser::ast::{
     DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, TypeExpr,
     TypeModifier,
@@ -33,13 +34,27 @@ impl Checker {
     /// - Response-header local names do not collide with each other or the `body` field
     /// - No two headers in the same direction resolve to the same wire name
     pub(crate) fn check_endpoint(&mut self, ep: &EndpointDecl) {
-        // Check for duplicate endpoint names
-        if self.endpoints.iter().any(|e| e.name == ep.name) {
+        // Check for duplicate endpoint names. `insert` returns `false` when the
+        // name was already present, giving us the duplicate flag and recording
+        // the name for later endpoints in a single O(1) operation.
+        let is_duplicate_name = !self.endpoint_names.insert(ep.name.clone());
+        if is_duplicate_name {
             self.error(format!("duplicate endpoint name `{}`", ep.name), ep.span);
         }
 
+        // Apply the API-version prefix (from an `api version "v1" { ... }` block)
+        // to the path, so everything downstream — path-param extraction, the
+        // resolved `EndpointInfo.path` consumed by every generator's URL/route
+        // building, and the OpenAPI paths key — sees the final, prefixed path.
+        // The version string is used literally as a leading path segment, with
+        // exactly one `/` at the seam regardless of how the author wrote it
+        // (`"v1"` and `"/v1"` are equivalent).
+        let resolved_path = apply_version_prefix(ep.api_version.as_deref(), &ep.path);
+
+        self.check_route_collision(ep, &resolved_path, is_duplicate_name);
+
         // Extract path parameters from URL pattern: "/api/users/{id}" -> ["id"]
-        let path_params = extract_path_params(&ep.path);
+        let path_params = extract_path_params(&resolved_path);
 
         // Validate: body not allowed on GET or DELETE
         if ep.body.is_some() && matches!(ep.method, HttpMethod::Get | HttpMethod::Delete) {
@@ -279,7 +294,7 @@ impl Checker {
         self.endpoints.push(EndpointInfo {
             name: ep.name.clone(),
             method: ep.method,
-            path: ep.path.clone(),
+            path: resolved_path,
             path_params,
             query_params,
             headers,
@@ -291,6 +306,46 @@ impl Checker {
             body_is_multipart,
             response_is_binary,
         });
+    }
+
+    /// Reports a route collision: two endpoints whose method and resolved path
+    /// *pattern* (path-param names ignored, see [`route_signature`]) coincide
+    /// match the same incoming requests and would conflict at the router. This
+    /// catches accidental duplicates among top-level endpoints as well as a
+    /// versioned endpoint colliding with a hand-written `/vX/...` path.
+    ///
+    /// Distinct names can still resolve to the same route, so this is checked
+    /// separately from the duplicate-name check. The first endpoint to claim a
+    /// signature owns it (recorded in `route_signatures`); later collisions are
+    /// reported against it. When the name itself is already a duplicate
+    /// (`is_duplicate_name`), the route diagnostic is suppressed — that is one
+    /// mistake, and reporting it twice is just noise.
+    fn check_route_collision(
+        &mut self,
+        ep: &EndpointDecl,
+        resolved_path: &str,
+        is_duplicate_name: bool,
+    ) {
+        let route = route_signature(ep.method, resolved_path);
+        match self.route_signatures.get(&route) {
+            Some(other) => {
+                if !is_duplicate_name {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: route `{} {}` conflicts with endpoint `{}`",
+                            ep.name,
+                            ep.method.as_upper_str(),
+                            resolved_path,
+                            other
+                        ),
+                        ep.span,
+                    );
+                }
+            }
+            None => {
+                self.route_signatures.insert(route, ep.name.clone());
+            }
+        }
     }
 
     /// Resolves a single endpoint header into a [`HeaderParamInfo`].
@@ -555,6 +610,80 @@ fn extract_path_params(path: &str) -> Vec<String> {
     params
 }
 
+/// Produces a routing signature for collision detection: the HTTP method
+/// paired with the path, but with every `{param}` placeholder collapsed to a
+/// bare `{}` so that routes differing only in path-parameter *names*
+/// (`GET /posts/{id}` vs `GET /posts/{slug}`) are recognized as the same route
+/// — they match the same incoming URLs and so would conflict at the router.
+///
+/// ```text
+/// (Get, "/posts/{id}")    -> "GET /posts/{}"
+/// (Get, "/posts/{slug}")  -> "GET /posts/{}"   (same signature)
+/// (Post, "/posts/{id}")   -> "POST /posts/{}"  (differs by method)
+/// ```
+///
+/// This is exact-*pattern* equality only — it does NOT detect a parameter
+/// segment overlapping a literal one. `GET /posts/{id}` and `GET /posts/tagged`
+/// produce different signatures and so are not flagged here, even though a
+/// request to `/posts/tagged` is ambiguous at runtime (it matches both, with
+/// the winner decided by the target router's precedence rules). Catching that
+/// class of ambiguity is out of scope; this check only rejects routes that are
+/// pattern-identical.
+fn route_signature(method: HttpMethod, path: &str) -> String {
+    let mut normalized = String::with_capacity(path.len());
+    let mut chars = path.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            // Consume the param name up to and including the closing `}`
+            // (mirroring `extract_path_params`) and emit a bare placeholder.
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    break;
+                }
+            }
+            normalized.push_str("{}");
+        } else {
+            normalized.push(ch);
+        }
+    }
+    format!("{} {normalized}", method.as_upper_str())
+}
+
+/// Prepends the API-version prefix to an endpoint path.
+///
+/// The version string (from an `api version "..." { }` block) is treated as a
+/// literal leading path segment. The author may write it with or without a
+/// leading slash (`"v1"` ≡ `"/v1"`); the path may likewise start with or without
+/// one. The result always has exactly one `/` at each seam and a single leading
+/// `/`. With no version (`None`), the path is returned unchanged.
+///
+/// ```text
+/// (Some("v1"),  "/posts")  -> "/v1/posts"
+/// (Some("/v1"), "/posts")  -> "/v1/posts"
+/// (Some("v1"),  "posts")   -> "/v1/posts"
+/// (None,        "/posts")  -> "/posts"
+/// ```
+fn apply_version_prefix(version: Option<&str>, path: &str) -> String {
+    match version {
+        None => path.to_string(),
+        Some(v) => {
+            // Normalize via the shared helper so the seam/whitespace handling
+            // matches exactly what the parser validated (`" v1 "` -> `v1`). The
+            // parser already rejects versions that are empty once normalized.
+            let v = normalize_api_version(v);
+            let p = path.trim_start_matches('/');
+            // An empty path would otherwise yield a trailing-slash seam
+            // (`/v1/`). Endpoints always carry a non-empty path today, but keep
+            // the helper total.
+            if p.is_empty() {
+                format!("/{v}")
+            } else {
+                format!("/{v}/{p}")
+            }
+        }
+    }
+}
+
 /// Extracts a [`DefaultValue`] from a literal AST expression.
 ///
 /// Returns `None` for non-literal expressions (which should not appear as
@@ -586,8 +715,10 @@ mod tests {
     use phoenix_common::diagnostics::Severity;
     use phoenix_common::span::SourceId;
     use phoenix_lexer::lexer::tokenize;
+    use phoenix_parser::ast::HttpMethod;
     use phoenix_parser::parser;
 
+    use super::{apply_version_prefix, route_signature};
     use crate::checker::check;
 
     /// Lex, parse, and type-check `source`, returning only the error-level
@@ -629,6 +760,249 @@ mod tests {
             errors.iter().any(|e| e.contains(expected_fragment)),
             "expected an error containing {:?}, but got: {:?}",
             expected_fragment,
+            errors
+        );
+    }
+
+    /// Returns the resolved path of the endpoint named `name`.
+    fn endpoint_path(source: &str, name: &str) -> String {
+        let tokens = tokenize(source, SourceId(0));
+        let (program, parse_errors) = parser::parse(&tokens);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let result = check(&program);
+        result
+            .endpoints
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no endpoint named {name}"))
+            .path
+            .clone()
+    }
+
+    #[test]
+    fn api_version_prefixes_path() {
+        let src = r#"
+            struct Post { Int id }
+            api version "v1" {
+                endpoint listPosts: GET "/posts" { response Post }
+                endpoint getPost: GET "/posts/{id}" { response Post }
+            }
+        "#;
+        assert_eq!(endpoint_path(src, "listPosts"), "/v1/posts");
+        assert_eq!(endpoint_path(src, "getPost"), "/v1/posts/{id}");
+    }
+
+    #[test]
+    fn api_version_slash_forms_normalize() {
+        // `"/v1"` prefix and a path without a leading slash both normalize to a
+        // single seam slash.
+        let src = r#"
+            struct Post { Int id }
+            api version "/v1" {
+                endpoint p: GET "posts" { response Post }
+            }
+        "#;
+        assert_eq!(endpoint_path(src, "p"), "/v1/posts");
+    }
+
+    #[test]
+    fn api_version_path_params_extracted_after_prefix() {
+        // The version prefix has no params; path params are still extracted.
+        let src = r#"
+            struct Post { Int id }
+            api version "v1" {
+                endpoint getPost: GET "/posts/{id}" { response Post }
+            }
+        "#;
+        let ep = first_endpoint(src);
+        assert_eq!(ep.path, "/v1/posts/{id}");
+        assert_eq!(ep.path_params, vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn multiple_api_version_blocks_and_unversioned() {
+        let src = r#"
+            struct Post { Int id }
+            api version "v1" {
+                endpoint a: GET "/posts" { response Post }
+            }
+            api version "v2" {
+                endpoint b: GET "/posts" { response Post }
+            }
+            endpoint health: GET "/health" { response Post }
+        "#;
+        assert_eq!(endpoint_path(src, "a"), "/v1/posts");
+        assert_eq!(endpoint_path(src, "b"), "/v2/posts");
+        assert_eq!(endpoint_path(src, "health"), "/health");
+    }
+
+    #[test]
+    fn api_version_duplicate_endpoint_name_still_rejected() {
+        // Endpoint names are globally unique even across version blocks.
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            api version "v1" { endpoint dup: GET "/a" { response Post } }
+            api version "v2" { endpoint dup: GET "/b" { response Post } }
+            "#,
+            "duplicate endpoint name",
+        );
+    }
+
+    #[test]
+    fn apply_version_prefix_normalizes_seams() {
+        // Exactly one `/` at the seam regardless of how either side is written.
+        assert_eq!(apply_version_prefix(Some("v1"), "/posts"), "/v1/posts");
+        assert_eq!(apply_version_prefix(Some("/v1"), "/posts"), "/v1/posts");
+        assert_eq!(apply_version_prefix(Some("v1"), "posts"), "/v1/posts");
+        assert_eq!(apply_version_prefix(Some("/v1/"), "posts"), "/v1/posts");
+        // Surrounding whitespace is trimmed defensively (the parser rejects
+        // empty-after-trim versions, but a stray-spaced one must not leak in).
+        assert_eq!(apply_version_prefix(Some(" v1 "), "/posts"), "/v1/posts");
+        // A multi-segment prefix (internal `/` is allowed) keeps its inner
+        // separator; only the outer seams are normalized to a single `/`.
+        assert_eq!(
+            apply_version_prefix(Some("v1/beta"), "/posts"),
+            "/v1/beta/posts"
+        );
+        assert_eq!(
+            apply_version_prefix(Some("/v1/beta/"), "posts"),
+            "/v1/beta/posts"
+        );
+        // No version leaves the path untouched.
+        assert_eq!(apply_version_prefix(None, "/posts"), "/posts");
+        // A degenerate empty/slash-only path yields the bare prefix, never a
+        // trailing-slash seam (`/v1/`).
+        assert_eq!(apply_version_prefix(Some("v1"), ""), "/v1");
+        assert_eq!(apply_version_prefix(Some("v1"), "/"), "/v1");
+    }
+
+    #[test]
+    fn api_version_multi_segment_prefix() {
+        // A version string may itself contain `/` to declare a multi-segment
+        // prefix; it splices in verbatim ahead of the endpoint path.
+        let src = r#"
+            struct Post { Int id }
+            api version "v1/beta" {
+                endpoint getPost: GET "/posts/{id}" { response Post }
+            }
+        "#;
+        let ep = first_endpoint(src);
+        assert_eq!(ep.path, "/v1/beta/posts/{id}");
+        assert_eq!(ep.path_params, vec!["id".to_string()]);
+    }
+
+    // ── Route-collision detection ───────────────────────────────────────
+
+    #[test]
+    fn route_signature_normalizes_path_param_names() {
+        // Same position, different param name -> same signature.
+        assert_eq!(
+            route_signature(HttpMethod::Get, "/posts/{id}"),
+            route_signature(HttpMethod::Get, "/posts/{slug}"),
+        );
+        // Different method -> different signature.
+        assert_ne!(
+            route_signature(HttpMethod::Get, "/posts/{id}"),
+            route_signature(HttpMethod::Post, "/posts/{id}"),
+        );
+        // Different static segment -> different signature.
+        assert_ne!(
+            route_signature(HttpMethod::Get, "/posts/{id}"),
+            route_signature(HttpMethod::Get, "/users/{id}"),
+        );
+    }
+
+    #[test]
+    fn duplicate_route_rejected() {
+        // Two endpoints with distinct names but the same method + path collide.
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" { response Post }
+            endpoint allPosts: GET "/posts" { response Post }
+            "#,
+            "conflicts with endpoint `listPosts`",
+        );
+    }
+
+    #[test]
+    fn route_collision_ignores_path_param_names() {
+        // `/posts/{id}` and `/posts/{slug}` match the same URLs -> collision.
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            endpoint getById: GET "/posts/{id}" { response Post }
+            endpoint getBySlug: GET "/posts/{slug}" { response Post }
+            "#,
+            "conflicts with endpoint `getById`",
+        );
+    }
+
+    #[test]
+    fn same_path_different_method_ok() {
+        // A shared path with distinct methods is a normal REST pattern.
+        assert_no_errors(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" { response Post }
+            endpoint createPost: POST "/posts" { response Post }
+            "#,
+        );
+    }
+
+    #[test]
+    fn versioned_route_collides_with_handwritten_prefix() {
+        // A versioned endpoint resolving to `/v2/posts` collides with a
+        // top-level endpoint whose path was written out as `/v2/posts`.
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            api version "v2" {
+                endpoint listV2: GET "/posts" { response Post }
+            }
+            endpoint handwritten: GET "/v2/posts" { response Post }
+            "#,
+            "conflicts with endpoint `listV2`",
+        );
+    }
+
+    #[test]
+    fn same_path_under_different_versions_ok() {
+        // The same path under different version prefixes resolves to distinct
+        // routes (`/v1/posts` vs `/v2/posts`) and must not collide.
+        assert_no_errors(
+            r#"
+            struct Post { Int id }
+            api version "v1" {
+                endpoint listV1: GET "/posts" { response Post }
+            }
+            api version "v2" {
+                endpoint listV2: GET "/posts" { response Post }
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn duplicate_name_suppresses_route_conflict() {
+        // Two endpoints sharing both a name AND a route are one mistake: only
+        // the duplicate-name error fires, not also a redundant route conflict.
+        let errors = check_source(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" { response Post }
+            endpoint listPosts: GET "/posts" { response Post }
+            "#,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("duplicate endpoint name")),
+            "expected a duplicate-name error, got: {:?}",
+            errors
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("conflicts with endpoint")),
+            "route conflict should be suppressed when the name is a duplicate, got: {:?}",
             errors
         );
     }

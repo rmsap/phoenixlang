@@ -931,4 +931,30 @@ endpoint downloadDoc: GET "/api/doc/{id}" {
         );
         insta::assert_snapshot!("openapi_binary_response", spec);
     }
+
+    /// An `api version` block prefixes the `paths` key in the generated OpenAPI
+    /// document, just as it does the client URL and server route. The sema layer
+    /// resolves the path before any generator runs, so this pins that the
+    /// OpenAPI emitter — the one consumer the roundtrip harness does not
+    /// exercise at runtime — keys off the prefixed path and never the bare one.
+    #[test]
+    fn api_version_prefixes_openapi_path() {
+        let spec = generate_from_source(
+            r#"
+struct Post { Int id }
+api version "v2" {
+    endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" { response Post }
+}
+"#,
+        );
+        assert!(
+            spec.contains("/v2/api/posts/tagged/{tag}"),
+            "OpenAPI paths key should carry the version prefix, got: {spec}"
+        );
+        // The unprefixed path must not also appear as its own key.
+        assert!(
+            !spec.contains("\"/api/posts/tagged/{tag}\""),
+            "OpenAPI should not also emit the unprefixed path, got: {spec}"
+        );
+    }
 }

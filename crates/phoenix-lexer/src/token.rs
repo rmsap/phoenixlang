@@ -136,6 +136,13 @@ pub enum TokenKind {
     /// Appears as `schema name { table ... }`. Parsed for forward compatibility
     /// with Phase 4 (typed database queries and migrations).
     Schema,
+    /// The `api` keyword, introducing an API-version block.
+    ///
+    /// Syntax: `api version "v1" { <endpoint decls> }`. The contextual word
+    /// `version` (a plain identifier, not a reserved keyword) follows `api`,
+    /// then a string literal naming the path-prefix version. The block contains
+    /// only endpoint declarations, each tagged with that version.
+    Api,
 
     // ── HTTP methods ────────────────────────────────────────
     /// The `GET` HTTP method keyword (case-sensitive).

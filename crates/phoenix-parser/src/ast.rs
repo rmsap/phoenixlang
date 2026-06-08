@@ -824,6 +824,11 @@ pub struct EndpointDecl {
     /// The URL path pattern, potentially containing path parameters
     /// (e.g. `"/api/users/{id}"`).
     pub path: String,
+    /// The `/vX` path-prefix version this endpoint was declared under via
+    /// `api version "..." { }`, or `None` if declared at top level. Captured
+    /// raw (e.g. `"v1"` or `"/v1"`) by the parser; applied to the path during
+    /// sema.
+    pub api_version: Option<String>,
     /// Query parameters declared in an optional `query { ... }` block.
     /// Empty if no query block is present.
     pub query_params: Vec<QueryParam>,

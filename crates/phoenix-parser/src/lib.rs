@@ -6,6 +6,8 @@
 //! multiple errors to be reported in a single pass.
 #![warn(missing_docs)]
 
+/// Shared validation and normalization for `api version "..."` prefix strings.
+pub mod api_version;
 /// Abstract syntax tree node definitions for the Phoenix language.
 pub mod ast;
 /// Expression parsing: Pratt parser for operator precedence and all expression forms.

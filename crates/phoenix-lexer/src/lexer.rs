@@ -11,7 +11,7 @@ use phoenix_common::span::{SourceId, Span};
 /// `Lexer::lex_ident_or_keyword` by
 /// `tests::keywords_const_matches_lexer_recognition`.
 pub const KEYWORDS: &[&str] = &[
-    "as", "body", "break", "continue", "defer", "dyn", "else", "endpoint", "enum", "error",
+    "api", "as", "body", "break", "continue", "defer", "dyn", "else", "endpoint", "enum", "error",
     "false", "for", "function", "headers", "if", "impl", "import", "in", "let", "match", "mut",
     "omit", "partial", "pick", "public", "query", "response", "return", "schema", "self", "struct",
     "trait", "true", "type", "where", "while",
@@ -358,6 +358,7 @@ impl<'src> Lexer<'src> {
             "headers" => TokenKind::Headers,
             "where" => TokenKind::Where,
             "schema" => TokenKind::Schema,
+            "api" => TokenKind::Api,
             "GET" => TokenKind::Get,
             "POST" => TokenKind::Post,
             "PUT" => TokenKind::Put,
@@ -1393,6 +1394,19 @@ mod tests {
     #[test]
     fn table_is_ident() {
         assert_eq!(token_kinds("table"), vec![Ident, Eof]);
+    }
+
+    /// `api` is a keyword.
+    #[test]
+    fn api_keyword() {
+        assert_eq!(token_kinds("api"), vec![Api, Eof]);
+    }
+
+    /// `version` is NOT a keyword — it's an identifier parsed contextually
+    /// after `api`.
+    #[test]
+    fn version_is_ident() {
+        assert_eq!(token_kinds("version"), vec![Ident, Eof]);
     }
 
     // ── Module-system keyword tests ─────────────────────

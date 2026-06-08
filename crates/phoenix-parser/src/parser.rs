@@ -1,3 +1,4 @@
+use crate::api_version::validate_api_version;
 use crate::ast::{
     Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
     FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock, ImportDecl, ImportItem,
@@ -62,6 +63,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Headers => "'headers'",
         TokenKind::Where => "'where'",
         TokenKind::Schema => "'schema'",
+        TokenKind::Api => "'api'",
         TokenKind::Get => "'GET'",
         TokenKind::Post => "'POST'",
         TokenKind::Put => "'PUT'",
@@ -166,6 +168,25 @@ impl<'src> Parser<'src> {
         self.skip_newlines();
 
         while self.peek().kind != TokenKind::Eof {
+            // An `api version "..." { ... }` block fans out to MULTIPLE
+            // top-level endpoint declarations (one per endpoint inside it),
+            // each tagged with the block's version. `parse_declaration`
+            // returns a single `Declaration`, so we detect and handle the
+            // block here at the loop level (least disruptive: every other
+            // path still goes through `parse_declaration`). A leading doc
+            // comment / `public` before `api` is handled inside the block
+            // parser via a peek; here we only need to detect `api` after an
+            // optional doc comment.
+            if self.is_at_api_version_block() {
+                match self.parse_api_version_block() {
+                    Some(endpoints) => {
+                        declarations.extend(endpoints.into_iter().map(Declaration::Endpoint));
+                    }
+                    None => self.synchronize(),
+                }
+                self.skip_newlines();
+                continue;
+            }
             if let Some(decl) = self.parse_declaration() {
                 declarations.push(decl);
             } else {
@@ -179,6 +200,175 @@ impl<'src> Parser<'src> {
         Program {
             declarations,
             span: start_span.merge(end_span),
+        }
+    }
+
+    /// Returns `true` if the parser is positioned at the start of an
+    /// `api version "..." { ... }` block, looking past an optional leading
+    /// doc comment (and any newlines after it) and an optional `public`
+    /// modifier. Used by `parse_program` to route to `parse_api_version_block`,
+    /// which fans the block out into multiple top-level endpoint declarations.
+    fn is_at_api_version_block(&self) -> bool {
+        let mut offset = 0;
+        // Skip a leading doc comment and any following newlines.
+        if self.peek_at(offset).kind == TokenKind::DocComment {
+            offset += 1;
+            while self.peek_at(offset).kind == TokenKind::Newline {
+                offset += 1;
+            }
+        }
+        // Skip an (invalid but recoverable) `public` modifier; the block
+        // parser reports the error.
+        if self.peek_at(offset).kind == TokenKind::Public {
+            offset += 1;
+        }
+        self.peek_at(offset).kind == TokenKind::Api
+    }
+
+    /// Parses an `api version "<string>" { <endpoint decls> }` block and
+    /// returns each contained endpoint, tagged with the block's version via
+    /// `EndpointDecl::api_version`. The block is flattened into top-level
+    /// endpoint declarations by the caller (`parse_program`) so downstream
+    /// consumers keep seeing a flat list — see the architecture note there.
+    fn parse_api_version_block(&mut self) -> Option<Vec<EndpointDecl>> {
+        // A doc comment may precede the whole block; it does not attach to any
+        // single endpoint, so we consume and discard it for now.
+        let _block_doc = self.try_consume_doc_comment();
+
+        // `public` cannot precede `api` — mirror the endpoint/schema pattern.
+        let public_span = if self.peek().kind == TokenKind::Public {
+            let span = self.peek().span;
+            self.advance();
+            Some(span)
+        } else {
+            None
+        };
+        self.reject_public_modifier(public_span, "`public` cannot precede `api`");
+
+        self.expect(TokenKind::Api)?;
+
+        // Track header validity across the (contextual) `version` keyword and
+        // the version string. A malformed header yields at most ONE diagnostic
+        // and, crucially, NEVER early-returns: the `{ ... }` block still
+        // follows and must be fully consumed, else its endpoints would be
+        // re-parsed as top-level (unversioned) declarations and its closing `}`
+        // would cascade into a spurious error. A rejected header parses the
+        // body normally but drops its endpoints (tagging nothing).
+        let mut version_valid = true;
+
+        // `version` is a contextual identifier (not a reserved keyword), so we
+        // match it by text rather than by token kind. The match is
+        // case-sensitive, so spell out the expected lowercase form to steer a
+        // user who wrote `Version`/`VERSION`.
+        if self.peek().kind == TokenKind::Ident && self.peek().text == "version" {
+            self.advance();
+        } else {
+            self.error_at_current("expected the keyword `version` (lowercase) after `api`");
+            version_valid = false;
+        }
+
+        // The version string literal (raw — sema normalizes/prefixes later).
+        // Validate it here, at the block header, where the block is still a
+        // single construct — so a bad version produces exactly ONE diagnostic
+        // rather than one per flattened endpoint. The path-safety rules live in
+        // `api_version::validate_api_version`, shared with sema's prefixing so
+        // the two can't drift apart. We only validate (and only report a
+        // missing string) when the header is otherwise well-formed, so a
+        // malformed header stays at a single diagnostic.
+        let version = if self.peek().kind == TokenKind::StringLiteral {
+            let version_token = self.advance();
+            let version_span = version_token.span;
+            let version = strip_string_literal_quotes(&version_token.text);
+            if version_valid && let Err(message) = validate_api_version(&version) {
+                self.diagnostics
+                    .push(Diagnostic::error(message, version_span));
+                version_valid = false;
+            }
+            version
+        } else {
+            if version_valid {
+                self.error_at_current("expected a version string after `version`");
+                version_valid = false;
+            }
+            String::new()
+        };
+
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        // The block contains ONLY endpoint declarations.
+        let mut endpoints = Vec::new();
+        loop {
+            match self.peek().kind {
+                TokenKind::RBrace | TokenKind::Eof => break,
+                _ => {
+                    // Endpoints inside the block may carry doc comments too.
+                    let doc_comment = self.try_consume_doc_comment();
+                    if self.peek().kind != TokenKind::Endpoint {
+                        self.error_at_current(
+                            "`api version` block may contain only endpoint declarations",
+                        );
+                        self.recover_to_next_block_item();
+                        self.skip_newlines();
+                        continue;
+                    }
+                    match self.parse_endpoint_decl(doc_comment) {
+                        // Parse the endpoint to consume it, but drop it when the
+                        // version header was rejected — the block is already an
+                        // error, and emitting unversioned/spuriously-routed
+                        // endpoints from it would only add noise.
+                        Some(mut endpoint) if version_valid => {
+                            endpoint.api_version = Some(version.clone());
+                            endpoints.push(endpoint);
+                        }
+                        Some(_) => {}
+                        None => {
+                            // The endpoint failed mid-parse; its own diagnostic
+                            // was already emitted. Recover to the next block
+                            // item rather than aborting the whole block, so a
+                            // following endpoint is still parsed and the block's
+                            // closing `}` is consumed normally instead of
+                            // cascading into spurious top-level errors.
+                            self.recover_to_next_block_item();
+                        }
+                    }
+                }
+            }
+            self.skip_newlines();
+        }
+
+        self.expect(TokenKind::RBrace)?;
+        Some(endpoints)
+    }
+
+    /// Skips a malformed (non-endpoint) declaration inside an `api version`
+    /// block, stopping at the next plausible item boundary: a top-level
+    /// `endpoint`, a doc comment, the block's own closing `}`, or EOF. Brace
+    /// depth is tracked so a skipped declaration's own `{ ... }` body does not
+    /// prematurely terminate the block (otherwise `struct Foo { ... }` would
+    /// leave the block's real `}` to cascade into spurious top-level errors).
+    fn recover_to_next_block_item(&mut self) {
+        let mut depth: usize = 0;
+        loop {
+            match self.peek().kind {
+                TokenKind::Eof => break,
+                TokenKind::LBrace => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        // The block's own closing brace — stop before it.
+                        break;
+                    }
+                    depth -= 1;
+                    self.advance();
+                }
+                TokenKind::Endpoint | TokenKind::DocComment if depth == 0 => break,
+                _ => {
+                    self.advance();
+                }
+            }
         }
     }
 
@@ -1222,6 +1412,10 @@ impl<'src> Parser<'src> {
             name_span: name_token.span,
             method,
             path,
+            // Top-level endpoints have no version prefix. The
+            // `api version "..." { }` block-parser overwrites this with
+            // `Some(version)` for endpoints declared inside a block.
+            api_version: None,
             query_params,
             headers,
             body,
@@ -1613,6 +1807,7 @@ impl<'src> Parser<'src> {
                 | TokenKind::Type
                 | TokenKind::Endpoint
                 | TokenKind::Schema
+                | TokenKind::Api
                 | TokenKind::Import
                 | TokenKind::Public => break,
                 _ => {
@@ -4012,6 +4207,375 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
             Declaration::Struct(s) => assert!(s.fields[0].constraint.is_some()),
             other => panic!("expected Struct, got {:?}", other),
         }
+    }
+
+    // ── api version block parsing tests ──────────────────────────────
+
+    /// A single-endpoint `api version` block flattens to one top-level
+    /// endpoint tagged with the version. The path is NOT prefixed (that is
+    /// sema's job); the parser only tags `api_version`.
+    #[test]
+    fn parse_api_version_block_single() {
+        let source = r#"api version "v1" {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "a");
+                assert_eq!(ep.path, "/posts");
+                assert_eq!(ep.api_version.as_deref(), Some("v1"));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// A block with two endpoints tags both with the same version.
+    #[test]
+    fn parse_api_version_multiple_endpoints() {
+        let source = r#"api version "v1" {
+            endpoint a: GET "/posts" { response Post }
+            endpoint b: GET "/users" { response User }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 2);
+        for decl in &program.declarations {
+            match decl {
+                Declaration::Endpoint(ep) => {
+                    assert_eq!(ep.api_version.as_deref(), Some("v1"));
+                }
+                other => panic!("expected Endpoint, got {:?}", other),
+            }
+        }
+    }
+
+    /// Two `api version` blocks plus a top-level endpoint coexist; each
+    /// endpoint is tagged with its block's version (or `None` at top level).
+    #[test]
+    fn parse_multiple_api_version_blocks() {
+        let source = r#"api version "v1" {
+            endpoint a: GET "/posts" { response Post }
+        }
+        api version "v2" {
+            endpoint b: GET "/posts" { response Post }
+        }
+        endpoint c: GET "/health" { response Health }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 3);
+        let versions: Vec<(String, Option<String>)> = program
+            .declarations
+            .iter()
+            .map(|d| match d {
+                Declaration::Endpoint(ep) => (ep.name.clone(), ep.api_version.clone()),
+                other => panic!("expected Endpoint, got {:?}", other),
+            })
+            .collect();
+        assert_eq!(versions[0], ("a".to_string(), Some("v1".to_string())));
+        assert_eq!(versions[1], ("b".to_string(), Some("v2".to_string())));
+        assert_eq!(versions[2], ("c".to_string(), None));
+    }
+
+    /// The version string is captured raw, including a leading slash form;
+    /// the parser does NOT normalize (sema does).
+    #[test]
+    fn parse_api_version_slash_form() {
+        let source = r#"api version "/v1" {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.api_version.as_deref(), Some("/v1"));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// An empty version string is rejected with a parse error.
+    #[test]
+    fn parse_api_version_empty_rejected() {
+        let source = r#"api version "" {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for an empty version string"
+        );
+        // The block body is still consumed: its endpoint must NOT leak out as a
+        // top-level declaration (which would also leave a dangling `}`).
+        assert!(
+            program.declarations.is_empty(),
+            "rejected block must not emit declarations, got: {:?}",
+            program.declarations
+        );
+    }
+
+    /// `api` without the contextual `version` keyword is a parse error.
+    /// Recovery consumes the block body, so it yields exactly one diagnostic
+    /// and the contained endpoint does NOT leak out as a top-level declaration
+    /// (which would also leave a dangling `}` to cascade).
+    #[test]
+    fn parse_api_requires_version_keyword() {
+        let source = r#"api "v1" {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected exactly one diagnostic, got: {:?}",
+            diagnostics
+        );
+        assert!(
+            program.declarations.is_empty(),
+            "rejected block must not emit declarations, got: {:?}",
+            program.declarations
+        );
+    }
+
+    /// `api version` with no version string is a parse error, and likewise
+    /// recovers by consuming the block body — exactly one diagnostic, no
+    /// leaked declarations.
+    #[test]
+    fn parse_api_requires_version_string() {
+        let source = r#"api version {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected exactly one diagnostic, got: {:?}",
+            diagnostics
+        );
+        assert!(
+            program.declarations.is_empty(),
+            "rejected block must not emit declarations, got: {:?}",
+            program.declarations
+        );
+    }
+
+    /// A version string that is only slashes (or whitespace) is rejected — it
+    /// would otherwise normalize to an empty leading path segment (`//posts`).
+    #[test]
+    fn parse_api_version_slash_only_rejected() {
+        for bad in ["/", "//", " "] {
+            let source = format!(
+                r#"api version "{bad}" {{
+                    endpoint a: GET "/posts" {{ response Post }}
+                }}"#
+            );
+            let (program, diagnostics) = parse_source(&source);
+            assert!(
+                !diagnostics.is_empty(),
+                "expected a diagnostic for version string {bad:?}"
+            );
+            assert!(
+                program.declarations.is_empty(),
+                "rejected block must not emit declarations for {bad:?}, got: {:?}",
+                program.declarations
+            );
+        }
+    }
+
+    /// A non-endpoint declaration inside an `api version` block is rejected.
+    /// Recovery skips the offending declaration's own brace-delimited body so a
+    /// following endpoint is still parsed and the block's closing `}` does not
+    /// cascade into spurious top-level errors — exactly one diagnostic.
+    #[test]
+    fn parse_api_version_rejects_non_endpoint() {
+        let source = r#"api version "v1" {
+            struct Nope { Int id }
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected exactly one diagnostic, got: {:?}",
+            diagnostics
+        );
+        // The endpoint following the malformed declaration is still recovered
+        // and tagged with the block's version.
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "a");
+                assert_eq!(ep.api_version.as_deref(), Some("v1"));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// A malformed *endpoint* inside the block (here: missing its path string)
+    /// is reported, then recovery skips the wreckage to the next item so a
+    /// following valid endpoint is still parsed and tagged — and the block's
+    /// own `}` is consumed normally rather than cascading into spurious
+    /// top-level errors.
+    #[test]
+    fn parse_api_version_recovers_from_malformed_endpoint() {
+        let source = r#"api version "v1" {
+            endpoint bad: GET { response Post }
+            endpoint good: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for the malformed endpoint"
+        );
+        // The valid endpoint after the wreckage is still recovered, tagged with
+        // the block's version, and is the only declaration produced.
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "good");
+                assert_eq!(ep.api_version.as_deref(), Some("v1"));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// A version string containing anything outside the path-segment-safe
+    /// charset is rejected — whitespace, path-parameter syntax (`{`/`}`), the
+    /// query/fragment delimiters (`?`/`#`), and `..` traversal would each
+    /// splice a malformed segment, a phantom path param, or an escape into
+    /// every route.
+    #[test]
+    fn parse_api_version_invalid_chars_rejected() {
+        for bad in [
+            "v 1", "v1/{id}", "{tenant}", "v1?x=1", "v1#frag", "v1/../v2",
+        ] {
+            let source = format!(
+                r#"api version "{bad}" {{
+                    endpoint a: GET "/posts" {{ response Post }}
+                }}"#
+            );
+            let (program, diagnostics) = parse_source(&source);
+            assert!(
+                !diagnostics.is_empty(),
+                "expected a diagnostic for version string {bad:?}"
+            );
+            assert!(
+                program.declarations.is_empty(),
+                "rejected block must not emit declarations for {bad:?}, got: {:?}",
+                program.declarations
+            );
+        }
+    }
+
+    /// A multi-segment version whose individual segments are malformed is
+    /// rejected: an internal empty segment (`v1//beta` -> `/v1//beta/posts`), a
+    /// `.` segment, or a `..` segment all pass the char allowlist yet would
+    /// malform the route or inject a traversal. `.` remains legal *inside* a
+    /// segment (covered by `parse_api_version_slash_form` et al.).
+    #[test]
+    fn parse_api_version_bad_segments_rejected() {
+        for bad in ["v1//beta", "v1/./beta", "v1/../beta", "v1/."] {
+            let source = format!(
+                r#"api version "{bad}" {{
+                    endpoint a: GET "/posts" {{ response Post }}
+                }}"#
+            );
+            let (program, diagnostics) = parse_source(&source);
+            assert!(
+                !diagnostics.is_empty(),
+                "expected a diagnostic for version string {bad:?}"
+            );
+            assert!(
+                program.declarations.is_empty(),
+                "rejected block must not emit declarations for {bad:?}, got: {:?}",
+                program.declarations
+            );
+        }
+    }
+
+    /// A doc comment preceding the `api version` block is consumed and dropped
+    /// without error (it attaches to no single endpoint). Pins the current
+    /// behavior so a future change that starts threading it through is a
+    /// deliberate, test-visible decision.
+    #[test]
+    fn parse_api_version_block_doc_comment_dropped() {
+        let source = r#"/** Versioned slice of the API. */
+        api version "v1" {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "a");
+                // The block doc comment does NOT leak onto the endpoint.
+                assert_eq!(ep.doc_comment, None);
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// A doc comment on an endpoint *inside* the block DOES attach to that
+    /// endpoint — only the block-level doc comment (preceding `api`) is dropped.
+    /// This pins the threading distinction so the two cases can't silently swap.
+    #[test]
+    fn parse_api_version_inner_endpoint_doc_comment_kept() {
+        let source = r#"api version "v1" {
+            /** List all posts. */
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.name, "a");
+                assert_eq!(ep.api_version.as_deref(), Some("v1"));
+                assert!(
+                    ep.doc_comment
+                        .as_deref()
+                        .is_some_and(|d| d.contains("List all posts")),
+                    "inner endpoint doc comment should be preserved, got: {:?}",
+                    ep.doc_comment
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// `public` cannot precede `api`; the block parser reports it but still
+    /// recovers the contained endpoints.
+    #[test]
+    fn parse_api_version_rejects_public() {
+        let source = r#"public api version "v1" {
+            endpoint a: GET "/posts" { response Post }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for `public` before `api`"
+        );
+        // Recovery still tags the endpoint with its version.
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.api_version.as_deref(), Some("v1"));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    /// An empty `api version` block parses with no error and contributes no
+    /// declarations (a harmless no-op).
+    #[test]
+    fn parse_api_version_empty_block() {
+        let source = r#"api version "v1" {
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 0);
     }
 
     // ── Schema declaration tests ────────────────────────────────────

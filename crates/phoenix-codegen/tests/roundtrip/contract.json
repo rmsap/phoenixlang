@@ -500,5 +500,43 @@
     "expect_client": {
       "expect_download": "AVATAR-BINARY-BYTES"
     }
+  },
+  {
+    "name": "listTaggedPosts_version_prefix",
+    "endpoint": "listTaggedPosts",
+    "kind": "ok",
+    "_note": "Versioned endpoint declared under `api version \"v2\" { }`. The generated path is /v2/api/posts/tagged/{tag}. This case proves the prefix round-trips: the generated client builds the /v2/... URL and the generated server registers the /v2/... route — if they disagreed on the prefix the request would 404 and this case would fail. No explicit path assertion is needed; mutual success IS the proof. Exercises a path param (tag) + a defaulted query param under the prefix.",
+    "call": {
+      "path_params": { "tag": "rust" },
+      "query": { "limit": 5 }
+    },
+    "handler": {
+      "expect_received": {
+        "tag": "rust",
+        "limit": 5
+      },
+      "returns": [
+        {
+          "id": 1,
+          "title": "Tagged Post",
+          "body": "body",
+          "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+          "status": "Published",
+          "tags": ["rust"]
+        }
+      ]
+    },
+    "expect_client": {
+      "ok": [
+        {
+          "id": 1,
+          "title": "Tagged Post",
+          "body": "body",
+          "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+          "status": "Published",
+          "tags": ["rust"]
+        }
+      ]
+    }
   }
 ]

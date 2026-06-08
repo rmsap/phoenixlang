@@ -136,6 +136,24 @@ func (s *stub) ListPosts(page int64, limit int64, tag *string, search *string, f
 	return &out, nil
 }
 
+// ListTaggedPosts exercises a versioned endpoint (path /v2/api/posts/tagged/{tag}):
+// a path param (tag) plus a defaulted query param (limit). Mutual success proves
+// the /v2 prefix round-trips between the generated client and server.
+func (s *stub) ListTaggedPosts(tag string, limit int64) (*[]api.Post, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"tag":   tag,
+		"limit": limit,
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	var out []api.Post
+	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
+	return &out, nil
+}
+
 func (s *stub) GetPost(id string) (*api.Post, error) {
 	s.hit = true
 	assertReceived(s.t, s.c, map[string]interface{}{"id": id})
@@ -370,6 +388,16 @@ func invoke(t *testing.T, client *api.ApiClient, c contractCase) error {
 		minScore := queryFloat(c, "minScore", 0.0)
 		maxScore := queryOptFloat(c, "maxScore")
 		got, err := client.ListPosts(page, limit, tag, search, featured, minScore, maxScore)
+		if err != nil {
+			return err
+		}
+		assertOK(t, c, got)
+		return nil
+
+	case "listTaggedPosts":
+		tag := c.Call.PathParams["tag"]
+		limit := queryInt(c, "limit", 20)
+		got, err := client.ListTaggedPosts(tag, limit)
 		if err != nil {
 			return err
 		}

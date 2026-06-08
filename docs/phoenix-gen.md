@@ -167,6 +167,31 @@ endpoint updateUser: PUT "/api/users/{id}" {
 - **`response TypeName`** defines the JSON response body.
 - **`error { }`** defines error variants with explicit HTTP status codes.
 
+No two endpoints may resolve to the same method and path *pattern* — path-parameter names are ignored, so `GET /posts/{id}` and `GET /posts/{slug}` collide because they match the same incoming requests. This is checked for all endpoints, not just versioned ones.
+
+### API versioning
+
+Wrap endpoints in an `api version "vX" { }` block to serve them all under a shared path prefix, instead of repeating `/v2` on every path:
+
+```phoenix
+api version "v2" {
+  endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" {
+    query { Int limit = 20 }
+    response List<Post>
+    error { NotFound(404) }
+  }
+}
+```
+
+The endpoint above is served at `/v2/api/posts/tagged/{tag}`. The prefix is applied to both the generated client's request URL and the generated server's route registration, so they stay in lockstep.
+
+- The version string is used literally as a leading path segment. A leading slash is optional — `"v2"` and `"/v2"` are equivalent, and the seam always collapses to a single `/`.
+- A block may contain only endpoint declarations. Multiple `api version` blocks may coexist, and endpoints declared at the top level (outside any block) are served unprefixed.
+- Endpoint names remain globally unique across all blocks.
+- The route-uniqueness rule above is applied *after* the version prefix is added, so a versioned endpoint resolving to `/v2/posts` collides with a top-level endpoint hand-written as `GET /v2/posts`. The same path under different version prefixes does not collide (`/v1/posts` and `/v2/posts` are distinct routes).
+
+> **Note:** `api` is a reserved keyword. Code that previously used `api` as an identifier (variable, field, or function name) must rename it. The contextual word `version` is *not* reserved and remains usable as an identifier.
+
 ### Doc comments
 
 `/** */` comments attach to the next declaration and flow through to generated code as JSDoc, Go doc comments, Python docstrings, and OpenAPI `description` fields:

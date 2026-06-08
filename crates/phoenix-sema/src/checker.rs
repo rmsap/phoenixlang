@@ -548,6 +548,16 @@ pub struct Checker {
     pub(crate) type_aliases: HashMap<String, TypeAliasInfo>,
     /// Resolved endpoint declarations.
     pub(crate) endpoints: Vec<EndpointInfo>,
+    /// Names of endpoints already seen, for O(1) duplicate-name detection.
+    /// Maintained incrementally as each endpoint is checked so the check is a
+    /// hash lookup rather than an O(n) rescan of `endpoints` (and thus O(n²)
+    /// overall).
+    pub(crate) endpoint_names: HashSet<String>,
+    /// Route signature (`"<Method> <path-with-{}-params>"`) → the name of the
+    /// first endpoint that claimed it. Maintained incrementally as each
+    /// endpoint is checked so route-collision detection is an O(1) lookup
+    /// rather than an O(n) rescan of `endpoints` (and thus O(n²) overall).
+    pub(crate) route_signatures: HashMap<String, String>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     /// Captured variables for each lambda, keyed by the lambda's source span.
     pub(crate) lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
@@ -663,6 +673,8 @@ impl Checker {
             trait_impls: HashSet::new(),
             type_aliases: HashMap::new(),
             endpoints: Vec::new(),
+            endpoint_names: HashSet::new(),
+            route_signatures: HashMap::new(),
             diagnostics: Vec::new(),
             lambda_captures: HashMap::new(),
             current_return_type: None,

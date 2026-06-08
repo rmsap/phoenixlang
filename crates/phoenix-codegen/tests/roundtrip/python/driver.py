@@ -133,6 +133,17 @@ class Stub:
         self._maybe_raise()
         return [m.Post(**item) for item in self._returns()]
 
+    async def list_tagged_posts(self, tag: str, *, limit: int) -> list[m.Post]:
+        # Versioned endpoint (/v2/api/posts/tagged/{tag}). The contract's
+        # expect_received keys are already snake_case (tag/limit).
+        self.hit = True
+        self.received = {
+            "tag": tag,
+            "limit": limit,
+        }
+        self._maybe_raise()
+        return [m.Post(**item) for item in self._returns()]
+
     async def get_post(self, id: str) -> m.Post:
         self.hit = True
         self.received = {"id": id}
@@ -378,6 +389,13 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
                 filename=thumb["filename"], content=thumb["content"].encode()
             )
         return await client.upload_avatar(call["path_params"]["id"], **kwargs)
+
+    if endpoint == "listTaggedPosts":
+        q = call.get("query", {})
+        kwargs: dict[str, Any] = {}
+        if "limit" in q and q["limit"] is not None:
+            kwargs["limit"] = q["limit"]
+        return await client.list_tagged_posts(call["path_params"]["tag"], **kwargs)
 
     if endpoint == "downloadAvatar":
         return await client.download_avatar(call["path_params"]["id"])

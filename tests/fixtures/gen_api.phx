@@ -203,3 +203,21 @@ endpoint downloadAvatar: GET "/api/authors/{id}/avatar" {
     response FileDownload
     error { NotFound(404) }
 }
+
+// ── API versioning (path-prefix block) ────────────────────────
+
+/**
+ * A versioned slice of the API: every endpoint here is served under the
+ * `/v2` path prefix (e.g. listTaggedPosts -> /v2/api/posts/tagged). Exercises
+ * the `api version "..." { }` block and the path-prefix resolution.
+ */
+api version "v2" {
+    /** List posts filtered by tag, under the v2 prefix. */
+    endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" {
+        query {
+            Int limit = 20
+        }
+        response List<Post>
+        error { NotFound(404) }
+    }
+}

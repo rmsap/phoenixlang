@@ -1792,6 +1792,40 @@ endpoint getUser: GET "/api/users/{id}" {
         insta::assert_snapshot!("get_with_path_param_handlers", files.handlers);
     }
 
+    /// An `api version` block prefixes the path in BOTH the generated client's
+    /// request URL and the generated server's route registration. The roundtrip
+    /// harness proves the two agree; this pins the actual literal string so a
+    /// regression that emitted a wrong-but-consistent prefix (which the
+    /// roundtrip would not catch) is caught here.
+    #[test]
+    fn api_version_prefixes_generated_path() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id }
+api version "v2" {
+    endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" { response Post }
+}
+"#,
+        );
+        assert!(
+            files.client.contains("/v2/api/posts/tagged/"),
+            "client URL should carry the version prefix, got: {}",
+            files.client
+        );
+        assert!(
+            files.server.contains("/v2/api/posts/tagged/"),
+            "server route should carry the version prefix, got: {}",
+            files.server
+        );
+        // The unprefixed path must not leak alongside the prefixed one.
+        assert!(
+            !files.client.contains("\"/api/posts/tagged/")
+                && !files.client.contains("`/api/posts/tagged/"),
+            "client should not also emit the unprefixed path, got: {}",
+            files.client
+        );
+    }
+
     #[test]
     fn post_with_body_omit() {
         let files = generate_from_source(

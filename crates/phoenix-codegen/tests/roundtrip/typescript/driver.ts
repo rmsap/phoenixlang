@@ -143,6 +143,18 @@ function makeStub(c: ContractCase, state: CaseState): Handlers {
       };
       return signal<Post[]>(c);
     },
+    // listTaggedPosts is a versioned (/v2) endpoint: a path param (tag) plus a
+    // defaulted query param (limit) under the /v2 prefix. The handler interface
+    // delivers them as separate args (tag, query.limit). Recording both proves
+    // the prefixed route reached the handler with the decoded inputs.
+    async listTaggedPosts(tag, query) {
+      state.hit = true;
+      state.received = {
+        tag,
+        limit: query.limit,
+      };
+      return signal<Post[]>(c);
+    },
     async searchPosts(query) {
       state.hit = true;
       state.received = {
@@ -270,6 +282,14 @@ async function invoke(c: ContractCase): Promise<unknown> {
       if (q.minScore !== undefined) opts.minScore = q.minScore as number;
       if (q.maxScore !== undefined) opts.maxScore = q.maxScore as number;
       return api.listPosts(opts);
+    }
+    case "listTaggedPosts": {
+      const tag = c.call.path_params?.tag;
+      assert.ok(tag !== undefined, `${c.name}: missing path_params.tag`);
+      const q = c.call.query ?? {};
+      const opts: Parameters<typeof api.listTaggedPosts>[1] = {};
+      if (q.limit !== undefined) opts.limit = q.limit as number;
+      return api.listTaggedPosts(tag, opts);
     }
     case "searchPosts": {
       const q = c.call.query ?? {};
