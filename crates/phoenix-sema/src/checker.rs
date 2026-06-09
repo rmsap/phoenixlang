@@ -471,6 +471,25 @@ pub struct EndpointInfo {
     /// one `File` field — i.e. a pure binary download. Computed in
     /// `check_endpoint`; consumed by the per-target download codegen.
     pub response_is_binary: bool,
+    /// Pagination for this endpoint, if it declares a `pagination { ... }` block.
+    /// `Some` only when the response is a bare `List<T>`; carries the mode and the
+    /// element type `T`. Generators emit a `<Endpoint>Page` envelope
+    /// (`{ items: List<T>, ...mode-specific fields }`) instead of a bare list.
+    /// See `docs/design-decisions.md` (pagination section).
+    pub pagination: Option<PaginationInfo>,
+}
+
+/// Resolved pagination metadata for an endpoint, produced during semantic
+/// analysis from a `pagination { offset|cursor }` block.
+#[derive(Debug, Clone)]
+pub struct PaginationInfo {
+    /// The pagination mode (`offset` or `cursor`), which fixes the envelope's
+    /// metadata field: `offset` → `totalCount: Int`; `cursor` →
+    /// `nextCursor: Option<String>`.
+    pub mode: phoenix_parser::ast::PaginationMode,
+    /// The list element type `T` (from the `List<T>` response). This is the type
+    /// of each item in the envelope's `items` field.
+    pub item_type: Type,
 }
 
 /// Information about a registered type alias.

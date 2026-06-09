@@ -2,8 +2,9 @@ use crate::api_version::validate_api_version;
 use crate::ast::{
     Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
     FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock, ImportDecl, ImportItem,
-    ImportItems, InlineTraitImpl, NamedType, Param, Program, QueryParam, SchemaDecl, SchemaTable,
-    StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
+    ImportItems, InlineTraitImpl, NamedType, PaginationMode, Param, Program, QueryParam,
+    SchemaDecl, SchemaTable, StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr,
+    TypeModifier, Visibility,
 };
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::{SourceId, Span};
@@ -61,6 +62,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Partial => "'partial'",
         TokenKind::Query => "'query'",
         TokenKind::Headers => "'headers'",
+        TokenKind::Pagination => "'pagination'",
         TokenKind::Where => "'where'",
         TokenKind::Schema => "'schema'",
         TokenKind::Api => "'api'",
@@ -1317,12 +1319,14 @@ impl<'src> Parser<'src> {
         let mut body = None;
         let mut response = None;
         let mut errors = Vec::new();
+        let mut pagination = None;
         let mut has_query = false;
         let mut has_headers = false;
         let mut has_response_headers = false;
         let mut has_body = false;
         let mut has_response = false;
         let mut has_error = false;
+        let mut has_pagination = false;
 
         // Parse inner sections
         loop {
@@ -1389,6 +1393,13 @@ impl<'src> Parser<'src> {
                         }
                     }
                 }
+                TokenKind::Pagination => {
+                    if has_pagination {
+                        self.error_at_current("duplicate `pagination` section in endpoint");
+                    }
+                    has_pagination = true;
+                    pagination = self.parse_pagination_block();
+                }
                 TokenKind::ErrorKw => {
                     if has_error {
                         self.error_at_current("duplicate `error` section in endpoint");
@@ -1398,7 +1409,7 @@ impl<'src> Parser<'src> {
                 }
                 _ => {
                     self.error_at_current(
-                        "expected `query`, `headers`, `body`, `response`, `error`, or `}`",
+                        "expected `query`, `headers`, `body`, `response`, `pagination`, `error`, or `}`",
                     );
                     self.advance();
                 }
@@ -1421,6 +1432,7 @@ impl<'src> Parser<'src> {
             body,
             response,
             response_headers,
+            pagination,
             errors,
             doc_comment,
             span: start.merge(end),
@@ -1707,6 +1719,45 @@ impl<'src> Parser<'src> {
         }
         let _ = self.expect(TokenKind::RBrace);
         params
+    }
+
+    /// Parses a `pagination { offset|cursor }` endpoint block.
+    ///
+    /// The block contains exactly one mode word — the contextual identifiers
+    /// `offset` or `cursor` (plain `Ident`s, not reserved keywords). Returns the
+    /// parsed [`PaginationMode`], or `None` on error (empty block, an unknown
+    /// word, or extra tokens). Surrounding newlines are permitted.
+    fn parse_pagination_block(&mut self) -> Option<PaginationMode> {
+        self.expect(TokenKind::Pagination)?;
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let tok = self.peek();
+        let mode = if tok.kind == TokenKind::Ident && tok.text == "offset" {
+            self.advance();
+            Some(PaginationMode::Offset)
+        } else if tok.kind == TokenKind::Ident && tok.text == "cursor" {
+            self.advance();
+            Some(PaginationMode::Cursor)
+        } else {
+            self.error_at_current("expected `offset` or `cursor` in `pagination` block");
+            // Consume the offending word (unless it's already the closing brace or
+            // EOF) so recovery resumes at `}` — otherwise the same token would
+            // re-trigger "expected `}`" here and the endpoint loop's catch-all,
+            // piling up redundant diagnostics for one typo.
+            if !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+                self.advance();
+            }
+            None
+        };
+
+        self.skip_newlines();
+        // Reject extra tokens (e.g. a second mode word) before the closing brace.
+        if self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            self.error_at_current("expected `}` after pagination mode");
+        }
+        let _ = self.expect(TokenKind::RBrace);
+        mode
     }
 
     // ── Schema declaration parsing ────────────────────────────────
@@ -4989,6 +5040,90 @@ schema db {
             "should report duplicate headers: {:?}",
             diagnostics
         );
+    }
+
+    // ── Pagination tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_pagination_offset() {
+        let source = r#"endpoint p: GET "/x" { response List<Post> pagination { offset } }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.pagination, Some(PaginationMode::Offset));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_pagination_cursor() {
+        let source = r#"endpoint p: GET "/x" { response List<Post> pagination { cursor } }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.pagination, Some(PaginationMode::Cursor));
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_pagination_unknown_mode_rejected() {
+        let source = r#"endpoint p: GET "/x" { response List<Post> pagination { bogus } }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected `offset` or `cursor`")),
+            "should reject unknown pagination mode: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_pagination_empty_rejected() {
+        let source = r#"endpoint p: GET "/x" { response List<Post> pagination { } }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected `offset` or `cursor`")),
+            "should reject empty pagination block: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_pagination_duplicate_rejected() {
+        let source = r#"endpoint p: GET "/x" {
+            response List<Post>
+            pagination { offset }
+            pagination { cursor }
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate `pagination`")),
+            "should report duplicate pagination: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_without_pagination() {
+        let source = r#"endpoint p: GET "/x" { response List<Post> }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.pagination, None);
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
     }
 
     #[test]

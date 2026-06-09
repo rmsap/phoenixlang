@@ -4,9 +4,11 @@
 //! Phoenix program. Maps Phoenix structs to JSON Schema component schemas,
 //! endpoints to path operations, and error variants to HTTP response status codes.
 
-use phoenix_parser::ast::{Declaration, EnumDecl, LiteralKind, Program, StructDecl};
+use phoenix_parser::ast::{
+    Declaration, EnumDecl, LiteralKind, PaginationMode, Program, StructDecl,
+};
 use phoenix_sema::Analysis;
-use phoenix_sema::checker::{DefaultValue, EndpointInfo};
+use phoenix_sema::checker::{DefaultValue, EndpointInfo, PaginationInfo};
 use phoenix_sema::types::Type;
 use serde_json::{Map, Value, json};
 
@@ -44,6 +46,13 @@ pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
         {
             let type_name = format!("{}Body", capitalize(&ep.name));
             schemas.insert(type_name, derived_type_to_schema(body));
+        }
+        // A paginated endpoint's 200 body is the `<Endpoint>Page` envelope object,
+        // emitted as a named component schema (mirroring the `<Endpoint>Body`
+        // precedent) and `$ref`d from the response.
+        if let Some(ref pagination) = ep.pagination {
+            let type_name = format!("{}Page", capitalize(&ep.name));
+            schemas.insert(type_name, pagination_page_schema(pagination));
         }
     }
 
@@ -225,6 +234,16 @@ fn build_operation(ep: &EndpointInfo) -> Value {
                     "schema": { "type": "string", "format": "binary" }
                 }
             })
+        } else if ep.pagination.is_some() {
+            // The 200 body is the `<Endpoint>Page` envelope object (a bare
+            // `List<T>` response becomes the page wrapper), referenced as a
+            // named component schema.
+            let page_type = format!("{}Page", capitalize(&ep.name));
+            json!({
+                "application/json": {
+                    "schema": { "$ref": format!("#/components/schemas/{}", page_type) }
+                }
+            })
         } else {
             json!({ "application/json": { "schema": type_to_json_schema(resp_type) } })
         };
@@ -393,6 +412,59 @@ fn derived_type_to_schema(body: &phoenix_sema::checker::ResolvedDerivedType) -> 
     if !required.is_empty() {
         map.insert("required".to_string(), Value::Array(required));
     }
+    Value::Object(map)
+}
+
+/// Builds the `<Endpoint>Page` envelope object schema for a paginated endpoint.
+///
+/// The `items` property is always the `List<T>` array (`type: array` with the
+/// item type as its `items` schema) and is required. The mode-specific metadata
+/// field follows the fixed canonical convention (see `docs/design-decisions.md`,
+/// pagination decision 3):
+/// - `offset` → `totalCount: { type: integer }`, required.
+/// - `cursor` → `nextCursor: Option<String>`, rendered nullable (the same
+///   `anyOf: [string, null]` shape any `Option<T>` gets) and omitted from
+///   `required` — the Go (`*string`) and Python (`str | None`) servers emit
+///   `nextCursor: null` on the last page, so the schema must permit `null`, not
+///   just absence.
+///
+/// The wire field names (`items`, `totalCount`, `nextCursor`) are camelCase,
+/// matching the TS and Go targets on the wire. The Python target diverges: it
+/// emits no `Field(alias=...)` on any model, so its wire names are snake_case
+/// (`total_count`/`next_cursor`) and a Python server is NOT described by this
+/// schema — a pre-existing Python wire-name divergence affecting every model,
+/// not pagination-specific (see `docs/design-decisions.md`, pagination
+/// decision 3).
+fn pagination_page_schema(pagination: &PaginationInfo) -> Value {
+    let mut properties: Map<String, Value> = Map::new();
+    let mut required = vec![json!("items")];
+
+    properties.insert(
+        "items".to_string(),
+        json!({ "type": "array", "items": type_to_json_schema(&pagination.item_type) }),
+    );
+
+    match pagination.mode {
+        PaginationMode::Offset => {
+            properties.insert("totalCount".to_string(), json!({ "type": "integer" }));
+            required.push(json!("totalCount"));
+        }
+        PaginationMode::Cursor => {
+            // `nextCursor` is `Option<String>`: nullable (an absent cursor is
+            // serialized as JSON `null` on the last page) and optional (omitted
+            // from `required`). Route through `type_to_json_schema` so it gets the
+            // exact `anyOf: [string, null]` shape every other `Option<T>` does.
+            properties.insert(
+                "nextCursor".to_string(),
+                type_to_json_schema(&Type::Generic("Option".to_string(), vec![Type::String])),
+            );
+        }
+    }
+
+    let mut map: Map<String, Value> = Map::new();
+    map.insert("type".to_string(), json!("object"));
+    map.insert("properties".to_string(), Value::Object(properties));
+    map.insert("required".to_string(), Value::Array(required));
     Value::Object(map)
 }
 
@@ -955,6 +1027,125 @@ api version "v2" {
         assert!(
             !spec.contains("\"/api/posts/tagged/{tag}\""),
             "OpenAPI should not also emit the unprefixed path, got: {spec}"
+        );
+    }
+
+    // ── pagination tests ───────────────────────────────────────────
+
+    #[test]
+    fn offset_pagination_page_schema() {
+        // An offset-paginated endpoint's 200 body is the `<Endpoint>Page` envelope
+        // object (`{ items: array, totalCount: integer }`, both required),
+        // emitted as a named component and `$ref`d from the response. The bare
+        // `List<Post>` no longer appears as the response schema.
+        let spec = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post>
+    pagination { offset }
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+
+        // The 200 response references the page component.
+        let resp_schema = &v["paths"]["/api/posts"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert_eq!(
+            resp_schema,
+            &json!({ "$ref": "#/components/schemas/ListPostsPage" }),
+            "200 response should $ref the page component:\n{spec}"
+        );
+
+        // The page component is an object with items (array of Post $refs) and a
+        // required totalCount integer.
+        let page = &v["components"]["schemas"]["ListPostsPage"];
+        assert_eq!(page["type"], json!("object"));
+        assert_eq!(
+            page["properties"]["items"],
+            json!({ "type": "array", "items": { "$ref": "#/components/schemas/Post" } }),
+            "items must be an array of the element schema:\n{spec}"
+        );
+        assert_eq!(
+            page["properties"]["totalCount"],
+            json!({ "type": "integer" })
+        );
+        assert_eq!(page["required"], json!(["items", "totalCount"]));
+
+        insta::assert_snapshot!("openapi_pagination_offset", spec);
+    }
+
+    #[test]
+    fn cursor_pagination_page_schema() {
+        // A cursor-paginated endpoint's page envelope carries an optional,
+        // nullable `nextCursor` (rendered `anyOf: [string, null]`, present in
+        // properties, omitted from required — the server emits `null` on the last
+        // page) and a required `items` array.
+        let spec = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post>
+    pagination { cursor }
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+
+        let resp_schema = &v["paths"]["/api/posts"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert_eq!(
+            resp_schema,
+            &json!({ "$ref": "#/components/schemas/ListPostsPage" }),
+            "200 response should $ref the page component:\n{spec}"
+        );
+
+        let page = &v["components"]["schemas"]["ListPostsPage"];
+        assert_eq!(page["type"], json!("object"));
+        assert_eq!(
+            page["properties"]["items"],
+            json!({ "type": "array", "items": { "$ref": "#/components/schemas/Post" } }),
+            "items must be an array of the element schema:\n{spec}"
+        );
+        assert_eq!(
+            page["properties"]["nextCursor"],
+            json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] }),
+            "nextCursor must be nullable (it serializes to null on the last page):\n{spec}"
+        );
+        assert_eq!(
+            page["required"],
+            json!(["items"]),
+            "nextCursor must be optional (excluded from required):\n{spec}"
+        );
+
+        insta::assert_snapshot!("openapi_pagination_cursor", spec);
+    }
+
+    #[test]
+    fn plain_list_response_is_unchanged_by_pagination() {
+        // A non-paginated `List<T>` response stays a bare array; no `<Endpoint>Page`
+        // component is emitted. Guards the byte-for-byte-unchanged invariant.
+        let spec = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post>
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+
+        let resp_schema = &v["paths"]["/api/posts"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"];
+        assert_eq!(
+            resp_schema,
+            &json!({ "type": "array", "items": { "$ref": "#/components/schemas/Post" } }),
+            "plain list response must remain a bare array:\n{spec}"
+        );
+        assert!(
+            v["components"]["schemas"]["ListPostsPage"].is_null(),
+            "no page component should be emitted for a non-paginated endpoint:\n{spec}"
         );
     }
 }

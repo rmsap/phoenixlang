@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use phoenix_parser::ast::{Declaration, EnumDecl, Program, StructDecl, TypeExpr};
+use phoenix_parser::ast::{Declaration, EnumDecl, PaginationMode, Program, StructDecl, TypeExpr};
 use phoenix_sema::Analysis;
 use phoenix_sema::checker::{DefaultValue, EndpointInfo, ResolvedDerivedType};
 use phoenix_sema::types::Type;
@@ -118,6 +118,9 @@ impl<'a> TsGenerator<'a> {
         }
         for ep in &self.check_result.endpoints {
             self.emit_endpoint_result_type(ep);
+        }
+        for ep in &self.check_result.endpoints {
+            self.emit_endpoint_page_type(ep);
         }
         for ep in &self.check_result.endpoints {
             self.emit_endpoint_error_types(ep);
@@ -329,6 +332,40 @@ impl<'a> TsGenerator<'a> {
         self.types_out.push_str("}\n\n");
     }
 
+    /// Emits the pagination envelope type for an endpoint that declares a
+    /// `pagination { }` block. The envelope wraps the bare `List<T>` response in
+    /// a typed page object with mode-specific metadata:
+    /// - **offset** → `interface ListPostsPage { items: Post[]; totalCount: number; }`
+    /// - **cursor** → `interface ListPostsPage { items: Post[]; nextCursor?: string; }`
+    ///
+    /// Endpoints without pagination emit nothing here and keep returning their
+    /// bare response type. Pagination and response headers are mutually exclusive
+    /// (sema rejects the combination), so this never collides with the
+    /// `<Endpoint>Result` envelope.
+    fn emit_endpoint_page_type(&mut self, ep: &EndpointInfo) {
+        let Some(ref pag) = ep.pagination else {
+            return;
+        };
+        let name = page_type_name(ep);
+        let item_type = type_to_ts(&pag.item_type);
+
+        self.types_out
+            .push_str(&format!("export interface {name} {{\n"));
+        self.types_out
+            .push_str(&format!("  items: {item_type}[];\n"));
+        match pag.mode {
+            PaginationMode::Offset => {
+                self.types_out.push_str("  totalCount: number;\n");
+            }
+            // `nextCursor` is null/absent on the last page — render it optional,
+            // matching how the response-header envelope renders an optional field.
+            PaginationMode::Cursor => {
+                self.types_out.push_str("  nextCursor?: string;\n");
+            }
+        }
+        self.types_out.push_str("}\n\n");
+    }
+
     /// Emits error type definitions for an endpoint's error variants.
     ///
     /// For an endpoint with `error { NotFound(404), Conflict(409) }`, produces:
@@ -420,9 +457,20 @@ impl<'a> TsGenerator<'a> {
                 // referenced in this file.
                 type_imports.insert(result_type_name(ep));
             }
+            if ep.pagination.is_some() {
+                // The method returns (and casts the decoded JSON to) the page
+                // envelope. The bare item type is NOT referenced in the client
+                // (the response below is read as the whole page object), so the
+                // `collect_import_names` on the `List<T>` response is skipped for
+                // paginated endpoints — import only the page type here.
+                type_imports.insert(page_type_name(ep));
+            }
             // A binary-download response is returned as a `Blob`, so the response
             // struct's name is never referenced in the client — don't import it.
+            // A paginated response is read as the page envelope (imported above);
+            // the bare `List<T>` element type is not referenced — skip it too.
             if !ep.response_is_binary
+                && ep.pagination.is_none()
                 && let Some(ref resp) = ep.response
             {
                 collect_import_names(resp, &mut type_imports);
@@ -489,6 +537,10 @@ impl<'a> TsGenerator<'a> {
             "Blob".to_string()
         } else if has_resp_headers {
             result_type_name(ep)
+        } else if ep.pagination.is_some() {
+            // The bare `List<T>` response is wrapped in the typed page envelope;
+            // the client reads the whole page object from the JSON body.
+            page_type_name(ep)
         } else {
             body_type.clone()
         };
@@ -726,6 +778,10 @@ impl<'a> TsGenerator<'a> {
                 if !ep.response_headers.is_empty() {
                     // Handler returns the envelope, which already bundles the body.
                     imports.insert(result_type_name(ep));
+                } else if ep.pagination.is_some() {
+                    // Handler returns the page envelope (which already bundles the
+                    // item type via its `items` field); import only the page type.
+                    imports.insert(page_type_name(ep));
                 } else if let Some(ref resp) = ep.response {
                     collect_import_names(resp, &mut imports);
                 }
@@ -754,6 +810,11 @@ impl<'a> TsGenerator<'a> {
             "Buffer".to_string()
         } else if !ep.response_headers.is_empty() {
             result_type_name(ep)
+        } else if ep.pagination.is_some() {
+            // Handler resolves the typed page envelope instead of the bare list;
+            // it supplies the metadata (totalCount / nextCursor) Phoenix can't
+            // compute.
+            page_type_name(ep)
         } else {
             ep.response
                 .as_ref()
@@ -911,7 +972,17 @@ impl<'a> TsGenerator<'a> {
             .push_str("export function createRouter(handlers: Handlers): Router {\n");
         self.server_out.push_str("  const router = Router();\n\n");
 
-        for ep in &self.check_result.endpoints {
+        // Express matches routes first-registered-wins, so a parametric route
+        // (`/api/posts/:id`) registered before a static sibling
+        // (`/api/posts/paged`) would shadow it — the static path gets captured as
+        // `id = "paged"`. Register more-specific (more-static) routes first so
+        // literal segments win, matching the most-specific-wins semantics Go's
+        // ServeMux and FastAPI already provide. The sort is stable, so endpoints
+        // of equal specificity keep their source order (snapshot-stable).
+        let mut ordered: Vec<&EndpointInfo> = self.check_result.endpoints.iter().collect();
+        ordered.sort_by_key(|ep| crate::route_specificity_key(&ep.path));
+
+        for ep in ordered {
             self.emit_server_route(ep);
         }
 
@@ -1591,6 +1662,15 @@ fn is_header_client_optional(h: &phoenix_sema::checker::HeaderParamInfo) -> bool
 /// declares response headers.
 fn result_type_name(ep: &EndpointInfo) -> String {
     format!("{}Result", capitalize(&ep.name))
+}
+
+/// The TypeScript name of the pagination envelope type for an endpoint
+/// (e.g. `listPosts` → `ListPostsPage`). Only emitted/used when the endpoint
+/// declares a `pagination { }` block. Distinct from `result_type_name`
+/// (pagination and response headers are mutually exclusive — sema rejects the
+/// combination).
+fn page_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Page", capitalize(&ep.name))
 }
 
 /// Generates an expression coercing a request header read server-side
@@ -2778,6 +2858,134 @@ endpoint getPost: GET "/api/posts/{id}" {
                 .contains("import type { GetPostResult, Post } from \"./types\";"),
             "client must import BOTH the envelope and the body type it casts to:\n{}",
             files.client
+        );
+    }
+
+    // ── pagination tests ────────────────────────────────────────────
+
+    /// An offset-paginated endpoint produces a `<Endpoint>Page` envelope
+    /// `{ items: T[]; totalCount: number }`; the client returns and casts the
+    /// JSON body to the page; the handler resolves the page; and the server
+    /// sends it with `res.json(result)`.
+    #[test]
+    fn offset_pagination_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    query { Int page  Int limit }
+    response List<Post>
+    pagination { offset }
+}
+"#,
+        );
+        insta::assert_snapshot!("offset_pagination_types", files.types);
+        insta::assert_snapshot!("offset_pagination_client", files.client);
+        insta::assert_snapshot!("offset_pagination_handlers", files.handlers);
+        insta::assert_snapshot!("offset_pagination_server", files.server);
+
+        // Interface shape.
+        assert!(
+            files.types.contains(
+                "export interface ListPostsPage {\n  items: Post[];\n  totalCount: number;\n}"
+            ),
+            "offset envelope must be {{ items: T[]; totalCount: number }}:\n{}",
+            files.types
+        );
+        // Client return type + typed JSON cast to the page.
+        assert!(
+            files.client.contains("Promise<ListPostsPage>"),
+            "client method must return Promise<ListPostsPage>:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("return (await response.json()) as ListPostsPage;"),
+            "client must cast the JSON body to the page:\n{}",
+            files.client
+        );
+        // Handler return type.
+        assert!(
+            files.handlers.contains("Promise<ListPostsPage>"),
+            "handler must return Promise<ListPostsPage>:\n{}",
+            files.handlers
+        );
+        // Imports reference only the page type, never the bare item type in the
+        // client (the JSON is read as the whole page object).
+        assert!(
+            files
+                .client
+                .contains("import type { ListPostsPage } from \"./types\";"),
+            "client must import only the page type:\n{}",
+            files.client
+        );
+    }
+
+    /// A cursor-paginated endpoint produces `{ items: T[]; nextCursor?: string }`
+    /// (the cursor is optional — absent on the last page).
+    #[test]
+    fn cursor_pagination_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    query { Option<String> cursor  Int limit }
+    response List<Post>
+    pagination { cursor }
+}
+"#,
+        );
+        insta::assert_snapshot!("cursor_pagination_types", files.types);
+        insta::assert_snapshot!("cursor_pagination_client", files.client);
+        insta::assert_snapshot!("cursor_pagination_handlers", files.handlers);
+
+        // Interface shape: optional nextCursor.
+        assert!(
+            files.types.contains(
+                "export interface ListPostsPage {\n  items: Post[];\n  nextCursor?: string;\n}"
+            ),
+            "cursor envelope must be {{ items: T[]; nextCursor?: string }}:\n{}",
+            files.types
+        );
+        assert!(
+            files.client.contains("Promise<ListPostsPage>"),
+            "client method must return Promise<ListPostsPage>:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("Promise<ListPostsPage>"),
+            "handler must return Promise<ListPostsPage>:\n{}",
+            files.handlers
+        );
+    }
+
+    /// A plain (non-paginated) `List<T>` response is byte-for-byte unchanged:
+    /// no `Page` envelope, and both client and handler return the bare `T[]`.
+    #[test]
+    fn plain_list_response_unchanged_by_pagination() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post>
+}
+"#,
+        );
+        assert!(
+            !files.types.contains("Page"),
+            "no Page envelope for a non-paginated list:\n{}",
+            files.types
+        );
+        assert!(
+            files.client.contains("Promise<Post[]>"),
+            "client must return the bare Post[]:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("Promise<Post[]>"),
+            "handler must return the bare Post[]:\n{}",
+            files.handlers
         );
     }
 

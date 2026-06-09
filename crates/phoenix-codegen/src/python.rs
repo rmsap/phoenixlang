@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use phoenix_parser::ast::{Declaration, EnumDecl, Program, StructDecl};
+use phoenix_parser::ast::{Declaration, EnumDecl, PaginationMode, Program, StructDecl};
 use phoenix_sema::Analysis;
 use phoenix_sema::checker::{DefaultValue, EndpointInfo};
 use phoenix_sema::types::Type;
@@ -96,6 +96,7 @@ impl<'a> PyGenerator<'a> {
         for ep in &self.check_result.endpoints {
             self.emit_derived_model(ep);
             self.emit_result_envelope(ep);
+            self.emit_page_model(ep);
         }
 
         // ── client.py ───────────────────────────────────────────────
@@ -130,7 +131,15 @@ impl<'a> PyGenerator<'a> {
             .push_str("\n\ndef create_router(handlers: Handlers) -> APIRouter:\n");
         self.server_out.push_str("    router = APIRouter()\n");
 
-        for ep in &self.check_result.endpoints {
+        // FastAPI (like Express) matches routes first-registered-wins, so a
+        // parametric route (`/api/posts/{id}`) registered before a static sibling
+        // (`/api/posts/paged`) would shadow it. Register more-specific (more-
+        // static) routes first so literal segments win. Stable sort preserves
+        // source order among equally-specific paths. See `route_specificity_key`.
+        let mut ordered: Vec<&EndpointInfo> = self.check_result.endpoints.iter().collect();
+        ordered.sort_by_key(|ep| crate::route_specificity_key(&ep.path));
+
+        for ep in ordered {
             self.emit_server_route(ep);
         }
 
@@ -213,7 +222,9 @@ impl<'a> PyGenerator<'a> {
                         .is_none_or(|info| !info.is_file_bearing))
             })
             || self.check_result.endpoints.iter().any(|ep| {
-                (!ep.body_is_multipart && ep.body.is_some()) || !ep.response_headers.is_empty()
+                (!ep.body_is_multipart && ep.body.is_some())
+                    || !ep.response_headers.is_empty()
+                    || ep.pagination.is_some()
             });
 
         // A multipart endpoint pulls in the client-side `FileUpload` dataclass
@@ -449,6 +460,54 @@ impl<'a> PyGenerator<'a> {
         }
     }
 
+    /// Emits the `<Endpoint>Page` pagination envelope model for an endpoint that
+    /// declares a `pagination { }` block. The envelope wraps the bare `List<T>`
+    /// response in a typed page with mode-specific metadata:
+    /// - **offset** → `class ListPostsPage(BaseModel): items: list[Post];
+    ///   total_count: int`
+    /// - **cursor** → `class ListPostsPage(BaseModel): items: list[Post];
+    ///   next_cursor: str | None = None`
+    ///
+    /// Field names are snake_case attributes that ARE the wire names — the Python
+    /// generator emits NO `Field(alias=...)` on any model (structs, body, result
+    /// envelope), so the wire form is snake_case (`total_count`/`next_cursor`),
+    /// matching every other Python model. (Cross-target OpenAPI uses camelCase,
+    /// but that divergence is pre-existing for all Python models, not introduced
+    /// here; the Python round-trip is same-language so the convention holds.)
+    ///
+    /// Endpoints without pagination emit nothing here and keep returning their
+    /// bare response type. Pagination and response headers are mutually exclusive
+    /// (sema rejects the combination), so this never collides with the
+    /// `<Endpoint>Result` envelope.
+    fn emit_page_model(&mut self, ep: &EndpointInfo) {
+        let Some(ref pag) = ep.pagination else {
+            return;
+        };
+        let type_name = page_type_name(ep);
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+        let item_type = type_to_python(&pag.item_type);
+
+        ensure_blank_lines(&mut self.models_out, 2);
+        self.models_out
+            .push_str(&format!("class {type_name}(BaseModel):\n"));
+        self.models_out
+            .push_str(&format!("    items: list[{item_type}]\n"));
+        match pag.mode {
+            PaginationMode::Offset => {
+                self.models_out.push_str("    total_count: int\n");
+            }
+            // `next_cursor` is null/absent on the last page — render it optional
+            // with a `None` default, matching how an optional envelope field is
+            // emitted elsewhere.
+            PaginationMode::Cursor => {
+                self.models_out
+                    .push_str("    next_cursor: str | None = None\n");
+            }
+        }
+    }
+
     // ── client.py emission ──────────────────────────────────────────
 
     /// Emits imports for the client file.
@@ -486,7 +545,13 @@ impl<'a> PyGenerator<'a> {
             if ep.body.is_some() && !ep.body_is_multipart {
                 imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if let Some(ref resp) = ep.response
+            // A paginated endpoint parses the body into `<Endpoint>Page` (the bare
+            // item type is referenced only inside that model in models.py), so
+            // import the page model and NOT the item type — importing the unused
+            // item type here would trip ruff F401.
+            if ep.pagination.is_some() {
+                imports.insert(page_type_name(ep));
+            } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
             {
                 collect_python_imports(resp, &mut imports);
@@ -520,7 +585,9 @@ impl<'a> PyGenerator<'a> {
                 .map(type_to_python)
                 .unwrap_or_else(|| "None".to_string())
         };
-        let response_type = if ep.response_headers.is_empty() {
+        let response_type = if ep.pagination.is_some() {
+            page_type_name(ep)
+        } else if ep.response_headers.is_empty() {
             body_type.clone()
         } else {
             format!("{}Result", capitalize(&ep.name))
@@ -792,6 +859,16 @@ impl<'a> PyGenerator<'a> {
             return;
         }
 
+        // A paginated endpoint parses the whole JSON body into the typed
+        // `<Endpoint>Page` envelope (items + mode metadata). `model_validate`
+        // constructs the nested `items: list[T]` from the wire array.
+        if ep.pagination.is_some() {
+            self.client_out.push_str(&format!(
+                "        return {response_type}.model_validate(response.json())\n"
+            ));
+            return;
+        }
+
         // Parse the body into the bare response type (list or single model).
         let is_list = matches!(&ep.response, Some(Type::Generic(name, _)) if name == "List");
         let body_expr = if is_list {
@@ -864,7 +941,12 @@ impl<'a> PyGenerator<'a> {
             if ep.body.is_some() && !ep.body_is_multipart {
                 imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            if let Some(ref resp) = ep.response
+            // A paginated handler returns `<Endpoint>Page` (the item type is only
+            // named inside that model), so import the page model, not the item
+            // type — an unused item-type import would trip ruff F401.
+            if ep.pagination.is_some() {
+                imports.insert(page_type_name(ep));
+            } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
             {
                 collect_python_imports(resp, &mut imports);
@@ -889,6 +971,8 @@ impl<'a> PyGenerator<'a> {
         // them in a FastAPI `Response`.
         let response_type = if ep.response_is_binary {
             "bytes".to_string()
+        } else if ep.pagination.is_some() {
+            page_type_name(ep)
         } else if ep.response_headers.is_empty() {
             ep.response
                 .as_ref()
@@ -1101,11 +1185,18 @@ impl<'a> PyGenerator<'a> {
             if ep.body.is_some() && !ep.body_is_multipart {
                 model_imports.insert(format!("{}Body", capitalize(&ep.name)));
             }
-            // A binary download returns `Response(content=bytes)`; the response
-            // struct is never constructed, so its type is not imported.
-            if let Some(ref resp) = ep.response
+            // A paginated route is annotated `-> <Endpoint>Page` and returns the
+            // handler's page through unchanged; the bare item type is referenced
+            // only inside that model in models.py, so import the page model and
+            // not the item type (an unused item import would trip ruff F401).
+            if ep.pagination.is_some() {
+                model_imports.insert(page_type_name(ep));
+            } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
             {
+                // A binary download returns `Response(content=bytes)`; the
+                // response struct is never constructed, so its type is not
+                // imported.
                 collect_python_imports(resp, &mut model_imports);
             }
             // The route returns `result.body`, so the envelope type itself is not
@@ -1128,6 +1219,10 @@ impl<'a> PyGenerator<'a> {
         // model; all other routes return the modelled response type.
         let response_type = if ep.response_is_binary {
             "Response".to_string()
+        } else if ep.pagination.is_some() {
+            // The route returns the handler's `<Endpoint>Page` directly (no
+            // unwrapping like the response-header `result.body` case).
+            page_type_name(ep)
         } else {
             ep.response
                 .as_ref()
@@ -1455,6 +1550,15 @@ fn unwrap_option(ty: &Type) -> Type {
         Type::Generic(name, args) if name == "Option" && args.len() == 1 => args[0].clone(),
         other => other.clone(),
     }
+}
+
+/// The Python name of the pagination envelope model for an endpoint
+/// (e.g. `listPosts` → `ListPostsPage`). Only emitted/used when the endpoint
+/// declares a `pagination { }` block. Distinct from the `<Endpoint>Result`
+/// response-header envelope (pagination and response headers are mutually
+/// exclusive — sema rejects the combination).
+fn page_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Page", capitalize(&ep.name))
 }
 
 /// Emits the client-side coercion of a single response header from its raw
@@ -2798,5 +2902,145 @@ endpoint replaceUser: PUT "/api/users/{id}" {
         let mut imports = BTreeSet::new();
         collect_python_imports(&Type::Dyn("Drawable".to_string()), &mut imports);
         assert!(imports.contains("Drawable"));
+    }
+
+    // ── pagination tests ────────────────────────────────────────────
+
+    /// An offset-paginated endpoint produces an `<Endpoint>Page` pydantic model
+    /// `{ items: list[T]; total_count: int }` (snake_case attrs ARE the wire
+    /// names — no `Field(alias=...)`, matching every other Python model). The
+    /// client returns and `model_validate`s the page; the handler returns the
+    /// page; the server route is annotated with and returns the page.
+    #[test]
+    fn offset_pagination_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    query { Int page  Int limit }
+    response List<Post>
+    pagination { offset }
+}
+"#,
+        );
+        insta::assert_snapshot!("py_offset_pagination_models", files.models);
+        insta::assert_snapshot!("py_offset_pagination_client", files.client);
+        insta::assert_snapshot!("py_offset_pagination_handlers", files.handlers);
+        insta::assert_snapshot!("py_offset_pagination_server", files.server);
+
+        // Model shape: snake_case wire names, no alias machinery.
+        assert!(
+            files.models.contains(
+                "class ListPostsPage(BaseModel):\n    items: list[Post]\n    total_count: int\n"
+            ),
+            "offset page model must be {{ items: list[Post]; total_count: int }}:\n{}",
+            files.models
+        );
+        assert!(
+            !files.models.contains("alias=") && !files.models.contains("populate_by_name"),
+            "page model must NOT use Field(alias=...) / populate_by_name:\n{}",
+            files.models
+        );
+        // Client return type + model_validate of the page.
+        assert!(
+            files.client.contains("-> ListPostsPage:"),
+            "client method must return ListPostsPage:\n{}",
+            files.client
+        );
+        assert!(
+            files
+                .client
+                .contains("return ListPostsPage.model_validate(response.json())"),
+            "client must parse the JSON body into the page:\n{}",
+            files.client
+        );
+        // Client imports only the page type, never the bare item type.
+        assert!(
+            files.client.contains("from .models import ListPostsPage")
+                && !files.client.contains("import Post"),
+            "client must import only the page type:\n{}",
+            files.client
+        );
+        // Handler return type.
+        assert!(
+            files.handlers.contains("-> ListPostsPage: ..."),
+            "handler must return ListPostsPage:\n{}",
+            files.handlers
+        );
+        // Server route annotated with and returns the page.
+        assert!(
+            files.server.contains("-> ListPostsPage:")
+                && files.server.contains("return await handlers.list_posts"),
+            "server route must return the page:\n{}",
+            files.server
+        );
+    }
+
+    /// A cursor-paginated endpoint produces `{ items: list[T]; next_cursor: str
+    /// | None = None }` (the cursor is optional — absent on the last page).
+    #[test]
+    fn cursor_pagination_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    query { Option<String> cursor  Int limit }
+    response List<Post>
+    pagination { cursor }
+}
+"#,
+        );
+        insta::assert_snapshot!("py_cursor_pagination_models", files.models);
+        insta::assert_snapshot!("py_cursor_pagination_client", files.client);
+        insta::assert_snapshot!("py_cursor_pagination_handlers", files.handlers);
+        insta::assert_snapshot!("py_cursor_pagination_server", files.server);
+
+        // Model shape: optional next_cursor with a None default.
+        assert!(
+            files.models.contains(
+                "class ListPostsPage(BaseModel):\n    items: list[Post]\n    next_cursor: str | None = None\n"
+            ),
+            "cursor page model must be {{ items: list[Post]; next_cursor: str | None = None }}:\n{}",
+            files.models
+        );
+        assert!(
+            files.client.contains("-> ListPostsPage:"),
+            "client method must return ListPostsPage:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("-> ListPostsPage: ..."),
+            "handler must return ListPostsPage:\n{}",
+            files.handlers
+        );
+    }
+
+    /// A plain (non-paginated) `List<T>` response is unchanged: no `Page`
+    /// envelope, and both client and handler keep the bare `list[T]`.
+    #[test]
+    fn plain_list_response_unchanged_by_pagination() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post>
+}
+"#,
+        );
+        assert!(
+            !files.models.contains("Page"),
+            "no Page envelope for a non-paginated list:\n{}",
+            files.models
+        );
+        assert!(
+            files.client.contains("-> list[Post]:"),
+            "client must return the bare list[Post]:\n{}",
+            files.client
+        );
+        assert!(
+            files.handlers.contains("-> list[Post]: ..."),
+            "handler must return the bare list[Post]:\n{}",
+            files.handlers
+        );
     }
 }

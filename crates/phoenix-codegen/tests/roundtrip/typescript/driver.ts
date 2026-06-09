@@ -54,6 +54,8 @@ import type {
   Author,
   CreatePostBody,
   GetPostMeteredResult,
+  ListPostsCursorPage,
+  ListPostsOffsetPage,
   Post,
   UpdateAuthorProfileBody,
   UploadAvatarBody,
@@ -154,6 +156,28 @@ function makeStub(c: ContractCase, state: CaseState): Handlers {
         limit: query.limit,
       };
       return signal<Post[]>(c);
+    },
+    // listPostsOffset / listPostsCursor exercise pagination envelopes: the
+    // handler returns the full <Endpoint>Page object ({items, totalCount} or
+    // {items, nextCursor}) and the client reads it back off the response body.
+    // The contract's handler.returns IS that page object, so return it directly
+    // typed as the Page. page/limit (offset) and cursor/limit (cursor) are
+    // ordinary query params delivered as a single `query` arg.
+    async listPostsOffset(query) {
+      state.hit = true;
+      state.received = {
+        page: query.page,
+        limit: query.limit,
+      };
+      return signal<ListPostsOffsetPage>(c);
+    },
+    async listPostsCursor(query) {
+      state.hit = true;
+      state.received = {
+        cursor: query.cursor,
+        limit: query.limit,
+      };
+      return signal<ListPostsCursorPage>(c);
     },
     async searchPosts(query) {
       state.hit = true;
@@ -290,6 +314,20 @@ async function invoke(c: ContractCase): Promise<unknown> {
       const opts: Parameters<typeof api.listTaggedPosts>[1] = {};
       if (q.limit !== undefined) opts.limit = q.limit as number;
       return api.listTaggedPosts(tag, opts);
+    }
+    case "listPostsOffset": {
+      const q = c.call.query ?? {};
+      const opts: Parameters<typeof api.listPostsOffset>[0] = {};
+      if (q.page !== undefined) opts.page = q.page as number;
+      if (q.limit !== undefined) opts.limit = q.limit as number;
+      return api.listPostsOffset(opts);
+    }
+    case "listPostsCursor": {
+      const q = c.call.query ?? {};
+      const opts: Parameters<typeof api.listPostsCursor>[0] = {};
+      if (q.cursor !== undefined) opts.cursor = q.cursor as string;
+      if (q.limit !== undefined) opts.limit = q.limit as number;
+      return api.listPostsCursor(opts);
     }
     case "searchPosts": {
       const q = c.call.query ?? {};

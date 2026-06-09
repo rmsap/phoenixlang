@@ -784,6 +784,20 @@ pub struct HeaderParam {
     pub span: Span,
 }
 
+/// The pagination mode declared via an endpoint's `pagination { ... }` block.
+///
+/// Exactly one of `offset` or `cursor`. The mode words are contextual
+/// identifiers in the grammar (plain `Ident`s, not reserved keywords). Drives
+/// the response-envelope shape generated in codegen (`offset` →
+/// `{ items, totalCount }`, `cursor` → `{ items, nextCursor }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum PaginationMode {
+    /// Offset/limit pagination. Envelope: `{ items: List<T>, totalCount: Int }`.
+    Offset,
+    /// Cursor pagination. Envelope: `{ items: List<T>, nextCursor: Option<String> }`.
+    Cursor,
+}
+
 /// An endpoint declaration describing a single HTTP API endpoint.
 ///
 /// Endpoint declarations are a Phoenix Gen feature that enables code generation
@@ -844,6 +858,9 @@ pub struct EndpointDecl {
     /// Response headers declared inline after the response type via a trailing
     /// `headers { ... }` block (`response Type headers { ... }`). Empty if none.
     pub response_headers: Vec<HeaderParam>,
+    /// The pagination mode declared via a `pagination { offset|cursor }` block;
+    /// `None` if absent. Drives response-envelope generation in codegen.
+    pub pagination: Option<PaginationMode>,
     /// Error variants with HTTP status codes, parsed from the `error { ... }`
     /// block. Empty if no error block is present.
     pub errors: Vec<EndpointErrorVariant>,

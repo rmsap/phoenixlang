@@ -1,0 +1,73 @@
+---
+source: crates/phoenix-codegen/src/openapi.rs
+expression: spec
+---
+{
+  "components": {
+    "schemas": {
+      "ListPostsPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Post"
+            },
+            "type": "array"
+          },
+          "totalCount": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "totalCount"
+        ],
+        "type": "object"
+      },
+      "Post": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/posts": {
+      "get": {
+        "operationId": "listPosts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPostsPage"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "summary": "listPosts"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
+}

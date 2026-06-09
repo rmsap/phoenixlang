@@ -144,6 +144,33 @@ class Stub:
         self._maybe_raise()
         return [m.Post(**item) for item in self._returns()]
 
+    async def list_posts_offset(
+        self, *, page: int, limit: int
+    ) -> m.ListPostsOffsetPage:
+        # Offset pagination: the response is the ListPostsOffsetPage envelope
+        # ({ items, total_count }), not a bare list. The contract's
+        # expect_received keys (page/limit) are already snake_case. The contract's
+        # returns is the full page object using camelCase wire keys (items /
+        # totalCount, with nested Post.avatarUrl); the generated model uses
+        # snake_case fields with no alias, so recursively snake_case the returns
+        # dict (same divergence handled in upload_avatar / update_author_profile)
+        # before model_validate builds the page model.
+        self.hit = True
+        self.received = {"page": page, "limit": limit}
+        self._maybe_raise()
+        return m.ListPostsOffsetPage.model_validate(_normalize(self._returns()))
+
+    async def list_posts_cursor(
+        self, *, cursor: str | None = None, limit: int
+    ) -> m.ListPostsCursorPage:
+        # Cursor pagination: the response is the ListPostsCursorPage envelope
+        # ({ items, next_cursor? }). Same camelCase→snake_case normalization of
+        # the contract's returns as list_posts_offset (nextCursor → next_cursor).
+        self.hit = True
+        self.received = {"cursor": cursor, "limit": limit}
+        self._maybe_raise()
+        return m.ListPostsCursorPage.model_validate(_normalize(self._returns()))
+
     async def get_post(self, id: str) -> m.Post:
         self.hit = True
         self.received = {"id": id}
@@ -396,6 +423,22 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
         if "limit" in q and q["limit"] is not None:
             kwargs["limit"] = q["limit"]
         return await client.list_tagged_posts(call["path_params"]["tag"], **kwargs)
+
+    if endpoint == "listPostsOffset":
+        q = call.get("query", {})
+        # Offset pagination query params (page/limit). The client returns a typed
+        # ListPostsOffsetPage envelope; assert_ok normalizes camel/snake and
+        # deep-compares the whole page (incl. total_count) against expect_client.ok.
+        return await client.list_posts_offset(page=q["page"], limit=q["limit"])
+
+    if endpoint == "listPostsCursor":
+        q = call.get("query", {})
+        kwargs: dict[str, Any] = {"limit": q["limit"]}
+        # cursor is optional (Option<String>); pass it only when present so the
+        # client's `| None = None` default applies otherwise.
+        if "cursor" in q and q["cursor"] is not None:
+            kwargs["cursor"] = q["cursor"]
+        return await client.list_posts_cursor(**kwargs)
 
     if endpoint == "downloadAvatar":
         return await client.download_avatar(call["path_params"]["id"])

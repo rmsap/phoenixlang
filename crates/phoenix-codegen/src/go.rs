@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use phoenix_parser::ast::{Declaration, EnumDecl, Expr, Program, StructDecl};
+use phoenix_parser::ast::{Declaration, EnumDecl, Expr, PaginationMode, Program, StructDecl};
 use phoenix_sema::Analysis;
 use phoenix_sema::checker::{
     DefaultValue, DerivedField, EndpointInfo, HeaderParamInfo, QueryParamInfo, ResolvedDerivedType,
@@ -167,6 +167,7 @@ impl<'a> GoGenerator<'a> {
         for ep in &self.check_result.endpoints {
             self.emit_derived_type(ep);
             self.emit_response_envelope(ep);
+            self.emit_pagination_envelope(ep);
         }
 
         // Compose types.go with header and conditional imports
@@ -561,6 +562,48 @@ impl<'a> GoGenerator<'a> {
         self.types_out.push_str(&render_struct(&type_name, &rows));
     }
 
+    /// Emits the generated `<Endpoint>Page` pagination envelope struct for an
+    /// endpoint that declares a `pagination { }` block. The response is no longer
+    /// the bare `[]T` — it becomes this envelope wrapping the items plus the
+    /// per-mode metadata field:
+    /// - **offset** → `{ Items []T `json:"items"`; TotalCount int64 `json:"totalCount"` }`
+    /// - **cursor** → `{ Items []T `json:"items"`; NextCursor *string `json:"nextCursor"` }`
+    ///   (pointer so an absent cursor serializes to `null` — nil marks the last page)
+    ///
+    /// This is the exact response-envelope machinery the response-header
+    /// `<Endpoint>Result` uses, with `Items` + a metadata field instead of `Body` +
+    /// headers; the two are mutually exclusive (sema rejects the combination), so
+    /// an endpoint never emits both. Endpoints WITHOUT pagination emit nothing and
+    /// keep returning the bare `[]T`.
+    fn emit_pagination_envelope(&mut self, ep: &EndpointInfo) {
+        let Some(ref pag) = ep.pagination else {
+            return;
+        };
+        let type_name = page_type_name(ep);
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+        let item_type = type_to_go(&pag.item_type);
+        let mut rows: Vec<(String, String, String)> = vec![(
+            "Items".to_string(),
+            format!("[]{item_type}"),
+            "`json:\"items\"`".to_string(),
+        )];
+        match pag.mode {
+            PaginationMode::Offset => rows.push((
+                "TotalCount".to_string(),
+                "int64".to_string(),
+                "`json:\"totalCount\"`".to_string(),
+            )),
+            PaginationMode::Cursor => rows.push((
+                "NextCursor".to_string(),
+                "*string".to_string(),
+                "`json:\"nextCursor\"`".to_string(),
+            )),
+        }
+        self.types_out.push_str(&render_struct(&type_name, &rows));
+    }
+
     /// Emits a `Validate() error` method on a derived body type if any of its
     /// fields carry a constraint inherited from the source struct.
     ///
@@ -642,6 +685,12 @@ impl<'a> GoGenerator<'a> {
         // `<Endpoint>Result` (body + each header) instead of the bare body.
         let has_resp_headers = !ep.response_headers.is_empty();
         let result_type = header_result_type_name(ep);
+        // A paginated endpoint returns the `<Endpoint>Page` envelope (`{items,
+        // <metadata>}`) instead of the bare `[]T` — the whole JSON body IS the
+        // page object, decoded like any struct response (mutually exclusive with
+        // response headers).
+        let is_paginated = ep.pagination.is_some();
+        let page_type = page_type_name(ep);
 
         // Build parameter list
         let mut params = Vec::new();
@@ -682,6 +731,8 @@ impl<'a> GoGenerator<'a> {
             "(io.ReadCloser, error)".to_string()
         } else if has_resp_headers {
             format!("(*{}, error)", result_type)
+        } else if is_paginated {
+            format!("(*{}, error)", page_type)
         } else {
             match &response_type {
                 Some(rt) => format!("(*{}, error)", rt),
@@ -861,6 +912,16 @@ impl<'a> GoGenerator<'a> {
             for h in &ep.response_headers {
                 self.emit_client_response_header_read(h);
             }
+            self.client_out.push_str("\treturn &result, nil\n");
+        } else if is_paginated {
+            // The whole response body is the page object (`{items, <metadata>}`),
+            // decoded into the `<Endpoint>Page` envelope like any struct response.
+            self.client_needs_json = true;
+            self.client_out
+                .push_str(&format!("\tvar result {}\n", page_type));
+            self.client_out.push_str(
+                "\tif err := json.NewDecoder(resp.Body).Decode(&result); err != nil {\n\t\treturn nil, err\n\t}\n",
+            );
             self.client_out.push_str("\treturn &result, nil\n");
         } else if let Some(ref rt) = response_type {
             self.client_out.push_str(&format!("\tvar result {}\n", rt));
@@ -1061,6 +1122,10 @@ impl<'a> GoGenerator<'a> {
             "(io.Reader, error)".to_string()
         } else if !ep.response_headers.is_empty() {
             format!("(*{}, error)", header_result_type_name(ep))
+        } else if ep.pagination.is_some() {
+            // A paginated endpoint's handler supplies the page envelope (items +
+            // metadata) instead of the bare `[]T`.
+            format!("(*{}, error)", page_type_name(ep))
         } else {
             match ep.response.as_ref().map(type_to_go) {
                 Some(rt) => format!("(*{}, error)", rt),
@@ -1827,6 +1892,15 @@ fn query_param_shape(ty: &Type) -> (bool, &Type) {
 /// `*T`), so the wire/stringify logic is shared between query params and headers.
 fn header_result_type_name(ep: &EndpointInfo) -> String {
     format!("{}Result", to_pascal_case(&ep.name))
+}
+
+/// The generated pagination-envelope type name for an endpoint that declares a
+/// `pagination { }` block: `<PascalEndpoint>Page` (e.g. `listPosts` →
+/// `ListPostsPage`). Used for the types.go struct, the handler return, the client
+/// return, and the server encode target. Distinct from the response-headers
+/// `<Endpoint>Result` envelope (the two are mutually exclusive per sema).
+fn page_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Page", to_pascal_case(&ep.name))
 }
 
 /// Renders a Go expression that stringifies a header value for the wire,
@@ -2971,5 +3045,113 @@ endpoint uploadAvatar: POST "/api/avatar" {
             "no-response handler call must be statement-scoped:\n{}",
             files.server
         );
+    }
+
+    /// An OFFSET-paginated endpoint: the bare `List<Post>` response becomes the
+    /// `<Endpoint>Page` envelope `{ Items []Post; TotalCount int64 }`. The handler
+    /// and client both return `*ListPostsPage`; the client decodes the whole body
+    /// into the page (the body IS the page object); the server JSON-encodes the
+    /// handler's returned `*ListPostsPage`.
+    #[test]
+    fn pagination_offset_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post> pagination { offset }
+}
+"#,
+        );
+        // Envelope struct: Items + TotalCount (offset's defining metadata).
+        assert!(
+            files.types.contains("type ListPostsPage struct {")
+                && files.types.contains("Items      []Post `json:\"items\"`")
+                && files
+                    .types
+                    .contains("TotalCount int64  `json:\"totalCount\"`"),
+            "offset envelope must be {{ Items []Post; TotalCount int64 }}:\n{}",
+            files.types
+        );
+        // Handler returns the page envelope, not the bare slice.
+        assert!(
+            files
+                .handlers
+                .contains("ListPosts() (*ListPostsPage, error)"),
+            "handler must return *ListPostsPage:\n{}",
+            files.handlers
+        );
+        // Client returns the envelope and decodes the whole body into it.
+        assert!(
+            files
+                .client
+                .contains("func (c *ApiClient) ListPosts() (*ListPostsPage, error)")
+                && files.client.contains("var result ListPostsPage")
+                && files
+                    .client
+                    .contains("json.NewDecoder(resp.Body).Decode(&result)"),
+            "client must return *ListPostsPage and decode the body into it:\n{}",
+            files.client
+        );
+        // Server JSON-encodes the handler's returned page.
+        assert!(
+            files.server.contains("result, err := h.ListPosts()")
+                && files.server.contains("json.NewEncoder(w).Encode(result)"),
+            "server must encode the returned *ListPostsPage:\n{}",
+            files.server
+        );
+        insta::assert_snapshot!("go_pagination_offset_types", files.types);
+        insta::assert_snapshot!("go_pagination_offset_client", files.client);
+        insta::assert_snapshot!("go_pagination_offset_handlers", files.handlers);
+        insta::assert_snapshot!("go_pagination_offset_server", files.server);
+    }
+
+    /// A CURSOR-paginated endpoint: the envelope is `{ Items []Post; NextCursor
+    /// *string }`. `NextCursor` is a pointer so an absent cursor serializes to
+    /// `null` (nil marks the last page). Handler/client return `*ListPostsPage`
+    /// and the body decode/encode path is identical to the offset case.
+    #[test]
+    fn pagination_cursor_envelope() {
+        let files = generate_from_source(
+            r#"
+struct Post { Int id  String title }
+endpoint listPosts: GET "/api/posts" {
+    response List<Post> pagination { cursor }
+}
+"#,
+        );
+        // Envelope struct: Items + NextCursor *string (nil = last page).
+        assert!(
+            files.types.contains("type ListPostsPage struct {")
+                && files.types.contains("Items      []Post  `json:\"items\"`")
+                && files
+                    .types
+                    .contains("NextCursor *string `json:\"nextCursor\"`"),
+            "cursor envelope must be {{ Items []Post; NextCursor *string }}:\n{}",
+            files.types
+        );
+        assert!(
+            files
+                .handlers
+                .contains("ListPosts() (*ListPostsPage, error)"),
+            "handler must return *ListPostsPage:\n{}",
+            files.handlers
+        );
+        assert!(
+            files
+                .client
+                .contains("func (c *ApiClient) ListPosts() (*ListPostsPage, error)")
+                && files.client.contains("var result ListPostsPage"),
+            "client must return *ListPostsPage:\n{}",
+            files.client
+        );
+        assert!(
+            files.server.contains("json.NewEncoder(w).Encode(result)"),
+            "server must encode the returned *ListPostsPage:\n{}",
+            files.server
+        );
+        insta::assert_snapshot!("go_pagination_cursor_types", files.types);
+        insta::assert_snapshot!("go_pagination_cursor_client", files.client);
+        insta::assert_snapshot!("go_pagination_cursor_handlers", files.handlers);
+        insta::assert_snapshot!("go_pagination_cursor_server", files.server);
     }
 }

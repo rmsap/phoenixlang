@@ -4,8 +4,8 @@
 //! correct.  Produces [`EndpointInfo`] with all types resolved.
 
 use crate::checker::{
-    Checker, DefaultValue, DerivedField, EndpointInfo, HeaderParamInfo, QueryParamInfo,
-    ResolvedDerivedType, header_wire_name,
+    Checker, DefaultValue, DerivedField, EndpointInfo, HeaderParamInfo, PaginationInfo,
+    QueryParamInfo, ResolvedDerivedType, header_wire_name,
 };
 use crate::types::Type;
 use phoenix_parser::api_version::normalize_api_version;
@@ -108,6 +108,38 @@ impl Checker {
                 );
             }
         }
+
+        // Pagination. A `pagination { offset|cursor }` block requires the
+        // response to be a bare `List<T>`: the generated `<Endpoint>Page` envelope
+        // wraps that list (`items: List<T>`) plus a mode-specific metadata field.
+        // `Option<List<T>>` is rejected — a paginated call always returns a page
+        // (emptiness is `items: []`), so a null page is meaningless. See
+        // `docs/design-decisions.md` (pagination section).
+        let pagination = ep.pagination.and_then(|mode| {
+            let item_type = match &response {
+                Some(Type::Generic(name, args)) if name == "List" && args.len() == 1 => {
+                    Some(args[0].clone())
+                }
+                _ => None,
+            };
+            match item_type {
+                Some(item_type) => Some(PaginationInfo { mode, item_type }),
+                None => {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: `pagination` requires the response to be a `List<T>` (got {}); a paginated response wraps a list — `Option<List<T>>` and non-list responses are not allowed",
+                            ep.name,
+                            response
+                                .as_ref()
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "no response".to_string())
+                        ),
+                        ep.span,
+                    );
+                    None
+                }
+            }
+        });
 
         // Resolve body type with modifiers. The request-body path looks the
         // base struct up by name (it does not call `resolve_type_expr`), so a
@@ -239,6 +271,26 @@ impl Checker {
             );
         }
 
+        // Pagination and response headers both wrap the handler's single return
+        // value in a generated envelope (`<Endpoint>Page` vs `<Endpoint>Result`),
+        // and a handler has exactly one return slot — so the two envelope types
+        // cannot coexist. Reject the combination here. (On the wire they are
+        // orthogonal — pagination metadata rides in the body, headers in HTTP
+        // headers — so this is purely a return-type-shape limitation. Future
+        // options, nest vs flat-merge, are recorded in `docs/design-decisions.md`
+        // pagination decision 7 / `docs/known-issues.md`.)
+        if pagination.is_some()
+            && let Some(first) = ep.response_headers.first()
+        {
+            self.error(
+                format!(
+                    "endpoint `{}`: `pagination` and response headers cannot be combined — both wrap the response in a generated envelope and a handler has one return value. Carry pagination metadata as response headers instead, or drop one. See docs/known-issues.md.",
+                    ep.name
+                ),
+                first.span,
+            );
+        }
+
         // Request headers share the generated parameter scope with path and
         // query params, so a duplicate local name would emit two parameters of
         // the same name (a compile error in the generated Go/TS/Python). Check
@@ -305,6 +357,7 @@ impl Checker {
             doc_comment: ep.doc_comment.clone(),
             body_is_multipart,
             response_is_binary,
+            pagination,
         });
     }
 
@@ -2154,6 +2207,95 @@ mod tests {
             }
             "#,
             "cannot be sent as a form field",
+        );
+    }
+
+    // ── Pagination ──────────────────────────────────────────────────
+
+    #[test]
+    fn pagination_offset_on_list_resolves() {
+        use phoenix_parser::ast::PaginationMode;
+        let ep = first_endpoint(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" {
+                response List<Post>
+                pagination { offset }
+            }
+            "#,
+        );
+        let pg = ep.pagination.expect("pagination should resolve");
+        assert!(matches!(pg.mode, PaginationMode::Offset));
+        // The item type is the list element (`Post`).
+        assert!(matches!(pg.item_type, crate::types::Type::Named(ref n) if n.ends_with("Post")));
+    }
+
+    #[test]
+    fn pagination_cursor_on_list_resolves() {
+        use phoenix_parser::ast::PaginationMode;
+        let ep = first_endpoint(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" {
+                response List<Post>
+                pagination { cursor }
+            }
+            "#,
+        );
+        let pg = ep.pagination.expect("pagination should resolve");
+        assert!(matches!(pg.mode, PaginationMode::Cursor));
+    }
+
+    #[test]
+    fn pagination_absent_is_none() {
+        let ep = first_endpoint(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" { response List<Post> }
+            "#,
+        );
+        assert!(ep.pagination.is_none());
+    }
+
+    #[test]
+    fn pagination_rejects_non_list_response() {
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            endpoint getPost: GET "/posts/{id}" {
+                response Post
+                pagination { offset }
+            }
+            "#,
+            "requires the response to be a `List<T>`",
+        );
+    }
+
+    #[test]
+    fn pagination_rejects_option_list_response() {
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" {
+                response Option<List<Post>>
+                pagination { offset }
+            }
+            "#,
+            "requires the response to be a `List<T>`",
+        );
+    }
+
+    #[test]
+    fn pagination_rejects_combination_with_response_headers() {
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/posts" {
+                response List<Post> headers { Int totalCount as "X-Total" }
+                pagination { offset }
+            }
+            "#,
+            "cannot be combined",
         );
     }
 }

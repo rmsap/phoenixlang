@@ -1662,3 +1662,114 @@ registered, so only the resolver sees every `File`-bearing position.
   JSON-body OpenAPI output — a consumer that relied on the old (incorrect)
   `required` set will see the field drop out. Covered by
   `derived_type_body_option_field_not_required`.
+
+---
+
+## Phoenix Gen — pagination design (2026-06-06)
+
+Adds first-class cursor and offset pagination, the single most common API shape
+("every team reinvents it"). Locked decisions (language-designer calls):
+
+1. **Surface — a `pagination { <mode> }` endpoint block**, a named section peer to
+   `query` / `headers` / `response` / `error`, NOT a response-type modifier.
+   Rationale: pagination spans request *and* response, so attaching it to the
+   response type alone understates it; a named block matches the grammar's
+   "concerns are blocks" pattern and keeps the mode on its own clear line. `<mode>`
+   is `offset` or `cursor`. New contextual handling for `pagination` + the two
+   mode words (prefer contextual identifiers over new reserved keywords where the
+   lexer allows, as `version` did for `api`).
+
+2. **Scope — envelope only; the user declares the request inputs (Approach 2).**
+   Declaring `pagination { offset }` generates the response *envelope* only. The
+   pagination *inputs* (`page`/`limit`, `cursor`/`limit`) are written by the user
+   in the normal `query { }` block and flow through the existing query-param
+   machinery untouched. Rationale: Phoenix can't know the right param names or
+   defaults for every API; reusing `query` keeps inputs explicit and flexible and
+   adds zero new input machinery. The `pagination` block governs the response
+   shape, nothing else.
+
+3. **Envelope fields — fixed canonical per mode, grammar extensible.** Phoenix
+   fixes the standard fields (the opinionated convention that makes pagination
+   first-class — a team wanting a bespoke shape uses a plain struct + `response`):
+   - **offset** → `<Endpoint>Page { items: List<T>, totalCount: Int }`. `totalCount`
+     is the defining offset signal (enables "page X of Y" / jump-to-last).
+   - **cursor** → `<Endpoint>Page { items: List<T>, nextCursor: Option<String> }`.
+     `nextCursor` null/absent = last page.
+   The handler **supplies** the metadata values (Phoenix cannot compute a total or
+   a cursor); Phoenix only types the envelope shape and wires it onto the response
+   body. The block grammar is a natural subset of a future
+   `pagination { offset  <extra fields> }`, so additive fields (e.g. `hasMore`)
+   are a non-breaking later slice — ship minimal-per-mode now, let demand pull
+   extras. Minimal-canonical chosen over batteries-included (no forcing every
+   offset handler to compute a COUNT for a `hasMore` it may not want).
+   **Cross-target wire-name caveat:** the metadata field name follows each
+   target's pre-existing model convention — camelCase (`totalCount`/`nextCursor`)
+   on Go/TS/OpenAPI, snake_case (`total_count`/`next_cursor`) on Python (the
+   Python generator emits no `Field(alias=...)` on any model, so the wire form is
+   snake_case). Same-language client↔server (incl. the round-trip suite) agree, so
+   this is not a round-trip bug — but it does mean a Python client cannot be mixed
+   with a Go/TS/OpenAPI server, and for offset this now lands on a *required*
+   field (`total_count` vs `totalCount`) rather than only optional struct fields.
+   This is the same pre-existing Python wire-name divergence affecting every
+   model, not something pagination introduces; a future `Field(alias=...)` pass on
+   the Python generator would unify all of them at once.
+
+4. **Response must be `List<T>`.** `pagination { }` requires the endpoint's
+   `response` to be a bare `List<T>`; the envelope's `items` is that same
+   `List<T>`. Sema rejects pagination on a non-list response. **`Option<List<T>>`
+   is explicitly rejected** (not merely unsupported): a paginated call always
+   returns a page; emptiness is `items: []` inside the envelope, so a *null page*
+   is meaningless/ambiguous. A struct that already nests a list is manual
+   pagination — use a plain `response`, not this block.
+
+5. **Naming.** Envelope type is `<Endpoint>Page` (distinct from the response-headers
+   `<Endpoint>Result`, and reads clearly at the call site, e.g. `ListPostsPage`).
+   The list field is always `items`. These are user-facing.
+
+6. **Inputs are NOT validated against the mode (decoupled).** Per Approach 2, sema
+   does not require an offset endpoint to declare `page`/`limit`, nor a cursor
+   endpoint to declare `cursor`. The block governs only the envelope; input
+   correctness is the user's responsibility (a lint could be added later). Keeps
+   the two halves decoupled and the query machinery untouched.
+
+7. **Pagination + response headers on the same endpoint: REJECTED for v1.**
+   Both features wrap the handler's single return value in a generated envelope
+   (`<Endpoint>Result` for headers, `<Endpoint>Page` for pagination), and a
+   handler has exactly one return slot — so the two envelope *types* cannot both
+   be the return type. (On the wire they are orthogonal: pagination metadata rides
+   in the response *body*, headers in HTTP *headers* — the collision is purely at
+   the generated return-type level.) Sema rejects the combination with a clear
+   message. It is rare, and the alternatives below are clean *additive* follow-ups
+   (the headers envelope's existing `body` slot is the natural seam), so rejecting
+   keeps this slice tight without painting us into a corner.
+   - **Future option A — nest:** `<Endpoint>Result { body: <Endpoint>Page { items,
+     totalCount }, <headers...> }`. Composes with minimal special-casing because
+     the headers envelope already has a `body` slot pagination can fill. Cost: the
+     user navigates `result.body.items`.
+   - **Future option B — flat-merge:** `{ items, totalCount, <headers...> }` with
+     codegen knowing which fields serialize to the body vs. become HTTP headers.
+     Flattest for the user, most special-casing across all four targets.
+   The user-facing "you'll hit a sema error if you combine them" angle is also
+   noted in [known-issues.md](known-issues.md#pagination-and-response-headers-cannot-be-combined-on-one-endpoint-v1).
+
+8. **Scope of this slice:** the `pagination { }` block (offset + cursor), envelope
+   generation in all four targets (TS/Python/Go/OpenAPI), reusing the
+   response-envelope precedent from headers. Proven by BOTH harnesses
+   (compile-and-lint + round-trip; the round-trip asserts the handler-supplied
+   metadata round-trips through the body). OpenAPI emits the `<Endpoint>Page`
+   object schema as the 200 response body.
+
+9. **Route-ordering fix (surfaced by this slice, not pagination-specific).** The
+   pagination round-trip exposed a latent bug in the TypeScript (Express) and
+   Python (FastAPI) server generators: both frameworks match routes
+   **first-registered-wins**, and the generators emitted routes in schema source
+   order, so a parametric route (`/api/posts/{id}`) declared before a static
+   sibling (`/api/posts/paged`) **shadowed** the static one — the static path was
+   captured as `id = "paged"` and dispatched to the wrong handler. Fix: both
+   generators now register routes **most-specific (most-static) first** via a
+   `route_specificity_key` (per-segment static-before-`{param}` ordering, stable
+   for equal specificity), matching the most-specific-wins semantics Go's
+   `net/http.ServeMux` (1.22+) already provides — Go needed no change, OpenAPI has
+   no routing. This is a general correctness fix (it also covers e.g.
+   `/users/me` vs `/users/{id}`), found because the round-trip suite executes the
+   generated server rather than only checking it compiles.

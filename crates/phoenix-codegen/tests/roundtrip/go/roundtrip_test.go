@@ -154,6 +154,43 @@ func (s *stub) ListTaggedPosts(tag string, limit int64) (*[]api.Post, error) {
 	return &out, nil
 }
 
+// ListPostsOffset returns an offset-pagination envelope (*ListPostsOffsetPage):
+// a list of items plus a totalCount metadata field. handler.returns is the whole
+// page JSON object, so it unmarshals directly into the Page struct — proving the
+// handler-supplied metadata round-trips through the response body.
+func (s *stub) ListPostsOffset(page int64, limit int64) (*api.ListPostsOffsetPage, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"page":  page,
+		"limit": limit,
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	var out api.ListPostsOffsetPage
+	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
+	return &out, nil
+}
+
+// ListPostsCursor returns a cursor-pagination envelope (*ListPostsCursorPage):
+// a list of items plus an optional nextCursor metadata field. cursor is an
+// optional query param (*string, nil when absent).
+func (s *stub) ListPostsCursor(cursor *string, limit int64) (*api.ListPostsCursorPage, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"cursor": derefStr(cursor),
+		"limit":  limit,
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	var out api.ListPostsCursorPage
+	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
+	return &out, nil
+}
+
 func (s *stub) GetPost(id string) (*api.Post, error) {
 	s.hit = true
 	assertReceived(s.t, s.c, map[string]interface{}{"id": id})
@@ -398,6 +435,26 @@ func invoke(t *testing.T, client *api.ApiClient, c contractCase) error {
 		tag := c.Call.PathParams["tag"]
 		limit := queryInt(c, "limit", 20)
 		got, err := client.ListTaggedPosts(tag, limit)
+		if err != nil {
+			return err
+		}
+		assertOK(t, c, got)
+		return nil
+
+	case "listPostsOffset":
+		page := queryInt(c, "page", 1)
+		limit := queryInt(c, "limit", 20)
+		got, err := client.ListPostsOffset(page, limit)
+		if err != nil {
+			return err
+		}
+		assertOK(t, c, got)
+		return nil
+
+	case "listPostsCursor":
+		cursor := queryOptStr(c, "cursor")
+		limit := queryInt(c, "limit", 20)
+		got, err := client.ListPostsCursor(cursor, limit)
 		if err != nil {
 			return err
 		}

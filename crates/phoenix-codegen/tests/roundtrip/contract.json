@@ -538,5 +538,125 @@
         }
       ]
     }
+  },
+  {
+    "name": "listPostsOffset_pagination_envelope",
+    "endpoint": "listPostsOffset",
+    "kind": "ok",
+    "_note": "Offset pagination. The response is the <Endpoint>Page envelope { items, totalCount }, not a bare list. handler.returns IS the page object the stub returns; expect_client.ok is the page the client must read back off the response body — proving the handler-supplied metadata (totalCount) round-trips. page/limit are ordinary query params (Approach 2). Wire field names are items/totalCount (camelCase) on Go/TS/OpenAPI; the Python target uses snake_case on the wire for all model fields (pre-existing convention) — each driver compares using its own target's field shape.",
+    "call": {
+      "query": { "page": 2, "limit": 10 }
+    },
+    "handler": {
+      "expect_received": { "page": 2, "limit": 10 },
+      "returns": {
+        "items": [
+          {
+            "id": 11,
+            "title": "Paged Post",
+            "body": "body",
+            "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+            "status": "Published",
+            "tags": ["a"]
+          }
+        ],
+        "totalCount": 137
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "items": [
+          {
+            "id": 11,
+            "title": "Paged Post",
+            "body": "body",
+            "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+            "status": "Published",
+            "tags": ["a"]
+          }
+        ],
+        "totalCount": 137
+      }
+    }
+  },
+  {
+    "name": "listPostsCursor_pagination_envelope",
+    "endpoint": "listPostsCursor",
+    "kind": "ok",
+    "_note": "Cursor pagination. Response is the <Endpoint>Page envelope { items, nextCursor? }. This case supplies a non-null nextCursor (more pages follow) and an explicit cursor input, proving the cursor metadata round-trips through the body.",
+    "call": {
+      "query": { "cursor": "abc", "limit": 10 }
+    },
+    "handler": {
+      "expect_received": { "cursor": "abc", "limit": 10 },
+      "returns": {
+        "items": [
+          {
+            "id": 21,
+            "title": "Feed Post",
+            "body": "body",
+            "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+            "status": "Published",
+            "tags": ["b"]
+          }
+        ],
+        "nextCursor": "def"
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "items": [
+          {
+            "id": 21,
+            "title": "Feed Post",
+            "body": "body",
+            "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+            "status": "Published",
+            "tags": ["b"]
+          }
+        ],
+        "nextCursor": "def"
+      }
+    }
+  },
+  {
+    "name": "listPostsCursor_last_page_null_cursor",
+    "endpoint": "listPostsCursor",
+    "kind": "ok",
+    "_note": "Cursor pagination, LAST page: nextCursor is null (no more pages). Exercises the null-cursor wire path the non-null case above doesn't — Go (`*string`) and Python (`str | None`) serialize it as JSON null, so this proves a null nextCursor round-trips through the body and back into the typed envelope. Matches the OpenAPI page schema, where nextCursor is nullable (anyOf [string, null]).",
+    "call": {
+      "query": { "cursor": "tail", "limit": 10 }
+    },
+    "handler": {
+      "expect_received": { "cursor": "tail", "limit": 10 },
+      "returns": {
+        "items": [
+          {
+            "id": 22,
+            "title": "Last Post",
+            "body": "body",
+            "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+            "status": "Published",
+            "tags": ["c"]
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    "expect_client": {
+      "ok": {
+        "items": [
+          {
+            "id": 22,
+            "title": "Last Post",
+            "body": "body",
+            "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+            "status": "Published",
+            "tags": ["c"]
+          }
+        ],
+        "nextCursor": null
+      }
+    }
   }
 ]

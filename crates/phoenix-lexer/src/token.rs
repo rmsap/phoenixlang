@@ -126,6 +126,13 @@ pub enum TokenKind {
     /// headers appear immediately after a response type as
     /// `response TypeExpr headers { ... }`.
     Headers,
+    /// The `pagination` keyword, introducing a pagination block inside an endpoint.
+    ///
+    /// Appears as a top-level endpoint section `pagination { offset }` or
+    /// `pagination { cursor }`. The mode words `offset`/`cursor` are contextual
+    /// identifiers (plain `Ident`s, not reserved keywords), matched by text in
+    /// the parser.
+    Pagination,
     /// The `where` keyword, introducing a constraint clause on a struct field.
     ///
     /// Appears as `Type name where <expr>` inside a struct body. The constraint

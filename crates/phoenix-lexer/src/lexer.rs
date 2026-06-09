@@ -11,10 +11,44 @@ use phoenix_common::span::{SourceId, Span};
 /// `Lexer::lex_ident_or_keyword` by
 /// `tests::keywords_const_matches_lexer_recognition`.
 pub const KEYWORDS: &[&str] = &[
-    "api", "as", "body", "break", "continue", "defer", "dyn", "else", "endpoint", "enum", "error",
-    "false", "for", "function", "headers", "if", "impl", "import", "in", "let", "match", "mut",
-    "omit", "partial", "pick", "public", "query", "response", "return", "schema", "self", "struct",
-    "trait", "true", "type", "where", "while",
+    "api",
+    "as",
+    "body",
+    "break",
+    "continue",
+    "defer",
+    "dyn",
+    "else",
+    "endpoint",
+    "enum",
+    "error",
+    "false",
+    "for",
+    "function",
+    "headers",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "let",
+    "match",
+    "mut",
+    "omit",
+    "pagination",
+    "partial",
+    "pick",
+    "public",
+    "query",
+    "response",
+    "return",
+    "schema",
+    "self",
+    "struct",
+    "trait",
+    "true",
+    "type",
+    "where",
+    "while",
 ];
 
 /// A lazy, pull-based lexer for Phoenix source code.
@@ -356,6 +390,7 @@ impl<'src> Lexer<'src> {
             "partial" => TokenKind::Partial,
             "query" => TokenKind::Query,
             "headers" => TokenKind::Headers,
+            "pagination" => TokenKind::Pagination,
             "where" => TokenKind::Where,
             "schema" => TokenKind::Schema,
             "api" => TokenKind::Api,
@@ -1291,6 +1326,7 @@ mod tests {
         assert_eq!(token_kinds("pick"), vec![Pick, Eof]);
         assert_eq!(token_kinds("partial"), vec![Partial, Eof]);
         assert_eq!(token_kinds("query"), vec![Query, Eof]);
+        assert_eq!(token_kinds("pagination"), vec![Pagination, Eof]);
     }
 
     #[test]

@@ -204,6 +204,38 @@ endpoint downloadAvatar: GET "/api/authors/{id}/avatar" {
     error { NotFound(404) }
 }
 
+// ── Pagination (offset + cursor envelopes) ────────────────────
+
+/**
+ * Offset-paginated post listing. The `pagination { offset }` block makes the
+ * response a `ListPostsOffsetPage` envelope: { items: List<Post>, totalCount }.
+ * The page/limit inputs are ordinary query params (Approach 2 — the user owns
+ * the inputs; the block governs only the response envelope).
+ */
+endpoint listPostsOffset: GET "/api/posts/paged" {
+    query {
+        Int page = 1
+        Int limit = 20
+    }
+    response List<Post>
+    pagination { offset }
+    error { NotFound(404) }
+}
+
+/**
+ * Cursor-paginated post listing. The `pagination { cursor }` block makes the
+ * response a `ListPostsCursorPage` envelope: { items: List<Post>, nextCursor? }
+ * (nextCursor absent/null = last page).
+ */
+endpoint listPostsCursor: GET "/api/posts/feed" {
+    query {
+        Option<String> cursor
+        Int limit = 20
+    }
+    response List<Post>
+    pagination { cursor }
+}
+
 // ── API versioning (path-prefix block) ────────────────────────
 
 /**

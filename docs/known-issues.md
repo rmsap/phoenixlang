@@ -79,6 +79,29 @@ working safety check.
 (multipart server routes). **Workaround:** validate the constrained field inside
 the handler. **Target phase:** demand-triggered. Surfaced 2026-06-05.
 
+### Pagination and response headers cannot be combined on one endpoint (v1)
+
+An endpoint may declare `pagination { ... }` **or** response headers
+(`response <T> headers { ... }`), but not both — sema rejects the combination with
+a clear error. Both features wrap the handler's single return value in a generated
+envelope type (`<Endpoint>Page` for pagination, `<Endpoint>Result` for response
+headers), and a handler has exactly one return slot, so the two envelope types
+can't both be the return type. On the wire the two are orthogonal (pagination
+metadata in the response body, headers in HTTP headers); the limitation is purely
+at the generated return-type level.
+
+**Workaround:** if you need both, carry the pagination metadata as response
+headers instead (`response List<T> headers { Int totalCount ... }`) and skip the
+`pagination` block, or carry it in a hand-written response struct.
+
+**Planned fix (additive, non-breaking):** nest the page inside the headers
+envelope (`<Endpoint>Result { body: <Endpoint>Page, <headers...> }`) — the headers
+envelope already has a `body` slot that pagination can fill — or flat-merge the
+fields with codegen routing each to body vs. HTTP header. Full rationale and both
+options are recorded in
+[design-decisions.md](design-decisions.md#phoenix-gen--pagination-design-2026-06-06)
+(decision 7). **Target phase:** demand-triggered.
+
 ### Defaulted request and query inputs diverge per target and mostly can't trigger the server default
 
 A Phoenix Gen endpoint input with a default — a query param (`Int page = 1`) or a request header (`Int maxStale = 60`) — does not produce a uniform generated **client** shape across targets, and on two of three targets the server's default branch is unreachable through the generated client:
