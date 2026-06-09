@@ -1387,9 +1387,10 @@ A *user-defined* generic enum like `enum Pair<T, U> { Both(T, U), Single(T) }` w
 
 **Deferred to the print-Float slice:** the formatter design decision (Ryu vs integer-fast-path + lossy vs host-delegated), the K-number it lands under, the matching `phx_print_f64` helper synthesis. `Op::BuiltinCall("Float.toString", _)` (if Phoenix ever wires it as a builtin) shares the same formatter; that's the natural pair-up for the slice.
 
-#### K.6. wasm32-gc Float-print formatter: synthesized inline Ryu, no runtime embed
+#### K.6. wasm32-gc Float-print formatter: synthesized inline Ryu, no runtime embed; both backends emit Ryu's scientific format
 
-**Decided:** 2026-06-05 (sub-decision under K, locked alongside PR 6 slice 5 — `print(Float)` on wasm32-gc via inline Ryu).
+**Decided:** 2026-06-05 (original module-size decision).
+**Amended:** 2026-06-09 (output-format pivot — see "Amendment: output format" below).
 
 **Primary reason: module size.** This decision was specifically chosen over the "embed-and-merge the runtime" alternative on module-size grounds. Embedding `phoenix-runtime` brings ~50KB of compiled WASM into every wasm32-gc module — even a "hello world" that never prints a Float — because the merge is whole-module: dlmalloc, the Phoenix mark-sweep GC, every linear-memory string/list/map/builder runtime helper, panic infrastructure. A synthesized inline `phx_print_f64` adds ~5KB of precomputed power-of-5 tables (in a passive data segment) plus ~400 instructions of bytecode — *only when the module actually calls* `print(Float)`. The size ratio is ~10× in favor of inline synthesis on the typical fixture, and ~70× on a hello-world. Module-size matters in the WASM-GC use cases Phoenix targets (browser delivery, embedded VMs, edge runtimes) — every kilobyte adds startup latency and bandwidth.
 
@@ -1400,44 +1401,72 @@ A *user-defined* generic enum like `enum Pair<T, U> { Both(T, U), Single(T) }` w
 3. **Avoids two memory models cohabiting.** Today wasm32-gc has a clean separation: WASM-GC managed heap for objects (host VM traces), ~4KB of linear memory for WASI iovec staging. Under embed-and-merge, programs would have both the host VM's managed heap *and* a linear-memory dlmalloc heap from the runtime. Two distinct allocators for one program; conceptually muddier; the host VM's GC can't trace through linear-memory references.
 4. **Wider runtime-merger reuse isn't actually there.** The runtime's string / list / map / builder helpers operate on linear-memory `PhxFatPtr` / typed pointers, not WASM-GC `(ref $type)`. Calling them from wasm32-gc would require extract-marshal-allocate-copy roundtrips that defeat the K.2 / K.4 zero-copy promises. The only runtime helpers we could *actually* use are the by-value scalar ones (`phx_print_i64`, `phx_print_f64`, `phx_print_bool`) — and one of those (`phx_print_i64`) is already synthesized inline cheaply. The runtime-merge code-reduction argument shrinks to "replace 80 LOC of `phx_print_i64` synth" — not worth the 50KB module-size hit.
 
-**Chosen.** Synthesize `phx_print_f64` inline using wasm-encoder. The helper structure mirrors `phx_print_i64`'s shape but with a larger algorithm:
+##### Amendment: output format (2026-06-09)
+
+The original 2026-06-05 decision said "synthesized inline Ryu" but **did not pin down the output format** the helper would target. An empirical probe (2026-06-09, during PR 6 slice 5 Phase 2 implementation) surfaced that Rust's `f64::to_string()` — which `phoenix-runtime::format_f64` calls for non-integer values — emits **fixed-point notation, always**, with no scientific shortcut. So `(1e100).to_string()` is a 101-character string (`"10000…000"`), `(5e-324).to_string()` is a 325-character string (`"0.000…0005"`), `f64::MAX.to_string()` is 309 digits. The `ryu` crate, by contrast, picks scientific when the magnitude is large or small (`"1e100"`, `"5e-324"`) — the same *convention* used by Python `repr`, Go `fmt`, ECMAScript, and the Ryu paper itself, though not the same *bytes* (those languages emit `1e+100` with an explicit `+`, and ECMAScript prints `5.0` as `"5"`). The single source of truth for Phoenix's *runtime print/`Float→String` format* is the `ryu` crate's `Buffer::format` output, pinned byte-for-byte by `format_f64_pins_ryu_output` in `phoenix-runtime`; the wasm32-gc port targets those bytes, not any other language's. Out of scope: `phoenix-codegen`'s emission of Float default values and literals into generated Go/TypeScript/Python source (Rust `Display` today) and generated Go's wire serialization (`strconv.FormatFloat(_, 'f', -1, 64)`, fixed-point) — those produce source literals and serialized values for other languages' parsers, not Phoenix `print` output, so matrix consistency doesn't constrain them. Whether they should converge on ryu's bytes is an open question for a codegen slice, not this one.
+
+A Ryu port that targets Rust's fixed-point output would need a ~340-byte scratch buffer (worst case `5e-324`) plus a custom fixed-point emission stage; a Ryu port that targets ryu-the-crate's scientific output needs a ~24-byte buffer and matches the published algorithm verbatim. The native-side question — which format is the right native default — surfaced at the same time: every other major language defaults to scientific for extreme magnitudes; Rust's fixed-point Display for f64 is widely criticized as a footgun. Forcing wasm32-gc to mirror it would propagate that footgun, and bloat the helper.
+
+**Resolution:** switch **both** backends to Ryu's scientific format.
+
+- Native `phoenix-runtime::format_f64` is rewritten to `ryu::Buffer::new().format(val).to_string()`. The integer fast-path (`val.fract() == 0.0 && in i64 range → (val as i64).to_string()`) is removed; the `-0.0`/NaN/inf branches were already handled by ryu (ryu emits `"-0.0"`, `"NaN"`, `"inf"`, `"-inf"`).
+- Wasm32-gc `phx_print_f64` ports the `ryu` crate's `d2s` algorithm verbatim — including the scientific-vs-fixed dispatch heuristic. No integer fast-path. No `-0.0` special case (ryu's algorithm handles it).
+
+**User-visible native output changes** (compared to the pre-amendment behavior):
+
+| Input | Was | Now |
+|---|---|---|
+| `print(5.0)`, `print(-7.0)` | `5`, `-7` | `5.0`, `-7.0` |
+| `print(0.0)`, `print(-0.0)` | `0`, `-0` | `0.0`, `-0.0` |
+| `print(1e100)` | 101-char fixed-point | `1e100` |
+| `print(5e-324)` | 325-char fixed-point | `5e-324` |
+| `print(f64::MAX)` | 309 digits | `1.7976931348623157e308` |
+| `print(0.1)`, `print(3.14)`, `print(0.30000000000000004)` | unchanged | unchanged |
+| `print(NaN)`, `print(inf)`, `print(-inf)` | unchanged | unchanged |
+
+The fixture/test impact is bounded to expectations that print *integer-valued* Floats — the only finite class whose output changes inside the fixed-point range: driver tests in `crates/phoenix-driver/tests/` — `basic.rs` (`float_addition`, `float_multiplication`, `negative_float_modulo`: `"4"`/`"10"`/`"-2"` → `"4.0"`/`"10.0"`/`"-2.0"`), `traits.rs` (`25` → `25.0`), `types_and_structs.rs` (Float struct fields), `enums_and_matching.rs` (Float enum-variant fields) — plus the `large` fixture expectations in `crates/phoenix-bench/tests/fixture_validity.rs` (tree-walk and IR-interp copies) and one native assertion in `crates/phoenix-cranelift/tests/compile_result_methods.rs` (`unwrap_or` yielding `0.0`). Tests asserting non-integer values (`78.53975`, `3.14`, …) are unchanged — ryu and Rust std agree there. Three Phase-1 wasm32-gc tests are reworked accordingly: the integer fast-path test is removed (no fast-path under ryu), the special-cases test drops its `-0.0 → "-0"` line, and the general-case trap test expands to also pin `print(5.0)`, `print(-0.0)`, and the out-of-range integer-valued case as traps until Phase 2 lands.
+
+**Known asymmetry: print output is not re-parseable as a Phoenix literal.** The lexer has no exponent syntax — `1e100` is not a valid Float literal (the wasm trap tests write it longhand) — so scientific-notation output from `print` cannot be pasted back into Phoenix source. Pre-amendment fixed-point output didn't have this asymmetry. Not a blocker for this slice, but it creates a standing motivation for exponent literals in a future lexer slice; if that lands, it should follow ryu's no-`+` form (`1e100`, `5e-324`) so literals round-trip with output.
+
+##### Algorithm (post-amendment)
 
 ```text
 phx_print_f64(v: f64):
   Step 1: Special cases (early returns)
-    - v is NaN: print "NaN"
-    - v is +Infinity: print "inf"
-    - v is -Infinity: print "-inf"
-      (±0.0 is NOT special-cased — both fall through to Step 2 and
-       print "0", matching native: native takes the integer fast-path
-       for -0.0 too, casts to 0i64, and drops the sign)
-  Step 2: Integer fast-path (matches native's `format_f64` semantics)
-    - if v.fract() == 0.0 && v in i64 range:
-        let n = v as i64
-        call phx_print_i64(n) — reuse existing helper, prints "5" not "5.0"
-        (±0.0 land here → "0"; the i64 cast drops -0.0's sign, as native does)
-  Step 3: General Ryu d2s
+    - v is NaN: print "NaN\n"
+    - v is +Infinity: print "inf\n"
+    - v is -Infinity: print "-inf\n"
+      (-0.0 is NOT special-cased — ryu's algorithm prints it as "-0.0".
+       Letting it flow into d2s matches ryu's behavior verbatim.)
+  Step 2: Ryu d2s (general case — finite, non-NaN, non-±inf)
     - extract sign / mantissa / exponent from f64 bit pattern
-    - compute decimal representation via Ryu's mulShift on precomputed POW5
-    - find shortest round-trippable decimal
-    - emit digits + decimal point + exponent (if needed)
+    - compute (digit_string, decimal_exponent) via ryu's mulShift on
+      precomputed POW5 / POW5_INV tables, plus the shortest-decimal
+      reduction loop
+    - emit digits + decimal point + (optional 'e' + signed exponent)
+      using ryu's scientific-vs-fixed dispatch heuristic
 ```
 
-**Precomputed tables.** Two passive data segments:
+**No integer fast-path.** The pre-amendment integer fast-path delegated `5.0` to `phx_print_i64`, producing `"5"`. Under ryu, `5.0` produces `"5.0"`; the fast-path is removed (it would now produce a different output from the general case). Removing the fast-path also removes the `-0.0`-loses-its-sign-via-i64-cast surprise: under ryu, `-0.0` flows through d2s naturally and emits `"-0.0"`.
+
+**Precomputed tables.** Two passive data segments (unchanged from the original decision — same algorithm, same tables):
 
 - **`DOUBLE_POW5_INV_TABLE`** — 342 entries × 128 bits (16 bytes) = ~5.3 KiB. Indexed by positive exponent; each entry is the ceiling of `2^k / 5^i` for the appropriate `k`.
 - **`DOUBLE_POW5_TABLE`** — 26 entries × 128 bits = ~416 bytes. Indexed by negative exponent; each entry is the floor of `5^i / 2^k`.
 
-The tables are embedded via `reserve_string_data`-style passive segments (using the existing `data_segment_count` accounting). They're emitted only when the module actually prints a Float — modules that don't carry no table overhead.
+The tables are embedded as passive segments (using the existing `data_segment_count` accounting). They're emitted only when the module actually prints a Float — modules that don't carry no table overhead.
 
 **128-bit multiplication.** WASM's i64 multiply is 64×64 → 64 (low bits only — no native widening multiply). For Ryu's `mulShift`, we need 64×64 → 128. The standard composition: split each i64 into two i32 halves, do four i32×i32 → i64 multiplications, sum with shifts. ~30 WASM instructions per call. Inlined at each `mulShift` site (called twice per Ryu invocation) rather than factored to a helper, since the call-site count is bounded.
+
+**Scratch buffer.** Ryu's f64 output is bounded by 24 characters. The worst case is a negative small-magnitude value whose exponent needs 4 chars: `-2.2250738585072014e-308` (= `-f64::MIN_POSITIVE`) — note it is *not* the large-magnitude `-1.7976931348623157e308` (23 chars), because the negative exponent costs one extra character. Ryu's own `Buffer` is `[u8; 24]`. The wasm32-gc helper reserves 32 bytes (`PRINT_F64_BUF_END - PRINT_F64_BUF_START`) — the 24-char worst case plus the trailing `\n` is 25, leaving 7 bytes of headroom. The pre-amendment 64-byte buffer is reduced to 32; the Phase-1 short-literal helper (`emit_print_literal`) still fits.
 
 **Adversarial test corpus.** A unit test compares wasm32-gc's `print(Float)` output against `phoenix-runtime::format_f64(v)` for a fixed corpus of f64 values covering:
 
 - Normal values: 0, 1, -1, 0.1, 3.14, 1e10, 1e-10, etc.
-- Boundaries: f64::MIN_POSITIVE, f64::MAX, f64::EPSILON.
-- Special: f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0.
-- Rounding edge cases known to stress Ryu (from the Ryu paper's published test set).
+- Boundaries: f64::MIN_POSITIVE, f64::MAX, f64::EPSILON, ±0.0.
+- Special: f64::NAN, f64::INFINITY, f64::NEG_INFINITY.
+- Ryu's published test set (rounding edge cases that historically stressed shortest-roundtrip algorithms).
+- Magnitude bracket switches (values right at the scientific/fixed dispatch boundary).
 
 Random testing is deferred — a deterministic corpus pins behavior; random fuzzing is a follow-up if a bug surfaces in fixture coverage.
 
@@ -1447,13 +1476,21 @@ Random testing is deferred — a deterministic corpus pins behavior; random fuzz
 - **Narrow extractor pulling just `phx_print_f64` + transitive deps.** Rejected: the transitive-dep walk through Rust std's float formatter pulls in formatting machinery, integer-to-string helpers, and panic landing pads; the extractor itself is delicate code (~300 LOC) for a one-function payload.
 - **Compile-time const-fold only.** Rejected as a *sole* approach: leaves runtime-computed Floats unprintable. Could be added as an optimization atop the synthesized helper in a follow-up — but not in place of it.
 - **Lossy fixed-precision fallback.** Rejected: byte-for-byte divergence from native on any non-integer Float breaks matrix consistency on every fixture that prints one.
+- **Mirror Rust std's fixed-point format on both sides (Option A from the 2026-06-09 review).** Rejected per the Amendment: requires ~340-byte buffer and a custom fixed-point emission stage on wasm32-gc; propagates Rust std's widely-criticized fixed-point default into a target where every other Phoenix backend would have to match.
+- **Defer print(Float) entirely (Option C from the 2026-06-09 review).** Rejected: a target that traps on `print(3.14)` is shippably broken; deferring leaves slice 5 half-complete with no exit story.
 
-**Implementation pointers** (Phase 1 landed; Phase 2/3 items flagged *not yet landed* — phase numbering matches `float_helpers.rs`'s module-level breakdown: Phase 1 = special cases + integer fast-path, Phase 2 = Ryu d2s, Phase 3 = adversarial corpus):
-- `phx_print_f64` synth: `crates/phoenix-cranelift/src/wasm/wasm_gc/float_helpers.rs` (new — separated from `string_helpers.rs` because the surface is large and self-contained). *Landed (Phase 1: special cases + integer fast-path; general Ryu case traps via `unreachable`).*
+**Implementation pointers** (numbering matches `float_helpers.rs`'s module-level breakdown):
+
+- Phase 1: native `format_f64` rewrite to ryu; wasm32-gc `phx_print_f64` keeps only NaN/±inf inline branches plus an `unreachable` trap for the general case. *To be reworked in this PR (the original Phase 1 — special cases + integer fast-path + `-0.0` — landed on 2026-06-08 and is now obsolete).*
+- Phase 2: port ryu's d2s digit-finding + scientific emission into wasm-encoder bytecode; emit POW5 / POW5_INV tables as passive data segments via the existing `reserve_string_data` path; replace the Phase-1 trap. *Not yet landed.*
+- Phase 3: adversarial test corpus — `float_print_matches_native` in `crates/phoenix-cranelift/tests/compile_wasm_gc.rs`. *Not yet landed.*
+
+Code locations:
+- `phx_print_f64` synth: `crates/phoenix-cranelift/src/wasm/wasm_gc/float_helpers.rs`.
 - `translate_print`'s Float arm: dispatch to `phx_print_f64` when arg is `ValType::F64`. *Landed.*
 - `HelperNeeds::print_f64` flag: scanner picks up `BuiltinCall("print", args)` whose `args[0]` is `IrType::F64`. *Landed.*
-- POW5 / POW5_INV tables: reserved as passive data segments via the existing `reserve_string_data` path (the segment-count accounting carries over) — to be added to `module_builder.rs` as `declare_pow5_tables`. *Phase 2, not yet landed.*
-- Adversarial corpus: `crates/phoenix-cranelift/tests/compile_wasm_gc.rs::float_print_matches_native` — a single test iterating a fixed corpus, computing native output via `phoenix_runtime::format_f64`, compiling a wasm32-gc module that prints the same value, asserting byte-equality. *Phase 3, not yet landed.*
+- Native `format_f64`: `crates/phoenix-runtime/src/lib.rs`.
+- `ryu` crate dep: `crates/phoenix-runtime/Cargo.toml` (workspace dep declared in root `Cargo.toml`).
 
 ---
 

@@ -111,7 +111,10 @@ pub fn roundtrip(source: &str) {
 /// strictly stronger than `roundtrip`: it catches cases where the IR
 /// interp and the compiled backend happen to agree on a wrong answer, so
 /// a regression in one surfaces immediately rather than propagating.
-pub fn three_way_roundtrip(source: &str) {
+///
+/// Returns the agreed output so callers that also pin exact bytes don't
+/// have to compile, link, and run the native binary a second time.
+pub fn three_way_roundtrip(source: &str) -> Vec<String> {
     let ast_out = ast_run(source);
     let ir_out = ir_run(source);
     let compiled_out = compile_and_run(source);
@@ -123,6 +126,7 @@ pub fn three_way_roundtrip(source: &str) {
         ir_out, compiled_out,
         "IR vs Compiled mismatch\n  IR:       {ir_out:?}\n  Compiled: {compiled_out:?}",
     );
+    compiled_out
 }
 
 /// Compile object bytes to a linked executable and return (obj_path, exe_path).

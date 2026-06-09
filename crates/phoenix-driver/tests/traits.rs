@@ -195,7 +195,8 @@ function main() {
     print(s.name())
 }
 "#,
-        &["25", "square"],
+        // Float prints with trailing `.0` under ryu (K.6 2026-06-09).
+        &["25.0", "square"],
     );
 }
 

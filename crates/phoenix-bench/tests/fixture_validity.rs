@@ -158,9 +158,10 @@ fn large_fixture_tree_walk() {
     let expected = vec![
         "(4, 6)",
         "(8, 12)",
-        "circle with radius 5: area = 78.53975",
-        "rectangle 3x4: area = 12",
-        "triangle base=6 height=3: area = 9",
+        // Float fields print with trailing `.0` under ryu (K.6 2026-06-09).
+        "circle with radius 5.0: area = 78.53975",
+        "rectangle 3.0x4.0: area = 12.0",
+        "triangle base=6.0 height=3.0: area = 9.0",
         "42",
         "Hello, Phoenix!",
         "60",
@@ -228,9 +229,10 @@ fn large_fixture_ir_interp() {
     let expected = vec![
         "(4, 6)",
         "(8, 12)",
-        "circle with radius 5: area = 78.53975",
-        "rectangle 3x4: area = 12",
-        "triangle base=6 height=3: area = 9",
+        // Float fields print with trailing `.0` under ryu (K.6 2026-06-09).
+        "circle with radius 5.0: area = 78.53975",
+        "rectangle 3.0x4.0: area = 12.0",
+        "triangle base=6.0 height=3.0: area = 9.0",
         "42",
         "Hello, Phoenix!",
         "60",

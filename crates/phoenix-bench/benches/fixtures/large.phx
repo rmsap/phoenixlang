@@ -16,9 +16,9 @@
 // for the authoritative assertion; fizzbuzz lines condensed):
 //   (4, 6)
 //   (8, 12)
-//   circle with radius 5: area = 78.53975
-//   rectangle 3x4: area = 12
-//   triangle base=6 height=3: area = 9
+//   circle with radius 5.0: area = 78.53975
+//   rectangle 3.0x4.0: area = 12.0
+//   triangle base=6.0 height=3.0: area = 9.0
 //   42
 //   Hello, Phoenix!
 //   60

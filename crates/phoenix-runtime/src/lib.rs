@@ -338,16 +338,26 @@ const _: () = {
 
 /// Format a float matching interpreter semantics.
 ///
-/// Whole-number floats that are finite and fit in an `i64` are printed
-/// without a decimal point (e.g. `3.0` → `"3"`).  All other values use
-/// Rust's default `f64` formatting (e.g. `3.14` → `"3.14"`,
-/// `f64::NAN` → `"NaN"`).
-fn format_f64(val: f64) -> String {
-    if val.fract() == 0.0 && val.is_finite() && val >= i64::MIN as f64 && val < i64::MAX as f64 {
-        (val as i64).to_string()
-    } else {
-        val.to_string()
-    }
+/// Uses the `ryu` crate's shortest-roundtrip d2s algorithm with
+/// scientific-notation emission. `1.0` → `"1.0"`, `0.1` → `"0.1"`,
+/// `1e100` → `"1e100"`, `5e-324` → `"5e-324"`, `f64::MAX` →
+/// `"1.7976931348623157e308"`. Special values: `NaN` → `"NaN"`,
+/// `±Infinity` → `"inf"` / `"-inf"`, `-0.0` → `"-0.0"`.
+///
+/// The single source of truth for this format is the `ryu` crate's
+/// `Buffer::format` output — not any other language's float printing.
+/// Python `repr`, Go `fmt`, and ECMAScript follow the same
+/// shortest-roundtrip-with-scientific-extremes convention, but their
+/// bytes differ (they emit `1e+100` with a `+`; ECMAScript prints `5.0`
+/// as `"5"`). The wasm32-gc port targets ryu's bytes exactly. It
+/// replaced the prior `f64::to_string()` fixed-point Display on
+/// 2026-06-09 (`docs/design-decisions.md` §Phase 2.4 K.6).
+///
+/// `pub` so cross-backend conformance tests (the K.6 Phase-3
+/// adversarial corpus in `phoenix-cranelift`) can compare against the
+/// canonical native output.
+pub fn format_f64(val: f64) -> String {
+    ryu::Buffer::new().format(val).to_string()
 }
 
 /// Convert a `&str` into a [`PhxFatPtr`] backed by GC memory.
@@ -481,9 +491,11 @@ mod tests {
 
     #[test]
     fn f64_to_str_whole() {
+        // Integer-valued Float prints with a trailing `.0` — there is no
+        // integer fast-path under ryu (K.6).
         let result = phx_f64_to_str(42.0);
         let s = unsafe { slice::from_raw_parts(result.ptr, result.len) };
-        assert_eq!(s, b"42");
+        assert_eq!(s, b"42.0");
     }
 
     #[test]
@@ -641,48 +653,105 @@ mod tests {
 
     #[test]
     fn f64_to_str_large_value() {
-        // Value that is finite with no fractional part but exceeds i64 range.
+        // Finite with no fractional part but exceeds i64 range; ryu
+        // emits it in scientific form.
         let result = phx_f64_to_str(1e19);
         let s = unsafe { slice::from_raw_parts(result.ptr, result.len) };
-        // Should use float formatting, not i64 cast.
-        let s_str = std::str::from_utf8(s).unwrap();
-        assert!(s_str.contains("e") || s_str.contains("10000000000000000000"));
+        assert_eq!(s, b"1e19");
     }
 
-    /// `i64::MAX as f64` rounds up to 2^63 which
-    /// overflows when cast back to i64.  `format_f64` must use float
-    /// formatting for this value, not integer formatting.
+    /// Pins the exact bytes of every output class the K.6 amendment
+    /// introduced (`docs/design-decisions.md` §Phase 2.4 K.6, table of
+    /// user-visible changes). The wasm32-gc Phase-3 corpus compares its
+    /// helper against `format_f64`, so this test is what anchors that
+    /// comparison to known-good strings — and what catches an accidental
+    /// swap to `ryu`'s `format_finite` (which skips the NaN/inf checks).
+    #[test]
+    fn format_f64_pins_ryu_output() {
+        let cases: &[(f64, &str)] = &[
+            // Trailing `.0` on integer-valued floats (no fast-path).
+            (5.0, "5.0"),
+            (-7.0, "-7.0"),
+            (0.0, "0.0"),
+            // -0.0 keeps its sign (the old i64 cast dropped it).
+            (-0.0, "-0.0"),
+            // Fixed-point range unchanged from Rust Display.
+            (0.1, "0.1"),
+            (2.54, "2.54"),
+            // Scientific notation for extreme magnitudes (was 101-,
+            // 325-, and 309-char fixed-point respectively).
+            (1e100, "1e100"),
+            (5e-324, "5e-324"),
+            (f64::MAX, "1.7976931348623157e308"),
+            // Fixed↔scientific dispatch boundary, both sides of each
+            // edge. Ryu emits fixed notation when the decimal point
+            // lands within (-5, 16] of the digit string, scientific
+            // outside it. The wasm32-gc d2s port must replicate this
+            // exact heuristic, so the boundary is pinned here on the
+            // native side (an off-by-one in the ported dispatch
+            // diverges from these bytes, not just from the Phase-3
+            // corpus's extreme magnitudes).
+            (1e15, "1000000000000000.0"),
+            (9999999999999998.0, "9999999999999998.0"),
+            (1e16, "1e16"),
+            (1e-5, "0.00001"),
+            (1e-6, "1e-6"),
+            // Longest possible ryu f64 output: 24 chars. The wasm32-gc
+            // scratch buffer (`PRINT_F64_BUF_*`) is sized against this.
+            (-f64::MIN_POSITIVE, "-2.2250738585072014e-308"),
+            // Special values route through ryu's `format` (NOT
+            // `format_finite`) checks.
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ];
+        for &(val, expected) in cases {
+            assert_eq!(
+                format_f64(val),
+                expected,
+                "format_f64({val:?}) diverged from the pinned K.6 output"
+            );
+        }
+        // Documentation, not a guard: both sides are constants, so this
+        // can only fail if the pinned string above is edited. The real
+        // invariant — wasm32-gc's scratch region (`PRINT_F64_BUF_END -
+        // PRINT_F64_BUF_START` in phoenix-cranelift's module_builder.rs)
+        // covers 24 chars + '\n' — spans crates and is enforced
+        // behaviorally by the Phase-3 corpus, not by this assert.
+        assert_eq!("-2.2250738585072014e-308".len(), 24);
+    }
+
+    /// `i64::MAX as f64` rounds up to 2^63 which overflows when cast back
+    /// to i64. Under ryu (decision K.6 2026-06-09 amendment), there is no
+    /// `(val as i64)` cast on the format path, so the UB-risk this test
+    /// originally guarded is gone — but the test stays as a regression
+    /// pin: `format_f64(i64::MAX as f64)` must roundtrip to the same f64
+    /// value and must not produce the wrap-to-`i64::MIN` string a buggy
+    /// reintroduced fast-path would emit.
     #[test]
     fn f64_to_str_i64_max_boundary() {
-        // i64::MAX as f64 rounds up to 9223372036854775808.0 (2^63),
-        // which is i64::MAX + 1.  Casting this to i64 is UB / overflow.
         let val = i64::MAX as f64;
         let result = format_f64(val);
-        // Must use float formatting (contains 'e' or the full digit string),
-        // NOT integer formatting (which would require a val-as-i64 cast).
         let parsed: f64 = result.parse().expect("must be a valid float string");
         assert_eq!(parsed, val);
-        // Verify we didn't take the integer path by checking the string
-        // is NOT what (val as i64).to_string() would produce (which wraps
-        // to i64::MIN = -9223372036854775808).
         assert!(
             !result.starts_with('-'),
             "format_f64({val}) = \"{result}\" — should not be negative"
         );
     }
 
-    /// Values just below i64::MAX should still use integer
-    /// formatting (the fix must not break the normal path).
+    /// Largest in-range integer-valued f64 just below `i64::MAX`. Under the
+    /// pre-amendment integer fast-path this printed as `"9223372036854774784"`;
+    /// under ryu (K.6 amendment) it prints in scientific form. The roundtrip
+    /// is the load-bearing assertion — the format choice is a side effect
+    /// of switching the formatter, not a separate guarantee.
     #[test]
     fn f64_to_str_just_below_i64_max() {
-        // The largest f64 that is strictly less than i64::MAX as f64.
-        // This is 9223372036854774784.0, which fits in i64.
         let val = 9223372036854774784.0_f64;
         assert!(val < i64::MAX as f64);
         let result = format_f64(val);
-        // Should use integer formatting.
-        let expected = (val as i64).to_string();
-        assert_eq!(result, expected);
+        let parsed: f64 = result.parse().expect("must be a valid float string");
+        assert_eq!(parsed, val);
     }
 
     // ── Allocation ─────────────────────────────────────────────────

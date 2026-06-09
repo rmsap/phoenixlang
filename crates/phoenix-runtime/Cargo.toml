@@ -21,3 +21,6 @@ repository.workspace = true
 #   targets it also produces unused `.so` / `.dylib` / `.dll`
 #   alongside the `.a`.
 crate-type = ["staticlib", "rlib", "cdylib"]
+
+[dependencies]
+ryu.workspace = true

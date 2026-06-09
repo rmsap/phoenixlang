@@ -712,6 +712,7 @@ function main() {
 
 #[test]
 fn enum_variant_display_with_fields() {
+    // Float fields print with a trailing `.0` under ryu (K.6).
     run_expect(
         r#"
 enum Shape {
@@ -725,7 +726,7 @@ function main() {
     print(r)
 }
 "#,
-        &["Circle(5)", "Rect(3, 4)"],
+        &["Circle(5.0)", "Rect(3.0, 4.0)"],
     );
 }
 

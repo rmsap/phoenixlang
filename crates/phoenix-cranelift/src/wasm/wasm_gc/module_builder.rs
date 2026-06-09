@@ -95,24 +95,30 @@ pub(super) const BOOL_FALSE_BYTES: &[u8] = b"false\n";
 
 /// Scratch region for `phx_print_f64` (special-case literals like
 /// `"NaN\n"` and, in Phase 2, the Ryu digit buffer). Sits above the
-/// bool data segments. 64 bytes covers an f64's worst-case shortest-
-/// round-trip decimal (17 significant digits + exponent + sign +
-/// decimal point + newline ≈ 26 chars) with padding. Defined here
-/// alongside the other linear-memory regions so the layout map above
-/// stays the single source of truth; consumed by
-/// [`super::float_helpers`].
+/// bool data segments. 32 bytes is comfortable: ryu's f64 output is
+/// bounded by 24 characters — the worst case is a negative
+/// small-magnitude value whose exponent needs 4 chars,
+/// `"-2.2250738585072014e-308"` (= -f64::MIN_POSITIVE; ryu's own
+/// `Buffer` is `[u8; 24]`) — plus the trailing `'\n'` = 25. The bound
+/// is pinned by `format_f64_pins_ryu_output` in `phoenix-runtime`.
+/// Per `docs/design-decisions.md`
+/// §Phase 2.4 K.6 (2026-06-09 amendment) the helper targets ryu's
+/// scientific format — not the pre-amendment fixed-point worst case
+/// that would have needed ~340 bytes. Defined here alongside the other
+/// linear-memory regions so the layout map above stays the single
+/// source of truth; consumed by [`super::float_helpers`].
 pub(super) const PRINT_F64_BUF_START: u32 = BOOL_FALSE_OFFSET + BOOL_FALSE_BYTES.len() as u32;
 /// Exclusive end of the f64 scratch region. Reserved for the Phase 2
-/// Ryu emitter (digit buffer); unused by the Phase 1 special-case /
-/// integer-fast-path code, hence the `dead_code` allowance.
+/// Ryu emitter (digit buffer); unused by the Phase 1 special-case
+/// code, hence the `dead_code` allowance.
 #[allow(dead_code)]
-pub(super) const PRINT_F64_BUF_END: u32 = PRINT_F64_BUF_START + 64;
+pub(super) const PRINT_F64_BUF_END: u32 = PRINT_F64_BUF_START + 32;
 
 /// Memory pages declared for the module. One 64-KiB page is more than
 /// enough for the iovec staging (12 bytes), the `phx_print_i64`
 /// scratch (32 bytes), the `phx_print_str` scratch (4096 bytes), the
 /// `"true\n"` / `"false\n"` bool payloads (11 bytes), and the
-/// `phx_print_f64` scratch (64 bytes) combined.
+/// `phx_print_f64` scratch (32 bytes) combined.
 /// Grows in a later slice if a longer-lines requirement emerges.
 const MEMORY_PAGES: u64 = 1;
 
@@ -1125,9 +1131,11 @@ impl ModuleBuilder {
     }
 
     /// Synthesize the `phx_print_f64` helper if `needs.print_f64`. The
-    /// helper depends on `fd_write` (for emitting digits) and on
-    /// `phx_print_i64` (for the integer fast-path), so this method
-    /// runs after `declare_imports` and `declare_print_helper`.
+    /// helper depends on `fd_write` (for emitting digits), so this
+    /// method runs after `declare_imports`. The pre-amendment dependency
+    /// on `phx_print_i64` (integer fast-path) is gone per K.6
+    /// 2026-06-09; Phase 2 can re-thread the index if the d2s port
+    /// wants digit-emission reuse.
     pub(super) fn declare_print_f64_helper(
         &mut self,
         needs: HelperNeeds,
@@ -1141,17 +1149,9 @@ impl ModuleBuilder {
                  `declare_imports` did not run (internal compiler bug)",
             )
         })?;
-        let print_i64_idx = self.print_i64_idx.ok_or_else(|| {
-            CompileError::new(
-                "wasm32-gc: `phx_print_f64` needs `phx_print_i64` for the \
-                 integer fast-path, but `declare_print_helper` did not run \
-                 (internal compiler bug)",
-            )
-        })?;
         self.print_f64_idx = Some(super::float_helpers::synthesize_print_f64(
             self,
             fd_write_idx,
-            print_i64_idx,
         )?);
         Ok(())
     }

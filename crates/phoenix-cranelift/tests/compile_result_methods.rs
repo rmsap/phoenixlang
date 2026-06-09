@@ -427,7 +427,8 @@ function main() {
 }
 "#,
     );
-    assert_eq!(out, vec!["true", "0"]);
+    // Float prints with trailing `.0` under ryu (K.6 2026-06-09).
+    assert_eq!(out, vec!["true", "0.0"]);
 }
 
 #[test]

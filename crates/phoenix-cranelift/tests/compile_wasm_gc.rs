@@ -727,37 +727,21 @@ fn mutable_let_runs_under_wasmtime_gc() {
     );
 }
 
-/// `print(Float)` handles special cases and
-/// the integer fast-path inline. Integer-valued finite f64 in i64
-/// range reuses `phx_print_i64` — `5.0` prints as `"5"`, matching
-/// native's `format_f64` semantic. See §Phase 2.4 decision K.6.
-#[test]
-fn print_float_phase1_integer_fast_path_runs_under_wasmtime_gc() {
-    assert_prints(
-        "function main() {\n  print(5.0)\n  print(-7.0)\n  print(0.0)\n}\n",
-        "print_float_phase1_integers",
-        b"5\n-7\n0\n",
-    );
-}
-
-/// NaN, ±inf, and -0.0 special cases. Each
-/// prints byte-for-byte with native's `format_f64`:
+/// NaN and ±inf special cases. Each prints byte-for-byte with native's
+/// post-amendment `format_f64` (ryu) (see §Phase 2.4 K.6 2026-06-09):
 /// - `f64::NAN` → `"NaN"`
 /// - `f64::INFINITY` → `"inf"`
 /// - `f64::NEG_INFINITY` → `"-inf"`
-/// - `-0.0` → `"0"` — native takes the integer fast-path for `-0.0`
-///   (`(-0.0).fract() == 0.0`, finite, in range), casts to `0i64`,
-///   and drops the sign. The helper matches by letting `-0.0` fall
-///   through to the same fast-path rather than special-casing "-0".
+///
+/// `-0.0` is **not** asserted here. Under ryu it prints as `"-0.0"`,
+/// which the Phase-2 d2s general case will emit; the pre-amendment
+/// Phase-1 `-0.0 → "-0"` literal is gone with the integer fast-path
+/// that produced it.
 ///
 /// Source-level Phoenix can't easily produce NaN/Infinity, so the
-/// fixture computes them: `0.0 / 0.0` for NaN, `1.0 / 0.0` for
-/// infinity, etc. `-0.0` is `-1.0 * 0.0`, which lowers to a runtime
-/// `Op::FMul` — Phoenix has no constant-folding pass, so the product
-/// is computed under wasmtime and the IEEE sign bit genuinely reaches
-/// `phx_print_f64` (this is what makes the next clause a real guard,
-/// not a no-op). The guard: that sign bit does *not* leak into the
-/// output.
+/// fixture computes them: `0.0 / 0.0` for NaN, `±1.0 / 0.0` for ±inf.
+/// These flow through the synthesized helper at runtime, exercising
+/// the IEEE-754 branches under wasmtime.
 #[test]
 fn print_float_phase1_special_cases_run_under_wasmtime_gc() {
     let source = concat!(
@@ -765,48 +749,59 @@ fn print_float_phase1_special_cases_run_under_wasmtime_gc() {
         "  let nan: Float = 0.0 / 0.0\n",
         "  let pinf: Float = 1.0 / 0.0\n",
         "  let ninf: Float = -1.0 / 0.0\n",
-        "  let neg_zero: Float = -1.0 * 0.0\n",
         "  print(nan)\n",
         "  print(pinf)\n",
         "  print(ninf)\n",
-        "  print(neg_zero)\n",
         "}\n",
     );
-    assert_prints(
-        source,
-        "print_float_phase1_specials",
-        b"NaN\ninf\n-inf\n0\n",
-    );
+    assert_prints(source, "print_float_phase1_specials", b"NaN\ninf\n-inf\n");
 }
 
-/// Non-integer finite floats trap at runtime
-/// via `unreachable` until the Ryu d2s general case lands (Phase 2).
-/// Pinned as a positive trap so a regression that returned garbage
-/// instead of trapping surfaces here.
+/// Every finite float — non-integer, integer-valued, ±0.0 — traps at
+/// runtime via `unreachable` until the Ryu d2s general case lands
+/// (Phase 2). The pre-amendment Phase 1 special-cased `±0.0` and
+/// integer-valued in-i64-range floats via the integer fast-path; both
+/// are removed under K.6 2026-06-09 (the fast-path emitted `"5"` where
+/// ryu emits `"5.0"`; `-0.0` emitted `"-0"` where ryu emits `"-0.0"`).
+///
+/// Three sub-cases pin all three trap paths:
+/// - non-integer (`1.5`) — original Phase-1 trap, unchanged
+/// - integer-valued in i64 range (`5.0`) — was fast-path, now traps
+/// - integer-valued *out of* i64 range (`1e20`-longhand) — also traps
+///
+/// `-0.0` would trap here too but is covered by its own test below
+/// (the `-1.0 * 0.0` runtime computation makes its sign bit traceable
+/// through the helper, which a constant `-0.0` literal would not — the
+/// lexer/parser may fold `-0.0` to `0.0` at literal time).
 #[test]
-fn print_float_phase1_general_case_traps_until_phase2() {
+fn print_float_phase1_finite_traps_until_phase2() {
     assert_traps(
         "function main() {\n  print(1.5)\n}\n",
-        "print_float_phase1_traps",
+        "print_float_phase1_traps_non_integer",
+    );
+    assert_traps(
+        "function main() {\n  print(5.0)\n}\n",
+        "print_float_phase1_traps_integer_in_range",
+    );
+    assert_traps(
+        "function main() {\n  print(100000000000000000000.0)\n}\n",
+        "print_float_phase1_traps_out_of_range",
     );
 }
 
-/// An integer-valued float *outside* `i64` range
-/// (`1e20`, written longhand since the lexer has no exponent syntax)
-/// has `fract() == 0.0` and is finite, but exceeds `i64::MAX as f64`,
-/// so it misses the integer fast-path's upper-bound guard
-/// (`v < i64::MAX as f64`) and falls to the still-unimplemented
-/// general case — trapping in Phase 1. Native's `format_f64` prints
-/// `"100000000000000000000"` here; this pins the Phase-1 divergence as
-/// a deliberate trap (not silent garbage from an over-eager cast) and
-/// exercises the range guard itself, which the in-range integer test
-/// can't. The general arm replaces this trap with real output when
-/// Ryu d2s lands (Phase 2).
+/// `-0.0` (computed via `-1.0 * 0.0` so its sign bit reaches the
+/// helper at runtime — Phoenix has no constant folding pass, so the
+/// product is computed under wasmtime) traps in Phase 1. Under ryu
+/// (K.6 2026-06-09) it will print `"-0.0"` once Phase 2 lands; the
+/// pre-amendment Phase 1 emitted `"0"` via the i64 fast-path that
+/// silently dropped the sign. Pinned separately from the
+/// integer-fast-path trap to exercise the runtime-computed sign
+/// genuinely reaching `phx_print_f64`.
 #[test]
-fn print_float_phase1_out_of_range_integer_traps_until_phase2() {
+fn print_float_phase1_negative_zero_traps_until_phase2() {
     assert_traps(
-        "function main() {\n  print(100000000000000000000.0)\n}\n",
-        "print_float_phase1_out_of_range",
+        "function main() {\n  let neg_zero: Float = -1.0 * 0.0\n  print(neg_zero)\n}\n",
+        "print_float_phase1_traps_negative_zero",
     );
 }
 

@@ -11,6 +11,13 @@ phoenix-common = { path = "../phoenix-common" }
 phoenix-modules = { path = "../phoenix-modules" }
 phoenix-parser = { path = "../phoenix-parser" }
 phoenix-sema = { path = "../phoenix-sema" }
+# Float formatting — shared shortest-roundtrip d2s implementation. The
+# interpreter's `Display for Value::Float` routes through this so that
+# `phoenix run` (interpreted) and `phoenix build` (native, via
+# phoenix-runtime::format_f64) emit byte-identical Float output. The
+# wasm32-gc backend ports the same algorithm. See
+# `docs/design-decisions.md` §Phase 2.4 K.6.
+ryu.workspace = true
 
 [dev-dependencies]
 phoenix-lexer = { path = "../phoenix-lexer" }

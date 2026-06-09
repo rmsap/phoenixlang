@@ -9,6 +9,11 @@ repository.workspace = true
 [dependencies]
 phoenix-common = { path = "../phoenix-common" }
 phoenix-ir = { path = "../phoenix-ir" }
+# Float formatting — shared shortest-roundtrip d2s. The IR interpreter's
+# Float Display must match the tree-walk interpreter and
+# `phoenix-runtime::format_f64` byte-for-byte so the backend matrix stays
+# consistent. See `docs/design-decisions.md` §Phase 2.4 K.6.
+ryu.workspace = true
 
 [dev-dependencies]
 phoenix-lexer = { path = "../phoenix-lexer" }

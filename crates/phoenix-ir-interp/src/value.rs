@@ -81,7 +81,11 @@ impl IrValue {
     pub fn format(&self, module: &IrModule) -> String {
         match self {
             IrValue::Int(n) => format!("{n}"),
-            IrValue::Float(n) => format!("{n}"),
+            // Float prints via ryu's shortest-roundtrip d2s in scientific
+            // form, matching `phoenix_runtime::format_f64` and the
+            // tree-walk interpreter byte-for-byte. See
+            // `docs/design-decisions.md` §Phase 2.4 K.6 (2026-06-09).
+            IrValue::Float(n) => ryu::Buffer::new().format(*n).to_string(),
             IrValue::String(s) => s.clone(),
             IrValue::Bool(b) => format!("{b}"),
             IrValue::Void => "void".to_string(),
@@ -222,7 +226,8 @@ impl fmt::Display for IrValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IrValue::Int(n) => write!(f, "{n}"),
-            IrValue::Float(n) => write!(f, "{n}"),
+            // Float prints via ryu's shortest-roundtrip d2s (K.6 2026-06-09).
+            IrValue::Float(n) => write!(f, "{}", ryu::Buffer::new().format(*n)),
             IrValue::String(s) => write!(f, "{s}"),
             IrValue::Bool(b) => write!(f, "{b}"),
             IrValue::Void => write!(f, "void"),

@@ -1,7 +1,7 @@
 //! Integration tests: basic compilation and execution of Phoenix programs.
 
 mod common;
-use common::{compile_and_run, roundtrip};
+use common::{compile_and_run, roundtrip, three_way_roundtrip};
 
 #[test]
 fn hello_world() {
@@ -395,6 +395,37 @@ function main() {
 "#,
     );
     assert_eq!(out, vec!["NaN"]);
+}
+
+/// Extreme magnitudes print in ryu's scientific form (K.6 2026-06-09).
+/// The three-way roundtrip ties AST interp, IR interp, and compiled
+/// output together; the byte assert pins all three to ryu's `1e20` /
+/// `1e-6` (agreement alone could mask a shared wrong answer). Literals
+/// are written longhand — the lexer has no exponent syntax.
+#[test]
+fn float_scientific_notation_end_to_end() {
+    let src = r#"
+function main() {
+    print(100000000000000000000.0)
+    print(0.000001)
+}
+"#;
+    assert_eq!(three_way_roundtrip(src), vec!["1e20", "1e-6"]);
+}
+
+/// `-0.0` prints as `"-0.0"` under ryu (K.6 2026-06-09) — the
+/// pre-amendment integer fast-path cast through i64 and dropped the
+/// sign. Computed via `-1.0 * 0.0` at runtime so the IEEE sign bit
+/// genuinely reaches `phx_f64_to_str`.
+#[test]
+fn float_negative_zero_keeps_sign() {
+    let src = r#"
+function main() {
+    let x: Float = -1.0 * 0.0
+    print(x)
+}
+"#;
+    assert_eq!(three_way_roundtrip(src), vec!["-0.0"]);
 }
 
 /// i64::MIN % -1 should produce 0 (safe modulo handling).

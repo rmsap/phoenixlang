@@ -451,6 +451,7 @@ function main() {
 
 #[test]
 fn float_addition() {
+    // Integer-valued Floats print with a trailing `.0` under ryu (K.6).
     run_expect(
         r#"
 function main() {
@@ -458,7 +459,7 @@ function main() {
     print(x)
 }
 "#,
-        &["4"],
+        &["4.0"],
     );
 }
 
@@ -477,6 +478,7 @@ function main() {
 
 #[test]
 fn float_multiplication() {
+    // Integer-valued Floats print with a trailing `.0` under ryu (K.6).
     run_expect(
         r#"
 function main() {
@@ -484,7 +486,41 @@ function main() {
     print(x)
 }
 "#,
-        &["10"],
+        &["10.0"],
+    );
+}
+
+#[test]
+fn float_scientific_notation_output() {
+    // Extreme magnitudes print in ryu's scientific form (K.6 2026-06-09):
+    // `1e20` / `1e-6`, not the 21- and 8-char fixed-point strings Rust's
+    // default Display would emit. Literals are written longhand — the
+    // lexer has no exponent syntax.
+    run_expect(
+        r#"
+function main() {
+    print(100000000000000000000.0)
+    print(0.000001)
+}
+"#,
+        &["1e20", "1e-6"],
+    );
+}
+
+#[test]
+fn float_negative_zero_keeps_sign() {
+    // `-0.0` prints as `"-0.0"` under ryu (K.6 2026-06-09) — the
+    // pre-amendment integer fast-path cast through i64 and dropped the
+    // sign. Computed via `-1.0 * 0.0` at runtime so the IEEE sign bit
+    // genuinely reaches the formatter.
+    run_expect(
+        r#"
+function main() {
+    let x: Float = -1.0 * 0.0
+    print(x)
+}
+"#,
+        &["-0.0"],
     );
 }
 
@@ -1626,6 +1662,7 @@ function main() {
 
 #[test]
 fn negative_float_modulo() {
+    // Integer-valued Floats print with a trailing `.0` under ryu (K.6).
     run_expect(
         r#"
 function main() {
@@ -1633,7 +1670,7 @@ function main() {
     print(x)
 }
 "#,
-        &["-2"],
+        &["-2.0"],
     );
 }
 

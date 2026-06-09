@@ -106,3 +106,13 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # Test scratch directories (used by phoenix-modules and phoenix-lsp tests)
 tempfile = "3"
+
+# Float formatting (shortest-roundtrip d2s in scientific notation). Used by
+# `phoenix-runtime::format_f64` for the canonical native output, by the
+# `phoenix-interp` / `phoenix-ir-interp` Float Display impls so interpreted
+# output matches it byte-for-byte, and as the reference implementation that
+# wasm32-gc's `phx_print_f64` ports verbatim (precomputed POW5 tables + d2s
+# algorithm + scientific emission). Same format on every backend →
+# byte-for-byte matrix consistency.
+# See `docs/design-decisions.md` §Phase 2.4 decision K.6.
+ryu = "1.0"

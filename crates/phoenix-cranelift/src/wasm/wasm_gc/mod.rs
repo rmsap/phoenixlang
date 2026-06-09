@@ -147,9 +147,8 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     if string_needs.print_bool {
         builder.declare_bool_data();
     }
-    // `phx_print_f64` synthesis needs the `fd_write` import and the
-    // already-synthesized `phx_print_i64` (for the integer fast-path)
-    // — both run above this point.
+    // `phx_print_f64` synthesis needs the `fd_write` import, which is
+    // declared above this point.
     builder.declare_print_f64_helper(string_needs)?;
 
     // Declare Phoenix user functions (so call sites can resolve their

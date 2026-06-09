@@ -122,7 +122,12 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n) => write!(f, "{}", n),
-            Value::Float(n) => write!(f, "{}", n),
+            // Float prints via ryu's shortest-roundtrip d2s in scientific
+            // form, matching `phoenix_runtime::format_f64` byte-for-byte.
+            // See `docs/design-decisions.md` §Phase 2.4 K.6 (2026-06-09
+            // amendment). Rust's default `{}` Display is fixed-point-only
+            // (`1e100` → 101-char string), which we deliberately don't use.
+            Value::Float(n) => write!(f, "{}", ryu::Buffer::new().format(*n)),
             Value::String(s) => write!(f, "{}", s),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Void => write!(f, "void"),

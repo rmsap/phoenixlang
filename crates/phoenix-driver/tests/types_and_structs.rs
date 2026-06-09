@@ -1401,7 +1401,8 @@ function main() {
     print(c.timeout)
 }
 "#,
-        &["localhost", "8080", "true", "30"],
+        // Float prints with trailing `.0` under ryu (K.6 2026-06-09).
+        &["localhost", "8080", "true", "30.0"],
     );
 }
 
@@ -1433,7 +1434,8 @@ function main() {
     print(scaled.height)
 }
 "#,
-        &["20", "10"],
+        // Float prints with trailing `.0` under ryu (K.6 2026-06-09).
+        &["20.0", "10.0"],
     );
 }
 
