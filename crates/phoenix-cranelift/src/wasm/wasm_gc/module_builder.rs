@@ -57,6 +57,8 @@ use super::translate;
 /// - `[BOOL_TRUE_OFFSET, BOOL_FALSE_OFFSET + 6)` — the `"true\n"` /
 ///   `"false\n"` payloads pre-populated by `print(Bool)`'s active data
 ///   segments (see [`Self::declare_bool_data`]).
+/// - `[PRINT_F64_BUF_START, PRINT_F64_BUF_END)` — `phx_print_f64`'s
+///   digit / literal scratch (see [`super::float_helpers`]).
 pub(super) const IOVEC_OFFSET: u32 = 8;
 pub(super) const NWRITTEN_OFFSET: u32 = 16;
 /// Scratch buffer for `phx_print_i64`'s digit conversion. 32 bytes
@@ -91,10 +93,26 @@ pub(super) const BOOL_TRUE_BYTES: &[u8] = b"true\n";
 pub(super) const BOOL_FALSE_OFFSET: u32 = BOOL_TRUE_OFFSET + BOOL_TRUE_BYTES.len() as u32;
 pub(super) const BOOL_FALSE_BYTES: &[u8] = b"false\n";
 
+/// Scratch region for `phx_print_f64` (special-case literals like
+/// `"NaN\n"` and, in Phase 2, the Ryu digit buffer). Sits above the
+/// bool data segments. 64 bytes covers an f64's worst-case shortest-
+/// round-trip decimal (17 significant digits + exponent + sign +
+/// decimal point + newline ≈ 26 chars) with padding. Defined here
+/// alongside the other linear-memory regions so the layout map above
+/// stays the single source of truth; consumed by
+/// [`super::float_helpers`].
+pub(super) const PRINT_F64_BUF_START: u32 = BOOL_FALSE_OFFSET + BOOL_FALSE_BYTES.len() as u32;
+/// Exclusive end of the f64 scratch region. Reserved for the Phase 2
+/// Ryu emitter (digit buffer); unused by the Phase 1 special-case /
+/// integer-fast-path code, hence the `dead_code` allowance.
+#[allow(dead_code)]
+pub(super) const PRINT_F64_BUF_END: u32 = PRINT_F64_BUF_START + 64;
+
 /// Memory pages declared for the module. One 64-KiB page is more than
 /// enough for the iovec staging (12 bytes), the `phx_print_i64`
-/// scratch (32 bytes), the `phx_print_str` scratch (4096 bytes), and
-/// the `"true\n"` / `"false\n"` bool payloads (11 bytes) combined.
+/// scratch (32 bytes), the `phx_print_str` scratch (4096 bytes), the
+/// `"true\n"` / `"false\n"` bool payloads (11 bytes), and the
+/// `phx_print_f64` scratch (64 bytes) combined.
 /// Grows in a later slice if a longer-lines requirement emerges.
 const MEMORY_PAGES: u64 = 1;
 
@@ -184,6 +202,14 @@ pub(super) struct ModuleBuilder {
     /// [`Self::declare_string_helpers`] when the IR module calls
     /// `print` with a String argument.
     print_str_idx: Option<u32>,
+
+    /// WASM function index of the synthesized `phx_print_f64` helper
+    /// — Ryu d2s implementation with integer fast-path, NaN/inf/zero
+    /// special cases, and a precomputed power-of-5 table for the
+    /// general case. Populated by
+    /// [`Self::declare_print_f64_helper`] when the IR module calls
+    /// `print` with a Float argument. See §Phase 2.4 decision K.6.
+    print_f64_idx: Option<u32>,
 
     /// WASM function index of the synthesized `phx_str_concat` helper
     /// — allocates a fresh `$bytes` of combined length, `array.copy`s
@@ -288,6 +314,7 @@ impl ModuleBuilder {
             bytes_type_idx: None,
             string_type_idx: None,
             print_str_idx: None,
+            print_f64_idx: None,
             str_concat_idx: None,
             str_eq_idx: None,
             str_cmp_idx: None,
@@ -1084,6 +1111,51 @@ impl ModuleBuilder {
         })
     }
 
+    /// Index of the synthesized `phx_print_f64` helper. See §Phase 2.4
+    /// decision K.6.
+    pub(super) fn require_print_f64_idx(&self) -> Result<u32, CompileError> {
+        self.print_f64_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_print_f64` helper index requested before \
+                 `declare_print_f64_helper` ran with `needs_print_f64 = true` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `print(Float)` call site)",
+            )
+        })
+    }
+
+    /// Synthesize the `phx_print_f64` helper if `needs.print_f64`. The
+    /// helper depends on `fd_write` (for emitting digits) and on
+    /// `phx_print_i64` (for the integer fast-path), so this method
+    /// runs after `declare_imports` and `declare_print_helper`.
+    pub(super) fn declare_print_f64_helper(
+        &mut self,
+        needs: HelperNeeds,
+    ) -> Result<(), CompileError> {
+        if !needs.print_f64 {
+            return Ok(());
+        }
+        let fd_write_idx = self.fd_write_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_print_f64` needs `fd_write`, but \
+                 `declare_imports` did not run (internal compiler bug)",
+            )
+        })?;
+        let print_i64_idx = self.print_i64_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_print_f64` needs `phx_print_i64` for the \
+                 integer fast-path, but `declare_print_helper` did not run \
+                 (internal compiler bug)",
+            )
+        })?;
+        self.print_f64_idx = Some(super::float_helpers::synthesize_print_f64(
+            self,
+            fd_write_idx,
+            print_i64_idx,
+        )?);
+        Ok(())
+    }
+
     /// Index of the synthesized `phx_print_str` helper.
     pub(super) fn require_print_str_idx(&self) -> Result<u32, CompileError> {
         self.print_str_idx.ok_or_else(|| {
@@ -1291,6 +1363,11 @@ pub(super) struct HelperNeeds {
     /// `"true\n"` / `"false\n"` active data segments and gates the
     /// inline if/else lowering in `translate_print`.
     pub(super) print_bool: bool,
+    /// True iff at least one `BuiltinCall("print", args)` site has an
+    /// `args[0]` whose IR type is `F64`. Drives synthesis of the
+    /// inline `phx_print_f64` helper (Ryu d2s + special cases) — see
+    /// §Phase 2.4 decision K.6.
+    pub(super) print_f64: bool,
 }
 
 /// Scan the IR module to determine which string helpers and types
@@ -1355,6 +1432,9 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
                                 }
                                 Some(IrType::Bool) => {
                                     needs.print_bool = true;
+                                }
+                                Some(IrType::F64) => {
+                                    needs.print_f64 = true;
                                 }
                                 _ => {}
                             }

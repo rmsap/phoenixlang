@@ -727,26 +727,86 @@ fn mutable_let_runs_under_wasmtime_gc() {
     );
 }
 
-/// As of PR 6 slice 4 the carve-out here is *print-only*: `ConstF64`,
-/// Float arithmetic, and Float comparison all lower now (see
-/// `float_scalar_ops_run_under_wasmtime_gc`), but `print(Float)` stays
-/// carved out until the formatter slice lands (§Phase 2.4 decision K.5).
-/// So `print(1.5)` lowers its `ConstF64` cleanly and then fails in
-/// `translate_print`'s Bool-fallback path. Slice 1 / slice 2's parallel
-/// test for `print(Bool)` was dropped when slice 2 added the inline
-/// two-segment lowering; this is the remaining carve-out.
-///
-/// The assertion looks for `F64`/`Float` in the diagnostic, which
-/// `translate_print`'s Bool-fallback error message mentions.
+/// `print(Float)` handles special cases and
+/// the integer fast-path inline. Integer-valued finite f64 in i64
+/// range reuses `phx_print_i64` — `5.0` prints as `"5"`, matching
+/// native's `format_f64` semantic. See §Phase 2.4 decision K.6.
 #[test]
-fn print_float_is_rejected_until_a_later_slice() {
-    let ir_module = lower_to_ir("function main() {\n  print(1.5)\n}\n");
-    let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("print(Float) should not compile until the f64 slice lands");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("F64") || msg.contains("Float"),
-        "expected an F64/Float diagnostic, got: {msg}"
+fn print_float_phase1_integer_fast_path_runs_under_wasmtime_gc() {
+    assert_prints(
+        "function main() {\n  print(5.0)\n  print(-7.0)\n  print(0.0)\n}\n",
+        "print_float_phase1_integers",
+        b"5\n-7\n0\n",
+    );
+}
+
+/// NaN, ±inf, and -0.0 special cases. Each
+/// prints byte-for-byte with native's `format_f64`:
+/// - `f64::NAN` → `"NaN"`
+/// - `f64::INFINITY` → `"inf"`
+/// - `f64::NEG_INFINITY` → `"-inf"`
+/// - `-0.0` → `"0"` — native takes the integer fast-path for `-0.0`
+///   (`(-0.0).fract() == 0.0`, finite, in range), casts to `0i64`,
+///   and drops the sign. The helper matches by letting `-0.0` fall
+///   through to the same fast-path rather than special-casing "-0".
+///
+/// Source-level Phoenix can't easily produce NaN/Infinity, so the
+/// fixture computes them: `0.0 / 0.0` for NaN, `1.0 / 0.0` for
+/// infinity, etc. `-0.0` is `-1.0 * 0.0`, which lowers to a runtime
+/// `Op::FMul` — Phoenix has no constant-folding pass, so the product
+/// is computed under wasmtime and the IEEE sign bit genuinely reaches
+/// `phx_print_f64` (this is what makes the next clause a real guard,
+/// not a no-op). The guard: that sign bit does *not* leak into the
+/// output.
+#[test]
+fn print_float_phase1_special_cases_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let nan: Float = 0.0 / 0.0\n",
+        "  let pinf: Float = 1.0 / 0.0\n",
+        "  let ninf: Float = -1.0 / 0.0\n",
+        "  let neg_zero: Float = -1.0 * 0.0\n",
+        "  print(nan)\n",
+        "  print(pinf)\n",
+        "  print(ninf)\n",
+        "  print(neg_zero)\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "print_float_phase1_specials",
+        b"NaN\ninf\n-inf\n0\n",
+    );
+}
+
+/// Non-integer finite floats trap at runtime
+/// via `unreachable` until the Ryu d2s general case lands (Phase 2).
+/// Pinned as a positive trap so a regression that returned garbage
+/// instead of trapping surfaces here.
+#[test]
+fn print_float_phase1_general_case_traps_until_phase2() {
+    assert_traps(
+        "function main() {\n  print(1.5)\n}\n",
+        "print_float_phase1_traps",
+    );
+}
+
+/// An integer-valued float *outside* `i64` range
+/// (`1e20`, written longhand since the lexer has no exponent syntax)
+/// has `fract() == 0.0` and is finite, but exceeds `i64::MAX as f64`,
+/// so it misses the integer fast-path's upper-bound guard
+/// (`v < i64::MAX as f64`) and falls to the still-unimplemented
+/// general case — trapping in Phase 1. Native's `format_f64` prints
+/// `"100000000000000000000"` here; this pins the Phase-1 divergence as
+/// a deliberate trap (not silent garbage from an over-eager cast) and
+/// exercises the range guard itself, which the in-range integer test
+/// can't. The general arm replaces this trap with real output when
+/// Ryu d2s lands (Phase 2).
+#[test]
+fn print_float_phase1_out_of_range_integer_traps_until_phase2() {
+    assert_traps(
+        "function main() {\n  print(100000000000000000000.0)\n}\n",
+        "print_float_phase1_out_of_range",
     );
 }
 

@@ -1362,15 +1362,24 @@ fn translate_print(
         // Treat `i32` as `Bool` — Phoenix's only `i32`-valued operand
         // type today is `Bool`. (Bool comparisons, BoolNot, etc. all
         // produce i32; struct/list refs are concrete refs and were
-        // matched above.) When `Float` printing lands in a follow-up
-        // slice, an `f64` arm joins this dispatch.
+        // matched above.)
         emit_print_bool_inline(ctx, b, arg_local)?;
         return Ok(());
     }
+    if arg_ty == ValType::F64 {
+        // Phase 1 (slice 5 part 1): special cases + integer fast-path.
+        // Phase 2 (slice 5 part 2, in progress): general Ryu d2s for
+        // non-integer finite f64. The helper traps with `unreachable`
+        // on the general case until Phase 2 lands. See §Phase 2.4
+        // decision K.6.
+        let print_f64_idx = b.require_print_f64_idx()?;
+        ctx.emit(Instruction::LocalGet(arg_local));
+        ctx.emit(Instruction::Call(print_f64_idx));
+        return Ok(());
+    }
     Err(CompileError::new(format!(
-        "wasm32-gc: `print(...)` supports `Int`, `String`, and `Bool` \
-         arguments (got a value lowered to WASM `{arg_ty:?}`); `Float` \
-         printing lands in the next slice"
+        "wasm32-gc: `print(...)` supports `Int`, `String`, `Bool`, and \
+         `Float` arguments (got a value lowered to WASM `{arg_ty:?}`)"
     )))
 }
 
