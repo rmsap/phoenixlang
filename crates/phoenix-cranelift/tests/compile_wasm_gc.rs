@@ -727,18 +727,17 @@ fn mutable_let_runs_under_wasmtime_gc() {
     );
 }
 
-/// Float values aren't yet a supported op surface on wasm32-gc at all
-/// (`ConstF64` itself errors before we even reach `translate_print`), so
-/// the carve-out here is broader than just "print": the whole f64 path
-/// — constants, arithmetic, comparison, print — lands together when
-/// the Float slice opens. Slice 1 / slice 2's parallel test for
-/// `print(Bool)` was dropped when slice 2 added the inline two-segment
-/// lowering; this is the remaining carve-out.
+/// As of PR 6 slice 4 the carve-out here is *print-only*: `ConstF64`,
+/// Float arithmetic, and Float comparison all lower now (see
+/// `float_scalar_ops_run_under_wasmtime_gc`), but `print(Float)` stays
+/// carved out until the formatter slice lands (§Phase 2.4 decision K.5).
+/// So `print(1.5)` lowers its `ConstF64` cleanly and then fails in
+/// `translate_print`'s Bool-fallback path. Slice 1 / slice 2's parallel
+/// test for `print(Bool)` was dropped when slice 2 added the inline
+/// two-segment lowering; this is the remaining carve-out.
 ///
-/// The assertion looks for `F64` (the IR-level Float marker name) in
-/// the diagnostic — when ConstF64 lands and we reach `translate_print`,
-/// the assertion still holds because `translate_print`'s Bool-fallback
-/// path's error message mentions `Float`.
+/// The assertion looks for `F64`/`Float` in the diagnostic, which
+/// `translate_print`'s Bool-fallback error message mentions.
 #[test]
 fn print_float_is_rejected_until_a_later_slice() {
     let ir_module = lower_to_ir("function main() {\n  print(1.5)\n}\n");
@@ -748,6 +747,123 @@ fn print_float_is_rejected_until_a_later_slice() {
     assert!(
         msg.contains("F64") || msg.contains("Float"),
         "expected an F64/Float diagnostic, got: {msg}"
+    );
+}
+
+/// PR 6 slice 4: Float scalar ops on wasm32-gc. Exercises every op
+/// the slice adds, with all results funneled through `print(Bool)`
+/// so the execution tier sees them (since `print(Float)` is still
+/// carved out — that's the next slice). Per §Phase 2.4 decision K.5.
+///
+/// - **`Op::ConstF64`** — float literals materialize via `f64.const`.
+/// - **F-arithmetic** (`FAdd` / `FSub` / `FMul` / `FDiv` / `FNeg`) —
+///   `+ - * /` and unary `-`. WASM `f64.<op>` matches IEEE-754
+///   semantics directly. The unary negation uses `f64.neg` (sign-bit
+///   flip), not the `0 - x` trick the i64 path uses.
+/// - **F-comparison** (`FEq` / `FNe` / `FLt` / `FGt` / `FLe` / `FGe`) —
+///   WASM `f64.<cmp>` returns i32 0/1, exactly Phoenix's Bool rep.
+///
+/// Eleven `print(Bool)` assertions. The four arithmetic results
+/// (`FAdd`/`FSub`/`FMul`/`FDiv`) and the `FNeg` result are each pinned
+/// to their exact value with `==` (all five are exactly representable
+/// in f64), so a wrong op output fails the test rather than slipping
+/// past a loose inequality. The remaining assertions exercise every
+/// comparison op at least once (`FNe`/`FLt`/`FGt`/`FLe`/`FGe`).
+///
+/// Expected stdout: `true\n` repeated 11 times (one per Bool assertion).
+#[test]
+fn float_scalar_ops_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let x: Float = 3.5\n",
+        "  let y: Float = 2.0\n",
+        "  let s: Float = x + y\n", // FAdd → 5.5
+        "  let d: Float = x - y\n", // FSub → 1.5
+        "  let p: Float = x * y\n", // FMul → 7.0
+        "  let q: Float = x / y\n", // FDiv → 1.75
+        "  let n: Float = -x\n",    // FNeg → -3.5
+        "  print(s == 5.5)\n",      // FEq pins FAdd  → 5.5
+        "  print(d == 1.5)\n",      // FEq pins FSub  → 1.5
+        "  print(p == 7.0)\n",      // FEq pins FMul  → 7.0
+        "  print(q == 1.75)\n",     // FEq pins FDiv  → 1.75
+        "  print(n + x == 0.0)\n",  // FEq pins FNeg  → -3.5 (so -3.5 + 3.5 == 0.0)
+        "  print(d != p)\n",        // FNe  → true (1.5 != 7.0)
+        "  print(d < x)\n",         // FLt  → true (1.5 < 3.5)
+        "  print(p > x)\n",         // FGt  → true (7.0 > 3.5)
+        "  print(q <= 2.0)\n",      // FLe  → true (1.75 <= 2.0)
+        "  print(p >= 7.0)\n",      // FGe  → true (7.0 >= 7.0)
+        "  print(n < 0.0)\n",       // FLt on FNeg result → true (-3.5 < 0.0)
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "float_scalar_ops_wasm_gc",
+        b"true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+/// PR 6 slice 4: IEEE-754 edge cases the scalar-op comments promise but
+/// the finite-literal test above can't reach — infinities and NaN. Per
+/// §Phase 2.4 decision K.5 (`f64.div` does not trap on divide-by-zero).
+///
+/// Operands come from `let` bindings divided at runtime (`x / z`,
+/// `z / z`) rather than constant literals, so the values are produced by
+/// the emitted `f64.div` rather than folded away — this exercises the
+/// real WASM semantics, not the frontend's constant evaluator.
+///
+/// - `x / z` with `z == 0.0` → `+inf` (FDiv, no trap).
+/// - `z / z` → `NaN` (FDiv, no trap).
+/// - `f64.neg(+inf)` → `-inf` (sign-bit flip, FNeg).
+/// - NaN ordering: every *ordered* comparison (`<`, `>`) returns 0 when
+///   an operand is NaN, `f64.eq(NaN, NaN)` returns 0, and
+///   `f64.ne(NaN, _)` returns 1 — matching native Rust f64.
+///
+/// Six `print(Bool)` assertions, all `true` (the NaN-ordered checks are
+/// negated with `!` so a correct `false` result prints `true`).
+///
+/// Expected stdout: `true\n` repeated 6 times.
+#[test]
+fn float_nan_and_infinity_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let x: Float = 3.5\n",
+        "  let z: Float = 0.0\n",
+        "  let pinf: Float = x / z\n", // FDiv → +inf
+        "  let nan: Float = z / z\n",  // FDiv → NaN
+        "  print(pinf > x)\n",         // +inf > 3.5 → true
+        "  print(-pinf < x)\n",        // FNeg(+inf) = -inf < 3.5 → true
+        "  print(nan != nan)\n",       // FNe with NaN → true
+        "  print(!(nan == nan))\n",    // FEq with NaN → false, negated → true
+        "  print(!(nan < x))\n",       // ordered FLt with NaN → false, negated → true
+        "  print(!(nan > x))\n",       // ordered FGt with NaN → false, negated → true
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "float_nan_and_infinity_wasm_gc",
+        b"true\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+    );
+}
+
+/// PR 6 slice 4: Float `%` (`Op::FMod`) is the one float-arithmetic op
+/// this slice deliberately omits — WASM has no `f64.rem`, so it needs an
+/// `fmod` runtime helper that lands in a later slice (§Phase 2.4 decision
+/// K.5). The frontend *does* lower `Float % Float` → `Op::FMod`
+/// (`lower_expr.rs`), so this pins the clean, specific rejection: the
+/// backend names the missing `f64.rem` rather than falling through to the
+/// generic "IR op not yet supported" catch-all. Tighten/flip this to a
+/// positive execution test when the `fmod` helper lands.
+#[test]
+fn float_mod_is_rejected_until_the_fmod_helper_lands() {
+    let ir_module = lower_to_ir(
+        "function main() {\n  let a: Float = 5.5\n  let b: Float = 2.0\n  print((a % b) > 1.0)\n}\n",
+    );
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("Float `%` should not compile until the fmod helper lands");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("f64.rem") && msg.contains("FMod"),
+        "expected a specific FMod/f64.rem diagnostic, got: {msg}"
     );
 }
 

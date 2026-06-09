@@ -1359,6 +1359,34 @@ A *user-defined* generic enum like `enum Pair<T, U> { Both(T, U), Single(T) }` w
 
 **Deferred to follow-up slices:** list/map/closure/`dyn` as variant field types (each needs its own type-mapping decision), pattern matching with struct destructuring (orthogonal to enum representation), `Option`/`Result` builtin methods (`.unwrap()`, `.map()`, etc. — orthogonal, share the same enum lowering).
 
+#### K.5. wasm32-gc Float scalar ops: arithmetic + comparison only, `print(Float)` deferred
+
+**Decided:** 2026-06-05 (sub-decision under K, locked alongside PR 6 slice 4 — Float scalar ops on wasm32-gc).
+
+**Context.** Float values have been carved out of wasm32-gc since slice 1 (the `print_float_is_rejected_until_a_later_slice` test pins this). The wider Float surface — constants, arithmetic, comparison, printing — has two mostly-orthogonal halves: the *scalar ops* (mechanical, ~30 lines of new code) and the *formatter* (Ryu f64-to-shortest-decimal, ~300 lines of intricate bytecode plus correctness risk). This slice ships the easy half; the formatter gets its own slice with its own design decision.
+
+**Chosen.** Slice 4 ships the scalar Float surface:
+
+- `Op::ConstF64(v)` → `f64.const v` (one instruction).
+- `Op::FAdd` / `Op::FSub` / `Op::FMul` / `Op::FDiv` → `f64.add` / `f64.sub` / `f64.mul` / `f64.div`.
+- `Op::FNeg` → `f64.neg` (one instruction, not the `0 - x` workaround the INeg path uses for Int).
+- `Op::FMod` (Float `%`) is **not** in this slice. It's the one float-arithmetic op without a one-instruction lowering: WASM has no `f64.rem`, so `%` needs an `fmod` runtime helper (sign-of-dividend remainder) rather than a direct opcode. The frontend already lowers `Float % Float` → `Op::FMod` (`lower_expr.rs`), so the wasm32-gc backend rejects it with a specific diagnostic (naming the missing `f64.rem`) rather than the generic catch-all; it lands with the rest of the Float runtime surface.
+- `Op::FEq` / `Op::FNe` / `Op::FLt` / `Op::FGt` / `Op::FLe` / `Op::FGe` → `f64.eq` / `f64.ne` / `f64.lt` / `f64.gt` / `f64.le` / `f64.ge`. WASM `f64.<cmp>` already returns i32 0/1 — exactly Phoenix's `Bool` representation — so no widen/narrow is needed and the existing comparison-binop emit helpers carry over verbatim.
+
+`print(Float)` keeps its carve-out from the `print_float_is_rejected_until_a_later_slice` test — the formatter slice (TBD K-number) picks among Ryu / integer-fast-path + lossy fallback / host-delegated approaches. Decoupling lets Float-arithmetic-only programs run on wasm32-gc immediately; Float-printing programs stay carved out cleanly.
+
+**Why not include the formatter now.** The Phoenix runtime's `format_f64` calls Rust's `f64::to_string()` which delegates to Ryu/Grisu3 internally — porting that to ~300 lines of WASM bytecode is the bulk of the print-Float surface and carries real correctness risk (precomputed power-of-10 tables, shortest-decimal reduction, NaN/Infinity edge cases). A lossy fixed-precision alternative would diverge from the native backend on any high-precision value, breaking matrix consistency on every fixture that prints a non-integer Float. The right move is to land the formatter as its own slice with its own design decision and adversarial verification against the native fixture corpus.
+
+**Matrix impact.** Any Float-arithmetic-only fixture (no `print(Float)`, no Float interpolation into `print(String)`) runs on wasm32-gc after this slice. Any Float-printing fixture stays carved out until the print-Float slice lands.
+
+**Implementation pointers:**
+- `Op::ConstF64` / F-arithmetic / F-comparison lowering: `crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs::translate_instruction` — add arms alongside the existing Int arithmetic and comparison families.
+- Helper reuse: the comparison helper was generalized to `emit_cmp` and reused verbatim for f64 — every comparison family (i64, f64, i32-Bool) consumes its operands off the stack and pushes the same i32 0/1, so only the WASM instruction differs and the i32 result type is fixed in the helper. A parallel `emit_f64_binop` (f64 result) carries the `emit_i64_binop` shape over for F-arithmetic.
+- `IrType::F64` → `ValType::F64` mapping: already wired in `wasm_valtypes_for` since slice 1 (unchanged).
+- Fixture: extend an existing fixture or add `tests/fixtures/wasm_gc_float.phx` exercising `+`/`-`/`*`/`/`/`neg` and all six comparisons, with results funneled through `print(Bool)` so the execution tier sees them.
+
+**Deferred to the print-Float slice:** the formatter design decision (Ryu vs integer-fast-path + lossy vs host-delegated), the K-number it lands under, the matching `phx_print_f64` helper synthesis. `Op::BuiltinCall("Float.toString", _)` (if Phoenix ever wires it as a builtin) shares the same formatter; that's the natural pair-up for the slice.
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)

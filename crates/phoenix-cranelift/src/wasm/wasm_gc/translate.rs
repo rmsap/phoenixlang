@@ -3,14 +3,23 @@
 //! Op surface as of PR 5 slice 3 (per design-decisions §Phase 2.4
 //! decision J):
 //!
-//! - **Constants:** `Op::ConstI64`, `Op::ConstBool`.
+//! - **Constants:** `Op::ConstI64`, `Op::ConstBool`, `Op::ConstF64`,
+//!   `Op::ConstString`.
 //! - **`let mut` lowering:** `Op::Alloca` / `Op::Load` / `Op::Store`
 //!   (immutable `let` binds its initializer's SSA value directly and
 //!   never walks these).
 //! - **Arithmetic (Int):** `Op::IAdd`, `Op::ISub`, `Op::IMul`,
 //!   `Op::IDiv`, `Op::IMod`, `Op::INeg`.
+//! - **Arithmetic (Float):** `Op::FAdd`, `Op::FSub`, `Op::FMul`,
+//!   `Op::FDiv`, `Op::FNeg`. WASM `f64.<op>` matches IEEE-754
+//!   semantics directly. See §Phase 2.4 decision K.5. `Op::FMod`
+//!   (Float `%`) is deferred: WASM has no native `f64.rem`, so it
+//!   needs an `fmod` runtime helper rather than a one-instruction
+//!   lowering — it errors with a specific diagnostic for now.
 //! - **Comparison (Int → Bool):** `Op::IEq`, `Op::INe`, `Op::ILt`,
 //!   `Op::ILe`, `Op::IGt`, `Op::IGe`.
+//! - **Comparison (Float → Bool):** `Op::FEq`, `Op::FNe`, `Op::FLt`,
+//!   `Op::FLe`, `Op::FGt`, `Op::FGe`.
 //! - **Bool ops:** `Op::BoolEq`, `Op::BoolNe`, `Op::BoolNot`.
 //! - **Calls:** `Op::Call(fid, [], args)` for direct user-function
 //!   calls (recursion included).
@@ -490,6 +499,13 @@ fn translate_instruction(
             ctx.emit(Instruction::LocalSet(local));
             Ok(())
         }
+        Op::ConstF64(v) => {
+            let vid = expect_result(instr, "Op::ConstF64")?;
+            ctx.emit(Instruction::F64Const(wasm_encoder::Ieee64::from(*v)));
+            let local = ctx.allocate_local(vid, ValType::F64);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
         // A *mutable* `let mut x: T = expr` lowers via `Op::Alloca(T) +
         // Op::Store(slot, expr)`, and each read of `x` emits `Op::Load(slot)`
         // (see `phoenix-ir` `lower_stmt`: immutable `let` instead binds the
@@ -544,16 +560,63 @@ fn translate_instruction(
             Ok(())
         }
         // Integer comparisons. Result is `Bool` (i32 0/1).
-        Op::IEq(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64Eq),
-        Op::INe(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64Ne),
-        Op::ILt(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64LtS),
-        Op::ILe(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64LeS),
-        Op::IGt(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64GtS),
-        Op::IGe(a, b_) => emit_i64_cmp(ctx, instr, *a, *b_, Instruction::I64GeS),
-        // Bool ops. `Bool` is i32 0/1 — comparison emits `i32.eq` /
-        // `i32.ne`; `not` flips via `i32.eqz` (1 → 0, 0 → 1).
-        Op::BoolEq(a, b_) => emit_i32_cmp(ctx, instr, *a, *b_, Instruction::I32Eq),
-        Op::BoolNe(a, b_) => emit_i32_cmp(ctx, instr, *a, *b_, Instruction::I32Ne),
+        Op::IEq(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I64Eq),
+        Op::INe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I64Ne),
+        Op::ILt(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I64LtS),
+        Op::ILe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I64LeS),
+        Op::IGt(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I64GtS),
+        Op::IGe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I64GeS),
+        // Bool comparison. `Bool` is i32 0/1, so equality emits
+        // `i32.eq` / `i32.ne`. (`BoolNot` is below the Float block.)
+        Op::BoolEq(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I32Eq),
+        Op::BoolNe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::I32Ne),
+        // Float arithmetic. Phoenix `Float` is IEEE-754 f64; WASM
+        // `f64.<op>` matches the semantics directly (no trap on divide-
+        // by-zero — `f64.div` yields `inf` / `-inf` / `NaN` per the
+        // spec, matching native Rust's `f64 / f64`). See §Phase 2.4
+        // decision K.5.
+        Op::FAdd(a, b_) => emit_f64_binop(ctx, instr, *a, *b_, Instruction::F64Add),
+        Op::FSub(a, b_) => emit_f64_binop(ctx, instr, *a, *b_, Instruction::F64Sub),
+        Op::FMul(a, b_) => emit_f64_binop(ctx, instr, *a, *b_, Instruction::F64Mul),
+        Op::FDiv(a, b_) => emit_f64_binop(ctx, instr, *a, *b_, Instruction::F64Div),
+        // Float `%` is the one arithmetic op without a one-instruction
+        // lowering: WASM has no `f64.rem`. Implementing it means an
+        // `fmod` runtime helper (sign-of-dividend remainder), which
+        // lands with the rest of the Float runtime surface — deferred
+        // here with a specific diagnostic rather than the generic
+        // catch-all. See §Phase 2.4 decision K.5.
+        Op::FMod(..) => Err(CompileError::new(
+            "wasm32-gc: Float `%` (`Op::FMod`) is not yet supported — \
+             WASM has no native `f64.rem` instruction, so it needs an \
+             `fmod` runtime helper that lands in a later slice (see \
+             §Phase 2.4 decision K.5)",
+        )),
+        Op::FNeg(a) => {
+            // `f64.neg` is its own instruction — unlike i64 (which has
+            // no unary negate and uses 0 - x), WASM provides `f64.neg`
+            // directly. Flips the sign bit without changing the
+            // mantissa or exponent, so `f64.neg(NaN)` is still NaN.
+            let vid = expect_result(instr, "Op::FNeg")?;
+            let a_local = ctx.binding_of(*a)?;
+            ctx.emit(Instruction::LocalGet(a_local));
+            ctx.emit(Instruction::F64Neg);
+            let local = ctx.allocate_local(vid, ValType::F64);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        // Float comparisons. WASM `f64.<cmp>` returns i32 0/1 directly
+        // — exactly Phoenix's `Bool` representation. NaN comparisons
+        // follow IEEE-754: every ordered op returns 0 when either
+        // operand is NaN; `f64.eq(NaN, NaN)` returns 0; `f64.ne(NaN, _)`
+        // returns 1. Matches native Rust f64 ordering.
+        Op::FEq(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::F64Eq),
+        Op::FNe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::F64Ne),
+        Op::FLt(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::F64Lt),
+        Op::FLe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::F64Le),
+        Op::FGt(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::F64Gt),
+        Op::FGe(a, b_) => emit_cmp(ctx, instr, *a, *b_, Instruction::F64Ge),
+        // Bool `not`. `Bool` is i32 0/1; `i32.eqz` flips it (1 → 0,
+        // 0 → 1).
         Op::BoolNot(a) => {
             let vid = expect_result(instr, "Op::BoolNot")?;
             let a_local = ctx.binding_of(*a)?;
@@ -1127,15 +1190,21 @@ fn emit_i64_binop(
     Ok(())
 }
 
-/// Emit a binary i64 → Bool comparison (i64 inputs, i32 0/1 result).
-fn emit_i64_cmp(
+/// Emit a binary comparison whose result is Phoenix `Bool` (WASM i32
+/// 0/1). The operand WASM type is irrelevant here — i64, f64, and i32
+/// comparison instructions all consume their operands off the stack
+/// and push the same i32 0/1 — so this single helper serves every
+/// comparison family: `IEq`…`IGe` (`i64.<cmp>`), `FEq`…`FGe`
+/// (`f64.<cmp>`), and `BoolEq`/`BoolNe` (`i32.<cmp>`). The caller picks
+/// the WASM instruction; only the i32 result type is fixed here.
+fn emit_cmp(
     ctx: &mut FuncCtx,
     instr: &phoenix_ir::instruction::Instruction,
     a: ValueId,
     b: ValueId,
     op: Instruction<'static>,
 ) -> Result<(), CompileError> {
-    let vid = expect_result(instr, "i64 cmp")?;
+    let vid = expect_result(instr, "cmp")?;
     let a_local = ctx.binding_of(a)?;
     let b_local = ctx.binding_of(b)?;
     ctx.emit(Instruction::LocalGet(a_local));
@@ -1146,22 +1215,23 @@ fn emit_i64_cmp(
     Ok(())
 }
 
-/// Emit a binary i32 → Bool comparison. Used for `BoolEq` / `BoolNe`
-/// where both operands are already i32 0/1.
-fn emit_i32_cmp(
+/// Emit a binary f64 → f64 op. Same shape as [`emit_i64_binop`] but
+/// for Float arithmetic — `FAdd` / `FSub` / `FMul` / `FDiv` route
+/// through here.
+fn emit_f64_binop(
     ctx: &mut FuncCtx,
     instr: &phoenix_ir::instruction::Instruction,
     a: ValueId,
     b: ValueId,
     op: Instruction<'static>,
 ) -> Result<(), CompileError> {
-    let vid = expect_result(instr, "i32 cmp")?;
+    let vid = expect_result(instr, "f64 binop")?;
     let a_local = ctx.binding_of(a)?;
     let b_local = ctx.binding_of(b)?;
     ctx.emit(Instruction::LocalGet(a_local));
     ctx.emit(Instruction::LocalGet(b_local));
     ctx.emit(op);
-    let local = ctx.allocate_local(vid, ValType::I32);
+    let local = ctx.allocate_local(vid, ValType::F64);
     ctx.emit(Instruction::LocalSet(local));
     Ok(())
 }
