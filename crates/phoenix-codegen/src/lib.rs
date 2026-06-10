@@ -43,16 +43,10 @@ pub enum GenMode {
     ServerOnly,
 }
 
-/// Capitalizes the first character of a string.
-///
-/// Returns an empty string for empty input.
-pub(crate) fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
+// The capitalization rule for generated type names lives in `phoenix-common`
+// so sema's envelope-collision check uses the exact same function — see
+// `phoenix_common::idents::capitalize`.
+pub(crate) use phoenix_common::capitalize;
 
 /// A sort key ordering endpoint paths most-specific (most-static) first.
 ///
@@ -90,13 +84,6 @@ pub(crate) fn route_specificity_key(path: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capitalize_handles_empty_and_unicode() {
-        assert_eq!(capitalize(""), "");
-        assert_eq!(capitalize("post"), "Post");
-        assert_eq!(capitalize("Post"), "Post");
-    }
 
     #[test]
     fn route_key_static_segment_sorts_before_param() {

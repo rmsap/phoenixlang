@@ -106,26 +106,6 @@ when pagination is needed.
 [design-decisions.md](design-decisions.md#phoenix-gen--multi-status-responses-design-2026-06-07)
 (decision 4). **Target phase:** demand-triggered.
 
-### Generated envelope type names can collide with user-defined types
-
-The generated envelope names — `<Endpoint>Response` (multi-status),
-`<Endpoint>Result` (response headers), `<Endpoint>Page` (pagination) — are not
-reserved: a user-defined struct with the same name (e.g. `struct
-UpsertUserResponse` alongside a multi-status endpoint `upsertUser`) produces two
-declarations of one type name in the generated output rather than being caught by
-sema. In Go and TypeScript that is a compile error naming the clash; in Python a
-duplicate `class X(BaseModel)` is a **silent redefinition** (the last definition
-wins) — only ruff's F811 flags it, and only if the user lints. The `Response`
-suffix is a particularly natural user choice, so multi-status raises the
-likelihood of a collision that has existed since
-`<Endpoint>Result`/`<Endpoint>Page`.
-
-**Workaround:** rename the user type; in Go/TS the generated-code compile error
-names the clash directly (for Python, lint with ruff or watch for the
-redefinition). **Planned fix:** a sema check rejecting a user type whose name
-matches a generated envelope for a declared endpoint feature. **Target phase:**
-demand-triggered. Surfaced 2026-06-09.
-
 ### Pagination and response headers cannot be combined on one endpoint (v1)
 
 An endpoint may declare `pagination { ... }` **or** response headers

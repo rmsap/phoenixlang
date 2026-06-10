@@ -2110,12 +2110,15 @@ fn header_string_expr(inner: &Type, value_expr: &str, needs_strconv: &mut bool) 
 }
 
 /// Converts a camelCase identifier to PascalCase (Go exported name).
+///
+/// Phoenix identifiers are already camelCase, so "PascalCase" reduces to
+/// capitalizing the first character — delegate to the shared `capitalize` so
+/// generated type names (notably the `<Endpoint>{Result,Page,Response}`
+/// envelopes) stay in lockstep with sema's envelope-collision check. If Go
+/// ever needs real word-splitting here, the envelope names must keep using
+/// `capitalize` or that check goes blind for Go.
 fn to_pascal_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
+    capitalize(s)
 }
 
 /// Returns a camelCase identifier (Go unexported / parameter name).

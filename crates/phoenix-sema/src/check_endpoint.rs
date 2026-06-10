@@ -8,6 +8,7 @@ use crate::checker::{
     QueryParamInfo, ResolvedDerivedType, ResponseStatusInfo, header_wire_name,
 };
 use crate::types::Type;
+use phoenix_common::capitalize;
 use phoenix_parser::api_version::normalize_api_version;
 use phoenix_parser::ast::{
     DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, TypeExpr,
@@ -42,6 +43,8 @@ impl Checker {
         if is_duplicate_name {
             self.error(format!("duplicate endpoint name `{}`", ep.name), ep.span);
         }
+
+        let exported_name_collides_with = self.check_exported_name_collision(ep, is_duplicate_name);
 
         // Apply the API-version prefix (from an `api version "v1" { ... }` block)
         // to the path, so everything downstream — path-param extraction, the
@@ -366,6 +369,15 @@ impl Checker {
             );
         }
 
+        self.check_generated_type_collisions(
+            ep,
+            is_duplicate_name,
+            exported_name_collides_with.as_deref(),
+            is_multi_status,
+            body.is_some(),
+            body_is_multipart,
+        );
+
         // Request headers share the generated parameter scope with path and
         // query params, so a duplicate local name would emit two parameters of
         // the same name (a compile error in the generated Go/TS/Python). Check
@@ -471,6 +483,214 @@ impl Checker {
             }
             None => {
                 self.route_signatures.insert(route, ep.name.clone());
+            }
+        }
+    }
+
+    /// Rejects an endpoint whose *exported* name — `capitalize(name)`, the
+    /// shared rule codegen builds exported identifiers with — is already
+    /// claimed by another endpoint. Endpoint names are unique only
+    /// case-sensitively, so `getUser` and `GetUser` are both distinct names;
+    /// but Go derives the client method, server method, and handler-interface
+    /// method from the exported form, so that pair emits two `GetUser`
+    /// methods on one struct — a Go compile error regardless of what else
+    /// either endpoint declares. (TS/Python keep the name as written and are
+    /// unaffected, but sema is target-agnostic, matching how `ClientBody` is
+    /// reserved on every target.) The predicate is exported-name equality,
+    /// not full case-insensitivity: `getUser` vs `getuSer` export as
+    /// `GetUser` vs `GetuSer` — distinct Go methods, no collision, accepted.
+    ///
+    /// Returns the owning endpoint's name on collision so
+    /// `check_generated_type_collisions` can treat the pair as
+    /// already-reported: equal exported names imply equal generated *type*
+    /// names (every generated type name is `exported + suffix`), so this
+    /// check subsumes all same-stem type collisions, leaving the type map to
+    /// catch the cross-stem `Body`/`ClientBody` overlap.
+    ///
+    /// An exact duplicate name is skipped entirely: it would trivially hit
+    /// its own first declaration's entry, and that is one mistake already
+    /// reported as the duplicate-name error.
+    fn check_exported_name_collision(
+        &mut self,
+        ep: &EndpointDecl,
+        is_duplicate_name: bool,
+    ) -> Option<String> {
+        if is_duplicate_name {
+            return None;
+        }
+        let exported = capitalize(&ep.name);
+        match self.endpoint_exported_names.get(&exported).cloned() {
+            Some(other) => {
+                self.error(
+                    format!(
+                        "endpoint `{}` collides with endpoint `{}`: both export the generated name `{}` (the Go client/handler method name), which declares the same method twice in the generated output; rename one of the endpoints",
+                        ep.name, other, exported
+                    ),
+                    ep.span,
+                );
+                Some(other)
+            }
+            None => {
+                self.endpoint_exported_names
+                    .insert(exported, ep.name.clone());
+                None
+            }
+        }
+    }
+
+    /// Reports generated-type name collisions. An endpoint declaration
+    /// synthesizes types in the generated output — the envelopes
+    /// `<Endpoint>Result` (response headers), `<Endpoint>Page` (pagination),
+    /// and `<Endpoint>Response` (multi-status, all three mutually exclusive),
+    /// plus the request-body types `<Endpoint>Body` (any `body` clause; not
+    /// exclusive with the envelopes) and `<Endpoint>ClientBody` (Go only,
+    /// multipart bodies), and the fixed-name multipart helper `FileUpload`
+    /// (Go only, shared by every multipart endpoint). Each such name must not
+    /// already be taken, or the generated output declares the same type
+    /// twice. Go/TS surface a compile error, but Python silently redefines
+    /// the class (last wins), a quiet miscompile — and for
+    /// endpoint-vs-endpoint `Body` collisions codegen's
+    /// `emitted_derived_types` dedupe is first-wins in every backend, so the
+    /// second endpoint silently binds to the first one's struct. Two
+    /// claimants are possible per name: a user-defined struct/enum, and
+    /// another endpoint generating the same name. For the latter, same-stem
+    /// pairs (equal exported names, e.g. `getUser`/`GetUser`) are already
+    /// rejected by `check_exported_name_collision`, so the live
+    /// endpoint-vs-endpoint case is the one cross-stem suffix overlap:
+    /// `"ClientBody"` ends with `"Body"`, so `upload` (multipart) and
+    /// `uploadClient` (any body) both generate `UploadClientBody`; no other
+    /// suffix pair overlaps. Names are built with the same shared
+    /// `capitalize` codegen uses, so this check cannot drift from the
+    /// generators. Caveat: `lookup_struct`/`lookup_enum` resolve in the
+    /// endpoint's module scope while `generated_type_names` is global
+    /// (mirroring `route_signatures`) — if endpoints ever live in non-entry
+    /// modules, a same-named type in a sibling module would be missed here.
+    /// See `docs/design-decisions.md` (generated-type-name collision check).
+    fn check_generated_type_collisions(
+        &mut self,
+        ep: &EndpointDecl,
+        is_duplicate_name: bool,
+        exported_name_collides_with: Option<&str>,
+        is_multi_status: bool,
+        has_body: bool,
+        body_is_multipart: bool,
+    ) {
+        // The `else if` chain claims at most one envelope: the exclusivity
+        // checks in `check_endpoint` (which run before this) reject any
+        // endpoint combining response headers, pagination, or multi-status,
+        // so under-claiming on an (already rejected) combination is harmless.
+        // If those rules ever relax, the chain must claim every declared
+        // envelope.
+        let mut generated_claims: Vec<(&'static str, &'static str)> = Vec::new();
+        if !ep.response_headers.is_empty() {
+            generated_claims.push(("Result", "an envelope"));
+        } else if ep.pagination.is_some() {
+            generated_claims.push(("Page", "an envelope"));
+        } else if is_multi_status {
+            generated_claims.push(("Response", "an envelope"));
+        }
+        if has_body {
+            generated_claims.push(("Body", "a request-body"));
+            if body_is_multipart {
+                generated_claims.push(("ClientBody", "a request-body"));
+            }
+        }
+        // At most one endpoint-vs-endpoint diagnostic per colliding endpoint
+        // *pair*: a colliding pair is one mistake even when several of its
+        // claimed names collide (e.g. both endpoints declare a body and
+        // multi-status). Suppression is per pair rather than per endpoint
+        // because a cross-stem `Body`/`ClientBody` collision involves a
+        // different other endpoint than a same-stem one, and those are two
+        // distinct mistakes. An exported-name collision seeds the list: that
+        // pair was already reported by `check_exported_name_collision`, and
+        // every same-stem type collision is the same mistake — while a
+        // cross-stem collision against a *third* endpoint still reports.
+        let mut reported_against: Vec<String> = match exported_name_collides_with {
+            Some(other) => vec![other.to_string()],
+            None => Vec::new(),
+        };
+        // When the endpoint name itself is a duplicate or exported-name
+        // collision, the user-type diagnostic is suppressed too — that name
+        // clash is the mistake to fix first. For names the owning declaration
+        // also claimed, the clash was already reported there; for a name only
+        // this endpoint claims (the colliding endpoints declare different
+        // features, e.g. headers vs body), the clash *cascades*: it surfaces
+        // on the recompile after the rename — which may well fix it, since
+        // the rename changes every generated name. Same deliberate-cascade
+        // discipline as the duplicate-multipart `FileUpload` corner below;
+        // pinned by `exported_name_collision_with_differing_features_cascades`.
+        let suppress_user_type_reports = is_duplicate_name || exported_name_collides_with.is_some();
+        let exported = capitalize(&ep.name);
+        for (suffix, kind) in generated_claims {
+            let generated_name = exported.clone() + suffix;
+            if !suppress_user_type_reports
+                && (self.lookup_struct(&generated_name).is_some()
+                    || self.lookup_enum(&generated_name).is_some())
+            {
+                self.error(
+                    format!(
+                        "endpoint `{}` generates {} type `{}` that collides with a user-defined type of the same name; rename the user type (the generated name is `{{Endpoint}}{}`)",
+                        ep.name, kind, generated_name, suffix
+                    ),
+                    ep.span,
+                );
+            }
+            // Endpoint-vs-endpoint: the first endpoint to claim a name owns it
+            // (recorded in `generated_type_names`); later collisions are
+            // reported against it. Same-stem hits land on the seeded
+            // exported-name collider and are suppressed as already-reported,
+            // so the live case is cross-stem: `"ClientBody"` ends with
+            // `"Body"`, so `upload` (multipart) and `uploadClient` (any body)
+            // both generate `UploadClientBody` — a collision only the map
+            // catches. All five suffixes still claim entries, keeping the map
+            // self-defending if a future suffix introduces a new overlap.
+            match self.generated_type_names.get(&generated_name).cloned() {
+                Some(other) => {
+                    if !is_duplicate_name && !reported_against.contains(&other) {
+                        reported_against.push(other.clone());
+                        self.error(
+                            format!(
+                                "endpoint `{}` generates {} type `{}` that collides with the type generated for endpoint `{}`; rename one of the endpoints",
+                                ep.name, kind, generated_name, other
+                            ),
+                            ep.span,
+                        );
+                    }
+                }
+                None => {
+                    self.generated_type_names
+                        .insert(generated_name, ep.name.clone());
+                }
+            }
+        }
+
+        // The multipart helper `FileUpload` (Go) is a *fixed-name* generated
+        // type shared by every multipart endpoint, so two multipart endpoints
+        // both needing it is by design, not a collision — it bypasses the
+        // endpoint-vs-endpoint reporting above. A user-defined type of that
+        // name still duplicates the declaration in generated Go, and that
+        // single mistake gets a single diagnostic: the first (non-duplicate)
+        // multipart endpoint claims the name in `generated_type_names` and
+        // only the claimant reports. The entry cannot trigger a false
+        // endpoint-pair collision in the loop above because no
+        // `<Endpoint>`+suffix name can equal `FileUpload` — none of the five
+        // suffixes is a suffix of it.
+        if body_is_multipart
+            && !is_duplicate_name
+            && !self.generated_type_names.contains_key("FileUpload")
+        {
+            self.generated_type_names
+                .insert("FileUpload".to_string(), ep.name.clone());
+            if self.lookup_struct("FileUpload").is_some()
+                || self.lookup_enum("FileUpload").is_some()
+            {
+                self.error(
+                    format!(
+                        "endpoint `{}`: a multipart (file-upload) body generates the helper type `FileUpload`, which collides with a user-defined type of the same name; rename the user type",
+                        ep.name
+                    ),
+                    ep.span,
+                );
             }
         }
     }
@@ -2908,6 +3128,663 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("requires the response to be a `List<T>`")),
             "should not surface the confusing pagination-requires-List error: {errors:?}"
+        );
+    }
+
+    // ── Generated-envelope name collisions ──────────────────────────
+
+    #[test]
+    fn envelope_collision_multi_status_response_rejected() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            struct UpsertUserResponse { Int x }
+            endpoint upsertUser: PUT "/u/{id}" {
+                response { 200: User  201: User }
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn envelope_collision_pagination_page_rejected() {
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            struct ListPostsPage { Int x }
+            endpoint listPosts: GET "/p" {
+                response List<Post>
+                pagination { offset }
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn envelope_collision_response_headers_result_rejected() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            struct GetUserResult { Int x }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn envelope_collision_with_enum_rejected() {
+        // The collision check covers enums too, not just structs.
+        assert_has_error(
+            r#"
+            struct Post { Int id }
+            enum ListPostsPage { A  B }
+            endpoint listPosts: GET "/p" {
+                response List<Post>
+                pagination { offset }
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn envelope_name_without_the_feature_is_not_a_collision() {
+        // `ListPostsPage` only collides when the endpoint actually declares
+        // pagination; a like-named struct alongside a plain endpoint is fine.
+        assert_no_errors(
+            r#"
+            struct Post { Int id }
+            struct ListPostsPage { Int x }
+            endpoint listPosts: GET "/p" {
+                response List<Post>
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn envelope_collision_between_two_endpoints_reported_at_name_level() {
+        // `getUser` and `GetUser` collide on the exported name itself (Go
+        // method/handler), so the pair is rejected there — and the same-stem
+        // `GetUserResult` type collision is the same mistake, suppressed.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            endpoint GetUser: GET "/uu/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("both export the generated name `GetUser`")),
+            "expected the exported-name collision error: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("collides with the type generated")),
+            "the same-stem type collision is the same mistake and should be suppressed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn exported_name_collision_rejected_without_any_generated_types() {
+        // The exported-name collision is independent of envelopes and bodies:
+        // two plain endpoints whose names differ only in first-letter case
+        // emit two `GetUser` methods on the generated Go client struct (and
+        // two identical handler-interface methods) even though neither
+        // generates a single type.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/u/{id}" {
+                response User
+            }
+            endpoint GetUser: GET "/uu/{id}" {
+                response User
+            }
+            "#,
+            "both export the generated name `GetUser`",
+        );
+    }
+
+    #[test]
+    fn exported_name_predicate_is_capitalize_equality_not_case_insensitivity() {
+        // `getUser` and `getuSer` are case-insensitively equal but export as
+        // `GetUser` vs `GetuSer` — distinct Go methods, no collision. The
+        // check must not over-reject by comparing full-lowercased names.
+        assert_no_errors(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/u/{id}" {
+                response User
+            }
+            endpoint getuSer: GET "/uu/{id}" {
+                response User
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn distinct_endpoint_envelopes_do_not_collide() {
+        assert_no_errors(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            endpoint getAdmin: GET "/a/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn duplicate_endpoint_name_does_not_also_report_envelope_collision() {
+        // A literally duplicated endpoint name is one mistake; it gets the
+        // duplicate-name diagnostic — not a second envelope-collision one,
+        // and not an exported-name collision against its own first
+        // declaration either.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            endpoint getUser: GET "/uu/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            "#,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("duplicate endpoint name")),
+            "expected the duplicate-name error: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("collides with the type generated")),
+            "duplicate name should not also surface a generated-type collision: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("both export the generated name")),
+            "duplicate name should not also surface an exported-name collision: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_endpoint_name_reports_user_type_collision_once() {
+        // Both declarations of a duplicated endpoint name predict the same
+        // generated names, but only the first (non-duplicate) one should report
+        // the clash against a user type — the second is the duplicate-name
+        // mistake, already diagnosed as such.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            struct GetUserResult { Int x }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            endpoint getUser: GET "/uu/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            "#,
+        );
+        let user_type_collisions = errors
+            .iter()
+            .filter(|e| e.contains("collides with a user-defined type"))
+            .count();
+        assert_eq!(
+            user_type_collisions, 1,
+            "expected exactly one user-type collision error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn exported_name_collision_reports_user_type_collision_once() {
+        // Same discipline as the duplicate-name case: `getUser` and `GetUser`
+        // predict the identical generated names, so the user-type clash
+        // against `GetUserResult` is reported once, by the endpoint that owns
+        // the exported name — the second endpoint's name collision is the
+        // mistake already diagnosed.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            struct GetUserResult { Int x }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            endpoint GetUser: GET "/uu/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            "#,
+        );
+        let user_type_collisions = errors
+            .iter()
+            .filter(|e| e.contains("collides with a user-defined type"))
+            .count();
+        assert_eq!(
+            user_type_collisions, 1,
+            "expected exactly one user-type collision error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn exported_name_collision_with_differing_features_cascades() {
+        // Deliberate cascade: when the colliding endpoints declare *different*
+        // features, the suppressed endpoint may claim a generated name the
+        // owner never did — here `GetUser` (body) claims `GetUserBody`, which
+        // `getUser` (headers) does not — so its clash with the user struct
+        // goes unreported this compile. The exported-name collision is the
+        // mistake to fix first, and renaming the endpoint changes every
+        // generated name, so the clash may not even survive the fix; if it
+        // does, it surfaces on the recompile. This pins that the corner stays
+        // a single name-level diagnostic — not a double report, not a crash.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            struct GetUserBody { Int x }
+            endpoint getUser: GET "/u/{id}" {
+                response User headers { Int total as "X-Total" }
+            }
+            endpoint GetUser: POST "/uu/{id}" {
+                body User
+            }
+            "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("both export the generated name `GetUser`")),
+            "expected the exported-name collision error: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("collides with a user-defined type")),
+            "the suppressed endpoint's `GetUserBody` clash should cascade, not report: {errors:?}"
+        );
+    }
+
+    // ── Generated request-body type (`<Endpoint>Body` / `<Endpoint>ClientBody`) ──
+
+    #[test]
+    fn body_collision_with_user_type_rejected() {
+        // Any `body` clause generates `<Endpoint>Body` in every backend.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            struct CreateUserBody { Int x }
+            endpoint createUser: POST "/u" {
+                body User
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn client_body_collision_with_user_type_rejected() {
+        // A multipart body additionally generates `<Endpoint>ClientBody` (Go).
+        assert_has_error(
+            r#"
+            struct AvatarUpload { File avatar  String caption }
+            struct UploadAvatarClientBody { Int x }
+            endpoint uploadAvatar: POST "/api/avatar" {
+                body AvatarUpload
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn body_name_without_a_body_is_not_a_collision() {
+        // `CreateUserBody` only collides when the endpoint actually declares a
+        // body; a like-named struct alongside a bodyless endpoint is fine.
+        assert_no_errors(
+            r#"
+            struct User { Int id }
+            struct CreateUserBody { Int x }
+            endpoint createUser: POST "/u" {
+                response User
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn client_body_name_with_json_body_is_not_a_collision() {
+        // `<Endpoint>ClientBody` is only generated for multipart bodies; a
+        // plain JSON body does not claim it.
+        assert_no_errors(
+            r#"
+            struct User { Int id }
+            struct CreateUserClientBody { Int x }
+            endpoint createUser: POST "/u" {
+                body User
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn body_collision_between_two_endpoints_rejected() {
+        // Without rejection the second endpoint silently binds to the first
+        // one's Body struct (codegen's `emitted_derived_types` dedupe is
+        // first-wins in every backend). The pair is caught at the
+        // exported-name level — same-stem names collide on the Go
+        // method/handler name before any type is even considered.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint createUser: POST "/u" {
+                body User
+            }
+            endpoint CreateUser: POST "/uu" {
+                body User
+            }
+            "#,
+            "both export the generated name `CreateUser`",
+        );
+    }
+
+    #[test]
+    fn body_claimed_alongside_envelope() {
+        // A body is not mutually exclusive with the envelopes: an endpoint with
+        // both multi-status and a body claims `<Endpoint>Response` AND
+        // `<Endpoint>Body`, and a user type colliding with either is rejected.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            struct UpsertUserBody { Int x }
+            endpoint upsertUser: PUT "/u/{id}" {
+                body User
+                response { 200: User  201: User }
+            }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    #[test]
+    fn case_colliding_endpoints_report_one_collision() {
+        // Both endpoints claim two colliding type names each
+        // (`UpsertUserResponse` and `UpsertUserBody`) on top of the colliding
+        // exported name, but the endpoint-name pair is one mistake — exactly
+        // one diagnostic, at the name level, with every same-stem type
+        // collision suppressed as the same mistake.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            endpoint upsertUser: PUT "/u/{id}" {
+                body User
+                response { 200: User  201: User }
+            }
+            endpoint UpsertUser: PUT "/uu/{id}" {
+                body User
+                response { 200: User  201: User }
+            }
+            "#,
+        );
+        let name_collisions = errors
+            .iter()
+            .filter(|e| e.contains("both export the generated name"))
+            .count();
+        assert_eq!(
+            name_collisions, 1,
+            "expected exactly one exported-name collision error: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("collides with the type generated")),
+            "same-stem type collisions are the same mistake and should be suppressed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn case_colliding_paginated_endpoints_report_one_collision() {
+        // The `Page` envelope variant of the same discipline: the pair is
+        // rejected at the exported-name level and the same-stem
+        // `ListPostsPage` type collision is suppressed.
+        let errors = check_source(
+            r#"
+            struct Post { Int id }
+            endpoint listPosts: GET "/p" {
+                response List<Post>
+                pagination { offset }
+            }
+            endpoint ListPosts: GET "/pp" {
+                response List<Post>
+                pagination { offset }
+            }
+            "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("both export the generated name `ListPosts`")),
+            "expected the exported-name collision error: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("collides with the type generated")),
+            "same-stem type collisions are the same mistake and should be suppressed: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn body_collision_cross_stem_client_body_rejected() {
+        // `"ClientBody"` ends with `"Body"`, so the two suffixes collide across
+        // *different* stems: `upload` (multipart) generates `UploadClientBody`,
+        // and so does `uploadClient` (any body). In Go the second emission is
+        // silently skipped by the first-wins dedupe, binding one endpoint to
+        // the other's struct.
+        assert_has_error(
+            r#"
+            struct FileDoc { File data }
+            struct Note { String text }
+            endpoint upload: POST "/up" {
+                body FileDoc
+            }
+            endpoint uploadClient: POST "/upc" {
+                body Note
+            }
+            "#,
+            "collides with the type generated for endpoint `upload`",
+        );
+    }
+
+    #[test]
+    fn body_collision_cross_stem_client_body_reverse_order_rejected() {
+        // Same cross-stem collision, opposite declaration order: here the
+        // plain `Body` claims the name first and the multipart endpoint's
+        // `ClientBody` is the late claimant.
+        assert_has_error(
+            r#"
+            struct FileDoc { File data }
+            struct Note { String text }
+            endpoint uploadClient: POST "/upc" {
+                body Note
+            }
+            endpoint upload: POST "/up" {
+                body FileDoc
+            }
+            "#,
+            "collides with the type generated for endpoint `uploadClient`",
+        );
+    }
+
+    #[test]
+    fn body_collision_two_distinct_endpoint_pairs_two_diagnostics() {
+        // One endpoint can collide with two *different* endpoints — same-stem
+        // on the exported name (`upload` vs `Upload`) and cross-stem on
+        // `ClientBody` (`upload` vs `uploadClient`). Those are two distinct
+        // mistakes, so the seeded per-pair suppression must report both: the
+        // exported-name diagnostic for the first pair, and the type-collision
+        // diagnostic for the second — suppressing only the same-stem
+        // `UploadBody` hit, which the name-level error already covers.
+        let errors = check_source(
+            r#"
+            struct FileDoc { File data }
+            struct Note { String text }
+            endpoint Upload: POST "/a" {
+                body Note
+            }
+            endpoint uploadClient: POST "/b" {
+                body Note
+            }
+            endpoint upload: POST "/c" {
+                body FileDoc
+            }
+            "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("both export the generated name `Upload`")),
+            "expected the same-stem pair to be reported at the name level: {errors:?}"
+        );
+        let generated_collisions: Vec<_> = errors
+            .iter()
+            .filter(|e| e.contains("collides with the type generated"))
+            .collect();
+        assert_eq!(
+            generated_collisions.len(),
+            1,
+            "expected exactly one type-collision diagnostic, for the cross-stem pair: {errors:?}"
+        );
+        assert!(
+            generated_collisions[0].contains("for endpoint `uploadClient`"),
+            "expected the cross-stem `ClientBody` pair to be reported: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn collision_with_user_type_declared_after_endpoint_rejected() {
+        // The registration pass collects every struct before any endpoint is
+        // checked, so a colliding type declared *after* the endpoint must
+        // still be found — this pins the two-pass guarantee the
+        // `lookup_struct` call relies on.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint upsertUser: PUT "/u/{id}" {
+                response { 200: User  201: User }
+            }
+            struct UpsertUserResponse { Int x }
+            "#,
+            "collides with a user-defined type",
+        );
+    }
+
+    // ── Fixed-name multipart helper (`FileUpload`) ──────────────────
+
+    #[test]
+    fn file_upload_helper_collision_with_user_type_rejected() {
+        // Any multipart endpoint generates the fixed-name `FileUpload` helper
+        // struct (Go), so a user type of that name duplicates the declaration
+        // in the generated output.
+        assert_has_error(
+            r#"
+            struct FileUpload { Int x }
+            struct Doc { File data }
+            endpoint upload: POST "/up" {
+                body Doc
+            }
+            "#,
+            "helper type `FileUpload`",
+        );
+    }
+
+    #[test]
+    fn file_upload_name_without_multipart_is_not_a_collision() {
+        // `FileUpload` is only generated for multipart bodies; alongside a
+        // plain JSON body the name is free.
+        assert_no_errors(
+            r#"
+            struct FileUpload { Int x }
+            struct Note { String text }
+            endpoint create: POST "/n" {
+                body Note
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn file_upload_collision_reported_once_across_multipart_endpoints() {
+        // The helper is emitted once and shared by every multipart endpoint,
+        // so a user `FileUpload` is one mistake — one diagnostic, at the
+        // first multipart endpoint, not one per endpoint.
+        let errors = check_source(
+            r#"
+            struct FileUpload { Int x }
+            struct Doc { File data }
+            endpoint upload: POST "/a" {
+                body Doc
+            }
+            endpoint uploadTwo: POST "/b" {
+                body Doc
+            }
+            "#,
+        );
+        let helper_collisions = errors
+            .iter()
+            .filter(|e| e.contains("helper type `FileUpload`"))
+            .count();
+        assert_eq!(
+            helper_collisions, 1,
+            "expected exactly one FileUpload collision error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn file_upload_collision_suppressed_when_only_multipart_endpoint_is_a_duplicate() {
+        // Deliberate cascade: when the only multipart endpoint carries a
+        // duplicated name, its `FileUpload` claim is suppressed along with
+        // its other diagnostics — the duplicate name is the mistake to fix
+        // first, and the helper clash surfaces on the recompile after the
+        // rename. This pins that the corner stays a cascade, not a crash or
+        // a double report.
+        let errors = check_source(
+            r#"
+            struct FileUpload { Int x }
+            struct Note { String text }
+            struct Doc { File data }
+            endpoint upload: POST "/a" {
+                body Note
+            }
+            endpoint upload: POST "/b" {
+                body Doc
+            }
+            "#,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("duplicate endpoint name")),
+            "expected the duplicate-name error: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("helper type `FileUpload`")),
+            "the duplicate's FileUpload clash should cascade, not report: {errors:?}"
         );
     }
 }

@@ -2123,6 +2123,69 @@ collided. Found because the compile-and-lint harness ran `tsc` over a fixture
 combining a request body with a multi-status response — the inline generator
 tests used bodyless endpoints and missed it.
 
+### Generated-type-name collision check (closed 2026-06-10)
+An endpoint declaration synthesizes up to five type names in the generated
+output: the envelopes `<Endpoint>Result` / `<Endpoint>Page` / `<Endpoint>Response`
+(mutually exclusive), plus the request-body types `<Endpoint>Body` (any `body`
+clause; combinable with the envelopes) and `<Endpoint>ClientBody` (Go only,
+multipart bodies). Multi-status made a collision materially more likely —
+`Response` is a natural user struct name. In Go/TS a collision is a loud
+generated-code compile error, but in Python a duplicate `class X(BaseModel)` is a
+**silent redefinition** (last wins) — a quiet miscompile. Closed with a sema check
+(`check_endpoint`): when an endpoint synthesizes one of those names, a
+user-defined struct or enum of that exact name is rejected with a clear message.
+The check only fires when the feature is actually declared (a like-named struct
+alongside a plain endpoint is fine — no false positives). Five follow-on
+hardenings landed with it: (1) **endpoint-vs-endpoint name collisions** are
+rejected at the *exported-name* level (`check_exported_name_collision`):
+endpoint names are unique only case-sensitively, so `getUser` and `GetUser` are
+both distinct names — but Go builds the client method, server method, and
+handler-interface method from `capitalize(name)`, so that pair emits two
+`GetUser` methods on one struct, a Go compile error **regardless of what else
+the endpoints declare** (TS/Python keep the name as written and are
+unaffected, but sema is target-agnostic, matching how `ClientBody` is reserved
+on every target; surfaced in review of this slice). The predicate is
+exported-name equality, not full case-insensitivity — `getUser` / `getuSer`
+export as distinct Go methods and stay legal. Because every generated type
+name is `exported + suffix`, this name-level check subsumes all *same-stem*
+type collisions, leaving one endpoint-vs-endpoint type case live: the
+cross-stem suffix overlap. `"ClientBody"` ends with `"Body"`, so `upload`
+(multipart) and `uploadClient` (any body) both generate `UploadClientBody`
+despite distinct stems — the only suffix-overlap pair among the five, caught
+by a `generated_type_names` claim map mirroring `route_signatures` (all five
+names still claim entries, so the map self-defends if a future suffix
+introduces a new overlap). This case is worst for `Body` and `ClientBody`:
+codegen's `emitted_derived_types` dedupe is first-wins in **every** backend,
+so without the check the second endpoint silently bound to the first one's
+struct. (2) The capitalization rule the generated names are built with moved to
+`phoenix_common::idents::capitalize`, shared by sema and every codegen backend
+(Go's `to_pascal_case` delegates to it), so the check and the generators cannot
+silently diverge. (3) Diagnostic discipline: a duplicated endpoint name or a
+colliding endpoint-name pair is one mistake and gets one diagnostic — per
+*pair*, since one endpoint can legitimately collide with two different
+endpoints (same-stem on the exported name, cross-stem on `ClientBody`) and
+those are two mistakes; an exported-name collision seeds the type check's
+per-pair suppression so the same-stem type hits don't double-report.
+(4) The fixed-name multipart helper `FileUpload` (Go; emitted once,
+shared by every multipart endpoint) is reserved too — a user type of that name
+duplicates the declaration in generated Go. Sharing across multipart endpoints
+is by design, so it bypasses the endpoint-vs-endpoint reporting: the first
+multipart endpoint claims the name and reports the user-type clash once
+(surfaced in review of this slice). (5) Deliberate cascade, pinned by test:
+when the only multipart endpoint carries a duplicated name, its `FileUpload`
+clash is suppressed with its other diagnostics and surfaces on the recompile
+after the rename. Known scope limit: the user-type lookup
+resolves in the endpoint's module scope while the claim maps are global — if
+endpoints ever live in non-entry modules, a same-named type in a sibling module
+would be missed (flagged in a code comment at the check). The checks live
+in `check_exported_name_collision` and `check_generated_type_collisions`,
+extracted alongside their structural sibling `check_route_collision`. Covered
+by the `envelope_collision_*`, `body_collision_*`, `exported_name_*`, and
+`file_upload_*` sema tests, plus
+`collision_with_user_type_declared_after_endpoint_rejected`, which pins the
+two-pass guarantee (registration before endpoint checking) that makes the
+lookup order-independent.
+
 ### Other drive-by hardening (surfaced by this slice)
 Three pre-existing gaps fixed while building this slice — the first two because
 the new code needed the same machinery, the third found while reviewing the new

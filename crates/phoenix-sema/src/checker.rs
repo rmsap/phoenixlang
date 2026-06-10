@@ -623,6 +623,32 @@ pub struct Checker {
     /// endpoint is checked so route-collision detection is an O(1) lookup
     /// rather than an O(n) rescan of `endpoints` (and thus O(n²) overall).
     pub(crate) route_signatures: HashMap<String, String>,
+    /// Exported endpoint name (`capitalize(name)`, the Go method/handler
+    /// name) → the name of the first endpoint that claimed it. Endpoint names
+    /// are unique only case-sensitively, so `getUser` and `GetUser` are both
+    /// distinct names — but Go builds the client method, server method, and
+    /// handler-interface method from `capitalize(name)`, so that pair emits
+    /// two `GetUser` methods on one struct: a Go compile error regardless of
+    /// what else the endpoints declare (TS/Python keep the name as written
+    /// and are unaffected). This map catches the second claimant; see
+    /// `check_exported_name_collision`. Maintained incrementally like
+    /// `route_signatures`.
+    pub(crate) endpoint_exported_names: HashMap<String, String>,
+    /// Generated type name (`<Endpoint>{Result,Page,Response,Body,ClientBody}`)
+    /// → the name of the first endpoint that claimed it. Same-stem collisions
+    /// (endpoint names with equal `capitalize(name)`) are rejected earlier by
+    /// the `endpoint_exported_names` check, so in practice this map's
+    /// endpoint-vs-endpoint reporting fires only for the one cross-stem
+    /// suffix overlap: `"ClientBody"` ends with `"Body"`, so `upload`
+    /// (multipart) and `uploadClient` (any body) both generate
+    /// `UploadClientBody` despite distinct stems. All five suffixes still
+    /// claim entries — that keeps the map self-defending if a future suffix
+    /// introduces a new overlap. The fixed-name multipart helper `FileUpload`
+    /// also claims an entry, but only so its user-type collision is reported
+    /// once — sharing it across multipart endpoints is by design (see
+    /// `check_generated_type_collisions`). Maintained incrementally like
+    /// `route_signatures`.
+    pub(crate) generated_type_names: HashMap<String, String>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     /// Captured variables for each lambda, keyed by the lambda's source span.
     pub(crate) lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
@@ -740,6 +766,8 @@ impl Checker {
             endpoints: Vec::new(),
             endpoint_names: HashSet::new(),
             route_signatures: HashMap::new(),
+            endpoint_exported_names: HashMap::new(),
+            generated_type_names: HashMap::new(),
             diagnostics: Vec::new(),
             lambda_captures: HashMap::new(),
             current_return_type: None,

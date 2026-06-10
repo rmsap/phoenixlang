@@ -11,6 +11,9 @@
 pub mod algorithms;
 /// Error and warning diagnostics produced by the compiler pipeline.
 pub mod diagnostics;
+/// Identifier-casing helpers shared between sema and the codegen backends
+/// (currently `capitalize`, the rule generated type names are built with).
+pub mod idents;
 /// Stable post-sema identifiers (`FuncId`, `StructId`, `EnumId`,
 /// `TraitId`) shared across sema, IR, and the backends.
 pub mod ids;
@@ -23,6 +26,7 @@ pub mod source;
 pub mod span;
 
 pub use diagnostics::Diagnostic;
+pub use idents::capitalize;
 pub use ids::{EnumId, FuncId, StructId, TraitId};
 pub use module_path::{ModulePath, module_qualify};
 pub use source::SourceMap;
