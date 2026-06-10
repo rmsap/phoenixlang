@@ -42,6 +42,11 @@ file and conforms to it. Each case:
     "expect_not_called": true             //   assert the handler was NOT invoked (constraint cases)
   },
 
+  "raw_response": {                       // OPTIONAL: serve this canned response
+    "status": 203,                        //   instead of the generated server
+    "body": { ... }                       //   (JSON body; omit for an empty body)
+  },
+
   "expect_client": {                      // what the CLIENT should observe
     "ok": { ... } | [ ... ],              //   expected typed result (ok cases)
     "error": {                            //   expected error (error / constraint cases)
@@ -53,6 +58,22 @@ file and conforms to it. Each case:
   }
 }
 ```
+
+### `raw_response` — bypassing the generated server
+
+When `raw_response` is present, the driver does **not** mount the generated
+server: it answers every request itself with the canned `status` (+ optional
+JSON `body`, sent as `application/json`; the Python driver snake_cases the body
+keys to match the Python generator's documented wire format). The stub handler
+is never invoked, so `handler` is empty and the ok-case "handler was called"
+assertion is skipped.
+
+This exists for the **client-leniency** cases: generated clients deliberately
+envelope ANY 2xx status — even one the contract never declared — because a
+proxy or middlebox can rewrite a success status (see `docs/design-decisions.md`,
+"Clients are deliberately lenient"). The generated server can never put an
+undeclared status on the wire (its envelope guard answers 500 instead), so a
+canned raw response is the only way to exercise that client path end-to-end.
 
 ### Case kinds
 
@@ -122,6 +143,24 @@ query params.
 - **`expect_client.expect_download`** — for a binary download: the bytes the
   client must read off the (non-JSON) response body, compared as decoded UTF-8.
   Present instead of `expect_client.ok`.
+- **`handler.returns_status`** — for a multi-status endpoint (a `response { }`
+  block): the HTTP status the stub handler chooses to return (e.g. `201` or
+  `204`). The driver sets it on the generated `<Endpoint>Response` envelope the
+  handler returns; the generated server writes that status to the wire. Also
+  used by `kind: "error"` cases to drive the server's handler-bug guards: an
+  undeclared status, a body paired with a typeless status, or a missing body on
+  a typed status each make the generated server answer 500 instead of writing
+  the bad envelope to the wire (asserted via `expect_client.error` with
+  `variant: "Unknown"`, the TS client's code for an unmapped error status).
+- **`expect_client.status`** — for a multi-status endpoint: the status code the
+  client must observe on the returned envelope (`result.status`). Asserted
+  alongside the body.
+- **`expect_client.ok_absent`** (bool) — for a multi-status endpoint whose chosen
+  status carries NO body (e.g. `204`): asserts the client's envelope body is
+  absent/null. Present instead of `expect_client.ok`. (When a body IS expected,
+  use `expect_client.ok` as usual — the body is compared against it.) For an
+  ALL-TYPELESS endpoint the envelope has no body field at all; `ok_absent` is
+  trivially satisfied there and the drivers assert the status only.
 - **`handler.expect_received`** — a map of arg-name → expected value. Drivers
   compare the **decoded args the handler actually received** against these.
   Numbers are compared numerically (don't assume int vs float). `null` means the

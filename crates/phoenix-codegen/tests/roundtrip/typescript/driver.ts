@@ -57,8 +57,11 @@ import type {
   ListPostsCursorPage,
   ListPostsOffsetPage,
   Post,
+  RequeuePostResponse,
   UpdateAuthorProfileBody,
   UploadAvatarBody,
+  UpsertPost2Body,
+  UpsertPost2Response,
 } from "./generated/types";
 
 const target = "typescript" as const;
@@ -83,6 +86,12 @@ interface ContractCase {
       fields: Record<string, unknown>;
     };
   };
+  // When present, the driver answers every request itself with this canned
+  // status (+ optional JSON body) INSTEAD of mounting the generated server —
+  // the only way to put a status on the wire that the generated server's own
+  // guard refuses (e.g. an undeclared 2xx for the client-leniency cases). The
+  // stub handler is never invoked, so the ok-case hit assertion is skipped.
+  raw_response?: { status: number; body?: unknown };
   handler: {
     expect_received?: Record<string, unknown>;
     returns?: unknown;
@@ -90,12 +99,19 @@ interface ContractCase {
     // binary download: the UTF-8 content the stub streams back as the raw
     // (non-JSON) response body (returned from the handler as a Buffer).
     returns_file?: string;
+    // multi-status: the HTTP status the stub sets on the returned
+    // <Endpoint>Response envelope; `returns` (when present) is the body.
+    returns_status?: number;
     raises?: string;
     expect_not_called?: boolean;
   };
   expect_client: {
     ok?: unknown;
     ok_headers?: Record<string, unknown>;
+    // multi-status: the status the client must observe on the envelope, and
+    // (for a bodyless status like 204) that the envelope body is absent.
+    status?: number;
+    ok_absent?: boolean;
     // binary download: the UTF-8 content the client must read off the Blob
     // response body (present instead of `ok`).
     expect_download?: string;
@@ -228,6 +244,43 @@ function makeStub(c: ContractCase, state: CaseState): Handlers {
       };
       return signal<Post>(c);
     },
+    // upsertPost2 is a multi-status endpoint: the handler returns the
+    // <Endpoint>Response envelope { status, body }. Record the path param + body
+    // fields like createPost, raise the declared error variant when the case
+    // asks for one (signal() builds the return from `returns`, which here is
+    // only the envelope's body, so throw directly instead), then build the
+    // envelope from handler.returns_status and handler.returns (the Post body,
+    // or undefined for the 204/no-body case).
+    async upsertPost2(id, body) {
+      state.hit = true;
+      state.received = {
+        id,
+        title: body.title,
+        body: body.body,
+        status: body.status,
+        tags: body.tags,
+      };
+      if (c.handler.raises !== undefined) {
+        throw new Error(c.handler.raises);
+      }
+      return {
+        status: c.handler.returns_status as number,
+        body:
+          c.handler.returns === undefined
+            ? undefined
+            : (c.handler.returns as Post),
+      } satisfies UpsertPost2Response;
+    },
+    // requeuePost is an ALL-TYPELESS multi-status endpoint: the
+    // RequeuePostResponse envelope has no body field at all — the stub only
+    // chooses the status from handler.returns_status.
+    async requeuePost(id) {
+      state.hit = true;
+      state.received = { id };
+      return {
+        status: c.handler.returns_status as number,
+      } satisfies RequeuePostResponse;
+    },
     async updateAuthorProfile(id, body) {
       // Body carries a constrained Option<string> field (avatarUrl) also
       // `partial`-applied; the server rejects the empty-avatarUrl constraint
@@ -355,6 +408,17 @@ async function invoke(c: ContractCase): Promise<unknown> {
     case "createPost": {
       const body = c.call.body as unknown as CreatePostBody;
       return api.createPost(body);
+    }
+    case "upsertPost2": {
+      const id = c.call.path_params?.id;
+      assert.ok(id !== undefined, `${c.name}: missing path_params.id`);
+      const body = c.call.body as unknown as UpsertPost2Body;
+      return api.upsertPost2(id, body);
+    }
+    case "requeuePost": {
+      const id = c.call.path_params?.id;
+      assert.ok(id !== undefined, `${c.name}: missing path_params.id`);
+      return api.requeuePost(id);
     }
     case "updateAuthorProfile": {
       const id = c.call.path_params?.id;
@@ -543,7 +607,20 @@ async function runCase(c: ContractCase): Promise<void> {
     next();
   };
   app.post("/api/authors/:id/avatar", upload, multipartToBlobFiles);
-  app.use(createRouter(makeStub(c, state)));
+  if (c.raw_response !== undefined) {
+    // raw_response case: bypass the generated server entirely and answer with
+    // the canned status/body (see the ContractCase field comment).
+    const raw = c.raw_response;
+    app.use((_req: ExpressRequest, res: ExpressResponse) => {
+      if (raw.body !== undefined) {
+        res.status(raw.status).json(raw.body);
+      } else {
+        res.status(raw.status).end();
+      }
+    });
+  } else {
+    app.use(createRouter(makeStub(c, state)));
+  }
 
   const server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -565,8 +642,10 @@ async function runCase(c: ContractCase): Promise<void> {
           thrown === undefined,
           `[${c.name}] expected success, got error: ${String(thrown)}`,
         );
-        assert.ok(state.hit, `[${c.name}] handler was never called (ok case)`);
-        assertReceived(c, state.received);
+        if (c.raw_response === undefined) {
+          assert.ok(state.hit, `[${c.name}] handler was never called (ok case)`);
+          assertReceived(c, state.received);
+        }
         if (c.endpoint === "getPostMetered") {
           // The client returns a typed envelope: compare its `.body` against
           // expect_client.ok and its response-header fields against ok_headers.
@@ -577,6 +656,37 @@ async function runCase(c: ContractCase): Promise<void> {
             `[${c.name}] client result body mismatch`,
           );
           assertOkHeaders(c, env);
+        } else if (c.endpoint === "upsertPost2") {
+          // Multi-status: the client returns the { status, body } envelope.
+          // Assert the observed status, then either an absent body (ok_absent,
+          // e.g. 204) or a body that deep-equals expect_client.ok.
+          const env = result as UpsertPost2Response;
+          assert.strictEqual(
+            env.status,
+            c.expect_client.status,
+            `[${c.name}] client result status: got ${String(env.status)}, want ${String(c.expect_client.status)}`,
+          );
+          if (c.expect_client.ok_absent === true) {
+            assert.ok(
+              env.body === undefined || env.body === null,
+              `[${c.name}] expected absent envelope body, got ${JSON.stringify(env.body)}`,
+            );
+          } else {
+            assert.deepStrictEqual(
+              env.body,
+              c.expect_client.ok,
+              `[${c.name}] client result body mismatch`,
+            );
+          }
+        } else if (c.endpoint === "requeuePost") {
+          // All-typeless multi-status: the envelope is { status } with no body
+          // field, so the only client-side observation is the status itself.
+          const env = result as RequeuePostResponse;
+          assert.strictEqual(
+            env.status,
+            c.expect_client.status,
+            `[${c.name}] client result status: got ${String(env.status)}, want ${String(c.expect_client.status)}`,
+          );
         } else if (c.expect_client.expect_download !== undefined) {
           // Binary download: the client returns a Blob; read its bytes as UTF-8
           // and compare to expect_client.expect_download. Keyed on the

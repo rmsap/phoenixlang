@@ -1881,3 +1881,191 @@ Adds first-class cursor and offset pagination, the single most common API shape
    no routing. This is a general correctness fix (it also covers e.g.
    `/users/me` vs `/users/{id}`), found because the round-trip suite executes the
    generated server rather than only checking it compiles.
+
+---
+
+## Phoenix Gen — multi-status responses design (2026-06-07)
+
+Adds multiple **success status codes** to one endpoint (e.g. a create-or-update
+returning `200` when it updated or `201` when it created). Scoped deliberately to
+**multi-status, NOT content negotiation**: the roadmap's
+`response { 200: User, 200 text: String }` sketch bundles two features —
+(a) multiple status codes and (b) multiple content-types per status (Accept-header
+negotiation with union return types). We are doing (a) only. (b) — content
+negotiation — is the expensive part (runtime client dispatch on the response
+`Content-Type`, union/sum return types that have no clean Go representation) and is
+deferred; see "Deferred" below. Locked decisions (language-designer calls):
+
+1. **Shared body type across statuses (Option A — no unions).** All typed statuses
+   in a `response { }` block must share ONE body type. `response { 200: User
+   201: User }` is allowed; `response { 200: User  201: Receipt }` (different body
+   types per status) is REJECTED by sema. Rationale: differing body types per
+   status is a discriminated union, which has no idiomatic Go representation
+   (`interface{}`/hand-rolled wrapper) and reintroduces exactly the
+   content-negotiation complexity this slice avoids. The common real cases
+   (create-or-update 200/201, accepted-vs-done 202/200) all carry the same body.
+   Endpoints genuinely needing different shapes per status use separate endpoints
+   or `error { }` variants. (Allowing differing types later is an additive
+   extension if demand appears.)
+
+2. **Grammar — a `response { <status>[: Type] ... }` block** alongside the
+   existing bare `response Type`. The bare form is unchanged (implicit `200`, no
+   envelope). The block form lists one or more success statuses, each either typed
+   (`200: User`) or **typeless** (`204` — no body). Typeless statuses may be mixed
+   with typed ones (`200: User  204`). All typed entries must use the same type
+   (decision 1). A typed entry must name a **struct** type: `List<T>`, scalars,
+   `Option<T>`, and enums are rejected by sema (the bare `response List<Post>`
+   etc. is unchanged). The envelope's `body: Option<T>` slot serializes through
+   the struct machinery in every target — Python in particular emits
+   `T.model_validate(...)` / `body.model_dump_json()`, which only exist on
+   pydantic models, so a non-struct `T` would generate code that fails at
+   runtime. Relaxing this later (e.g. via pydantic `TypeAdapter`) is additive.
+   Status codes must be in the success range (2xx); failures stay in
+   the `error { }` block. Duplicate status codes are rejected. Bodyless statuses
+   (`204` No Content, `205` Reset Content) must be typeless: HTTP (RFC 9110)
+   forbids a body on them, and the generated servers could not honor a typed
+   entry either way — on a 204, Go's `net/http` and Express silently drop body
+   writes; on a 205 (which neither framework suppresses) the body would hit the
+   wire as an illegal response. So a typed `204: T` or `205: T` is a contract
+   the wire cannot honor — sema rejects it. An empty `response { }` is
+   a parse error (it would otherwise silently mean "no response declared").
+
+3. **Return shape — a status-carrying envelope `<Endpoint>Response { status: Int,
+   body: Option<T> }`.** A `response { }` block makes the handler return, and the
+   client observe, this envelope (vs. the bare body for a plain `response Type`).
+   `status` is the actual HTTP status; the handler sets it, the server writes it,
+   the client reads it. **`body` is ALWAYS `Option<T>`** — uniform across all
+   blocks regardless of whether a typeless status is present. Rationale: one
+   envelope shape = one codegen path per target (simpler, fewer branches); the
+   caller unwraps the Option once. (A block with only typeless statuses — e.g.
+   `response { 202  204 }` — has no `T`; the envelope is just `{ status: Int }`
+   with no `body` field.) The envelope type name is `<Endpoint>Response` (distinct
+   from the response-headers `<Endpoint>Result` and the pagination
+   `<Endpoint>Page`).
+
+4. **Composition — multi-status is mutually exclusive with response headers AND
+   with pagination (v1).** All three wrap the handler's single return value in a
+   generated envelope (`<Endpoint>Response` / `<Endpoint>Result` /
+   `<Endpoint>Page`), and one return slot can hold only one envelope type — the
+   same constraint that already makes headers and pagination mutually exclusive.
+   Sema rejects multi-status + pagination; the parser rejects an inline
+   `headers { ... }` after a `response { }` block (the response-header spelling)
+   with a targeted error — without that, the trailing block would re-dispatch as
+   the standalone REQUEST `headers` section and silently change semantics. Rare
+   combination; rejecting keeps the slice tight. The user-facing note is recorded
+   in
+   [known-issues.md](known-issues.md#multi-status-responses-cannot-be-combined-with-response-headers-or-pagination-v1).
+   Future option (additive, non-breaking): nest the envelopes (the
+   `<Endpoint>Result` envelope's `body` slot could hold a `<Endpoint>Response`),
+   per the same reasoning recorded for headers+pagination.
+
+5. **Per-target codegen.** The server writes the handler-chosen status code
+   (instead of the hardcoded 200/204) and serializes `body` when present. The
+   client reads the status into `status` and parses the body (when the response
+   carries one) into `body: Option<T>`. Clients detect an empty body by
+   **content**, never by special-casing a status code — any typeless status
+   (202, 204, …) sends an empty body, not just 204 (Go: `ContentLength`/EOF
+   tolerance; TypeScript: non-empty `response.text()`; Python:
+   `response.content`). The server **validates the handler-chosen envelope
+   against the declared contract** before writing it and answers 500 on a
+   mismatch — three guards, all handler bugs reported instead of written to the
+   wire:
+   - *undeclared status* ("handler returned undeclared status"): a buggy
+     handler can return a zero-value envelope (Go's `WriteHeader(0)` panics,
+     Express's `res.status(0)` throws) or smuggle a 4xx through the success
+     envelope past the `error { }` mapping;
+   - *body on a typeless status* ("handler returned a body for a bodyless
+     status"): the frameworks only suppress bodies on 204/304 (plus 1xx in
+     Go), so a body paired with e.g. a typeless 202 WOULD hit the wire — and
+     the content-guarded client would parse it, silently violating the
+     contract;
+   - *missing body on a typed status* ("handler returned no body for a typed
+     status"): the contract — and the emitted OpenAPI spec — promise a body
+     there; without the guard the client would surface a contract-violating
+     absent body.
+   An all-typeless block has no body field, so only the membership guard
+   applies there. **Clients are deliberately lenient**: they envelope whatever
+   success status the wire delivers without checking it against the declared
+   set — only the server enforces the contract. A generated client may be
+   pointed at a non-Phoenix implementation of the same API, and failing hard
+   on an undeclared 2xx would help nobody; the caller sees the real status and
+   can decide. (Minor target divergence at the success/redirect edge: the TS
+   client throws on any non-2xx via `!response.ok`, while the Go client
+   (`>= 400`) and the Python client (`raise_for_status()`) would envelope a
+   3xx — unreachable in practice, since redirects are auto-followed and the
+   generated clients never send conditional headers.) JSON content-type
+   throughout (no negotiation — decision is multi-status only). OpenAPI lists
+   each declared status as a separate entry in the operation's `responses`
+   map, each with the shared `T` schema (or no content for a typeless status)
+   — OpenAPI represents this natively and needs no envelope.
+
+6. **Sema data model.** `EndpointInfo` keeps `response: Option<Type>` and gains
+   `response_statuses: Vec<ResponseStatusInfo>`. A bare `response Type` leaves
+   `response_statuses` EMPTY — `response` stays the single source of truth, so
+   every existing endpoint's generated output is byte-identical (no churn for
+   the non-multi-status case, mirroring how headers/pagination left non-using
+   endpoints unchanged). A `response { }` block populates `response_statuses`
+   (its non-emptiness is the multi-status signal to codegen) and mirrors the
+   shared body type `T` back into `response` so downstream "what is the success
+   body type" reads keep working. (An earlier sketch instead lowered the bare
+   form to an implicit single-200 entry; the empty-for-bare representation was
+   chosen because it needs no special-casing to keep existing output
+   unchanged.)
+
+7. **Scope of this slice:** multi-status success responses (shared body type +
+   typeless statuses), all four targets, proven by BOTH harnesses
+   (compile-and-lint + round-trip; the round-trip asserts the handler-chosen
+   status + body round-trip). Content negotiation (multiple content-types per
+   status, union returns, Accept dispatch) is OUT.
+
+### Deferred — content negotiation (the other half of the roadmap sketch)
+Multiple content-types at one status (`200 json: User`, `200 text: String`) with
+Accept-header dispatch and union return types is deferred indefinitely. It is the
+high-complexity / low-frequency half: it forces runtime client dispatch on the
+response `Content-Type` and a sum/union return type that Go cannot express
+idiomatically (only `interface{}` or a generated discriminated wrapper), which
+would undercut the "idiomatic per-target output" quality bar. Revisit only if real
+demand appears; the multi-status grammar above leaves room to add a per-status
+content-type qualifier later without breaking existing schemas.
+
+### Body-identifier collision fix (surfaced by this slice)
+The fixture's multi-status endpoint has BOTH a request `body` and a multi-status
+envelope, which exposed a latent TypeScript-generator bug: the client method
+declared a local `let body` for the parsed response body, colliding with the
+`body: <T>Body` request-body **parameter** (TS2300 duplicate identifier; also a
+type error). Fix: the TS client now names the response-body local `responseBody`
+(returning `{ status, body: responseBody }`). Python had already avoided this
+(its agent named the local `response_body`); Go uses struct fields so never
+collided. Found because the compile-and-lint harness ran `tsc` over a fixture
+combining a request body with a multi-status response — the inline generator
+tests used bodyless endpoints and missed it.
+
+### Other drive-by hardening (surfaced by this slice)
+Three pre-existing gaps fixed while building this slice — the first two because
+the new code needed the same machinery, the third found while reviewing the new
+`response { }` block against its `error { }` sibling:
+- **TS client — unconsumed response bodies.** Every client path that never reads
+  the body now cancels it with `await response.body?.cancel()`: void-response
+  endpoints, the new all-typeless multi-status envelope, and the error path of
+  endpoints without an `error { }` block (which throws without reading the
+  body; the `error { }` path already consumes it via `response.text()`).
+  Previously the unconsumed fetch body held the underlying connection until GC;
+  cancelling releases it for reuse immediately. This changed the existing
+  void-response and error-path client snapshots.
+- **Go server — `(nil, nil)` handler returns.** The binary-download and
+  response-header server paths now guard `result == nil` with a 500 ("handler
+  returned nil result") before dereferencing, matching the guard the new
+  multi-status path ships with. A `(nil, nil)` return is a handler bug Go's type
+  system can't prevent; previously it panicked the route (`io.Copy` from a nil
+  reader / a nil-envelope field read).
+- **Parser — `error { }` malformed-entry hang; comma separators.** The
+  `error { }` variant loop had no recovery advance, so ANY malformed variant —
+  including the natural comma-separated spelling
+  `error { NotFound(404), Conflict(409) }`, which two of this repo's own doc
+  comments used — re-examined the same token forever and hung the compiler.
+  Fixed with a consumed-nothing guard (skip one token when a variant parse
+  consumes nothing). And because the comma spelling is clearly the habit users
+  will bring (the roadmap's own sketch used it), both `error { }` and the new
+  `response { }` block now accept an optional comma after each entry, matching
+  the forgiving `omit { a, b }` field-list style. Endpoint sections remain
+  canonically newline-separated; the comma is tolerated, not required.

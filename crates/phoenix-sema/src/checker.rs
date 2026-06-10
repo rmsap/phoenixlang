@@ -451,8 +451,35 @@ pub struct EndpointInfo {
     pub headers: Vec<HeaderParamInfo>,
     /// The resolved body type with modifiers applied, if present.
     pub body: Option<ResolvedDerivedType>,
-    /// The resolved response type, if declared.
+    /// The resolved response type — the success body type.
+    ///
+    /// For a **bare** `response <T>` endpoint this is the resolved `T` (or `None`
+    /// for no response), exactly as before, and [`response_statuses`] is empty.
+    /// Downstream code treating this as "the single success body type" is
+    /// unchanged for the bare case.
+    ///
+    /// For a **block** `response { ... }` endpoint (when [`response_statuses`] is
+    /// non-empty) this holds the shared body type `T` common to every typed
+    /// status entry (decision 1: all typed statuses share one type), or `None`
+    /// when every entry is typeless (e.g. `response { 202  204 }`). The
+    /// non-emptiness of [`response_statuses`] — not this field — is what signals
+    /// "this is a multi-status endpoint; emit the envelope" to codegen.
+    ///
+    /// [`response_statuses`]: EndpointInfo::response_statuses
     pub response: Option<Type>,
+    /// Resolved success-status entries from a **block** `response { ... }` form.
+    ///
+    /// EMPTY for the common bare `response <T>` case (and for no response at
+    /// all): bare endpoints keep [`response`] as the single source of truth and
+    /// codegen reads `response_statuses` ONLY when it is non-empty, so every
+    /// existing endpoint's generated output is byte-identical. NON-EMPTY signals
+    /// a multi-status endpoint, for which codegen emits the
+    /// `<Endpoint>Response { status: Int, body: Option<T> }` envelope; the shared
+    /// body type `T` is mirrored into [`response`] for that case too. See
+    /// `docs/design-decisions.md` (multi-status responses design).
+    ///
+    /// [`response`]: EndpointInfo::response
+    pub response_statuses: Vec<ResponseStatusInfo>,
     /// Resolved response headers (set by the handler, read by the client).
     /// Empty unless the endpoint declares `response <T> headers { ... }`. When
     /// non-empty, generators bundle the body + these into a typed envelope.
@@ -477,6 +504,25 @@ pub struct EndpointInfo {
     /// (`{ items: List<T>, ...mode-specific fields }`) instead of a bare list.
     /// See `docs/design-decisions.md` (pagination section).
     pub pagination: Option<PaginationInfo>,
+}
+
+/// One resolved success-status entry from a `response { ... }` block, produced
+/// during semantic analysis.
+///
+/// Mirrors the parser's `ResponseStatus` with the body type resolved. The body
+/// type is `Some` for a typed entry (`200: User`) and `None` for a typeless
+/// entry (`204`). All typed entries within one block share the same resolved
+/// type (enforced in `check_endpoint`; see decision 1).
+#[derive(Debug, Clone)]
+pub struct ResponseStatusInfo {
+    /// The HTTP success status code for this entry. In 200..=299 whenever the
+    /// program passed checking: a non-2xx entry is diagnosed but still recorded
+    /// (so one bad status doesn't cascade into shared-type/duplicate errors on
+    /// the entries around it), and codegen never runs on a failed check.
+    pub status: u16,
+    /// The resolved response body type for this status, or `None` for a typeless
+    /// entry (e.g. `204`).
+    pub ty: Option<Type>,
 }
 
 /// Resolved pagination metadata for an endpoint, produced during semantic

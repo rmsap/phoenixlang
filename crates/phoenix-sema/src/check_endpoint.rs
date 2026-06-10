@@ -5,7 +5,7 @@
 
 use crate::checker::{
     Checker, DefaultValue, DerivedField, EndpointInfo, HeaderParamInfo, PaginationInfo,
-    QueryParamInfo, ResolvedDerivedType, header_wire_name,
+    QueryParamInfo, ResolvedDerivedType, ResponseStatusInfo, header_wire_name,
 };
 use crate::types::Type;
 use phoenix_parser::api_version::normalize_api_version;
@@ -13,6 +13,7 @@ use phoenix_parser::ast::{
     DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, TypeExpr,
     TypeModifier,
 };
+use std::collections::HashSet;
 
 impl Checker {
     /// Type-checks an endpoint declaration and, if valid, adds a resolved
@@ -73,7 +74,7 @@ impl Checker {
         // requires such a response struct to hold EXACTLY one field, of type
         // `File`, and nothing else (a binary stream cannot be multiplexed with
         // JSON fields). See `docs/design-decisions.md` (multipart).
-        let response = ep.response.as_ref().map(|te| {
+        let mut response = ep.response.as_ref().map(|te| {
             let prev = self.file_bearing_struct_allowed;
             self.file_bearing_struct_allowed = true;
             let ty = self.resolve_type_expr(te);
@@ -87,10 +88,39 @@ impl Checker {
             ty
         });
 
+        // Multi-status block form: `response { 200: User  201: User  204 }`.
+        // Resolve and validate the block, then mirror the shared body type `T`
+        // into `response` so downstream "what is the success body type" reads
+        // keep working. `response_statuses` being non-empty is what signals
+        // multi-status to codegen; `is_multi_status` gates the binary/pagination
+        // resolution below so a block-form endpoint is never also flagged binary
+        // or paginatable (decision 6 / decision 4). See
+        // `docs/design-decisions.md` (multi-status responses design).
+        let is_multi_status = !ep.response_statuses.is_empty();
+        let response_statuses = self.check_response_statuses(ep);
+        if is_multi_status {
+            // Shared body type `T` (the first VALID typed entry; all valid typed
+            // entries are validated equal in `check_response_statuses`, and an
+            // entry that failed to resolve is skipped here the same way it is
+            // skipped there). `None` when the block has only typeless statuses
+            // (e.g. `response { 202  204 }`). Only the valid/None distinction is
+            // ever observable downstream: a `Type::Error` entry always comes with
+            // a diagnostic, and codegen never runs on a failed check.
+            response = response_statuses
+                .iter()
+                .find_map(|rs| rs.ty.clone().filter(|t| *t != Type::Error));
+        }
+
         // Rule 3 (response/download): a file-bearing response struct must be a
-        // pure binary download — exactly one field, of type `File`.
+        // pure binary download — exactly one field, of type `File`. Multi-status
+        // bodies are JSON-only (`check_response_statuses` rejects a file-bearing
+        // struct with a targeted error and resolves it to `Type::Error`), so a
+        // multi-status endpoint is never a binary download — skip the check for
+        // the block form so the shared-`T` mirrored into `response` above can
+        // never be misread as a binary download.
         let mut response_is_binary = false;
-        if let Some(Type::Named(name)) = &response
+        if !is_multi_status
+            && let Some(Type::Named(name)) = &response
             && let Some(si) = self.lookup_struct(name)
             && si.is_file_bearing
         {
@@ -115,31 +145,42 @@ impl Checker {
         // `Option<List<T>>` is rejected — a paginated call always returns a page
         // (emptiness is `items: []`), so a null page is meaningless. See
         // `docs/design-decisions.md` (pagination section).
-        let pagination = ep.pagination.and_then(|mode| {
-            let item_type = match &response {
-                Some(Type::Generic(name, args)) if name == "List" && args.len() == 1 => {
-                    Some(args[0].clone())
+        // Precedence: a multi-status block + pagination is reported as the
+        // combo rejection below (decision 4), NOT as the "pagination requires a
+        // `List<T>` response" error — the shared-`T` mirrored into `response`
+        // for a multi-status block is not a `List<T>`, so running the pagination
+        // resolution here would emit a confusing "requires List" diagnostic.
+        // Skip pagination resolution entirely for the block form; the dedicated
+        // combo error fires unconditionally when `ep.pagination` is set.
+        let pagination = if is_multi_status {
+            None
+        } else {
+            ep.pagination.and_then(|mode| {
+                let item_type = match &response {
+                    Some(Type::Generic(name, args)) if name == "List" && args.len() == 1 => {
+                        Some(args[0].clone())
+                    }
+                    _ => None,
+                };
+                match item_type {
+                    Some(item_type) => Some(PaginationInfo { mode, item_type }),
+                    None => {
+                        self.error(
+                            format!(
+                                "endpoint `{}`: `pagination` requires the response to be a `List<T>` (got {}); a paginated response wraps a list — `Option<List<T>>` and non-list responses are not allowed",
+                                ep.name,
+                                response
+                                    .as_ref()
+                                    .map(|t| t.to_string())
+                                    .unwrap_or_else(|| "no response".to_string())
+                            ),
+                            ep.span,
+                        );
+                        None
+                    }
                 }
-                _ => None,
-            };
-            match item_type {
-                Some(item_type) => Some(PaginationInfo { mode, item_type }),
-                None => {
-                    self.error(
-                        format!(
-                            "endpoint `{}`: `pagination` requires the response to be a `List<T>` (got {}); a paginated response wraps a list — `Option<List<T>>` and non-list responses are not allowed",
-                            ep.name,
-                            response
-                                .as_ref()
-                                .map(|t| t.to_string())
-                                .unwrap_or_else(|| "no response".to_string())
-                        ),
-                        ep.span,
-                    );
-                    None
-                }
-            }
-        });
+            })
+        };
 
         // Resolve body type with modifiers. The request-body path looks the
         // base struct up by name (it does not call `resolve_type_expr`), so a
@@ -181,7 +222,7 @@ impl Checker {
         }
 
         // Validate error variants
-        let mut seen_errors = std::collections::HashSet::new();
+        let mut seen_errors = HashSet::new();
         let mut errors = Vec::new();
         for ev in &ep.errors {
             if !seen_errors.insert(&ev.name) {
@@ -291,12 +332,45 @@ impl Checker {
             );
         }
 
+        // Multi-status (`response { ... }`) wraps the handler's return value in a
+        // generated `<Endpoint>Response` envelope, exactly as response headers
+        // wrap it in `<Endpoint>Result` and pagination in `<Endpoint>Page`. One
+        // return slot holds one envelope, so multi-status is mutually exclusive
+        // with both (decision 4). NOTE: the parser already rejects an inline
+        // `headers { ... }` after a response block with its own targeted error
+        // (and discards the block), so a block-form endpoint can never populate
+        // `response_headers`. This first check is therefore
+        // defensive/unreachable via the current grammar; kept as cheap
+        // insurance. See `docs/known-issues.md`.
+        if is_multi_status && let Some(first) = ep.response_headers.first() {
+            self.error(
+                format!(
+                    "endpoint `{}`: a multi-status `response {{ }}` block cannot also declare response headers — both wrap the return value in a generated envelope and a handler has one return value. See docs/known-issues.md",
+                    ep.name
+                ),
+                first.span,
+            );
+        }
+        if is_multi_status && ep.pagination.is_some() {
+            let span = ep
+                .response_statuses
+                .first()
+                .map(|rs| rs.span)
+                .unwrap_or(ep.span);
+            self.error(
+                format!(
+                    "endpoint `{}`: a multi-status `response {{ }}` block cannot also be paginated — both wrap the return value in a generated envelope. See docs/known-issues.md",
+                    ep.name
+                ),
+                span,
+            );
+        }
+
         // Request headers share the generated parameter scope with path and
         // query params, so a duplicate local name would emit two parameters of
         // the same name (a compile error in the generated Go/TS/Python). Check
         // each request header against the path/query names and the other headers.
-        let mut input_names: std::collections::HashSet<&str> =
-            path_params.iter().map(String::as_str).collect();
+        let mut input_names: HashSet<&str> = path_params.iter().map(String::as_str).collect();
         for qp in &ep.query_params {
             input_names.insert(qp.name.as_str());
         }
@@ -316,8 +390,7 @@ impl Checker {
         // `<Endpoint>Result` envelope (alongside the envelope's `body` field), so
         // they must be distinct from each other. (They cannot collide with `body`
         // itself: `body` is a reserved keyword and so cannot be a header name.)
-        let mut response_field_names: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut response_field_names: HashSet<&str> = HashSet::new();
         for h in &ep.response_headers {
             if !response_field_names.insert(h.name.as_str()) {
                 self.error(
@@ -352,6 +425,7 @@ impl Checker {
             headers,
             body,
             response,
+            response_statuses,
             response_headers,
             errors,
             doc_comment: ep.doc_comment.clone(),
@@ -487,7 +561,7 @@ impl Checker {
         ast: &[HeaderParam],
         direction: &str,
     ) {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for (info, h) in resolved.iter().zip(ast.iter()) {
             if !seen.insert(info.wire_name.to_ascii_lowercase()) {
                 self.error(
@@ -627,6 +701,182 @@ impl Checker {
                 );
             }
         }
+    }
+
+    /// Resolves and validates a multi-status `response { ... }` block,
+    /// returning one [`ResponseStatusInfo`] per declared status.
+    ///
+    /// Returns an empty `Vec` for the bare `response <T>` form (or no response),
+    /// in which case the caller leaves `EndpointInfo.response` as the single
+    /// source of truth and no envelope is generated.
+    ///
+    /// Validates (see `docs/design-decisions.md`, multi-status responses design,
+    /// decisions 1 and 2):
+    /// - Each entry's body type resolves (`resolve_type_expr` reports unknown
+    ///   types itself); typeless entries (`204`) carry `ty: None`. A
+    ///   file-bearing struct (a binary download) is rejected with a targeted
+    ///   message — multi-status bodies are JSON-only.
+    /// - Each typed entry must name a STRUCT type: `List<T>`, scalars,
+    ///   `Option<T>`, enums, etc. are rejected (the bare `response <Type>` form
+    ///   keeps supporting them). The envelope's `body` slot serializes through
+    ///   the struct machinery in every target — Python in particular emits
+    ///   `T.model_validate(...)` / `body.model_dump_json()`, which only exist on
+    ///   pydantic models, so a non-struct `T` would generate code that fails at
+    ///   runtime. Relaxing this later is additive.
+    /// - All typed entries share ONE body type (decision 1 / Option A — no
+    ///   unions).
+    /// - Every status is in the success range 200..=299 (failures belong in the
+    ///   `error { }` block).
+    /// - Bodyless statuses (204, 205) must be typeless — HTTP forbids a body on
+    ///   them, and generated servers would silently drop one.
+    /// - Status codes are unique within the block.
+    ///
+    /// An empty `response { }` never reaches here as a non-bare block: the
+    /// parser reports it and yields an empty list, which the `is_empty` early
+    /// return treats the same as the bare form.
+    fn check_response_statuses(&mut self, ep: &EndpointDecl) -> Vec<ResponseStatusInfo> {
+        if ep.response_statuses.is_empty() {
+            return Vec::new();
+        }
+
+        let mut resolved: Vec<ResponseStatusInfo> = Vec::with_capacity(ep.response_statuses.len());
+        let mut seen_statuses: HashSet<u16> = HashSet::new();
+        // The shared body type `T`: the first typed entry's resolved type. Every
+        // later typed entry must equal it (decision 1). Seeded only from entries
+        // that RESOLVED — an entry rejected above (unknown type, file-bearing,
+        // non-struct) must not pin `shared_ty` to `Type::Error` and thereby
+        // suppress a genuine mismatch between the valid entries around it
+        // (e.g. `200: Bogus  201: User  202: Receipt` must report both the
+        // unknown `Bogus` AND the User/Receipt mismatch in one pass).
+        let mut shared_ty: Option<Type> = None;
+
+        for rs in &ep.response_statuses {
+            // 2xx-only: failures belong in `error { }` (decision 2).
+            if !(200..=299).contains(&rs.status) {
+                self.error(
+                    format!(
+                        "endpoint `{}`: response status {} is not a success code (2xx); failures belong in the `error {{ }}` block",
+                        ep.name, rs.status
+                    ),
+                    rs.span,
+                );
+            }
+
+            // Bodyless statuses: HTTP (RFC 9110) forbids a body on 204 (No
+            // Content) and 205 (Reset Content), and the generated servers
+            // could not honor a typed entry either way: on a 204, Go's
+            // net/http and Express silently drop body writes; on a 205
+            // (which neither framework suppresses) the body would hit the
+            // wire as an illegal response. Reject the typed entry rather
+            // than generating a contract the wire cannot honor.
+            if matches!(rs.status, 204 | 205) && rs.ty.is_some() {
+                self.error(
+                    format!(
+                        "endpoint `{}`: status {} cannot declare a body type — HTTP forbids a body on {} responses; list it typeless (`{}`)",
+                        ep.name, rs.status, rs.status, rs.status
+                    ),
+                    rs.span,
+                );
+            }
+
+            // Unique statuses.
+            if !seen_statuses.insert(rs.status) {
+                self.error(
+                    format!(
+                        "endpoint `{}`: duplicate response status {}",
+                        ep.name, rs.status
+                    ),
+                    rs.span,
+                );
+            }
+
+            // Resolve the body type. Unknown types error inside
+            // `resolve_type_expr` (returning `Type::Error`) — adding a second
+            // diagnostic here would be a cascade, so don't. Resolve with the
+            // file-bearing gate up (like the bare response path) and reject a
+            // file-bearing struct AFTER resolution with a targeted message:
+            // letting the gate stay down would surface the generic "body-only
+            // type usable only in `body`/`response` position" error, which is
+            // confusing here — the type IS in response position; the actual
+            // problem is that multi-status bodies are JSON-only.
+            let ty = rs.ty.as_ref().map(|te| {
+                let prev = self.file_bearing_struct_allowed;
+                self.file_bearing_struct_allowed = true;
+                let resolved_ty = self.resolve_type_expr(te);
+                self.file_bearing_struct_allowed = prev;
+                if resolved_ty == Type::Error {
+                    return Type::Error;
+                }
+                // `(name, is_file_bearing)` when the entry names a struct;
+                // cloned out of the lookup so the borrow ends before `error`.
+                let struct_info = match &resolved_ty {
+                    Type::Named(name) => self
+                        .lookup_struct(name)
+                        .map(|si| (name.clone(), si.is_file_bearing)),
+                    _ => None,
+                };
+                match struct_info {
+                    Some((name, true)) => {
+                        self.error(
+                            format!(
+                                "endpoint `{}`: response status {} cannot carry file-bearing struct `{}` — a multi-status `response {{ }}` block is JSON-only; use the bare `response <Type>` form for a binary download",
+                                ep.name, rs.status, name
+                            ),
+                            rs.span,
+                        );
+                        Type::Error
+                    }
+                    Some((_, false)) => resolved_ty,
+                    // Non-struct entry (`List<T>`, a scalar, `Option<T>`, an
+                    // enum, ...): the envelope's `body` slot serializes through
+                    // the struct machinery in every target (Python emits
+                    // `T.model_validate(...)` / `body.model_dump_json()`, which
+                    // only exist on pydantic models), so reject it here instead
+                    // of generating code that fails at runtime.
+                    None => {
+                        self.error(
+                            format!(
+                                "endpoint `{}`: response status {} body type must be a named struct (got `{}`) — a multi-status `response {{ }}` block carries one struct shape; use the bare `response <Type>` form for list or scalar responses",
+                                ep.name, rs.status, resolved_ty
+                            ),
+                            rs.span,
+                        );
+                        Type::Error
+                    }
+                }
+            });
+
+            // Shared body type (decision 1): every typed entry must match the
+            // first VALID typed entry. Typeless entries are exempt, and an
+            // entry that failed to resolve (`Type::Error`, already errored
+            // above) neither seeds nor compares — its own diagnostic stands and
+            // it must not cascade here or mask the valid entries' mismatches.
+            if let Some(this_ty) = &ty
+                && *this_ty != Type::Error
+            {
+                match &shared_ty {
+                    None => shared_ty = Some(this_ty.clone()),
+                    Some(first_ty) => {
+                        if first_ty != this_ty {
+                            self.error(
+                                format!(
+                                    "endpoint `{}`: all typed response statuses must share one body type (Option A); found `{}` and `{}` — use separate endpoints or `error {{ }}` for different shapes",
+                                    ep.name, first_ty, this_ty
+                                ),
+                                rs.span,
+                            );
+                        }
+                    }
+                }
+            }
+
+            resolved.push(ResponseStatusInfo {
+                status: rs.status,
+                ty,
+            });
+        }
+
+        resolved
     }
 }
 
@@ -773,6 +1023,7 @@ mod tests {
 
     use super::{apply_version_prefix, route_signature};
     use crate::checker::check;
+    use crate::types::Type;
 
     /// Lex, parse, and type-check `source`, returning only the error-level
     /// diagnostic messages.
@@ -2296,6 +2547,367 @@ mod tests {
             }
             "#,
             "cannot be combined",
+        );
+    }
+
+    // ---- Multi-status `response { ... }` block (decisions 1, 2, 4, 6) ----
+
+    #[test]
+    fn multi_status_two_typed_same_type_accepts() {
+        let src = r#"
+            struct User { Int id }
+            endpoint createUser: POST "/users" {
+                response { 200: User  201: User }
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert_eq!(ep.response_statuses.len(), 2);
+        assert_eq!(ep.response_statuses[0].status, 200);
+        assert_eq!(
+            ep.response_statuses[0].ty,
+            Some(Type::Named("User".to_string()))
+        );
+        assert_eq!(ep.response_statuses[1].status, 201);
+        assert_eq!(
+            ep.response_statuses[1].ty,
+            Some(Type::Named("User".to_string()))
+        );
+        // The shared body type `T` is mirrored into `response`.
+        assert_eq!(ep.response, Some(Type::Named("User".to_string())));
+    }
+
+    #[test]
+    fn multi_status_typed_and_typeless_accepts() {
+        let src = r#"
+            struct User { Int id }
+            endpoint createUser: POST "/users" {
+                response { 200: User  204 }
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert_eq!(ep.response_statuses.len(), 2);
+        assert_eq!(ep.response_statuses[0].status, 200);
+        assert_eq!(
+            ep.response_statuses[0].ty,
+            Some(Type::Named("User".to_string()))
+        );
+        assert_eq!(ep.response_statuses[1].status, 204);
+        assert_eq!(ep.response_statuses[1].ty, None);
+        // Shared `T` still comes from the one typed entry.
+        assert_eq!(ep.response, Some(Type::Named("User".to_string())));
+    }
+
+    #[test]
+    fn multi_status_typeless_first_mirrors_shared_type() {
+        // The shared-`T` mirror scans for the FIRST TYPED entry (`find_map`),
+        // not the first entry: a typeless status listed before the typed one
+        // must still mirror `T` into `response`.
+        let src = r#"
+            struct User { Int id }
+            endpoint createUser: POST "/users" {
+                response { 204  200: User }
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert_eq!(ep.response_statuses.len(), 2);
+        assert_eq!(ep.response_statuses[0].status, 204);
+        assert_eq!(ep.response_statuses[0].ty, None);
+        assert_eq!(ep.response_statuses[1].status, 200);
+        assert_eq!(
+            ep.response_statuses[1].ty,
+            Some(Type::Named("User".to_string()))
+        );
+        assert_eq!(ep.response, Some(Type::Named("User".to_string())));
+    }
+
+    #[test]
+    fn multi_status_all_typeless_accepts() {
+        let src = r#"
+            endpoint accept: POST "/jobs" {
+                response { 202  204 }
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert_eq!(ep.response_statuses.len(), 2);
+        assert_eq!(ep.response_statuses[0].status, 202);
+        assert_eq!(ep.response_statuses[0].ty, None);
+        assert_eq!(ep.response_statuses[1].status, 204);
+        assert_eq!(ep.response_statuses[1].ty, None);
+        // No typed entry → no shared body type.
+        assert_eq!(ep.response, None);
+    }
+
+    #[test]
+    fn bare_response_leaves_statuses_empty() {
+        // Regression: the common bare-response case is untouched.
+        let src = r#"
+            struct User { Int id }
+            endpoint getUser: GET "/users/{id}" {
+                response User
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert!(ep.response_statuses.is_empty());
+        assert_eq!(ep.response, Some(Type::Named("User".to_string())));
+    }
+
+    #[test]
+    fn multi_status_differing_body_types_rejected() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            struct Receipt { Int id }
+            endpoint createUser: POST "/users" {
+                response { 200: User  201: Receipt }
+            }
+            "#,
+            "must share one body type",
+        );
+    }
+
+    #[test]
+    fn multi_status_non_2xx_rejected() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            struct NotFound { Int id }
+            endpoint getUser: GET "/users/{id}" {
+                response { 200: User  404: NotFound }
+            }
+            "#,
+            "not a success code",
+        );
+    }
+
+    #[test]
+    fn multi_status_duplicate_status_rejected() {
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint getUser: GET "/users/{id}" {
+                response { 200: User  200: User }
+            }
+            "#,
+            "duplicate response status",
+        );
+    }
+
+    #[test]
+    fn multi_status_with_request_headers_allowed() {
+        // Request headers are orthogonal to multi-status (they don't wrap the
+        // return value), so this combination is FINE. NOTE: the multi-status +
+        // RESPONSE-headers combo never reaches sema — the parser rejects an
+        // inline `headers { ... }` after a response block with its own targeted
+        // error and discards the block. The sema check for it is therefore
+        // defensive; this test instead pins that a standalone (request)
+        // `headers` block coexists cleanly with a multi-status block.
+        let src = r#"
+            struct User { Int id }
+            endpoint createUser: POST "/users" {
+                headers { String x }
+                response { 200: User  201: User }
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert_eq!(ep.headers.len(), 1);
+        assert_eq!(ep.response_statuses.len(), 2);
+        assert!(ep.response_headers.is_empty());
+    }
+
+    #[test]
+    fn multi_status_typed_204_rejected() {
+        // HTTP forbids a body on 204; a typed entry would generate a server
+        // that silently drops the handler-supplied body.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint deleteUser: DELETE "/users/{id}" {
+                response { 204: User }
+            }
+            "#,
+            "cannot declare a body type",
+        );
+    }
+
+    #[test]
+    fn multi_status_typed_205_rejected_typeless_accepted() {
+        // 205 (Reset Content) is bodyless like 204: a typed entry is rejected,
+        // a typeless one accepted. 205 matters at the codegen layer — neither
+        // Express nor Go's net/http auto-suppresses a body on it (unlike 204),
+        // so the generated servers' body-shape guard is the only protection;
+        // sema letting a typeless 205 through is what makes that path live.
+        assert_has_error(
+            r#"
+            struct User { Int id }
+            endpoint resetUser: PUT "/users/{id}" {
+                response { 205: User }
+            }
+            "#,
+            "cannot declare a body type",
+        );
+        let src = r#"
+            struct User { Int id }
+            endpoint resetUser: PUT "/users/{id}" {
+                response { 200: User  205 }
+            }
+        "#;
+        assert_no_errors(src);
+        let ep = first_endpoint(src);
+        assert_eq!(ep.response_statuses.len(), 2);
+        assert_eq!(ep.response_statuses[1].status, 205);
+        assert_eq!(ep.response_statuses[1].ty, None);
+    }
+
+    #[test]
+    fn multi_status_unknown_type_single_diagnostic() {
+        // `resolve_type_expr` reports the unknown type itself; the block path
+        // must not add a second "unknown response type" diagnostic on top.
+        let errors = check_source(
+            r#"
+            endpoint getThing: GET "/things/{id}" {
+                response { 200: Bogus  204 }
+            }
+            "#,
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "an unknown type must produce exactly one diagnostic, got: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("unknown type `Bogus`"),
+            "the one diagnostic should be resolve_type_expr's, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn multi_status_unknown_first_type_does_not_mask_mismatch() {
+        // `shared_ty` is seeded from the first VALID typed entry: an unresolved
+        // first entry (`200: Bogus`) must not pin it to `Type::Error` and
+        // thereby suppress the genuine User-vs-Receipt mismatch behind it —
+        // both errors must surface in ONE pass, not one per fix-recompile.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            struct Receipt { Int id }
+            endpoint createUser: POST "/users" {
+                response { 200: Bogus  201: User  202: Receipt }
+            }
+            "#,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("unknown type `Bogus`")),
+            "the unknown first entry keeps its own diagnostic: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("must share one body type")
+                && e.contains("`User`")
+                && e.contains("`Receipt`")),
+            "the User/Receipt mismatch must not be masked by the unknown first entry: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn multi_status_file_bearing_struct_rejected() {
+        // A file-bearing struct is a binary download, which only the bare
+        // `response <Type>` form supports; the block form must reject it with
+        // the targeted JSON-only message, not the generic "body-only type"
+        // error (the type IS in response position) and not an "unknown type"
+        // cascade.
+        let errors = check_source(
+            r#"
+            struct Doc { File data }
+            endpoint getDoc: GET "/docs/{id}" {
+                response { 200: Doc  204 }
+            }
+            "#,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("JSON-only")),
+            "expected the targeted file-bearing rejection, got: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("body-only type")),
+            "the generic body-only-position error is misleading here: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("unknown")),
+            "no unknown-type cascade expected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn multi_status_list_body_rejected() {
+        // A `List<T>` body is bare-form-only: the envelope's `body` slot
+        // serializes through the struct machinery (Python emits
+        // `T.model_validate(...)` / `body.model_dump_json()`, which only exist
+        // on pydantic models), so a non-struct entry must be rejected here
+        // instead of generating Python that fails at runtime. Both entries name
+        // the same list type, so there must also be NO shared-type cascade on
+        // top of the per-entry rejections.
+        let errors = check_source(
+            r#"
+            struct Post { Int id }
+            endpoint syncPosts: POST "/posts/sync" {
+                response { 200: List<Post>  201: List<Post> }
+            }
+            "#,
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("must be a named struct")),
+            "expected the non-struct body rejection, got: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("must share one body type")),
+            "rejected entries must not also cascade the shared-type error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn multi_status_scalar_body_rejected() {
+        // Same restriction for a scalar body (`200: String`).
+        assert_has_error(
+            r#"
+            endpoint getStatus: GET "/status" {
+                response { 200: String  204 }
+            }
+            "#,
+            "must be a named struct",
+        );
+    }
+
+    #[test]
+    fn multi_status_with_pagination_rejected() {
+        // Precedence: the combo error fires, NOT a confusing "pagination
+        // requires a `List<T>` response" error.
+        let errors = check_source(
+            r#"
+            struct User { Int id }
+            endpoint listUsers: GET "/users" {
+                response { 200: User  201: User }
+                pagination { offset }
+            }
+            "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("cannot also be paginated")),
+            "expected the multi-status+pagination combo error, got: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("requires the response to be a `List<T>`")),
+            "should not surface the confusing pagination-requires-List error: {errors:?}"
         );
     }
 }

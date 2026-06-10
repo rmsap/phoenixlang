@@ -658,5 +658,402 @@
         "nextCursor": null
       }
     }
+  },
+  {
+    "name": "upsertPost2_multi_status_created",
+    "endpoint": "upsertPost2",
+    "kind": "ok",
+    "_note": "Multi-status: the handler returns the <Endpoint>Response envelope { status, body }. Here the stub returns 201 with a Post body; the client must read BOTH the status (201) and the body back. handler.returns_status is the status the stub sets; handler.returns is the body; expect_client.status + expect_client.ok are what the client must observe.",
+    "call": {
+      "path_params": { "id": "5" },
+      "body": {
+        "title": "Upserted",
+        "body": "content",
+        "status": "Published",
+        "tags": ["x"]
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "5",
+        "title": "Upserted",
+        "body": "content",
+        "status": "Published",
+        "tags": ["x"]
+      },
+      "returns_status": 201,
+      "returns": {
+        "id": 5,
+        "title": "Upserted",
+        "body": "content",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Published",
+        "tags": ["x"]
+      }
+    },
+    "expect_client": {
+      "status": 201,
+      "ok": {
+        "id": 5,
+        "title": "Upserted",
+        "body": "content",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Published",
+        "tags": ["x"]
+      }
+    }
+  },
+  {
+    "name": "upsertPost2_multi_status_no_content",
+    "endpoint": "upsertPost2",
+    "kind": "ok",
+    "_note": "Multi-status typeless branch: the stub returns 204 with NO body. The client must observe status 204 and an absent/null body. returns_status = 204, no returns; expect_client.status = 204, no ok (body absent).",
+    "call": {
+      "path_params": { "id": "6" },
+      "body": {
+        "title": "Unchanged",
+        "body": "same",
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "6",
+        "title": "Unchanged",
+        "body": "same",
+        "status": "Draft",
+        "tags": []
+      },
+      "returns_status": 204
+    },
+    "expect_client": {
+      "status": 204,
+      "ok_absent": true
+    }
+  },
+  {
+    "name": "upsertPost2_multi_status_updated",
+    "endpoint": "upsertPost2",
+    "kind": "ok",
+    "_note": "Multi-status 200 branch: the stub returns 200 (updated existing) with a Post body, completing coverage of the typed statuses (201 created is covered above). The client must read status 200 plus the body.",
+    "call": {
+      "path_params": { "id": "7" },
+      "body": {
+        "title": "Revised",
+        "body": "updated content",
+        "status": "Published",
+        "tags": ["y", "z"]
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "7",
+        "title": "Revised",
+        "body": "updated content",
+        "status": "Published",
+        "tags": ["y", "z"]
+      },
+      "returns_status": 200,
+      "returns": {
+        "id": 7,
+        "title": "Revised",
+        "body": "updated content",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Published",
+        "tags": ["y", "z"]
+      }
+    },
+    "expect_client": {
+      "status": 200,
+      "ok": {
+        "id": 7,
+        "title": "Revised",
+        "body": "updated content",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Published",
+        "tags": ["y", "z"]
+      }
+    }
+  },
+  {
+    "name": "upsertPost2_multi_status_accepted_no_body",
+    "endpoint": "upsertPost2",
+    "kind": "ok",
+    "_note": "Multi-status NON-204 typeless branch: the stub returns 202 with NO body. Pins that clients detect the empty body by CONTENT, not by special-casing 204 — a status-code guard would try to parse the empty 202 body and throw.",
+    "call": {
+      "path_params": { "id": "8" },
+      "body": {
+        "title": "Queued",
+        "body": "pending",
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "8",
+        "title": "Queued",
+        "body": "pending",
+        "status": "Draft",
+        "tags": []
+      },
+      "returns_status": 202
+    },
+    "expect_client": {
+      "status": 202,
+      "ok_absent": true
+    }
+  },
+  {
+    "name": "upsertPost2_undeclared_status",
+    "endpoint": "upsertPost2",
+    "kind": "error",
+    "_note": "Server-side handler-bug guard: the stub returns a status (418) outside the declared {200, 201, 202, 204} set. The generated server must refuse to write it and answer 500 ('handler returned undeclared status') — a smuggled non-2xx would bypass error { }. The TS client surfaces an unmapped status as ApiError('Unknown', ...).",
+    "call": {
+      "path_params": { "id": "9" },
+      "body": {
+        "title": "Rogue",
+        "body": "teapot",
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "9",
+        "title": "Rogue",
+        "body": "teapot",
+        "status": "Draft",
+        "tags": []
+      },
+      "returns_status": 418
+    },
+    "expect_client": {
+      "error": {
+        "variant": "Unknown",
+        "status_per_target": {
+          "go": 500,
+          "typescript": 500,
+          "python": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "upsertPost2_body_for_bodyless_status",
+    "endpoint": "upsertPost2",
+    "kind": "error",
+    "_note": "Server-side handler-bug guard, body-shape direction: the stub pairs a body with the TYPELESS 204. Only 204/304 (plus 1xx in Go) get framework body suppression — on a typeless 202 or 205 the body would reach the wire and silently violate the contract — so the server rejects the shape mismatch itself with a 500 ('handler returned a body for a bodyless status') for ANY typeless status.",
+    "call": {
+      "path_params": { "id": "10" },
+      "body": {
+        "title": "Sneaky",
+        "body": "should not be sent",
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "10",
+        "title": "Sneaky",
+        "body": "should not be sent",
+        "status": "Draft",
+        "tags": []
+      },
+      "returns_status": 204,
+      "returns": {
+        "id": 10,
+        "title": "Sneaky",
+        "body": "should not be sent",
+        "author": { "id": 7, "name": "Ada", "email": "ada@example.com", "avatarUrl": null },
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "expect_client": {
+      "error": {
+        "variant": "Unknown",
+        "status_per_target": {
+          "go": 500,
+          "typescript": 500,
+          "python": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "upsertPost2_no_body_for_typed_status",
+    "endpoint": "upsertPost2",
+    "kind": "error",
+    "_note": "Server-side handler-bug guard, body-shape direction: the stub returns the TYPED 200 with NO body. The contract (and the OpenAPI spec) promise a Post body on 200, so the server answers 500 ('handler returned no body for a typed status') instead of writing a bodyless 200 the client would surface as body=None.",
+    "call": {
+      "path_params": { "id": "11" },
+      "body": {
+        "title": "Hollow",
+        "body": "no payload back",
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "11",
+        "title": "Hollow",
+        "body": "no payload back",
+        "status": "Draft",
+        "tags": []
+      },
+      "returns_status": 200
+    },
+    "expect_client": {
+      "error": {
+        "variant": "Unknown",
+        "status_per_target": {
+          "go": 500,
+          "typescript": 500,
+          "python": 500
+        }
+      }
+    }
+  },
+  {
+    "name": "upsertPost2_error_validation",
+    "endpoint": "upsertPost2",
+    "kind": "error",
+    "_note": "Multi-status + error { }: the stub raises ValidationError instead of returning an envelope. Pins that the declared-error mapping still works on a multi-status endpoint — the Go server re-emits its own variant→status mapping inside the multi-status branch, so this is the only runtime coverage of that code path. Independent of the envelope guards above (no returns_status at all here).",
+    "call": {
+      "path_params": { "id": "14" },
+      "body": {
+        "title": "Bad",
+        "body": "rejected",
+        "status": "Draft",
+        "tags": []
+      }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "14",
+        "title": "Bad",
+        "body": "rejected",
+        "status": "Draft",
+        "tags": []
+      },
+      "raises": "ValidationError"
+    },
+    "expect_client": {
+      "error": {
+        "variant": "ValidationError",
+        "status_per_target": {
+          "go": 400,
+          "typescript": 400,
+          "python": 400
+        }
+      }
+    }
+  },
+  {
+    "name": "requeuePost_accepted",
+    "endpoint": "requeuePost",
+    "kind": "ok",
+    "_note": "ALL-TYPELESS multi-status block (response { 202 204 }): the RequeuePostResponse envelope is just { status } with NO body field — the client must record the status without ever touching the response body. This is the no-shared-T codegen branch the mixed upsertPost2 endpoint cannot reach.",
+    "call": {
+      "path_params": { "id": "12" }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "12"
+      },
+      "returns_status": 202
+    },
+    "expect_client": {
+      "status": 202,
+      "ok_absent": true
+    }
+  },
+  {
+    "name": "requeuePost_noop",
+    "endpoint": "requeuePost",
+    "kind": "ok",
+    "_note": "All-typeless block, second declared status: the stub picks 204 (no-op) and the client reads it back off the status-only envelope.",
+    "call": {
+      "path_params": { "id": "13" }
+    },
+    "handler": {
+      "expect_received": {
+        "id": "13"
+      },
+      "returns_status": 204
+    },
+    "expect_client": {
+      "status": 204,
+      "ok_absent": true
+    }
+  },
+  {
+    "name": "upsertPost2_undeclared_2xx_client_lenient",
+    "endpoint": "upsertPost2",
+    "kind": "ok",
+    "_note": "CLIENT LENIENCY (design-decisions.md 'Clients are deliberately lenient'): a proxy or middlebox can rewrite a success status to a 2xx the contract never declared, and the client must envelope whatever 2xx arrives rather than fail. The generated server can never send an undeclared status (its guard answers 500), so raw_response short-circuits it: the driver answers every request itself with this canned status+body and the generated handler is NEVER invoked (no handler fields; the ok-case handler-was-called assertion is skipped). 203 is undeclared on upsertPost2 (declared: 200/201/202/204).",
+    "call": {
+      "path_params": { "id": "15" },
+      "body": {
+        "title": "Proxied",
+        "body": "rewritten upstream",
+        "status": "Published",
+        "tags": []
+      }
+    },
+    "handler": {},
+    "raw_response": {
+      "status": 203,
+      "body": {
+        "id": 15,
+        "title": "Proxied",
+        "body": "rewritten upstream",
+        "author": {
+          "id": 7,
+          "name": "Ada",
+          "email": "ada@example.com",
+          "avatarUrl": null
+        },
+        "status": "Published",
+        "tags": []
+      }
+    },
+    "expect_client": {
+      "status": 203,
+      "ok": {
+        "id": 15,
+        "title": "Proxied",
+        "body": "rewritten upstream",
+        "author": {
+          "id": 7,
+          "name": "Ada",
+          "email": "ada@example.com",
+          "avatarUrl": null
+        },
+        "status": "Published",
+        "tags": []
+      }
+    }
+  },
+  {
+    "name": "requeuePost_undeclared_2xx_client_lenient",
+    "endpoint": "requeuePost",
+    "kind": "ok",
+    "_note": "Client leniency on the ALL-TYPELESS envelope: a non-standard 2xx (299) with no body, undeclared on requeuePost (declared: 202/204), served via raw_response (generated handler never invoked). The status-only envelope must carry 299 through without the client touching the (empty) body.",
+    "call": {
+      "path_params": { "id": "16" }
+    },
+    "handler": {},
+    "raw_response": {
+      "status": 299
+    },
+    "expect_client": {
+      "status": 299,
+      "ok_absent": true
+    }
   }
 ]

@@ -97,6 +97,7 @@ impl<'a> PyGenerator<'a> {
             self.emit_derived_model(ep);
             self.emit_result_envelope(ep);
             self.emit_page_model(ep);
+            self.emit_multi_status_envelope(ep);
         }
 
         // ── client.py ───────────────────────────────────────────────
@@ -508,6 +509,44 @@ impl<'a> PyGenerator<'a> {
         }
     }
 
+    /// Emits the `<Endpoint>Response` multi-status envelope model for an endpoint
+    /// that declares a `response { }` block (`response_statuses` non-empty). The
+    /// handler returns, and the client observes, this envelope instead of the bare
+    /// body:
+    /// - `status: int` — the actual HTTP status (handler sets it, server writes it,
+    ///   client reads it).
+    /// - `body: T | None = None` — the shared body type as an Option, present only
+    ///   when the block declares at least one typed status (`ep.response` is
+    ///   `Some`). An all-typeless block (e.g. `response { 202  204 }`) has no `T`,
+    ///   so the envelope is just `{ status: int }` with no `body` field.
+    ///
+    /// Field names are snake_case attributes that ARE the wire names — the Python
+    /// generator emits NO `Field(alias=...)` on any model, matching every other
+    /// Python model. (`status`/`body` are single words, so no alias is needed.)
+    ///
+    /// This mirrors the response-header `<Endpoint>Result` / pagination
+    /// `<Endpoint>Page` envelope machinery; all three are mutually exclusive (sema
+    /// rejects the combinations). Endpoints WITHOUT a `response { }` block emit
+    /// nothing and keep returning the bare body unchanged.
+    fn emit_multi_status_envelope(&mut self, ep: &EndpointInfo) {
+        if ep.response_statuses.is_empty() {
+            return;
+        }
+        let type_name = multi_status_type_name(ep);
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+
+        ensure_blank_lines(&mut self.models_out, 2);
+        self.models_out
+            .push_str(&format!("class {type_name}(BaseModel):\n"));
+        self.models_out.push_str("    status: int\n");
+        if let Some(body_type) = ep.response.as_ref().map(type_to_python) {
+            self.models_out
+                .push_str(&format!("    body: {body_type} | None = None\n"));
+        }
+    }
+
     // ── client.py emission ──────────────────────────────────────────
 
     /// Emits imports for the client file.
@@ -549,7 +588,18 @@ impl<'a> PyGenerator<'a> {
             // item type is referenced only inside that model in models.py), so
             // import the page model and NOT the item type — importing the unused
             // item type here would trip ruff F401.
-            if ep.pagination.is_some() {
+            // A multi-status endpoint returns the `<Endpoint>Response` envelope
+            // AND — unlike pagination — parses the shared body directly
+            // (`T.model_validate(response.json())`) before wrapping it, so the
+            // client references BOTH names: import the envelope and the body
+            // type. (An all-typeless block has no `T` and imports only the
+            // envelope.)
+            if !ep.response_statuses.is_empty() {
+                imports.insert(multi_status_type_name(ep));
+                if let Some(ref resp) = ep.response {
+                    collect_python_imports(resp, &mut imports);
+                }
+            } else if ep.pagination.is_some() {
                 imports.insert(page_type_name(ep));
             } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
@@ -585,7 +635,9 @@ impl<'a> PyGenerator<'a> {
                 .map(type_to_python)
                 .unwrap_or_else(|| "None".to_string())
         };
-        let response_type = if ep.pagination.is_some() {
+        let response_type = if !ep.response_statuses.is_empty() {
+            multi_status_type_name(ep)
+        } else if ep.pagination.is_some() {
             page_type_name(ep)
         } else if ep.response_headers.is_empty() {
             body_type.clone()
@@ -852,6 +904,39 @@ impl<'a> PyGenerator<'a> {
             return;
         }
 
+        // Multi-status: build the `<Endpoint>Response` envelope from the HTTP
+        // response — the handler-chosen status comes from `response.status_code`;
+        // the optional shared body is parsed into `T | None` only when the
+        // response actually carries one (a typeless status like 204 sends no
+        // body). An all-typeless block (no `T`) has no `body` field, so just
+        // record the status.
+        if !ep.response_statuses.is_empty() {
+            if let Some(ref resp) = ep.response {
+                let body_ty = type_to_python(resp);
+                // The local is named `response_body` (not `body`) so it never
+                // shadows the request-body parameter (also `body`), which would
+                // trip mypy with conflicting types; the explicit `T | None`
+                // annotation keeps mypy happy with the conditional assignment.
+                // The empty-body guard is on CONTENT only — never a status-code
+                // special case — because ANY typeless status (202, 204, ...)
+                // sends an empty body (design decision 5; mirrors the Go
+                // ContentLength/EOF guard and the TS non-empty `response.text()`
+                // check). A statement (not a conditional expression) so black
+                // never re-wraps it based on the body type's name length.
+                self.client_out.push_str(&format!(
+                    "        response_body: {body_ty} | None = None\n        if response.content:\n            response_body = {body_ty}.model_validate(response.json())\n"
+                ));
+                self.client_out.push_str(&format!(
+                    "        return {response_type}(status=response.status_code, body=response_body)\n"
+                ));
+            } else {
+                self.client_out.push_str(&format!(
+                    "        return {response_type}(status=response.status_code)\n"
+                ));
+            }
+            return;
+        }
+
         // Binary download: return the raw response bytes (no JSON parsing).
         if ep.response_is_binary {
             self.client_out
@@ -944,7 +1029,12 @@ impl<'a> PyGenerator<'a> {
             // A paginated handler returns `<Endpoint>Page` (the item type is only
             // named inside that model), so import the page model, not the item
             // type — an unused item-type import would trip ruff F401.
-            if ep.pagination.is_some() {
+            // A multi-status handler returns the `<Endpoint>Response` envelope; the
+            // shared body type is named only inside that model, so import the
+            // envelope and not the item type (an unused import would trip F401).
+            if !ep.response_statuses.is_empty() {
+                imports.insert(multi_status_type_name(ep));
+            } else if ep.pagination.is_some() {
                 imports.insert(page_type_name(ep));
             } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
@@ -969,7 +1059,9 @@ impl<'a> PyGenerator<'a> {
         let fn_name = to_snake_case(&ep.name);
         // A binary download handler returns the raw `bytes`; the server wraps
         // them in a FastAPI `Response`.
-        let response_type = if ep.response_is_binary {
+        let response_type = if !ep.response_statuses.is_empty() {
+            multi_status_type_name(ep)
+        } else if ep.response_is_binary {
             "bytes".to_string()
         } else if ep.pagination.is_some() {
             page_type_name(ep)
@@ -1142,11 +1234,14 @@ impl<'a> PyGenerator<'a> {
         // A binary download response, or any endpoint with response headers,
         // needs FastAPI's `Response` (the former returns `Response(content=...)`,
         // the latter sets headers on an injected `Response` param).
-        let needs_response = self
-            .check_result
-            .endpoints
-            .iter()
-            .any(|ep| !ep.response_headers.is_empty() || ep.response_is_binary);
+        // A multi-status route also returns a `Response` directly (the status is
+        // handler-chosen, so FastAPI cannot infer it from a decorator), so it
+        // pulls in `Response` too.
+        let needs_response = self.check_result.endpoints.iter().any(|ep| {
+            !ep.response_headers.is_empty()
+                || ep.response_is_binary
+                || !ep.response_statuses.is_empty()
+        });
         // The `Annotated[...]` file-alias form lives in the typing import group,
         // emitted before the third-party fastapi group (isort order).
         if needs_annotated {
@@ -1189,7 +1284,13 @@ impl<'a> PyGenerator<'a> {
             // handler's page through unchanged; the bare item type is referenced
             // only inside that model in models.py, so import the page model and
             // not the item type (an unused item import would trip ruff F401).
-            if ep.pagination.is_some() {
+            // A multi-status route returns a `Response` built from the envelope's
+            // `result.status`/`result.body`; the route never names the body type
+            // (it serializes via `result.body.model_dump_json()`), so importing it
+            // here would trip ruff F401. Nothing to import for this branch.
+            if !ep.response_statuses.is_empty() {
+                // intentionally no model import
+            } else if ep.pagination.is_some() {
                 model_imports.insert(page_type_name(ep));
             } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
@@ -1217,7 +1318,13 @@ impl<'a> PyGenerator<'a> {
         // A binary download route returns a FastAPI `Response` (the raw bytes
         // wrapped with `media_type="application/octet-stream"`), not the pydantic
         // model; all other routes return the modelled response type.
-        let response_type = if ep.response_is_binary {
+        let is_multi_status = !ep.response_statuses.is_empty();
+        let response_type = if is_multi_status {
+            // A multi-status route writes the handler-chosen status dynamically, so
+            // it returns a FastAPI `Response` object directly (not the pydantic
+            // envelope) — the idiomatic way to control the status at runtime.
+            "Response".to_string()
+        } else if ep.response_is_binary {
             "Response".to_string()
         } else if ep.pagination.is_some() {
             // The route returns the handler's `<Endpoint>Page` directly (no
@@ -1230,8 +1337,10 @@ impl<'a> PyGenerator<'a> {
                 .unwrap_or_else(|| "None".to_string())
         };
 
-        // FastAPI path: {id} stays as {id} (FastAPI uses same syntax)
-        let status = if ep.response.is_none() {
+        // FastAPI path: {id} stays as {id} (FastAPI uses same syntax). A
+        // multi-status route sets the status dynamically inside the body (via the
+        // returned `Response`), so no static `status_code=` on the decorator.
+        let status = if !is_multi_status && ep.response.is_none() {
             ", status_code=204"
         } else {
             ""
@@ -1455,7 +1564,104 @@ impl<'a> PyGenerator<'a> {
             handler_args.push(format!("{snake}={snake}"));
         }
 
-        if has_response_headers {
+        if is_multi_status {
+            // The handler returns the `<Endpoint>Response` envelope carrying the
+            // chosen status + optional shared body. The route writes that status
+            // (not a static 200/204) by returning a `Response` directly: serialize
+            // `result.body` as JSON when present, else an empty-body response with
+            // the chosen status. (An all-typeless block has no `body` field, so the
+            // response is always bodyless.)
+            //
+            // The handler-chosen envelope is validated against the DECLARED
+            // contract first — all three mismatches are handler bugs, reported as
+            // a 500 instead of written to the wire (mirrors the Go/TS servers):
+            // - an undeclared status (a buggy handler returning 0, or a 4xx
+            //   smuggled through the success envelope, bypassing `error { }`);
+            // - a body paired with a typeless status (Starlette only suppresses
+            //   bodies on 204/304 — on e.g. a typeless 202 the body WOULD hit the
+            //   wire, and the content-guarded client would parse it, silently
+            //   violating the contract);
+            // - a None body paired with a typed status (the contract — and the
+            //   OpenAPI spec — promise a body there).
+            // An all-typeless block has no `body` field, so only the membership
+            // check applies.
+            let call = format_call(
+                indent,
+                &format!("result = await handlers.{fn_name}"),
+                &handler_args,
+                "",
+            );
+            self.server_out.push_str(&call);
+            // Each guard's `return Response(...)` goes through `format_call` so
+            // the wrapping tracks the route's actual depth the way black does
+            // (collapsed args at shallow indents, exploded with a trailing
+            // comma once the collapsed line passes 88 columns).
+            //
+            // KNOWN BOUND: the `if <condition>:` lines themselves are NOT
+            // width-aware. A block declaring roughly ≥7-8 statuses pushes the
+            // status-tuple membership test past 88 columns, where black would
+            // parenthesize and re-wrap the condition — so that generated server
+            // would fail a user's `black --check`. Accepted for now: realistic
+            // blocks declare 2-4 statuses, and the fix (a width-aware condition
+            // emitter mirroring black's wrapping of boolean ops) is not worth
+            // its complexity until someone hits the bound.
+            let emit_500 = |out: &mut String, condition: &str, message: &str| {
+                out.push_str(&format!("{indent}if {condition}:\n"));
+                out.push_str(&format_call(
+                    &format!("{indent}    "),
+                    "return Response",
+                    &[
+                        format!("content=\"{message}\""),
+                        "status_code=500".to_string(),
+                    ],
+                    "",
+                ));
+            };
+            emit_500(
+                &mut self.server_out,
+                &format!("result.status not in {}", declared_statuses_py(ep)),
+                "handler returned undeclared status",
+            );
+            if ep.response.is_some() {
+                let typed: Vec<u16> = ep
+                    .response_statuses
+                    .iter()
+                    .filter(|rs| rs.ty.is_some())
+                    .map(|rs| rs.status)
+                    .collect();
+                let typeless: Vec<u16> = ep
+                    .response_statuses
+                    .iter()
+                    .filter(|rs| rs.ty.is_none())
+                    .map(|rs| rs.status)
+                    .collect();
+                emit_500(
+                    &mut self.server_out,
+                    &format!(
+                        "result.status in {} and result.body is None",
+                        py_status_tuple(&typed)
+                    ),
+                    "handler returned no body for a typed status",
+                );
+                if !typeless.is_empty() {
+                    emit_500(
+                        &mut self.server_out,
+                        &format!(
+                            "result.status in {} and result.body is not None",
+                            py_status_tuple(&typeless)
+                        ),
+                        "handler returned a body for a bodyless status",
+                    );
+                }
+                self.server_out.push_str(&format!(
+                    "{indent}if result.body is not None:\n{indent}    return Response(\n{indent}        content=result.body.model_dump_json(),\n{indent}        status_code=result.status,\n{indent}        media_type=\"application/json\",\n{indent}    )\n{indent}return Response(status_code=result.status)\n"
+                ));
+            } else {
+                self.server_out.push_str(&format!(
+                    "{indent}return Response(status_code=result.status)\n"
+                ));
+            }
+        } else if has_response_headers {
             // The handler returns the typed envelope; capture it, copy each
             // response header onto the FastAPI `Response` (string-coerced, guarded
             // for optional), then return the bare body for serialization.
@@ -1559,6 +1765,34 @@ fn unwrap_option(ty: &Type) -> Type {
 /// exclusive — sema rejects the combination).
 fn page_type_name(ep: &EndpointInfo) -> String {
     format!("{}Page", capitalize(&ep.name))
+}
+
+/// The Python name of the multi-status response envelope model for an endpoint
+/// (e.g. `upsertUser` → `UpsertUserResponse`). Only emitted/used when the
+/// endpoint declares a `response { }` block (`response_statuses` non-empty).
+/// Distinct from the `<Endpoint>Result` response-header envelope and the
+/// `<Endpoint>Page` pagination envelope (all three are mutually exclusive — sema
+/// rejects the combinations).
+fn multi_status_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Response", capitalize(&ep.name))
+}
+
+/// Renders the declared success statuses of a multi-status endpoint as a Python
+/// tuple literal for the server's handler-status validation (e.g. `(200, 201)`).
+fn declared_statuses_py(ep: &EndpointInfo) -> String {
+    let codes: Vec<u16> = ep.response_statuses.iter().map(|rs| rs.status).collect();
+    py_status_tuple(&codes)
+}
+
+/// Renders a list of status codes as a Python tuple literal (a single-element
+/// tuple needs the trailing comma: `(201,)`).
+fn py_status_tuple(codes: &[u16]) -> String {
+    let rendered: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
+    if rendered.len() == 1 {
+        format!("({},)", rendered[0])
+    } else {
+        format!("({})", rendered.join(", "))
+    }
 }
 
 /// Emits the client-side coercion of a single response header from its raw
@@ -1830,1217 +2064,5 @@ fn is_self_length(expr: &phoenix_parser::ast::Expr) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use phoenix_common::span::SourceId;
-    use phoenix_lexer::lexer::tokenize;
-    use phoenix_parser::parser;
-    use phoenix_sema::checker;
-
-    /// An interior empty doc line renders as a bare `#` (no trailing space) so
-    /// ruff E265 stays happy. Guards the empty-line branch of
-    /// `render_hash_comment`, which the doc-comment integration tests don't hit.
-    #[test]
-    fn render_hash_comment_blanks_out_empty_lines() {
-        assert_eq!(
-            render_hash_comment("    ", "first\n\nthird"),
-            "    # first\n    #\n    # third\n"
-        );
-    }
-
-    fn generate_from_source(source: &str) -> PythonFiles {
-        let tokens = tokenize(source, SourceId(0));
-        let (program, parse_errors) = parser::parse(&tokens);
-        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-        let result = checker::check(&program);
-        assert!(
-            result.diagnostics.is_empty(),
-            "check errors: {:?}",
-            result.diagnostics
-        );
-        generate_python(&program, &result)
-    }
-
-    #[test]
-    fn struct_to_model() {
-        let files = generate_from_source(
-            r#"
-/** A registered user */
-struct User {
-    Int id
-    String name
-    Option<String> bio
-}
-"#,
-        );
-        insta::assert_snapshot!("py_struct_to_model", files.models);
-    }
-
-    #[test]
-    fn simple_enum() {
-        let files = generate_from_source("enum Role { Admin  Editor  Viewer }");
-        insta::assert_snapshot!("py_simple_enum", files.models);
-    }
-
-    #[test]
-    fn model_with_constraints() {
-        let files = generate_from_source(
-            r#"
-struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    Int age where self >= 0 && self <= 150
-}
-"#,
-        );
-        insta::assert_snapshot!("py_model_constraints", files.models);
-    }
-
-    #[test]
-    fn get_with_path_param() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint getUser: GET "/api/users/{id}" {
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("py_get_client", files.client);
-        insta::assert_snapshot!("py_get_handler", files.handlers);
-        insta::assert_snapshot!("py_get_server", files.server);
-    }
-
-    #[test]
-    fn post_with_body() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  String email }
-endpoint createUser: POST "/api/users" {
-    body User omit { id }
-    response User
-    error { Conflict(409) }
-}
-"#,
-        );
-        insta::assert_snapshot!("py_post_client", files.client);
-        insta::assert_snapshot!("py_post_server", files.server);
-        insta::assert_snapshot!("py_post_models", files.models);
-    }
-
-    #[test]
-    fn query_params_with_defaults() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint listUsers: GET "/api/users" {
-    query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
-    }
-    response List<User>
-}
-"#,
-        );
-        insta::assert_snapshot!("py_query_client", files.client);
-        insta::assert_snapshot!("py_query_handler", files.handlers);
-        insta::assert_snapshot!("py_query_server", files.server);
-    }
-
-    /// A required, camelCase query param renders `= Query(alias=...)` — a
-    /// syntactic default — so it must sort AFTER a required plain param, or the
-    /// generated server is invalid Python ("non-default argument follows default
-    /// argument"). Guards the parameter partitioning in `emit_server_route`.
-    #[test]
-    fn required_aliased_query_param_sorts_after_plain() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint searchUsers: GET "/api/users" {
-    query {
-        Int maxResults
-        Int page
-    }
-    response List<User>
-}
-"#,
-        );
-        let plain = files.server.find("page: int").expect("plain param present");
-        let aliased = files
-            .server
-            .find("max_results: int = Query(alias=\"maxResults\")")
-            .expect("aliased param present");
-        assert!(
-            plain < aliased,
-            "required plain param must precede the aliased (defaulted) one:\n{}",
-            files.server
-        );
-    }
-
-    #[test]
-    fn void_response() {
-        let files = generate_from_source(
-            r#"
-endpoint deleteUser: DELETE "/api/users/{id}" {
-    error { NotFound(404) }
-}
-"#,
-        );
-        insta::assert_snapshot!("py_void_client", files.client);
-        insta::assert_snapshot!("py_void_server", files.server);
-    }
-
-    /// A request header with an auto-derived wire name (`idempotencyKey →
-    /// Idempotency-Key`) must: appear as a snake_case keyword-only client arg,
-    /// be sent on a `headers` dict keyed by the EXACT wire name, bind on the
-    /// server via `Header(alias="<wire_name>")`, and thread into the handler.
-    #[test]
-    fn request_header_auto_wire_name() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint createUser: POST "/api/users" {
-    headers { String idempotencyKey }
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("py_req_header_client", files.client);
-        insta::assert_snapshot!("py_req_header_handler", files.handlers);
-        insta::assert_snapshot!("py_req_header_server", files.server);
-        // Client sends the exact wire name; server aliases to it.
-        assert!(
-            files
-                .client
-                .contains("headers[\"Idempotency-Key\"] = idempotency_key"),
-            "client must key the header dict on the wire name:\n{}",
-            files.client
-        );
-        assert!(
-            files.server.contains("Header(alias=\"Idempotency-Key\")"),
-            "server must alias the Header param to the wire name:\n{}",
-            files.server
-        );
-    }
-
-    /// An explicit `as "Exact-Wire-Name"` override pins the wire name verbatim,
-    /// overriding the auto Title-Kebab transform on both client and server.
-    #[test]
-    fn request_header_as_override() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint createUser: POST "/api/users" {
-    headers { String token as "X-Auth" }
-    response User
-}
-"#,
-        );
-        assert!(
-            files.client.contains("headers[\"X-Auth\"] = token"),
-            "client must use the override wire name:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .server
-                .contains("token: str = Header(alias=\"X-Auth\")"),
-            "server must alias to the override wire name:\n{}",
-            files.server
-        );
-    }
-
-    /// An optional request header renders `T | None = Header(None, alias=...)`
-    /// on the server, a defaulted keyword arg on the client, and is only added
-    /// to the wire dict when present.
-    #[test]
-    fn optional_request_header() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint createUser: POST "/api/users" {
-    headers { Option<String> traceId }
-    response User
-}
-"#,
-        );
-        assert!(
-            files
-                .server
-                .contains("trace_id: str | None = Header(None, alias=\"Trace-Id\")"),
-            "optional header must render Header(None, alias=...):\n{}",
-            files.server
-        );
-        assert!(
-            files.client.contains("trace_id: str | None = None"),
-            "optional header must be a defaulted client kwarg:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .client
-                .contains("if trace_id is not None:\n            headers[\"Trace-Id\"] = trace_id"),
-            "optional header must be guarded on the wire:\n{}",
-            files.client
-        );
-    }
-
-    /// A `Bool` request header must be serialized as lowercase `true`/`false` on
-    /// the wire — NOT Python's `str(True)` → `"True"`. This matches every other
-    /// path (Go `strconv.FormatBool`, TS `String(bool)`, and this generator's own
-    /// response-header set/read which use lowercase + `== "true"`), so a bool
-    /// header round-trips across languages. Regression guard for the capitalized
-    /// `str(...)` bug.
-    #[test]
-    fn bool_request_header_serializes_lowercase() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint createUser: POST "/api/users" {
-    headers { Bool debug }
-    response User
-}
-"#,
-        );
-        assert!(
-            files
-                .client
-                .contains("headers[\"Debug\"] = \"true\" if debug else \"false\""),
-            "bool header must serialize lowercase, not str(bool):\n{}",
-            files.client
-        );
-        assert!(
-            !files.client.contains("str(debug)"),
-            "bool header must not use str() (yields capitalized True/False):\n{}",
-            files.client
-        );
-    }
-
-    /// A request header with a literal default binds the default into both the
-    /// server `Header(<default>, alias=...)` and the client kwarg
-    /// (`max_stale: int = 60`). Per the documented "defaulted request headers"
-    /// gap, the client sends it unconditionally (no `Option<T>` guard).
-    #[test]
-    fn defaulted_request_header_binds_default() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint createUser: POST "/api/users" {
-    headers { Int maxStale = 60 }
-    response User
-}
-"#,
-        );
-        assert!(
-            files
-                .server
-                .contains("max_stale: int = Header(60, alias=\"Max-Stale\")"),
-            "server must bind the default into Header(...):\n{}",
-            files.server
-        );
-        assert!(
-            files.client.contains("max_stale: int = 60"),
-            "client must default the kwarg:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .client
-                .contains("headers[\"Max-Stale\"] = str(max_stale)"),
-            "client must send the defaulted header unconditionally:\n{}",
-            files.client
-        );
-    }
-
-    /// An endpoint with response headers returns a typed `<Endpoint>Result`
-    /// envelope: a pydantic model bundling `body` + each header (snake_case),
-    /// the handler returns it, the server sets headers on the `Response` and
-    /// returns `result.body`, and the client reads headers off the response.
-    #[test]
-    fn response_header_envelope() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint getPost: GET "/api/posts/{id}" {
-    response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }
-}
-"#,
-        );
-        insta::assert_snapshot!("py_resp_header_models", files.models);
-        insta::assert_snapshot!("py_resp_header_client", files.client);
-        insta::assert_snapshot!("py_resp_header_handler", files.handlers);
-        insta::assert_snapshot!("py_resp_header_server", files.server);
-        // Envelope shape.
-        assert!(
-            files.models.contains(
-                "class GetPostResult(BaseModel):\n    body: Post\n    ratelimit_remaining: int\n"
-            ),
-            "envelope model must bundle body + typed header:\n{}",
-            files.models
-        );
-        // Handler returns the envelope.
-        assert!(
-            files.handlers.contains("-> GetPostResult: ..."),
-            "handler must return the envelope:\n{}",
-            files.handlers
-        );
-        // Server sets the header off the result and returns the body.
-        assert!(
-            files.server.contains(
-                "response.headers[\"X-RateLimit-Remaining\"] = str(result.ratelimit_remaining)"
-            ),
-            "server must set the response header from the result:\n{}",
-            files.server
-        );
-        assert!(
-            files.server.contains("return result.body\n"),
-            "server must return the bare body:\n{}",
-            files.server
-        );
-        // Client reads the header into the envelope it returns.
-        assert!(
-            files.client.contains(
-                "ratelimit_remaining_raw = response.headers.get(\"X-RateLimit-Remaining\")"
-            ),
-            "client must read the response header off the wire:\n{}",
-            files.client
-        );
-        assert!(
-            files.client.contains("return GetPostResult("),
-            "client must return the typed envelope:\n{}",
-            files.client
-        );
-    }
-
-    // ── Multipart upload / binary download ──────────────────────────
-
-    /// A request body containing a `File` field is `multipart/form-data`: the
-    /// server explodes it into `<f>: UploadFile = File(...)` + `<s>: <T> =
-    /// Form(...)` params (importing File/Form/UploadFile from fastapi), the
-    /// handler takes `UploadFile`/scalar params, and the client sends `files=`/
-    /// `data=` with the file field typed `bytes`. No `XBody` model is emitted.
-    #[test]
-    fn multipart_request_body() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-struct UploadResult { String url }
-endpoint uploadAvatar: POST "/api/avatar" {
-    body AvatarUpload
-    response UploadResult
-}
-"#,
-        );
-        insta::assert_snapshot!("py_multipart_models", files.models);
-        insta::assert_snapshot!("py_multipart_client", files.client);
-        insta::assert_snapshot!("py_multipart_handler", files.handlers);
-        insta::assert_snapshot!("py_multipart_server", files.server);
-        // Server: a non-aliased file is a bare `UploadFile` param (FastAPI
-        // auto-detects it; avoids ruff B008 on a `File(...)` default), scalars use
-        // `Form(...)`. Only `Form` + `UploadFile` are imported (no `File`, since no
-        // file needs an alias here).
-        assert!(
-            files
-                .server
-                .contains("from fastapi import APIRouter, Form, UploadFile"),
-            "server must import Form/UploadFile from fastapi:\n{}",
-            files.server
-        );
-        assert!(
-            files.server.contains("avatar: UploadFile,"),
-            "non-aliased File field must be a bare UploadFile param:\n{}",
-            files.server
-        );
-        assert!(
-            !files.server.contains("File("),
-            "non-aliased File field must not emit a File(...) default (ruff B008):\n{}",
-            files.server
-        );
-        assert!(
-            files.server.contains("caption: str = Form(...)"),
-            "scalar field must bind via Form(...):\n{}",
-            files.server
-        );
-        // No XBody model emitted for a multipart body.
-        assert!(
-            !files.models.contains("UploadAvatarBody"),
-            "multipart body must not emit an XBody model:\n{}",
-            files.models
-        );
-        // Client sends files=/data=, file field typed `FileUpload`.
-        assert!(
-            files.client.contains("avatar: FileUpload"),
-            "client file field must be typed FileUpload:\n{}",
-            files.client
-        );
-        assert!(
-            files.client.contains("files=files") && files.client.contains("data=data"),
-            "client must send files=/data=:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .client
-                .contains("files[\"avatar\"] = (avatar.filename, avatar.content)"),
-            "client must put the file in the files dict (filename, content) by wire name:\n{}",
-            files.client
-        );
-        // The shared FileUpload dataclass is emitted into models.py and imported.
-        assert!(
-            files.models.contains("class FileUpload:"),
-            "models must emit the FileUpload dataclass:\n{}",
-            files.models
-        );
-        assert!(
-            files.client.contains("from .models import") && files.client.contains("FileUpload"),
-            "client must import FileUpload:\n{}",
-            files.client
-        );
-        // Handler takes UploadFile + scalar.
-        assert!(
-            files.handlers.contains("avatar: UploadFile"),
-            "handler must take UploadFile param:\n{}",
-            files.handlers
-        );
-    }
-
-    /// An `Option<File>` body field is an optional upload: server renders
-    /// `UploadFile | None = File(None)`, client `bytes | None = None` only added
-    /// to the files dict when present, handler `UploadFile | None = None`.
-    #[test]
-    fn multipart_optional_file() {
-        let files = generate_from_source(
-            r#"
-struct MaybeUpload { Option<File> avatar  String caption }
-endpoint upload: POST "/api/maybe" {
-    body MaybeUpload
-}
-"#,
-        );
-        insta::assert_snapshot!("py_multipart_optional_client", files.client);
-        insta::assert_snapshot!("py_multipart_optional_handler", files.handlers);
-        insta::assert_snapshot!("py_multipart_optional_server", files.server);
-        assert!(
-            files.server.contains("avatar: UploadFile | None = None"),
-            "optional non-aliased file must render a bare UploadFile | None = None:\n{}",
-            files.server
-        );
-        assert!(
-            files.client.contains("avatar: FileUpload | None = None"),
-            "optional file client param must default None:\n{}",
-            files.client
-        );
-        assert!(
-            files.client.contains(
-                "if avatar is not None:\n            files[\"avatar\"] = (avatar.filename, avatar.content)"
-            ),
-            "optional file must be guarded before adding to files:\n{}",
-            files.client
-        );
-        assert!(
-            files.handlers.contains("avatar: UploadFile | None = None"),
-            "optional file handler param:\n{}",
-            files.handlers
-        );
-    }
-
-    /// A camelCase `File` field needs the wire name pinned. Since a `File(...)`
-    /// default trips ruff B008 (unlike `Form`/`Query`/`Header`), the alias is
-    /// carried in the *annotation* — `Annotated[UploadFile, File(alias="<wire>")]`
-    /// — not in default position, pulling in `Annotated` + `File` imports.
-    #[test]
-    fn multipart_aliased_file_uses_annotated() {
-        let files = generate_from_source(
-            r#"
-struct Upload { File avatarImage  String caption }
-endpoint upload: POST "/api/upload" {
-    body Upload
-}
-"#,
-        );
-        insta::assert_snapshot!("py_multipart_aliased_server", files.server);
-        assert!(
-            files.server.contains("from typing import Annotated"),
-            "aliased file must import Annotated:\n{}",
-            files.server
-        );
-        assert!(
-            files
-                .server
-                .contains("from fastapi import APIRouter, File, Form, UploadFile"),
-            "aliased file must import File (for the alias):\n{}",
-            files.server
-        );
-        assert!(
-            files
-                .server
-                .contains("avatar_image: Annotated[UploadFile, File(alias=\"avatarImage\")]"),
-            "aliased file must use Annotated[..., File(alias=...)]:\n{}",
-            files.server
-        );
-        // Client keys the files dict by the wire name.
-        assert!(
-            files
-                .client
-                .contains("files[\"avatarImage\"] = (avatar_image.filename, avatar_image.content)"),
-            "client must key the file by the wire name:\n{}",
-            files.client
-        );
-    }
-
-    /// A response whose type is a single-`File` struct is a binary download: the
-    /// server returns `Response(content=..., media_type="application/octet-stream")`,
-    /// the handler returns `bytes`, the client returns `response.content`. No
-    /// response model is emitted and the response struct is not imported.
-    #[test]
-    fn binary_response_download() {
-        let files = generate_from_source(
-            r#"
-struct Doc { File data }
-endpoint download: GET "/api/doc/{id}" {
-    response Doc
-}
-"#,
-        );
-        insta::assert_snapshot!("py_binary_models", files.models);
-        insta::assert_snapshot!("py_binary_client", files.client);
-        insta::assert_snapshot!("py_binary_handler", files.handlers);
-        insta::assert_snapshot!("py_binary_server", files.server);
-        // Server returns a Response with octet-stream media type.
-        assert!(
-            files
-                .server
-                .contains("from fastapi import APIRouter, Response"),
-            "server must import Response:\n{}",
-            files.server
-        );
-        assert!(
-            files.server.contains("-> Response:"),
-            "binary route must return Response:\n{}",
-            files.server
-        );
-        assert!(
-            files
-                .server
-                .contains("return Response(content=data, media_type=\"application/octet-stream\")"),
-            "server must wrap bytes in an octet-stream Response:\n{}",
-            files.server
-        );
-        // Handler returns bytes; client returns response.content.
-        assert!(
-            files.handlers.contains("-> bytes: ..."),
-            "handler must return bytes:\n{}",
-            files.handlers
-        );
-        assert!(
-            files.client.contains("-> bytes:") && files.client.contains("return response.content"),
-            "client must return response.content as bytes:\n{}",
-            files.client
-        );
-        // No model emitted for the file-bearing response struct.
-        assert!(
-            !files.models.contains("class Doc"),
-            "file-bearing response struct must not emit a model:\n{}",
-            files.models
-        );
-        assert!(
-            !files.client.contains("UploadFile"),
-            "client must not reference UploadFile:\n{}",
-            files.client
-        );
-    }
-
-    /// A schema whose only model-relevant declaration is a multipart body (a
-    /// file-bearing struct emits no model) with no response model: models.py
-    /// emits just the `FileUpload` dataclass under `from dataclasses import
-    /// dataclass`, and NO `from pydantic import BaseModel`. Guards the import
-    /// block + spacing for the dataclass-only branch (`needs_base_model == false`).
-    #[test]
-    fn multipart_only_no_response_emits_dataclass_only() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-endpoint upload: POST "/api/upload" { body AvatarUpload }
-"#,
-        );
-        assert!(
-            files.models.contains("from dataclasses import dataclass"),
-            "the FileUpload dataclass needs the dataclasses import:\n{}",
-            files.models
-        );
-        assert!(
-            !files.models.contains("from pydantic import BaseModel"),
-            "no pydantic BaseModel is needed when the only struct is a multipart body:\n{}",
-            files.models
-        );
-        assert!(
-            files.models.contains("class FileUpload:"),
-            "FileUpload dataclass must be emitted:\n{}",
-            files.models
-        );
-        assert!(
-            !files.models.contains("class AvatarUpload"),
-            "file-bearing body struct must not emit a model:\n{}",
-            files.models
-        );
-        insta::assert_snapshot!("py_multipart_only_models", files.models);
-    }
-
-    /// A multipart endpoint with a path param: the generated FastAPI route must
-    /// order params as path param(s) → required `UploadFile` → defaulted
-    /// `Form(...)`. Python forbids a non-default param after a defaulted one, so
-    /// the relative order is load-bearing (a required `UploadFile` must precede
-    /// every `Form(...)` scalar). The handler call forwards each field by name.
-    #[test]
-    fn multipart_with_path_param_orders_route_params() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-struct UploadResult { String url }
-endpoint uploadAvatar: POST "/api/authors/{id}/avatar" {
-    body AvatarUpload
-    response UploadResult
-}
-"#,
-        );
-        let id_pos = files.server.find("id: str").expect("id param in route");
-        let avatar_pos = files
-            .server
-            .find("avatar: UploadFile")
-            .expect("avatar param in route");
-        let caption_pos = files
-            .server
-            .find("caption: str = Form(...)")
-            .expect("caption param in route");
-        assert!(
-            id_pos < avatar_pos && avatar_pos < caption_pos,
-            "route params must order path → UploadFile → Form(...):\n{}",
-            files.server
-        );
-        // Each exploded field is forwarded to the handler by name.
-        for frag in ["id=id", "avatar=avatar", "caption=caption"] {
-            assert!(
-                files.server.contains(frag),
-                "route must forward `{frag}` to the handler:\n{}",
-                files.server
-            );
-        }
-    }
-
-    /// A `File` field relaxed by `partial` is an OPTIONAL upload, exactly like
-    /// `Option<File>`: the client/handler params become `FileUpload | None = None`
-    /// / `UploadFile | None = None` and the server binds a bare `UploadFile | None
-    /// = None` (no `File(...)` default). Regression guard for the `partial`-over-a-
-    /// multipart-body parity fix (the `is_file` branch must honor `f.optional`).
-    #[test]
-    fn multipart_partial_file_is_optional() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-endpoint uploadAvatar: POST "/api/avatar" {
-    body AvatarUpload partial { avatar }
-}
-"#,
-        );
-        assert!(
-            files.client.contains("avatar: FileUpload | None = None"),
-            "partial-relaxed file client param must be optional:\n{}",
-            files.client
-        );
-        assert!(
-            files.handlers.contains("avatar: UploadFile | None = None"),
-            "partial-relaxed file handler param must be optional:\n{}",
-            files.handlers
-        );
-        assert!(
-            files.server.contains("avatar: UploadFile | None = None"),
-            "partial-relaxed file server param must be a bare optional UploadFile:\n{}",
-            files.server
-        );
-        // The optional file must be guarded before being added to the files dict.
-        assert!(
-            files.client.contains("if avatar is not None:"),
-            "partial-relaxed file must be guarded on the client:\n{}",
-            files.client
-        );
-    }
-
-    /// A multipart body with `Int`/`Bool` scalars: the client `data` dict
-    /// stringifies them onto the form. A `bool` serializes as canonical lowercase
-    /// `"true"`/`"false"` (the TS server compares `=== "true"`), and the ternary
-    /// is emitted WITHOUT surrounding parens — it lands on the RHS of a
-    /// `data[...] = ` assignment, where `black` strips redundant parentheses, so
-    /// the wrapped form would fail `black --check`. Regression guard for that
-    /// (caught by the multipart round-trip's `crop` field).
-    #[test]
-    fn multipart_scalar_bool_data_line_is_paren_free() {
-        let files = generate_from_source(
-            r#"
-struct Upload { File avatar  Int rotation  Bool crop }
-endpoint upload: POST "/api/upload" { body Upload }
-"#,
-        );
-        assert!(
-            files
-                .client
-                .contains("data[\"crop\"] = \"true\" if crop else \"false\""),
-            "multipart bool must serialize lowercase with no wrapping parens (black strips them):\n{}",
-            files.client
-        );
-        assert!(
-            files.client.contains("data[\"rotation\"] = rotation"),
-            "multipart int is passed through to the form data dict as-is:\n{}",
-            files.client
-        );
-    }
-
-    /// An endpoint that is BOTH a multipart upload AND a binary download
-    /// (`body_is_multipart` + `response_is_binary`): the server route explodes
-    /// the body into `UploadFile`/`Form(...)` params yet still returns a
-    /// `Response` (the binary branch), the handler takes the exploded params and
-    /// returns `bytes`, and the client sends `files=`/`data=` while returning
-    /// `response.content`. Guards that the multipart-param and binary-response
-    /// branches compose in one route without conflicting.
-    #[test]
-    fn multipart_upload_with_binary_response() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-struct Thumbnail { File data }
-endpoint convertAvatar: POST "/api/avatar/convert" {
-    body AvatarUpload
-    response Thumbnail
-}
-"#,
-        );
-        // Server: multipart params + a Response return + octet-stream wrap.
-        assert!(
-            files
-                .server
-                .contains("from fastapi import APIRouter, Form, Response, UploadFile"),
-            "server must import Form/Response/UploadFile:\n{}",
-            files.server
-        );
-        assert!(
-            files.server.contains("avatar: UploadFile,")
-                && files.server.contains("caption: str = Form(...)")
-                && files.server.contains("-> Response:"),
-            "server route must explode the body yet return Response:\n{}",
-            files.server
-        );
-        assert!(
-            files
-                .server
-                .contains("data = await handlers.convert_avatar(")
-                && files.server.contains(
-                    "return Response(content=data, media_type=\"application/octet-stream\")"
-                ),
-            "server must call the handler with the exploded args and wrap the bytes:\n{}",
-            files.server
-        );
-        // Handler takes the exploded params and returns bytes.
-        assert!(
-            files.handlers.contains("avatar: UploadFile")
-                && files.handlers.contains("-> bytes: ..."),
-            "handler must take UploadFile + return bytes:\n{}",
-            files.handlers
-        );
-        // Client sends files=/data= and returns the raw response bytes.
-        assert!(
-            files.client.contains("files=files")
-                && files.client.contains("data=data")
-                && files.client.contains("return response.content"),
-            "client must send multipart and return response.content:\n{}",
-            files.client
-        );
-    }
-
-    /// A multi-line doc comment must have EVERY line prefixed with `#`, not just
-    /// the first — otherwise continuation lines leak into the file as code.
-    /// Regression guard for `render_hash_comment`.
-    #[test]
-    fn multiline_doc_comment_is_fully_commented() {
-        let files = generate_from_source(
-            r#"
-struct Widget { Int id }
-/**
- * Fetch a widget by id
- * with extra detail on the second line
- */
-endpoint getWidget: GET "/api/widgets/{id}" {
-    response Widget
-}
-"#,
-        );
-        assert!(
-            files.client.contains(
-                "    # Fetch a widget by id\n    # with extra detail on the second line\n"
-            ),
-            "every doc line must be commented:\n{}",
-            files.client
-        );
-        // The continuation line must never appear UNcommented (leaked as code).
-        assert!(
-            !files.client.contains("\n    with extra detail"),
-            "continuation doc line leaked as code:\n{}",
-            files.client
-        );
-    }
-
-    #[test]
-    fn snake_case_conversion() {
-        assert_eq!(to_snake_case("createUser"), "create_user");
-        assert_eq!(to_snake_case("getHTTPResponse"), "get_h_t_t_p_response");
-        assert_eq!(to_snake_case("id"), "id");
-        assert_eq!(to_snake_case("userId"), "user_id");
-        assert_eq!(to_snake_case("listUsers"), "list_users");
-    }
-
-    #[test]
-    fn screaming_snake_conversion() {
-        assert_eq!(to_screaming_snake("Admin"), "ADMIN");
-        assert_eq!(to_screaming_snake("NotFound"), "NOT_FOUND");
-        assert_eq!(to_screaming_snake("ValidationError"), "VALIDATION_ERROR");
-    }
-
-    #[test]
-    fn multiple_endpoints() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  String email }
-endpoint listUsers: GET "/api/users" {
-    response List<User>
-}
-endpoint createUser: POST "/api/users" {
-    body User omit { id }
-    response User
-}
-endpoint getUser: GET "/api/users/{id}" {
-    response User
-}
-endpoint deleteUser: DELETE "/api/users/{id}" {
-}
-"#,
-        );
-        insta::assert_snapshot!("py_multi_models", files.models);
-        insta::assert_snapshot!("py_multi_client", files.client);
-        insta::assert_snapshot!("py_multi_handlers", files.handlers);
-        insta::assert_snapshot!("py_multi_server", files.server);
-    }
-
-    // ── Gap-filling tests ───────────────────────────────────────────
-
-    /// `pick` modifier in derived body.
-    #[test]
-    fn body_pick_only() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  String email  Int age }
-endpoint updateEmail: PATCH "/api/users/{id}" {
-    body User pick { email }
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("py_pick_models", files.models);
-        insta::assert_snapshot!("py_pick_client", files.client);
-    }
-
-    /// `partial` modifier makes all fields optional.
-    #[test]
-    fn body_partial() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name where self.length > 0  Int age where self >= 0 }
-endpoint updateUser: PATCH "/api/users/{id}" {
-    body User omit { id } partial
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("py_partial_models", files.models);
-    }
-
-    /// A `partial` body field whose type already contains an inner `| None`
-    /// (here `List<Option<String>>` → `list[str | None]`) must still gain the
-    /// *outer* `| None` from `partial` — the container is not itself optional.
-    /// Guards against the `already_optional` heuristic matching the inner union.
-    #[test]
-    fn body_partial_inner_optional_container() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  List<Option<String>> tags }
-endpoint updatePost: PATCH "/api/posts/{id}" {
-    body Post omit { id } partial
-    response Post
-}
-"#,
-        );
-        assert!(
-            files
-                .models
-                .contains("tags: list[str | None] | None = None"),
-            "expected outer `| None` on a partial List<Option<String>> field, got:\n{}",
-            files.models
-        );
-    }
-
-    /// Multiple path params.
-    #[test]
-    fn multiple_path_params() {
-        let files = generate_from_source(
-            r#"
-struct Comment { Int id  String text }
-endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
-    response Comment
-}
-"#,
-        );
-        insta::assert_snapshot!("py_multi_path_client", files.client);
-        insta::assert_snapshot!("py_multi_path_handler", files.handlers);
-    }
-
-    /// Float constraints in Pydantic Field.
-    #[test]
-    fn float_constraints() {
-        let files = generate_from_source(
-            r#"
-struct Measurement { Float value where self >= 0.0 && self <= 100.5 }
-"#,
-        );
-        insta::assert_snapshot!("py_float_constraints", files.models);
-    }
-
-    /// Bool and String query param defaults.
-    #[test]
-    fn bool_string_defaults() {
-        let files = generate_from_source(
-            r#"
-struct Item { Int id  String name }
-endpoint listItems: GET "/api/items" {
-    query {
-        String sortBy = "name"
-        Bool ascending = true
-        Int limit = 50
-    }
-    response List<Item>
-}
-"#,
-        );
-        insta::assert_snapshot!("py_bool_string_defaults_client", files.client);
-        insta::assert_snapshot!("py_bool_string_defaults_server", files.server);
-    }
-
-    /// Map<K,V> type in struct.
-    #[test]
-    fn map_type() {
-        let files = generate_from_source(
-            r#"
-struct Config { Map<String, String> settings  Int version }
-"#,
-        );
-        insta::assert_snapshot!("py_map_type", files.models);
-    }
-
-    /// Enum as response type.
-    #[test]
-    fn enum_response() {
-        let files = generate_from_source(
-            r#"
-enum Status { Active  Inactive  Banned }
-endpoint getStatus: GET "/api/status" {
-    response Status
-}
-"#,
-        );
-        insta::assert_snapshot!("py_enum_response_client", files.client);
-    }
-
-    /// PUT method.
-    #[test]
-    fn put_method() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint replaceUser: PUT "/api/users/{id}" {
-    body User
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("py_put_server", files.server);
-    }
-
-    /// default_value_to_python covers all variants.
-    #[test]
-    fn default_value_conversions() {
-        assert_eq!(default_value_to_python(&DefaultValue::Int(42)), "42");
-        assert_eq!(default_value_to_python(&DefaultValue::Float(1.5)), "1.5");
-        assert_eq!(
-            default_value_to_python(&DefaultValue::String("hello".into())),
-            "\"hello\""
-        );
-        assert_eq!(default_value_to_python(&DefaultValue::Bool(true)), "True");
-        assert_eq!(default_value_to_python(&DefaultValue::Bool(false)), "False");
-    }
-
-    /// `dyn Trait` erases to the trait name — callers are expected to have
-    /// a matching Protocol / ABC defined in hand-written Python.
-    #[test]
-    fn dyn_type_erases_to_trait_name() {
-        assert_eq!(
-            type_to_python(&Type::Dyn("Drawable".to_string())),
-            "Drawable"
-        );
-    }
-
-    /// `dyn Trait` gets recorded as an import so the generator wires up the
-    /// user-defined trait symbol the same way it does named structs/enums.
-    #[test]
-    fn dyn_type_records_import() {
-        let mut imports = BTreeSet::new();
-        collect_python_imports(&Type::Dyn("Drawable".to_string()), &mut imports);
-        assert!(imports.contains("Drawable"));
-    }
-
-    // ── pagination tests ────────────────────────────────────────────
-
-    /// An offset-paginated endpoint produces an `<Endpoint>Page` pydantic model
-    /// `{ items: list[T]; total_count: int }` (snake_case attrs ARE the wire
-    /// names — no `Field(alias=...)`, matching every other Python model). The
-    /// client returns and `model_validate`s the page; the handler returns the
-    /// page; the server route is annotated with and returns the page.
-    #[test]
-    fn offset_pagination_envelope() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint listPosts: GET "/api/posts" {
-    query { Int page  Int limit }
-    response List<Post>
-    pagination { offset }
-}
-"#,
-        );
-        insta::assert_snapshot!("py_offset_pagination_models", files.models);
-        insta::assert_snapshot!("py_offset_pagination_client", files.client);
-        insta::assert_snapshot!("py_offset_pagination_handlers", files.handlers);
-        insta::assert_snapshot!("py_offset_pagination_server", files.server);
-
-        // Model shape: snake_case wire names, no alias machinery.
-        assert!(
-            files.models.contains(
-                "class ListPostsPage(BaseModel):\n    items: list[Post]\n    total_count: int\n"
-            ),
-            "offset page model must be {{ items: list[Post]; total_count: int }}:\n{}",
-            files.models
-        );
-        assert!(
-            !files.models.contains("alias=") && !files.models.contains("populate_by_name"),
-            "page model must NOT use Field(alias=...) / populate_by_name:\n{}",
-            files.models
-        );
-        // Client return type + model_validate of the page.
-        assert!(
-            files.client.contains("-> ListPostsPage:"),
-            "client method must return ListPostsPage:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .client
-                .contains("return ListPostsPage.model_validate(response.json())"),
-            "client must parse the JSON body into the page:\n{}",
-            files.client
-        );
-        // Client imports only the page type, never the bare item type.
-        assert!(
-            files.client.contains("from .models import ListPostsPage")
-                && !files.client.contains("import Post"),
-            "client must import only the page type:\n{}",
-            files.client
-        );
-        // Handler return type.
-        assert!(
-            files.handlers.contains("-> ListPostsPage: ..."),
-            "handler must return ListPostsPage:\n{}",
-            files.handlers
-        );
-        // Server route annotated with and returns the page.
-        assert!(
-            files.server.contains("-> ListPostsPage:")
-                && files.server.contains("return await handlers.list_posts"),
-            "server route must return the page:\n{}",
-            files.server
-        );
-    }
-
-    /// A cursor-paginated endpoint produces `{ items: list[T]; next_cursor: str
-    /// | None = None }` (the cursor is optional — absent on the last page).
-    #[test]
-    fn cursor_pagination_envelope() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint listPosts: GET "/api/posts" {
-    query { Option<String> cursor  Int limit }
-    response List<Post>
-    pagination { cursor }
-}
-"#,
-        );
-        insta::assert_snapshot!("py_cursor_pagination_models", files.models);
-        insta::assert_snapshot!("py_cursor_pagination_client", files.client);
-        insta::assert_snapshot!("py_cursor_pagination_handlers", files.handlers);
-        insta::assert_snapshot!("py_cursor_pagination_server", files.server);
-
-        // Model shape: optional next_cursor with a None default.
-        assert!(
-            files.models.contains(
-                "class ListPostsPage(BaseModel):\n    items: list[Post]\n    next_cursor: str | None = None\n"
-            ),
-            "cursor page model must be {{ items: list[Post]; next_cursor: str | None = None }}:\n{}",
-            files.models
-        );
-        assert!(
-            files.client.contains("-> ListPostsPage:"),
-            "client method must return ListPostsPage:\n{}",
-            files.client
-        );
-        assert!(
-            files.handlers.contains("-> ListPostsPage: ..."),
-            "handler must return ListPostsPage:\n{}",
-            files.handlers
-        );
-    }
-
-    /// A plain (non-paginated) `List<T>` response is unchanged: no `Page`
-    /// envelope, and both client and handler keep the bare `list[T]`.
-    #[test]
-    fn plain_list_response_unchanged_by_pagination() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint listPosts: GET "/api/posts" {
-    response List<Post>
-}
-"#,
-        );
-        assert!(
-            !files.models.contains("Page"),
-            "no Page envelope for a non-paginated list:\n{}",
-            files.models
-        );
-        assert!(
-            files.client.contains("-> list[Post]:"),
-            "client must return the bare list[Post]:\n{}",
-            files.client
-        );
-        assert!(
-            files.handlers.contains("-> list[Post]: ..."),
-            "handler must return the bare list[Post]:\n{}",
-            files.handlers
-        );
-    }
-}
+#[path = "python_tests.rs"]
+mod tests;

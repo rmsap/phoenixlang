@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from generated import models as m
 from generated.client import ApiClient
@@ -187,6 +187,38 @@ class Stub:
         }
         self._maybe_raise()
         return m.Post(**self._returns())
+
+    async def upsert_post2(
+        self, id: str, body: m.UpsertPost2Body
+    ) -> m.UpsertPost2Response:
+        # Multi-status endpoint: the handler returns an UpsertPost2Response
+        # envelope { status, body }. The stub sets the status from
+        # handler.returns_status; the generated server writes that status to the
+        # wire. body is a Post built from the contract's camelCase `returns` when
+        # present (REUSE _normalize to map camelCase→snake_case, since the Post
+        # model uses snake_case fields with no alias), else None (the 204 case).
+        self.hit = True
+        self.received = {
+            "id": id,
+            "title": body.title,
+            "body": body.body,
+            "status": _enum_value(body.status),
+            "tags": body.tags,
+        }
+        self._maybe_raise()
+        returns_status = self.case["handler"]["returns_status"]
+        returns = self.case["handler"].get("returns")
+        post = m.Post.model_validate(_normalize(returns)) if returns is not None else None
+        return m.UpsertPost2Response(status=returns_status, body=post)
+
+    async def requeue_post(self, id: str) -> m.RequeuePostResponse:
+        # ALL-TYPELESS multi-status endpoint: the RequeuePostResponse envelope
+        # has no body field at all — the stub only chooses the status from
+        # handler.returns_status.
+        self.hit = True
+        self.received = {"id": id}
+        self._maybe_raise()
+        return m.RequeuePostResponse(status=self.case["handler"]["returns_status"])
 
     async def update_author_profile(
         self, id: str, body: m.UpdateAuthorProfileBody
@@ -359,6 +391,20 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
         else:
             body = m.CreatePostBody(**raw_body)
         return await client.create_post(body)
+
+    if endpoint == "upsertPost2":
+        # Multi-status endpoint. Build the body model from the contract's body
+        # (its keys — title/body/status/tags — are already snake_case-compatible,
+        # like createPost), call the client, then assert the dynamic status the
+        # client read off the envelope plus the optional body.
+        raw_body = call["body"]
+        body = m.UpsertPost2Body(**raw_body)
+        return await client.upsert_post2(call["path_params"]["id"], body)
+
+    if endpoint == "requeuePost":
+        # All-typeless multi-status endpoint: no request body, just the path
+        # param; the client returns the status-only envelope.
+        return await client.requeue_post(call["path_params"]["id"])
 
     if endpoint == "updateAuthorProfile":
         raw_body = call["body"]
@@ -568,6 +614,32 @@ def assert_ok_headers(case: dict[str, Any], result: Any) -> None:
             )
 
 
+def assert_multi_status(case: dict[str, Any], result: Any) -> None:
+    """Multi-status endpoints return an <Endpoint>Response envelope carrying the
+    handler-chosen status plus an optional body. Assert the client observed the
+    expected status (expect_client.status) and either an absent body
+    (expect_client.ok_absent) or a body matching expect_client.ok (compared via
+    the same camelCase→snake_case normalization as assert_ok)."""
+    expect = case["expect_client"]
+    want_status = expect["status"]
+    got_status = result.status
+    if got_status != want_status:
+        raise DriverError(
+            f"[{case['name']}] envelope status: got {got_status}, "
+            f"want {want_status}"
+        )
+    # An ALL-TYPELESS envelope (e.g. RequeuePostResponse) has no `body`
+    # attribute at all — getattr treats that the same as an absent body.
+    result_body = getattr(result, "body", None)
+    if expect.get("ok_absent"):
+        if result_body is not None:
+            raise DriverError(
+                f"[{case['name']}] expected absent body, got {result_body!r}"
+            )
+        return
+    assert_ok(case, result_body)
+
+
 def assert_error_status(case: dict[str, Any], err: Exception | None) -> None:
     if err is None:
         raise DriverError(f"[{case['name']}] expected an error, got success")
@@ -598,7 +670,31 @@ def assert_error_status(case: dict[str, Any], err: Exception | None) -> None:
 async def run_case(case: dict[str, Any]) -> None:
     stub = Stub(case)
     app = FastAPI()
-    app.include_router(create_router(stub))
+    raw = case.get("raw_response")
+    if raw is not None:
+        # raw_response case: bypass the generated server entirely and answer
+        # every request with the canned status (+ optional JSON body) — the only
+        # way to put a status on the wire that the generated server's own guard
+        # refuses (e.g. an undeclared 2xx for the client-leniency cases). The
+        # stub is never invoked. The body is snake_case-normalized because the
+        # Python generator's wire format is snake_case (the same documented
+        # divergence the stubs handle for handler.returns).
+        async def _raw_catch_all(path: str) -> Response:
+            body = raw.get("body")
+            if body is None:
+                return Response(status_code=raw["status"])
+            return Response(
+                content=json.dumps(_normalize(body)),
+                status_code=raw["status"],
+                media_type="application/json",
+            )
+
+        app.api_route(
+            "/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        )(_raw_catch_all)
+    else:
+        app.include_router(create_router(stub))
 
     client = ApiClient("http://test")
     # Swap the generated client's AsyncClient for one bound to the in-process
@@ -625,13 +721,28 @@ async def run_case(case: dict[str, Any]) -> None:
             raise DriverError(
                 f"[{case['name']}] expected success, got error: {call_err}"
             )
-        if not stub.hit:
+        if not stub.hit and raw is None:
             raise DriverError(
                 f"[{case['name']}] handler was never called for ok case"
             )
+        # Each response-shape key selects a different assertion path, so a
+        # contract case carrying more than one would silently assert only the
+        # first match — reject the ambiguity loudly instead.
+        shape_keys = [
+            k
+            for k in ("status", "expect_download", "ok_headers")
+            if k in case["expect_client"]
+        ]
+        if len(shape_keys) > 1:
+            raise DriverError(
+                f"[{case['name']}] expect_client mixes response shapes: "
+                f"{shape_keys}"
+            )
         # Binary download endpoints return raw bytes (no JSON model); compare
         # the decoded bytes against expect_client.expect_download.
-        if "expect_download" in case["expect_client"]:
+        if "status" in case["expect_client"]:
+            assert_multi_status(case, result)
+        elif "expect_download" in case["expect_client"]:
             assert_download(case, result)
         # Header endpoints return a typed envelope (body + response headers);
         # compare the body against expect_client.ok and the response headers

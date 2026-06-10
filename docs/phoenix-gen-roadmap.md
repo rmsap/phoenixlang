@@ -89,7 +89,7 @@ The current schema language handles structs, enums (simple and ADT), endpoints w
 - **Headers.** Both request (`headers { String authorization }`) and response. Auth tokens, idempotency keys, content negotiation, custom request IDs all live here.
 - **File uploads / multipart.** `body multipart { File avatar, String caption }`. Generated code wires up the framework's multipart handling (multer, fastapi UploadFile, Go `multipart.Reader`).
 - **Pagination patterns.** First-class support for cursor and offset pagination, since this is the single most common API shape and every team reinvents it. Probably a `paginated` modifier on response types.
-- **Multiple content types per response.** `response { 200: User, 200 text: String }` — content negotiation by Accept header.
+- **Multiple content types per response.** `response { 200: User, 200 text: String }` — content negotiation by Accept header. *Update 2026-06: the multi-status half shipped (`response { 200: User, 201: User, 204 }`, JSON-only); the content-negotiation half is deferred indefinitely — see `design-decisions.md` (multi-status responses design).*
 - **API versioning prefix.** `api version "v1" { ... endpoints ... }` so `/v1` doesn't have to be repeated on every path.
 
 ### Decisions punted to post-v1.0 (with documented rationale)
@@ -100,9 +100,19 @@ The current schema language handles structs, enums (simple and ADT), endpoints w
 
 ### Schema language gaps to close (already on the list, finish for v1.0)
 
-- Multi-bound generic parameters (`<T: Foo + Bar>`) — currently parser-rejected per known-issues
+- Multi-bound generic parameters (`<T: Foo + Bar>`) — currently parser-rejected per known-issues. **Reclassified 2026-06-07: this is Phase-3 *language* work, NOT a Gen-facing schema feature — deferred from the Gen track.** Trait bounds are a runtime/monomorphization construct (they let generic *code* call trait methods on `T`); a Gen `.phx` schema describes data shapes and HTTP contracts and never declares bounded generic parameters — the generics Gen consumes (`List<Post>`, `Option<String>`, `Map<K,V>`) are unbounded, so the number-of-bounds question never arises in Gen's domain. Implementing it means threading bounds through parser → sema → monomorphization → IR → codegen (the execution pipeline Gen deliberately never touches), and it pairs naturally with the bidirectional-inference / trait-bound items already queued in `known-issues.md`. Owned by the core-language Phase-3 effort; no Gen user exercises it. The parser already rejects it with a clear diagnostic, so there is no miscompile risk in the interim.
 - Better error messages for malformed `where` clauses
 - Uniform handling of `Option<T>` everywhere it appears
+
+**Gen-facing schema scope — status.** The five Gen-shaped "must-add for v1.0" schema
+features are all implemented and proven by both harnesses (compile-and-lint +
+round-trip): **headers**, **multipart/file upload + binary download**, **API
+versioning prefix**, **pagination** (offset + cursor), and **multi-status
+responses** (shared body + typeless; content negotiation deferred — see
+design-decisions.md). The remaining §4 items are either the reclassified language
+work above or smaller polish (`where`-clause error messages, uniform `Option<T>`).
+The next Gen priorities are therefore non-schema: Block C (code-gen quality — e.g.
+a second TS server framework), the §6 fixture library, and Block F distribution.
 
 ---
 
@@ -126,6 +136,15 @@ Each target gets a `compiles_and_lints.rs` integration test in `phoenix-codegen/
 4. Asserts both pass
 
 This catches regressions from "the generator produces strings that look right" — a real failure mode for any codegen tool.
+
+### Internal code health: generator test layout
+
+Each generator's `#[cfg(test)]` module lives in a sibling file
+(`go_tests.rs`, `python_tests.rs`, `typescript_tests.rs`), declared from the
+generator via `#[path]` so the module path — and therefore every insta
+snapshot name — matches the original inline layout. New generator tests go in
+the sibling file, not back inline; `openapi.rs` keeps its inline module (it is
+a fraction of the size and emits a single file).
 
 ### Server framework strategy
 

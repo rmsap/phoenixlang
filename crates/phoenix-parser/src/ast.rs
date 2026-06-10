@@ -726,6 +726,34 @@ pub struct EndpointErrorVariant {
     pub span: Span,
 }
 
+/// A single success-status entry in a `response { ... }` block.
+///
+/// The block form of `response` lists one or more success status codes, each
+/// either typed (`200: User`) or **typeless** (`204` — no body). Each entry
+/// becomes one `ResponseStatus`.
+///
+/// ```text
+/// response {
+///     200: User
+///     201: User
+///     204
+/// }
+/// ```
+///
+/// The parser records the form used but does NOT enforce the shared-body-type,
+/// 2xx-only, or duplicate-status rules — those are sema's responsibility.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseStatus {
+    /// The HTTP success status code for this entry (e.g. `200`, `204`).
+    pub status: u16,
+    /// The response body type for this status, or `None` for a typeless entry
+    /// (e.g. `204` with no `: Type`).
+    pub ty: Option<TypeExpr>,
+    /// Source span covering this entry (the status integer through the type, if
+    /// present).
+    pub span: Span,
+}
+
 /// A query parameter declared in an endpoint `query` block.
 ///
 /// Query parameters define the typed query-string inputs for an endpoint.
@@ -852,9 +880,32 @@ pub struct EndpointDecl {
     /// The request body type with optional derivation modifiers, parsed from
     /// the `body` section. `None` if the endpoint has no body (e.g. `GET`).
     pub body: Option<DerivedType>,
-    /// The response type, parsed from the `response` section.
-    /// `None` if the endpoint does not declare a response type.
+    /// The response type, parsed from the BARE `response <Type>` form.
+    /// `None` if the endpoint declares no response, or declares the block form
+    /// (`response { ... }`) instead — see [`response_statuses`].
+    ///
+    /// Mutually exclusive with [`response_statuses`]: the bare form populates
+    /// this field and leaves `response_statuses` empty; the block form does the
+    /// reverse. Sema preserves that split — a bare endpoint keeps its resolved
+    /// `response` as the single source of truth (its resolved status list stays
+    /// empty, so existing endpoints' generated output is unchanged), while a
+    /// block endpoint gets resolved status entries with the shared body type
+    /// mirrored back into the resolved `response`. The parser only records
+    /// which form was used.
+    ///
+    /// [`response_statuses`]: EndpointDecl::response_statuses
     pub response: Option<TypeExpr>,
+    /// The success-status entries parsed from the BLOCK `response { ... }` form.
+    /// Empty when the bare `response <Type>` form is used or no response is
+    /// declared.
+    ///
+    /// Mutually exclusive with [`response`]: see that field's docs for how the
+    /// two forms map. Sema resolves these entries (their non-emptiness is what
+    /// marks the endpoint multi-status downstream) and validates the block
+    /// (shared body type, 2xx-only, no duplicate statuses).
+    ///
+    /// [`response`]: EndpointDecl::response
+    pub response_statuses: Vec<ResponseStatus>,
     /// Response headers declared inline after the response type via a trailing
     /// `headers { ... }` block (`response Type headers { ... }`). Empty if none.
     pub response_headers: Vec<HeaderParam>,

@@ -224,7 +224,26 @@ fn build_operation(ep: &EndpointInfo) -> Value {
         Some(Value::Object(headers_map))
     };
 
-    if let Some(ref resp_type) = ep.response {
+    if !ep.response_statuses.is_empty() {
+        // Multi-status endpoint (`response { <status>[: Type] ... }`): emit one
+        // entry per declared success status. Typed statuses share one body type
+        // (sema decision 1), so they all get the same JSON schema; a typeless
+        // status (e.g. `204`) carries no `content`. Mutually exclusive with
+        // binary/pagination/response-headers shaping (sema rejects the combos),
+        // so none of those branches co-occur here.
+        for rs in &ep.response_statuses {
+            let entry = match &rs.ty {
+                Some(ty) => json!({
+                    "description": "Successful response",
+                    "content": {
+                        "application/json": { "schema": type_to_json_schema(ty) }
+                    }
+                }),
+                None => json!({ "description": typeless_status_description(rs.status) }),
+            };
+            responses.insert(rs.status.to_string(), entry);
+        }
+    } else if let Some(ref resp_type) = ep.response {
         // A binary download (single-`File` response struct) streams raw bytes:
         // `application/octet-stream` with a `format: binary` schema. Otherwise the
         // success body is the JSON-serialized response type.
@@ -283,6 +302,23 @@ fn build_operation(ep: &EndpointInfo) -> Value {
 
     op.insert("responses".to_string(), Value::Object(responses));
     Value::Object(op)
+}
+
+/// Description for a TYPELESS multi-status entry: the standard HTTP reason
+/// phrase where one exists for the 2xx code (a typeless `202` reads better as
+/// "Accepted" than "No content"), falling back to "No content" — the absence
+/// of a body is the entry's defining feature. Sema restricts the block to
+/// 200..=299, so only 2xx codes can reach this.
+fn typeless_status_description(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        _ => "No content",
+    }
 }
 
 /// Converts a Phoenix `Type` to a JSON Schema value.
@@ -1146,6 +1182,128 @@ endpoint listPosts: GET "/api/posts" {
         assert!(
             v["components"]["schemas"]["ListPostsPage"].is_null(),
             "no page component should be emitted for a non-paginated endpoint:\n{spec}"
+        );
+    }
+
+    // ── multi-status response tests ────────────────────────────────
+
+    #[test]
+    fn multi_status_shared_body() {
+        // `response { 200: User  201: User }`: two entries in the operation's
+        // `responses` map, each with the SAME (shared) `User` schema. Native
+        // OpenAPI — no envelope.
+        let spec = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint upsertUser: PUT "/api/users/{id}" {
+    response {
+        200: User
+        201: User
+    }
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+        let responses = &v["paths"]["/api/users/{id}"]["put"]["responses"];
+        let user_ref = json!({ "$ref": "#/components/schemas/User" });
+        assert_eq!(
+            responses["200"]["content"]["application/json"]["schema"], user_ref,
+            "200 must carry the shared User schema:\n{spec}"
+        );
+        assert_eq!(
+            responses["201"]["content"]["application/json"]["schema"], user_ref,
+            "201 must carry the SAME shared User schema:\n{spec}"
+        );
+        insta::assert_snapshot!("openapi_multi_status_shared_body", spec);
+    }
+
+    #[test]
+    fn multi_status_typed_and_typeless() {
+        // `response { 200: User  204 }`: the typed status carries the `User`
+        // schema; the typeless `204` has a description but NO `content` (no body).
+        let spec = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint updateUser: PUT "/api/users/{id}" {
+    response {
+        200: User
+        204
+    }
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+        let responses = &v["paths"]["/api/users/{id}"]["put"]["responses"];
+        assert_eq!(
+            responses["200"]["content"]["application/json"]["schema"],
+            json!({ "$ref": "#/components/schemas/User" }),
+            "200 must carry the User schema:\n{spec}"
+        );
+        assert!(
+            responses["204"]["content"].is_null() && responses["204"]["description"].is_string(),
+            "typeless 204 must have a description and NO content:\n{spec}"
+        );
+        insta::assert_snapshot!("openapi_multi_status_mixed", spec);
+    }
+
+    #[test]
+    fn multi_status_all_typeless() {
+        // `response { 202  204 }`: both entries are typeless — description only,
+        // no content on either.
+        let spec = generate_from_source(
+            r#"
+endpoint enqueueJob: POST "/api/jobs" {
+    response {
+        202
+        204
+    }
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+        let responses = &v["paths"]["/api/jobs"]["post"]["responses"];
+        assert!(
+            responses["202"]["content"].is_null()
+                && responses["202"]["description"].is_string()
+                && responses["204"]["content"].is_null()
+                && responses["204"]["description"].is_string(),
+            "all-typeless entries must each be description-only with no content:\n{spec}"
+        );
+        insta::assert_snapshot!("openapi_multi_status_all_typeless", spec);
+    }
+
+    #[test]
+    fn multi_status_and_error_block_coexist() {
+        // Multi-status entries and `error { }` variants land in ONE `responses`
+        // map. The key ranges are disjoint by construction (sema: block statuses
+        // are 2xx-only, error variants 400-599), so each insert must survive the
+        // other — pin all three keys on the same operation.
+        let spec = generate_from_source(
+            r#"
+struct User { Int id  String name }
+endpoint updateUser: PUT "/api/users/{id}" {
+    response {
+        200: User
+        204
+    }
+    error { NotFound(404) }
+}
+"#,
+        );
+        let v: Value = serde_json::from_str(&spec).expect("spec is valid JSON");
+        let responses = &v["paths"]["/api/users/{id}"]["put"]["responses"];
+        assert_eq!(
+            responses["200"]["content"]["application/json"]["schema"],
+            json!({ "$ref": "#/components/schemas/User" }),
+            "200 must carry the User schema:\n{spec}"
+        );
+        assert!(
+            responses["204"]["content"].is_null() && responses["204"]["description"].is_string(),
+            "typeless 204 must survive alongside the error entry:\n{spec}"
+        );
+        assert!(
+            responses["404"].is_object(),
+            "the error variant's 404 must survive alongside the multi-status entries:\n{spec}"
         );
     }
 }

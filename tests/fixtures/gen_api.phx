@@ -236,6 +236,46 @@ endpoint listPostsCursor: GET "/api/posts/feed" {
     pagination { cursor }
 }
 
+// ── Multi-status responses (shared body + typeless) ───────────
+
+/**
+ * Create-or-update a post: returns 200 (updated existing) or 201 (created new),
+ * both carrying the same Post body, 202 (accepted for async processing — no
+ * body), or 204 (no change). The `response { }` block makes the handler/client
+ * use the `UpsertPost2Response` envelope { status: Int, body: Option<Post> } —
+ * the handler picks the status, the client reads it back. The typeless 202
+ * deliberately sits alongside 204: clients must detect an empty body by
+ * CONTENT, not by special-casing the 204 status code.
+ */
+endpoint upsertPost2: PUT "/api/posts2/{id}" {
+    body Post omit { id, author }
+    response {
+        200: Post
+        201: Post
+        202
+        204
+    }
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}
+
+/**
+ * Re-queue a post for background processing: returns 202 (accepted — queued
+ * for reprocessing) or 204 (no-op — already queued). An ALL-TYPELESS block:
+ * no typed status, so the `RequeuePostResponse` envelope is just
+ * { status: Int } with no body field — a distinct codegen branch (no body
+ * decode in the client, no body write in the server) that the mixed
+ * upsertPost2 endpoint cannot reach.
+ */
+endpoint requeuePost: POST "/api/posts/{id}/requeue" {
+    response {
+        202
+        204
+    }
+}
+
 // ── API versioning (path-prefix block) ────────────────────────
 
 /**

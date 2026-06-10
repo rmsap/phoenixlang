@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
@@ -49,7 +50,18 @@ type contractCase struct {
 	Kind     string      `json:"kind"` // "ok" | "error" | "constraint"
 	Call     callSpec    `json:"call"`
 	Handler  handlerSpec `json:"handler"`
+	Raw      *rawSpec    `json:"raw_response"`
 	Expect   expectSpec  `json:"expect_client"`
+}
+
+// rawSpec mirrors the optional raw_response field: when present, the driver
+// serves this canned status (+ optional JSON body) for every request INSTEAD of
+// mounting the generated server — the only way to put a status on the wire that
+// the generated server's own guard would refuse (e.g. an undeclared 2xx for the
+// client-leniency cases). The stub handler is never invoked.
+type rawSpec struct {
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body"`
 }
 
 type callSpec struct {
@@ -77,6 +89,7 @@ type handlerSpec struct {
 	Returns         json.RawMessage        `json:"returns"`
 	ReturnsHeaders  map[string]interface{} `json:"returns_headers"`
 	ReturnsFile     string                 `json:"returns_file"`
+	ReturnsStatus   int                    `json:"returns_status"`
 	Raises          string                 `json:"raises"`
 	ExpectNotCalled bool                   `json:"expect_not_called"`
 }
@@ -85,6 +98,8 @@ type expectSpec struct {
 	OK             json.RawMessage        `json:"ok"`
 	OKHeaders      map[string]interface{} `json:"ok_headers"`
 	ExpectDownload *string                `json:"expect_download"`
+	Status         int                    `json:"status"`
+	OkAbsent       bool                   `json:"ok_absent"`
 	Error          *errorExpect           `json:"error"`
 }
 
@@ -244,6 +259,50 @@ func (s *stub) CreatePost(body api.CreatePostBody) (*api.Post, error) {
 	return &out, nil
 }
 
+// UpsertPost2 exercises a multi-status endpoint (a response { } block). The
+// handler returns the <Endpoint>Response envelope { status, body }: it sets
+// .Status from handler.returns_status (the status the stub chooses) and .Body
+// from handler.returns (unmarshalled into a *Post) when present — left nil for
+// the no-body status (e.g. 204). The generated server writes that status to the
+// wire; the client reads it back plus the optional body.
+func (s *stub) UpsertPost2(id string, body api.UpsertPost2Body) (*api.UpsertPost2Response, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"id":     id,
+		"title":  body.Title,
+		"body":   body.Body,
+		"status": string(body.Status),
+		"tags":   normalizeSlice(body.Tags),
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	out := &api.UpsertPost2Response{Status: s.c.Handler.ReturnsStatus}
+	if len(s.c.Handler.Returns) > 0 {
+		var post api.Post
+		mustUnmarshal(s.t, s.c.Handler.Returns, &post)
+		out.Body = &post
+	}
+	return out, nil
+}
+
+// RequeuePost exercises an ALL-TYPELESS multi-status endpoint (response
+// { 202 204 }). The RequeuePostResponse envelope has no Body field at all —
+// the stub only chooses the status (handler.returns_status); the generated
+// server writes it and the client reads it back off the status-only envelope.
+func (s *stub) RequeuePost(id string) (*api.RequeuePostResponse, error) {
+	s.hit = true
+	got := map[string]interface{}{
+		"id": id,
+	}
+	assertReceived(s.t, s.c, got)
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	return &api.RequeuePostResponse{Status: s.c.Handler.ReturnsStatus}, nil
+}
+
 func (s *stub) SearchPosts(maxResults int64, sortField string) (*[]api.Post, error) {
 	s.hit = true
 	got := map[string]interface{}{
@@ -373,7 +432,22 @@ func TestRoundtrip(t *testing.T) {
 		c := c
 		t.Run(c.Name, func(t *testing.T) {
 			s := &stub{t: t, c: c}
-			srv := httptest.NewServer(api.NewRouter(s))
+			var h http.Handler = api.NewRouter(s)
+			if c.Raw != nil {
+				// raw_response case: bypass the generated server entirely and
+				// answer with the canned status/body (see rawSpec).
+				raw := c.Raw
+				h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if len(raw.Body) > 0 {
+						w.Header().Set("Content-Type", "application/json")
+					}
+					w.WriteHeader(raw.Status)
+					if len(raw.Body) > 0 {
+						_, _ = w.Write(raw.Body)
+					}
+				})
+			}
+			srv := httptest.NewServer(h)
 			defer srv.Close()
 			client := api.NewApiClient(srv.URL)
 
@@ -384,7 +458,7 @@ func TestRoundtrip(t *testing.T) {
 				if callErr != nil {
 					t.Fatalf("expected success, got error: %v", callErr)
 				}
-				if !s.hit {
+				if !s.hit && c.Raw == nil {
 					t.Fatalf("handler was never called for ok case")
 				}
 			case "error":
@@ -499,6 +573,41 @@ func invoke(t *testing.T, client *api.ApiClient, c contractCase) error {
 			return err
 		}
 		assertOK(t, c, got)
+		return nil
+
+	case "upsertPost2":
+		// Multi-status endpoint: the client returns an envelope { status, body }.
+		// Assert the observed status equals expect_client.status; when ok_absent is
+		// set (the no-body status, e.g. 204) the envelope body must be nil,
+		// otherwise compare the body (*Post) against expect_client.ok.
+		var body api.UpsertPost2Body
+		mustUnmarshal(t, c.Call.Body, &body)
+		got, err := client.UpsertPost2(c.Call.PathParams["id"], body)
+		if err != nil {
+			return err
+		}
+		if got.Status != c.Expect.Status {
+			t.Fatalf("[%s] envelope status: got %d, want %d", c.Name, got.Status, c.Expect.Status)
+		}
+		if c.Expect.OkAbsent {
+			if got.Body != nil {
+				t.Fatalf("[%s] expected absent body, got %#v", c.Name, got.Body)
+			}
+		} else {
+			assertOK(t, c, got.Body)
+		}
+		return nil
+
+	case "requeuePost":
+		// All-typeless multi-status endpoint: the envelope is { Status } with no
+		// Body field, so the only client-side observation is the status itself.
+		got, err := client.RequeuePost(c.Call.PathParams["id"])
+		if err != nil {
+			return err
+		}
+		if got.Status != c.Expect.Status {
+			t.Fatalf("[%s] envelope status: got %d, want %d", c.Name, got.Status, c.Expect.Status)
+		}
 		return nil
 
 	case "updateAuthorProfile":

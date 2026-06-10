@@ -3,8 +3,8 @@ use crate::ast::{
     Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
     FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock, ImportDecl, ImportItem,
     ImportItems, InlineTraitImpl, NamedType, PaginationMode, Param, Program, QueryParam,
-    SchemaDecl, SchemaTable, StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr,
-    TypeModifier, Visibility,
+    ResponseStatus, SchemaDecl, SchemaTable, StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl,
+    TypeExpr, TypeModifier, Visibility,
 };
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::{SourceId, Span};
@@ -1318,6 +1318,7 @@ impl<'src> Parser<'src> {
         let mut response_headers = Vec::new();
         let mut body = None;
         let mut response = None;
+        let mut response_statuses = Vec::new();
         let mut errors = Vec::new();
         let mut pagination = None;
         let mut has_query = false;
@@ -1360,6 +1361,32 @@ impl<'src> Parser<'src> {
                     has_response = true;
                     self.advance();
                     self.skip_newlines();
+                    // Block form: `response { <status>[: Type] ... }`. An `{`
+                    // following `response` (rather than a type name or
+                    // `headers`) selects the multi-status block; newlines were
+                    // just skipped, so the `{` may sit on the next line. The
+                    // block form
+                    // populates `response_statuses`; a trailing inline `headers`
+                    // block is rejected right below (multi-status is mutually
+                    // exclusive with response headers — decision 4).
+                    if self.peek().kind == TokenKind::LBrace {
+                        response_statuses = self.parse_response_block();
+                        // In the bare form a same-line `headers { ... }` binds as
+                        // RESPONSE headers, so reject the same spelling here with a
+                        // targeted error and consume the block to recover —
+                        // otherwise it would re-dispatch as the standalone REQUEST
+                        // `headers` section and silently turn the would-be response
+                        // headers into handler/client inputs. (A `headers` block on
+                        // its own line is still the request section, exactly as for
+                        // the bare form — we deliberately do NOT skip newlines
+                        // before this check.)
+                        if self.peek().kind == TokenKind::Headers {
+                            self.error_at_current(
+                                "a multi-status `response { }` block cannot declare response headers — both wrap the return value in a generated envelope; see docs/known-issues.md",
+                            );
+                            let _ = self.parse_headers_block();
+                        }
+                    } else
                     // `response headers { ... }` with no response type: response
                     // headers are bundled with the body into a typed envelope, so
                     // they require a response type. Catch this here (before
@@ -1431,6 +1458,7 @@ impl<'src> Parser<'src> {
             headers,
             body,
             response,
+            response_statuses,
             response_headers,
             pagination,
             errors,
@@ -1557,7 +1585,10 @@ impl<'src> Parser<'src> {
     ///
     /// Each variant is an identifier followed by a parenthesised integer
     /// literal representing the HTTP status code. Variants are separated by
-    /// newlines.
+    /// newlines, each optionally followed by a comma — so the one-line
+    /// `error { NotFound(404), Conflict(409) }` also parses, matching the
+    /// forgiving field-list style of `omit { a, b }` and the comma handling
+    /// of [`parse_response_block`](Self::parse_response_block).
     ///
     /// Returns an empty vector if the `error` keyword or opening `{` is
     /// missing (a diagnostic is recorded in that case).
@@ -1572,6 +1603,7 @@ impl<'src> Parser<'src> {
         self.skip_newlines();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
             let estart = self.peek().span;
+            let entry_pos = self.pos;
             if let Some(name_tok) = self.expect(TokenKind::Ident)
                 && self.expect(TokenKind::LParen).is_some()
                 && let Some(code_tok) = self.expect(TokenKind::IntLiteral)
@@ -1587,10 +1619,134 @@ impl<'src> Parser<'src> {
                     span: estart.merge(eend),
                 });
             }
+            // Recovery: a malformed variant can fail its FIRST `expect` without
+            // consuming anything (`expect` records a diagnostic but does not
+            // advance on mismatch), and `skip_newlines` below would not move
+            // either — without this skip the loop re-examined the same token
+            // forever, hanging the compiler on any malformed entry.
+            if self.pos == entry_pos {
+                self.advance();
+            }
+            self.eat(TokenKind::Comma);
             self.skip_newlines();
         }
         let _ = self.expect(TokenKind::RBrace);
         errors
+    }
+
+    /// Parses the block form of a `response` section: `response { ... }`.
+    ///
+    /// Expected syntax:
+    ///
+    /// ```text
+    /// response {
+    ///     200: User
+    ///     201: User
+    ///     204
+    /// }
+    /// ```
+    ///
+    /// Each entry is a success status code (an integer literal) optionally
+    /// followed by `: <Type>`. A typeless entry (just `204`) records `ty: None`.
+    /// Entries are separated by newlines, each optionally followed by a comma —
+    /// so the one-line `response { 200: User, 201: User }` also parses,
+    /// matching [`parse_error_block`](Self::parse_error_block) and the
+    /// field-list style of `omit { a, b }`.
+    ///
+    /// The leading `response` keyword is already consumed by the caller; this
+    /// method expects the opening `{`. The shared-body-type, 2xx-only, and
+    /// duplicate-status rules are NOT enforced here — they are sema's job. The
+    /// parser does reject what only it can see cleanly: an empty `response { }`
+    /// (which would otherwise silently behave as "no response declared") and a
+    /// status literal that does not fit a `u16` (reported by its written text,
+    /// not folded to `0`). A malformed entry missing its status integer is
+    /// reported as a parse error and skipped for clean recovery.
+    ///
+    /// Returns an empty vector if the opening `{` is missing (a diagnostic is
+    /// recorded in that case). Mirrors the `{ ... }` loop style of
+    /// [`parse_query_block`](Self::parse_query_block) and the integer-reading of
+    /// [`parse_error_block`](Self::parse_error_block).
+    fn parse_response_block(&mut self) -> Vec<ResponseStatus> {
+        let mut statuses = Vec::new();
+        let Some(lbrace) = self.expect(TokenKind::LBrace) else {
+            return statuses;
+        };
+        let lbrace_span = lbrace.span;
+        // Distinct from `statuses.is_empty()`: malformed entries are dropped
+        // during recovery (with their own diagnostics), and an
+        // all-entries-malformed block should not ALSO cascade the empty-block
+        // error below.
+        let mut saw_entry = false;
+        self.skip_newlines();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            // Status code: a required integer literal. Mirror the integer
+            // reading in `parse_error_block` (parse the token text). On a
+            // missing integer, `expect` records a diagnostic; skip the offending
+            // token to recover so it doesn't re-dispatch as another section.
+            if let Some(code_tok) = self.expect(TokenKind::IntLiteral) {
+                saw_entry = true;
+                let mut span = code_tok.span;
+                // Optional `: <Type>` makes the entry typed; its absence makes
+                // it typeless (e.g. `204`).
+                let ty = if self.eat(TokenKind::Colon) {
+                    let ty = self.parse_type_expr();
+                    if let Some(t) = &ty {
+                        span = span.merge(t.span());
+                    }
+                    ty
+                } else if self.peek().kind == TokenKind::Ident {
+                    // `200 User` — a forgotten colon. Without this arm the
+                    // identifier would fall through to the NEXT iteration's
+                    // integer expect and report an unhelpful "expected integer
+                    // literal, found identifier". Name the actual mistake, then
+                    // parse the type anyway so the entry recovers as typed (a
+                    // newline-separated typeless entry never hits this arm:
+                    // newlines are tokens, so `peek` only sees an identifier
+                    // when it shares the entry's line).
+                    let ident = self.peek();
+                    self.diagnostics.push(Diagnostic::error(
+                        format!(
+                            "missing `:` between status and type — write `{}: {}`",
+                            code_tok.text, ident.text
+                        ),
+                        ident.span,
+                    ));
+                    let ty = self.parse_type_expr();
+                    if let Some(t) = &ty {
+                        span = span.merge(t.span());
+                    }
+                    ty
+                } else {
+                    None
+                };
+                // An out-of-range literal (e.g. `70000`) cannot be an HTTP
+                // status. Report it by its written text and drop the entry —
+                // folding to a sentinel like `0` would make sema complain about
+                // a status the user never wrote.
+                match code_tok.text.parse::<u16>() {
+                    Ok(status) => statuses.push(ResponseStatus { status, ty, span }),
+                    Err(_) => self.diagnostics.push(Diagnostic::error(
+                        format!("invalid HTTP status code `{}`", code_tok.text),
+                        code_tok.span,
+                    )),
+                }
+            } else {
+                // No status integer (e.g. `response { : User }`): the diagnostic
+                // is already recorded by `expect`; advance past the bad token to
+                // avoid an infinite loop and re-dispatch.
+                self.advance();
+            }
+            self.eat(TokenKind::Comma);
+            self.skip_newlines();
+        }
+        let _ = self.expect(TokenKind::RBrace);
+        if !saw_entry {
+            self.diagnostics.push(Diagnostic::error(
+                "`response { }` must declare at least one status",
+                lbrace_span,
+            ));
+        }
+        statuses
     }
 
     /// Parses a `query` block inside an endpoint declaration.
@@ -3800,6 +3956,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_endpoint_error_block_comma_separated() {
+        // The one-line comma-separated spelling (the natural habit from
+        // `omit { a, b }`) must parse identically to the newline form,
+        // trailing comma included. Regression: before the comma support, the
+        // variant loop had no recovery advance, so this exact source HUNG the
+        // parser (the comma was re-examined forever).
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User
+            error { NotFound(404), Forbidden(403), }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.errors.len(), 2);
+                assert_eq!(ep.errors[0].name, "NotFound");
+                assert_eq!(ep.errors[0].status_code, 404);
+                assert_eq!(ep.errors[1].name, "Forbidden");
+                assert_eq!(ep.errors[1].status_code, 403);
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_error_block_malformed_entry_recovers() {
+        // A malformed variant (`NotFound 404` — missing parens) must produce a
+        // diagnostic and TERMINATE: the loop's consumed-nothing guard advances
+        // past tokens the variant grammar rejects, where it previously spun
+        // forever. The well-formed variant around it still parses.
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User
+            error {
+                NotFound 404
+                Forbidden(403)
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "a malformed error variant should be a parse error"
+        );
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert!(
+                    ep.errors.iter().any(|e| e.name == "Forbidden"),
+                    "the well-formed variant must survive recovery, got: {:?}",
+                    ep.errors
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_endpoint_with_doc_comment() {
         let source = r#"/** Fetches a single user by ID. */
         endpoint getUser: GET "/api/users/{id}" {
@@ -5183,6 +5394,324 @@ schema db {
                 assert!(
                     ep.response_headers.is_empty(),
                     "the malformed block must be consumed, not bound as response headers"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    // ── Multi-status response block tests ─────────────────────────────
+
+    #[test]
+    fn parse_response_block_multi_status() {
+        let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
+            response {
+                200: User
+                201: User
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert!(
+                    ep.response.is_none(),
+                    "block form leaves bare `response` None"
+                );
+                assert_eq!(ep.response_statuses.len(), 2);
+                assert_eq!(ep.response_statuses[0].status, 200);
+                match ep.response_statuses[0].ty.as_ref().expect("typed entry") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+                assert_eq!(ep.response_statuses[1].status, 201);
+                match ep.response_statuses[1].ty.as_ref().expect("typed entry") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_with_typeless() {
+        let source = r#"endpoint updateUser: PUT "/api/users/{id}" {
+            response {
+                200: User
+                204
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert!(ep.response.is_none());
+                assert_eq!(ep.response_statuses.len(), 2);
+                assert_eq!(ep.response_statuses[0].status, 200);
+                match ep.response_statuses[0].ty.as_ref().expect("typed entry") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+                assert_eq!(ep.response_statuses[1].status, 204);
+                assert!(
+                    ep.response_statuses[1].ty.is_none(),
+                    "204 is a typeless entry"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_all_typeless() {
+        let source = r#"endpoint acceptJob: POST "/api/jobs" {
+            response {
+                202
+                204
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert!(ep.response.is_none());
+                assert_eq!(ep.response_statuses.len(), 2);
+                assert_eq!(ep.response_statuses[0].status, 202);
+                assert!(ep.response_statuses[0].ty.is_none());
+                assert_eq!(ep.response_statuses[1].status, 204);
+                assert!(ep.response_statuses[1].ty.is_none());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_bare_response_unchanged() {
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                match ep.response.as_ref().expect("should have response") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+                assert!(
+                    ep.response_statuses.is_empty(),
+                    "bare form leaves `response_statuses` empty"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_bare_response_with_headers_unchanged() {
+        let source = r#"endpoint getUser: GET "/api/users/{id}" {
+            response User headers {
+                String x
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                match ep.response.as_ref().expect("should have response") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+                assert_eq!(ep.response_headers.len(), 1);
+                assert_eq!(ep.response_headers[0].name, "x");
+                assert!(
+                    ep.response_statuses.is_empty(),
+                    "bare form leaves `response_statuses` empty"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_missing_status_errors() {
+        let source = r#"endpoint badEndpoint: GET "/api/bad" {
+            response {
+                : User
+            }
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "missing status integer should be a parse error"
+        );
+    }
+
+    #[test]
+    fn parse_response_block_empty_errors() {
+        // An empty `response { }` declares nothing; without a diagnostic it
+        // would silently behave as "no response declared".
+        let source = r#"endpoint badEndpoint: GET "/api/bad" {
+            response { }
+        }"#;
+        let (_, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("at least one status")),
+            "empty response block should be a parse error, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_response_block_inline_headers_rejected() {
+        // A same-line `headers { ... }` after the block is the response-header
+        // spelling of the bare form; multi-status cannot carry response headers,
+        // so it must be a targeted parse error — NOT silently re-dispatched as
+        // the request `headers` section (which would turn the would-be response
+        // headers into handler/client inputs).
+        let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
+            response { 200: User } headers {
+                String x
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot declare response headers")),
+            "inline headers after a response block should be a parse error, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.response_statuses.len(), 1);
+                assert!(
+                    ep.response_headers.is_empty(),
+                    "the rejected block must not become response headers"
+                );
+                assert!(
+                    ep.headers.is_empty(),
+                    "the rejected block must not become request headers"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_newline_headers_stays_request_section() {
+        // A `headers { ... }` block on its OWN line after a response block is the
+        // standalone request-headers section (section ordering is free), exactly
+        // as for the bare `response <Type>` form.
+        let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
+            response { 200: User }
+            headers {
+                String x
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.response_statuses.len(), 1);
+                assert_eq!(ep.headers.len(), 1, "request headers section expected");
+                assert!(ep.response_headers.is_empty());
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_out_of_range_status_errors() {
+        // A literal that does not fit a u16 is reported by its written text,
+        // not folded to a sentinel `0` that sema would then complain about.
+        let source = r#"endpoint badEndpoint: GET "/api/bad" {
+            response {
+                70000: User
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid HTTP status code `70000`")),
+            "out-of-range status should be a parse error, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => assert!(
+                ep.response_statuses.is_empty(),
+                "the invalid entry must be dropped, not folded to status 0"
+            ),
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_missing_colon_hint() {
+        // `200 User` (forgotten colon) must name the actual mistake — not let
+        // `User` fall through to the next iteration's integer expect and report
+        // "expected integer literal" — and recover the entry as typed.
+        let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
+            response {
+                200 User
+                204
+            }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("missing `:`") && d.message.contains("`200: User`")),
+            "forgotten colon should get a targeted hint, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.response_statuses.len(), 2, "both entries recovered");
+                match ep.response_statuses[0].ty.as_ref().expect("recovers typed") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+                assert_eq!(ep.response_statuses[1].status, 204);
+                assert!(
+                    ep.response_statuses[1].ty.is_none(),
+                    "a newline-separated typeless entry must not trip the hint"
+                );
+            }
+            other => panic!("expected Endpoint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_response_block_comma_separated() {
+        // The one-line comma-separated spelling (the natural habit from
+        // `omit { a, b }`, and what the roadmap sketch used) must parse
+        // identically to the newline form, trailing comma included. A comma
+        // after a typeless entry must not turn it typed, and a comma must not
+        // trip the missing-colon hint.
+        let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
+            response { 200: User, 201: User, 204, }
+        }"#;
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Endpoint(ep) => {
+                assert_eq!(ep.response_statuses.len(), 3);
+                assert_eq!(ep.response_statuses[0].status, 200);
+                match ep.response_statuses[0].ty.as_ref().expect("typed entry") {
+                    TypeExpr::Named(n) => assert_eq!(n.name, "User"),
+                    other => panic!("expected Named(User), got {:?}", other),
+                }
+                assert_eq!(ep.response_statuses[1].status, 201);
+                assert!(ep.response_statuses[1].ty.is_some());
+                assert_eq!(ep.response_statuses[2].status, 204);
+                assert!(
+                    ep.response_statuses[2].ty.is_none(),
+                    "a comma after a typeless entry must keep it typeless"
                 );
             }
             other => panic!("expected Endpoint, got {:?}", other),

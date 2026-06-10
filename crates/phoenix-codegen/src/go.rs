@@ -168,6 +168,7 @@ impl<'a> GoGenerator<'a> {
             self.emit_derived_type(ep);
             self.emit_response_envelope(ep);
             self.emit_pagination_envelope(ep);
+            self.emit_multi_status_envelope(ep);
         }
 
         // Compose types.go with header and conditional imports
@@ -604,6 +605,49 @@ impl<'a> GoGenerator<'a> {
         self.types_out.push_str(&render_struct(&type_name, &rows));
     }
 
+    /// Emits the generated `<Endpoint>Response` multi-status envelope struct for an
+    /// endpoint that declares a `response { }` block (`response_statuses`
+    /// non-empty). The handler returns, and the client observes, this envelope
+    /// instead of the bare body:
+    /// - `Status int` — the actual HTTP status (handler sets it, server writes it,
+    ///   client reads it).
+    /// - `Body *T` — the shared body type as an Option (pointer, `omitempty`),
+    ///   present only when the block declares at least one typed status (`ep.response`
+    ///   is `Some`). An all-typeless block (e.g. `response { 202  204 }`) has no `T`,
+    ///   so the envelope is just `{ Status int }` with no `Body` field.
+    ///
+    /// This mirrors the response-header `<Endpoint>Result` / pagination
+    /// `<Endpoint>Page` envelope machinery; all three are mutually exclusive (sema
+    /// rejects the combinations), so an endpoint never emits more than one.
+    /// Endpoints WITHOUT a `response { }` block emit nothing and keep returning the
+    /// bare body unchanged.
+    fn emit_multi_status_envelope(&mut self, ep: &EndpointInfo) {
+        if ep.response_statuses.is_empty() {
+            return;
+        }
+        let type_name = multi_status_type_name(ep);
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+        // `Status` is Go `int` — the one place a Phoenix-design `Int` does not
+        // render as `int64` (`type_to_go`). Deliberate: it mirrors
+        // `http.Response.StatusCode int`, so handlers and clients assign it
+        // without casts, and the JSON wire form is identical either way.
+        let mut rows: Vec<(String, String, String)> = vec![(
+            "Status".to_string(),
+            "int".to_string(),
+            "`json:\"status\"`".to_string(),
+        )];
+        if let Some(body_type) = ep.response.as_ref().map(type_to_go) {
+            rows.push((
+                "Body".to_string(),
+                format!("*{body_type}"),
+                "`json:\"body,omitempty\"`".to_string(),
+            ));
+        }
+        self.types_out.push_str(&render_struct(&type_name, &rows));
+    }
+
     /// Emits a `Validate() error` method on a derived body type if any of its
     /// fields carry a constraint inherited from the source struct.
     ///
@@ -691,6 +735,10 @@ impl<'a> GoGenerator<'a> {
         // response headers).
         let is_paginated = ep.pagination.is_some();
         let page_type = page_type_name(ep);
+        // A multi-status endpoint returns the `<Endpoint>Response` envelope
+        // (handler-chosen status + optional shared body) instead of the bare body.
+        let is_multi_status = !ep.response_statuses.is_empty();
+        let multi_status_type = multi_status_type_name(ep);
 
         // Build parameter list
         let mut params = Vec::new();
@@ -722,12 +770,14 @@ impl<'a> GoGenerator<'a> {
         // than a bare `error`): true with response headers (→ envelope), a binary
         // download (→ stream), or a bare response type. The error-return prefix
         // below must match this exactly.
-        let returns_value = has_resp_headers || response_type.is_some();
+        let returns_value = is_multi_status || has_resp_headers || response_type.is_some();
 
         // Return type. A binary download returns the raw response stream
         // (`io.ReadCloser`) the caller drains and closes; with response headers
         // the method returns the envelope pointer; otherwise the bare response.
-        let return_sig = if ep.response_is_binary {
+        let return_sig = if is_multi_status {
+            format!("(*{}, error)", multi_status_type)
+        } else if ep.response_is_binary {
             "(io.ReadCloser, error)".to_string()
         } else if has_resp_headers {
             format!("(*{}, error)", result_type)
@@ -815,21 +865,31 @@ impl<'a> GoGenerator<'a> {
         if response_type.is_some() && !ep.response_is_binary {
             self.client_needs_json = true;
         }
+        // The error-return arity must track `returns_value` in every branch: a
+        // body-carrying endpoint (JSON or multipart) with no response returns
+        // bare `error` (so `return nil, err` would not compile), while an
+        // all-typeless multi-status block returns the envelope pair despite
+        // having no response type.
+        let err_ret = if returns_value { "nil, err" } else { "err" };
         if ep.body_is_multipart {
-            self.emit_client_multipart_body(ep, http_method);
+            self.emit_client_multipart_body(ep, http_method, err_ret);
         } else if ep.body.is_some() {
             self.client_needs_bytes = true;
             self.client_needs_json = true;
             self.client_out
                 .push_str("\tdata, err := json.Marshal(body)\n");
-            self.client_out
-                .push_str("\tif err != nil {\n\t\treturn nil, err\n\t}\n");
+            self.client_out.push_str(&format!(
+                "\tif err != nil {{\n\t\treturn {}\n\t}}\n",
+                err_ret
+            ));
             self.client_out.push_str(&format!(
                 "\treq, err := http.NewRequest(\"{}\", u, bytes.NewReader(data))\n",
                 http_method
             ));
-            self.client_out
-                .push_str("\tif err != nil {\n\t\treturn nil, err\n\t}\n");
+            self.client_out.push_str(&format!(
+                "\tif err != nil {{\n\t\treturn {}\n\t}}\n",
+                err_ret
+            ));
             self.client_out
                 .push_str("\treq.Header.Set(\"Content-Type\", \"application/json\")\n");
         } else {
@@ -837,11 +897,6 @@ impl<'a> GoGenerator<'a> {
                 "\treq, err := http.NewRequest(\"{}\", u, nil)\n",
                 http_method
             ));
-            let err_ret = if response_type.is_some() {
-                "nil, err"
-            } else {
-                "err"
-            };
             self.client_out.push_str(&format!(
                 "\tif err != nil {{\n\t\treturn {}\n\t}}\n",
                 err_ret
@@ -899,7 +954,31 @@ impl<'a> GoGenerator<'a> {
         // Decode response. A binary download returns the raw stream; with response
         // headers, decode the body into the envelope's `Body` field, then read each
         // header from `resp.Header`.
-        if ep.response_is_binary {
+        if is_multi_status {
+            // Build the `<Endpoint>Response` envelope: the handler-chosen status
+            // comes from the HTTP response; the optional shared body is decoded into
+            // `*T` only when the response actually carries one. An all-typeless block
+            // (no `T`) has no `Body` field, so just record the status.
+            self.client_out.push_str(&format!(
+                "\tresult := {}{{Status: resp.StatusCode}}\n",
+                multi_status_type
+            ));
+            if let Some(ref rt) = response_type {
+                self.client_needs_json = true;
+                // A typeless status (e.g. 204) sends no body; only decode when the
+                // response reports a non-empty body. `ContentLength == 0` covers the
+                // explicit empty case; `io.EOF` from the decoder covers a streamed
+                // empty body (chunked / unknown length).
+                self.client_needs_io = true;
+                self.client_out.push_str("\tif resp.ContentLength != 0 {\n");
+                self.client_out.push_str(&format!("\t\tvar body {}\n", rt));
+                self.client_out.push_str(
+                    "\t\tif err := json.NewDecoder(resp.Body).Decode(&body); err != nil && err != io.EOF {\n\t\t\treturn nil, err\n\t\t} else if err == nil {\n\t\t\tresult.Body = &body\n\t\t}\n",
+                );
+                self.client_out.push_str("\t}\n");
+            }
+            self.client_out.push_str("\treturn &result, nil\n");
+        } else if ep.response_is_binary {
             self.client_needs_io = true;
             self.client_out.push_str("\treturn resp.Body, nil\n");
         } else if has_resp_headers {
@@ -941,10 +1020,12 @@ impl<'a> GoGenerator<'a> {
     /// `multipart.Writer` over a `bytes.Buffer`, a `CreateFormFile` part per file
     /// field (copying `FileUpload.Content`) and a `WriteField` per scalar field
     /// (stringified like query params / headers). The request `Content-Type` is
-    /// the writer's `FormDataContentType()` (carries the boundary). All error
-    /// paths return `(nil, err)` — a multipart endpoint always returns a value
-    /// (it has a JSON response, an envelope, or a binary stream).
-    fn emit_client_multipart_body(&mut self, ep: &EndpointInfo, http_method: &str) {
+    /// the writer's `FormDataContentType()` (carries the boundary). Every error
+    /// path returns via `err_ret`, which the caller derives from `returns_value`
+    /// — a multipart upload with no `response` is legal (see the
+    /// `multipart_upload_no_response` test) and its client method returns bare
+    /// `error`, so a hardcoded `nil, err` would not compile there.
+    fn emit_client_multipart_body(&mut self, ep: &EndpointInfo, http_method: &str, err_ret: &str) {
         let Some(ref body) = ep.body else { return };
         self.client_needs_bytes = true;
         self.client_needs_multipart = true;
@@ -976,7 +1057,7 @@ impl<'a> GoGenerator<'a> {
                 };
                 self.client_out.push_str(&open);
                 self.client_out.push_str(&format!(
-                    "\t\tpart, err := writer.CreateFormFile(\"{wire}\", body.{field}.Filename)\n\t\tif err != nil {{\n\t\t\treturn nil, err\n\t\t}}\n\t\tif _, err := io.Copy(part, body.{field}.Content); err != nil {{\n\t\t\treturn nil, err\n\t\t}}\n"
+                    "\t\tpart, err := writer.CreateFormFile(\"{wire}\", body.{field}.Filename)\n\t\tif err != nil {{\n\t\t\treturn {err_ret}\n\t\t}}\n\t\tif _, err := io.Copy(part, body.{field}.Content); err != nil {{\n\t\t\treturn {err_ret}\n\t\t}}\n"
                 ));
                 self.client_out.push_str("\t}\n");
             } else {
@@ -994,7 +1075,7 @@ impl<'a> GoGenerator<'a> {
                 // error-checked (matching the file path) and satisfies errcheck.
                 let i = if optional { "\t\t" } else { "\t" };
                 let write = format!(
-                    "{i}if err := writer.WriteField(\"{wire}\", {str_expr}); err != nil {{\n{i}\treturn nil, err\n{i}}}\n"
+                    "{i}if err := writer.WriteField(\"{wire}\", {str_expr}); err != nil {{\n{i}\treturn {err_ret}\n{i}}}\n"
                 );
                 if optional {
                     self.client_out
@@ -1005,13 +1086,14 @@ impl<'a> GoGenerator<'a> {
             }
         }
 
-        self.client_out
-            .push_str("\tif err := writer.Close(); err != nil {\n\t\treturn nil, err\n\t}\n");
+        self.client_out.push_str(&format!(
+            "\tif err := writer.Close(); err != nil {{\n\t\treturn {err_ret}\n\t}}\n"
+        ));
         self.client_out.push_str(&format!(
             "\treq, err := http.NewRequest(\"{http_method}\", u, &buf)\n",
         ));
         self.client_out
-            .push_str("\tif err != nil {\n\t\treturn nil, err\n\t}\n");
+            .push_str(&format!("\tif err != nil {{\n\t\treturn {err_ret}\n\t}}\n"));
         self.client_out
             .push_str("\treq.Header.Set(\"Content-Type\", writer.FormDataContentType())\n");
     }
@@ -1117,7 +1199,11 @@ impl<'a> GoGenerator<'a> {
         // streams to the wire; with response headers the handler returns the typed
         // envelope; otherwise the bare response type (unchanged for the common
         // case).
-        let return_type = if ep.response_is_binary {
+        let return_type = if !ep.response_statuses.is_empty() {
+            // A multi-status endpoint's handler supplies the `<Endpoint>Response`
+            // envelope (handler-chosen status + optional shared body).
+            format!("(*{}, error)", multi_status_type_name(ep))
+        } else if ep.response_is_binary {
             self.handlers_needs_io = true;
             "(io.Reader, error)".to_string()
         } else if !ep.response_headers.is_empty() {
@@ -1235,7 +1321,85 @@ impl<'a> GoGenerator<'a> {
         if !ep.errors.is_empty() {
             self.server_needs_strings = true;
         }
-        if ep.response_is_binary {
+        if !ep.response_statuses.is_empty() {
+            // Multi-status: the handler returns the `<Endpoint>Response` envelope
+            // carrying the chosen status + optional shared body. The server writes
+            // that status (not a hardcoded 200/204) and JSON-encodes the body only
+            // when present (a typeless status — or an all-typeless block — leaves
+            // `result.Body` nil and writes a bodyless response).
+            self.server_out.push_str(&format!(
+                "\t\tresult, err := h.{}({})\n",
+                handler_name, args_str
+            ));
+            self.server_out.push_str("\t\tif err != nil {\n");
+            self.emit_server_error_mapping(ep);
+            // A `(nil, nil)` return is a handler bug Go's type system can't
+            // prevent; without this guard `result.Status` below panics the
+            // route. Same guard as the binary and response-header paths.
+            self.server_out.push_str(
+                "\t\tif result == nil {\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
+            );
+            // Validate the handler-chosen envelope against the DECLARED contract
+            // before writing it — all three mismatches are handler bugs, reported
+            // as a 500 instead of written to the wire (mirrors the TS/Python
+            // servers):
+            // - an undeclared status (a zero-value envelope would make
+            //   `WriteHeader(0)` panic, and a 4xx smuggled through the success
+            //   envelope would bypass `error { }`);
+            // - a body paired with a typeless status (`net/http` only suppresses
+            //   body writes on 1xx/204/304 — on e.g. a typeless 202 or 205 the
+            //   body WOULD hit the wire, and the content-guarded client would
+            //   parse it, silently violating the contract);
+            // - a nil body paired with a typed status (the contract — and the
+            //   OpenAPI spec — promise a body there).
+            // One switch covers all three: the typed arm requires a body, the
+            // typeless arm forbids one, default is undeclared. An all-typeless
+            // block has no `Body` field, so its single arm is bare membership.
+            let typed: Vec<String> = ep
+                .response_statuses
+                .iter()
+                .filter(|rs| rs.ty.is_some())
+                .map(|rs| rs.status.to_string())
+                .collect();
+            let typeless: Vec<String> = ep
+                .response_statuses
+                .iter()
+                .filter(|rs| rs.ty.is_none())
+                .map(|rs| rs.status.to_string())
+                .collect();
+            self.server_out.push_str("\t\tswitch result.Status {\n");
+            if ep.response.is_some() {
+                self.server_out.push_str(&format!(
+                    "\t\tcase {}:\n\t\t\tif result.Body == nil {{\n\t\t\t\thttp.Error(w, \"handler returned no body for a typed status\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}}\n",
+                    typed.join(", ")
+                ));
+                if !typeless.is_empty() {
+                    self.server_out.push_str(&format!(
+                        "\t\tcase {}:\n\t\t\tif result.Body != nil {{\n\t\t\t\thttp.Error(w, \"handler returned a body for a bodyless status\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}}\n",
+                        typeless.join(", ")
+                    ));
+                }
+            } else {
+                self.server_out
+                    .push_str(&format!("\t\tcase {}:\n", typeless.join(", ")));
+            }
+            self.server_out.push_str(
+                "\t\tdefault:\n\t\t\thttp.Error(w, \"handler returned undeclared status\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
+            );
+            if ep.response.is_some() {
+                // The block declares at least one typed status, so the envelope has
+                // a `Body *T`. Set the content type, write the status, then encode
+                // the body when the handler supplied one.
+                self.server_needs_json = true;
+                self.server_out.push_str(
+                    "\t\tif result.Body != nil {\n\t\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n\t\t\tw.WriteHeader(result.Status)\n\t\t\tjson.NewEncoder(w).Encode(result.Body)\n\t\t} else {\n\t\t\tw.WriteHeader(result.Status)\n\t\t}\n",
+                );
+            } else {
+                // All-typeless block: no `Body` field, just write the status.
+                self.server_out
+                    .push_str("\t\tw.WriteHeader(result.Status)\n");
+            }
+        } else if ep.response_is_binary {
             // Binary download: the handler returns an `io.Reader`; stream it to
             // the wire as `application/octet-stream` (no JSON encoding).
             self.server_needs_io = true;
@@ -1244,14 +1408,12 @@ impl<'a> GoGenerator<'a> {
                 handler_name, args_str
             ));
             self.server_out.push_str("\t\tif err != nil {\n");
-            for (name, code) in &ep.errors {
-                self.server_out.push_str(&format!(
-                    "\t\t\tif strings.Contains(err.Error(), \"{name}\") {{\n\t\t\t\thttp.Error(w, \"{name}\", {code})\n\t\t\t\treturn\n\t\t\t}}\n"
-                ));
-            }
-            self.server_out
-                .push_str("\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n");
-            self.server_out.push_str("\t\t\treturn\n\t\t}\n");
+            self.emit_server_error_mapping(ep);
+            // A `(nil, nil)` return is a handler bug Go's type system can't
+            // prevent; `io.Copy` from a nil reader would panic the route.
+            self.server_out.push_str(
+                "\t\tif result == nil {\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
+            );
             self.server_out
                 .push_str("\t\tw.Header().Set(\"Content-Type\", \"application/octet-stream\")\n");
             // The status line and headers are already committed, so a streaming
@@ -1264,15 +1426,16 @@ impl<'a> GoGenerator<'a> {
                 handler_name, args_str
             ));
             self.server_out.push_str("\t\tif err != nil {\n");
-            // Error mapping
-            for (name, code) in &ep.errors {
-                self.server_out.push_str(&format!(
-                    "\t\t\tif strings.Contains(err.Error(), \"{name}\") {{\n\t\t\t\thttp.Error(w, \"{name}\", {code})\n\t\t\t\treturn\n\t\t\t}}\n"
-                ));
+            self.emit_server_error_mapping(ep);
+            // A `(nil, nil)` return is a handler bug Go's type system can't
+            // prevent; the header reads below deref the envelope pointer and
+            // would panic the route. The plain-response case needs no guard —
+            // `Encode` renders a nil pointer as `null` without panicking.
+            if has_resp_headers {
+                self.server_out.push_str(
+                    "\t\tif result == nil {\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
+                );
             }
-            self.server_out
-                .push_str("\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n");
-            self.server_out.push_str("\t\t\treturn\n\t\t}\n");
             // Response headers: set each on `w.Header()` (stringified, optional
             // guarded) before the body is encoded. With an envelope the body
             // lives in `result.Body`; otherwise `result` is the body itself.
@@ -1299,19 +1462,28 @@ impl<'a> GoGenerator<'a> {
                 "\t\tif err := h.{}({}); err != nil {{\n",
                 handler_name, args_str
             ));
-            for (name, code) in &ep.errors {
-                self.server_out.push_str(&format!(
-                    "\t\t\tif strings.Contains(err.Error(), \"{name}\") {{\n\t\t\t\thttp.Error(w, \"{name}\", {code})\n\t\t\t\treturn\n\t\t\t}}\n"
-                ));
-            }
-            self.server_out
-                .push_str("\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n");
-            self.server_out.push_str("\t\t\treturn\n\t\t}\n");
+            self.emit_server_error_mapping(ep);
             self.server_out
                 .push_str("\t\tw.WriteHeader(http.StatusNoContent)\n");
         }
 
         self.server_out.push_str("\t})\n");
+    }
+
+    /// Emits the interior of a server route's `if err != nil { ... }` block,
+    /// shared by every route shape (multi-status, binary, plain response, no
+    /// response): one `strings.Contains` check per declared `error { }`
+    /// variant answering its mapped status, then the 500 fallback. The caller
+    /// has already opened the `if`; this closes it.
+    fn emit_server_error_mapping(&mut self, ep: &EndpointInfo) {
+        for (name, code) in &ep.errors {
+            self.server_out.push_str(&format!(
+                "\t\t\tif strings.Contains(err.Error(), \"{name}\") {{\n\t\t\t\thttp.Error(w, \"{name}\", {code})\n\t\t\t\treturn\n\t\t\t}}\n"
+            ));
+        }
+        self.server_out
+            .push_str("\t\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n");
+        self.server_out.push_str("\t\t\treturn\n\t\t}\n");
     }
 
     /// Emits server-side multipart parsing for an upload endpoint: parse the form
@@ -1903,6 +2075,16 @@ fn page_type_name(ep: &EndpointInfo) -> String {
     format!("{}Page", to_pascal_case(&ep.name))
 }
 
+/// The generated multi-status-envelope type name for an endpoint that declares a
+/// `response { }` block (`response_statuses` non-empty): `<PascalEndpoint>Response`
+/// (e.g. `createUser` → `CreateUserResponse`). Used for the types.go struct, the
+/// handler return, the client return, and the server status/body wiring. Distinct
+/// from the response-headers `<Endpoint>Result` and pagination `<Endpoint>Page`
+/// envelopes (all three are mutually exclusive per sema).
+fn multi_status_type_name(ep: &EndpointInfo) -> String {
+    format!("{}Response", to_pascal_case(&ep.name))
+}
+
 /// Renders a Go expression that stringifies a header value for the wire,
 /// mirroring how query params convert `int64`/`float64`/`bool` to `string`.
 /// `value_expr` is the already-dereferenced value (e.g. `*x` for an optional).
@@ -2107,1051 +2289,5 @@ fn constraint_needs_strings(expr: &phoenix_parser::ast::Expr) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use phoenix_common::span::SourceId;
-    use phoenix_lexer::lexer::tokenize;
-    use phoenix_parser::parser;
-    use phoenix_sema::checker;
-
-    /// An interior empty doc line renders as a bare `//` (trailing space trimmed)
-    /// so the output stays gofmt-clean. Guards the empty-line branch of
-    /// `render_line_comment`, which the doc-comment integration tests don't hit.
-    #[test]
-    fn render_line_comment_blanks_out_empty_lines() {
-        assert_eq!(
-            render_line_comment("// ", "first\n\nthird"),
-            "// first\n//\n// third\n"
-        );
-    }
-
-    /// The tab-indented prefix (used for handler doc comments) must keep its
-    /// leading tab on a blank line while still trimming the trailing space after
-    /// `//`, i.e. `"\t// "` → `"\t//"`. `trim_end` only strips trailing
-    /// whitespace, so the indent survives — but nothing else pins that, so guard
-    /// it explicitly.
-    #[test]
-    fn render_line_comment_keeps_indent_on_empty_lines() {
-        assert_eq!(
-            render_line_comment("\t// ", "first\n\nthird"),
-            "\t// first\n\t//\n\t// third\n"
-        );
-    }
-
-    fn generate_from_source(source: &str) -> GoFiles {
-        let tokens = tokenize(source, SourceId(0));
-        let (program, parse_errors) = parser::parse(&tokens);
-        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
-        let result = checker::check(&program);
-        assert!(
-            result.diagnostics.is_empty(),
-            "check errors: {:?}",
-            result.diagnostics
-        );
-        generate_go(&program, &result)
-    }
-
-    #[test]
-    fn struct_to_go() {
-        let files = generate_from_source(
-            r#"
-/** A registered user */
-struct User {
-    Int id
-    String name
-    Option<String> bio
-}
-"#,
-        );
-        insta::assert_snapshot!("go_struct", files.types);
-    }
-
-    #[test]
-    fn simple_enum() {
-        let files = generate_from_source("enum Role { Admin  Editor  Viewer }");
-        insta::assert_snapshot!("go_enum", files.types);
-    }
-
-    #[test]
-    fn get_with_path_param() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint getUser: GET "/api/users/{id}" {
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_get_client", files.client);
-        insta::assert_snapshot!("go_get_handler", files.handlers);
-        insta::assert_snapshot!("go_get_server", files.server);
-    }
-
-    #[test]
-    fn post_with_body_and_errors() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  String email }
-endpoint createUser: POST "/api/users" {
-    body User omit { id }
-    response User
-    error { Conflict(409) }
-}
-"#,
-        );
-        insta::assert_snapshot!("go_post_client", files.client);
-        insta::assert_snapshot!("go_post_server", files.server);
-        insta::assert_snapshot!("go_post_types", files.types);
-    }
-
-    #[test]
-    fn query_params() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint listUsers: GET "/api/users" {
-    query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
-    }
-    response List<User>
-}
-"#,
-        );
-        insta::assert_snapshot!("go_query_client", files.client);
-        insta::assert_snapshot!("go_query_server", files.server);
-    }
-
-    #[test]
-    fn void_response() {
-        let files = generate_from_source(
-            r#"
-endpoint deleteUser: DELETE "/api/users/{id}" {
-    error { NotFound(404) }
-}
-"#,
-        );
-        insta::assert_snapshot!("go_void_client", files.client);
-        insta::assert_snapshot!("go_void_server", files.server);
-    }
-
-    /// A multi-line doc comment must have EVERY line prefixed with `//`, not just
-    /// the first — otherwise continuation lines leak into the file as invalid Go.
-    /// Regression guard for `render_line_comment`.
-    #[test]
-    fn multiline_doc_comment_is_fully_commented() {
-        let files = generate_from_source(
-            r#"
-struct Widget { Int id }
-/**
- * Fetch a widget by id
- * with extra detail on the second line
- */
-endpoint getWidget: GET "/api/widgets/{id}" {
-    response Widget
-}
-"#,
-        );
-        assert!(
-            files.client.contains(
-                "// GetWidget fetch a widget by id\n// with extra detail on the second line.\n"
-            ),
-            "every doc line must be commented:\n{}",
-            files.client
-        );
-        // The continuation line must never appear UNcommented (leaked as code).
-        assert!(
-            !files.client.contains("\nwith extra detail"),
-            "continuation doc line leaked as code:\n{}",
-            files.client
-        );
-    }
-
-    #[test]
-    fn multiple_endpoints() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  String email }
-endpoint listUsers: GET "/api/users" {
-    response List<User>
-}
-endpoint createUser: POST "/api/users" {
-    body User omit { id }
-    response User
-}
-endpoint getUser: GET "/api/users/{id}" {
-    response User
-}
-endpoint deleteUser: DELETE "/api/users/{id}" {
-}
-"#,
-        );
-        insta::assert_snapshot!("go_multi_types", files.types);
-        insta::assert_snapshot!("go_multi_client", files.client);
-        insta::assert_snapshot!("go_multi_handlers", files.handlers);
-        insta::assert_snapshot!("go_multi_server", files.server);
-    }
-
-    #[test]
-    fn pascal_case_conversion() {
-        assert_eq!(to_pascal_case("createUser"), "CreateUser");
-        assert_eq!(to_pascal_case("id"), "Id");
-        assert_eq!(to_pascal_case("listUsers"), "ListUsers");
-        assert_eq!(to_pascal_case("User"), "User");
-    }
-
-    #[test]
-    fn multiple_path_params() {
-        let files = generate_from_source(
-            r#"
-struct Comment { Int id  String text }
-endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
-    response Comment
-}
-"#,
-        );
-        insta::assert_snapshot!("go_multi_path_client", files.client);
-    }
-
-    #[test]
-    fn partial_body() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  Int age }
-endpoint updateUser: PATCH "/api/users/{id}" {
-    body User omit { id } partial
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_partial_types", files.types);
-    }
-
-    // ── Gap-filling tests ───────────────────────────────────────────
-
-    /// `pick` modifier in derived body.
-    #[test]
-    fn pick_body() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name  String email  Int age }
-endpoint updateEmail: PATCH "/api/users/{id}" {
-    body User pick { email }
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_pick_types", files.types);
-    }
-
-    /// A constrained `Option<T>` field carried into a body keeps `optional ==
-    /// false` (no `partial` applied) yet renders as a Go pointer, so the body's
-    /// `Validate()` must nil-guard and dereference it — exactly like the source
-    /// struct's own `Validate()`. Guards `emit_body_validate_method`'s pointer
-    /// detection against regressing to a bare `f.optional` check.
-    #[test]
-    fn body_validate_optional_constrained_field() {
-        let files = generate_from_source(
-            r#"
-struct Account {
-    Int id
-    Option<String> displayName where self.length <= 60
-}
-endpoint updateAccount: PATCH "/api/accounts/{id}" {
-    body Account omit { id }
-    response Account
-}
-"#,
-        );
-        assert!(
-            files
-                .types
-                .contains("func (s UpdateAccountBody) Validate() error {"),
-            "body type should have a Validate method:\n{}",
-            files.types
-        );
-        assert!(
-            files
-                .types
-                .contains("if s.DisplayName != nil && !(len(*s.DisplayName) <= 60) {"),
-            "Option body field must be nil-guarded and dereferenced:\n{}",
-            files.types
-        );
-    }
-
-    /// A constrained `Option<T>` field that ALSO gets `partial` applied must not
-    /// render as `**T`: `type_to_go` already maps `Option<T>` to `*T`, and
-    /// `partial` only marks it optional — it must stay a single pointer so both
-    /// the struct field and the body `Validate()` (single deref `*s.Field`) are
-    /// valid Go. Regression guard for the `derived_field_go_type` double-pointer
-    /// collapse.
-    #[test]
-    fn body_validate_partial_option_constrained_field() {
-        let files = generate_from_source(
-            r#"
-struct Account {
-    Int id
-    Option<String> displayName where self.length <= 60
-}
-endpoint patchAccount: PATCH "/api/accounts/{id}" {
-    body Account omit { id } partial { displayName }
-    response Account
-}
-"#,
-        );
-        assert!(
-            !files.types.contains("**"),
-            "an optional Option field must collapse to a single pointer, not **T:\n{}",
-            files.types
-        );
-        assert!(
-            files
-                .types
-                .contains("DisplayName *string `json:\"displayName,omitempty\"`"),
-            "partial Option field should render as a single *string:\n{}",
-            files.types
-        );
-        assert!(
-            files
-                .types
-                .contains("if s.DisplayName != nil && !(len(*s.DisplayName) <= 60) {"),
-            "partial Option body field must be nil-guarded and single-dereferenced:\n{}",
-            files.types
-        );
-    }
-
-    /// Map<K,V> and Bool fields in struct.
-    #[test]
-    fn map_and_bool_fields() {
-        let files = generate_from_source(
-            r#"
-struct Config {
-    Map<String, String> settings
-    Bool enabled
-    Float threshold
-}
-"#,
-        );
-        insta::assert_snapshot!("go_map_bool_float_types", files.types);
-    }
-
-    /// PUT method.
-    #[test]
-    fn put_method() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint replaceUser: PUT "/api/users/{id}" {
-    body User
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_put_server", files.server);
-    }
-
-    /// String and Bool query param defaults.
-    #[test]
-    fn string_bool_query_defaults() {
-        let files = generate_from_source(
-            r#"
-struct Item { Int id  String name }
-endpoint listItems: GET "/api/items" {
-    query {
-        String sortBy = "name"
-        Bool ascending = true
-    }
-    response List<Item>
-}
-"#,
-        );
-        insta::assert_snapshot!("go_string_bool_query_client", files.client);
-        insta::assert_snapshot!("go_string_bool_query_server", files.server);
-    }
-
-    /// Required `Float` and enum query params, plus an optional enum. Exercises
-    /// the server-parse paths whose local type must match the handler signature:
-    /// `float64` via `strconv.ParseFloat`, and a `T(v)` / `*T` conversion for the
-    /// string-backed enum. Also pins the conditional server import set.
-    #[test]
-    fn float_and_enum_query_params() {
-        let files = generate_from_source(
-            r#"
-enum Sort { Asc  Desc }
-struct Item { Int id  String name }
-endpoint listItems: GET "/api/items" {
-    query {
-        Float minScore = 0.5
-        Sort sort
-        Option<Sort> fallback
-    }
-    response List<Item>
-}
-"#,
-        );
-        insta::assert_snapshot!("go_float_enum_query_client", files.client);
-        insta::assert_snapshot!("go_float_enum_query_server", files.server);
-        insta::assert_snapshot!("go_float_enum_query_handlers", files.handlers);
-    }
-
-    /// A derived body that omits every field collapses to `struct{}` — gofmt
-    /// rewrites the multi-line empty form, so this guards `render_struct`.
-    #[test]
-    fn empty_derived_body_is_gofmt_clean() {
-        let files = generate_from_source(
-            r#"
-struct Ping { Int id }
-endpoint ping: POST "/api/ping" {
-    body Ping omit { id }
-    response Ping
-}
-"#,
-        );
-        assert!(
-            files.types.contains("type PingBody struct{}"),
-            "expected collapsed empty struct, got:\n{}",
-            files.types
-        );
-        assert!(!files.types.contains("type PingBody struct {\n}"));
-    }
-
-    /// A schema with types but no endpoints emits a client with no methods, so
-    /// `fmt` (only ever used inside a method) must not be imported — an unused
-    /// import would fail `go build`. `net/http` stays (the client struct holds a
-    /// `*http.Client`).
-    #[test]
-    fn types_only_client_omits_fmt_import() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-"#,
-        );
-        assert!(
-            !files.client.contains("\"fmt\""),
-            "types-only client must not import fmt:\n{}",
-            files.client
-        );
-        assert!(
-            files.client.contains("\"net/http\""),
-            "client must still import net/http:\n{}",
-            files.client
-        );
-    }
-
-    /// Enum as response type.
-    #[test]
-    fn enum_response() {
-        let files = generate_from_source(
-            r#"
-enum Status { Active  Inactive  Banned }
-endpoint getStatus: GET "/api/status" {
-    response Status
-}
-"#,
-        );
-        insta::assert_snapshot!("go_enum_response_client", files.client);
-    }
-
-    /// default_value_to_go covers all variants.
-    #[test]
-    fn default_value_conversions() {
-        assert_eq!(default_value_to_go(&DefaultValue::Int(42)), "42");
-        assert_eq!(default_value_to_go(&DefaultValue::Float(1.5)), "1.5");
-        assert_eq!(
-            default_value_to_go(&DefaultValue::String("hello".into())),
-            "\"hello\""
-        );
-        assert_eq!(default_value_to_go(&DefaultValue::Bool(true)), "true");
-        assert_eq!(default_value_to_go(&DefaultValue::Bool(false)), "false");
-    }
-
-    // ── Validation tests ───────────────────────────────────────────
-
-    /// Validate method with numeric and string length constraints.
-    #[test]
-    fn validate_numeric_and_string() {
-        let files = generate_from_source(
-            r#"
-struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    Int age where self >= 0 && self <= 150
-}
-"#,
-        );
-        insta::assert_snapshot!("go_validate_types", files.types);
-    }
-
-    /// Validate method with `contains` constraint (requires strings import).
-    #[test]
-    fn validate_contains() {
-        let files = generate_from_source(
-            r#"
-struct User {
-    Int id
-    String email where self.contains("@") && self.length > 3
-}
-"#,
-        );
-        insta::assert_snapshot!("go_validate_contains_types", files.types);
-    }
-
-    /// No Validate method when struct has no constraints.
-    #[test]
-    fn no_validate_without_constraints() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-"#,
-        );
-        assert!(
-            !files.types.contains("Validate"),
-            "should not emit Validate when no constraints"
-        );
-        assert!(
-            !files.types.contains("import"),
-            "should not emit imports when no constraints"
-        );
-    }
-
-    /// `dyn Trait` maps to a bare Go interface name (the interface itself
-    /// is expected to be defined in hand-written Go alongside the generated
-    /// struct).  Parallel to the TS/Python behavior.
-    #[test]
-    fn dyn_type_erases_to_trait_name() {
-        assert_eq!(type_to_go(&Type::Dyn("Drawable".to_string())), "Drawable");
-    }
-
-    // ── Headers ─────────────────────────────────────────────────────
-
-    /// A required request header with an auto-derived wire name
-    /// (`idempotencyKey` → `Idempotency-Key`) threads through the client param
-    /// list, the `req.Header.Set` call, the handler signature, and the
-    /// server-side `r.Header.Get` parse.
-    #[test]
-    fn request_header_auto_wire_name() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint createUser: POST "/api/users" {
-    body User omit { id }
-    headers {
-        String idempotencyKey
-    }
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_req_header_client", files.client);
-        insta::assert_snapshot!("go_req_header_handlers", files.handlers);
-        insta::assert_snapshot!("go_req_header_server", files.server);
-    }
-
-    /// An explicit `as "..."` override pins the wire name verbatim (used on the
-    /// client `Set` and the server `Get`), while the local/param stays camelCase.
-    #[test]
-    fn request_header_as_override() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint getUser: GET "/api/users/{id}" {
-    headers {
-        String authToken as "X-Auth-Token"
-    }
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_req_header_override_client", files.client);
-        insta::assert_snapshot!("go_req_header_override_server", files.server);
-    }
-
-    /// An optional request header is a `*string` param, sent only behind a nil
-    /// guard on the client and parsed into a nil-able `*string` on the server.
-    #[test]
-    fn optional_request_header() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint getUser: GET "/api/users/{id}" {
-    headers {
-        Option<String> traceId
-    }
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_opt_header_client", files.client);
-        insta::assert_snapshot!("go_opt_header_server", files.server);
-    }
-
-    /// A `Bool` request header serializes via `strconv.FormatBool`, which emits
-    /// lowercase `true`/`false` — the cross-language wire convention every
-    /// backend must agree on (TS `String(bool)`, Python `"true"/"false"`), so a
-    /// bool header round-trips. Locks the convention on the Go side.
-    #[test]
-    fn bool_request_header_serializes_lowercase() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint getUser: GET "/api/users/{id}" {
-    headers {
-        Bool debug
-    }
-    response User
-}
-"#,
-        );
-        assert!(
-            files
-                .client
-                .contains("req.Header.Set(\"Debug\", strconv.FormatBool(debug))"),
-            "bool header must serialize via strconv.FormatBool (lowercase):\n{}",
-            files.client
-        );
-    }
-
-    /// A request header with a literal default seeds the server-side local with
-    /// that default (`maxStale := int64(60)`) before the optional `r.Header.Get`
-    /// overwrite, so an absent header lands on the declared default rather than
-    /// the Go zero value. Per the documented "defaulted request headers" gap, the
-    /// generated client still takes it as a required positional arg.
-    #[test]
-    fn defaulted_request_header_seeds_server_default() {
-        let files = generate_from_source(
-            r#"
-struct User { Int id  String name }
-endpoint getUser: GET "/api/users/{id}" {
-    headers {
-        Int maxStale = 60
-    }
-    response User
-}
-"#,
-        );
-        assert!(
-            files.server.contains("maxStale := int64(60)"),
-            "server must seed the local with the declared default:\n{}",
-            files.server
-        );
-        assert!(
-            files
-                .server
-                .contains("if v := r.Header.Get(\"Max-Stale\"); v != \"\""),
-            "server must still overwrite from the header when present:\n{}",
-            files.server
-        );
-        assert!(
-            files.client.contains("maxStale int64"),
-            "client must take the defaulted header as a required positional arg:\n{}",
-            files.client
-        );
-    }
-
-    /// A response header produces the `<Endpoint>Result` envelope: the handler
-    /// and client return `*GetPostResult` (body + typed header), the server
-    /// writes the header via `w.Header().Set` and encodes `result.Body`, and the
-    /// client reads it back from `resp.Header`. Covers a required `int64` header
-    /// (numeric stringify/parse both directions) and an optional one.
-    #[test]
-    fn response_header_envelope() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint getPost: GET "/api/posts/{id}" {
-    response Post headers {
-        Int ratelimitRemaining
-        Option<String> requestId as "X-Request-Id"
-    }
-}
-"#,
-        );
-        insta::assert_snapshot!("go_resp_header_types", files.types);
-        insta::assert_snapshot!("go_resp_header_client", files.client);
-        insta::assert_snapshot!("go_resp_header_handlers", files.handlers);
-        insta::assert_snapshot!("go_resp_header_server", files.server);
-    }
-
-    /// A multipart request body (one `File` + one scalar): types.go gains the
-    /// `FileUpload` helper and a `<Endpoint>ClientBody` (File field → `FileUpload`)
-    /// while the server `<Endpoint>Body` keeps `*multipart.FileHeader`; the client
-    /// builds a `multipart.Writer` (CreateFormFile + WriteField); the server calls
-    /// `r.ParseMultipartForm` + `r.FormFile`/`r.FormValue`; the handler takes the
-    /// `*multipart.FileHeader`-bearing body unchanged.
-    #[test]
-    fn multipart_request_body() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-struct User { Int id  String name }
-endpoint uploadAvatar: POST "/api/avatar" {
-    body AvatarUpload
-    response User
-}
-"#,
-        );
-        insta::assert_snapshot!("go_multipart_req_types", files.types);
-        insta::assert_snapshot!("go_multipart_req_client", files.client);
-        insta::assert_snapshot!("go_multipart_req_handlers", files.handlers);
-        insta::assert_snapshot!("go_multipart_req_server", files.server);
-    }
-
-    /// An optional file part (`Option<File>`): the client body field is
-    /// `*FileUpload` (nil-guarded in the multipart writer), and the server's
-    /// `r.FormFile` tolerates an absent part.
-    #[test]
-    fn multipart_optional_file() {
-        let files = generate_from_source(
-            r#"
-struct DocUpload { Option<File> attachment  String title }
-struct Doc { Int id }
-endpoint uploadDoc: POST "/api/docs" {
-    body DocUpload
-    response Doc
-}
-"#,
-        );
-        insta::assert_snapshot!("go_multipart_opt_types", files.types);
-        insta::assert_snapshot!("go_multipart_opt_client", files.client);
-        insta::assert_snapshot!("go_multipart_opt_server", files.server);
-    }
-
-    /// A binary response body (a struct with exactly one `File` field): the
-    /// handler returns `(io.Reader, error)`, the server streams via `io.Copy`
-    /// with `application/octet-stream`, and the client returns
-    /// `(io.ReadCloser, error)` handing back the raw `resp.Body`.
-    #[test]
-    fn binary_response_download() {
-        let files = generate_from_source(
-            r#"
-struct FileDownload { File contents }
-endpoint downloadFile: GET "/api/files/{id}" {
-    response FileDownload
-}
-"#,
-        );
-        insta::assert_snapshot!("go_binary_resp_types", files.types);
-        insta::assert_snapshot!("go_binary_resp_client", files.client);
-        insta::assert_snapshot!("go_binary_resp_handlers", files.handlers);
-        insta::assert_snapshot!("go_binary_resp_server", files.server);
-    }
-
-    /// Two REQUIRED `File` fields in one multipart body: each form-file part must
-    /// be emitted in its own block so the `part, err :=` declarations don't
-    /// collide (a second `:=` with no new variable on the left does not compile
-    /// in Go). Regression guard.
-    #[test]
-    fn multipart_two_required_files() {
-        let files = generate_from_source(
-            r#"
-struct TwoFiles { File first  File second }
-struct Ok { Int id }
-endpoint uploadBoth: POST "/api/both" {
-    body TwoFiles
-    response Ok
-}
-"#,
-        );
-        // Both files build a part, but the declarations are block-scoped so they
-        // never appear back-to-back at the same indent.
-        assert_eq!(
-            files
-                .client
-                .matches("part, err := writer.CreateFormFile")
-                .count(),
-            2,
-            "both required files must build a part:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .client
-                .contains("part, err := writer.CreateFormFile(\"first\", body.First.Filename)"),
-            "first file part:\n{}",
-            files.client
-        );
-        assert!(
-            files
-                .client
-                .contains("part, err := writer.CreateFormFile(\"second\", body.Second.Filename)"),
-            "second file part:\n{}",
-            files.client
-        );
-        // Server side: two required files parse into distinct `_, fh<Field>, err :=`
-        // declarations at function scope. This compiles because `:=` only needs one
-        // new variable on the left (`fhFirst`/`fhSecond` differ), but guard it with a
-        // snapshot since the diff's block-scoping rationale is a server concern too.
-        assert!(
-            files
-                .server
-                .contains(", fhFirst, err := r.FormFile(\"first\")")
-                && files
-                    .server
-                    .contains(", fhSecond, err := r.FormFile(\"second\")"),
-            "both required files must parse server-side into distinct vars:\n{}",
-            files.server
-        );
-        insta::assert_snapshot!("go_multipart_two_files_client", files.client);
-        insta::assert_snapshot!("go_multipart_two_files_server", files.server);
-    }
-
-    /// A multipart body whose scalar field carries a `where` constraint still
-    /// gets validated server-side: the `<Endpoint>Body` keeps its `Validate()`
-    /// method and the server calls it after assembling the body from the parsed
-    /// form (the JSON path does the same). Go is the one target that validates
-    /// multipart bodies — see `docs/known-issues.md`. A validate failure maps to
-    /// the endpoint's declared `ValidationError` variant.
-    #[test]
-    fn multipart_body_with_constraint_validates() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption where self.length > 0 }
-struct User { Int id }
-endpoint uploadAvatar: POST "/api/avatar" {
-    body AvatarUpload
-    response User
-    error { ValidationError(400) }
-}
-"#,
-        );
-        // The constrained body type carries a Validate() method...
-        assert!(
-            files
-                .types
-                .contains("func (s UploadAvatarBody) Validate() error {"),
-            "constrained multipart body must get a Validate() method:\n{}",
-            files.types
-        );
-        // ...and the server calls it after assembling the body from the form.
-        assert!(
-            files
-                .server
-                .contains("if err := body.Validate(); err != nil {"),
-            "server must validate the assembled multipart body:\n{}",
-            files.server
-        );
-        // A validate failure maps to the declared ValidationError(400).
-        assert!(
-            files
-                .server
-                .contains("http.Error(w, \"ValidationError\", 400)"),
-            "validate failure maps to ValidationError(400):\n{}",
-            files.server
-        );
-    }
-
-    /// An endpoint that is BOTH a multipart upload AND a binary download
-    /// (`body_is_multipart` + `response_is_binary`): the server must parse the
-    /// multipart form (which declares an `err` via `r.FormFile`) AND then call
-    /// the handler with `result, err := h.X(...)` — the second `:=` only
-    /// compiles because `result` is a fresh variable on the left, so this guards
-    /// that the two branches compose without an `err` redeclaration conflict.
-    /// The handler returns `(io.Reader, error)` and the server streams it via
-    /// `io.Copy` with an octet-stream content type.
-    #[test]
-    fn multipart_upload_with_binary_response() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-struct Thumbnail { File data }
-endpoint convertAvatar: POST "/api/avatar/convert" {
-    body AvatarUpload
-    response Thumbnail
-}
-"#,
-        );
-        // Server parses the multipart form (declaring `err` via FormFile)...
-        assert!(
-            files.server.contains("r.ParseMultipartForm(")
-                && files
-                    .server
-                    .contains(", fhAvatar, err := r.FormFile(\"avatar\")"),
-            "server must parse the multipart body:\n{}",
-            files.server
-        );
-        // ...then calls the handler with a fresh `result` (so the reused `err`
-        // does not trip a no-new-variable `:=` error) and streams the result.
-        assert!(
-            files
-                .server
-                .contains("result, err := h.ConvertAvatar(body)"),
-            "server must call the handler with `result, err :=` after the form parse:\n{}",
-            files.server
-        );
-        assert!(
-            files.server.contains("_, _ = io.Copy(w, result)")
-                && files
-                    .server
-                    .contains("w.Header().Set(\"Content-Type\", \"application/octet-stream\")"),
-            "server must stream the binary response via io.Copy:\n{}",
-            files.server
-        );
-        // Handler returns the upload body + an io.Reader.
-        assert!(
-            files
-                .handlers
-                .contains("ConvertAvatar(body ConvertAvatarBody) (io.Reader, error)"),
-            "handler must take the multipart body and return (io.Reader, error):\n{}",
-            files.handlers
-        );
-        // Client builds the multipart writer and returns the raw response stream.
-        assert!(
-            files.client.contains("multipart.NewWriter(&buf)")
-                && files.client.contains("(io.ReadCloser, error)")
-                && files.client.contains("return resp.Body, nil"),
-            "client must send multipart and return the response stream:\n{}",
-            files.client
-        );
-    }
-
-    /// A multipart upload with a REQUIRED `File` field and NO `response`: the
-    /// required `r.FormFile(...)` declares an `err` in the route closure, so the
-    /// no-response handler call MUST be statement-scoped (`if err := h.X(...);
-    /// err != nil`) rather than a bare `err := h.X(...)` — the latter is a second
-    /// `:=` with `err` as its only new variable and does not compile ("no new
-    /// variables on left side of :="). Regression guard for that collision.
-    #[test]
-    fn multipart_upload_no_response() {
-        let files = generate_from_source(
-            r#"
-struct AvatarUpload { File avatar  String caption }
-endpoint uploadAvatar: POST "/api/avatar" {
-    body AvatarUpload
-}
-"#,
-        );
-        // The required file parse declares a closure-scoped `err`...
-        assert!(
-            files
-                .server
-                .contains(", fhAvatar, err := r.FormFile(\"avatar\")"),
-            "required file must parse into a closure-scoped err:\n{}",
-            files.server
-        );
-        // ...so the no-response handler call must NOT be a bare statement-level
-        // `err := h.X(...)` (which would redeclare the closure-scoped err and not
-        // compile). The leading `\t\t` distinguishes the bare form from the
-        // accepted statement-scoped `\t\tif err := h.X(...)`.
-        assert!(
-            !files.server.contains("\t\terr := h.UploadAvatar("),
-            "no-response handler call must not redeclare err (would not compile):\n{}",
-            files.server
-        );
-        assert!(
-            files
-                .server
-                .contains("if err := h.UploadAvatar(body); err != nil {"),
-            "no-response handler call must be statement-scoped:\n{}",
-            files.server
-        );
-    }
-
-    /// An OFFSET-paginated endpoint: the bare `List<Post>` response becomes the
-    /// `<Endpoint>Page` envelope `{ Items []Post; TotalCount int64 }`. The handler
-    /// and client both return `*ListPostsPage`; the client decodes the whole body
-    /// into the page (the body IS the page object); the server JSON-encodes the
-    /// handler's returned `*ListPostsPage`.
-    #[test]
-    fn pagination_offset_envelope() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint listPosts: GET "/api/posts" {
-    response List<Post> pagination { offset }
-}
-"#,
-        );
-        // Envelope struct: Items + TotalCount (offset's defining metadata).
-        assert!(
-            files.types.contains("type ListPostsPage struct {")
-                && files.types.contains("Items      []Post `json:\"items\"`")
-                && files
-                    .types
-                    .contains("TotalCount int64  `json:\"totalCount\"`"),
-            "offset envelope must be {{ Items []Post; TotalCount int64 }}:\n{}",
-            files.types
-        );
-        // Handler returns the page envelope, not the bare slice.
-        assert!(
-            files
-                .handlers
-                .contains("ListPosts() (*ListPostsPage, error)"),
-            "handler must return *ListPostsPage:\n{}",
-            files.handlers
-        );
-        // Client returns the envelope and decodes the whole body into it.
-        assert!(
-            files
-                .client
-                .contains("func (c *ApiClient) ListPosts() (*ListPostsPage, error)")
-                && files.client.contains("var result ListPostsPage")
-                && files
-                    .client
-                    .contains("json.NewDecoder(resp.Body).Decode(&result)"),
-            "client must return *ListPostsPage and decode the body into it:\n{}",
-            files.client
-        );
-        // Server JSON-encodes the handler's returned page.
-        assert!(
-            files.server.contains("result, err := h.ListPosts()")
-                && files.server.contains("json.NewEncoder(w).Encode(result)"),
-            "server must encode the returned *ListPostsPage:\n{}",
-            files.server
-        );
-        insta::assert_snapshot!("go_pagination_offset_types", files.types);
-        insta::assert_snapshot!("go_pagination_offset_client", files.client);
-        insta::assert_snapshot!("go_pagination_offset_handlers", files.handlers);
-        insta::assert_snapshot!("go_pagination_offset_server", files.server);
-    }
-
-    /// A CURSOR-paginated endpoint: the envelope is `{ Items []Post; NextCursor
-    /// *string }`. `NextCursor` is a pointer so an absent cursor serializes to
-    /// `null` (nil marks the last page). Handler/client return `*ListPostsPage`
-    /// and the body decode/encode path is identical to the offset case.
-    #[test]
-    fn pagination_cursor_envelope() {
-        let files = generate_from_source(
-            r#"
-struct Post { Int id  String title }
-endpoint listPosts: GET "/api/posts" {
-    response List<Post> pagination { cursor }
-}
-"#,
-        );
-        // Envelope struct: Items + NextCursor *string (nil = last page).
-        assert!(
-            files.types.contains("type ListPostsPage struct {")
-                && files.types.contains("Items      []Post  `json:\"items\"`")
-                && files
-                    .types
-                    .contains("NextCursor *string `json:\"nextCursor\"`"),
-            "cursor envelope must be {{ Items []Post; NextCursor *string }}:\n{}",
-            files.types
-        );
-        assert!(
-            files
-                .handlers
-                .contains("ListPosts() (*ListPostsPage, error)"),
-            "handler must return *ListPostsPage:\n{}",
-            files.handlers
-        );
-        assert!(
-            files
-                .client
-                .contains("func (c *ApiClient) ListPosts() (*ListPostsPage, error)")
-                && files.client.contains("var result ListPostsPage"),
-            "client must return *ListPostsPage:\n{}",
-            files.client
-        );
-        assert!(
-            files.server.contains("json.NewEncoder(w).Encode(result)"),
-            "server must encode the returned *ListPostsPage:\n{}",
-            files.server
-        );
-        insta::assert_snapshot!("go_pagination_cursor_types", files.types);
-        insta::assert_snapshot!("go_pagination_cursor_client", files.client);
-        insta::assert_snapshot!("go_pagination_cursor_handlers", files.handlers);
-        insta::assert_snapshot!("go_pagination_cursor_server", files.server);
-    }
-}
+#[path = "go_tests.rs"]
+mod tests;

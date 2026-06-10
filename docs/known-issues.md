@@ -79,6 +79,53 @@ working safety check.
 (multipart server routes). **Workaround:** validate the constrained field inside
 the handler. **Target phase:** demand-triggered. Surfaced 2026-06-05.
 
+### Multi-status responses cannot be combined with response headers or pagination (v1)
+
+An endpoint that declares a multi-status `response { 200: User  201: User }` block
+may not ALSO declare response headers (`response ... headers { }`) or
+`pagination { }`. All three features wrap the handler's single return value in a
+generated envelope (`<Endpoint>Response` for multi-status, `<Endpoint>Result` for
+response headers, `<Endpoint>Page` for pagination), and a handler has one return
+slot, so only one envelope type can apply. (This is the same one-return-slot
+constraint that makes response-headers and pagination mutually exclusive.)
+
+Where each rejection happens: multi-status + `pagination { }` is rejected by
+**sema**; an inline `headers { ... }` after a `response { }` block (the
+response-header spelling of the bare form) is rejected by the **parser** with a
+targeted error. A `headers { ... }` block on its own line is unaffected — it is
+the standalone **request**-headers section, exactly as for the bare form, and
+combines freely with multi-status.
+
+**Workaround:** model the secondary concern differently — e.g. carry would-be
+response-header values as fields on the body type, or use a single success status
+when pagination is needed.
+
+**Planned fix (additive, non-breaking):** nest the envelopes (e.g. the
+`<Endpoint>Result` envelope's `body` slot could hold a `<Endpoint>Response` or
+`<Endpoint>Page`). Full rationale in
+[design-decisions.md](design-decisions.md#phoenix-gen--multi-status-responses-design-2026-06-07)
+(decision 4). **Target phase:** demand-triggered.
+
+### Generated envelope type names can collide with user-defined types
+
+The generated envelope names — `<Endpoint>Response` (multi-status),
+`<Endpoint>Result` (response headers), `<Endpoint>Page` (pagination) — are not
+reserved: a user-defined struct with the same name (e.g. `struct
+UpsertUserResponse` alongside a multi-status endpoint `upsertUser`) produces two
+declarations of one type name in the generated output rather than being caught by
+sema. In Go and TypeScript that is a compile error naming the clash; in Python a
+duplicate `class X(BaseModel)` is a **silent redefinition** (the last definition
+wins) — only ruff's F811 flags it, and only if the user lints. The `Response`
+suffix is a particularly natural user choice, so multi-status raises the
+likelihood of a collision that has existed since
+`<Endpoint>Result`/`<Endpoint>Page`.
+
+**Workaround:** rename the user type; in Go/TS the generated-code compile error
+names the clash directly (for Python, lint with ruff or watch for the
+redefinition). **Planned fix:** a sema check rejecting a user type whose name
+matches a generated envelope for a declared endpoint feature. **Target phase:**
+demand-triggered. Surfaced 2026-06-09.
+
 ### Pagination and response headers cannot be combined on one endpoint (v1)
 
 An endpoint may declare `pagination { ... }` **or** response headers
