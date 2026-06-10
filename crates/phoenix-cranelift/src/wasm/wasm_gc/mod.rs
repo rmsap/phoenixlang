@@ -65,6 +65,7 @@ use crate::error::CompileError;
 mod enums;
 mod float_helpers;
 mod module_builder;
+mod ryu_tables;
 mod string_helpers;
 mod translate;
 

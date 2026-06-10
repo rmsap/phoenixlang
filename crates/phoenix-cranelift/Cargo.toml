@@ -44,3 +44,6 @@ insta = { workspace = true }
 # lockstep as `wasm-encoder` / `wasmparser` (see workspace `Cargo.toml`).
 wasmprinter = { workspace = true }
 tempfile = { workspace = true }
+# Expected bytes come straight from the canonical d2s implementation that native's
+# `phoenix_runtime::format_f64` wraps (§Phase 2.4 K.6 2026-06-09).
+ryu = { workspace = true }

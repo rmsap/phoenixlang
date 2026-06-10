@@ -59,6 +59,11 @@ use super::translate;
 ///   segments (see [`Self::declare_bool_data`]).
 /// - `[PRINT_F64_BUF_START, PRINT_F64_BUF_END)` — `phx_print_f64`'s
 ///   digit / literal scratch (see [`super::float_helpers`]).
+/// - `[RYU_POW5_INV_SPLIT_OFFSET, RYU_POW5_SPLIT_OFFSET)` and
+///   `[RYU_POW5_SPLIT_OFFSET, …)` — the Ryu d2s power-of-5 tables
+///   (`(u64 lo, u64 hi)` pairs, 16 bytes per entry, little-endian),
+///   materialized by active data segments when `phx_print_f64` is
+///   synthesized. See [`super::ryu_tables`] and §Phase 2.4 K.6.
 pub(super) const IOVEC_OFFSET: u32 = 8;
 pub(super) const NWRITTEN_OFFSET: u32 = 16;
 /// Scratch buffer for `phx_print_i64`'s digit conversion. 32 bytes
@@ -93,14 +98,17 @@ pub(super) const BOOL_TRUE_BYTES: &[u8] = b"true\n";
 pub(super) const BOOL_FALSE_OFFSET: u32 = BOOL_TRUE_OFFSET + BOOL_TRUE_BYTES.len() as u32;
 pub(super) const BOOL_FALSE_BYTES: &[u8] = b"false\n";
 
-/// Scratch region for `phx_print_f64` (special-case literals like
-/// `"NaN\n"` and, in Phase 2, the Ryu digit buffer). Sits above the
-/// bool data segments. 32 bytes is comfortable: ryu's f64 output is
-/// bounded by 24 characters — the worst case is a negative
-/// small-magnitude value whose exponent needs 4 chars,
+/// Scratch region for `phx_print_f64` — both the special-case
+/// literals (`"NaN\n"`, `"inf\n"`, `"-inf\n"`) and the Ryu emission
+/// buffer. Sits above the bool data segments. 32 bytes is comfortable:
+/// ryu's f64 output is bounded by 24 characters — the worst case is a
+/// negative small-magnitude value whose exponent needs 4 chars,
 /// `"-2.2250738585072014e-308"` (= -f64::MIN_POSITIVE; ryu's own
 /// `Buffer` is `[u8; 24]`) — plus the trailing `'\n'` = 25. The bound
 /// is pinned by `format_f64_pins_ryu_output` in `phoenix-runtime`.
+/// (The emitter's transient footprint also fits: the `12.34`-style
+/// branch stages digits one byte right of their final position before
+/// the `memory.copy` shift, peaking at offset 19 within the region.)
 /// Per `docs/design-decisions.md`
 /// §Phase 2.4 K.6 (2026-06-09 amendment) the helper targets ryu's
 /// scientific format — not the pre-amendment fixed-point worst case
@@ -108,19 +116,56 @@ pub(super) const BOOL_FALSE_BYTES: &[u8] = b"false\n";
 /// linear-memory regions so the layout map above stays the single
 /// source of truth; consumed by [`super::float_helpers`].
 pub(super) const PRINT_F64_BUF_START: u32 = BOOL_FALSE_OFFSET + BOOL_FALSE_BYTES.len() as u32;
-/// Exclusive end of the f64 scratch region. Reserved for the Phase 2
-/// Ryu emitter (digit buffer); unused by the Phase 1 special-case
-/// code, hence the `dead_code` allowance.
-#[allow(dead_code)]
+/// Exclusive end of the f64 scratch region.
 pub(super) const PRINT_F64_BUF_END: u32 = PRINT_F64_BUF_START + 32;
+
+/// Base offset of the Ryu `DOUBLE_POW5_INV_SPLIT` table (291 entries ×
+/// 16 bytes, ~4.5 KiB; trimmed to the f64-reachable indices 0..=290 —
+/// see `ryu_tables.rs`) — consulted by `phx_ryu_d2d` for binary
+/// exponents ≥ 0. 16-aligned so every `(lo, hi)` pair sits at a
+/// natural 8-byte boundary for the helper's `i64.load align=3` hints.
+/// Populated by an active data segment only when the module prints a
+/// Float (see [`Self::declare_active_data`] /
+/// `float_helpers::synthesize_print_f64`); a Float-free module carries
+/// neither segment.
+pub(super) const RYU_POW5_INV_SPLIT_OFFSET: u32 = PRINT_F64_BUF_END.next_multiple_of(16);
+/// Base offset of the Ryu `DOUBLE_POW5_SPLIT` table (325 entries × 16
+/// bytes, ~5.1 KiB) — consulted by `phx_ryu_d2d` for binary exponents
+/// < 0. Packed directly after the inverse table. The segment holds the
+/// f64-reachable indices 1..=325, so entry i sits at
+/// `RYU_POW5_SPLIT_OFFSET + (i − 1) · 16`; loads go through
+/// [`RYU_POW5_SPLIT_INDEX_BASE`] to keep index arithmetic out of the
+/// bytecode.
+pub(super) const RYU_POW5_SPLIT_OFFSET: u32 =
+    RYU_POW5_INV_SPLIT_OFFSET + (super::ryu_tables::DOUBLE_POW5_INV_TABLE_SIZE as u32) * 16;
+/// Virtual index base for the pow5 table: `phx_ryu_d2d` addresses
+/// entry i as `RYU_POW5_SPLIT_INDEX_BASE + i · 16`, exactly as if the
+/// table still carried its unreachable entry 0. One entry-width below
+/// the segment start, i.e. it points into the last inverse-table
+/// entry — harmless, because every reachable i is ≥
+/// `DOUBLE_POW5_SPLIT_FIRST_IDX` (= 1), which the exponent-sweep
+/// differential test exercises end-to-end.
+pub(super) const RYU_POW5_SPLIT_INDEX_BASE: u32 =
+    RYU_POW5_SPLIT_OFFSET - (super::ryu_tables::DOUBLE_POW5_SPLIT_FIRST_IDX as u32) * 16;
+/// Exclusive end of the Ryu table region — the high-water mark of the
+/// fixed linear-memory layout. Must stay under `MEMORY_PAGES` × 64 KiB.
+const RYU_TABLES_END: u32 =
+    RYU_POW5_SPLIT_OFFSET + (super::ryu_tables::DOUBLE_POW5_TABLE_SIZE as u32) * 16;
 
 /// Memory pages declared for the module. One 64-KiB page is more than
 /// enough for the iovec staging (12 bytes), the `phx_print_i64`
 /// scratch (32 bytes), the `phx_print_str` scratch (4096 bytes), the
-/// `"true\n"` / `"false\n"` bool payloads (11 bytes), and the
-/// `phx_print_f64` scratch (32 bytes) combined.
-/// Grows in a later slice if a longer-lines requirement emerges.
+/// `"true\n"` / `"false\n"` bool payloads (11 bytes), the
+/// `phx_print_f64` scratch (32 bytes), and the two Ryu power-of-5
+/// tables (~9.6 KiB) combined — the layout tops out under 14 KiB
+/// (asserted below). Grows in a later slice if a longer-lines
+/// requirement emerges.
 const MEMORY_PAGES: u64 = 1;
+
+/// The fixed layout must fit the declared memory; a future region
+/// added past the Ryu tables that overflows the page should fail the
+/// build here, not trap at runtime.
+const _: () = assert!(RYU_TABLES_END <= MEMORY_PAGES as u32 * 65536);
 
 pub(super) struct ModuleBuilder {
     /// Function-signature interning. Shared with the wasm32-linear
@@ -210,11 +255,12 @@ pub(super) struct ModuleBuilder {
     print_str_idx: Option<u32>,
 
     /// WASM function index of the synthesized `phx_print_f64` helper
-    /// — Ryu d2s implementation with integer fast-path, NaN/inf/zero
-    /// special cases, and a precomputed power-of-5 table for the
-    /// general case. Populated by
-    /// [`Self::declare_print_f64_helper`] when the IR module calls
-    /// `print` with a Float argument. See §Phase 2.4 decision K.6.
+    /// — NaN/±inf/±0.0 special cases inline, plus the Ryu d2s general
+    /// case (shortest-roundtrip digits via the precomputed power-of-5
+    /// tables, emitted in ryu's positional/scientific format).
+    /// Populated by [`Self::declare_print_f64_helper`] when the IR
+    /// module calls `print` with a Float argument. See §Phase 2.4
+    /// decision K.6 (2026-06-09 amendment).
     print_f64_idx: Option<u32>,
 
     /// WASM function index of the synthesized `phx_str_concat` helper
@@ -351,6 +397,18 @@ impl ModuleBuilder {
             .active(0, &false_expr, BOOL_FALSE_BYTES.iter().copied());
         self.data_segment_count += 2;
         self.bool_data_declared = true;
+    }
+
+    /// Emit an active data segment that materializes `bytes` at
+    /// `offset` in linear memory at module instantiation. Used by the
+    /// Ryu power-of-5 tables (`float_helpers::synthesize_print_f64`);
+    /// the caller owns the offset choice — the layout map at the top
+    /// of this file is the single source of truth. Bumps
+    /// `data_segment_count` for the validator's `DataCount` section.
+    pub(super) fn declare_active_data(&mut self, offset: u32, bytes: &[u8]) {
+        let offset_expr = wasm_encoder::ConstExpr::i32_const(offset as i32);
+        self.data.active(0, &offset_expr, bytes.iter().copied());
+        self.data_segment_count += 1;
     }
 
     /// Assert that the `print(Bool)` data segments were declared before
@@ -1130,12 +1188,10 @@ impl ModuleBuilder {
         })
     }
 
-    /// Synthesize the `phx_print_f64` helper if `needs.print_f64`. The
-    /// helper depends on `fd_write` (for emitting digits), so this
-    /// method runs after `declare_imports`. The pre-amendment dependency
-    /// on `phx_print_i64` (integer fast-path) is gone per K.6
-    /// 2026-06-09; Phase 2 can re-thread the index if the d2s port
-    /// wants digit-emission reuse.
+    /// Synthesize the `phx_print_f64` helper (and its Ryu d2s
+    /// sub-helpers + power-of-5 data segments) if `needs.print_f64`.
+    /// The helper depends on `fd_write` (for emitting digits), so this
+    /// method runs after `declare_imports`.
     pub(super) fn declare_print_f64_helper(
         &mut self,
         needs: HelperNeeds,

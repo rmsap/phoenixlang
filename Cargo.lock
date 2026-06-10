@@ -1207,6 +1207,7 @@ dependencies = [
  "phoenix-parser",
  "phoenix-runtime",
  "phoenix-sema",
+ "ryu",
  "target-lexicon",
  "tempfile",
  "wasm-encoder 0.248.0",

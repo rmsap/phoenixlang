@@ -1392,7 +1392,7 @@ A *user-defined* generic enum like `enum Pair<T, U> { Both(T, U), Single(T) }` w
 **Decided:** 2026-06-05 (original module-size decision).
 **Amended:** 2026-06-09 (output-format pivot — see "Amendment: output format" below).
 
-**Primary reason: module size.** This decision was specifically chosen over the "embed-and-merge the runtime" alternative on module-size grounds. Embedding `phoenix-runtime` brings ~50KB of compiled WASM into every wasm32-gc module — even a "hello world" that never prints a Float — because the merge is whole-module: dlmalloc, the Phoenix mark-sweep GC, every linear-memory string/list/map/builder runtime helper, panic infrastructure. A synthesized inline `phx_print_f64` adds ~5KB of precomputed power-of-5 tables (in a passive data segment) plus ~400 instructions of bytecode — *only when the module actually calls* `print(Float)`. The size ratio is ~10× in favor of inline synthesis on the typical fixture, and ~70× on a hello-world. Module-size matters in the WASM-GC use cases Phoenix targets (browser delivery, embedded VMs, edge runtimes) — every kilobyte adds startup latency and bandwidth.
+**Primary reason: module size.** This decision was specifically chosen over the "embed-and-merge the runtime" alternative on module-size grounds. Embedding `phoenix-runtime` brings ~50KB of compiled WASM into every wasm32-gc module — even a "hello world" that never prints a Float — because the merge is whole-module: dlmalloc, the Phoenix mark-sweep GC, every linear-memory string/list/map/builder runtime helper, panic infrastructure. A synthesized inline `phx_print_f64` adds ~9.6KB of precomputed power-of-5 tables (active data segments; the as-built figure — the original estimate said ~5KB, assuming ryu's "small" reconstructed-table variant, but the implementation uses ryu's full-table constants — trimmed to the f64-reachable index ranges — for bit-for-bit fidelity and zero runtime reconstruction code) plus ~1,100 instructions of bytecode across `phx_print_f64` and its `phx_ryu_*` sub-helpers — *only when the module actually calls* `print(Float)`. As measured 2026-06-10: a module whose only statement is `print(1.0)` compiles to 12,270 bytes / 1,161 instructions, vs. 269 bytes / 86 instructions for `print(1)` — so against the ~50KB embedded runtime the ratio is ~4× on a Float-printing module, and two orders of magnitude on a Float-free one (which carries neither tables nor helper; pinned structurally by `float_free_module_carries_no_ryu_tables`). Module-size matters in the WASM-GC use cases Phoenix targets (browser delivery, embedded VMs, edge runtimes) — every kilobyte adds startup latency and bandwidth.
 
 **Supporting reasons (in order of weight):**
 
@@ -1449,26 +1449,28 @@ phx_print_f64(v: f64):
 
 **No integer fast-path.** The pre-amendment integer fast-path delegated `5.0` to `phx_print_i64`, producing `"5"`. Under ryu, `5.0` produces `"5.0"`; the fast-path is removed (it would now produce a different output from the general case). Removing the fast-path also removes the `-0.0`-loses-its-sign-via-i64-cast surprise: under ryu, `-0.0` flows through d2s naturally and emits `"-0.0"`.
 
-**Precomputed tables.** Two passive data segments (unchanged from the original decision — same algorithm, same tables):
+**Precomputed tables.** Two active data segments holding ryu's full-table constants, **computed from their mathematical definitions** in `ryu_tables.rs` at codegen time (a ~150-line limb bignum; runs once per process, microseconds). Two as-built corrections to the original sketch here: (1) the sketch assumed ryu's "small" feature tables — 26 reconstructed-at-runtime entries; the full tables cost more bytes but need no runtime reconstruction bytecode to port or get wrong. (2) The first implementation copied `d2s_full_table.rs` verbatim from the `ryu` crate, which would have pulled ryu's Apache-2.0/BSL-1.0 terms into the repo as a source-form redistribution; computing the entries from the published definitions (Adams, PLDI 2018) keeps the repo MIT-only — the constants are mathematical facts, and bit-equality with ryu is enforced by test (see the per-exponent sweep below) instead of by provenance:
 
-- **`DOUBLE_POW5_INV_TABLE`** — 342 entries × 128 bits (16 bytes) = ~5.3 KiB. Indexed by positive exponent; each entry is the ceiling of `2^k / 5^i` for the appropriate `k`.
-- **`DOUBLE_POW5_TABLE`** — 26 entries × 128 bits = ~416 bytes. Indexed by negative exponent; each entry is the floor of `5^i / 2^k`.
+- **`DOUBLE_POW5_INV_SPLIT`** — 291 entries × 128 bits (16 bytes) = ~4.5 KiB. Indexed for binary exponents ≥ 0; entry q is `floor(2^(bitlen(5^q) − 1 + 125) / 5^q) + 1`.
+- **`DOUBLE_POW5_SPLIT`** — 325 entries × 128 bits = ~5.1 KiB. Indexed for binary exponents < 0; entry i is the top 125 bits of `5^i`.
 
-The tables are embedded as passive segments (using the existing `data_segment_count` accounting). They're emitted only when the module actually prints a Float — modules that don't carry no table overhead.
+Both segments are trimmed to the index ranges f64 inputs can actually reach (0..=290 and 1..=325; entries are bit-identical to ryu's where reachable). The reference implementation's tables carry 342 and 326 entries — sized for the algorithm family, not the f64 input range — and shipping the unreachable ~0.8 KiB in every Float-printing module would cut against this decision's whole premise. The pow5 segment starts at index 1, so `phx_ryu_d2d` addresses it through a base constant one entry-width below the segment (`RYU_POW5_SPLIT_INDEX_BASE`), keeping the index arithmetic in the bytecode unchanged.
 
-**128-bit multiplication.** WASM's i64 multiply is 64×64 → 64 (low bits only — no native widening multiply). For Ryu's `mulShift`, we need 64×64 → 128. The standard composition: split each i64 into two i32 halves, do four i32×i32 → i64 multiplications, sum with shifts. ~30 WASM instructions per call. Inlined at each `mulShift` site (called twice per Ryu invocation) rather than factored to a helper, since the call-site count is bounded.
+The tables are embedded as *active* segments at fixed linear-memory offsets (`RYU_POW5_INV_SPLIT_OFFSET` / `RYU_POW5_SPLIT_OFFSET` in `module_builder.rs`'s layout map) — active rather than passive because they're plain constant loads at fixed addresses, with no `array.new_data` consumer needing a segment index. They're emitted only when the module actually prints a Float — modules that don't carry no table overhead (pinned structurally by `float_free_module_carries_no_ryu_tables`, which asserts a Float-free module is smaller than the table payload alone).
+
+**128-bit multiplication.** WASM's i64 multiply is 64×64 → 64 (low bits only — no native widening multiply). For Ryu's `mulShift`, we need 64×64 → 128. The standard composition: split each i64 into two 32-bit halves, do four widening multiplications, sum with carries. As built this is a `phx_ryu_umul128_hi` helper function called from a `phx_ryu_mul_shift_64` helper (three calls per d2s invocation — ryu's `mul_shift_all_64` computes vr/vp/vm) rather than inlined per site: helpers keep the hand-written bytecode auditable against the ryu source, and `phx_print_f64` is cold code where call overhead is irrelevant.
 
 **Scratch buffer.** Ryu's f64 output is bounded by 24 characters. The worst case is a negative small-magnitude value whose exponent needs 4 chars: `-2.2250738585072014e-308` (= `-f64::MIN_POSITIVE`) — note it is *not* the large-magnitude `-1.7976931348623157e308` (23 chars), because the negative exponent costs one extra character. Ryu's own `Buffer` is `[u8; 24]`. The wasm32-gc helper reserves 32 bytes (`PRINT_F64_BUF_END - PRINT_F64_BUF_START`) — the 24-char worst case plus the trailing `\n` is 25, leaving 7 bytes of headroom. The pre-amendment 64-byte buffer is reduced to 32; the Phase-1 short-literal helper (`emit_print_literal`) still fits.
 
-**Adversarial test corpus.** A unit test compares wasm32-gc's `print(Float)` output against `phoenix-runtime::format_f64(v)` for a fixed corpus of f64 values covering:
+**Adversarial test corpus.** Five tests in `compile_wasm_gc.rs` compare wasm32-gc's `print(Float)` output against the `ryu` crate (= native `format_f64`'s bytes):
 
-- Normal values: 0, 1, -1, 0.1, 3.14, 1e10, 1e-10, etc.
-- Boundaries: f64::MIN_POSITIVE, f64::MAX, f64::EPSILON, ±0.0.
-- Special: f64::NAN, f64::INFINITY, f64::NEG_INFINITY.
-- Ryu's published test set (rounding edge cases that historically stressed shortest-roundtrip algorithms).
-- Magnitude bracket switches (values right at the scientific/fixed dispatch boundary).
+- `float_print_matches_native` — 29 pinned literals covering every formatter branch and the positional/scientific dispatch boundaries (1e15/1e16, 1e-5/1e-6), 2^53, classic non-terminating binaries, negatives.
+- `float_print_extremes_match_native` — f64::MAX and the smallest subnormal (5e-324), fed as longhand decimal literals (Phoenix's lexer takes arbitrary-length digit strings; its parser delegates to correctly-rounded `str::parse`).
+- `float_print_computed_values_run_under_wasmtime_gc` — runtime-computed `-0.0`, `0.1 + 0.2`, `1.0 / 3.0`.
+- `float_print_random_bits_match_native` — 200 deterministic pseudo-random (SplitMix64, pinned seed) IEEE-754 bit patterns, uniform over exponents. Strictly deterministic, so not "fuzzing" — but it covers table-index and rounding territory a hand-picked corpus can't.
+- `float_print_every_binary_exponent_matches_native` — one value per IEEE binary exponent (0..=2046, SplitMix64 mantissas). The d2s table index is a function of the binary exponent alone, so this sweep exercises **every reachable entry of both power-of-5 tables** end-to-end against the oracle — it is the test that licenses computing the tables instead of copying them.
 
-Random testing is deferred — a deterministic corpus pins behavior; random fuzzing is a follow-up if a bug surfaces in fixture coverage.
+NaN / ±inf are covered separately by `print_float_special_cases_run_under_wasmtime_gc` (they short-circuit before d2s).
 
 **Alternatives considered:**
 
@@ -1481,16 +1483,16 @@ Random testing is deferred — a deterministic corpus pins behavior; random fuzz
 
 **Implementation pointers** (numbering matches `float_helpers.rs`'s module-level breakdown):
 
-- Phase 1: native `format_f64` rewrite to ryu; wasm32-gc `phx_print_f64` keeps only NaN/±inf inline branches plus an `unreachable` trap for the general case. *To be reworked in this PR (the original Phase 1 — special cases + integer fast-path + `-0.0` — landed on 2026-06-08 and is now obsolete).*
-- Phase 2: port ryu's d2s digit-finding + scientific emission into wasm-encoder bytecode; emit POW5 / POW5_INV tables as passive data segments via the existing `reserve_string_data` path; replace the Phase-1 trap. *Not yet landed.*
-- Phase 3: adversarial test corpus — `float_print_matches_native` in `crates/phoenix-cranelift/tests/compile_wasm_gc.rs`. *Not yet landed.*
+- Phase 1: native `format_f64` rewrite to ryu; wasm32-gc `phx_print_f64` NaN/±inf inline branches. *Landed 2026-06-09 (reworking the obsolete 2026-06-08 fast-path version).*
+- Phase 2: port ryu's d2s digit-finding + positional/scientific emission into wasm-encoder bytecode; emit the POW5 / POW5_INV tables as active data segments; replace the Phase-1 trap. *Landed 2026-06-09.*
+- Phase 3: adversarial test corpus (see above) in `crates/phoenix-cranelift/tests/compile_wasm_gc.rs`. *Landed 2026-06-09.*
 
 Code locations:
-- `phx_print_f64` synth: `crates/phoenix-cranelift/src/wasm/wasm_gc/float_helpers.rs`.
+- `phx_print_f64` + `phx_ryu_*` helper synth: `crates/phoenix-cranelift/src/wasm/wasm_gc/float_helpers.rs`; table computation: `ryu_tables.rs` alongside it; linear-memory table offsets: `module_builder.rs` layout map.
 - `translate_print`'s Float arm: dispatch to `phx_print_f64` when arg is `ValType::F64`. *Landed.*
 - `HelperNeeds::print_f64` flag: scanner picks up `BuiltinCall("print", args)` whose `args[0]` is `IrType::F64`. *Landed.*
 - Native `format_f64`: `crates/phoenix-runtime/src/lib.rs`.
-- `ryu` crate dep: `crates/phoenix-runtime/Cargo.toml` (workspace dep declared in root `Cargo.toml`).
+- `ryu` crate dep: `crates/phoenix-runtime/Cargo.toml` (workspace dep declared in root `Cargo.toml`; also a `phoenix-cranelift` dev-dependency as the Phase 3 test oracle). Linking the crate imposes no source-form obligations on this repo; only copying its source would have (see the `ryu_tables.rs` module doc).
 
 ---
 

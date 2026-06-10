@@ -733,17 +733,18 @@ fn mutable_let_runs_under_wasmtime_gc() {
 /// - `f64::INFINITY` → `"inf"`
 /// - `f64::NEG_INFINITY` → `"-inf"`
 ///
-/// `-0.0` is **not** asserted here. Under ryu it prints as `"-0.0"`,
-/// which the Phase-2 d2s general case will emit; the pre-amendment
-/// Phase-1 `-0.0 → "-0"` literal is gone with the integer fast-path
-/// that produced it.
+/// These are the non-finite inputs the d2s general case never sees —
+/// `phx_print_f64` short-circuits them inline before bit extraction,
+/// exactly as ryu's `Buffer::format` checks `is_nan` / `is_finite`
+/// before calling `format64`. (`-0.0` is finite and is covered by
+/// `float_print_computed_values_run_under_wasmtime_gc`.)
 ///
 /// Source-level Phoenix can't easily produce NaN/Infinity, so the
 /// fixture computes them: `0.0 / 0.0` for NaN, `±1.0 / 0.0` for ±inf.
 /// These flow through the synthesized helper at runtime, exercising
 /// the IEEE-754 branches under wasmtime.
 #[test]
-fn print_float_phase1_special_cases_run_under_wasmtime_gc() {
+fn print_float_special_cases_run_under_wasmtime_gc() {
     let source = concat!(
         "function main() {\n",
         "  let nan: Float = 0.0 / 0.0\n",
@@ -754,54 +755,280 @@ fn print_float_phase1_special_cases_run_under_wasmtime_gc() {
         "  print(ninf)\n",
         "}\n",
     );
-    assert_prints(source, "print_float_phase1_specials", b"NaN\ninf\n-inf\n");
+    assert_prints(source, "print_float_specials", b"NaN\ninf\n-inf\n");
 }
 
-/// Every finite float — non-integer, integer-valued, ±0.0 — traps at
-/// runtime via `unreachable` until the Ryu d2s general case lands
-/// (Phase 2). The pre-amendment Phase 1 special-cased `±0.0` and
-/// integer-valued in-i64-range floats via the integer fast-path; both
-/// are removed under K.6 2026-06-09 (the fast-path emitted `"5"` where
-/// ryu emits `"5.0"`; `-0.0` emitted `"-0"` where ryu emits `"-0.0"`).
+/// The adversarial corpus pinning the synthesized Ryu d2s port against the
+/// `ryu` crate — the exact implementation native's
+/// `phoenix_runtime::format_f64` wraps, so agreement here is agreement
+/// with every other backend, byte for byte.
 ///
-/// Three sub-cases pin all three trap paths:
-/// - non-integer (`1.5`) — original Phase-1 trap, unchanged
-/// - integer-valued in i64 range (`5.0`) — was fast-path, now traps
-/// - integer-valued *out of* i64 range (`1e20`-longhand) — also traps
+/// Each corpus entry is a Phoenix float literal; the expected stdout
+/// is computed by parsing the same literal as a Rust `f64` (both
+/// Phoenix's parser and Rust's use correctly-rounded `str::parse`, so
+/// the bit patterns match) and formatting it with `ryu`. The corpus
+/// deliberately stresses every branch of the port:
 ///
-/// `-0.0` would trap here too but is covered by its own test below
-/// (the `-1.0 * 0.0` runtime computation makes its sign bit traceable
-/// through the helper, which a constant `-0.0` literal would not — the
-/// lexer/parser may fold `-0.0` to `0.0` at literal time).
+/// - **`12340000000.0` shape** (`0 <= k && kk <= 16`): integer-valued
+///   floats incl. the 10^15/10^16 positional/scientific boundary and
+///   2^53 (the integer-precision edge).
+/// - **`12.34` shape** (`0 < kk <= 16`): the staged-digits +
+///   `memory.copy` shift path, incl. classic non-terminating binaries
+///   (0.1, 0.3) and a 17-significant-digit value.
+/// - **`0.001234` shape** (`-5 < kk <= 0`): leading-zeros path, incl.
+///   the 1e-5 boundary (last value formatted positionally).
+/// - **Scientific, single digit** (`length == 1`): 1e16, 1e-6, and the
+///   extremes — f64::MAX-longhand (309 digits, exponent `e308`) and
+///   the smallest subnormal (5e-324, the `q <= 1` / `mm_shift`
+///   bookkeeping corner).
+/// - **Scientific, multi-digit**: the first-digit copy-down + `'.'`
+///   insertion path (`"1.2345e20"`).
+/// - **Round-even fixup**: values whose rare-path digit search
+///   (`vm/vr_is_trailing_zeros` set, so the trailing-zeros loop runs)
+///   ends with `last_removed_digit == 5` and an even `vr`, making the
+///   demote-to-4 fixup decide the final digit — without the fixup
+///   they print `…3` where ryu prints `…2`. Found by instrumented
+///   search over random bit patterns; deterministic corpus entries so
+///   the branch doesn't rely on the random streams to be reached.
+/// - **Negatives** of several shapes (sign byte + every branch).
 #[test]
-fn print_float_phase1_finite_traps_until_phase2() {
-    assert_traps(
-        "function main() {\n  print(1.5)\n}\n",
-        "print_float_phase1_traps_non_integer",
-    );
-    assert_traps(
-        "function main() {\n  print(5.0)\n}\n",
-        "print_float_phase1_traps_integer_in_range",
-    );
-    assert_traps(
-        "function main() {\n  print(100000000000000000000.0)\n}\n",
-        "print_float_phase1_traps_out_of_range",
-    );
+fn float_print_matches_native() {
+    let corpus: &[&str] = &[
+        // zero / one / small integers (positional ".0" branch)
+        "0.0",
+        "1.0",
+        "5.0",
+        "100.0",
+        "9007199254740992.0",      // 2^53
+        "1000000000000000.0",      // 1e15 — last positional integer
+        "10000000000000000.0",     // 1e16 — first scientific ("1e16")
+        "100000000000000000000.0", // 1e20 — "1e20"
+        // decimal-point-inside branch
+        "1.5",
+        "2.5",
+        "12.34",
+        "0.1",
+        "0.2",
+        "0.3",
+        "123456.789",
+        "3.141592653589793",
+        "2.718281828459045",
+        "1.7976931348623157", // 17 significant digits
+        // leading-zeros branch
+        "0.001234",
+        "0.5",
+        "0.00001",   // 1e-5 — last positional small value
+        "0.000001",  // 1e-6 — first scientific ("1e-6")
+        "0.0000001", // 1e-7 — "1e-7"
+        "0.000030000000000000004",
+        // scientific multi-digit branch ("1.2345e20")
+        "123450000000000000000.0",
+        // rare-path round-even fixup (last_removed_digit == 5, vr even,
+        // vr_is_trailing_zeros) — these print …3 without it
+        "894048597157646.2",
+        "83992540645848.12",
+        // negatives across branches
+        "-1.0",
+        "-1.5",
+        "-0.001234",
+        "-123456.789",
+        "-10000000000000000.0",
+    ];
+
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    for lit in corpus {
+        source.push_str(&format!("  print({lit})\n"));
+        let val: f64 = lit.parse().expect("corpus literal parses as f64");
+        expected.extend_from_slice(ryu::Buffer::new().format(val).as_bytes());
+        expected.push(b'\n');
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "float_print_corpus", &expected);
 }
 
-/// `-0.0` (computed via `-1.0 * 0.0` so its sign bit reaches the
-/// helper at runtime — Phoenix has no constant folding pass, so the
-/// product is computed under wasmtime) traps in Phase 1. Under ryu
-/// (K.6 2026-06-09) it will print `"-0.0"` once Phase 2 lands; the
-/// pre-amendment Phase 1 emitted `"0"` via the i64 fast-path that
-/// silently dropped the sign. Pinned separately from the
-/// integer-fast-path trap to exercise the runtime-computed sign
-/// genuinely reaching `phx_print_f64`.
+/// The f64 extremes as longhand literals — too long to keep readable
+/// inline in the corpus above, and worth their own test because they
+/// stress different machinery: f64::MAX exercises the largest table
+/// index / `e308` exponent emission, and the smallest subnormal
+/// (5e-324) exercises the `ieee_exponent == 0` decode plus the
+/// `q <= 1` trailing-zero bookkeeping. The longhand decimal expansions
+/// are generated with Rust's exact fixed-point formatter; Phoenix's
+/// lexer takes arbitrary-length digit strings and its parser delegates
+/// to the same correctly-rounded `str::parse::<f64>`.
 #[test]
-fn print_float_phase1_negative_zero_traps_until_phase2() {
-    assert_traps(
-        "function main() {\n  let neg_zero: Float = -1.0 * 0.0\n  print(neg_zero)\n}\n",
-        "print_float_phase1_traps_negative_zero",
+fn float_print_extremes_match_native() {
+    let max_longhand = format!("{:.1}", f64::MAX); // 309 digits + ".0"
+    let min_subnormal = 5e-324_f64;
+    let min_subnormal_longhand = format!("{min_subnormal:.1074}");
+
+    let source = format!(
+        "function main() {{\n  print({max_longhand})\n  print({min_subnormal_longhand})\n}}\n"
+    );
+    let mut expected = Vec::new();
+    expected.extend_from_slice(ryu::Buffer::new().format(f64::MAX).as_bytes());
+    expected.push(b'\n');
+    expected.extend_from_slice(ryu::Buffer::new().format(min_subnormal).as_bytes());
+    expected.push(b'\n');
+    assert_prints(&source, "float_print_extremes", &expected);
+}
+
+/// Differential check over arbitrary IEEE-754 bit patterns: 200
+/// deterministic pseudo-random u64s (SplitMix64, fixed seed — tests
+/// must not be flaky) reinterpreted as f64, non-finite patterns
+/// skipped, each printed by the wasm32-gc module and compared against
+/// `ryu`. A hand-picked corpus pins the branches we know about; this
+/// sweep catches what hand-picking can't — a transposed table entry,
+/// an off-by-one in the 128-bit carry, a wrong rounding decision on
+/// some unanticipated mantissa shape — since random bit patterns are
+/// uniform over exponents (most land in the extreme-magnitude
+/// scientific branches, where the table indices range widest).
+///
+/// Each value is fed to Phoenix as its exact fixed-point decimal
+/// expansion (`{:.1074}` — every finite f64's exact expansion has at
+/// most 1074 fractional digits, so the literal round-trips to the
+/// identical bit pattern through correctly-rounded `str::parse`).
+#[test]
+fn float_print_random_bits_match_native() {
+    // SplitMix64 — deterministic, seed pinned.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    };
+
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    let mut emitted = 0;
+    while emitted < 200 {
+        let val = f64::from_bits(next());
+        if !val.is_finite() {
+            continue;
+        }
+        source.push_str(&format!("  print({val:.1074})\n"));
+        expected.extend_from_slice(ryu::Buffer::new().format(val).as_bytes());
+        expected.push(b'\n');
+        emitted += 1;
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "float_print_random_bits", &expected);
+}
+
+/// One value per IEEE-754 binary exponent (0 = subnormal through 2046;
+/// 2047 is inf/NaN, covered by the specials test), each printed by the
+/// wasm32-gc module and compared against `ryu`.
+///
+/// This test carries the power-of-5 table guarantee: the tables in
+/// `ryu_tables.rs` are *computed* from their mathematical definitions
+/// rather than copied from the `ryu` crate (which keeps the repo
+/// MIT-only — see the module doc there), and `phx_ryu_d2d`'s table
+/// index is a function of the binary exponent alone (q and i derive
+/// from e2, which derives from the IEEE exponent). Sweeping every
+/// exponent therefore exercises every reachable entry of both tables
+/// — inverse indices 0..=290 and pow5 indices 1..=325 — end-to-end
+/// against the oracle. A single wrong bit in any computed entry shows
+/// up here as a digit mismatch. Mantissas are drawn from SplitMix64
+/// (pinned seed, distinct from `float_print_random_bits`' stream) so
+/// the digit-finding loops see varied shapes too.
+#[test]
+fn float_print_every_binary_exponent_matches_native() {
+    let mut state: u64 = 0x243F6A8885A308D3; // pi digits — any fixed seed
+    let mut next = move || {
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    };
+
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    for ieee_exponent in 0u64..=2046 {
+        let mut mantissa = next() & ((1u64 << 52) - 1);
+        if ieee_exponent == 0 && mantissa == 0 {
+            mantissa = 1; // keep the subnormal row non-zero
+        }
+        let val = f64::from_bits(ieee_exponent << 52 | mantissa);
+        source.push_str(&format!("  print({val:.1074})\n"));
+        expected.extend_from_slice(ryu::Buffer::new().format(val).as_bytes());
+        expected.push(b'\n');
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "float_print_exponent_sweep", &expected);
+}
+
+/// Runtime-computed float values (no literal on the print path, so the
+/// full IEEE-754 bit pattern genuinely flows through `phx_ryu_d2d`
+/// under wasmtime — Phoenix has no constant-folding pass, but this
+/// removes any doubt):
+///
+/// - `-1.0 * 0.0` → `"-0.0"` — the sign-of-zero case the pre-amendment
+///   integer fast-path silently dropped (it printed `"0"`).
+/// - `0.1 + 0.2` → `"0.30000000000000004"` — the canonical
+///   shortest-roundtrip showcase: 17 digits, not `"0.3"`.
+/// - `1.0 / 3.0` → `"0.3333333333333333"` — non-terminating binary
+///   with a 16-digit shortest form.
+#[test]
+fn float_print_computed_values_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let neg_zero: Float = -1.0 * 0.0\n",
+        "  let classic: Float = 0.1 + 0.2\n",
+        "  let third: Float = 1.0 / 3.0\n",
+        "  print(neg_zero)\n",
+        "  print(classic)\n",
+        "  print(third)\n",
+        "}\n",
+    );
+    let mut expected = Vec::new();
+    // -0.0 is the value Phoenix's `-1.0 * 0.0` computes at runtime.
+    for val in [-0.0, 0.1 + 0.2, 1.0 / 3.0] {
+        expected.extend_from_slice(ryu::Buffer::new().format(val).as_bytes());
+        expected.push(b'\n');
+    }
+    assert_prints(source, "float_print_computed", &expected);
+}
+
+/// Pins the module-size claim at the heart of §Phase 2.4 K.6's
+/// inline-synthesis decision: a module that never prints a Float
+/// carries neither the synthesized `phx_print_f64` machinery nor the
+/// ~9.6 KiB of power-of-5 tables. Proven structurally, with no
+/// dependency on absolute module sizes (which drift as codegen
+/// evolves):
+///
+/// - the Float-free module is *smaller than the table payload alone*,
+///   so it cannot possibly contain the tables;
+/// - the otherwise-identical Float-printing module is larger by at
+///   least the table payload, confirming the tables land where (and
+///   only where) `print(Float)` appears.
+#[test]
+fn float_free_module_carries_no_ryu_tables() {
+    // (291 + 325) entries × 16 bytes. Keep in sync with the
+    // `*_TABLE_SIZE` constants in `src/wasm/wasm_gc/ryu_tables.rs`.
+    const RYU_TABLE_BYTES: usize = (291 + 325) * 16;
+
+    let int_only = compile_to_wasm_gc("function main() {\n  print(1)\n}\n");
+    validate_gc_module(&int_only, "float_free_int_only");
+    assert!(
+        int_only.len() < RYU_TABLE_BYTES,
+        "Float-free module is {} bytes — at least as large as the {RYU_TABLE_BYTES} bytes \
+         of ryu power-of-5 tables, so it may be carrying them; the K.6 \
+         pay-only-when-printing-Float size claim has regressed",
+        int_only.len(),
+    );
+
+    let with_float = compile_to_wasm_gc("function main() {\n  print(1.0)\n}\n");
+    validate_gc_module(&with_float, "float_free_with_float");
+    assert!(
+        with_float.len() >= int_only.len() + RYU_TABLE_BYTES,
+        "print(Float) module ({} bytes) is not at least {RYU_TABLE_BYTES} bytes larger than \
+         the Float-free module ({} bytes) — the power-of-5 data segments appear to be missing \
+         or truncated",
+        with_float.len(),
+        int_only.len(),
     );
 }
 
