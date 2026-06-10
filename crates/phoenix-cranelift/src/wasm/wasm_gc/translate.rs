@@ -12,10 +12,10 @@
 //!   `Op::IDiv`, `Op::IMod`, `Op::INeg`.
 //! - **Arithmetic (Float):** `Op::FAdd`, `Op::FSub`, `Op::FMul`,
 //!   `Op::FDiv`, `Op::FNeg`. WASM `f64.<op>` matches IEEE-754
-//!   semantics directly. See §Phase 2.4 decision K.5. `Op::FMod`
-//!   (Float `%`) is deferred: WASM has no native `f64.rem`, so it
-//!   needs an `fmod` runtime helper rather than a one-instruction
-//!   lowering — it errors with a specific diagnostic for now.
+//!   semantics directly. `Op::FMod` (Float `%`) has no native
+//!   `f64.rem`, so it calls the synthesized `phx_fmod` helper (musl
+//!   `fmod` port in `float_helpers.rs`, bit-identical to native
+//!   Rust's `%`). See §Phase 2.4 decision K.5.
 //! - **Comparison (Int → Bool):** `Op::IEq`, `Op::INe`, `Op::ILt`,
 //!   `Op::ILe`, `Op::IGt`, `Op::IGe`.
 //! - **Comparison (Float → Bool):** `Op::FEq`, `Op::FNe`, `Op::FLt`,
@@ -580,17 +580,14 @@ fn translate_instruction(
         Op::FMul(a, b_) => emit_f64_binop(ctx, instr, *a, *b_, Instruction::F64Mul),
         Op::FDiv(a, b_) => emit_f64_binop(ctx, instr, *a, *b_, Instruction::F64Div),
         // Float `%` is the one arithmetic op without a one-instruction
-        // lowering: WASM has no `f64.rem`. Implementing it means an
-        // `fmod` runtime helper (sign-of-dividend remainder), which
-        // lands with the rest of the Float runtime surface — deferred
-        // here with a specific diagnostic rather than the generic
-        // catch-all. See §Phase 2.4 decision K.5.
-        Op::FMod(..) => Err(CompileError::new(
-            "wasm32-gc: Float `%` (`Op::FMod`) is not yet supported — \
-             WASM has no native `f64.rem` instruction, so it needs an \
-             `fmod` runtime helper that lands in a later slice (see \
-             §Phase 2.4 decision K.5)",
-        )),
+        // lowering: WASM has no `f64.rem`, so it calls the synthesized
+        // `phx_fmod` helper (musl `fmod` port — sign-of-dividend
+        // truncated remainder, bit-identical to native Rust's
+        // `f64 % f64`). See §Phase 2.4 decision K.5.
+        Op::FMod(a, b_) => {
+            let fmod_idx = b.require_fmod_idx()?;
+            emit_f64_binop(ctx, instr, *a, *b_, Instruction::Call(fmod_idx))
+        }
         Op::FNeg(a) => {
             // `f64.neg` is its own instruction — unlike i64 (which has
             // no unary negate and uses 0 - x), WASM provides `f64.neg`
@@ -1217,7 +1214,9 @@ fn emit_cmp(
 
 /// Emit a binary f64 → f64 op. Same shape as [`emit_i64_binop`] but
 /// for Float arithmetic — `FAdd` / `FSub` / `FMul` / `FDiv` route
-/// through here.
+/// through here. `op` need not be a pure opcode: `FMod` passes an
+/// `Instruction::Call` to the `(f64, f64) → f64` `phx_fmod` helper,
+/// which consumes the same two-operand stack shape.
 fn emit_f64_binop(
     ctx: &mut FuncCtx,
     instr: &phoenix_ir::instruction::Instruction,

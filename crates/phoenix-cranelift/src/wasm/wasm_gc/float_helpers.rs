@@ -1434,3 +1434,290 @@ fn emit_print_literal(
     func.instruction(&Instruction::I32Store(*i32_memarg));
     emit_fd_write_call(func, fd_write_idx);
 }
+
+/// `phx_fmod(x: f64, y: f64) -> f64` — IEEE-754 truncated remainder
+/// (sign of the dividend), matching Rust's `f64 % f64` (which lowers
+/// to the platform `fmod`) bit-for-bit on every finite result. A port
+/// of musl's `fmod` (`src/math/fmod.c`, MIT license) — like the Ryu
+/// d2s port above, the algorithm is pure integer manipulation of the
+/// f64 bit pattern (align exponents, repeated subtraction on the
+/// mantissas, renormalize), so it is *exact*: the true remainder is
+/// always representable and unique, and no rounding step exists to
+/// diverge from native. NaN outcomes agree by class (every case below
+/// yields NaN exactly when Rust `%` does) but their payload bits are
+/// not pinned to any particular platform's.
+///
+/// Special cases (handled by musl's `(x*y)/(x*y)` NaN funnel and the
+/// `|x| <= |y|` early-outs, all preserved here):
+/// - `y == ±0`, `y` NaN, or `x` ±inf/NaN → NaN
+/// - `|x| == |y|` → ±0 with x's sign;  `|x| < |y|` → x unchanged
+/// - `x == ±0` → x (via the `|x| < |y|` early-out)
+///
+/// Synthesized when `HelperNeeds::fmod` is set (an `Op::FMod` site
+/// exists). Unlike the print helpers it needs no `fd_write` import —
+/// it is a pure function. See §Phase 2.4 decision K.5. musl's
+/// copyright notice is preserved in `THIRD-PARTY-NOTICES.md` at the
+/// repo root, as the MIT license requires for ports.
+pub(super) fn synthesize_fmod(b: &mut ModuleBuilder) -> u32 {
+    let sig = b.intern_signature(&[ValType::F64, ValType::F64], &[ValType::F64]);
+    let mut f = Function::new([(4, ValType::I64), (2, ValType::I32)]);
+    const X: u32 = 0; // f64 param (dividend)
+    const Y: u32 = 1; // f64 param (divisor)
+    const UXI: u32 = 2; // i64 — x bits, then the running mantissa
+    const UYI: u32 = 3; // i64 — y bits, then y's aligned mantissa
+    const I: u32 = 4; // i64 — subtraction scratch (musl's `i`)
+    const SX: u32 = 5; // i64 — x's sign bit, isolated, re-OR'd at the end
+    const EX: u32 = 6; // i32 — x's biased exponent (goes negative during alignment)
+    const EY: u32 = 7; // i32 — y's biased exponent
+
+    ins(
+        &mut f,
+        &[
+            // Decompose both operands.
+            Instruction::LocalGet(X),
+            Instruction::I64ReinterpretF64,
+            Instruction::LocalSet(UXI),
+            Instruction::LocalGet(Y),
+            Instruction::I64ReinterpretF64,
+            Instruction::LocalSet(UYI),
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(52),
+            Instruction::I64ShrU,
+            Instruction::I32WrapI64,
+            Instruction::I32Const(0x7FF),
+            Instruction::I32And,
+            Instruction::LocalSet(EX),
+            Instruction::LocalGet(UYI),
+            Instruction::I64Const(52),
+            Instruction::I64ShrU,
+            Instruction::I32WrapI64,
+            Instruction::I32Const(0x7FF),
+            Instruction::I32And,
+            Instruction::LocalSet(EY),
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(i64::MIN),
+            Instruction::I64And,
+            Instruction::LocalSet(SX),
+            // Special cases: y == ±0 || y is NaN || x is ±inf/NaN.
+            // musl returns (x*y)/(x*y) — always NaN here (0/0, inf/inf,
+            // or NaN propagation), matching Rust `%` for each case.
+            Instruction::LocalGet(UYI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::I64Eqz,
+            Instruction::LocalGet(Y),
+            Instruction::LocalGet(Y),
+            Instruction::F64Ne,
+            Instruction::I32Or,
+            Instruction::LocalGet(EX),
+            Instruction::I32Const(0x7FF),
+            Instruction::I32Eq,
+            Instruction::I32Or,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(X),
+            Instruction::LocalGet(Y),
+            Instruction::F64Mul,
+            Instruction::LocalGet(X),
+            Instruction::LocalGet(Y),
+            Instruction::F64Mul,
+            Instruction::F64Div,
+            Instruction::Return,
+            Instruction::End,
+            // |x| <= |y| early-outs (compare bits with the sign shifted
+            // out): equal magnitudes → ±0 with x's sign; smaller → x.
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::LocalGet(UYI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::I64LeU,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::LocalGet(UYI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::I64Eq,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(SX),
+            Instruction::F64ReinterpretI64,
+            Instruction::Return,
+            Instruction::End,
+            Instruction::LocalGet(X),
+            Instruction::Return,
+            Instruction::End,
+        ],
+    );
+    emit_fmod_normalize(&mut f, UXI, EX, I);
+    emit_fmod_normalize(&mut f, UYI, EY, I);
+    ins(
+        &mut f,
+        &[
+            // x mod y: align exponents by shifting x's mantissa left,
+            // subtracting y's whenever it fits. An exact-zero
+            // intermediate means y divides x → ±0 with x's sign.
+            Instruction::Block(BlockType::Empty),
+            Instruction::Loop(BlockType::Empty),
+            Instruction::LocalGet(EX),
+            Instruction::LocalGet(EY),
+            Instruction::I32LeS,
+            Instruction::BrIf(1),
+            Instruction::LocalGet(UXI),
+            Instruction::LocalGet(UYI),
+            Instruction::I64Sub,
+            Instruction::LocalTee(I),
+            Instruction::I64Const(0),
+            Instruction::I64GeS,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(I),
+            Instruction::I64Eqz,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(SX),
+            Instruction::F64ReinterpretI64,
+            Instruction::Return,
+            Instruction::End,
+            Instruction::LocalGet(I),
+            Instruction::LocalSet(UXI),
+            Instruction::End,
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::LocalSet(UXI),
+            Instruction::LocalGet(EX),
+            Instruction::I32Const(1),
+            Instruction::I32Sub,
+            Instruction::LocalSet(EX),
+            Instruction::Br(0),
+            Instruction::End,
+            Instruction::End,
+            // Final aligned subtraction (ex == ey).
+            Instruction::LocalGet(UXI),
+            Instruction::LocalGet(UYI),
+            Instruction::I64Sub,
+            Instruction::LocalTee(I),
+            Instruction::I64Const(0),
+            Instruction::I64GeS,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(I),
+            Instruction::I64Eqz,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(SX),
+            Instruction::F64ReinterpretI64,
+            Instruction::Return,
+            Instruction::End,
+            Instruction::LocalGet(I),
+            Instruction::LocalSet(UXI),
+            Instruction::End,
+            // Renormalize the remainder's leading bit back to position 52.
+            Instruction::Block(BlockType::Empty),
+            Instruction::Loop(BlockType::Empty),
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(52),
+            Instruction::I64ShrU,
+            Instruction::I64Eqz,
+            Instruction::I32Eqz, // (uxi >> 52) != 0 → done
+            Instruction::BrIf(1),
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::LocalSet(UXI),
+            Instruction::LocalGet(EX),
+            Instruction::I32Const(1),
+            Instruction::I32Sub,
+            Instruction::LocalSet(EX),
+            Instruction::Br(0),
+            Instruction::End,
+            Instruction::End,
+            // Scale back: positive exponent re-encodes normally; ex <= 0
+            // shifts down into the subnormal encoding.
+            Instruction::LocalGet(EX),
+            Instruction::I32Const(0),
+            Instruction::I32GtS,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(UXI),
+            Instruction::I64Const(HIDDEN_BIT),
+            Instruction::I64Sub,
+            Instruction::LocalGet(EX),
+            Instruction::I64ExtendI32U,
+            Instruction::I64Const(52),
+            Instruction::I64Shl,
+            Instruction::I64Or,
+            Instruction::LocalSet(UXI),
+            Instruction::Else,
+            Instruction::LocalGet(UXI),
+            Instruction::I32Const(1),
+            Instruction::LocalGet(EX),
+            Instruction::I32Sub,
+            Instruction::I64ExtendI32U,
+            Instruction::I64ShrU,
+            Instruction::LocalSet(UXI),
+            Instruction::End,
+            // Reapply the dividend's sign.
+            Instruction::LocalGet(UXI),
+            Instruction::LocalGet(SX),
+            Instruction::I64Or,
+            Instruction::F64ReinterpretI64,
+            Instruction::End,
+        ],
+    );
+    b.add_and_emit_function(sig, &f)
+}
+
+/// Emit `phx_fmod`'s mantissa normalization for one operand (musl's
+/// two identical "normalize x"/"normalize y" stanzas, parameterized by
+/// local index): subnormals (`exp == 0`) shift their mantissa up until
+/// the implicit-bit position is occupied — scanning a copy in
+/// `scratch` and tracking the deficit in `exp`, which goes ≤ 0 — while
+/// normals just mask in the hidden bit. On entry `bits` holds the raw
+/// f64 bit pattern; on exit it holds the mantissa with its leading bit
+/// at position 52 (the sign bit, already captured by the caller, is
+/// shifted out along the way for subnormals).
+fn emit_fmod_normalize(f: &mut Function, bits: u32, exp: u32, scratch: u32) {
+    ins(
+        f,
+        &[
+            Instruction::LocalGet(exp),
+            Instruction::I32Eqz,
+            Instruction::If(BlockType::Empty),
+            Instruction::LocalGet(bits),
+            Instruction::I64Const(12),
+            Instruction::I64Shl,
+            Instruction::LocalSet(scratch),
+            Instruction::Block(BlockType::Empty),
+            Instruction::Loop(BlockType::Empty),
+            Instruction::LocalGet(scratch),
+            Instruction::I64Const(0),
+            Instruction::I64LtS, // top bit set → normalized scan done
+            Instruction::BrIf(1),
+            Instruction::LocalGet(exp),
+            Instruction::I32Const(1),
+            Instruction::I32Sub,
+            Instruction::LocalSet(exp),
+            Instruction::LocalGet(scratch),
+            Instruction::I64Const(1),
+            Instruction::I64Shl,
+            Instruction::LocalSet(scratch),
+            Instruction::Br(0),
+            Instruction::End,
+            Instruction::End,
+            // bits <<= 1 - exp  (exp <= 0 here, so the amount is >= 1)
+            Instruction::LocalGet(bits),
+            Instruction::I32Const(1),
+            Instruction::LocalGet(exp),
+            Instruction::I32Sub,
+            Instruction::I64ExtendI32U,
+            Instruction::I64Shl,
+            Instruction::LocalSet(bits),
+            Instruction::Else,
+            Instruction::LocalGet(bits),
+            Instruction::I64Const(MANTISSA_MASK),
+            Instruction::I64And,
+            Instruction::I64Const(HIDDEN_BIT),
+            Instruction::I64Or,
+            Instruction::LocalSet(bits),
+            Instruction::End,
+        ],
+    );
+}

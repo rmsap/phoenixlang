@@ -168,6 +168,25 @@ fn count_enum_type_decls(bytes: &[u8]) -> (usize, usize) {
     (parents, variants)
 }
 
+/// Count the locally-defined functions in `bytes` (code-section
+/// entries — imports don't count). Used to assert a synthesized helper
+/// is present in (and only in) the modules that need it when the
+/// helper is too small for a `float_free_module_carries_no_ryu_tables`
+///-style size-delta argument: two fixtures identical except for the
+/// op that demands the helper must differ by exactly one function.
+fn count_local_functions(bytes: &[u8]) -> usize {
+    use wasmparser::{Parser, Payload};
+    Parser::new(0)
+        .parse_all(bytes)
+        .filter(|payload| {
+            matches!(
+                payload.as_ref().expect("parse wasm payload"),
+                Payload::CodeSectionEntry(_)
+            )
+        })
+        .count()
+}
+
 /// Count `ref.cast` (non-null) operators across every function body.
 /// On wasm32-gc only `Op::EnumGetField` emits a `ref.cast` (it narrows
 /// the parent-typed receiver to the concrete variant before the field
@@ -992,6 +1011,246 @@ fn float_print_computed_values_run_under_wasmtime_gc() {
     assert_prints(source, "float_print_computed", &expected);
 }
 
+/// Float `%` via the synthesized
+/// `phx_fmod` helper (musl `fmod` port), differentially pinned against
+/// Rust's `f64 % f64` — the semantics every other backend inherits
+/// from the runtime / interpreters. The pairs stress the algorithm's
+/// distinct paths: sign combinations (truncated remainder keeps the
+/// *dividend's* sign), the `|x| < |y|` return-x early-out, the
+/// `|x| == |y|` signed-zero early-out, an exact-division interior
+/// zero, magnitude gaps large enough to run the alignment loop
+/// hundreds of iterations, and classic non-terminating binaries
+/// (1.0 % 0.1). Operands are parenthesized in the emitted source (here
+/// and in every `float_fmod_*` test) so the expectation pins
+/// `fmod(a, b)` itself, not Phoenix's unary-minus/`%` precedence —
+/// without parens, `-5.5 % 2.0` would only match Rust by the accident
+/// that fmod is odd in its dividend, making `-(a % b) == (-a) % b`.
+#[test]
+fn float_fmod_matches_native() {
+    let pairs: &[(&str, &str)] = &[
+        ("5.5", "2.0"),
+        ("-5.5", "2.0"),
+        ("5.5", "-2.0"),
+        ("-5.5", "-2.0"),
+        ("1.0", "0.1"),
+        ("123456.789", "0.001"),
+        ("3.0", "3.0"),
+        ("-3.0", "3.0"),
+        ("2.0", "5.5"),
+        ("-2.0", "5.5"),
+        ("6.0", "1.5"),
+        ("0.3", "0.1"),
+        ("100000000000000000000.0", "3.7"),
+        ("0.00001", "10000000000000000.0"),
+        ("7.25", "0.25"),
+    ];
+
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    for (a, b) in pairs {
+        source.push_str(&format!("  print(({a}) % ({b}))\n"));
+        let av: f64 = a.parse().expect("dividend literal parses");
+        let bv: f64 = b.parse().expect("divisor literal parses");
+        expected.extend_from_slice(ryu::Buffer::new().format(av % bv).as_bytes());
+        expected.push(b'\n');
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "float_fmod_corpus", &expected);
+}
+
+/// Deterministic subnormal coverage for Float `%`. The random sweep
+/// can't reach these (see its doc), so each subnormal path in
+/// `phx_fmod` gets a hand-picked pair, fed as exact longhand decimal
+/// literals the same way the sweep feeds its operands:
+/// - both operands subnormal → both mantissa-normalize loops run
+///   (x's leading mantissa bit sits at 43, so its loop iterates;
+///   y = 7 × 2⁻¹⁰⁷⁴ makes its loop iterate ~49 times);
+/// - a negative largest-subnormal dividend → the x-normalize loop's
+///   zero-iteration edge (leading bit already at the top after the
+///   `<< 12`), plus the dividend's sign reapplied to a scaled-down
+///   subnormal result;
+/// - normal % subnormal → the alignment loop's longest practical run
+///   (~1074 iterations);
+/// - subnormal % normal → the `|x| < |y|` return-x early-out handing
+///   back the minimum subnormal untouched;
+/// - normal operands with a subnormal remainder
+///   (1.5·MIN_POSITIVE % MIN_POSITIVE = 2⁻¹⁰²³) → the `ex <= 0`
+///   scale-down re-encoding without either normalize loop.
+#[test]
+fn float_fmod_subnormals_match_native() {
+    let pairs: &[(f64, f64)] = &[
+        (
+            f64::from_bits(0x0000_0FFF_FFFF_FFFF),
+            f64::from_bits(0x0000_0000_0000_0007),
+        ),
+        (
+            f64::from_bits(0x800F_FFFF_FFFF_FFFF),
+            f64::from_bits(0x0000_0000_0000_0007),
+        ),
+        (3.5, f64::from_bits(0x0000_0000_0000_0003)),
+        (f64::from_bits(0x0000_0000_0000_0001), 1.0),
+        (f64::MIN_POSITIVE * 1.5, f64::MIN_POSITIVE),
+    ];
+
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    for (a, b) in pairs {
+        source.push_str(&format!("  print(({a:.1074}) % ({b:.1074}))\n"));
+        expected.extend_from_slice(ryu::Buffer::new().format(a % b).as_bytes());
+        expected.push(b'\n');
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "float_fmod_subnormals", &expected);
+}
+
+/// Float `%` IEEE-754 special cases, computed at runtime so the bit
+/// patterns genuinely reach `phx_fmod` under wasmtime (Phoenix can't
+/// lex inf/NaN literals anyway). Each expectation is Rust `%`'s
+/// behavior, which `phx_fmod` mirrors via musl's NaN funnel and
+/// early-outs:
+/// - `x % inf = x` (and preserves a negative dividend); `x % -inf`
+///   likewise — the `|x| < |y|` early-out compares with y's sign bit
+///   shifted out
+/// - `inf % y` / `x % 0.0` / `x % NaN` → NaN
+/// - `NaN % y` / `inf % inf` / `0.0 % 0.0` → NaN, each reaching the
+///   funnel by a different arm than the trio above: a NaN dividend
+///   hits `ex == 0x7ff` with a non-inf mantissa, `inf % inf` trips
+///   both the dividend and divisor checks at once, and `0.0 % 0.0`
+///   hits the zero-divisor arm with a zero dividend
+/// - `0.0 % y = 0.0`; `-0.0 % y = -0.0` (sign of dividend survives)
+#[test]
+fn float_fmod_special_cases_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let inf: Float = 1.0 / 0.0\n",
+        "  let neg_inf: Float = -1.0 / 0.0\n",
+        "  let nan: Float = 0.0 / 0.0\n",
+        "  let neg_zero: Float = -1.0 * 0.0\n",
+        "  print(5.0 % inf)\n",
+        "  print((-5.0) % inf)\n",
+        "  print(5.0 % neg_inf)\n",
+        "  print(inf % 5.0)\n",
+        "  print(5.0 % 0.0)\n",
+        "  print(5.0 % nan)\n",
+        "  print(nan % 5.0)\n",
+        "  print(inf % inf)\n",
+        "  print(0.0 % 0.0)\n",
+        "  print(0.0 % 5.0)\n",
+        "  print(neg_zero % 5.0)\n",
+        "}\n",
+    );
+    let inf = f64::INFINITY;
+    let neg_inf = f64::NEG_INFINITY;
+    let nan = f64::NAN;
+    let neg_zero = -0.0_f64;
+    let mut expected = Vec::new();
+    for val in [
+        5.0 % inf,
+        -5.0 % inf,
+        5.0 % neg_inf,
+        inf % 5.0,
+        5.0 % 0.0,
+        5.0 % nan,
+        nan % 5.0,
+        inf % inf,
+        0.0 % 0.0,
+        0.0 % 5.0,
+        neg_zero % 5.0,
+    ] {
+        if val.is_nan() {
+            expected.extend_from_slice(b"NaN");
+        } else {
+            // No case yields ±inf (`x % inf` returns x; the rest are
+            // NaN), and `ryu` debug-asserts finiteness — a future case
+            // that breaks this panics here rather than passing loosely.
+            expected.extend_from_slice(ryu::Buffer::new().format(val).as_bytes());
+        }
+        expected.push(b'\n');
+    }
+    assert_prints(source, "float_fmod_specials", &expected);
+}
+
+/// Differential sweep of Float `%` over arbitrary finite operand
+/// pairs — same SplitMix64 construction as
+/// [`float_print_random_bits_match_native`]: random bit patterns are
+/// uniform over exponents, so the alignment loop runs with magnitude
+/// gaps and mantissa shapes a hand-picked corpus wouldn't include.
+/// What it does *not* reach: a uniform 11-bit exponent field is
+/// subnormal with probability 1/2048 per operand, and the loop
+/// asserts that no operand or result is subnormal (or NaN, from a ±0
+/// divisor) — those paths are pinned deterministically by
+/// [`float_fmod_subnormals_match_native`] and the specials test, and
+/// the assertion keeps that division of labor true if the seed or
+/// pair count ever changes. 100 pairs, fed as exact longhand decimal
+/// literals.
+#[test]
+fn float_fmod_random_bits_match_native() {
+    // SplitMix64 — deterministic, seed pinned (distinct from the
+    // print sweep's seed so the two tests cover different values).
+    let mut state: u64 = 0x243F6A8885A308D3;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    };
+    let mut next_finite = move || loop {
+        let val = f64::from_bits(next());
+        if val.is_finite() {
+            return val;
+        }
+    };
+
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    for _ in 0..100 {
+        let a = next_finite();
+        let b = next_finite();
+        // The doc's claim that this sweep stays out of the subnormal
+        // and NaN paths (covered by the subnormals/specials tests) is
+        // seed-dependent — enforce it so a seed or count change can't
+        // silently shift coverage between the tests.
+        for val in [a, b, a % b] {
+            assert!(
+                val == 0.0 || val.is_normal(),
+                "sweep drew a subnormal/NaN ({val:e} from {a:e} % {b:e}); \
+                 the seed change moved coverage pinned by the subnormals/\
+                 specials tests — restore the no-subnormal property or \
+                 update both docs",
+            );
+        }
+        source.push_str(&format!("  print(({a:.1074}) % ({b:.1074}))\n"));
+        expected.extend_from_slice(ryu::Buffer::new().format(a % b).as_bytes());
+        expected.push(b'\n');
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "float_fmod_random_bits", &expected);
+}
+
+/// Pins `phx_fmod`'s pay-per-use claim (§Phase 2.4 K.5: "synthesized
+/// only when an `Op::FMod` site exists") structurally, the way
+/// [`float_free_module_carries_no_ryu_tables`] pins the K.6 claim —
+/// but by function count rather than byte size, since the helper is a
+/// few hundred bytes, far too small for a size-delta argument. The two
+/// fixtures are identical except `-` vs `%` on the same Float
+/// operands, so the only function-count difference an extra entry
+/// could come from is the helper itself.
+#[test]
+fn fmod_free_module_carries_no_fmod_helper() {
+    let without_fmod = compile_to_wasm_gc("function main() {\n  print((5.5 - 2.0) > 1.0)\n}\n");
+    validate_gc_module(&without_fmod, "fmod_free_without");
+    let with_fmod = compile_to_wasm_gc("function main() {\n  print((5.5 % 2.0) > 1.0)\n}\n");
+    validate_gc_module(&with_fmod, "fmod_free_with");
+    assert_eq!(
+        count_local_functions(&with_fmod),
+        count_local_functions(&without_fmod) + 1,
+        "a `%` module must carry exactly one more function (`phx_fmod`) than the \
+         otherwise-identical `-` module — either the helper is missing where needed \
+         or it is being synthesized into modules with no `Op::FMod` site",
+    );
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
 /// inline-synthesis decision: a module that never prints a Float
 /// carries neither the synthesized `phx_print_f64` machinery nor the
@@ -1127,25 +1386,14 @@ fn float_nan_and_infinity_run_under_wasmtime_gc() {
     );
 }
 
-/// PR 6 slice 4: Float `%` (`Op::FMod`) is the one float-arithmetic op
-/// this slice deliberately omits — WASM has no `f64.rem`, so it needs an
-/// `fmod` runtime helper that lands in a later slice (§Phase 2.4 decision
-/// K.5). The frontend *does* lower `Float % Float` → `Op::FMod`
-/// (`lower_expr.rs`), so this pins the clean, specific rejection: the
-/// backend names the missing `f64.rem` rather than falling through to the
-/// generic "IR op not yet supported" catch-all. Tighten/flip this to a
-/// positive execution test when the `fmod` helper lands.
+/// `5.5 % 2.0 = 1.5 > 1.0` → `true`, with the
+/// result funneled through `print(Bool)`.
 #[test]
-fn float_mod_is_rejected_until_the_fmod_helper_lands() {
-    let ir_module = lower_to_ir(
+fn float_mod_runs_under_wasmtime_gc() {
+    assert_prints(
         "function main() {\n  let a: Float = 5.5\n  let b: Float = 2.0\n  print((a % b) > 1.0)\n}\n",
-    );
-    let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("Float `%` should not compile until the fmod helper lands");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("f64.rem") && msg.contains("FMod"),
-        "expected a specific FMod/f64.rem diagnostic, got: {msg}"
+        "float_mod_wasm_gc",
+        b"true\n",
     );
 }
 

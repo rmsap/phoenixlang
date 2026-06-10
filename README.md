@@ -332,4 +332,6 @@ Phoenix is in early development and contributions are welcome.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Ports of MIT-licensed third-party code
+carry their upstream notices in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

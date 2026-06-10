@@ -104,7 +104,7 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // always exported as `memory`, and the upcoming String slice stages
     // literals there regardless of whether the program prints.
     let needs_print = translate::module_calls_print(ir_module);
-    let string_needs = scan_helper_needs(ir_module);
+    let helper_needs = scan_helper_needs(ir_module);
     // Declare every Phoenix struct's nominal WASM-GC type first, so
     // any subsequent function signature whose params/returns include
     // `IrType::StructRef(name, _)` can encode the right
@@ -117,7 +117,7 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // struct in slice 1 has a String field; the cross-cutting case is
     // a follow-up slice). See §Phase 2.4 decision K.2.
     builder.declare_phoenix_structs(ir_module)?;
-    if string_needs.string_types {
+    if helper_needs.string_types {
         builder.declare_string_types();
     }
     // Declare every Phoenix enum's parent + per-variant subtypes after
@@ -135,22 +135,25 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // `fd_write` lookup inside `declare_string_helpers` is safe to rely
     // on because `print_str` can only be set by a `print(...)` call
     // site, which `module_calls_print` also detects — so
-    // `string_needs.print_str` implies `needs_print`, which means
+    // `helper_needs.print_str` implies `needs_print`, which means
     // `declare_imports` ran just above and `fd_write_idx` is populated.
     // The lookup still errors (rather than panics) if that invariant is
     // ever broken by a change to `module_calls_print`.
-    builder.declare_string_helpers(string_needs)?;
+    builder.declare_string_helpers(helper_needs)?;
     // `print(Bool)` lowers inline — no helper to synthesize — but the
     // two `"true\n"` / `"false\n"` active data segments still have to
     // be declared (and counted toward the `DataCount` section) before
     // the function-body translation can stage iovecs at their fixed
     // offsets. See §Phase 2.4 decision K.3.
-    if string_needs.print_bool {
+    if helper_needs.print_bool {
         builder.declare_bool_data();
     }
     // `phx_print_f64` synthesis needs the `fd_write` import, which is
     // declared above this point.
-    builder.declare_print_f64_helper(string_needs)?;
+    builder.declare_print_f64_helper(helper_needs)?;
+    // `phx_fmod` is a pure function (no imports); it only shares the
+    // helpers' immediate-emit-before-deferred-body ordering constraint.
+    builder.declare_fmod_helper(helper_needs)?;
 
     // Declare Phoenix user functions (so call sites can resolve their
     // WASM function indices before any body is emitted), then emit

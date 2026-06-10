@@ -263,6 +263,13 @@ pub(super) struct ModuleBuilder {
     /// decision K.6 (2026-06-09 amendment).
     print_f64_idx: Option<u32>,
 
+    /// WASM function index of the synthesized `phx_fmod` helper —
+    /// IEEE-754 truncated remainder (musl `fmod` port), matching
+    /// Rust's `f64 % f64` bit-for-bit. Populated by
+    /// [`Self::declare_fmod_helper`] when the IR module emits
+    /// `Op::FMod`. See §Phase 2.4 decision K.5.
+    fmod_idx: Option<u32>,
+
     /// WASM function index of the synthesized `phx_str_concat` helper
     /// — allocates a fresh `$bytes` of combined length, `array.copy`s
     /// from each operand honoring `$offset`, and `struct.new`s the
@@ -367,6 +374,7 @@ impl ModuleBuilder {
             string_type_idx: None,
             print_str_idx: None,
             print_f64_idx: None,
+            fmod_idx: None,
             str_concat_idx: None,
             str_eq_idx: None,
             str_cmp_idx: None,
@@ -1212,6 +1220,31 @@ impl ModuleBuilder {
         Ok(())
     }
 
+    /// Index of the synthesized `phx_fmod` helper.
+    pub(super) fn require_fmod_idx(&self) -> Result<u32, CompileError> {
+        self.fmod_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_fmod` helper index requested before \
+                 `declare_fmod_helper` ran with `needs.fmod = true` \
+                 (internal compiler bug — `scan_helper_needs` missed an \
+                 `Op::FMod` site)",
+            )
+        })
+    }
+
+    /// Synthesize the `phx_fmod` helper if `needs.fmod`. Unlike the
+    /// print helpers it has no `fd_write` dependency (pure function),
+    /// so it can be declared whether or not the module prints — the
+    /// only ordering constraint is the immediate-emit-before-deferred-
+    /// body invariant shared by every helper.
+    pub(super) fn declare_fmod_helper(&mut self, needs: HelperNeeds) -> Result<(), CompileError> {
+        if !needs.fmod {
+            return Ok(());
+        }
+        self.fmod_idx = Some(super::float_helpers::synthesize_fmod(self));
+        Ok(())
+    }
+
     /// Index of the synthesized `phx_print_str` helper.
     pub(super) fn require_print_str_idx(&self) -> Result<u32, CompileError> {
         self.print_str_idx.ok_or_else(|| {
@@ -1382,7 +1415,8 @@ impl ModuleBuilder {
     }
 }
 
-/// What string helpers / type declarations a given IR module needs.
+/// What synthesized helpers / type declarations a given IR module
+/// needs — string machinery, `phx_print_f64`, and `phx_fmod` alike.
 /// Populated by [`scan_helper_needs`]. The fields are strict subsets
 /// — `print_str` implies `string_types`, `str_concat` implies
 /// `string_types`, etc. — so the field-by-field check at synthesis
@@ -1424,11 +1458,15 @@ pub(super) struct HelperNeeds {
     /// inline `phx_print_f64` helper (Ryu d2s + special cases) — see
     /// §Phase 2.4 decision K.6.
     pub(super) print_f64: bool,
+    /// True iff at least one `Op::FMod` (Float `%`) appears. Drives
+    /// synthesis of the `phx_fmod` helper (musl `fmod` port — WASM has
+    /// no `f64.rem` instruction). See §Phase 2.4 decision K.5.
+    pub(super) fmod: bool,
 }
 
-/// Scan the IR module to determine which string helpers and types
-/// need to be emitted. Walks every concrete function once and flips the
-/// relevant flag for each op kind encountered.
+/// Scan the IR module to determine which synthesized helpers and
+/// types need to be emitted. Walks every concrete function once and
+/// flips the relevant flag for each op kind encountered.
 ///
 /// Resolving a `print(String)` site's argument type needs a
 /// `ValueId → IrType` map for the function, but most functions never
@@ -1462,6 +1500,9 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
                 match &instr.op {
                     Op::ConstString(_) => {
                         needs.string_types = true;
+                    }
+                    Op::FMod(_, _) => {
+                        needs.fmod = true;
                     }
                     Op::StringConcat(_, _) => {
                         needs.string_types = true;
