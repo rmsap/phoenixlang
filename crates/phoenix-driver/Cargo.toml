@@ -40,8 +40,10 @@ toml = { workspace = true }
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 tempfile = { workspace = true }
 
-# Linux-only: needed to set RLIMIT_AS in the child process before exec, so
-# the alloc-bounded-memory test can prove the GC actually collects (the
-# child OOMs if it leaks instead of sweeping unrooted allocations).
+# Linux-only: needed to set RLIMIT_AS in the child process before exec —
+# gc_bounded_memory.rs proves the GC actually collects (the child OOMs if it
+# leaks instead of sweeping unrooted allocations), and gen_schema_fixtures.rs
+# caps `phoenix check` so the parser error-recovery OOM dies fast instead of
+# thrashing the host until the wall-clock timeout.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2"

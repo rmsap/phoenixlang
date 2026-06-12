@@ -1,0 +1,550 @@
+// Phoenix Gen — a realistic multi-tenant SaaS control-plane API
+//
+// TYPE-MODELING NOTES: Phoenix Gen has no native UUID, DateTime, Decimal/Money,
+// or bytes types. Conventions used throughout:
+//   - IDs are opaque `String`s (no native UUID type).
+//   - Timestamps are Unix epoch SECONDS as `Int` (no native DateTime type) and
+//     are documented as such at each field.
+//   - Soft-delete is modeled as `Bool deleted` plus `Option<Int> deletedAt`
+//     (epoch seconds when the row was tombstoned; absent while live).
+//   - Tenant scoping appears in two styles across the API: a request header
+//     `X-Tenant-Id` (via `as`) on most endpoints, and an explicit `{tenantId}`
+//     PATH PARAM on the tenant-rooted resource tree — both are exercised.
+
+// ── Enums (simple unit-variant only, so they codegen on all targets) ──
+
+/** A member's role within an organization, ordered most- to least-privileged */
+enum Role { Owner  Admin  Member  Viewer }
+
+/** Lifecycle state of an organization's subscription */
+enum PlanTier { Free  Pro  Business  Enterprise }
+
+/** Status of a pending or accepted seat invitation */
+enum InviteStatus { Pending  Accepted  Revoked  Expired }
+
+/** Coarse-grained permission scopes a role may be granted */
+enum Permission { ReadOnly  Write  Manage  Billing }
+
+// ── Domain types ──────────────────────────────────────────────
+
+/** A tenant organization — the top-level multi-tenancy boundary. Wide struct
+ *  carrying identity, plan, audit, and soft-delete fields */
+struct Organization {
+    /** Opaque org id, also the tenant id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Human-readable display name */
+    String name where self.length > 0 && self.length <= 200
+    /** URL-safe slug used in vanity URLs */
+    String slug where self.length > 0 && self.length <= 63
+    /** Billing contact email for the tenant */
+    String billingEmail where self.contains("@") && self.length > 3
+    PlanTier plan
+    /** Purchased seat count; members may not exceed this */
+    Int seatLimit where self >= 1
+    /** Seats currently consumed by active members */
+    Int seatsUsed where self >= 0
+    /** Whether the tenant has been suspended (e.g. non-payment) */
+    Bool suspended
+    /** Soft-delete tombstone flag */
+    Bool deleted
+    /** Epoch SECONDS when soft-deleted; absent while the org is live */
+    Option<Int> deletedAt
+    /** Creation time as Unix epoch SECONDS (no native DateTime type) */
+    Int createdAt where self >= 0
+    /** Last-modified time as Unix epoch SECONDS */
+    Int updatedAt where self >= 0
+    /** Opaque user id of the creator (no native UUID type — using String) */
+    String createdBy where self.length > 0
+    /** Arbitrary tenant-level settings as string key/value pairs */
+    Map<String, String> settings
+}
+
+/** A workspace (project) nested inside an organization */
+struct Workspace {
+    /** Opaque workspace id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Owning tenant/org id */
+    String orgId where self.length > 0
+    String name where self.length > 0 && self.length <= 120
+    /** Optional free-form description */
+    Option<String> description where self.length <= 1000
+    /** Whether non-members of the workspace can view it */
+    Bool isPublic
+    Bool deleted
+    /** Epoch SECONDS when soft-deleted; absent while live */
+    Option<Int> deletedAt
+    /** Creation time as Unix epoch SECONDS */
+    Int createdAt where self >= 0
+    /** Last-modified time as Unix epoch SECONDS */
+    Int updatedAt where self >= 0
+    /** Opaque user id of the creator */
+    String createdBy where self.length > 0
+}
+
+/** A member of an organization — a user bound to a tenant with a role.
+ *  Wide struct combining identity, role/permission, audit, and soft-delete */
+struct Member {
+    /** Opaque membership id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Owning tenant/org id */
+    String orgId where self.length > 0
+    /** Opaque user id behind this membership */
+    String userId where self.length > 0
+    String displayName where self.length > 0 && self.length <= 200
+    String email where self.contains("@") && self.length > 3
+    Role role
+    /** Effective permission scopes granted to this member */
+    List<Permission> permissions
+    /** Whether the member's email/seat has been confirmed */
+    Bool active
+    Bool deleted
+    /** Epoch SECONDS when soft-deleted; absent while live */
+    Option<Int> deletedAt
+    /** Epoch SECONDS of last successful sign-in; absent if never signed in */
+    Option<Int> lastSeenAt
+    /** Creation time as Unix epoch SECONDS */
+    Int createdAt where self >= 0
+    /** Last-modified time as Unix epoch SECONDS */
+    Int updatedAt where self >= 0
+    /** Opaque user id of whoever provisioned this member */
+    String createdBy where self.length > 0
+}
+
+/** A seat invitation extended to a prospective member */
+struct Invite {
+    /** Opaque invite id (no native UUID type — using String) */
+    String id where self.length > 0
+    String orgId where self.length > 0
+    String email where self.contains("@") && self.length > 3
+    /** Role the invitee will receive on acceptance */
+    Role role
+    InviteStatus status
+    /** Opaque single-use acceptance token (no native bytes/UUID type) */
+    String token where self.length > 0
+    /** Epoch SECONDS after which the invite is no longer valid */
+    Int expiresAt where self >= 0
+    /** Creation time as Unix epoch SECONDS */
+    Int createdAt where self >= 0
+    /** Opaque user id of the inviter */
+    String createdBy where self.length > 0
+}
+
+/** An immutable audit-log entry recording a tenant-scoped action */
+struct AuditEvent {
+    /** Opaque event id (no native UUID type — using String) */
+    String id where self.length > 0
+    String orgId where self.length > 0
+    /** Opaque user id of the actor who performed the action */
+    String actorId where self.length > 0
+    /** Action verb, e.g. "member.invited" */
+    String action where self.length > 0 && self.length <= 120
+    /** Type of the affected resource, e.g. "workspace" */
+    String targetType where self.length > 0
+    /** Opaque id of the affected resource */
+    String targetId where self.length > 0
+    /** Occurrence time as Unix epoch SECONDS (no native DateTime type) */
+    Int createdAt where self >= 0
+    /** Arbitrary structured context as string key/value pairs */
+    Map<String, String> metadata
+}
+
+/** An API key issued to a tenant for programmatic access */
+struct ApiKey {
+    /** Opaque key id (no native UUID type — using String) */
+    String id where self.length > 0
+    String orgId where self.length > 0
+    /** Human label for the key */
+    String name where self.length > 0 && self.length <= 120
+    /** Non-secret display prefix, e.g. "pk_live_" */
+    String prefix where self.length > 0 && self.length <= 16
+    /** Scopes this key is allowed to exercise */
+    List<Permission> scopes
+    Bool revoked
+    /** Epoch SECONDS of last use; absent if never used */
+    Option<Int> lastUsedAt
+    /** Creation time as Unix epoch SECONDS */
+    Int createdAt where self >= 0
+    /** Opaque user id of the issuer */
+    String createdBy where self.length > 0
+}
+
+// ── Organization endpoints (tenant created/listed at the platform root) ──
+
+/** Provision a new tenant organization. The platform admin token authorizes;
+ *  server fills id/audit/seat-usage/soft-delete fields */
+endpoint createOrganization: POST "/organizations" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    body Organization omit {
+        id, seatsUsed, suspended, deleted, deletedAt, createdAt, updatedAt
+    }
+    response Organization
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** Fetch an organization by id */
+endpoint getOrganization: GET "/organizations/{id}" {
+    headers {
+        String authorization
+    }
+    response Organization
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** List organizations visible to the caller (offset-paginated) */
+endpoint listOrganizations: GET "/organizations" {
+    headers {
+        String authorization
+    }
+    query {
+        Int page = 1
+        Int limit = 20
+        Option<String> q
+        Bool includeDeleted = false
+    }
+    response List<Organization>
+    pagination { offset }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+    }
+}
+
+/** Partially update an organization. Tenant carried via header; every supplied
+ *  field is optional (partial), and immutable/audit fields are omitted */
+endpoint updateOrganization: PATCH "/organizations/{id}" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    body Organization omit {
+        id, seatsUsed, deleted, deletedAt, createdAt, updatedAt, createdBy
+    } partial
+    response Organization
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Soft-delete (tombstone) an organization */
+endpoint deleteOrganization: DELETE "/organizations/{id}" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Workspaces (tenant-rooted path tree: {tenantId} as a PATH PARAM) ──
+
+/** List a tenant's workspaces (cursor-paginated). Tenant scoping here is via
+ *  the {tenantId} PATH PARAM rather than a header */
+endpoint listWorkspaces: GET "/tenants/{tenantId}/workspaces" {
+    headers {
+        String authorization
+    }
+    query {
+        Option<String> cursor
+        Int limit = 25
+        Option<String> q
+        Bool includeDeleted = false
+    }
+    response List<Workspace>
+    pagination { cursor }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Create a workspace under a tenant. Server fills id/orgId/audit/soft-delete */
+endpoint createWorkspace: POST "/tenants/{tenantId}/workspaces" {
+    headers {
+        String authorization
+    }
+    body Workspace omit {
+        id, orgId, deleted, deletedAt, createdAt, updatedAt
+    }
+    response Workspace
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** Fetch a workspace by id within a tenant */
+endpoint getWorkspace: GET "/tenants/{tenantId}/workspaces/{id}" {
+    headers {
+        String authorization
+    }
+    response Workspace
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Create-or-update a workspace by id (idempotent PUT): returns 200 when an
+ *  existing workspace was replaced, 201 when a new one was created. Both carry
+ *  the same Workspace body (multi-status block — all typed entries share one
+ *  type) */
+endpoint upsertWorkspace: PUT "/tenants/{tenantId}/workspaces/{id}" {
+    headers {
+        String authorization
+    }
+    body Workspace omit {
+        id, orgId, deleted, deletedAt, createdAt, updatedAt, createdBy
+    }
+    response {
+        200: Workspace
+        201: Workspace
+    }
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** Rename a workspace — a required new name, plus an optional description
+ *  update riding along (pick + selective partial) */
+endpoint renameWorkspace: PATCH "/tenants/{tenantId}/workspaces/{id}" {
+    headers {
+        String authorization
+    }
+    body Workspace pick { name, description } partial { description }
+    response Workspace
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+// ── Members (tenant carried via X-Tenant-Id header) ──
+
+/** List members of the caller's tenant (offset-paginated), filterable by role */
+endpoint listMembers: GET "/members" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+        Option<String> trace as "X-Trace-Id"
+    }
+    query {
+        Int page = 1
+        Int limit = 50
+        Option<String> q
+        Bool activeOnly = true
+    }
+    response List<Member>
+    pagination { offset }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+    }
+}
+
+/** Fetch a single member by id within the caller's tenant */
+endpoint getMember: GET "/members/{id}" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    response Member
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Change a member's role and/or permissions (pick: only those two fields) */
+endpoint updateMemberRole: PATCH "/members/{id}" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    body Member pick { role, permissions }
+    response Member
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Remove (soft-delete) a member, freeing their seat */
+endpoint removeMember: DELETE "/members/{id}" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Invitations ──
+
+/** Invite a user to the tenant by email. Idempotency-Key guards double-sends */
+endpoint createInvite: POST "/invites" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+        String idemKey as "Idempotency-Key"
+    }
+    body Invite omit { id, orgId, status, token, createdAt }
+    response Invite
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** List outstanding invites for the tenant (cursor-paginated) */
+endpoint listInvites: GET "/invites" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    query {
+        Option<String> cursor
+        Int limit = 20
+    }
+    response List<Invite>
+    pagination { cursor }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+    }
+}
+
+/** Accept an invite via its single-use token. Returns the resulting Member,
+ *  plus rate-limit info in response headers */
+endpoint acceptInvite: POST "/invites/{token}/accept" {
+    headers {
+        String authorization
+    }
+    response Member headers {
+        Int ratelimitRemaining as "X-RateLimit-Remaining"
+        Option<String> requestId as "X-Request-Id"
+    }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Audit log (read-only, tenant-scoped) ──
+
+/** Stream the tenant's audit log (cursor-paginated), filterable by action */
+endpoint listAuditEvents: GET "/audit-events" {
+    headers {
+        String authorization
+        String tenant as "X-Tenant-Id"
+    }
+    query {
+        Option<String> cursor
+        Int limit = 100
+        Option<String> action
+        Option<String> actorId
+    }
+    response List<AuditEvent>
+    pagination { cursor }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+    }
+}
+
+// ── API versioning: API-key management under the /v1 prefix ──
+
+/** A versioned slice: tenant API-key management served under the `/v1` prefix */
+api version "v1" {
+    /** Issue a new API key for the tenant. Server fills id/orgId/audit/state;
+     *  the one-time secret itself is returned out of band (not modeled here) */
+    endpoint createApiKey: POST "/api-keys" {
+        headers {
+            String authorization
+            String tenant as "X-Tenant-Id"
+        }
+        body ApiKey omit { id, orgId, prefix, revoked, lastUsedAt, createdAt }
+        response ApiKey
+        error {
+            ValidationError(400)
+            Unauthorized(401)
+            Forbidden(403)
+            Conflict(409)
+        }
+    }
+
+    /** List the tenant's API keys (offset-paginated) */
+    endpoint listApiKeys: GET "/api-keys" {
+        headers {
+            String authorization
+            String tenant as "X-Tenant-Id"
+        }
+        query {
+            Int page = 1
+            Int limit = 20
+            Bool includeRevoked = false
+        }
+        response List<ApiKey>
+        pagination { offset }
+        error {
+            Unauthorized(401)
+            Forbidden(403)
+        }
+    }
+
+    /** Revoke an API key. Returns 200 with the revoked key, or 204 if it was
+     *  already revoked (idempotent revoke — multi-status, mixed typed/typeless) */
+    endpoint revokeApiKey: DELETE "/api-keys/{id}" {
+        headers {
+            String authorization
+            String tenant as "X-Tenant-Id"
+        }
+        response {
+            200: ApiKey
+            204
+        }
+        error {
+            Unauthorized(401)
+            Forbidden(403)
+            NotFound(404)
+        }
+    }
+}

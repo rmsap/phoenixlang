@@ -2215,3 +2215,89 @@ the new code needed the same machinery, the third found while reviewing the new
   `response { }` block now accept an optional comma after each entry, matching
   the forgiving `omit { a, b }` field-list style. Endpoint sections remain
   canonically newline-separated; the comma is tolerated, not required.
+
+---
+
+## Phoenix Gen — type-system gaps surfaced by the fixture library (2026-06-09)
+
+The §6 fixture library (six realistic schemas: payments, multitenant_saas,
+webhooks, file_storage, social, internal_admin — ~2,900 lines) was written to
+stress the generators against real API shapes. As the roadmap predicted ("adding
+a fixture often surfaces a missing schema feature — that's the point"), the
+exercise produced a consistent audit of what realistic APIs *want* that Phoenix
+Gen's type/feature surface doesn't yet express. Recorded here as a forward-looking
+list (these are scope/roadmap items, not bugs; the genuine *bugs* found are in
+known-issues.md). Every fixture independently hit the same first three, which is
+the strongest signal:
+
+**Missing primitive types (hit by nearly every fixture):**
+- **DateTime / timestamp** — modeled everywhere as `Int` Unix epoch seconds. The
+  single most-wanted missing type; every fixture has created/updated/expires
+  fields. A native instant type would also let codegen emit `string`/`datetime`
+  with `format: date-time` in OpenAPI instead of a bare integer.
+- **UUID / opaque id** — modeled as `String`. Every fixture's ids and tokens. A
+  distinct id type would enable `format: uuid` and stronger typing.
+- **Money / Decimal** — payments modeled amounts as `Int` minor units (cents).
+  No fixed-precision decimal exists; a payments domain really wants currency-aware
+  money.
+- **bytes / binary scalar** — checksums, signatures, raw tokens modeled as
+  `String`. `File` exists but only in endpoint-body position, not as a value type.
+- **URL** — destination/avatar/media URLs modeled as validated `String`s
+  (e.g. `self.contains("https://")`). Lower-value than the four above, but hit
+  by webhooks (subscription destinations) and social (avatar/media URLs); a
+  native type would enable `format: uri` in OpenAPI.
+
+**Feature/expressiveness gaps:**
+- **Enum-typed query / filter params** — a `query { Status status }` filter can't
+  use an enum type; it degrades to `Option<String>` the handler must re-parse.
+  Hit by social, internal_admin (admin filters), webhooks (status filters).
+- **Enum fields in multipart bodies** — a `File`-bearing (multipart) body's
+  non-file fields must be scalar/`Option`-scalar; an enum field had to become a
+  `String` (file_storage `StorageClass` → `storageClassName`).
+- **Inline response projection** — there is no `response Struct pick { ... }` /
+  `omit`; a read-only/lightweight response shape (public profile, usage summary)
+  must be declared as its own dedicated struct. Hit by social (`PublicProfile`),
+  file_storage (`BucketUsage`).
+- **Constraints on optionals are asymmetric** — `where self.length > 0` is
+  *accepted* on `Option<String>` but `.contains(...)` on `Option<String>` and
+  numeric comparison on `Option<Int>` are rejected. Caveat: "accepted" is not
+  "validated" — `.length` parses as a field access, which sema silently skips on
+  non-struct types, so the constraint is unchecked rather than unwrapped.
+  (Tracked as two bugs in known-issues — the inconsistency plus the silent
+  field-access skip; the broader "constraints on optionals" story is a design
+  question.)
+- **Pagination + response-headers can't co-occur** — a paginated feed can't also
+  carry rate-limit response headers (the one-envelope rule, decision recorded in
+  the pagination/multi-status sections). Hit by social (`getHomeFeed`).
+- **No list-valued query params** — a batch endpoint can't declare
+  `List<String>` in a `query { }` block; ids arrive as a comma-separated
+  `String` the handler must split. Hit by social (`batchReactionCounts`).
+- **No reusable header sets** — response headers (e.g. a standard rate-limit
+  trio) are declared inline per endpoint; no way to define and share a header
+  group.
+- **No Range-request / partial-content representation** — file_storage can only
+  express a full binary download, not byte-range/partial reads.
+
+**Prioritization read.** The three primitive gaps (DateTime, UUID, Money) are the
+highest-value because they're universal and would immediately improve generated
+type fidelity (and OpenAPI `format`s). They are additive type-system work, not
+breaking changes. The feature gaps (enum query params, inline response
+projection) are smaller, additive, and demand-rankable. None of these block the
+existing slices — they are the natural "what's next for the schema language after
+the v1.0 must-adds" backlog, surfaced empirically rather than guessed.
+
+**Harness wiring status (opt-in).** All six fixtures parse and check clean —
+the parse/sema-clean invariant is guarded by
+`crates/phoenix-driver/tests/gen_schema_fixtures.rs`, which runs `phoenix check`
+over each fixture — but running them through the compile-and-lint harness is
+RED today: the first dense fixture (payments) immediately surfaced three real
+generator bugs (Go `q`-param collision, TS optional-before-required param
+order, Python non-`black`-clean client; all in known-issues.md). The wiring is
+committed rather than described: `compiles_and_lints.rs` carries a
+`FILE_FIXTURES` const of `include_str!` pairs plus a loop appended to each of
+the four target tests, gated behind `PHOENIX_GEN_FIXTURE_LIB=1` so default CI
+stays green (set the var to reproduce the bugs). The close-out instruction —
+delete the gate once all three bugs are fixed — lives on `FILE_FIXTURES`' doc
+comment, the canonical copy. (Note: a run must NOT impose a tight `ulimit -v`
+— redocly's WASM runtime needs a large address space and OOMs under a 6 GB
+cap, a false failure unrelated to the generated specs.)

@@ -252,6 +252,79 @@ endpoint getThing: GET "/api/things/{id}" {
 }
 "#;
 
+/// The realistic schema fixture library (workspace `tests/fixtures/`; see the
+/// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
+/// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`;
+/// running the library through THIS harness is gated behind
+/// `PHOENIX_GEN_FIXTURE_LIB=1` because three known generator bugs make it red
+/// (Go `q`-param local collision, TypeScript optional-before-required param
+/// order (TS1016), Python non-`black`-clean client — all in
+/// docs/known-issues.md). When the last of those closes, delete
+/// [`fixture_lib_enabled`] and run these unconditionally. (This is the
+/// canonical copy of that close-out instruction; the three bug entries and
+/// design-decisions.md point here.)
+///
+/// This list and the per-fixture test list in `phoenix-driver`'s
+/// `gen_schema_fixtures.rs` must name the same fixtures; the
+/// `gen_schema_library_lists_match` test in `phoenix-driver`'s
+/// `fixture_inventory.rs` fails if the two lists ever diverge, so a schema
+/// added to one file but forgotten in the other can't silently skip
+/// compile-and-lint (or `phoenix check`) coverage.
+const FILE_FIXTURES: &[(&str, &str)] = &[
+    (
+        "payments.phx",
+        include_str!("../../../tests/fixtures/payments.phx"),
+    ),
+    (
+        "multitenant_saas.phx",
+        include_str!("../../../tests/fixtures/multitenant_saas.phx"),
+    ),
+    (
+        "webhooks.phx",
+        include_str!("../../../tests/fixtures/webhooks.phx"),
+    ),
+    (
+        "file_storage.phx",
+        include_str!("../../../tests/fixtures/file_storage.phx"),
+    ),
+    (
+        "social.phx",
+        include_str!("../../../tests/fixtures/social.phx"),
+    ),
+    (
+        "internal_admin.phx",
+        include_str!("../../../tests/fixtures/internal_admin.phx"),
+    ),
+];
+
+/// Opt-in gate for the [`FILE_FIXTURES`] loops. An env var (not `#[ignore]`d
+/// tests) because the TypeScript/Python checks mutate their committed
+/// scaffold's `generated/` dir and MUST stay funneled through the single
+/// `#[test]` per target — a separate ignored test would race the regular one
+/// under `--include-ignored`.
+///
+/// Panics on any value other than `"1"`/`"0"`/empty (including a non-unicode
+/// value): someone who sets `PHOENIX_GEN_FIXTURE_LIB=true` to reproduce the
+/// known bugs must get an error, not a silently green run and a wrong
+/// conclusion.
+fn fixture_lib_enabled() -> bool {
+    match std::env::var("PHOENIX_GEN_FIXTURE_LIB") {
+        Ok(v) => match v.as_str() {
+            "1" => true,
+            "" | "0" => false,
+            other => panic!(
+                "PHOENIX_GEN_FIXTURE_LIB must be \"1\" (run the fixture library) \
+                 or \"0\"/unset (skip it); got {other:?}"
+            ),
+        },
+        Err(std::env::VarError::NotPresent) => false,
+        Err(e @ std::env::VarError::NotUnicode(_)) => panic!(
+            "PHOENIX_GEN_FIXTURE_LIB must be \"1\" (run the fixture library) \
+             or \"0\"/unset (skip it); {e}"
+        ),
+    }
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    roundtrip.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -359,6 +432,15 @@ fn go_output_compiles_and_lints() {
     // All-optional request + response headers (the `*T` param / nil-guarded
     // send / nil-able envelope-field paths).
     check_go_output(&generate_go_files(HEADER_SCHEMA));
+
+    // Realistic schema fixture library — opt-in until its known generator
+    // bugs are fixed; see FILE_FIXTURES.
+    if fixture_lib_enabled() {
+        for (name, schema) in FILE_FIXTURES.iter().copied() {
+            eprintln!("fixture library: {name}");
+            check_go_output(&generate_go_files(schema));
+        }
+    }
 }
 
 // ── OpenAPI target ───────────────────────────────────────────────────────
@@ -409,6 +491,16 @@ fn openapi_output_lints() {
     check_openapi_output("WRAP_SCHEMA", WRAP_SCHEMA);
     check_openapi_output("FEATURE_SCHEMA", FEATURE_SCHEMA);
     check_openapi_output("HEADER_SCHEMA", HEADER_SCHEMA);
+
+    // Realistic schema fixture library — opt-in until its known generator
+    // bugs are fixed; see FILE_FIXTURES. NOTE: redocly's WASM runtime needs a
+    // large address space; do not run this under a tight `ulimit -v` (it OOMs
+    // under a 6 GB cap — a false failure unrelated to the generated specs).
+    if fixture_lib_enabled() {
+        for (name, schema) in FILE_FIXTURES.iter().copied() {
+            check_openapi_output(name, schema);
+        }
+    }
 }
 
 // ── TypeScript target ─────────────────────────────────────────────────────
@@ -504,6 +596,15 @@ fn typescript_output_compiles_and_lints() {
     // optional-chain send guard — the `emit_header_set` path the mixed-header
     // `getPostMetered` in SCHEMA never reaches.
     check_typescript_output(&scaffold, &generate_typescript_files(HEADER_SCHEMA));
+
+    // Realistic schema fixture library — opt-in until its known generator
+    // bugs are fixed; see FILE_FIXTURES.
+    if fixture_lib_enabled() {
+        for (name, schema) in FILE_FIXTURES.iter().copied() {
+            eprintln!("fixture library: {name}");
+            check_typescript_output(&scaffold, &generate_typescript_files(schema));
+        }
+    }
 }
 
 // ── Python target ──────────────────────────────────────────────────────────
@@ -606,4 +707,13 @@ fn python_output_compiles_and_lints() {
     // All-optional request + response headers (all-`| None` kwargs, guarded
     // sends, and an all-optional envelope).
     check_python_output(&scaffold, &venv_bin, &generate_python_files(HEADER_SCHEMA));
+
+    // Realistic schema fixture library — opt-in until its known generator
+    // bugs are fixed; see FILE_FIXTURES.
+    if fixture_lib_enabled() {
+        for (name, schema) in FILE_FIXTURES.iter().copied() {
+            eprintln!("fixture library: {name}");
+            check_python_output(&scaffold, &venv_bin, &generate_python_files(schema));
+        }
+    }
 }

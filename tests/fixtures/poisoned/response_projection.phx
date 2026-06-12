@@ -1,0 +1,23 @@
+// POISONED fixture — intentionally malformed. Preserves repro trigger 3 of 3
+// from the parser error-recovery OOM entry (docs/known-issues.md): a `pick`
+// projection on a `response` type — projections are only supported on `body`
+// types. This hit the memory runaway while authoring social.phx (which
+// declares a dedicated PublicProfile struct as the workaround), but it NO
+// LONGER reproduces on current main: recovery emits a bounded diagnostic run
+// and exits non-zero (verified 2026-06-12, including re-introduced into the
+// full social.phx).
+//
+// Guarded by an un-`#[ignore]`d test in
+// crates/phoenix-driver/tests/gen_schema_fixtures.rs that asserts the clean
+// rejection STAYS clean. Do NOT rewrite the response as a dedicated struct —
+// preserving the once-pathological input is the point.
+
+struct User {
+    String id where self.length > 0
+    String email where self.contains("@")
+    String passwordHash where self.length > 0
+}
+
+endpoint getPublicUser: GET "/users/{id}" {
+    response User pick { id, email }
+}

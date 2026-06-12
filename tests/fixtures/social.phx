@@ -1,0 +1,536 @@
+// Phoenix Gen — a realistic Social Network API
+//
+// MODELING NOTES (Phoenix Gen has no native DateTime/UUID/bytes types):
+//   * All ids are opaque `String`s (no native UUID type)
+//   * All timestamps are Unix epoch SECONDS as `Int` (no native DateTime type)
+//   * Counts (followers, likes, comments) are non-negative `Int`s
+//   * No native Money/Decimal/bytes types are needed by this domain
+//
+// Resource shape: users -> posts -> comments, plus follow graph and an
+// aggregated home feed. Heavy use of omit/pick/partial derivations, both
+// cursor and offset pagination, request + response headers, multi-status
+// responses, and a `/v1` versioned slice.
+
+// ── Domain enums (simple unit-variant only — payload enums are skipped by
+//    the Go/Python generators, so we keep these flat) ──────────────
+
+/** Who can see a post or profile field */
+enum Visibility { Public  Followers  Private }
+
+/** Lifecycle state of a post */
+enum PostState { Draft  Published  Archived  Removed }
+
+/** A reaction kind on a post or comment (kind/category are NOT reserved) */
+enum ReactionKind { Like  Love  Laugh  Sad  Angry }
+
+/** Direction a relationship can be queried in */
+enum FollowState { Pending  Accepted  Blocked }
+
+// ── Domain structs ────────────────────────────────────────────
+
+/** A user account and public-ish profile */
+struct User {
+    /** Opaque user id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Unique handle, e.g. "ada" — no leading @, 1..30 chars */
+    String username where self.length > 0 && self.length <= 30
+    /** Human display name */
+    String displayName where self.length > 0 && self.length <= 80
+    /** Contact email (kept private; never exposed on the public profile pick) */
+    String email where self.contains("@") && self.length > 3
+    /** Free-form bio/about text */
+    String bio where self.length <= 280
+    /** Avatar image URL, if one has been set */
+    Option<String> avatarUrl where self.length > 0
+    /** Default visibility applied to this user's new posts */
+    Visibility defaultVisibility
+    /** Whether the account has a verified badge */
+    Bool verified
+    /** Number of accounts following this user */
+    Int followerCount where self >= 0
+    /** Number of accounts this user follows */
+    Int followingCount where self >= 0
+    /** Account creation time, Unix epoch SECONDS (no native DateTime type) */
+    Int createdAt where self >= 0
+}
+
+/** A post authored by a user */
+struct Post {
+    /** Opaque post id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Id of the authoring user */
+    String authorId where self.length > 0
+    /** Post text content */
+    String content where self.length > 0 && self.length <= 5000
+    /** Hashtags extracted from the content (without the leading #) */
+    List<String> tags
+    /** Media attachment URLs in display order */
+    List<String> mediaUrls
+    /** Who can see this post */
+    Visibility visibility
+    PostState state
+    /** Number of likes/reactions across all kinds */
+    Int reactionCount where self >= 0
+    /** Number of top-level + threaded comments */
+    Int commentCount where self >= 0
+    /** Number of times reshared */
+    Int repostCount where self >= 0
+    /** Id of the post this one reshares, if it is a repost */
+    Option<String> repostOfId where self.length > 0
+    /** Creation time, Unix epoch SECONDS (no native DateTime type) */
+    Int createdAt where self >= 0
+    /** Last edit time, Unix epoch SECONDS; absent if never edited */
+    Option<Int> editedAt
+    /** Arbitrary key/value annotations attached by the client */
+    Map<String, String> annotations
+}
+
+/** A comment on a post; threaded via an optional parent comment id */
+struct Comment {
+    /** Opaque comment id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Post this comment belongs to */
+    String postId where self.length > 0
+    /** Author of the comment */
+    String authorId where self.length > 0
+    /** Comment text */
+    String content where self.length > 0 && self.length <= 2000
+    /** Parent comment id for threaded replies; absent for top-level comments */
+    Option<String> parentId where self.length > 0
+    /** Number of reactions on this comment */
+    Int reactionCount where self >= 0
+    /** Creation time, Unix epoch SECONDS (no native DateTime type) */
+    Int createdAt where self >= 0
+}
+
+/** A directed follow relationship between two users */
+struct Follow {
+    /** The user who initiated the follow */
+    String followerId where self.length > 0
+    /** The user being followed */
+    String followeeId where self.length > 0
+    FollowState state
+    /** When the follow was created, Unix epoch SECONDS */
+    Int createdAt where self >= 0
+}
+
+/** A reaction placed by a user on a post */
+struct Reaction {
+    /** Opaque reaction id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Post the reaction is on */
+    String postId where self.length > 0
+    /** User who reacted */
+    String userId where self.length > 0
+    /** `kind` is not a reserved word, so it's used directly as the field name */
+    ReactionKind kind
+    /** When the reaction was placed, Unix epoch SECONDS */
+    Int createdAt where self >= 0
+}
+
+/** A single entry in an aggregated home feed: a post plus a denormalized
+ *  snapshot of its author, so feed clients render without an extra lookup */
+struct FeedItem {
+    Post post
+    User author
+    /** Why this item surfaced, e.g. "followed", "reposted_by_followed" */
+    String reason where self.length > 0
+    /** Whether the requesting user has already reacted to this post */
+    Bool reactedByMe
+}
+
+/** A public-facing profile projection: the safe subset of `User` exposed to
+ *  anyone, deliberately excluding the private email and the internal
+ *  default-visibility setting. (Phoenix Gen has no `response ... pick`, so a
+ *  read-only projection like this is modeled as its own struct) */
+struct PublicProfile {
+    String id where self.length > 0
+    String username where self.length > 0 && self.length <= 30
+    String displayName where self.length > 0 && self.length <= 80
+    String bio where self.length <= 280
+    Option<String> avatarUrl where self.length > 0
+    Bool verified
+    Int followerCount where self >= 0
+    Int followingCount where self >= 0
+}
+
+/** Engagement totals for a user's account, surfaced on a stats endpoint */
+struct UserStats {
+    String userId where self.length > 0
+    Int totalPosts where self >= 0
+    Int totalReactionsReceived where self >= 0
+    Int totalCommentsReceived where self >= 0
+    Int followerCount where self >= 0
+    Int followingCount where self >= 0
+}
+
+// ── User endpoints ────────────────────────────────────────────
+
+/** Register a new user. Server assigns id, counts, verified flag and
+ *  createdAt, so those are omitted from the create body */
+endpoint createUser: POST "/users" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    body User omit { id, verified, followerCount, followingCount, createdAt }
+    response User
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Conflict(409)
+    }
+}
+
+/** Fetch a user's full account record (self or admin view) */
+endpoint getUser: GET "/users/{id}" {
+    headers {
+        String authorization
+    }
+    response User
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Public profile view: returns the safe `PublicProfile` projection, which
+ *  excludes the private email and the internal default-visibility setting */
+endpoint getPublicProfile: GET "/users/{id}/profile" {
+    response PublicProfile
+    error { NotFound(404) }
+}
+
+/** Patch the authenticated user's profile. Every supplied field is optional
+ *  (partial over a picked subset of mutable fields) */
+endpoint updateProfile: PATCH "/users/{id}" {
+    headers {
+        String authorization
+    }
+    body User pick { displayName, bio, avatarUrl, defaultVisibility } partial
+    response User
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Search users by handle/name (offset-paginated) */
+endpoint searchUsers: GET "/users" {
+    query {
+        Option<String> q
+        Int page = 1
+        Int limit = 20
+        Bool verifiedOnly = false
+    }
+    response List<User>
+    pagination { offset }
+}
+
+/** Aggregate engagement stats for a user */
+endpoint getUserStats: GET "/users/{id}/stats" {
+    headers {
+        String authorization
+    }
+    response UserStats
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+// ── Follow graph endpoints ────────────────────────────────────
+
+/** Follow a user. Returns 201 when a new follow is created, 200 when the
+ *  follow already existed (idempotent replay). Both carry the same Follow
+ *  body (multi-status block — typed entries share one type) */
+endpoint followUser: POST "/users/{id}/follow" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    response {
+        200: Follow
+        201: Follow
+    }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+        Forbidden(403)
+    }
+}
+
+/** Unfollow a user. 204 on success, 404 if no such follow existed */
+endpoint unfollowUser: DELETE "/users/{id}/follow" {
+    headers {
+        String authorization
+    }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** List a user's followers (cursor-paginated — the follower graph is large
+ *  and append-only, so cursors beat offsets here) */
+endpoint listFollowers: GET "/users/{id}/followers" {
+    query {
+        Option<String> cursor
+        Int limit = 50
+    }
+    response List<User>
+    pagination { cursor }
+    error { NotFound(404) }
+}
+
+/** List the accounts a user follows (cursor-paginated) */
+endpoint listFollowing: GET "/users/{id}/following" {
+    query {
+        Option<String> cursor
+        Int limit = 50
+    }
+    response List<User>
+    pagination { cursor }
+    error { NotFound(404) }
+}
+
+// ── Post endpoints ────────────────────────────────────────────
+
+/** Create a post. The server assigns id, counts and timestamps, and derives
+ *  the author from auth, so all of those are omitted */
+endpoint createPost: POST "/posts" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+        Option<String> trace as "X-Trace-Id"
+    }
+    body Post omit { id, authorId, reactionCount, commentCount, repostCount, createdAt, editedAt }
+    response Post
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+    }
+}
+
+/** Fetch a single post, metered: request carries auth + a conditional
+ *  If-None-Match, and the response surfaces rate-limit + cache headers */
+endpoint getPost: GET "/posts/{id}" {
+    headers {
+        String authorization
+        Option<String> ifNoneMatch as "If-None-Match"
+        Int maxStale = 30
+    }
+    response Post headers {
+        Int ratelimitRemaining as "X-RateLimit-Remaining"
+        Option<String> etag as "ETag"
+    }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Edit a post's mutable fields. Every field is optional (partial over a
+ *  picked subset — counts and ids are not editable) */
+endpoint editPost: PATCH "/posts/{id}" {
+    headers {
+        String authorization
+    }
+    body Post pick { content, tags, mediaUrls, visibility, state } partial
+    response Post
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Delete a post. 204 on success */
+endpoint deletePost: DELETE "/posts/{id}" {
+    headers {
+        String authorization
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** List a user's posts (offset-paginated), optionally filtered by state */
+endpoint listUserPosts: GET "/users/{id}/posts" {
+    query {
+        Int page = 1
+        Int limit = 20
+        Option<String> stateFilter
+    }
+    response List<Post>
+    pagination { offset }
+    error { NotFound(404) }
+}
+
+// ── Comment endpoints (nested under posts) ────────────────────
+
+/** Add a comment to a post. Server assigns id, count and createdAt; postId is
+ *  taken from the path; parentId stays for threaded replies */
+endpoint createComment: POST "/posts/{postId}/comments" {
+    headers {
+        String authorization
+    }
+    body Comment omit { id, postId, reactionCount, createdAt }
+    response Comment
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** List a post's comments (cursor-paginated for deep threads) */
+endpoint listComments: GET "/posts/{postId}/comments" {
+    query {
+        Option<String> cursor
+        Int limit = 50
+        // When set, return only replies under this parent comment
+        Option<String> parentId
+    }
+    response List<Comment>
+    pagination { cursor }
+    error { NotFound(404) }
+}
+
+/** Delete a comment. 204 on success */
+endpoint deleteComment: DELETE "/posts/{postId}/comments/{commentId}" {
+    headers {
+        String authorization
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+// ── Reaction endpoints ────────────────────────────────────────
+
+/** React to a post. Idempotent per (user, post): 201 on a new reaction,
+ *  200 when the reaction kind was updated on an existing reaction */
+endpoint reactToPost: POST "/posts/{postId}/reactions" {
+    headers {
+        String authorization
+    }
+    body Reaction omit { id, postId, userId, createdAt }
+    response {
+        200: Reaction
+        201: Reaction
+    }
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Remove the authenticated user's reaction from a post. 204 on success */
+endpoint removeReaction: DELETE "/posts/{postId}/reactions" {
+    headers {
+        String authorization
+    }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** List who reacted to a post (offset-paginated) */
+endpoint listReactions: GET "/posts/{postId}/reactions" {
+    query {
+        Int page = 1
+        Int limit = 20
+        // Filter to a single reaction kind, e.g. "Like"
+        Option<String> reactionKind
+    }
+    response List<Reaction>
+    pagination { offset }
+    error { NotFound(404) }
+}
+
+// ── Aggregated home feed (fan-out across followed users) ──────
+
+/** The authenticated user's home timeline: a cursor-paginated, denormalized
+ *  feed aggregating posts from everyone they follow plus reshares. NOTE:
+ *  pagination + response-headers can't co-occur on one endpoint (both wrap the
+ *  return value in a generated envelope), so this paginated feed cannot also
+ *  carry rate-limit headers — see the type-system-gaps note in
+ *  design-decisions.md */
+endpoint getHomeFeed: GET "/feed" {
+    headers {
+        String authorization
+    }
+    query {
+        Option<String> cursor
+        Int limit = 30
+        // Drop reposts, show only original posts
+        Bool originalsOnly = false
+    }
+    response List<FeedItem>
+    pagination { cursor }
+    error { Unauthorized(401) }
+}
+
+/** The public/explore feed: trending public posts (offset-paginated, no auth
+ *  required). Demonstrates an unauthenticated aggregated listing */
+endpoint getExploreFeed: GET "/explore" {
+    query {
+        Int page = 1
+        Int limit = 30
+        Option<String> tag
+    }
+    response List<FeedItem>
+    pagination { offset }
+}
+
+// ── API versioning (v1 path-prefix block) ─────────────────────
+
+/** A versioned slice: everything here is served under the `/v1` prefix */
+api version "v1" {
+    /** A trimmed mention-suggestion lookup: returns lightweight profile picks
+     *  for the typeahead, capped and cursor-paginated */
+    endpoint suggestMentions: GET "/users/suggest" {
+        headers {
+            String authorization
+        }
+        query {
+            String prefix
+            Option<String> cursor
+            Int limit = 8
+        }
+        response List<User>
+        pagination { cursor }
+        error { Unauthorized(401) }
+    }
+
+    /** Bulk-fetch reaction summaries for a batch of posts: post ids arrive as
+     *  a comma-separated query param (no native list-valued query params, so
+     *  the handler splits the string). Returns rate-limit headers so clients
+     *  can pace their batches — a non-paginated List response CAN carry a
+     *  response-header envelope (only pagination excludes it) */
+    endpoint batchReactionCounts: GET "/posts/reaction-summary" {
+        headers {
+            String authorization
+        }
+        query {
+            String postIds
+        }
+        response List<Post> headers {
+            Int ratelimitRemaining as "X-RateLimit-Remaining"
+            Option<String> requestId as "X-Request-Id"
+        }
+        error {
+            Unauthorized(401)
+            NotFound(404)
+        }
+    }
+}

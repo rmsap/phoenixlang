@@ -30,7 +30,7 @@
 mod common;
 
 use common::compiled_fixtures::build_fixture;
-use std::os::unix::process::CommandExt;
+use common::rlimit::cap_address_space;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
@@ -86,18 +86,7 @@ fn run_under_rlimit(fixture: &str, expected_stdout: &str) {
     let limit_bytes = rlimit_bytes();
 
     let mut cmd = Command::new(&bin.0);
-    unsafe {
-        cmd.pre_exec(move || {
-            let rlim = libc::rlimit {
-                rlim_cur: limit_bytes,
-                rlim_max: limit_bytes,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &rlim) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    cap_address_space(&mut cmd, limit_bytes);
 
     let output = cmd
         .output()

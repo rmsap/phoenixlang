@@ -1,0 +1,334 @@
+// Phoenix Gen — a realistic Payments API
+//
+// MONEY MODELING NOTE: Phoenix Gen has no native Money/Decimal type, so all
+// monetary amounts are modeled as `Int` minor units (e.g. cents for USD).
+// Every amount field below is documented as "minor units". There is also no
+// native DateTime/timestamp, UUID, or bytes type, so timestamps are Unix epoch
+// seconds (`Int`) and IDs are opaque `String`s.
+
+// ── Domain types ──────────────────────────────────────────────
+
+/** A processing status for a charge or refund */
+enum PaymentStatus { Pending  Succeeded  Failed  Refunded }
+
+/** Supported card networks (simple unit enum so it codegens on all targets) */
+enum CardBrand { Visa  Mastercard  Amex  Discover }
+
+/** Currency, as ISO-4217 alpha codes. No native currency type exists */
+enum Currency { USD  EUR  GBP  JPY }
+
+/** A tokenized payment card. PANs are never modeled here — only the last four
+ *  and brand, as returned by the vault */
+struct Card {
+    /** Opaque card token id (no native UUID type — using String) */
+    String id where self.length > 0
+    CardBrand brand
+    String last4 where self.length == 4
+    /** Expiry month, 1..12 */
+    Int expMonth where self >= 1 && self <= 12
+    /** Expiry year, full 4-digit */
+    Int expYear where self >= 2000
+}
+
+/** A customer record */
+struct Customer {
+    /** Opaque customer id (no native UUID type — using String) */
+    String id where self.length > 0
+    String name where self.length > 0 && self.length <= 200
+    String email where self.contains("@") && self.length > 3
+    /** Default card token, if the customer has one on file */
+    Option<String> defaultCardId
+}
+
+/** A charge against a customer's payment method */
+struct Charge {
+    /** Opaque charge id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Customer the charge belongs to */
+    String customerId where self.length > 0
+    /** Amount in MINOR UNITS (e.g. cents). No native Money/Decimal type */
+    Int amount where self >= 0
+    Currency currency
+    PaymentStatus status
+    /** Free-form, human-readable description */
+    String description where self.length <= 500
+    /** The card snapshot used for this charge */
+    Card card
+    /** Whether funds have been captured (vs. auth-only) */
+    Bool captured
+    /** Creation time as Unix epoch SECONDS. No native DateTime type */
+    Int createdAt where self >= 0
+    /** Arbitrary key/value metadata attached at creation */
+    Map<String, String> metadata
+}
+
+/** A refund issued against a prior charge */
+struct Refund {
+    /** Opaque refund id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** The charge being refunded */
+    String chargeId where self.length > 0
+    /** Amount refunded in MINOR UNITS. No native Money/Decimal type */
+    Int amount where self >= 0
+    Currency currency
+    PaymentStatus status
+    /** Optional reason code/string */
+    Option<String> reason where self.length > 0
+    /** Creation time as Unix epoch SECONDS. No native DateTime type */
+    Int createdAt where self >= 0
+}
+
+/** A line-item breakdown used when quoting an itemized charge */
+struct LineItem {
+    String label where self.length > 0 && self.length <= 200
+    /** Unit price in MINOR UNITS. No native Money/Decimal type */
+    Int unitAmount where self >= 0
+    Int quantity where self >= 1
+}
+
+/** Request body for an itemized charge quote: the line items to total plus
+ *  the charge context the preview is computed against. The `List<LineItem>`
+ *  field exercises list-of-struct fields in a body position */
+struct QuoteRequest {
+    String customerId where self.length > 0
+    Currency currency
+    /** The items to total */
+    List<LineItem> items
+    /** Optional free-form note carried onto the quoted charge preview */
+    Option<String> description where self.length <= 500
+}
+
+// ── Customer endpoints ────────────────────────────────────────
+
+/** Create a customer. Idempotency-Key header protects against double-submit */
+endpoint createCustomer: POST "/customers" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    body Customer omit { id }
+    response Customer
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Conflict(409)
+    }
+}
+
+/** Fetch a customer by id */
+endpoint getCustomer: GET "/customers/{id}" {
+    headers {
+        String authorization
+    }
+    response Customer
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** List customers (cursor-paginated) */
+endpoint listCustomers: GET "/customers" {
+    headers {
+        String authorization
+    }
+    query {
+        Option<String> cursor
+        Int limit = 20
+        Option<String> q
+    }
+    response List<Customer>
+    pagination { cursor }
+    error { Unauthorized(401) }
+}
+
+// ── Charge endpoints ──────────────────────────────────────────
+
+/** Create a charge. Idempotency-Key protects against duplicate charges */
+endpoint createCharge: POST "/charges" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+        Option<String> trace as "X-Trace-Id"
+    }
+    body Charge omit { id, status, captured, createdAt, card }
+    response Charge
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        CardDeclined(402)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Create-or-get a charge by idempotency key: returns 201 when newly created,
+ *  200 when an existing charge is returned for a replayed key. Both carry the
+ *  same Charge body (multi-status block — all typed entries share one type) */
+endpoint createOrGetCharge: POST "/charges/idempotent" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    body Charge omit { id, status, captured, createdAt, card }
+    response {
+        200: Charge
+        201: Charge
+    }
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        CardDeclined(402)
+        Conflict(409)
+    }
+}
+
+/** Fetch a charge by id */
+endpoint getCharge: GET "/charges/{id}" {
+    headers {
+        String authorization
+    }
+    response Charge
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** List charges (offset-paginated), optionally filtered by customer/status */
+endpoint listCharges: GET "/charges" {
+    headers {
+        String authorization
+    }
+    query {
+        Int page = 1
+        Int limit = 20
+        Option<String> customerId
+        Bool capturedOnly = false
+    }
+    response List<Charge>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+/** Capture a previously authorized (auth-only) charge. May capture a smaller
+ *  amount than authorized. Returns rate-limit info via response headers */
+endpoint captureCharge: POST "/charges/{id}/capture" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    query {
+        Option<Int> amount
+    }
+    response Charge headers {
+        Int ratelimitRemaining as "X-RateLimit-Remaining"
+        Option<String> requestId as "X-Request-Id"
+    }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Refund endpoints ──────────────────────────────────────────
+
+/** Issue a refund against a charge. Idempotency-Key protects against
+ *  duplicate refunds */
+endpoint createRefund: POST "/refunds" {
+    headers {
+        String authorization
+        String idemKey as "Idempotency-Key"
+    }
+    body Refund omit { id, status, createdAt }
+    response Refund
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Fetch a refund by id */
+endpoint getRefund: GET "/refunds/{id}" {
+    headers {
+        String authorization
+    }
+    response Refund
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** List refunds for a charge (offset-paginated) */
+endpoint listRefunds: GET "/charges/{chargeId}/refunds" {
+    headers {
+        String authorization
+    }
+    query {
+        Int page = 1
+        Int limit = 20
+    }
+    response List<Refund>
+    pagination { offset }
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+// ── Card management (pick for a lightweight update) ────────────
+
+/** Attach/update the customer's default card token. Only the default card is
+ *  editable here; everything else is read-only */
+endpoint setDefaultCard: PATCH "/customers/{id}/default-card" {
+    headers {
+        String authorization
+    }
+    body Customer pick { defaultCardId }
+    response Customer
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+// ── API versioning (v1 path-prefix block) ─────────────────────
+
+/** A versioned slice: everything here is served under the `/v1` prefix */
+api version "v1" {
+    /** Itemized quote: compute a charge total from line items without
+     *  persisting anything. Returns the computed Charge preview */
+    endpoint quoteCharge: POST "/charges/quote" {
+        headers {
+            String authorization
+        }
+        body QuoteRequest
+        response Charge
+        error {
+            ValidationError(400)
+            Unauthorized(401)
+        }
+    }
+
+    /** List a customer's saved cards */
+    endpoint listCards: GET "/customers/{id}/cards" {
+        headers {
+            String authorization
+        }
+        query {
+            Int page = 1
+            Int limit = 20
+        }
+        response List<Card>
+        pagination { offset }
+        error {
+            Unauthorized(401)
+            NotFound(404)
+        }
+    }
+}

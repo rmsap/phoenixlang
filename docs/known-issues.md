@@ -152,6 +152,209 @@ The server-side default is still meaningful for **external / non-Phoenix callers
 
 ## Bugs
 
+### Parser error-recovery allocates pathologically (OOM) on several malformed inputs
+
+The parser's error-recovery path can balloon memory to the point of OOM (measured
+**662 MB → 1 GB+** allocation-failure on small ~300-line schemas, vs **~9 MB** for
+a well-formed one — a ~75×+ blowup, enough to thrash/freeze a memory-constrained
+box, notably WSL2 where the ballooned VM is slow to return RAM to the host).
+This is a **product bug, not just a test issue** — it fires on `phoenix check`
+and `phoenix gen` alike, on natural mistakes a real user would make.
+
+It is **NOT one specific construct** — multiple distinct malformed inputs
+trigger the same runaway, which points at a shared root cause in error recovery
+(the parser hits something unexpected and recovers by allocating without making
+forward progress). Triggers found while authoring the fixture library, each
+preserved as a minimal committed repro in `tests/fixtures/poisoned/`:
+
+1. **A reserved keyword in identifier position** — e.g. a struct field named
+   `type` or `headers` (`EventType type`, `Map<String,String> headers`). Found in
+   `webhooks.phx`. Both are natural field names. STILL REPRODUCES — the committed
+   repro (`poisoned/keyword_field.phx`) preserves the `type` variant; any entry
+   in `phoenix-lexer`'s `KEYWORDS` triggers it the same way.
+2. **A `/** ... */` doc comment INSIDE a `query { }` block** — even with no
+   keyword involved. Found in `social.phx` (doc comments on query params). Using a
+   `//` line comment instead avoids it. STILL REPRODUCES
+   (`poisoned/doc_comment_in_query.phx`).
+3. **An invalid response projection** like `response User pick { ... }` (inline
+   `pick`/`omit` on a `response` type is not supported) — the parse error's
+   recovery cascaded into the same blowup when found in `social.phx`
+   (2026-06-09). **No longer reproduces as of 2026-06-12**: recovery now emits
+   a bounded diagnostic run and exits, even with the projection re-introduced
+   into the full social.phx — likely fixed incidentally by the recent
+   endpoint-parser changes (multi-status / pagination / api blocks). Kept as
+   an un-ignored regression test (`poisoned/response_projection.phx`).
+
+**Workaround(s):** avoid keyword field names (the keyword list is in
+`phoenix-lexer`'s `KEYWORDS`); don't put `/** */` doc comments inside `query { }`
+blocks (use `//`); don't use `omit`/`pick` on a `response` type. But the real fix
+is in the parser.
+**Planned fix:** bound error recovery so any unexpected/invalid token emits one
+diagnostic and *advances the cursor*, rather than re-attempting a parse from the
+same position and accumulating error/AST state. A single fix likely closes
+the remaining (and any undiscovered) triggers at once. The repro inputs are
+committed as `tests/fixtures/poisoned/` (one minimal schema per trigger),
+guarded by tests in `phoenix-driver`'s `gen_schema_fixtures.rs`: the
+still-live triggers are `#[ignore]`d — un-ignore them with the fix so they
+become its regression tests (they assert a prompt non-zero exit with a
+diagnostic, not death by rlimit/timeout); the already-recovered trigger 3
+runs un-ignored today.
+**Target phase:** should be PRIORITIZED — it is a denial-of-service-shaped footgun
+in the shipping product. Surfaced 2026-06-09.
+
+### `where` constraints behave inconsistently on `Option<T>` — and `.length` constraints are never actually type-checked
+
+Observed behavior: a `.length` constraint on an `Option<String>` is accepted
+(`Option<String> reason where self.length > 0` passes `phoenix check`), but
+`.contains(...)` on an `Option<String>` and a numeric comparison on an
+`Option<Int>` (`Option<Int> code where self >= 100`) are both **rejected** (the
+latter with "cannot compare `Option<Int>` and `Int` with `>=`"). A user
+reasonably expects all three to behave the same way.
+
+The real split is NOT string-vs-numeric, it is **field access vs
+method-call/comparison**. `self.length` (no parens) parses as a *field access*,
+and field access on a non-struct base type silently type-checks as an error type
+with no diagnostic (see the entry "Field access on a built-in (non-struct) type
+silently type-checks as an error type" — that bug is the root cause here). The
+binary-op checker then short-circuits on the error type and the constraint
+validator skips its Bool requirement for error types, so the `.length`
+constraint is **silently unvalidated**, not "unwrapped to the inner `String`".
+Consequences:
+
+- `Option<Int> code where self.length > 0` is accepted too — nonsense, unchecked.
+- No `.length` constraint anywhere — including on plain `String` fields — is
+  actually type-checked by sema; it is only meaningful because codegen renders
+  it. (Generated output for the existing `.length` constraints is correct, so
+  this is a checking gap, not a miscompile.)
+- `.contains(...)` (a real method call) and numeric comparisons go through the
+  method-dispatch / binary-op paths, which type-check for real and loudly
+  reject `Option<T>` receivers.
+
+**Workaround:** drop the constraint on the optional field, or make the field
+non-optional. **Planned fix:** two parts — (1) unwrap `Option<T>` to `T` when
+type-checking a field constraint's `self`, so `.contains` and numeric
+comparisons work on optionals; (2) close the silent field-access hole (the
+"Field access on a built-in (non-struct) type" entry) and recognize `.length`
+as a property of `String` during constraint checking, so `.length` constraints
+are genuinely validated. Note that (1) alone does NOT make `.length` checked —
+without (2) it stays silently unvalidated.
+**Target phase:** demand-triggered for (1); (2) should ride along with any sema
+work since it also swallows constraint typos — but see the ordering constraint
+in that entry: landing (2) without (1) (or without an `Option<String>`
+special case) turns the fixture-library gate red. Surfaced 2026-06-09.
+
+### Field access on a built-in (non-struct) type silently type-checks as an error type — no diagnostic
+
+`check_field_access` (`phoenix-sema/src/check_expr.rs`) only knows struct
+fields. For any non-struct base type (`String`, `Int`, `Option<...>`,
+`List<...>`, …) the struct lookup fails and the function falls through to
+`return Type::Error` **without emitting a diagnostic**. Downstream checks
+(binary ops, the field-constraint Bool requirement) deliberately go quiet on
+error types to avoid diagnostic cascades, so the mistake never surfaces.
+
+Concrete consequence: a constraint typo like `String name where self.lenght > 0`
+passes `phoenix check` silently and lands in the constraint AST the generators
+consume. It is also the root cause of the inconsistency described in the
+"`where` constraints behave inconsistently on `Option<T>`" entry — `.length`
+constraints are accepted everywhere because they are never checked at all.
+
+**Workaround:** none — there is no signal that anything was skipped.
+**Planned fix:** emit a diagnostic from `check_field_access` when the base type
+is not a struct (or the struct lacks the field), and special-case the
+schema-constraint property `.length` on `String` so the established
+`self.length` constraint style still checks clean. Add a regression test that a
+misspelled constraint field is rejected. **Ordering constraint:** the fixture
+library leans heavily on `Option<String> x where self.length > 0`-style
+constraints (accepted today only because of this hole), so this fix must also
+special-case `.length` on `Option<String>` — or land together with part (1) of
+the `Option<T>` entry (unwrap `Option<T>` for constraint `self`) — otherwise
+every `gen_schema_fixtures` test goes red the moment the diagnostic lands.
+**Target phase:** with the `Option<T>` constraint fix.
+Surfaced 2026-06-12 while reviewing the fixture library.
+
+### Go generator doubles a trailing period in doc comments
+
+The Go generator unconditionally appends `.` when rendering a struct/field/endpoint
+doc comment into a `// ...` Go comment. A Phoenix doc comment that already ends in
+a period therefore renders with `..` (e.g. `/** Fetch a charge by id. */` →
+`// Fetch a charge by id..`). It is cosmetic — the generated Go still compiles and
+`gofmt` accepts it — but `..` is sloppy output and would be flagged by some
+doc-style linters. Only Go does this; the other targets do not append a period.
+
+It did not surface earlier because `gen_api.phx` never ends a doc comment with a
+period; `payments.phx` exposed it while being authored. The committed
+`payments.phx` has since been normalized to the omit-the-period workaround, so
+**the live in-tree repro is `internal_admin.phx`**, whose doc comments end with
+sentence periods (e.g. `/** Change an account's role. Lightweight pick body. */`).
+
+**File:** `phoenix-codegen/src/go.rs` (the doc-comment rendering site that appends
+`.`). **Workaround:** omit the trailing period in `.phx` doc comments.
+**Planned fix:** append `.` only when the comment does not already end in
+sentence-ending punctuation (`.`/`!`/`?`). **Target phase:** small, do opportunistically.
+Surfaced 2026-06-09.
+
+### Go client: a query/header param named `q` collides with the generated `q := url.Values{}`
+
+The Go client builds the query string with a hardcoded local `q := url.Values{}`.
+If an endpoint declares a **query param (or header) named `q`** — a very common
+name for a search query — the generated code emits two `q`s, producing
+`no new variables on left side of :=` and a cascade of type errors
+(`q.Set undefined (type *string ...)`). The generated Go does **not compile**.
+
+Found by `payments.phx` (`listCustomers` has `Option<String> q`). Same class as
+the TypeScript `body`/`responseBody` collision fixed for multi-status: a generated
+local clashes with a user-chosen identifier. **File:** `phoenix-codegen/src/go.rs`
+(client query-string assembly). **Workaround:** rename the query param (e.g.
+`query` is a keyword so avoid it; use `search`/`term`). **Planned fix:** name the
+generated query-builder local something that can't collide (e.g. `_q` /
+`queryValues`), or uniquify it against the endpoint's param names. **Target phase:**
+should fix — it's a compile-breaking collision on a common param name. Surfaced
+2026-06-09 by the fixture library.
+**On close:** one of the three bugs gating the fixture library out of the
+default compile-and-lint run — see the close-out instruction on `FILE_FIXTURES`
+in `phoenix-codegen`'s `compiles_and_lints.rs` (the canonical copy).
+
+### TypeScript client: an optional param emitted before a required one (TS1016)
+
+The TypeScript client method signature lists params in a fixed order
+(path params, then body, then query/header object, etc.); for some endpoint
+shapes this places an **optional** parameter before a **required** one, which
+`tsc` rejects with `TS1016: A required parameter cannot follow an optional
+parameter`. The generated TypeScript does **not compile**.
+
+Found by `payments.phx` (5 endpoints hit it). The trigger is param ordering —
+an optional earlier param (e.g. an optional header such as `X-Trace-Id`) emitted
+before a required later one in the generated signature; pin down the precise
+slot interaction when fixing. **File:** `phoenix-codegen/src/typescript.rs` (client
+method signature assembly). **Workaround:** none clean at the schema level (it's
+ordering, not naming). **Planned fix:** order generated params so all required
+ones precede all optional ones (TypeScript's rule), or give every optional param a
+default so the "optional" no longer violates ordering. **Target phase:** should
+fix — compile-breaking. Surfaced 2026-06-09 by the fixture library.
+**On close:** one of the three bugs gating the fixture library out of the
+default compile-and-lint run — see the close-out instruction on `FILE_FIXTURES`
+in `phoenix-codegen`'s `compiles_and_lints.rs` (the canonical copy).
+
+### Python client: generated `client.py` is not always `black`-clean
+
+For some endpoint shapes the Python generator emits a `client.py` that `black
+--check` wants to reformat (the generator's hand-rolled formatting doesn't match
+black in every case). The code is valid and type-checks; it is a formatting-fidelity
+gap, the Python analog of the prettier-wrapping cases already handled for the
+inline schemas — the fixture library's denser shapes reach a layout the generator
+doesn't pre-format correctly. Found by `payments.phx`.
+
+**File:** `phoenix-codegen/src/python.rs` (+ `python/format.rs`) — the client
+method emission. **Workaround:** run `black` on the generated output.
+**Planned fix:** identify the specific construct black rewrites (run
+`black --diff` on the generated `client.py` for payments) and adjust the
+generator to emit black-clean output, as was done for the earlier black/prettier
+wrapping cases. **Target phase:** should fix to hold the "lints clean" bar.
+Surfaced 2026-06-09 by the fixture library.
+**On close:** one of the three bugs gating the fixture library out of the
+default compile-and-lint run — see the close-out instruction on `FILE_FIXTURES`
+in `phoenix-codegen`'s `compiles_and_lints.rs` (the canonical copy).
+
 ### Silent zero substitution on out-of-range integer/float literals
 
 **File:** `phoenix-parser/src/expr.rs`

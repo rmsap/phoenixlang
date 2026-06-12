@@ -1,0 +1,27 @@
+// POISONED fixture — intentionally malformed. `phoenix check` on this file
+// currently balloons memory instead of erroring (parser error-recovery OOM,
+// docs/known-issues.md). This preserves repro trigger 1 of 3: a reserved
+// keyword in identifier position — here a struct field named `type` (any
+// entry in `phoenix-lexer`'s KEYWORDS works; `headers` is another natural
+// field name that hit this while authoring webhooks.phx).
+//
+// Guarded by an `#[ignore]`d test in
+// crates/phoenix-driver/tests/gen_schema_fixtures.rs. Do NOT rename the
+// field to make this file check clean — preserving the trigger is the point.
+
+enum EventType {
+    Created
+    Updated
+    Deleted
+}
+
+struct Event {
+    String id where self.length > 0
+    // `type` is a reserved keyword — the trigger this fixture preserves.
+    EventType type
+    Int createdAt where self >= 0
+}
+
+endpoint getEvent: GET "/events/{id}" {
+    response Event
+}

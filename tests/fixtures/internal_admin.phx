@@ -1,0 +1,790 @@
+// Phoenix Gen — a realistic Internal Admin / Back-Office API
+//
+// This is the DENSEST fixture: wide constraint-heavy structs + many
+// enum-driven state machines + many admin/back-office endpoints. It is the
+// "wide types + constraints" stress fixture.
+//
+// MODELING NOTES (Phoenix Gen has no native DateTime/UUID/bytes/Money types):
+//   * All ids are opaque `String`s (no native UUID type), doc-commented as such
+//   * All timestamps are Unix epoch SECONDS as `Int` (no native DateTime type)
+//   * Monetary figures (e.g. account credit) are `Int` minor units (cents)
+//   * All admin-only endpoints authenticate via the `X-Admin-Token` header
+//
+// Field-naming note: reserved keywords (type/headers/query/where/...) are
+// avoided as field names — the full list is `phoenix-lexer`'s `KEYWORDS`.
+// Lifecycle fields here are named `state` purely by house style; `status` is
+// NOT reserved (sibling fixtures use it freely as a field and query-param name).
+//
+// Doc-comment style note: the sentence-ending periods in this file's doc
+// comments are DELIBERATE — this is the live in-tree repro for the "Go
+// generator doubles a trailing period in doc comments" bug in
+// docs/known-issues.md (payments.phx was normalized to the omit-the-period
+// workaround, so this file is what keeps the repro alive). Do NOT strip the
+// periods to match the other fixtures' style.
+
+// ── Enum-heavy state machines ─────────────────────────────────
+//
+// Variant names are deliberately DUPLICATED across enums (Pending, Rejected,
+// Closed, Failed appear in two enums each) to exercise per-target collision
+// handling — e.g. the Go generator must prefix constants with the enum name
+// (`TicketStateClosed` vs `AccountStateClosed`) or the output won't compile.
+
+/** Lifecycle state of a user account (admin-driven state machine) */
+enum AccountState { Active  Suspended  Banned  Closed  PendingReview }
+
+/** Privilege level granted to an account */
+enum AccountRole { Member  Moderator  Support  Admin  SuperAdmin }
+
+/** Whether an account's email/identity has been verified */
+enum VerificationState { Unverified  Pending  Verified  Rejected }
+
+/** Lifecycle state of a support ticket (state machine) */
+enum TicketState { Open  Triaged  InProgress  Waiting  Resolved  Closed }
+
+/** Triage priority for a support ticket */
+enum TicketPriority { Low  Normal  High  Urgent  Critical }
+
+/** Lifecycle state of a background/admin job (state machine) */
+enum JobState { Queued  Running  Succeeded  Failed  Cancelled  Retrying }
+
+/** Decision rendered by a moderator on a review-queue item */
+enum ReviewDecision { Pending  Approved  Rejected  Escalated  NeedsInfo }
+
+/** Category of content/entity sitting in the review queue */
+enum ReviewKind { UserProfile  PostContent  Comment  Image  Report }
+
+/** Rollout state of a feature flag (state machine) */
+enum FlagState { Off  InternalOnly  Beta  GradualRollout  On  Deprecated }
+
+/** Kind of action recorded in the immutable audit log */
+enum AuditActionKind {
+    AccountSuspended  AccountBanned  AccountReactivated  AccountClosed
+    PasswordReset     Impersonation   RoleChanged        FlagToggled
+    TicketReassigned  JobCancelled    ReviewDecided      DataExported
+}
+
+/** Outcome classification of an audited action */
+enum AuditOutcome { Success  Denied  Failed  Partial }
+
+/** Channel a notification preference applies to */
+enum NotifyChannel { Email  Sms  Push  Webhook }
+
+// ── Wide, constraint-dense structs ────────────────────────────
+
+/** A back-office view of a user account. This is the WIDEST struct (18 fields),
+ *  exercising the constraint-heavy generation path: nearly every scalar field
+ *  carries a `where` clause. */
+struct AdminUser {
+    /** Opaque account id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Login handle, 3..32 chars */
+    String username where self.length >= 3 && self.length <= 32
+    /** Primary email; must look email-ish */
+    String email where self.contains("@") && self.length > 3
+    /** Human display name */
+    String displayName where self.length > 0 && self.length <= 120
+    AccountRole role
+    AccountState state
+    VerificationState verification
+    /** Whether two-factor auth is enabled */
+    Bool twoFactorEnabled
+    /** Country as ISO-3166 alpha-2, exactly 2 chars */
+    String countryCode where self.length == 2
+    /** IETF locale tag, e.g. "en-US" */
+    String locale where self.length >= 2 && self.length <= 12
+    /** Account credit balance in MINOR UNITS (cents). No native Money type */
+    Int creditBalance where self >= 0
+    /** Lifetime support tickets opened (non-negative) */
+    Int ticketCount where self >= 0
+    /** Failed login attempts since last success (0..100) */
+    Int failedLoginCount where self >= 0 && self <= 100
+    /** Account creation time, Unix epoch SECONDS (no native DateTime type) */
+    Int createdAt where self >= 0
+    /** Last successful login time, Unix epoch SECONDS; absent if never */
+    Option<Int> lastLoginAt
+    /** Internal moderator note; absent when none */
+    Option<String> note where self.length > 0
+    /** Arbitrary key/value admin tags attached to the account */
+    Map<String, String> labels
+    /** Free-form list of granted permission scope strings */
+    List<String> scopes
+}
+
+/** A support ticket in the back-office queue (constraint-dense, 14 fields) */
+struct Ticket {
+    /** Opaque ticket id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Account that opened the ticket */
+    String accountId where self.length > 0
+    /** Short subject line */
+    String subject where self.length > 0 && self.length <= 200
+    /** Full ticket body text */
+    String description where self.length > 0
+    TicketState state
+    TicketPriority priority
+    /** Bucketing category, e.g. "billing" */
+    String category where self.length > 0
+    /** Assigned agent account id; absent when unassigned */
+    Option<String> assigneeId where self.length > 0
+    /** Number of back-and-forth messages so far (non-negative) */
+    Int messageCount where self >= 0
+    /** Open time, Unix epoch SECONDS */
+    Int createdAt where self >= 0
+    /** Last-updated time, Unix epoch SECONDS */
+    Int updatedAt where self >= 0
+    /** Resolution time, Unix epoch SECONDS; absent until resolved */
+    Option<Int> resolvedAt
+    /** Searchable free-form tags */
+    List<String> tags
+    /** Whether the reporter has been notified of the latest update */
+    Bool reporterNotified
+}
+
+/** A background/admin job record (state machine + retry metadata, 12 fields) */
+struct AdminJob {
+    /** Opaque job id (no native UUID type — using String) */
+    String id where self.length > 0
+    /** Job kind discriminator, e.g. "reindex-search" */
+    String jobKind where self.length > 0
+    JobState state
+    /** Percentage complete, 0..100 */
+    Int progressPct where self >= 0 && self <= 100
+    /** Retry attempts performed so far (0..10) */
+    Int attempts where self >= 0 && self <= 10
+    /** Max retry attempts allowed (1..10) */
+    Int maxAttempts where self >= 1 && self <= 10
+    /** Enqueue time, Unix epoch SECONDS */
+    Int queuedAt where self >= 0
+    /** Start time, Unix epoch SECONDS; absent until started */
+    Option<Int> startedAt
+    /** Finish time, Unix epoch SECONDS; absent until finished */
+    Option<Int> finishedAt
+    /** Last error message if the job failed; absent otherwise */
+    Option<String> lastError where self.length > 0
+    /** Opaque parameters bag for the job */
+    Map<String, String> params
+    /** Account that triggered the job */
+    String triggeredBy where self.length > 0
+}
+
+/** An item sitting in a moderation review queue (review-decision machine) */
+struct ReviewItem {
+    /** Opaque review-item id (no native UUID type — using String) */
+    String id where self.length > 0
+    ReviewKind kind
+    ReviewDecision decision
+    /** Id of the entity under review (account/post/comment/etc.) */
+    String subjectId where self.length > 0
+    /** Account that submitted/flagged the item */
+    String reportedBy where self.length > 0
+    /** Moderator who rendered the decision; absent while Pending */
+    Option<String> moderatorId where self.length > 0
+    /** Computed risk score, 0..100 */
+    Int riskScore where self >= 0 && self <= 100
+    /** Reason/notes supplied with the report */
+    String reason where self.length > 0 && self.length <= 1000
+    /** Submission time, Unix epoch SECONDS */
+    Int createdAt where self >= 0
+    /** Decision time, Unix epoch SECONDS; absent while Pending */
+    Option<Int> decidedAt
+}
+
+/** A feature flag and its rollout configuration (rollout state machine) */
+struct FeatureFlag {
+    /** Stable flag key, e.g. "new-dashboard" */
+    String flagKey where self.length > 0 && self.length <= 80
+    /** Human-friendly flag name */
+    String name where self.length > 0
+    /** What the flag controls */
+    String description where self.length <= 500
+    FlagState state
+    /** Rollout percentage for GradualRollout, 0..100 */
+    Int rolloutPct where self >= 0 && self <= 100
+    /** Whether the flag is permanent (vs. a temporary experiment) */
+    Bool permanent
+    /** Owning team name */
+    String owningTeam where self.length > 0
+    /** Last toggle time, Unix epoch SECONDS */
+    Int updatedAt where self >= 0
+    /** Explicit allow-list of account ids forced ON */
+    List<String> forcedOnAccounts
+}
+
+/** An immutable audit-log entry recording an admin action */
+struct AuditEntry {
+    /** Opaque audit-entry id (no native UUID type — using String) */
+    String id where self.length > 0
+    AuditActionKind actionKind
+    AuditOutcome outcome
+    /** Admin account that performed the action */
+    String actorId where self.length > 0
+    /** Target entity the action was performed on; absent for global actions */
+    Option<String> targetId where self.length > 0
+    /** Source IP the action came from, as a String (no native IP type) */
+    String sourceIp where self.length > 0
+    /** Action time, Unix epoch SECONDS */
+    Int occurredAt where self >= 0
+    /** Structured key/value detail bag for the action */
+    Map<String, String> details
+}
+
+/** Per-account notification preference row (small struct for pick/partial) */
+struct NotifyPreference {
+    String accountId where self.length > 0
+    NotifyChannel channel
+    Bool enabled
+    /** Quiet-hours start, 0..23 (hour of day) */
+    Int quietHourStart where self >= 0 && self <= 23
+    /** Quiet-hours end, 0..23 (hour of day) */
+    Int quietHourEnd where self >= 0 && self <= 23
+}
+
+/** Aggregate dashboard metrics surfaced on the admin home screen */
+struct AdminDashboard {
+    Int totalAccounts where self >= 0
+    Int suspendedAccounts where self >= 0
+    Int openTickets where self >= 0
+    Int pendingReviews where self >= 0
+    Int runningJobs where self >= 0
+    /** Snapshot time, Unix epoch SECONDS */
+    Int computedAt where self >= 0
+}
+
+/** A pure binary download body: EXACTLY one File field, generating a binary
+ *  streaming download (used by the v2 data-export endpoint below). */
+struct DataExport {
+    File archive
+}
+
+/** Request body for the v2 bulk-suspend endpoint: the accounts to act on plus
+ *  an optional shared reason. Exercises a list-bearing request body inside a
+ *  versioned slice. */
+struct BulkSuspendRequest {
+    /** Account ids to suspend (opaque ids — no native UUID type) */
+    List<String> accountIds
+    /** Optional reason recorded on every resulting suspension */
+    Option<String> reason where self.length > 0
+}
+
+// ── User administration endpoints ─────────────────────────────
+
+/** List/search accounts with rich filters (offset-paginated). The state/role
+ *  filters are plain query strings the handler interprets. */
+endpoint listUsers: GET "/admin/users" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        // line comments only inside query blocks (doc comments are a footgun here)
+        Int page = 1
+        Int limit = 50
+        Option<String> q
+        Option<String> stateFilter
+        Option<String> roleFilter
+        Bool unverifiedOnly = false
+        Bool twoFactorOnly = false
+    }
+    response List<AdminUser>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+/** Fetch a single account by id */
+endpoint getUser: GET "/admin/users/{id}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response AdminUser
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Create an account on a user's behalf (omit server-generated fields) */
+endpoint createUser: POST "/admin/users" {
+    headers {
+        String adminToken as "X-Admin-Token"
+        String idemKey as "Idempotency-Key"
+    }
+    body AdminUser omit {
+        id, state, verification, creditBalance, ticketCount,
+        failedLoginCount, createdAt, lastLoginAt
+    }
+    response AdminUser
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** Edit mutable profile fields. Every supplied field is optional (partial over
+ *  a picked subset — ids, counters and lifecycle state are not editable here) */
+endpoint updateUser: PATCH "/admin/users/{id}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body AdminUser pick { displayName, email, countryCode, locale, note, labels } partial
+    response AdminUser
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Change an account's role. Lightweight pick body. */
+endpoint setUserRole: PATCH "/admin/users/{id}/role" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body AdminUser pick { role }
+    response AdminUser
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Suspend an account: returns 200 with the updated account when newly
+ *  suspended, or 202 (accepted — suspension already queued/applied) with no
+ *  body. Multi-status block exercising a typed + typeless mix. */
+endpoint suspendUser: POST "/admin/users/{id}/suspend" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Option<String> reason
+    }
+    response {
+        200: AdminUser
+        202
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Ban an account (terminal state transition) */
+endpoint banUser: POST "/admin/users/{id}/ban" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Option<String> reason
+    }
+    response AdminUser
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Reactivate a suspended/banned account back to Active */
+endpoint reactivateUser: POST "/admin/users/{id}/reactivate" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response AdminUser
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Force a password reset: returns rate-limit info via response headers. The
+ *  account row is returned so the caller can see the updated state. */
+endpoint forcePasswordReset: POST "/admin/users/{id}/force-password-reset" {
+    headers {
+        String adminToken as "X-Admin-Token"
+        String idemKey as "Idempotency-Key"
+    }
+    response AdminUser headers {
+        Int ratelimitRemaining as "X-RateLimit-Remaining"
+        Option<String> requestId as "X-Request-Id"
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Begin an impersonation session for support purposes. Returns the target
+ *  account plus a short-lived impersonation token via response headers. */
+endpoint impersonateUser: POST "/admin/users/{id}/impersonate" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response AdminUser headers {
+        String impersonationToken as "X-Impersonation-Token"
+        Int expiresAt as "X-Expires-At"
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+/** Delete (hard-close) an account. Returns 204 on success (idempotent). */
+endpoint deleteUser: DELETE "/admin/users/{id}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Support-ticket endpoints (state machine) ──────────────────
+
+/** List tickets (offset-paginated), filterable by state/priority/assignee */
+endpoint listTickets: GET "/admin/tickets" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Int page = 1
+        Int limit = 50
+        Option<String> stateFilter
+        Option<String> priorityFilter
+        Option<String> assigneeId
+        Bool unassignedOnly = false
+    }
+    response List<Ticket>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+/** Fetch a single ticket by id */
+endpoint getTicket: GET "/admin/tickets/{id}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response Ticket
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Reassign a ticket to a different agent (lightweight pick + partial) */
+endpoint reassignTicket: PATCH "/admin/tickets/{id}/assignee" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body Ticket pick { assigneeId, priority } partial { priority }
+    response Ticket
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Transition a ticket's state (e.g. Triaged -> InProgress -> Resolved) */
+endpoint transitionTicket: POST "/admin/tickets/{id}/transition" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body Ticket pick { state }
+    response Ticket
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Review-queue endpoints (moderation decision machine) ──────
+
+/** List items awaiting moderation review (cursor-paginated) */
+endpoint listReviewItems: GET "/admin/reviews" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Option<String> cursor
+        Int limit = 50
+        Option<String> kindFilter
+        Bool pendingOnly = true
+    }
+    response List<ReviewItem>
+    pagination { cursor }
+    error { Unauthorized(401) }
+}
+
+/** Render a decision on a review-queue item (state transition via pick) */
+endpoint decideReview: POST "/admin/reviews/{id}/decide" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body ReviewItem pick { decision, moderatorId } partial { moderatorId }
+    response ReviewItem
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Background-job endpoints (job state machine) ──────────────
+
+/** Enqueue an admin job (omit server-managed lifecycle/timing fields) */
+endpoint createJob: POST "/admin/jobs" {
+    headers {
+        String adminToken as "X-Admin-Token"
+        String idemKey as "Idempotency-Key"
+    }
+    body AdminJob omit {
+        id, state, progressPct, attempts, queuedAt,
+        startedAt, finishedAt, lastError
+    }
+    response AdminJob
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** List jobs (offset-paginated), filterable by kind/state */
+endpoint listJobs: GET "/admin/jobs" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Int page = 1
+        Int limit = 50
+        Option<String> kindFilter
+        Option<String> stateFilter
+        Bool runningOnly = false
+    }
+    response List<AdminJob>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+/** Fetch a single job by id */
+endpoint getJob: GET "/admin/jobs/{id}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response AdminJob
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Cancel a running/queued job: returns 200 with the cancelled job when the
+ *  cancel was applied, or 204 when it was already terminal (idempotent). */
+endpoint cancelJob: POST "/admin/jobs/{id}/cancel" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response {
+        200: AdminJob
+        204
+    }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+/** Retry a failed job (re-queue): returns the re-queued job */
+endpoint retryJob: POST "/admin/jobs/{id}/retry" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response AdminJob
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+        Conflict(409)
+    }
+}
+
+// ── Feature-flag endpoints (rollout state machine) ────────────
+
+/** List all feature flags (offset-paginated) */
+endpoint listFlags: GET "/admin/flags" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Int page = 1
+        Int limit = 100
+        Option<String> stateFilter
+        Bool permanentOnly = false
+    }
+    response List<FeatureFlag>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+/** Fetch a single flag by key */
+endpoint getFlag: GET "/admin/flags/{flagKey}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response FeatureFlag
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Create a feature flag */
+endpoint createFlag: POST "/admin/flags" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body FeatureFlag omit { updatedAt }
+    response FeatureFlag
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        Conflict(409)
+    }
+}
+
+/** Toggle/adjust a flag's rollout state and percentage (partial pick) */
+endpoint toggleFlag: PATCH "/admin/flags/{flagKey}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body FeatureFlag pick { state, rolloutPct, forcedOnAccounts } partial
+    response FeatureFlag
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        Forbidden(403)
+        NotFound(404)
+    }
+}
+
+// ── Notification-preference endpoints ─────────────────────────
+
+/** Fetch an account's notification preferences */
+endpoint listNotifyPrefs: GET "/admin/users/{accountId}/notify-prefs" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response List<NotifyPreference>
+    error {
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+/** Update a single channel preference (partial pick over quiet hours) */
+endpoint updateNotifyPref: PATCH "/admin/users/{accountId}/notify-prefs/{channel}" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    body NotifyPreference pick { enabled, quietHourStart, quietHourEnd } partial
+    response NotifyPreference
+    error {
+        ValidationError(400)
+        Unauthorized(401)
+        NotFound(404)
+    }
+}
+
+// ── Audit-log + dashboard (read-only) ─────────────────────────
+
+/** Immutable audit-log listing (cursor-paginated), filterable by actor/action */
+endpoint listAuditLog: GET "/admin/audit" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    query {
+        Option<String> cursor
+        Int limit = 100
+        Option<String> actorId
+        Option<String> actionFilter
+        Option<String> outcomeFilter
+    }
+    response List<AuditEntry>
+    pagination { cursor }
+    error {
+        Unauthorized(401)
+        Forbidden(403)
+    }
+}
+
+/** Aggregate admin dashboard metrics */
+endpoint getDashboard: GET "/admin/dashboard" {
+    headers {
+        String adminToken as "X-Admin-Token"
+    }
+    response AdminDashboard
+    error { Unauthorized(401) }
+}
+
+// ── API versioning (v2 path-prefix block) ─────────────────────
+
+/** A versioned slice: bulk back-office operations served under `/v2`. */
+api version "v2" {
+    /** Bulk-suspend a set of accounts: the target ids (and an optional shared
+     *  reason) arrive in the request body. Returns 200 with the updated
+     *  dashboard snapshot when applied, or 207-style 202 (accepted — queued)
+     *  when the batch was deferred. Multi-status mixed block. */
+    endpoint bulkSuspendUsers: POST "/admin/users/bulk-suspend" {
+        headers {
+            String adminToken as "X-Admin-Token"
+            String idemKey as "Idempotency-Key"
+        }
+        body BulkSuspendRequest
+        response {
+            200: AdminDashboard
+            202
+        }
+        error {
+            ValidationError(400)
+            Unauthorized(401)
+            Forbidden(403)
+        }
+    }
+
+    /** Export an account's data bundle as a binary download (single-File
+     *  response struct — binary stream, no JSON envelope). */
+    endpoint exportUserData: GET "/admin/users/{id}/export" {
+        headers {
+            String adminToken as "X-Admin-Token"
+        }
+        response DataExport
+        error {
+            Unauthorized(401)
+            Forbidden(403)
+            NotFound(404)
+        }
+    }
+}

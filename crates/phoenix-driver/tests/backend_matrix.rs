@@ -26,11 +26,15 @@
 //! [`compile_wasm_linear.rs`] integration tests and §2.3's
 //! `PHOENIX_REQUIRE_VALGRIND` gate. CI sets it (see ci.yml).
 //!
-//! Two fixture families are excluded: `gen_*.phx` (inputs to
-//! `phoenix gen`, not worth exercising through the matrix) and
-//! `wasm_gc_*.phx` (single-backend smoke inputs for
+//! Three fixture families are excluded: `gen_*.phx` (inputs to
+//! `phoenix gen`, not worth exercising through the matrix), the
+//! realistic schema library that `gen_schema_fixtures.rs` guards
+//! instead, and `wasm_gc_*.phx` (single-backend smoke inputs for
 //! `phoenix-cranelift`'s `compile_wasm_gc.rs`; what they exercise is
 //! already covered here by ordinary fixtures on the wasm32-gc column).
+//! `fixture_inventory.rs` asserts every fixture is claimed by *some*
+//! suite, so a newcomer missing from every list fails there rather
+//! than silently going unguarded.
 //!
 //! One `#[test]` per fixture, generated via `backend_matrix_test!`,
 //! so a failure names the diverging fixture in `cargo test` output

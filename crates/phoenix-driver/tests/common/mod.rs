@@ -7,6 +7,8 @@
 
 pub mod compiled_fixtures;
 pub mod matrix_harness;
+#[cfg(target_os = "linux")]
+pub mod rlimit;
 
 use phoenix_common::span::SourceId;
 use phoenix_interp::interpreter;

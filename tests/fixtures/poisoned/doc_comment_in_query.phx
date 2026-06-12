@@ -1,0 +1,24 @@
+// POISONED fixture — intentionally malformed. `phoenix check` on this file
+// currently balloons memory instead of erroring (parser error-recovery OOM,
+// docs/known-issues.md). This preserves repro trigger 2 of 3: a `/** ... */`
+// doc comment INSIDE a `query { }` block — no keyword involved. A `//` line
+// comment in the same position is fine (that's the workaround the real
+// fixture library uses; this hit while authoring social.phx).
+//
+// Guarded by an `#[ignore]`d test in
+// crates/phoenix-driver/tests/gen_schema_fixtures.rs. Do NOT convert the doc
+// comment to a line comment — preserving the trigger is the point.
+
+struct Item {
+    String id where self.length > 0
+    String name where self.length > 0
+}
+
+endpoint listItems: GET "/items" {
+    query {
+        /** Filter to items owned by this user */
+        Option<String> owner
+        Int limit = 20
+    }
+    response List<Item>
+}
