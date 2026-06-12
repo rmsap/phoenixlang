@@ -1,0 +1,22 @@
+// Reduced-iteration sibling of `gc_loop_carried_ref.phx`, exercising
+// the same non-entry-block parameter rooting: a ref-typed value
+// carried across the loop back-edge as a block parameter must be
+// rooted on every iteration or the accumulated string is swept and
+// the next concat reads freed memory.
+//
+// 2000 iterations of growing-string concat allocate ~2 MB cumulative
+// (sum 1..2000 bytes), crossing the 1-MB auto-collect threshold so
+// the GC still fires while `acc` is the only live root chain — but
+// small enough that the wasm32-gc column finishes promptly under
+// wasmtime's GC, where the full fixture's 50k concats take minutes
+// (host-VM GC throughput). The full fixture keeps the wasm32-gc
+// opt-out; this one runs all five matrix columns.
+function main() {
+  let mut acc: String = ""
+  let mut i: Int = 0
+  while (i < 2000) {
+    acc = acc + "x"
+    i = i + 1
+  }
+  print(acc.length())
+}

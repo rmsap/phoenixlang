@@ -3,21 +3,28 @@
 //! Both `three_backend_matrix.rs` (single-file fixtures) and
 //! `multi_module_matrix.rs` (multi-file projects) assert that every
 //! fixture produces byte-identical stdout under `phoenix run`,
-//! `phoenix run-ir`, `phoenix build` (native), and `phoenix build
-//! --target wasm32-linear` executed under `wasmtime`. The only
+//! `phoenix run-ir`, `phoenix build` (native), `phoenix build
+//! --target wasm32-linear` executed under `wasmtime`, and `phoenix
+//! build --target wasm32-gc` executed under `wasmtime -W gc=y`. The only
 //! per-suite differences are how a fixture *key* maps onto the
 //! filesystem / into diagnostics and whether an `expected.txt` pin
 //! exists — captured in [`MatrixCfg`]. Everything else (process
 //! spawning, temp-bin cleanup, the wasmtime soft-skip gate, the
 //! divergence message) lives here so the two suites can't drift.
 //!
-//! The `wasm32-linear` column is **soft-skipped** when `wasmtime`
+//! Both wasm columns are **soft-skipped** when `wasmtime`
 //! isn't on `$PATH` (a visible warning is printed). Setting
 //! `PHOENIX_REQUIRE_WASMTIME=1` turns the skip into a hard failure —
 //! the same gating shape as the `compile_wasm_linear.rs` integration
 //! tests and §2.3's `PHOENIX_REQUIRE_VALGRIND` gate. CI provisions
 //! `wasmtime` and runs `phoenix-driver` with that var set, so a skip
 //! there means a real regression (see `.github/workflows/ci.yml`).
+//!
+//! The availability probe only checks that `wasmtime` is *present*: a
+//! wasmtime too old to accept `-W gc=y` fails the wasm32-gc column
+//! with a "wasmtime exited non-zero" panic rather than soft-skipping.
+//! That's deliberate (a version check would mask real failures), but
+//! if you hit it locally, upgrade wasmtime.
 
 use std::process::Command;
 use std::sync::OnceLock;
@@ -88,10 +95,11 @@ fn native_bin(cfg: &MatrixCfg, key: &str) -> TempBin {
     ))
 }
 
-fn wasm_bin(cfg: &MatrixCfg, key: &str) -> TempBin {
+fn wasm_bin(cfg: &MatrixCfg, key: &str, target: &str) -> TempBin {
     temp_bin(format!(
-        "{}_wasm_{}_{:?}.wasm",
+        "{}_{}_{}_{:?}.wasm",
         (cfg.bin_stem)(key),
+        target.replace('-', "_"),
         std::process::id(),
         std::thread::current().id(),
     ))
@@ -147,13 +155,19 @@ fn wasmtime_available() -> bool {
     *AVAILABLE.get_or_init(|| Command::new("wasmtime").arg("--version").output().is_ok())
 }
 
-/// Compile via `phoenix build --target wasm32-linear`, run the
-/// resulting `.wasm` under `wasmtime`, and return its stdout. Returns
+/// Compile via `phoenix build --target <target>`, run the resulting
+/// `.wasm` under `wasmtime` (with `wasmtime_args` prepended — the
+/// wasm32-gc column passes `-W gc=y`), and return its stdout. Returns
 /// `None` when `wasmtime` isn't on `$PATH` (soft skip), with a stderr
 /// warning; `PHOENIX_REQUIRE_WASMTIME=1` turns the skip into a panic
 /// instead. The `.wasm` is removed via the [`TempBin`] guard on every
 /// exit path, matching the native `build_and_execute`.
-fn build_and_execute_wasm(cfg: &MatrixCfg, key: &str) -> Option<Vec<u8>> {
+fn build_and_execute_wasm(
+    cfg: &MatrixCfg,
+    key: &str,
+    target: &str,
+    wasmtime_args: &[&str],
+) -> Option<Vec<u8>> {
     let label = (cfg.label)(key);
     if !wasmtime_available() {
         if require_wasmtime() {
@@ -163,31 +177,32 @@ fn build_and_execute_wasm(cfg: &MatrixCfg, key: &str) -> Option<Vec<u8>> {
             );
         }
         eprintln!(
-            "warning: skipping wasm32-linear column for {label} — `wasmtime` \
+            "warning: skipping {target} column for {label} — `wasmtime` \
              not on PATH (set PHOENIX_REQUIRE_WASMTIME=1 to fail instead; see \
              docs/design-decisions.md §Phase 2.4 decision B)"
         );
         return None;
     }
     let path = (cfg.source_rel)(key);
-    let bin = wasm_bin(cfg, key);
+    let bin = wasm_bin(cfg, key, target);
 
     let build = phoenix_bin()
-        .args(["build", "--target", "wasm32-linear", &path, "-o"])
+        .args(["build", "--target", target, &path, "-o"])
         .arg(&bin.0)
         .output()
         .unwrap_or_else(|e| {
-            panic!("failed to spawn `phoenix build --target wasm32-linear {path}`: {e}")
+            panic!("failed to spawn `phoenix build --target {target} {path}`: {e}")
         });
     if !build.status.success() {
         panic!(
-            "`phoenix build --target wasm32-linear {path}` exited non-zero\n  stdout: {}\n  stderr: {}",
+            "`phoenix build --target {target} {path}` exited non-zero\n  stdout: {}\n  stderr: {}",
             String::from_utf8_lossy(&build.stdout),
             String::from_utf8_lossy(&build.stderr)
         );
     }
 
     let run = Command::new("wasmtime")
+        .args(wasmtime_args)
         .arg(&bin.0)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn wasmtime on `{}`: {e}", bin.0.display()));
@@ -203,32 +218,34 @@ fn build_and_execute_wasm(cfg: &MatrixCfg, key: &str) -> Option<Vec<u8>> {
 }
 
 /// Assert every supplied backend produced byte-identical stdout.
-/// `wasm` is `None` when the wasm32-linear column was skipped (either
-/// `wasmtime` was absent or the fixture opted out). On any divergence,
+/// A wasm column is `None` when it was skipped (either `wasmtime` was
+/// absent or the fixture opted out of that column). On any divergence,
 /// panics showing every backend's stdout — the AST-interp `run` output
 /// is the triage reference point, so it's always shown regardless of
-/// which pair actually diverged. One helper so the divergence message
-/// stays consistent across the skip / no-skip callers.
+/// which pair actually diverged.
 fn assert_stdout_agreement(
     label: &str,
     run: &[u8],
     run_ir: &[u8],
     build: &[u8],
     wasm: Option<&[u8]>,
+    wasm_gc: Option<&[u8]>,
 ) {
     let native_diverge = run != run_ir || run_ir != build;
     let wasm_diverge = wasm.map(|w| w != build).unwrap_or(false);
-    if native_diverge || wasm_diverge {
-        let wasm_repr = match wasm {
+    let wasm_gc_diverge = wasm_gc.map(|w| w != build).unwrap_or(false);
+    if native_diverge || wasm_diverge || wasm_gc_diverge {
+        let col = |c: Option<&[u8]>| match c {
             Some(w) => format!("{:?}", String::from_utf8_lossy(w)),
             None => "(skipped)".to_string(),
         };
         panic!(
-            "{label}: backends disagree on stdout\n  run:    {:?}\n  run-ir: {:?}\n  build:  {:?}\n  wasm:   {}",
+            "{label}: backends disagree on stdout\n  run:     {:?}\n  run-ir:  {:?}\n  build:   {:?}\n  wasm:    {}\n  wasm-gc: {}",
             String::from_utf8_lossy(run),
             String::from_utf8_lossy(run_ir),
             String::from_utf8_lossy(build),
-            wasm_repr
+            col(wasm),
+            col(wasm_gc)
         );
     }
 }
@@ -252,33 +269,39 @@ fn assert_expected(cfg: &MatrixCfg, key: &str, run_stdout: &[u8]) {
     }
 }
 
-/// Full matrix: run / run-ir / native build / wasm (when available),
-/// then the optional `expected.txt` pin. The entry point for the
-/// plain `..._matrix_test!($name, $key)` macro arm.
-pub fn assert_backend_agreement(cfg: &MatrixCfg, key: &str) {
-    let run = run_subcommand(cfg, "run", key);
-    let run_ir = run_subcommand(cfg, "run-ir", key);
-    let build = build_and_execute(cfg, key);
-    let wasm = build_and_execute_wasm(cfg, key);
-    assert_stdout_agreement(&(cfg.label)(key), &run, &run_ir, &build, wasm.as_deref());
-    assert_expected(cfg, key, &run);
-}
-
-/// Like [`assert_backend_agreement`] but carves out the wasm32-linear
-/// column for fixtures that depend on Phoenix features that backend
-/// doesn't lower yet (e.g. `dyn Trait` — `Op::DynAlloc` / `Op::DynCall`).
-/// The three-backend agreement (and any `expected.txt` pin) is still
-/// asserted; `reason` is printed so a future enablement can flip the
-/// macro arm back. The entry point for the `skip_wasm:` macro arm.
-pub fn assert_backend_agreement_skip_wasm(cfg: &MatrixCfg, key: &str, reason: &str) {
+/// Full matrix: run / run-ir / native build / wasm32-linear /
+/// wasm32-gc (each wasm column when available and not opted out),
+/// then the optional `expected.txt` pin. The entry point for every
+/// `..._matrix_test!` macro arm; the arms differ only in
+/// `wasm_gc_skip` — `Some(reason)` skips the wasm32-gc column, with
+/// the reason printed so a future enablement (each wasm32-gc slice's
+/// "shrink the skip list" exit criterion) can find every opt-out by
+/// grepping the test output or the call sites. The wasm32-linear
+/// column has no opt-out: no fixture needs one today, so the
+/// parameter waits for the first feature that backend doesn't lower.
+pub fn assert_backend_agreement(cfg: &MatrixCfg, key: &str, wasm_gc_skip: Option<&str>) {
     let label = (cfg.label)(key);
-    eprintln!(
-        "note: {label}: skipping wasm32-linear column — {reason} \
-         (see backend matrix opt-out at this site)"
-    );
     let run = run_subcommand(cfg, "run", key);
     let run_ir = run_subcommand(cfg, "run-ir", key);
     let build = build_and_execute(cfg, key);
-    assert_stdout_agreement(&label, &run, &run_ir, &build, None);
+    let wasm = build_and_execute_wasm(cfg, key, "wasm32-linear", &[]);
+    let wasm_gc = match wasm_gc_skip {
+        Some(reason) => {
+            eprintln!(
+                "note: {label}: skipping wasm32-gc column — {reason} \
+                 (see backend matrix opt-out at this site)"
+            );
+            None
+        }
+        None => build_and_execute_wasm(cfg, key, "wasm32-gc", &["-W", "gc=y"]),
+    };
+    assert_stdout_agreement(
+        &label,
+        &run,
+        &run_ir,
+        &build,
+        wasm.as_deref(),
+        wasm_gc.as_deref(),
+    );
     assert_expected(cfg, key, &run);
 }

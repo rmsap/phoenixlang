@@ -1,15 +1,21 @@
-//! Four-backend roundtrip matrix for multi-file Phoenix projects.
+//! Five-backend roundtrip matrix for multi-file Phoenix projects.
 //!
 //! Walks every `tests/fixtures/multi/<name>/main.phx` and asserts
-//! that `phoenix run`, `phoenix run-ir`, `phoenix build` (native), and
-//! `phoenix build --target wasm32-linear` + execute under `wasmtime`
-//! all produce byte-identical stdout, plus a check against the
-//! project's `expected.txt`. The harness is shared with the single-file
-//! `three_backend_matrix.rs` via [`common::backend_matrix`]; this file
-//! only supplies the multi-file [`MatrixCfg`] conventions (including
-//! the `expected.txt` pin) and the project list.
+//! that `phoenix run`, `phoenix run-ir`, `phoenix build` (native),
+//! `phoenix build --target wasm32-linear` + execute under `wasmtime`,
+//! and `phoenix build --target wasm32-gc` + execute under
+//! `wasmtime -W gc=y` all produce byte-identical stdout, plus a check
+//! against the project's `expected.txt`. The harness is shared with
+//! the single-file `three_backend_matrix.rs` via
+//! [`common::backend_matrix`]; this file only supplies the multi-file
+//! [`MatrixCfg`] conventions (including the `expected.txt` pin) and
+//! the project list.
 //!
-//! The `wasm32-linear` column soft-skips when `wasmtime` isn't on
+//! wasm32-gc skips were derived empirically (2026-06-11); each
+//! annotation names the missing feature and is deleted by the slice
+//! that lands it.
+//!
+//! Both wasm columns soft-skip when `wasmtime` isn't on
 //! `$PATH` (with a visible warning); `PHOENIX_REQUIRE_WASMTIME=1`
 //! turns the skip into a hard failure. CI sets it (see ci.yml).
 //!
@@ -45,22 +51,22 @@ static CFG: MatrixCfg = MatrixCfg {
 };
 
 macro_rules! multi_matrix_test {
+    // All five columns.
     ($name:ident, $project:literal) => {
         #[test]
         fn $name() {
-            common::backend_matrix::assert_backend_agreement(&CFG, $project);
+            common::backend_matrix::assert_backend_agreement(&CFG, $project, None);
         }
     };
-    // No multi-file fixture needs this arm yet — every project lowers
-    // to wasm. It's the ready-to-use escape hatch (mirroring the
-    // single-file matrix's `traits_dyn` carve-out) for the first
-    // project that reaches for an op the wasm32-linear backend doesn't
-    // lower. Referenced by full path so this unexpanded arm doesn't
-    // force an otherwise-unused import.
-    ($name:ident, $project:literal, skip_wasm: $reason:literal) => {
+    // Skip only the wasm32-gc column — for features wasm32-linear
+    // already lowers but the PR 6 wasm32-gc slices haven't reached.
+    // (A both-columns `skip_wasm:` arm can be re-added if a project
+    // ever needs an op wasm32-linear doesn't lower; no project does
+    // today.)
+    ($name:ident, $project:literal, skip_wasm_gc: $reason:literal) => {
         #[test]
         fn $name() {
-            common::backend_matrix::assert_backend_agreement_skip_wasm(&CFG, $project, $reason);
+            common::backend_matrix::assert_backend_agreement(&CFG, $project, Some($reason));
         }
     };
 }
@@ -68,14 +74,14 @@ macro_rules! multi_matrix_test {
 multi_matrix_test!(matrix_basic_import, "basic_import");
 multi_matrix_test!(matrix_import_alias, "import_alias");
 multi_matrix_test!(matrix_import_wildcard, "import_wildcard");
-multi_matrix_test!(matrix_nested_modules, "nested_modules");
+multi_matrix_test!(matrix_nested_modules, "nested_modules", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
 // The §2.6 tripwire: a public function whose default arg references a
 // private symbol in its own module. Without wrapper synthesis the
 // caller would inline the private symbol directly into the entry's
 // IR; with wrapper synthesis (Task #7) the call site emits a zero-arg
 // `Op::Call(__default_*)` instead.
 multi_matrix_test!(matrix_default_wrapper, "default_wrapper");
-multi_matrix_test!(matrix_visibility_struct_pub, "visibility_struct_pub");
+multi_matrix_test!(matrix_visibility_struct_pub, "visibility_struct_pub", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
 multi_matrix_test!(matrix_visibility_enum_pub, "visibility_enum_pub");
 // A method invocation on an imported struct: catches regressions
 // where the value's runtime type tag drifts from the methods table's
@@ -87,7 +93,7 @@ multi_matrix_test!(matrix_struct_methods, "struct_methods");
 // the method's own module: validates that the callee's module is
 // pushed before evaluating defaults, so the private helper resolves
 // through the callee's scope rather than the caller's.
-multi_matrix_test!(matrix_method_default_helper, "method_default_helper");
+multi_matrix_test!(matrix_method_default_helper, "method_default_helper", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
 // A cross-module enum whose variants carry payload fields, both
 // constructed and pattern-matched in the entry. Catches
 // regressions where the enum's qualified key (`lib::Outcome`)
@@ -95,7 +101,7 @@ multi_matrix_test!(matrix_method_default_helper, "method_default_helper");
 // op naming, and runtime value tag — a silent failure mode that
 // fieldless variants don't exercise because no payload coercion
 // runs.
-multi_matrix_test!(matrix_enum_with_fields, "enum_with_fields");
+multi_matrix_test!(matrix_enum_with_fields, "enum_with_fields", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
 // A trait imported from a sibling module and used as a generic
 // bound (`<T: Drawable>`) on a function in the entry. Two structs
 // in the sibling module each `impl Drawable`. Exercises the
@@ -114,3 +120,30 @@ multi_matrix_test!(matrix_trait_bound, "trait_bound");
 // add a `multi/dyn_trait_imported` fixture and matrix entry here so
 // the dyn-dispatch path's qualified-trait keying gets the same
 // three-backend roundtrip coverage as the generic-bound form above.
+
+/// Tripwire: every `tests/fixtures/multi/<name>/` project must have a
+/// `multi_matrix_test!` entry above. The registered set is checked by
+/// scanning this file's own source for the quoted project name, so a
+/// project dropped into the directory without an entry fails here
+/// instead of silently getting zero matrix coverage.
+#[test]
+fn every_project_has_a_matrix_entry() {
+    let src = include_str!("multi_module_matrix.rs");
+    let dir = common::compiled_fixtures::workspace_root().join("tests/fixtures/multi");
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().into_string().unwrap();
+        if !src.contains(&format!("\"{name}\"")) {
+            missing.push(name);
+        }
+    }
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "multi-file projects without a multi_matrix_test! entry: {missing:?}"
+    );
+}
