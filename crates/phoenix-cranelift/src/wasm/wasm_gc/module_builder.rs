@@ -263,6 +263,19 @@ pub(super) struct ModuleBuilder {
     /// decision K.6 (2026-06-09 amendment).
     print_f64_idx: Option<u32>,
 
+    /// WASM function index of the synthesized `phx_ryu_format_f64`
+    /// formatter (text into the f64 scratch buffer, returns length).
+    /// Shared by `phx_print_f64` and `phx_tostring_f64`. Populated by
+    /// [`Self::declare_float_format_helpers`].
+    ryu_format_f64_idx: Option<u32>,
+
+    /// `phx_tostring_i64` / `phx_tostring_f64` / `phx_tostring_bool` —
+    /// the `toString` builtin's per-type constructors, each returning a
+    /// fresh `$string`. Populated by [`Self::declare_tostring_helpers`].
+    tostring_i64_idx: Option<u32>,
+    tostring_f64_idx: Option<u32>,
+    tostring_bool_idx: Option<u32>,
+
     /// WASM function index of the synthesized `phx_fmod` helper —
     /// IEEE-754 truncated remainder (musl `fmod` port), matching
     /// Rust's `f64 % f64` bit-for-bit. Populated by
@@ -395,6 +408,10 @@ impl ModuleBuilder {
             string_type_idx: None,
             print_str_idx: None,
             print_f64_idx: None,
+            ryu_format_f64_idx: None,
+            tostring_i64_idx: None,
+            tostring_f64_idx: None,
+            tostring_bool_idx: None,
             fmod_idx: None,
             str_concat_idx: None,
             str_eq_idx: None,
@@ -1339,28 +1356,104 @@ impl ModuleBuilder {
         })
     }
 
-    /// Synthesize the `phx_print_f64` helper (and its Ryu d2s
-    /// sub-helpers + power-of-5 data segments) if `needs.print_f64`.
-    /// The helper depends on `fd_write` (for emitting digits), so this
-    /// method runs after `declare_imports`.
-    pub(super) fn declare_print_f64_helper(
+    /// Synthesize the shared `phx_ryu_format_f64` chain (Ryu d2s
+    /// sub-helpers + power-of-5 data segments + the formatter) when
+    /// either consumer needs it, then the consumers themselves:
+    /// `phx_print_f64` (formatter + newline + `fd_write` — needs the
+    /// `fd_write` import, so this runs after `declare_imports`) and/or
+    /// `phx_tostring_f64` (synthesized later by
+    /// [`Self::declare_tostring_helpers`], which only needs the
+    /// formatter index recorded here). A `toString(Float)`-only module
+    /// carries the formatter but no print wrapper and no WASI import.
+    pub(super) fn declare_float_format_helpers(
         &mut self,
         needs: HelperNeeds,
     ) -> Result<(), CompileError> {
-        if !needs.print_f64 {
+        if !needs.print_f64 && !needs.tostring_f64 {
             return Ok(());
         }
-        let fd_write_idx = self.fd_write_idx.ok_or_else(|| {
-            CompileError::new(
-                "wasm32-gc: `phx_print_f64` needs `fd_write`, but \
-                 `declare_imports` did not run (internal compiler bug)",
-            )
-        })?;
-        self.print_f64_idx = Some(super::float_helpers::synthesize_print_f64(
-            self,
-            fd_write_idx,
-        )?);
+        let format_idx = super::float_helpers::synthesize_format_f64(self)?;
+        self.ryu_format_f64_idx = Some(format_idx);
+        if needs.print_f64 {
+            let fd_write_idx = self.fd_write_idx.ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-gc: `phx_print_f64` needs `fd_write`, but \
+                     `declare_imports` did not run (internal compiler bug)",
+                )
+            })?;
+            self.print_f64_idx = Some(super::float_helpers::synthesize_print_f64(
+                self,
+                fd_write_idx,
+                format_idx,
+            )?);
+        }
         Ok(())
+    }
+
+    /// Synthesize whichever `toString` helpers `needs` flags. Runs
+    /// after [`Self::declare_float_format_helpers`] (the `Float` arm
+    /// reuses `phx_ryu_format_f64`) and after `declare_string_types`
+    /// (every arm allocates a `$string`). No `fd_write` dependency —
+    /// `toString` is pure construction.
+    pub(super) fn declare_tostring_helpers(
+        &mut self,
+        needs: HelperNeeds,
+    ) -> Result<(), CompileError> {
+        if needs.tostring_i64 {
+            self.tostring_i64_idx = Some(super::tostring_helpers::synthesize_tostring_i64(self)?);
+        }
+        if needs.tostring_bool {
+            self.tostring_bool_idx = Some(super::tostring_helpers::synthesize_tostring_bool(self)?);
+        }
+        if needs.tostring_f64 {
+            let format_idx = self.ryu_format_f64_idx.ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-gc: `phx_tostring_f64` needs `phx_ryu_format_f64`, \
+                     but `declare_float_format_helpers` did not record it \
+                     (internal compiler bug — the needs flags disagree)",
+                )
+            })?;
+            self.tostring_f64_idx = Some(super::tostring_helpers::synthesize_tostring_f64(
+                self, format_idx,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Index of the synthesized `phx_tostring_i64` helper.
+    pub(super) fn require_tostring_i64_idx(&self) -> Result<u32, CompileError> {
+        self.tostring_i64_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_tostring_i64` requested before \
+                 `declare_tostring_helpers` ran with `needs.tostring_i64` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `toString(Int)` site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_tostring_f64` helper.
+    pub(super) fn require_tostring_f64_idx(&self) -> Result<u32, CompileError> {
+        self.tostring_f64_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_tostring_f64` requested before \
+                 `declare_tostring_helpers` ran with `needs.tostring_f64` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `toString(Float)` site)",
+            )
+        })
+    }
+
+    /// Index of the synthesized `phx_tostring_bool` helper.
+    pub(super) fn require_tostring_bool_idx(&self) -> Result<u32, CompileError> {
+        self.tostring_bool_idx.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: `phx_tostring_bool` requested before \
+                 `declare_tostring_helpers` ran with `needs.tostring_bool` \
+                 (internal compiler bug — `scan_helper_needs` missed a \
+                 `toString(Bool)` site)",
+            )
+        })
     }
 
     /// Index of the synthesized `phx_fmod` helper.
@@ -1605,6 +1698,13 @@ pub(super) struct HelperNeeds {
     /// synthesis of the `phx_fmod` helper (musl `fmod` port — WASM has
     /// no `f64.rem` instruction). See §Phase 2.4 decision K.5.
     pub(super) fmod: bool,
+    /// `toString(Int)` / `toString(Float)` / `toString(Bool)` sites —
+    /// each drives one `phx_tostring_*` constructor. (`toString(String)`
+    /// is a no-op copy and needs no helper.) `tostring_f64` also forces
+    /// the `phx_ryu_format_f64` chain.
+    pub(super) tostring_i64: bool,
+    pub(super) tostring_f64: bool,
+    pub(super) tostring_bool: bool,
 }
 
 /// Scan the IR module to determine which synthesized helpers and
@@ -1650,6 +1750,17 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
                     }
                     Op::FMod(_, _) => {
                         needs.fmod = true;
+                    }
+                    Op::BuiltinCall(name, args) if name == "toString" => {
+                        let vid_types = vid_types.get_or_insert_with(|| build_vid_type_map(func));
+                        match args.first().and_then(|vid| vid_types.get(vid)) {
+                            Some(IrType::I64) => needs.tostring_i64 = true,
+                            Some(IrType::F64) => needs.tostring_f64 = true,
+                            Some(IrType::Bool) => needs.tostring_bool = true,
+                            // `toString(String)` is identity (no helper);
+                            // other types error at the dispatch site.
+                            _ => {}
+                        }
                     }
                     // `List.contains` on a `List<String>` compares
                     // elements by bytes via the `phx_str_eq` helper

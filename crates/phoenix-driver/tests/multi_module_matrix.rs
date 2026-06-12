@@ -101,7 +101,7 @@ multi_matrix_test!(matrix_method_default_helper, "method_default_helper", skip_w
 // op naming, and runtime value tag — a silent failure mode that
 // fieldless variants don't exercise because no payload coercion
 // runs.
-multi_matrix_test!(matrix_enum_with_fields, "enum_with_fields", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
+multi_matrix_test!(matrix_enum_with_fields, "enum_with_fields");
 // A trait imported from a sibling module and used as a generic
 // bound (`<T: Drawable>`) on a function in the entry. Two structs
 // in the sibling module each `impl Drawable`. Exercises the

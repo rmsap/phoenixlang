@@ -68,6 +68,7 @@ mod lists;
 mod module_builder;
 mod ryu_tables;
 mod string_helpers;
+mod tostring_helpers;
 mod translate;
 
 use module_builder::{ModuleBuilder, scan_helper_needs};
@@ -157,10 +158,14 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     }
     // `phx_print_f64` synthesis needs the `fd_write` import, which is
     // declared above this point.
-    builder.declare_print_f64_helper(helper_needs)?;
+    builder.declare_float_format_helpers(helper_needs)?;
     // `phx_fmod` is a pure function (no imports); it only shares the
     // helpers' immediate-emit-before-deferred-body ordering constraint.
     builder.declare_fmod_helper(helper_needs)?;
+    // `toString` constructors — pure construction (no `fd_write`),
+    // but the Float arm reuses `phx_ryu_format_f64` from just above
+    // and every arm allocates a `$string` (types declared earlier).
+    builder.declare_tostring_helpers(helper_needs)?;
 
     // Declare Phoenix user functions (so call sites can resolve their
     // WASM function indices before any body is emitted), then emit

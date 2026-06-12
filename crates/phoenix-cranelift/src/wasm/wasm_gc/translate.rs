@@ -1285,6 +1285,7 @@ fn translate_builtin_call(
         "print" => translate_print(ctx, b, args),
         "String.length" => translate_string_length(ctx, b, args, instr),
         "String.substring" => translate_string_substring(ctx, b, args, instr),
+        "toString" => translate_to_string(ctx, b, args, instr),
         "List.length" => lists::translate_list_length(ctx, args, instr),
         "List.get" => lists::translate_list_get(ctx, b, args, instr),
         "List.push" => lists::translate_list_push(ctx, b, args, instr),
@@ -1368,16 +1369,76 @@ fn translate_string_length(
     Ok(())
 }
 
-/// `print(value)` — dispatch on the value's Phoenix `IrType` to the
+/// `toString(value) -> String` — dispatch on the operand's WASM
+/// binding type to the matching `phx_tostring_*` constructor
+/// (`i64` → decimal digits, `f64` → the shared ryu formatter,
+/// `i32`-carried Bool → `"true"` / `"false"` literals), with
+/// `toString(String)` lowered as a plain local copy (source-level
+/// identity). Same ValType-keyed dispatch shape as `translate_print`.
+fn translate_to_string(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "BuiltinCall(\"toString\")")?;
+    if args.len() != 1 {
+        return Err(CompileError::new(format!(
+            "wasm32-gc: `toString` builtin takes exactly one argument; got {} \
+             (IR verifier should have caught this)",
+            args.len()
+        )));
+    }
+    let arg_local = ctx.binding_of(args[0])?;
+    let string_idx = b.require_string_type_idx()?;
+    let string_ty = ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(string_idx),
+    });
+    let helper_idx = match ctx.binding_type_of(args[0])? {
+        ValType::I64 => b.require_tostring_i64_idx()?,
+        ValType::F64 => b.require_tostring_f64_idx()?,
+        // Bare i32 is Phoenix `Bool` — the same representation-keyed
+        // assumption `translate_print` documents.
+        ValType::I32 => b.require_tostring_bool_idx()?,
+        ValType::Ref(RefType {
+            heap_type: HeapType::Concrete(idx),
+            ..
+        }) if idx == string_idx => {
+            // Identity: copy the existing `$string` ref into the
+            // result binding.
+            ctx.emit(Instruction::LocalGet(arg_local));
+            let local = ctx.allocate_local(vid, string_ty);
+            ctx.emit(Instruction::LocalSet(local));
+            return Ok(());
+        }
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc: `toString` argument lowered to `{other:?}`, which \
+                 has no toString mapping yet (Int / Float / Bool / String are \
+                 supported — matching the wasm32-linear surface; other types \
+                 land with their own slices)"
+            )));
+        }
+    };
+    ctx.emit(Instruction::LocalGet(arg_local));
+    ctx.emit(Instruction::Call(helper_idx));
+    let local = ctx.allocate_local(vid, string_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `print(value)` — dispatch on the value's WASM binding type to the
 /// matching synthesized helper (or inline emission for `Bool`).
-/// Supports `Int`, `String`, and `Bool`; `Float` lands in a follow-up
-/// slice.
+/// Supports `Int`, `String`, `Bool`, and `Float`.
 ///
 /// Dispatch shape: `i64` → `phx_print_i64` helper. `(ref null $string)`
 /// → `phx_print_str` helper. `i32` carrying the Phoenix `Bool` lowers
 /// inline (no helper) via an if/else that stages the iovec at one of
-/// two pre-populated linear-memory regions. See §Phase 2.4 decisions
-/// K.2 (string helper) and K.3 (Bool inline shape).
+/// two pre-populated linear-memory regions. `f64` → `phx_print_f64`
+/// helper (the shared `phx_ryu_format_f64` formatter + newline +
+/// `fd_write`). See §Phase 2.4 decisions K.2 (string helper), K.3
+/// (Bool inline shape), and K.6 (Float).
 fn translate_print(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
@@ -1416,11 +1477,6 @@ fn translate_print(
         return Ok(());
     }
     if arg_ty == ValType::F64 {
-        // Phase 1 (slice 5 part 1): special cases + integer fast-path.
-        // Phase 2 (slice 5 part 2, in progress): general Ryu d2s for
-        // non-integer finite f64. The helper traps with `unreachable`
-        // on the general case until Phase 2 lands. See §Phase 2.4
-        // decision K.6.
         let print_f64_idx = b.require_print_f64_idx()?;
         ctx.emit(Instruction::LocalGet(arg_local));
         ctx.emit(Instruction::Call(print_f64_idx));

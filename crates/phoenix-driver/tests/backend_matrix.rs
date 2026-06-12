@@ -87,8 +87,8 @@ macro_rules! backend_matrix_test {
 
 backend_matrix_test!(matrix_hello, "hello.phx");
 backend_matrix_test!(matrix_fibonacci, "fibonacci.phx");
-backend_matrix_test!(matrix_fizzbuzz, "fizzbuzz.phx", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
-backend_matrix_test!(matrix_features, "features.phx", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
+backend_matrix_test!(matrix_fizzbuzz, "fizzbuzz.phx");
+backend_matrix_test!(matrix_features, "features.phx");
 backend_matrix_test!(matrix_generics, "generics.phx", skip_wasm_gc: "generic struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
 backend_matrix_test!(matrix_traits_static, "traits_static.phx", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
 backend_matrix_test!(matrix_traits_dyn, "traits_dyn.phx", skip_wasm_gc: "`dyn Trait` is not lowered on wasm32-gc yet");
@@ -148,7 +148,7 @@ backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx", 
 // produce visibly wrong bytes; or build a sibling bounded-memory test
 // per fixture. Tracked as a Phase 2.7 follow-up rather than a 2.3 gate
 // because both options are infrastructure work, not GC correctness work.
-backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
+backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
 backend_matrix_test!(matrix_defer_basic, "defer_basic.phx");
 backend_matrix_test!(matrix_defer_explicit_return, "defer_explicit_return.phx");
 backend_matrix_test!(matrix_map_hash_many_keys, "map_hash_many_keys.phx", skip_wasm_gc: "maps (`Op::MapAlloc`) are not lowered on wasm32-gc yet");
@@ -167,8 +167,11 @@ backend_matrix_test!(
     matrix_defer_shadowed_at_return,
     "defer_shadowed_at_return.phx"
 );
-backend_matrix_test!(matrix_defer_nested_function_frames, "defer_nested_function_frames.phx", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
-backend_matrix_test!(matrix_gc_keeps_alive, "gc_keeps_alive.phx", skip_wasm_gc: "builtin `toString` is not lowered on wasm32-gc yet");
+backend_matrix_test!(
+    matrix_defer_nested_function_frames,
+    "defer_nested_function_frames.phx"
+);
+backend_matrix_test!(matrix_gc_keeps_alive, "gc_keeps_alive.phx");
 backend_matrix_test!(matrix_gc_loop_carried_ref, "gc_loop_carried_ref.phx", skip_wasm_gc: "output is correct but 50k growing-string concats take minutes under wasmtime's GC — host-VM GC throughput, not a codegen gap (verified 2026-06-11 at reduced iteration counts); loop-carried-ref rooting stays covered on wasm32-gc via gc_loop_carried_ref_small.phx");
 // Reduced-iteration sibling (2000 concats, ~2 MB cumulative — still
 // past the 1-MB auto-collect threshold) that runs all five columns.

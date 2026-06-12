@@ -1848,18 +1848,107 @@ fn list_literal_over_array_new_fixed_cap_is_rejected() {
     validate_gc_module(&bytes, "list_literal_at_cap_wasm_gc");
 }
 
+/// `toString` across the supported argument types (PR 6 toString
+/// slice). Output must be byte-identical to the other backends:
+/// `toString(Int)` is Rust `i64::to_string`, `toString(Bool)` is
+/// `"true"`/`"false"`, `toString(String)` is the identity. Funneled
+/// through `print(String)` (and concat) so the constructed `$string`
+/// values are observed end-to-end, not just type-checked.
+#[test]
+fn tostring_int_bool_string_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  print(toString(0))\n",
+        "  print(toString(42))\n",
+        "  let neg: Int = 0 - 9876543210\n",
+        "  print(toString(neg))\n",
+        "  print(toString(true))\n",
+        "  print(toString(false))\n",
+        "  print(toString(\"already\"))\n",
+        "  print(\"n=\" + toString(7))\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "tostring_core_wasm_gc",
+        b"0\n42\n-9876543210\ntrue\nfalse\nalready\nn=7\n",
+    );
+}
+
+/// `toString(Float)` reuses `phx_ryu_format_f64`, so its bytes must
+/// match the `ryu` crate exactly — same oracle as the `float_print_*`
+/// corpus, but exercised through `$string` construction + concat
+/// instead of the print fast path. NaN / ±inf are covered explicitly:
+/// their literal arm of the formatter (bytes staged by `write_literal`,
+/// length returned) flows through `phx_tostring_f64`'s copy loop here,
+/// a path the digit values never reach.
+#[test]
+fn tostring_float_matches_native() {
+    let values: &[&str] = &[
+        "0.0",
+        "1.5",
+        "-1.5",
+        "0.1",
+        "100.0",
+        "0.000001",
+        "123456.789",
+    ];
+    let mut source = String::from("function main() {\n");
+    let mut expected = Vec::new();
+    for lit in values {
+        source.push_str(&format!("  print(\"v=\" + toString({lit}))\n"));
+        let val: f64 = lit.parse().unwrap();
+        expected.extend_from_slice(b"v=");
+        expected.extend_from_slice(ryu::Buffer::new().format(val).as_bytes());
+        expected.push(b'\n');
+    }
+    // NaN / ±inf have no Phoenix literals, so the fixture computes
+    // them — same workaround as `print_float_specials`.
+    let specials: &[(&str, &str, f64)] = &[
+        ("nan", "0.0 / 0.0", f64::NAN),
+        ("pinf", "1.0 / 0.0", f64::INFINITY),
+        ("ninf", "-1.0 / 0.0", f64::NEG_INFINITY),
+    ];
+    for (name, expr, val) in specials {
+        source.push_str(&format!("  let {name}: Float = {expr}\n"));
+        source.push_str(&format!("  print(\"v=\" + toString({name}))\n"));
+        expected.extend_from_slice(b"v=");
+        expected.extend_from_slice(ryu::Buffer::new().format(*val).as_bytes());
+        expected.push(b'\n');
+    }
+    source.push_str("}\n");
+    assert_prints(&source, "tostring_float_wasm_gc", &expected);
+}
+
+/// String interpolation lowers every non-String hole through
+/// `toString` + concat — the end-to-end path the fizzbuzz / features
+/// fixtures lean on. Pins a mixed-type interpolation.
+#[test]
+fn string_interpolation_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let n: Int = 3\n",
+        "  let f: Float = 2.5\n",
+        "  let b: Bool = true\n",
+        "  print(\"n={n} f={f} b={b}\")\n",
+        "}\n",
+    );
+    assert_prints(source, "interpolation_wasm_gc", b"n=3 f=2.5 b=true\n");
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
-/// inline-synthesis decision: a module that never prints a Float
-/// carries neither the synthesized `phx_print_f64` machinery nor the
-/// ~9.6 KiB of power-of-5 tables. Proven structurally, with no
-/// dependency on absolute module sizes (which drift as codegen
-/// evolves):
+/// inline-synthesis decision: a module that never prints a Float —
+/// and never `toString`s one, the second trigger for the formatter
+/// chain — carries neither the synthesized `phx_ryu_format_f64`
+/// machinery nor the ~9.6 KiB of power-of-5 tables. Proven
+/// structurally, with no dependency on absolute module sizes (which
+/// drift as codegen evolves):
 ///
 /// - the Float-free module is *smaller than the table payload alone*,
 ///   so it cannot possibly contain the tables;
 /// - the otherwise-identical Float-printing module is larger by at
 ///   least the table payload, confirming the tables land where (and
-///   only where) `print(Float)` appears.
+///   only where) `print(Float)` / `toString(Float)` appears.
 #[test]
 fn float_free_module_carries_no_ryu_tables() {
     // (291 + 325) entries × 16 bytes. Keep in sync with the

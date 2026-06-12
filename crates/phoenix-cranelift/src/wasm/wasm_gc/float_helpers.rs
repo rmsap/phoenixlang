@@ -93,15 +93,15 @@ fn load64(off: u64) -> Instruction<'static> {
     })
 }
 
-/// `phx_print_f64(v: f64)` — print `v` followed by a newline in
-/// exactly the bytes native's `phoenix_runtime::format_f64` (= the
-/// `ryu` crate) produces. NaN / ±inf are handled inline up front;
-/// ±0.0 and all other finite values flow through the ported
-/// `format64` + `d2d`.
-pub(super) fn synthesize_print_f64(
-    b: &mut ModuleBuilder,
-    fd_write_idx: u32,
-) -> Result<u32, CompileError> {
+/// `phx_ryu_format_f64(v: f64) -> i32` — format `v` into the linear-
+/// memory scratch at `PRINT_F64_BUF_START` in exactly the bytes
+/// native's `phoenix_runtime::format_f64` (= the `ryu` crate)
+/// produces, returning the byte length. No trailing newline and no
+/// I/O — `phx_print_f64` (the thin wrapper below) appends the newline
+/// and calls `fd_write`; `phx_tostring_f64` copies the bytes into a
+/// fresh `$string`. NaN / ±inf are handled inline up front; ±0.0 and
+/// all other finite values flow through the ported `format64` + `d2d`.
+pub(super) fn synthesize_format_f64(b: &mut ModuleBuilder) -> Result<u32, CompileError> {
     // Materialize the power-of-5 tables. Serialized as little-endian
     // `(lo: u64, hi: u64)` pairs — `phx_ryu_d2d` loads `lo` at
     // `base + idx*16` and `hi` at `base + idx*16 + 8`, where `base`
@@ -131,7 +131,7 @@ pub(super) fn synthesize_print_f64(
     let write_exp3_idx = synthesize_write_exp3(b, write_digits_idx);
     let d2d_idx = synthesize_d2d(b, mul_shift_idx, mult_pow5_idx);
 
-    let sig = b.intern_signature(&[ValType::F64], &[]);
+    let sig = b.intern_signature(&[ValType::F64], &[ValType::I32]);
 
     // Locals beyond the f64 param at 0.
     let mut func = Function::new([(2, ValType::I64), (6, ValType::I32)]);
@@ -144,17 +144,6 @@ pub(super) fn synthesize_print_f64(
     const K: u32 = 6; // i32 — d2d's decimal exponent
     const KK: u32 = 7; // i32 — LEN + K (10^(KK-1) <= |v| < 10^KK)
     const CUR: u32 = 8; // i32 — zero-fill cursor / exponent base scratch
-
-    let i32_memarg = MemArg {
-        offset: 0,
-        align: 2,
-        memory_index: 0,
-    };
-    let byte_memarg = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
 
     // ── Special case: NaN ────────────────────────────────────────
     // A f64 is NaN iff exponent bits are all 1 and mantissa is non-zero.
@@ -170,8 +159,15 @@ pub(super) fn synthesize_print_f64(
             Instruction::If(BlockType::Empty),
         ],
     );
-    emit_print_literal(&mut func, fd_write_idx, b"NaN\n", &i32_memarg, &byte_memarg);
-    ins(&mut func, &[Instruction::Return, Instruction::End]);
+    write_literal(&mut func, b"NaN");
+    ins(
+        &mut func,
+        &[
+            Instruction::I32Const(3),
+            Instruction::Return,
+            Instruction::End,
+        ],
+    );
 
     // ── Special case: ±Infinity ──────────────────────────────────
     // `f64.abs(v) == INFINITY` handles both with one comparison; the
@@ -190,18 +186,24 @@ pub(super) fn synthesize_print_f64(
             Instruction::If(BlockType::Empty),
         ],
     );
-    emit_print_literal(
-        &mut func,
-        fd_write_idx,
-        b"-inf\n",
-        &i32_memarg,
-        &byte_memarg,
-    );
-    func.instruction(&Instruction::Else);
-    emit_print_literal(&mut func, fd_write_idx, b"inf\n", &i32_memarg, &byte_memarg);
+    write_literal(&mut func, b"-inf");
     ins(
         &mut func,
-        &[Instruction::End, Instruction::Return, Instruction::End],
+        &[
+            Instruction::I32Const(4),
+            Instruction::Return,
+            Instruction::Else,
+        ],
+    );
+    write_literal(&mut func, b"inf");
+    ins(
+        &mut func,
+        &[
+            Instruction::I32Const(3),
+            Instruction::Return,
+            Instruction::End,
+            Instruction::End,
+        ],
     );
 
     // ── General case: ryu `format64` (src/pretty/mod.rs) ─────────
@@ -535,25 +537,59 @@ pub(super) fn synthesize_print_f64(
             Instruction::End, // branch 2
             Instruction::End, // branch 1
             Instruction::End, // zero / d2d if-else
-            // Trailing newline; stage iovec; fd_write.
+            // Return the formatted length.
             Instruction::LocalGet(IDX),
+            Instruction::I32Const(PRINT_F64_BUF_START as i32),
+            Instruction::I32Sub,
+        ],
+    );
+    func.instruction(&Instruction::End);
+
+    Ok(b.add_and_emit_function(sig, &func))
+}
+
+/// `phx_print_f64(v: f64)` — `phx_ryu_format_f64` + trailing newline +
+/// `fd_write`. The formatter owns every byte of the text (including
+/// the NaN / ±inf literals); this wrapper owns the I/O.
+pub(super) fn synthesize_print_f64(
+    b: &mut ModuleBuilder,
+    fd_write_idx: u32,
+    format_f64_idx: u32,
+) -> Result<u32, CompileError> {
+    let sig = b.intern_signature(&[ValType::F64], &[]);
+    let mut func = Function::new([(1, ValType::I32)]);
+    const V: u32 = 0; // f64 param
+    const LEN: u32 = 1; // i32 — formatted byte length
+    let i32_memarg = MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    };
+    ins(
+        &mut func,
+        &[
+            Instruction::LocalGet(V),
+            Instruction::Call(format_f64_idx),
+            Instruction::LocalSet(LEN),
+            // '\n' at START + len
+            Instruction::I32Const(PRINT_F64_BUF_START as i32),
+            Instruction::LocalGet(LEN),
+            Instruction::I32Add,
             Instruction::I32Const(b'\n' as i32),
             store8(0),
+            // iovec: (START, len + 1)
             Instruction::I32Const(IOVEC_OFFSET as i32),
             Instruction::I32Const(PRINT_F64_BUF_START as i32),
             Instruction::I32Store(i32_memarg),
             Instruction::I32Const(IOVEC_OFFSET as i32 + 4),
-            Instruction::LocalGet(IDX),
+            Instruction::LocalGet(LEN),
             Instruction::I32Const(1),
             Instruction::I32Add,
-            Instruction::I32Const(PRINT_F64_BUF_START as i32),
-            Instruction::I32Sub,
             Instruction::I32Store(i32_memarg),
         ],
     );
     emit_fd_write_call(&mut func, fd_write_idx);
     func.instruction(&Instruction::End);
-
     Ok(b.add_and_emit_function(sig, &func))
 }
 
@@ -1403,36 +1439,23 @@ fn synthesize_d2d(b: &mut ModuleBuilder, mul_shift_idx: u32, mult_pow5_idx: u32)
     b.add_and_emit_function(sig, &f)
 }
 
-/// Emit an iovec-staged `fd_write` for a fixed byte sequence. The bytes
-/// are written to a scratch region in linear memory at the start of
-/// each call (the helper's scratch buffer doubles as the literal
-/// staging area), then fd_write is called.
-fn emit_print_literal(
-    func: &mut Function,
-    fd_write_idx: u32,
-    bytes: &[u8],
-    i32_memarg: &MemArg,
-    byte_memarg: &MemArg,
-) {
-    // Write bytes into the f64 print buffer one at a time. For the
-    // short literals we use (NaN, ±inf) this is fine; an
-    // optimization would coalesce 4/8-byte writes but the literals
-    // are short enough that the byte loop costs no measurable time.
+/// Write a fixed byte sequence to the start of the f64 scratch
+/// buffer (no iovec, no I/O — the formatter's contract is "bytes in
+/// the buffer + a length", and the NaN / ±inf literals satisfy it the
+/// same way the digit paths do). Byte-at-a-time stores: the literals
+/// are ≤ 4 bytes, so coalescing would buy nothing.
+fn write_literal(func: &mut Function, bytes: &[u8]) {
     for (i, &byte) in bytes.iter().enumerate() {
         func.instruction(&Instruction::I32Const(
             PRINT_F64_BUF_START as i32 + i as i32,
         ));
         func.instruction(&Instruction::I32Const(byte as i32));
-        func.instruction(&Instruction::I32Store8(*byte_memarg));
+        func.instruction(&Instruction::I32Store8(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
     }
-    // Stage iovec.
-    func.instruction(&Instruction::I32Const(IOVEC_OFFSET as i32));
-    func.instruction(&Instruction::I32Const(PRINT_F64_BUF_START as i32));
-    func.instruction(&Instruction::I32Store(*i32_memarg));
-    func.instruction(&Instruction::I32Const(IOVEC_OFFSET as i32 + 4));
-    func.instruction(&Instruction::I32Const(bytes.len() as i32));
-    func.instruction(&Instruction::I32Store(*i32_memarg));
-    emit_fd_write_call(func, fd_write_idx);
 }
 
 /// `phx_fmod(x: f64, y: f64) -> f64` — IEEE-754 truncated remainder
