@@ -235,7 +235,7 @@ fn calling_a_struct_name_does_not_resolve_as_an_enum_variant() {
     // handles construction without an "ambiguous variant"/"unknown
     // variant" diagnostic.
     let entry = entry_only(
-        "struct Foo { Int x }\n\
+        "struct Foo { x: Int }\n\
          function main() { let f: Foo = Foo(42) print(f.x) }",
     );
     let analysis = check_modules(&[entry]);
@@ -305,7 +305,7 @@ fn cross_module_method_call_on_generic_receiver_resolves_with_bindings() {
     );
     let other = non_entry(
         "lib",
-        "public struct Container<T> { public T value }\n\
+        "public struct Container<T> { public value: T }\n\
          impl Container { function get(self) -> T { self.value } }",
         SourceId(1),
     );
@@ -335,7 +335,7 @@ fn imported_struct_works_in_function_signature() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -375,7 +375,7 @@ fn imported_generic_struct_works_in_function_signature() {
     );
     let other = non_entry(
         "lib",
-        "public struct Container<T> { public T value }\n\
+        "public struct Container<T> { public value: T }\n\
          impl Container { function get(self) -> T { self.value } }",
         SourceId(1),
     );
@@ -396,7 +396,7 @@ fn imported_struct_works_via_alias_in_signature() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -411,10 +411,10 @@ fn imported_struct_works_via_alias_in_signature() {
 fn imported_struct_used_as_struct_field_type_resolves() {
     let entry = entry_only(
         "import lib { Inner }\n\
-         struct Outer { Inner inner }\n\
+         struct Outer { inner: Inner }\n\
          function main() { let i: Inner = Inner(1) let o: Outer = Outer(i) print(o.inner.x) }",
     );
-    let other = non_entry("lib", "public struct Inner { public Int x }", SourceId(1));
+    let other = non_entry("lib", "public struct Inner { public x: Int }", SourceId(1));
     let analysis = check_modules(&[entry, other]);
     assert!(
         analysis.diagnostics.is_empty(),

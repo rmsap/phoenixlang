@@ -32,17 +32,17 @@ Install Phoenix — see the [main README](../README.md#quick-start) for full ins
 
 ```phoenix
 struct User {
-  Int id
-  String name
-  String email
-  Int age
+  id: Int
+  name: String
+  email: String
+  age: Int
 }
 
 endpoint listUsers: GET "/api/users" {
   query {
-    Int page = 1
-    Int limit = 20
-    Option<String> search
+    page: Int = 1
+    limit: Int = 20
+    search: Option<String>
   }
   response List<User>
 }
@@ -134,10 +134,10 @@ Schema files use Phoenix syntax: structs, enums, type aliases, and `endpoint` de
 ```phoenix
 /** A registered user */
 struct User {
-  Int id
-  String name
-  String email
-  Int age
+  id: Int
+  name: String
+  email: String
+  age: Int
 }
 
 enum Role { Admin, Editor, Viewer }
@@ -150,7 +150,7 @@ Endpoints map directly to HTTP semantics with distinct sections for path params,
 ```phoenix
 endpoint updateUser: PUT "/api/users/{id}" {
   query {
-    Bool notify = false           // query string: ?notify=true
+    notify: Bool = false           // query string: ?notify=true
   }
   body User omit { id } partial   // all User fields except id, all optional
   response User
@@ -161,8 +161,8 @@ endpoint updateUser: PUT "/api/users/{id}" {
 }
 ```
 
-- **Path params** are inferred from the URL pattern. `{id}` expects an `Int id` parameter — no separate declaration needed. The type is inferred from the matching struct field or defaults to `String`.
-- **`query { }`** defines URL query parameters. Supports default values (`Int page = 1`) and optional params (`Option<String> search`).
+- **Path params** are inferred from the URL pattern. `{id}` expects an `id: Int` parameter — no separate declaration needed. The type is inferred from the matching struct field or defaults to `String`.
+- **`query { }`** defines URL query parameters. Supports default values (`page: Int = 1`) and optional params (`search: Option<String>`).
 - **`body TypeName`** defines the JSON request body. Supports `omit`, `pick`, and `partial` modifiers (see [Type derivation](#type-derivation-omit-pick-and-partial)). Only valid on POST, PUT, and PATCH — the type checker rejects `body` on GET and DELETE.
 - **`response TypeName`** defines the JSON response body.
 - **`error { }`** defines error variants with explicit HTTP status codes.
@@ -176,7 +176,7 @@ Wrap endpoints in an `api version "vX" { }` block to serve them all under a shar
 ```phoenix
 api version "v2" {
   endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" {
-    query { Int limit = 20 }
+    query { limit: Int = 20 }
     response List<Post>
     error { NotFound(404) }
   }
@@ -200,10 +200,10 @@ The endpoint above is served at `/v2/api/posts/tagged/{tag}`. The prefix is appl
 /** A registered user in the system */
 struct User {
   /** Full display name */
-  String name
+  name: String
   /** Primary email address */
-  String email
-  Int age
+  email: String
+  age: Int
 }
 
 /** Retrieve a single user by their unique ID */
@@ -235,11 +235,11 @@ API endpoints almost never accept the exact same shape as the full domain type. 
 
 ```phoenix
 struct User {
-  Int id
-  String name
-  String email
-  Int age
-  String createdAt
+  id: Int
+  name: String
+  email: String
+  age: Int
+  createdAt: String
 }
 
 // All fields except id and createdAt, all required
@@ -303,10 +303,10 @@ export type PatchUserBody = {
 
 ```phoenix
 struct User {
-  Int id
-  String name where self.length > 0 && self.length <= 100
-  String email where self.contains("@") && self.length > 3
-  Int age where self >= 0 && self <= 150
+  id: Int
+  name: String where self.length > 0 && self.length <= 100
+  email: String where self.contains("@") && self.length > 3
+  age: Int where self >= 0 && self <= 150
 }
 
 endpoint createUser: POST "/api/users" {
@@ -578,8 +578,8 @@ type Shape =
 
 | Phoenix | TypeScript | Go | JSON | OpenAPI |
 |---|---|---|---|---|
-| `String name` | `name: string` | `Name string` | required | in `required` array |
-| `Option<String> name` | `name?: string` | `Name *string` | absent or `null` | not in `required` |
+| `name: String` | `name: string` | `Name string` | required | in `required` array |
+| `name: Option<String>` | `name?: string` | `Name *string` | absent or `null` | not in `required` |
 
 Both absent and `null` in JSON map to `None`.
 

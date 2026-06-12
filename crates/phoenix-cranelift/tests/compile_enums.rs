@@ -129,8 +129,8 @@ fn enum_containing_struct_with_string() {
     roundtrip(
         r#"
 struct Info {
-    String label
-    Int count
+    label: String
+    count: Int
 }
 enum Container {
     WithInfo(Info)

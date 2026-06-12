@@ -330,6 +330,27 @@ pub(super) struct ModuleBuilder {
     /// so the map is injective.
     phx_enum_parent_to_key: HashMap<u32, EnumInstantiationKey>,
 
+    /// Concrete list element type → `(array_type_idx, list_struct_idx)`
+    /// per §Phase 2.4 decision K.7 (`$arr_T` / `$list_T`). Populated by
+    /// [`Self::declare_phoenix_lists`] (via [`super::lists::declare`]);
+    /// consulted by `Op::ListAlloc` and the `List.*` builtin lowerings.
+    phx_lists: HashMap<IrType, (u32, u32)>,
+
+    /// Concrete list element type → `$builder_T` struct index. Only
+    /// populated for element types the module actually builds with
+    /// `ListBuilder<T>`.
+    phx_list_builders: HashMap<IrType, u32>,
+
+    /// Reverse index `$list_T` struct idx → element type, for
+    /// lowerings that only know the receiver's WASM binding type
+    /// (e.g. `List.contains`, whose result is `Bool`). Kept in
+    /// lockstep with [`Self::phx_lists`] by [`Self::record_list`].
+    phx_list_elem_by_struct: HashMap<u32, IrType>,
+
+    /// Reverse index `$builder_T` struct idx → element type, same
+    /// purpose for `ListBuilder.push` (Void result).
+    phx_builder_elem_by_struct: HashMap<u32, IrType>,
+
     /// True once [`Self::declare_bool_data`] has emitted the
     /// `"true\n"` / `"false\n"` active data segments. The inline
     /// `print(Bool)` lowering in `translate.rs` stages iovecs at the
@@ -382,6 +403,10 @@ impl ModuleBuilder {
             str_length_idx: None,
             phx_enums: HashMap::new(),
             phx_enum_parent_to_key: HashMap::new(),
+            phx_lists: HashMap::new(),
+            phx_list_builders: HashMap::new(),
+            phx_list_elem_by_struct: HashMap::new(),
+            phx_builder_elem_by_struct: HashMap::new(),
             bool_data_declared: false,
             data_segment_count: 0,
         }
@@ -773,6 +798,124 @@ impl ModuleBuilder {
             .get(name)
             .and_then(|variants| variants.get(variant_idx as usize))
             .map(|(_, fields)| fields.len() as u32)
+    }
+
+    /// Declare WASM-GC types for every `List<T>` / `ListBuilder<T>`
+    /// instantiation per §Phase 2.4 decision K.7. Thin wrapper over
+    /// [`lists::declare`] — mirrors [`Self::declare_phoenix_enums`].
+    ///
+    /// Must run *after* structs / string types / enums (list element
+    /// types of those kinds encode their indices) and *before* any
+    /// function signature touching `IrType::ListRef` /
+    /// `ListBuilderRef` is interned.
+    pub(super) fn declare_phoenix_lists(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        super::lists::declare(self, ir_module)
+    }
+
+    /// Declare a list element array type (`$arr_T`) and return its
+    /// type-section index. Narrow [`TypeInterner`] wrapper for
+    /// [`super::lists::declare`], same pattern as
+    /// [`Self::declare_enum_parent_struct`].
+    pub(super) fn declare_list_array(&mut self, elem: wasm_encoder::FieldType) -> u32 {
+        self.types.declare_array(elem)
+    }
+
+    /// Declare a list / builder struct type and return its
+    /// type-section index. Narrow [`TypeInterner`] wrapper for
+    /// [`super::lists::declare`].
+    pub(super) fn declare_list_struct(&mut self, fields: &[wasm_encoder::FieldType]) -> u32 {
+        self.types.declare_struct(fields)
+    }
+
+    /// Record a fully-declared list instantiation: element type →
+    /// `($arr_T, $list_T)` indices, plus the reverse index. Called once
+    /// per element type by [`super::lists::declare`].
+    pub(super) fn record_list(&mut self, elem: IrType, arr_idx: u32, list_idx: u32) {
+        self.phx_list_elem_by_struct.insert(list_idx, elem.clone());
+        self.phx_lists.insert(elem, (arr_idx, list_idx));
+    }
+
+    /// Record a declared `$builder_T` for an element type, plus the
+    /// reverse index.
+    pub(super) fn record_list_builder(&mut self, elem: IrType, builder_idx: u32) {
+        self.phx_builder_elem_by_struct
+            .insert(builder_idx, elem.clone());
+        self.phx_list_builders.insert(elem, builder_idx);
+    }
+
+    /// `($arr_T, $list_T)` type-section indices for the list
+    /// instantiation with element type `elem`. Used by `Op::ListAlloc`
+    /// and every `List.*` builtin lowering.
+    ///
+    /// A *placeholder* element type gets its own diagnostic: the K.7
+    /// collection pass deliberately skips generic placeholders (they
+    /// are not concrete instantiations), so reaching here with one is
+    /// an unconstrained-element list surviving to codegen — not a
+    /// collection-pass bug. Sema rejects the `let xs = []` surface
+    /// form ("cannot infer type … add a type annotation"); this arm
+    /// covers any placeholder path sema doesn't front-run (see the
+    /// "Placeholder paths" docstring in
+    /// `phoenix-ir/src/monomorphize/mod.rs::erase_type_vars_in_fn`).
+    pub(super) fn require_list_types(&self, elem: &IrType) -> Result<(u32, u32), CompileError> {
+        self.phx_lists.get(elem).copied().ok_or_else(|| {
+            if super::enums::contains_generic_placeholder(elem) {
+                CompileError::new(
+                    "wasm32-gc: a list's element type was never constrained \
+                     to a concrete type, so no WASM-GC list type exists for \
+                     it. Annotate the list (e.g. `let xs: List<Int> = []`)."
+                        .to_string(),
+                )
+            } else {
+                CompileError::new(format!(
+                    "wasm32-gc: list instantiation `List<{elem:?}>` was not \
+                     declared by `declare_phoenix_lists` — the element-type \
+                     collection pass missed it (internal compiler bug; K.7 \
+                     `collect_list_elems` walks every IR type source)"
+                ))
+            }
+        })
+    }
+
+    /// `$builder_T` type-section index for the `ListBuilder<T>`
+    /// instantiation with element type `elem`. Placeholder element
+    /// types get the annotate-your-list diagnostic — same rationale as
+    /// [`Self::require_list_types`].
+    pub(super) fn require_list_builder_idx(&self, elem: &IrType) -> Result<u32, CompileError> {
+        self.phx_list_builders.get(elem).copied().ok_or_else(|| {
+            if super::enums::contains_generic_placeholder(elem) {
+                CompileError::new(
+                    "wasm32-gc: a list builder's element type was never \
+                     constrained to a concrete type, so no WASM-GC builder \
+                     type exists for it. Annotate the builder (e.g. \
+                     `let b: ListBuilder<Int> = List.builder()`)."
+                        .to_string(),
+                )
+            } else {
+                CompileError::new(format!(
+                    "wasm32-gc: builder instantiation `ListBuilder<{elem:?}>` \
+                     was not declared by `declare_phoenix_lists` (internal \
+                     compiler bug — K.7 `collect_list_elems` should have seen \
+                     its `ListBuilderRef`)"
+                ))
+            }
+        })
+    }
+
+    /// Reverse-lookup a list's element type from its `$list_T` struct
+    /// index (recovered from a receiver's WASM binding type). Used by
+    /// lowerings whose IR result type doesn't carry the element type
+    /// (`List.contains` → Bool).
+    pub(super) fn list_elem_by_struct_idx(&self, list_idx: u32) -> Option<&IrType> {
+        self.phx_list_elem_by_struct.get(&list_idx)
+    }
+
+    /// Reverse-lookup a builder's element type from its `$builder_T`
+    /// struct index (`ListBuilder.push` → Void).
+    pub(super) fn builder_elem_by_struct_idx(&self, builder_idx: u32) -> Option<&IrType> {
+        self.phx_builder_elem_by_struct.get(&builder_idx)
     }
 
     /// Declare the WASI imports the synthesized helpers and `_start`
@@ -1484,17 +1627,21 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
         // Built on first use (see the lazy `get_or_insert_with` below).
         let mut vid_types: Option<HashMap<ValueId, IrType>> = None;
         // Function-level signatures contribute too: if a function takes
-        // or returns a `StringRef`, the string types have to be
-        // declared so the signature can encode them.
-        if func.return_type == IrType::StringRef || func.param_types.contains(&IrType::StringRef) {
+        // or returns a type *containing* `StringRef` — including a
+        // `List<String>` whose `$arr` element encodes the `$string`
+        // index (K.7) — the string types have to be declared so the
+        // signature / list declaration can encode them.
+        if type_contains_string(&func.return_type)
+            || func.param_types.iter().any(type_contains_string)
+        {
             needs.string_types = true;
         }
         for block in &func.blocks {
-            if block.params.iter().any(|(_, t)| *t == IrType::StringRef) {
+            if block.params.iter().any(|(_, t)| type_contains_string(t)) {
                 needs.string_types = true;
             }
             for instr in &block.instructions {
-                if instr.result_type == IrType::StringRef {
+                if type_contains_string(&instr.result_type) {
                     needs.string_types = true;
                 }
                 match &instr.op {
@@ -1503,6 +1650,19 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
                     }
                     Op::FMod(_, _) => {
                         needs.fmod = true;
+                    }
+                    // `List.contains` on a `List<String>` compares
+                    // elements by bytes via the `phx_str_eq` helper
+                    // (K.7 "Semantics mapping") — flag its synthesis.
+                    Op::BuiltinCall(name, args) if name == "List.contains" => {
+                        let vid_types = vid_types.get_or_insert_with(|| build_vid_type_map(func));
+                        if let Some(recv_vid) = args.first()
+                            && let Some(IrType::ListRef(elem)) = vid_types.get(recv_vid)
+                            && **elem == IrType::StringRef
+                        {
+                            needs.string_types = true;
+                            needs.str_eq = true;
+                        }
                     }
                     Op::StringConcat(_, _) => {
                         needs.string_types = true;
@@ -1559,6 +1719,29 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
         }
     }
     needs
+}
+
+/// Whether `ty` is, or transitively contains, `StringRef` — e.g. a
+/// `List<String>` (whose K.7 `$arr` element type encodes the `$string`
+/// index) or a `List<List<String>>`. Drives `HelperNeeds::string_types`
+/// so `declare_string_types` runs before any declaration that needs
+/// the index.
+fn type_contains_string(ty: &IrType) -> bool {
+    match ty {
+        IrType::StringRef => true,
+        IrType::ListRef(inner) | IrType::ListBuilderRef(inner) => type_contains_string(inner),
+        IrType::StructRef(_, args) | IrType::EnumRef(_, args) => {
+            args.iter().any(type_contains_string)
+        }
+        IrType::MapRef(k, v) | IrType::MapBuilderRef(k, v) => {
+            type_contains_string(k) || type_contains_string(v)
+        }
+        IrType::ClosureRef {
+            param_types,
+            return_type,
+        } => param_types.iter().any(type_contains_string) || type_contains_string(return_type),
+        _ => false,
+    }
 }
 
 /// Build a `ValueId → IrType` map for one function by combining (a)

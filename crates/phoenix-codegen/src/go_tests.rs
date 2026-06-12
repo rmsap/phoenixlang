@@ -52,9 +52,9 @@ fn struct_to_go() {
         r#"
 /** A registered user */
 struct User {
-    Int id
-    String name
-    Option<String> bio
+    id: Int
+    name: String
+    bio: Option<String>
 }
 "#,
     );
@@ -71,7 +71,7 @@ fn simple_enum() {
 fn get_with_path_param() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     response User
 }
@@ -86,7 +86,7 @@ endpoint getUser: GET "/api/users/{id}" {
 fn post_with_body_and_errors() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint createUser: POST "/api/users" {
     body User omit { id }
     response User
@@ -103,12 +103,12 @@ endpoint createUser: POST "/api/users" {
 fn query_params() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint listUsers: GET "/api/users" {
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
+        page: Int = 1
+        limit: Int = 20
+        search: Option<String>
     }
     response List<User>
 }
@@ -138,7 +138,7 @@ endpoint deleteUser: DELETE "/api/users/{id}" {
 fn multiline_doc_comment_is_fully_commented() {
     let files = generate_from_source(
         r#"
-struct Widget { Int id }
+struct Widget { id: Int }
 /**
  * Fetch a widget by id
  * with extra detail on the second line
@@ -167,7 +167,7 @@ endpoint getWidget: GET "/api/widgets/{id}" {
 fn multiple_endpoints() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint listUsers: GET "/api/users" {
     response List<User>
 }
@@ -200,7 +200,7 @@ fn pascal_case_conversion() {
 fn multiple_path_params() {
     let files = generate_from_source(
         r#"
-struct Comment { Int id  String text }
+struct Comment { id: Int  text: String }
 endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
     response Comment
 }
@@ -213,7 +213,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
 fn partial_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  Int age }
+struct User { id: Int  name: String  age: Int }
 endpoint updateUser: PATCH "/api/users/{id}" {
     body User omit { id } partial
     response User
@@ -230,7 +230,7 @@ endpoint updateUser: PATCH "/api/users/{id}" {
 fn pick_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint updateEmail: PATCH "/api/users/{id}" {
     body User pick { email }
     response User
@@ -250,8 +250,8 @@ fn body_validate_optional_constrained_field() {
     let files = generate_from_source(
         r#"
 struct Account {
-    Int id
-    Option<String> displayName where self.length <= 60
+    id: Int
+    displayName: Option<String> where self.length <= 60
 }
 endpoint updateAccount: PATCH "/api/accounts/{id}" {
     body Account omit { id }
@@ -286,8 +286,8 @@ fn body_validate_partial_option_constrained_field() {
     let files = generate_from_source(
         r#"
 struct Account {
-    Int id
-    Option<String> displayName where self.length <= 60
+    id: Int
+    displayName: Option<String> where self.length <= 60
 }
 endpoint patchAccount: PATCH "/api/accounts/{id}" {
     body Account omit { id } partial { displayName }
@@ -322,9 +322,9 @@ fn map_and_bool_fields() {
     let files = generate_from_source(
         r#"
 struct Config {
-    Map<String, String> settings
-    Bool enabled
-    Float threshold
+    settings: Map<String, String>
+    enabled: Bool
+    threshold: Float
 }
 "#,
     );
@@ -336,7 +336,7 @@ struct Config {
 fn put_method() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint replaceUser: PUT "/api/users/{id}" {
     body User
     response User
@@ -351,11 +351,11 @@ endpoint replaceUser: PUT "/api/users/{id}" {
 fn string_bool_query_defaults() {
     let files = generate_from_source(
         r#"
-struct Item { Int id  String name }
+struct Item { id: Int  name: String }
 endpoint listItems: GET "/api/items" {
     query {
-        String sortBy = "name"
-        Bool ascending = true
+        sortBy: String = "name"
+        ascending: Bool = true
     }
     response List<Item>
 }
@@ -374,12 +374,12 @@ fn float_and_enum_query_params() {
     let files = generate_from_source(
         r#"
 enum Sort { Asc  Desc }
-struct Item { Int id  String name }
+struct Item { id: Int  name: String }
 endpoint listItems: GET "/api/items" {
     query {
-        Float minScore = 0.5
-        Sort sort
-        Option<Sort> fallback
+        minScore: Float = 0.5
+        sort: Sort
+        fallback: Option<Sort>
     }
     response List<Item>
 }
@@ -396,7 +396,7 @@ endpoint listItems: GET "/api/items" {
 fn empty_derived_body_is_gofmt_clean() {
     let files = generate_from_source(
         r#"
-struct Ping { Int id }
+struct Ping { id: Int }
 endpoint ping: POST "/api/ping" {
     body Ping omit { id }
     response Ping
@@ -419,7 +419,7 @@ endpoint ping: POST "/api/ping" {
 fn types_only_client_omits_fmt_import() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 "#,
     );
     assert!(
@@ -469,9 +469,9 @@ fn validate_numeric_and_string() {
     let files = generate_from_source(
         r#"
 struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    Int age where self >= 0 && self <= 150
+    id: Int
+    name: String where self.length > 0 && self.length <= 100
+    age: Int where self >= 0 && self <= 150
 }
 "#,
     );
@@ -484,8 +484,8 @@ fn validate_contains() {
     let files = generate_from_source(
         r#"
 struct User {
-    Int id
-    String email where self.contains("@") && self.length > 3
+    id: Int
+    email: String where self.contains("@") && self.length > 3
 }
 "#,
     );
@@ -497,7 +497,7 @@ struct User {
 fn no_validate_without_constraints() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 "#,
     );
     assert!(
@@ -528,11 +528,11 @@ fn dyn_type_erases_to_trait_name() {
 fn request_header_auto_wire_name() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
     body User omit { id }
     headers {
-        String idempotencyKey
+        idempotencyKey: String
     }
     response User
 }
@@ -549,10 +549,10 @@ endpoint createUser: POST "/api/users" {
 fn request_header_as_override() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     headers {
-        String authToken as "X-Auth-Token"
+        authToken: String as "X-Auth-Token"
     }
     response User
 }
@@ -568,10 +568,10 @@ endpoint getUser: GET "/api/users/{id}" {
 fn optional_request_header() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     headers {
-        Option<String> traceId
+        traceId: Option<String>
     }
     response User
 }
@@ -589,10 +589,10 @@ endpoint getUser: GET "/api/users/{id}" {
 fn bool_request_header_serializes_lowercase() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     headers {
-        Bool debug
+        debug: Bool
     }
     response User
 }
@@ -616,10 +616,10 @@ endpoint getUser: GET "/api/users/{id}" {
 fn defaulted_request_header_seeds_server_default() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     headers {
-        Int maxStale = 60
+        maxStale: Int = 60
     }
     response User
 }
@@ -653,11 +653,11 @@ endpoint getUser: GET "/api/users/{id}" {
 fn response_header_envelope() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint getPost: GET "/api/posts/{id}" {
     response Post headers {
-        Int ratelimitRemaining
-        Option<String> requestId as "X-Request-Id"
+        ratelimitRemaining: Int
+        requestId: Option<String> as "X-Request-Id"
     }
 }
 "#,
@@ -678,8 +678,8 @@ endpoint getPost: GET "/api/posts/{id}" {
 fn multipart_request_body() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
-struct User { Int id  String name }
+struct AvatarUpload { avatar: File  caption: String }
+struct User { id: Int  name: String }
 endpoint uploadAvatar: POST "/api/avatar" {
     body AvatarUpload
     response User
@@ -699,8 +699,8 @@ endpoint uploadAvatar: POST "/api/avatar" {
 fn multipart_optional_file() {
     let files = generate_from_source(
         r#"
-struct DocUpload { Option<File> attachment  String title }
-struct Doc { Int id }
+struct DocUpload { attachment: Option<File>  title: String }
+struct Doc { id: Int }
 endpoint uploadDoc: POST "/api/docs" {
     body DocUpload
     response Doc
@@ -720,7 +720,7 @@ endpoint uploadDoc: POST "/api/docs" {
 fn binary_response_download() {
     let files = generate_from_source(
         r#"
-struct FileDownload { File contents }
+struct FileDownload { contents: File }
 endpoint downloadFile: GET "/api/files/{id}" {
     response FileDownload
 }
@@ -740,8 +740,8 @@ endpoint downloadFile: GET "/api/files/{id}" {
 fn multipart_two_required_files() {
     let files = generate_from_source(
         r#"
-struct TwoFiles { File first  File second }
-struct Ok { Int id }
+struct TwoFiles { first: File  second: File }
+struct Ok { id: Int }
 endpoint uploadBoth: POST "/api/both" {
     body TwoFiles
     response Ok
@@ -801,8 +801,8 @@ endpoint uploadBoth: POST "/api/both" {
 fn multipart_body_with_constraint_validates() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption where self.length > 0 }
-struct User { Int id }
+struct AvatarUpload { avatar: File  caption: String where self.length > 0 }
+struct User { id: Int }
 endpoint uploadAvatar: POST "/api/avatar" {
     body AvatarUpload
     response User
@@ -848,8 +848,8 @@ endpoint uploadAvatar: POST "/api/avatar" {
 fn multipart_upload_with_binary_response() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
-struct Thumbnail { File data }
+struct AvatarUpload { avatar: File  caption: String }
+struct Thumbnail { data: File }
 endpoint convertAvatar: POST "/api/avatar/convert" {
     body AvatarUpload
     response Thumbnail
@@ -910,7 +910,7 @@ endpoint convertAvatar: POST "/api/avatar/convert" {
 fn multipart_upload_no_response() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
+struct AvatarUpload { avatar: File  caption: String }
 endpoint uploadAvatar: POST "/api/avatar" {
     body AvatarUpload
 }
@@ -964,7 +964,7 @@ endpoint uploadAvatar: POST "/api/avatar" {
 fn body_no_response() {
     let files = generate_from_source(
         r#"
-struct Feedback { String message  Int rating }
+struct Feedback { message: String  rating: Int }
 endpoint submitFeedback: POST "/api/feedback" {
     body Feedback
 }
@@ -996,7 +996,7 @@ endpoint submitFeedback: POST "/api/feedback" {
 fn pagination_offset_envelope() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
     response List<Post> pagination { offset }
 }
@@ -1053,7 +1053,7 @@ endpoint listPosts: GET "/api/posts" {
 fn pagination_cursor_envelope() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
     response List<Post> pagination { cursor }
 }
@@ -1105,7 +1105,7 @@ endpoint listPosts: GET "/api/posts" {
 fn multi_status_shared_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1189,7 +1189,7 @@ endpoint upsertUser: PUT "/api/users/{id}" {
 fn multi_status_typed_and_typeless() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint updateUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1321,7 +1321,7 @@ endpoint enqueueJob: POST "/api/jobs" {
 fn multi_status_with_errors() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1367,14 +1367,14 @@ endpoint upsertUser: PUT "/api/users/{id}" {
 fn multi_status_with_inputs() {
     let files = generate_from_source(
         r#"
-struct Job { Int id  String state }
+struct Job { id: Int  state: String }
 endpoint restartJob: POST "/api/jobs/{id}/restart" {
     headers {
-        String authorization
-        Option<String> traceId
+        authorization: String
+        traceId: Option<String>
     }
     query {
-        Int priority = 5
+        priority: Int = 5
     }
     response {
         200: Job
@@ -1414,7 +1414,7 @@ endpoint restartJob: POST "/api/jobs/{id}/restart" {
 fn multi_status_typeless_205() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint resetUser: PUT "/api/users/{id}/reset" {
     response {
         200: User
@@ -1451,7 +1451,7 @@ endpoint resetUser: PUT "/api/users/{id}/reset" {
 fn multi_status_with_request_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     body User omit { id }
     response {

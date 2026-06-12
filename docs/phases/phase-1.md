@@ -330,8 +330,8 @@ function fetchUser(id: Int) -> Result<User, String> {
 ```phoenix
 // Before (current): separate impl blocks
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 impl Point {
   function distance(self) -> Float { ... }
@@ -342,8 +342,8 @@ impl Display for Point {
 
 // After: everything inside the type body
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   function distance(self) -> Float { ... }
 

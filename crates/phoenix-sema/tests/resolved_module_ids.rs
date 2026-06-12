@@ -44,7 +44,7 @@ fn method_lookup_returns_none_for_unknown_pair() {
     let result = check_full(
         r#"
 struct Counter {
-    Int v
+    v: Int
     function get(self) -> Int { return self.v }
 }
 function main() { }
@@ -65,7 +65,7 @@ fn method_lookup_finds_user_methods_via_func_id() {
     let result = check_full(
         r#"
 struct Counter {
-    Int v
+    v: Int
     function get(self) -> Int { return self.v }
 }
 function main() { }
@@ -124,7 +124,7 @@ fn user_methods_occupy_contiguous_func_ids_after_free_functions() {
         r#"
 function alpha() { }
 struct Counter {
-    Int v
+    v: Int
     function tick(self) -> Int { return self.v + 1 }
 }
 function beta() { }
@@ -176,8 +176,8 @@ function main() { }
 #[test]
 fn func_ids_stable_across_repeated_check_calls() {
     let source = r#"
-struct Dog { Int age }
-struct Cat { Int age }
+struct Dog { age: Int }
+struct Cat { age: Int }
 enum Mood {
     Happy
     Grumpy
@@ -203,7 +203,7 @@ function main() { }
 fn user_method_ids_with_multiple_impl_blocks_same_type() {
     let result = check_full(
         r#"
-struct Counter { Int v }
+struct Counter { v: Int }
 impl Counter { function inc(self) -> Int { return self.v + 1 } }
 impl Counter { function dec(self) -> Int { return self.v - 1 } }
 function main() { }
@@ -228,7 +228,7 @@ fn user_method_ids_with_inline_methods_then_standalone_impl() {
     let result = check_full(
         r#"
 struct Counter {
-    Int v
+    v: Int
     function get(self) -> Int { return self.v }
 }
 impl Counter { function bump(self) -> Int { return self.v + 1 } }
@@ -297,7 +297,7 @@ fn user_method_index_round_trip() {
     let result = check_full(
         r#"
 struct Counter {
-    Int v
+    v: Int
     function inc(self) -> Int { return self.v + 1 }
 }
 function main() { }
@@ -394,7 +394,7 @@ fn duplicate_method_emits_diagnostic_and_keeps_first_definition() {
     let tokens = tokenize(
         r#"
 struct Counter {
-    Int v
+    v: Int
     function get(self) -> Int { return self.v }
     function get(self) -> Bool { return true }
 }
@@ -437,7 +437,7 @@ fn duplicate_method_across_impl_blocks_emits_diagnostic() {
     // the FuncId allocation; `register_impl` emits the diagnostic.
     let tokens = tokenize(
         r#"
-struct Counter { Int v }
+struct Counter { v: Int }
 impl Counter { function bump(self) -> Int { return self.v + 1 } }
 impl Counter { function bump(self) -> Int { return self.v + 2 } }
 function main() { }
@@ -492,7 +492,7 @@ fn user_methods_with_names_round_trips_through_method_index() {
     let result = check_full(
         r#"
 struct Counter {
-    Int v
+    v: Int
     function get(self) -> Int { return self.v }
     function bump(self) -> Int { return self.v + 1 }
 }
@@ -512,8 +512,8 @@ function main() { }
 fn structs_with_names_and_enums_with_names_round_trip() {
     let result = check_full(
         r#"
-struct Dog { Int age }
-struct Cat { Int age }
+struct Dog { age: Int }
+struct Cat { age: Int }
 enum Mood {
     Happy
     Grumpy
@@ -535,11 +535,11 @@ fn build_from_checker_invariants_hold_for_realistic_program() {
         r#"
 trait Greet { function hi(self) -> String }
 struct Dog {
-    String name
+    name: String
     impl Greet { function hi(self) -> String { return self.name } }
 }
 struct Cat {
-    String name
+    name: String
     function meow(self) -> String { return self.name }
 }
 enum Mood {

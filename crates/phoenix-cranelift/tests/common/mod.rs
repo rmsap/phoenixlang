@@ -173,7 +173,7 @@ pub fn drawable_prelude() -> &'static str {
 }
 
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return \"circle\" }
@@ -181,7 +181,7 @@ struct Circle {
 }
 
 struct Square {
-    Int side
+    side: Int
 
     impl Drawable {
         function draw(self) -> String { return \"square\" }

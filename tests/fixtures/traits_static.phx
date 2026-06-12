@@ -13,7 +13,7 @@ trait Greet {
 }
 
 struct Dog {
-  String name
+  name: String
 
   impl Greet {
     function greet(self) -> String { "woof" }
@@ -21,7 +21,7 @@ struct Dog {
 }
 
 struct Cat {
-  String name
+  name: String
 
   impl Greet {
     function greet(self) -> String { "meow" }

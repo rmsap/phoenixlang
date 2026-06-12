@@ -58,9 +58,9 @@ endpoint getUser: GET "/api/users/{id}" {
 /** List all users, optionally filtered by search query */
 endpoint listUsers: GET "/api/users" {
   query {
-    Int page = 1
-    Int limit = 20
-    Option<String> search
+    page: Int = 1
+    limit: Int = 20
+    search: Option<String>
   }
   response List<User>
 }

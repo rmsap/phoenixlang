@@ -20,8 +20,8 @@ trait Shape {
 }
 
 struct Rect {
-  Int w
-  Int h
+  w: Int
+  h: Int
 
   impl Shape {
     function noise(self) { print("rect-noise") }
@@ -30,7 +30,7 @@ struct Rect {
 }
 
 struct Circle {
-  Int r
+  r: Int
 
   impl Shape {
     function noise(self) { print("circle-noise") }

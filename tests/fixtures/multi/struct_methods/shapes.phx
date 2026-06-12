@@ -1,5 +1,5 @@
 public struct Circle {
-  public Int radius
+  public radius: Int
 
   public function area(self) -> Int { self.radius * self.radius * 3 }
   public function describe(self) -> String { "circle" }

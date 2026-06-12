@@ -69,7 +69,7 @@ trait Greet {
 }
 
 struct Dog {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String {
@@ -101,7 +101,7 @@ trait Mix {
 }
 
 struct Bowl {
-    Int scale
+    scale: Int
 
     impl Mix {
         function mix(self, a: Int, b: String) -> String {
@@ -149,7 +149,7 @@ fn dyn_in_struct_field() {
     let output = compile_and_run(&with_drawable_prelude(
         r#"
 struct Scene {
-    dyn Drawable hero
+    hero: dyn Drawable
 }
 
 function main() {
@@ -240,8 +240,8 @@ trait Measure {
     function is_big(self) -> Bool
 }
 struct Room {
-    Int w
-    Int h
+    w: Int
+    h: Int
 
     impl Measure {
         function area(self) -> Int { return self.w * self.h }
@@ -566,14 +566,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int s
+    s: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -603,7 +603,7 @@ trait Mix {
     function mix(self, a: Int, b: String) -> String
 }
 struct Bowl {
-    Int scale
+    scale: Int
 
     impl Mix {
         function mix(self, a: Int, b: String) -> String { return b }
@@ -670,7 +670,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -710,7 +710,7 @@ function main() {
 fn three_way_agreement_on_struct_field() {
     three_way_roundtrip(&with_drawable_prelude(
         r#"
-struct Scene { dyn Drawable hero }
+struct Scene { hero: dyn Drawable }
 function main() {
     let s = Scene(Circle(3))
     print(s.hero.draw())
@@ -736,14 +736,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int s
+    s: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -788,14 +788,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int s
+    s: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -841,7 +841,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Container<T> {
-    T value
+    value: T
 
     impl Drawable {
         function draw(self) -> String { return "container" }
@@ -876,7 +876,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -912,7 +912,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -948,14 +948,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int s
+    s: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -1127,7 +1127,7 @@ function main() {
 fn dyn_field_reassignment_coerces_concrete() {
     let output = compile_and_run(&with_drawable_prelude(
         r#"
-struct Scene { dyn Drawable hero }
+struct Scene { hero: dyn Drawable }
 function main() {
     let mut s: Scene = Scene(Circle(3))
     print(s.hero.draw())
@@ -1148,7 +1148,7 @@ function main() {
 fn dyn_field_method_chaining() {
     let output = compile_and_run(&with_drawable_prelude(
         r#"
-struct Scene { dyn Drawable hero }
+struct Scene { hero: dyn Drawable }
 function make() -> Scene { return Scene(Circle(3)) }
 function main() {
     print(make().hero.draw())
@@ -1169,14 +1169,14 @@ trait Greeter {
     function greet(self) -> String
 }
 struct Hello {
-    Int dummy
+    dummy: Int
 
     impl Greeter {
         function greet(self) -> String { return "hello" }
     }
 }
 struct World {
-    Int dummy
+    dummy: Int
 
     impl Greeter {
         function greet(self) -> String { return "world" }

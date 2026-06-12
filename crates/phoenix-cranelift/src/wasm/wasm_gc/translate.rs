@@ -33,8 +33,11 @@
 //!   `Terminator::Branch`. Block-param locals are single-slot only
 //!   today; multi-slot params (`StringRef`, `DynRef`) land later.
 //!
-//! Subsequent slices add closures / lists / maps / enums / dyn /
-//! strings across PR 6 in matrix-expansion increments.
+//! Strings, enums, floats (incl. print + `%`), and the closure-free
+//! `List<T>` / `ListBuilder<T>` surface (§K.7) have landed across the
+//! PR 6 slices; closures / maps / dyn (and with closures, the
+//! closure-taking list methods) are the remaining matrix-expansion
+//! increments.
 //!
 //! Shadow-stack emission is suppressed entirely on this target — the
 //! host VM's GC handles tracing, so `phx_gc_push_frame` / `set_root` /
@@ -50,6 +53,7 @@ use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
 use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType};
 
+use super::lists;
 use super::module_builder::{self, ModuleBuilder};
 use crate::error::CompileError;
 
@@ -134,11 +138,29 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(idx),
             })])
         }
+        IrType::ListRef(elem) => {
+            // Nullable concrete ref to the K.7 `$list_T` wrapper
+            // struct — same nullability rationale as `StructRef` /
+            // `StringRef` above.
+            let (_, list_idx) = b.require_list_types(elem)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(list_idx),
+            })])
+        }
+        IrType::ListBuilderRef(elem) => {
+            let builder_idx = b.require_list_builder_idx(elem)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(builder_idx),
+            })])
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
-             (Phase 2.4 PR 5 slices 1-3 + PR 6 slice 1 cover Int / Bool / \
-              Float / Void / StructRef / StringRef; closures / lists / \
-              maps / enums / dyn land in PR 6 follow-up slices)"
+             (Phase 2.4 PR 5 slices 1-3 + PR 6 slices cover Int / Bool / \
+              Float / Void / StructRef / StringRef / EnumRef / ListRef / \
+              ListBuilderRef; closures / maps / dyn land in PR 6 \
+              follow-up slices)"
         ))),
     }
 }
@@ -182,7 +204,7 @@ pub(super) fn wasm_return_valtypes(
 /// deliberate MVP simplicity choice: a flat `ValueId → local` map sidesteps
 /// operand-stack lifetime tracking entirely. Revisit if local pressure or
 /// code size becomes a concern in a later slice.
-struct FuncCtx {
+pub(super) struct FuncCtx {
     /// Buffered body instructions. WASM `Function` wants the whole
     /// body up front; we accumulate here and hand off at the end.
     instructions: Vec<Instruction<'static>>,
@@ -291,12 +313,28 @@ impl FuncCtx {
             .unwrap_or(&[])
     }
 
-    fn allocate_local(&mut self, vid: ValueId, wasm_ty: ValType) -> u32 {
+    pub(super) fn allocate_local(&mut self, vid: ValueId, wasm_ty: ValType) -> u32 {
         let idx = self.next_local;
         self.push_local_decl(wasm_ty);
         self.next_local += 1;
         self.bindings.insert(vid, idx);
         self.binding_types.insert(vid, wasm_ty);
+        idx
+    }
+
+    /// Allocate an anonymous scratch local not tied to any `ValueId`.
+    /// Used by multi-step lowerings (the K.7 list copy loops, builder
+    /// growth) that revisit intermediate values. WASM zero-initializes
+    /// locals **once at function entry**, not per use — a lowering
+    /// that re-executes inside a loop must explicitly initialize its
+    /// scratch before reading it. Scratches are never pooled: every
+    /// call declares a fresh local, so each list-op *instruction* in a
+    /// function body adds its own — harmless for validity, but a
+    /// candidate for reuse-by-type if body size ever matters.
+    pub(super) fn scratch_local(&mut self, wasm_ty: ValType) -> u32 {
+        let idx = self.next_local;
+        self.push_local_decl(wasm_ty);
+        self.next_local += 1;
         idx
     }
 
@@ -307,11 +345,11 @@ impl FuncCtx {
         }
     }
 
-    fn emit(&mut self, instr: Instruction<'static>) {
+    pub(super) fn emit(&mut self, instr: Instruction<'static>) {
         self.instructions.push(instr);
     }
 
-    fn binding_of(&self, vid: ValueId) -> Result<u32, CompileError> {
+    pub(super) fn binding_of(&self, vid: ValueId) -> Result<u32, CompileError> {
         self.bindings.get(&vid).copied().ok_or_else(|| {
             CompileError::new(format!(
                 "wasm32-gc: unbound `{vid:?}` reached the translator \
@@ -323,7 +361,7 @@ impl FuncCtx {
     /// The WASM `ValType` a binding was allocated with. Used to
     /// dispatch type-sensitive lowering (e.g. `print`) on the operand's
     /// actual representation.
-    fn binding_type_of(&self, vid: ValueId) -> Result<ValType, CompileError> {
+    pub(super) fn binding_type_of(&self, vid: ValueId) -> Result<ValType, CompileError> {
         self.binding_types.get(&vid).copied().ok_or_else(|| {
             CompileError::new(format!(
                 "wasm32-gc: binding `{vid:?}` has no recorded WASM type \
@@ -775,11 +813,12 @@ fn translate_instruction(
         Op::StructSetField(obj, field_idx, val) => {
             translate_struct_set(ctx, b, *obj, *field_idx, *val)
         }
+        Op::ListAlloc(elems) => lists::translate_list_alloc(ctx, b, elems, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR op `{other:?}` not yet supported \
              (Phase 2.4 PR 5 slices 1-3 cover arithmetic / control \
-              flow / direct calls / struct ops — closures / lists / \
-              maps / strings / enums / dyn land in PR 6)"
+              flow / direct calls / struct ops — closures / \
+              maps / dyn land in PR 6 follow-up slices)"
         ))),
     }
 }
@@ -1246,11 +1285,22 @@ fn translate_builtin_call(
         "print" => translate_print(ctx, b, args),
         "String.length" => translate_string_length(ctx, b, args, instr),
         "String.substring" => translate_string_substring(ctx, b, args, instr),
+        "List.length" => lists::translate_list_length(ctx, args, instr),
+        "List.get" => lists::translate_list_get(ctx, b, args, instr),
+        "List.push" => lists::translate_list_push(ctx, b, args, instr),
+        "List.contains" => lists::translate_list_contains(ctx, b, args, instr),
+        "List.take" => lists::translate_list_take_drop(ctx, b, args, instr, lists::ListSlice::Take),
+        "List.drop" => lists::translate_list_take_drop(ctx, b, args, instr, lists::ListSlice::Drop),
+        "ListBuilder.alloc" => lists::translate_list_builder_alloc(ctx, b, instr),
+        "ListBuilder.push" => lists::translate_list_builder_push(ctx, b, args),
+        "ListBuilder.freeze" => lists::translate_list_builder_freeze(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: builtin `{other}` not yet supported \
-             (PR 5 slice 1 covers `print(Int)`; PR 6 slice 1 adds \
-              `print(String)` / `String.length`; PR 6 slice 2 adds \
-              `String.substring` and `print(Bool)`)"
+             (PR 5 slice 1 covers `print(Int)`; PR 6 slices add \
+              `print(String)` / `print(Bool)` / `print(Float)`, the \
+              `String.*` surface, and the closure-free `List.*` / \
+              `ListBuilder.*` surface; closure-taking list methods land \
+              after the closure slice — §Phase 2.4 K.7)"
         ))),
     }
 }
@@ -1640,7 +1690,7 @@ fn require_dispatcher(
     })
 }
 
-fn expect_result(
+pub(super) fn expect_result(
     instr: &phoenix_ir::instruction::Instruction,
     op_label: &str,
 ) -> Result<ValueId, CompileError> {

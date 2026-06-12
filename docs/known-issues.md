@@ -44,13 +44,13 @@ consumer needs the filename server-side in TS.
 
 **File:** `phoenix-codegen/src/typescript.rs` (multipart server body extraction +
 the `MultipartRequest` interface). **Workaround:** pass the filename as a separate
-scalar form field (`String filename`) alongside the `File`. **Target phase:**
+scalar form field (`filename: String`) alongside the `File`. **Target phase:**
 demand-triggered. Surfaced 2026-06-05 building the multipart round-trip suite.
 
 ### Multipart body field constraints are validated only in the Go target
 
 A scalar field of a multipart request body may carry a `where` constraint (e.g.
-`String caption where self.length > 0`). On a **JSON** body every target enforces
+`caption: String where self.length > 0`). On a **JSON** body every target enforces
 that constraint server-side; on a **multipart** body only **Go** does (it
 assembles the `<Endpoint>Body` struct from the parsed form, then calls
 `body.Validate()`, exactly like the JSON path). **Python and TypeScript silently
@@ -138,7 +138,7 @@ metadata in the response body, headers in HTTP headers); the limitation is purel
 at the generated return-type level.
 
 **Workaround:** if you need both, carry the pagination metadata as response
-headers instead (`response List<T> headers { Int totalCount ... }`) and skip the
+headers instead (`response List<T> headers { totalCount: Int ... }`) and skip the
 `pagination` block, or carry it in a hand-written response struct.
 
 **Planned fix (additive, non-breaking):** nest the page inside the headers
@@ -151,7 +151,7 @@ options are recorded in
 
 ### Defaulted request and query inputs diverge per target and mostly can't trigger the server default
 
-A Phoenix Gen endpoint input with a default — a query param (`Int page = 1`) or a request header (`Int maxStale = 60`) — does not produce a uniform generated **client** shape across targets, and on two of three targets the server's default branch is unreachable through the generated client:
+A Phoenix Gen endpoint input with a default — a query param (`page: Int = 1`) or a request header (`maxStale: Int = 60`) — does not produce a uniform generated **client** shape across targets, and on two of three targets the server's default branch is unreachable through the generated client:
 
 - **Go:** a **required** value arg (`page int64` / `maxStale int64`), always written to the wire. The server's "if absent → apply default" branch is dead code via the generated client.
 - **Python:** a kwarg with the default baked in (`max_stale: int = 60`), sent **unconditionally** (only `Option<T>` inputs are send-guarded). Likewise always on the wire.

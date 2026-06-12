@@ -1,6 +1,6 @@
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 
 function main() {

@@ -71,8 +71,8 @@ fn within_module_duplicate_struct_emits_diagnostic() {
     // the second is rejected with an "is already defined" diagnostic
     // and its registration is dropped (not silently overwriting).
     let entry = entry_only(
-        "struct Foo { Int x }\n\
-         struct Foo { String y }\n\
+        "struct Foo { x: Int }\n\
+         struct Foo { y: String }\n\
          function main() {}",
     );
     let analysis = check_modules(&[entry]);
@@ -160,7 +160,7 @@ fn impl_block_on_imported_type_is_rejected() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -191,9 +191,9 @@ fn within_module_duplicate_struct_with_inline_methods_no_panic() {
     // `build_user_and_builtin_methods`. With the fix, the duplicate is
     // diagnosed and its method's FuncId is consumed via the orphan path.
     let entry = entry_only(
-        "struct Foo { Int x }\n\
+        "struct Foo { x: Int }\n\
          struct Foo {\n\
-         String y\n\
+         y: String\n\
          function bar(self) -> Int { 1 }\n\
          }\n\
          function main() {}",
@@ -256,7 +256,7 @@ fn within_module_duplicate_struct_does_not_cascade_body_diagnostics() {
     // were missing. Pin that no body-level diagnostics reference the
     // duplicate's content.
     let entry = entry_only(
-        "struct Foo { Int x }\n\
+        "struct Foo { x: Int }\n\
          struct Foo {\n\
          function bad(self) -> Int { undefined_name }\n\
          }\n\
@@ -296,7 +296,7 @@ fn coherence_violating_impl_methods_do_not_pollute_target_methods_table() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -477,7 +477,7 @@ fn non_entry_module_cannot_shadow_builtin_enum() {
 
 #[test]
 fn cannot_shadow_builtin_with_struct() {
-    let entry = entry_only("struct Result { Int x }\nfunction main() {}");
+    let entry = entry_only("struct Result { x: Int }\nfunction main() {}");
     let analysis = check_modules(&[entry]);
     assert!(
         analysis.diagnostics.iter().any(|d| {
@@ -645,7 +645,7 @@ fn impl_unknown_trait_for_local_type_routes_through_orphan_path() {
     // after the methods were inserted. Pin the fix: the rejected
     // method is not silently callable as inherent.
     let entry = entry_only(
-        "struct Foo { Int x }\n\
+        "struct Foo { x: Int }\n\
          impl Bogus for Foo { function bogus(self) -> Int { 0 } }\n\
          function main() { let f: Foo = Foo(1) print(f.bogus()) }",
     );
@@ -698,7 +698,7 @@ fn coherence_violating_trait_impl_for_imported_type_routes_through_orphan_path()
     let other = non_entry(
         "lib",
         "public trait Display { function show(self) -> String }\n\
-         public struct User { public String name }",
+         public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -745,9 +745,9 @@ fn within_module_duplicate_and_coherence_violation_in_same_program_no_panic() {
     // a count mismatch.
     let entry = entry_only(
         "import lib { User }\n\
-         struct Foo { Int x }\n\
+         struct Foo { x: Int }\n\
          struct Foo {\n\
-         String y\n\
+         y: String\n\
          function dup_method(self) -> Int { 1 }\n\
          }\n\
          impl User { public function shout(self) -> String { \"hi\" } }\n\
@@ -755,7 +755,7 @@ fn within_module_duplicate_and_coherence_violation_in_same_program_no_panic() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -797,10 +797,10 @@ fn impl_on_type_declared_in_multiple_foreign_modules_lists_all_candidates() {
     );
     let module_a = non_entry(
         "alpha",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
-    let module_b = non_entry("beta", "public struct User { public Int id }", SourceId(2));
+    let module_b = non_entry("beta", "public struct User { public id: Int }", SourceId(2));
     let analysis = check_modules(&[entry, module_a, module_b]);
     let diag = analysis
         .diagnostics

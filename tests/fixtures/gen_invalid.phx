@@ -1,6 +1,6 @@
 struct User {
-    Int id
-    String name
+    id: Int
+    name: String
 }
 
 endpoint getUser: GET "/api/users/{id}" {

@@ -133,12 +133,12 @@ fn cross_module_struct_names_coexist() {
     // field set without collision. Touches the qualified-key
     // registration path end-to-end (not just absence of diagnostics).
     let entry = entry_only(
-        "struct User { Int id }\n\
+        "struct User { id: Int }\n\
          function main() { let u: User = User(42) print(u.id) }",
     );
     let other = non_entry(
         "models",
-        "public struct User { String name }\n\
+        "public struct User { name: String }\n\
          public function makeUser(n: String) -> User { User(n) }",
         SourceId(1),
     );
@@ -251,7 +251,7 @@ fn single_file_module_scopes_map_each_name_to_itself() {
     // and the today's builtins as a smoke check that the scope isn't
     // empty for some pathological reason.
     let entry = entry_only(
-        "struct User { String name }\n\
+        "struct User { name: String }\n\
          enum Color { Red Green Blue }\n\
          function helper() -> Int { 1 }\n\
          function main() {}",
@@ -297,7 +297,7 @@ fn non_entry_struct_carries_def_module() {
     let entry = entry_only("function main() {}");
     let other = non_entry(
         "models",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -319,8 +319,8 @@ fn non_entry_drain_is_lexical_so_id_allocation_is_deterministic() {
     // `z::Bar` even though the dependency-ordering / parse-ordering
     // of the modules tells us nothing about which would land first.
     let entry = entry_only("function main() {}");
-    let mod_z = non_entry("z", "public struct Bar { public Int x }", SourceId(1));
-    let mod_a = non_entry("a", "public struct Foo { public Int x }", SourceId(2));
+    let mod_z = non_entry("z", "public struct Bar { public x: Int }", SourceId(1));
+    let mod_a = non_entry("a", "public struct Foo { public x: Int }", SourceId(2));
     let analysis = check_modules(&[entry, mod_z, mod_a]);
     let foo_id = analysis
         .module
@@ -356,8 +356,8 @@ fn non_entry_drain_is_lexical_within_a_module_too() {
     // give `Zebra` the lower id.
     let other = non_entry(
         "models",
-        "public struct Zebra { public Int x }\n\
-         public struct Aardvark { public Int x }",
+        "public struct Zebra { public x: Int }\n\
+         public struct Aardvark { public x: Int }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);

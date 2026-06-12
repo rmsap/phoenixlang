@@ -21,8 +21,8 @@ trait Shape {
 }
 
 struct Rect {
-  Int w
-  Int h
+  w: Int
+  h: Int
 
   impl Shape {
     function kind(self) -> String { "rect" }
@@ -32,7 +32,7 @@ struct Rect {
 }
 
 struct Circle {
-  Int r
+  r: Int
 
   impl Shape {
     function kind(self) -> String { "circle" }

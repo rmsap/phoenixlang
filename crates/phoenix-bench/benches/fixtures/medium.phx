@@ -6,8 +6,8 @@
 //   78.53975
 
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 enum Shape {
     Circle(Float)

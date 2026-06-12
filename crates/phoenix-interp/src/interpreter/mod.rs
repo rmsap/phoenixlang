@@ -1818,14 +1818,14 @@ mod tests {
     #[test]
     fn run_struct() {
         run_source(
-            "struct Point {\n  Int x\n  Int y\n}\nfunction main() {\n  let p: Point = Point(3, 4)\n  print(p.x)\n  print(p.y)\n}"
+            "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() {\n  let p: Point = Point(3, 4)\n  print(p.x)\n  print(p.y)\n}"
         ).unwrap();
     }
 
     #[test]
     fn run_method() {
         run_source(
-            "struct Counter {\n  Int value\n}\nimpl Counter {\n  function get(self) -> Int {\n    return self.value\n  }\n}\nfunction main() {\n  let c: Counter = Counter(42)\n  print(c.get())\n}"
+            "struct Counter {\n  value: Int\n}\nimpl Counter {\n  function get(self) -> Int {\n    return self.value\n  }\n}\nfunction main() {\n  let c: Counter = Counter(42)\n  print(c.get())\n}"
         ).unwrap();
     }
 
@@ -2209,7 +2209,7 @@ mod tests {
     #[test]
     fn run_generic_struct() {
         run_source(
-            "struct Pair<A, B> {\n  A first\n  B second\n}\nfunction main() {\n  let p: Pair<Int, String> = Pair(1, \"hello\")\n  print(p.first)\n  print(p.second)\n}"
+            "struct Pair<A, B> {\n  first: A\n  second: B\n}\nfunction main() {\n  let p: Pair<Int, String> = Pair(1, \"hello\")\n  print(p.first)\n  print(p.second)\n}"
         ).unwrap();
     }
 
@@ -2343,7 +2343,7 @@ mod tests {
     #[test]
     fn run_list_in_struct() {
         run_source(
-            "struct Bag {\n  String label\n  List<Int> items\n}\nfunction main() {\n  let b: Bag = Bag(\"nums\", [10, 20, 30])\n  print(b.label)\n  print(b.items.get(1))\n}"
+            "struct Bag {\n  label: String\n  items: List<Int>\n}\nfunction main() {\n  let b: Bag = Bag(\"nums\", [10, 20, 30])\n  print(b.label)\n  print(b.items.get(1))\n}"
         ).unwrap();
     }
 
@@ -2498,8 +2498,8 @@ function main() {
         run_source(
             r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let mut p: Point = Point(1, 2)
@@ -2515,8 +2515,8 @@ function main() {
     fn run_field_assignment_nested() {
         run_source(
             r#"
-struct Inner { Int value }
-struct Outer { Inner inner }
+struct Inner { value: Int }
+struct Outer { inner: Inner }
 function main() {
   let mut o: Outer = Outer(Inner(1))
   o.inner.value = 42
@@ -3036,9 +3036,9 @@ function main() { print(fib(10)) }"#,
     fn run_nested_field_assignment_3_levels() {
         let output = run_capturing_source(
             r#"
-struct C { Int value }
-struct B { C c }
-struct A { B b }
+struct C { value: Int }
+struct B { c: C }
+struct A { b: B }
 function main() {
   let mut a: A = A(B(C(0)))
   a.b.c.value = 42

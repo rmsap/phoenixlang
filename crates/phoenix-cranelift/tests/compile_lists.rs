@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{compile_and_run, roundtrip};
+use common::{compile_and_run, expect_panic, roundtrip};
 
 #[test]
 fn list_literal_int() {
@@ -381,6 +381,41 @@ function main() {
     print(dropped.length())
 }
 "#,
+    );
+}
+
+/// Negative `take` aborts the compiled binary end-to-end (2026-06-10
+/// unification, design-decisions §Phase 2.4 K.7 "Semantics mapping"):
+/// the interpreters and wasm32-gc already error, and the
+/// `phx_list_take` guard itself is unit-pinned in phoenix-runtime —
+/// this runs the whole native path through the linked binary's exit
+/// code and stderr.
+#[test]
+fn list_take_negative_aborts() {
+    expect_panic(
+        r#"
+function main() {
+    let xs = [1, 2, 3]
+    let n = 0 - 2
+    print(xs.take(n).length())
+}
+"#,
+        "take() argument must be non-negative",
+    );
+}
+
+/// Negative `drop` aborts — same unification as `take`.
+#[test]
+fn list_drop_negative_aborts() {
+    expect_panic(
+        r#"
+function main() {
+    let xs = [1, 2, 3]
+    let n = 0 - 2
+    print(xs.drop(n).length())
+}
+"#,
+        "drop() argument must be non-negative",
     );
 }
 

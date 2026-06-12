@@ -63,9 +63,9 @@ Every type in Phoenix is **automatically serializable** — no annotations, no b
 
 ```phoenix
 struct User {
-  String name
-  String email
-  Int age
+  name: String
+  email: String
+  age: Int
 }
 
 async function handleCreate(req: Request) -> Response {
@@ -248,10 +248,10 @@ Phoenix validates SQL queries at **compile time** against an explicit schema dec
 
 ```phoenix
 struct User {
-  Int id
-  String name
-  String email
-  Int age
+  id: Int
+  name: String
+  email: String
+  age: Int
 }
 
 schema db {
@@ -262,12 +262,12 @@ schema db {
   }
 }
 
-async function getAdults() -> Result<List<{ String name, Int age }>, DbError> {
+async function getAdults() -> Result<List<{ name: String, age: Int }>, DbError> {
   let adults = await db.query(SELECT name, age FROM users WHERE age >= 18)
   Ok(adults)
 }
 
-async function findUser(id: Int) -> Result<{ String name, String email }, DbError> {
+async function findUser(id: Int) -> Result<{ name: String, email: String }, DbError> {
   let rows = await db.query(SELECT name, email FROM users WHERE id = $id)
   if rows.length() == 0 { return Err(DbError("not found")) }
   Ok(rows.get(0))

@@ -51,8 +51,8 @@ const SCHEMA: &str = include_str!("../../../tests/fixtures/gen_api.phx");
 /// the strict linters flag them.
 const MINIMAL_SCHEMA: &str = r#"
 struct Item {
-    Int id
-    String name
+    id: Int
+    name: String
 }
 
 endpoint getItem: GET "/api/items/{id}" {
@@ -67,8 +67,8 @@ endpoint getItem: GET "/api/items/{id}" {
 /// reach, and locks the output to what `prettier`/`black` actually accept.
 const WIDE_SCHEMA: &str = r#"
 struct Profile {
-    Int id
-    String thisIsAnIntentionallyLongFieldNameToForceGuardWrapping where self.length > 0 && self.length <= 100
+    id: Int
+    thisIsAnIntentionallyLongFieldNameToForceGuardWrapping: String where self.length > 0 && self.length <= 100
 }
 
 endpoint createProfile: POST "/api/profiles" {
@@ -96,15 +96,15 @@ enum AccountSubscriptionTierLevel {
 }
 
 struct Widget {
-    Int id
-    String label
-    AccountSubscriptionTierLevel tier
+    id: Int
+    label: String
+    tier: AccountSubscriptionTierLevel
 }
 
 endpoint listWidgets: GET "/api/widgets" {
     query {
-        Int pageNumberOffsetForResults = 1
-        Option<String> optionalSearchKeywordFilter
+        pageNumberOffsetForResults: Int = 1
+        optionalSearchKeywordFilter: Option<String>
     }
     response List<Widget>
 }
@@ -135,9 +135,9 @@ endpoint createWidget: POST "/api/widgets" {
 ///     `Request<{ regionId: string; configId: string }>` request typing.
 const FEATURE_SCHEMA: &str = r#"
 struct ServerConfig {
-    Int id
-    Map<String, String> settings
-    Float load where self >= 0.0 && self <= 1.0
+    id: Int
+    settings: Map<String, String>
+    load: Float where self >= 0.0 && self <= 1.0
 }
 
 endpoint getRegionConfig: GET "/api/regions/{regionId}/configs/{configId}" {
@@ -167,8 +167,8 @@ enum Shape {
 }
 
 struct Drawing {
-    Int id
-    Shape shape
+    id: Int
+    shape: Shape
 }
 
 endpoint getDrawing: GET "/api/drawings/{id}" {
@@ -195,15 +195,15 @@ endpoint getDrawing: GET "/api/drawings/{id}" {
 ///     so this schema is what uniquely guards the reordering hazard.
 const EDGE_SCHEMA: &str = r#"
 struct Account {
-    Int id
-    String handle where self.length > 0 && self.length <= 30
-    Option<String> displayName where self.length <= 60
+    id: Int
+    handle: String where self.length > 0 && self.length <= 30
+    displayName: Option<String> where self.length <= 60
 }
 
 endpoint searchAccounts: GET "/api/accounts" {
     query {
-        Int maxResults
-        Int page
+        maxResults: Int
+        page: Int
     }
     response List<Account>
 }
@@ -232,22 +232,22 @@ endpoint updateAccount: PATCH "/api/accounts/{id}" {
 ///     header to nil/None/undefined for each.
 const HEADER_SCHEMA: &str = r#"
 struct Thing {
-    Int id
-    String name
+    id: Int
+    name: String
 }
 
 endpoint listThings: GET "/api/things" {
     headers {
-        Option<String> traceId
-        Option<Int> maxResults
+        traceId: Option<String>
+        maxResults: Option<Int>
     }
     response List<Thing>
 }
 
 endpoint getThing: GET "/api/things/{id}" {
     response Thing headers {
-        Option<String> etag
-        Option<Int> ratelimitRemaining
+        etag: Option<String>
+        ratelimitRemaining: Option<Int>
     }
 }
 "#;

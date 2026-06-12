@@ -45,14 +45,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return \"circle\" }
     }
 }
 struct Square {
-    Int side
+    side: Int
 
     impl Drawable {
         function draw(self) -> String { return \"square\" }
@@ -182,10 +182,10 @@ fn struct_ctor_with_dyn_field_emits_dyn_alloc_at_ctor_site() {
         "
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
     impl Drawable { function draw(self) -> String { return \"c\" } }
 }
-struct Scene { dyn Drawable hero }
+struct Scene { hero: dyn Drawable }
 function main() {
     let s = Scene(Circle(3))
     print(s.hero.draw())
@@ -233,7 +233,7 @@ fn let_annotation_with_dyn_emits_dyn_alloc() {
         "
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
     impl Drawable { function draw(self) -> String { return \"c\" } }
 }
 function main() {
@@ -257,11 +257,11 @@ fn reassignment_into_dyn_emits_dyn_alloc_on_each_store() {
         "
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
     impl Drawable { function draw(self) -> String { return \"c\" } }
 }
 struct Square {
-    Int side
+    side: Int
     impl Drawable { function draw(self) -> String { return \"s\" } }
 }
 function main() {
@@ -285,7 +285,7 @@ fn function_return_into_dyn_emits_dyn_alloc() {
         "
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
     impl Drawable { function draw(self) -> String { return \"c\" } }
 }
 function make() -> dyn Drawable { return Circle(1) }
@@ -307,7 +307,7 @@ fn enum_variant_with_dyn_field_emits_dyn_alloc() {
         "
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
     impl Drawable { function draw(self) -> String { return \"c\" } }
 }
 enum Slot { Held(dyn Drawable)
@@ -336,7 +336,7 @@ fn repeated_dyn_alloc_for_same_pair_yields_single_vtable_entry() {
         "
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
     impl Drawable { function draw(self) -> String { return \"c\" } }
 }
 function one(x: dyn Drawable) -> String { return x.draw() }

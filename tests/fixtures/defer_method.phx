@@ -7,7 +7,7 @@
 //   done
 //   42
 struct Counter {
-  Int value
+  value: Int
 
   function show(self) -> Int {
     defer print("done")

@@ -12,7 +12,7 @@ function greet(name: String, prefix: String = "hi", times: Int = 1) -> String {
 }
 
 struct Counter {
-  Int n
+  n: Int
 
   function bump(self, by: Int = 1) -> Int {
     self.n + by

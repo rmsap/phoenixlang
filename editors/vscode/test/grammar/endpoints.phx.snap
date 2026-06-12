@@ -26,29 +26,29 @@
 #       ^^^ source.phoenix
 >//^^^^^ keyword.other.endpoint.phoenix
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
->    Int page = 1
+>    page: Int = 1
 #^^^^ source.phoenix
-#    ^^^ source.phoenix support.type.primitive.phoenix
-#       ^ source.phoenix
-#        ^^^^ source.phoenix variable.other.phoenix
-#            ^ source.phoenix
-#             ^ source.phoenix keyword.operator.assignment.phoenix
-#              ^ source.phoenix
-#               ^ source.phoenix constant.numeric.integer.phoenix
->//  ^^^ support.type.primitive.phoenix
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
->//             ^ constant.numeric.integer.phoenix
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
->    Option<String> search
+#    ^^^^ source.phoenix variable.other.phoenix
+#        ^^ source.phoenix
+#          ^^^ source.phoenix support.type.primitive.phoenix
+#             ^ source.phoenix
+#              ^ source.phoenix keyword.operator.assignment.phoenix
+#               ^ source.phoenix
+#                ^ source.phoenix constant.numeric.integer.phoenix
+>//        ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>//              ^ constant.numeric.integer.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>    search: Option<String>
 #^^^^ source.phoenix
-#    ^^^^^^ source.phoenix support.type.generic.phoenix
-#          ^ source.phoenix keyword.operator.comparison.phoenix
-#           ^^^^^^ source.phoenix support.type.primitive.phoenix
-#                 ^ source.phoenix keyword.operator.comparison.phoenix
-#                  ^ source.phoenix
-#                   ^^^^^^ source.phoenix variable.other.phoenix
->//  ^^^^^^ support.type.generic.phoenix
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+#    ^^^^^^ source.phoenix variable.other.phoenix
+#          ^^ source.phoenix
+#            ^^^^^^ source.phoenix support.type.generic.phoenix
+#                  ^ source.phoenix keyword.operator.comparison.phoenix
+#                   ^^^^^^ source.phoenix support.type.primitive.phoenix
+#                         ^ source.phoenix keyword.operator.comparison.phoenix
+>//          ^^^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
 >  }
 #^^^^ source.phoenix
 >  body User omit { id } partial
@@ -102,7 +102,10 @@
 #                  ^^^ source.phoenix keyword.other.http-method.phoenix
 #                     ^ source.phoenix
 #                      ^ source.phoenix string.quoted.double.phoenix
-#                       ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                       ^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                  ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.begin.phoenix
+#                                   ^^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix variable.other.phoenix
+#                                     ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.end.phoenix
 #                                      ^ source.phoenix string.quoted.double.phoenix
 #                                       ^^^ source.phoenix
 >//                ^^^ keyword.other.http-method.phoenix
@@ -123,7 +126,10 @@
 #                     ^^^ source.phoenix keyword.other.http-method.phoenix
 #                        ^ source.phoenix
 #                         ^ source.phoenix string.quoted.double.phoenix
-#                          ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                          ^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                     ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.begin.phoenix
+#                                      ^^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix variable.other.phoenix
+#                                        ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.end.phoenix
 #                                         ^ source.phoenix string.quoted.double.phoenix
 #                                          ^^^ source.phoenix
 >//                   ^^^ keyword.other.http-method.phoenix
@@ -139,7 +145,10 @@
 #                    ^^^^^ source.phoenix keyword.other.http-method.phoenix
 #                         ^ source.phoenix
 #                          ^ source.phoenix string.quoted.double.phoenix
-#                           ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                           ^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                      ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.begin.phoenix
+#                                       ^^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix variable.other.phoenix
+#                                         ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.end.phoenix
 #                                          ^ source.phoenix string.quoted.double.phoenix
 #                                           ^^^ source.phoenix
 >//                  ^^^^^ keyword.other.http-method.phoenix
@@ -155,7 +164,10 @@
 #                     ^^^^^^ source.phoenix keyword.other.http-method.phoenix
 #                           ^ source.phoenix
 #                            ^ source.phoenix string.quoted.double.phoenix
-#                             ^^^^^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                             ^^^^^^^^^^^ source.phoenix string.quoted.double.phoenix
+#                                        ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.begin.phoenix
+#                                         ^^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix variable.other.phoenix
+#                                           ^ source.phoenix string.quoted.double.phoenix meta.interpolation.phoenix punctuation.section.interpolation.end.phoenix
 #                                            ^ source.phoenix string.quoted.double.phoenix
 #                                             ^^^ source.phoenix
 >//                   ^^^^^^ keyword.other.http-method.phoenix

@@ -1251,6 +1251,603 @@ fn fmod_free_module_carries_no_fmod_helper() {
     );
 }
 
+/// PR 6 slice 7 (§Phase 2.4 K.7): the core `List<T>` surface —
+/// literal (`Op::ListAlloc` → `array.new_fixed` + `struct.new`),
+/// `get`, `length`, and for-in iteration (which the frontend lowers to
+/// `List.length` + `List.get`, so it rides the same machinery).
+#[test]
+fn list_literal_get_length_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xs: List<Int> = [10, 20, 30]\n",
+        "  print(xs.length())\n",
+        "  print(xs.get(0))\n",
+        "  print(xs.get(2))\n",
+        "  for x in xs {\n",
+        "    print(x)\n",
+        "  }\n",
+        "}\n",
+    );
+    assert_prints(source, "list_core_wasm_gc", b"3\n10\n30\n10\n20\n30\n");
+}
+
+/// `List.push` is immutable (K.7 / native parity): the result is a
+/// fresh list of `len + 1` and the receiver is untouched. `take` /
+/// `drop` clamp over-length arguments to the list length ("take/skip
+/// at most n"); negative arguments are a runtime error and get their
+/// own trap test below.
+#[test]
+fn list_push_take_drop_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xs: List<Int> = [1, 2, 3]\n",
+        "  let ys = xs.push(4)\n",
+        "  print(ys.length())\n", // 4
+        "  print(xs.length())\n", // 3 — receiver untouched
+        "  print(ys.get(3))\n",   // 4
+        "  let front = ys.take(2)\n",
+        "  print(front.length())\n", // 2
+        "  print(front.get(1))\n",   // 2
+        "  let back = ys.drop(2)\n",
+        "  print(back.length())\n",        // 2
+        "  print(back.get(0))\n",          // 3
+        "  print(ys.take(99).length())\n", // 4 — clamped to len
+        "  print(ys.drop(99).length())\n", // 0 — clamped to len
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_push_take_drop_wasm_gc",
+        b"4\n3\n4\n2\n2\n2\n3\n4\n0\n",
+    );
+}
+
+/// Negative `take` / `drop` arguments trap (2026-06-10 unification,
+/// K.7 "Semantics mapping"): every backend errors — the interpreters
+/// abort with `take()/drop() argument must be non-negative`, native
+/// aborts in `phx_list_take` / `phx_list_drop` (pinned by
+/// `take_negative_aborts` / `drop_negative_aborts` in
+/// phoenix-runtime), and wasm32-gc traps. The pre-unification native
+/// clamp-to-0 was a silent cross-backend divergence this slice
+/// surfaced and closed.
+#[test]
+fn list_take_drop_negative_traps_under_wasmtime_gc() {
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let xs: List<Int> = [1, 2, 3]\n",
+            "  let neg: Int = 0 - 2\n",
+            "  print(xs.take(neg).length())\n",
+            "}\n",
+        ),
+        "list_take_negative_wasm_gc",
+    );
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let xs: List<Int> = [1, 2, 3]\n",
+            "  let neg: Int = 0 - 2\n",
+            "  print(xs.drop(neg).length())\n",
+            "}\n",
+        ),
+        "list_drop_negative_wasm_gc",
+    );
+}
+
+/// `List.contains` per-element-type equality (K.7 "Semantics
+/// mapping", matching native's `elements_equal`):
+/// - Int: value compare.
+/// - Float: IEEE `f64.eq` — NaN is never equal to anything, including
+///   itself, so a list containing NaN reports `false` for NaN.
+/// - String: byte equality via `phx_str_eq` — a probe string from a
+///   *different allocation* than the stored element still matches
+///   (this is the line that would catch an accidental `ref.eq`).
+#[test]
+fn list_contains_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xs: List<Int> = [1, 2, 3]\n",
+        "  print(xs.contains(2))\n", // true
+        "  print(xs.contains(9))\n", // false
+        "  let fs: List<Float> = [0.5, 2.5]\n",
+        "  print(fs.contains(2.5))\n",  // true
+        "  print(fs.contains(0.25))\n", // false
+        "  let nan: Float = 0.0 / 0.0\n",
+        "  let withnan: List<Float> = [nan, 1.0]\n",
+        "  print(withnan.contains(nan))\n", // false — NaN != NaN
+        "  let ss: List<String> = [\"alpha\", \"beta\"]\n",
+        "  print(ss.contains(\"beta\"))\n", // true — byte equality
+        "  print(ss.contains(\"gamma\"))\n", // false
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_contains_wasm_gc",
+        b"true\nfalse\ntrue\nfalse\nfalse\ntrue\nfalse\n",
+    );
+}
+
+/// Reference-typed list elements: `List<String>` (elements are
+/// `(ref null $string)` — single refs, not the linear backend's fat
+/// pointers) and `List<Point>` (struct refs, with field reads through
+/// `get`'s result).
+#[test]
+fn list_of_string_and_struct_elements_run_under_wasmtime_gc() {
+    let source = concat!(
+        "struct Point {\n  x: Int\n  y: Int\n}\n",
+        "function main() {\n",
+        "  let names: List<String> = [\"alpha\", \"beta\"]\n",
+        "  print(names.get(1))\n",   // beta
+        "  print(names.length())\n", // 2
+        "  let ps: List<Point> = [Point(1, 2), Point(3, 4)]\n",
+        "  print(ps.get(1).x)\n", // 3
+        "  for p in ps {\n",
+        "    print(p.y)\n", // 2, 4
+        "  }\n",
+        "}\n",
+    );
+    assert_prints(source, "list_ref_elements_wasm_gc", b"beta\n2\n3\n2\n4\n");
+}
+
+/// Nested `List<List<Int>>` — the inner instantiation's `$list_T` is
+/// the element ValType of the outer's `$arr_T`, so this pins the K.7
+/// inner-before-outer declaration ordering end-to-end.
+#[test]
+fn nested_list_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xss: List<List<Int>> = [[1, 2], [3, 4, 5]]\n",
+        "  print(xss.length())\n",        // 2
+        "  print(xss.get(0).length())\n", // 2
+        "  print(xss.get(1).get(2))\n",   // 5
+        "  for xs in xss {\n",
+        "    print(xs.length())\n", // 2, 3
+        "  }\n",
+        "}\n",
+    );
+    assert_prints(source, "nested_list_wasm_gc", b"2\n2\n5\n2\n3\n");
+}
+
+/// Out-of-bounds `List.get` traps — both the past-the-end index and a
+/// negative index (which the single unsigned compare catches by
+/// wrapping to a huge u64). Native prints `runtime error: list index …
+/// out of bounds` and exits 1; wasm32-gc follows the established trap
+/// precedent (K.7 "Semantics mapping").
+#[test]
+fn list_get_out_of_bounds_traps_under_wasmtime_gc() {
+    assert_traps(
+        "function main() {\n  let xs: List<Int> = [1, 2, 3]\n  print(xs.get(3))\n}\n",
+        "list_get_oob_high_wasm_gc",
+    );
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let xs: List<Int> = [1, 2, 3]\n",
+            "  let neg: Int = 0 - 1\n",
+            "  print(xs.get(neg))\n",
+            "}\n",
+        ),
+        "list_get_oob_negative_wasm_gc",
+    );
+}
+
+/// `ListBuilder<Int>` end-to-end (K.7): alloc → 12 pushes (the buffer
+/// starts at capacity 8, so this crosses one 2× growth) → zero-copy
+/// freeze → read the frozen list. The frozen list's `$len` (12) is
+/// smaller than its shared buffer (16 slots) — `length` and iteration
+/// must read `$len`, not the array size; the expected output pins
+/// that.
+#[test]
+fn list_builder_push_freeze_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let b: ListBuilder<Int> = List.builder()\n",
+        "  let mut i: Int = 0\n",
+        "  while (i < 12) {\n",
+        "    b.push(i * i)\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  let frozen = b.freeze()\n",
+        "  print(frozen.length())\n",
+        "  for x in frozen {\n",
+        "    print(x)\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut expected = b"12\n".to_vec();
+    for i in 0..12i64 {
+        expected.extend_from_slice(format!("{}\n", i * i).as_bytes());
+    }
+    assert_prints(source, "list_builder_wasm_gc", &expected);
+}
+
+/// Every list op on a *frozen* list whose shared buffer carries
+/// capacity slack (`$len` 12, buffer 16 — the only state where
+/// `$len != array.len`). The slack slots hold `array.new_default`'s
+/// zero, so the squares pushed start at 1 and the sharpest line is
+/// `contains(0) == false`: a scan keyed on `array.len` instead of
+/// `$len` would walk into the slack and find the default. Likewise
+/// `take(99)` must clamp to `$len` (12), not the 16-slot buffer, and
+/// `push` must copy exactly `$len` elements into its fresh array.
+#[test]
+fn frozen_list_with_capacity_slack_ops_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let b: ListBuilder<Int> = List.builder()\n",
+        "  let mut i: Int = 1\n",
+        "  while (i <= 12) {\n",
+        "    b.push(i * i)\n", // 1, 4, …, 144 — never 0
+        "    i = i + 1\n",
+        "  }\n",
+        "  let frozen = b.freeze()\n",
+        "  print(frozen.length())\n",      // 12 — $len, not array.len
+        "  print(frozen.contains(0))\n",   // false — must not scan slack
+        "  print(frozen.contains(144))\n", // true
+        "  let pushed = frozen.push(169)\n",
+        "  print(pushed.length())\n",          // 13
+        "  print(pushed.get(12))\n",           // 169
+        "  print(frozen.length())\n",          // 12 — receiver untouched
+        "  print(frozen.take(99).length())\n", // 12 — clamps to $len, not 16
+        "  let back = frozen.drop(10)\n",
+        "  print(back.length())\n", // 2
+        "  print(back.get(0))\n",   // 121
+        "  print(back.get(1))\n",   // 144
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "frozen_list_slack_ops_wasm_gc",
+        b"12\nfalse\ntrue\n13\n169\n12\n12\n2\n121\n144\n",
+    );
+}
+
+/// `get` on a frozen list bounds-checks against `$len`, not the
+/// buffer: index 12 is inside the 16-slot shared buffer but past the
+/// frozen `$len` of 12, and must trap rather than read a slack slot.
+#[test]
+fn frozen_list_get_in_slack_traps_under_wasmtime_gc() {
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let b: ListBuilder<Int> = List.builder()\n",
+            "  let mut i: Int = 1\n",
+            "  while (i <= 12) {\n",
+            "    b.push(i * i)\n",
+            "    i = i + 1\n",
+            "  }\n",
+            "  let frozen = b.freeze()\n",
+            "  print(frozen.get(12))\n",
+            "}\n",
+        ),
+        "frozen_list_slack_get_oob_wasm_gc",
+    );
+}
+
+/// Use-after-freeze traps (native aborts with `builder was already
+/// frozen`): the frozen flag is what makes the K.7 zero-copy freeze
+/// sound — the shared buffer must never be written after the list
+/// takes it.
+#[test]
+fn list_builder_push_after_freeze_traps_under_wasmtime_gc() {
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let b: ListBuilder<Int> = List.builder()\n",
+            "  b.push(1)\n",
+            "  let f = b.freeze()\n",
+            "  b.push(2)\n",
+            "  print(f.length())\n",
+            "}\n",
+        ),
+        "list_builder_push_after_freeze_wasm_gc",
+    );
+}
+
+/// Double-`freeze()` traps. Distinct from the push-after-freeze test
+/// above: `translate_list_builder_freeze` carries its own `$frozen`
+/// check (separate emission from push's), so this pins the second
+/// guard independently. Native aborts with `builder was already
+/// frozen` on the same call.
+#[test]
+fn list_builder_double_freeze_traps_under_wasmtime_gc() {
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let b: ListBuilder<Int> = List.builder()\n",
+            "  b.push(1)\n",
+            "  let f = b.freeze()\n",
+            "  print(b.freeze().length())\n",
+            "  print(f.length())\n",
+            "}\n",
+        ),
+        "list_builder_double_freeze_wasm_gc",
+    );
+}
+
+/// `List.contains` over struct elements uses `ref.eq` *identity* —
+/// the exact analogue of native's bytewise compare of the stored
+/// 8-byte pointer (`elements_equal` with `is_string = false`): the
+/// same instance is found, a structurally-equal fresh instance is
+/// not. Pins the `Cmp::RefIdentity` arm, which the Int/Float/String
+/// contains test cannot reach.
+#[test]
+fn list_contains_struct_elements_compare_by_identity_under_wasmtime_gc() {
+    let source = concat!(
+        "struct Point {\n  x: Int\n  y: Int\n}\n",
+        "function main() {\n",
+        "  let p: Point = Point(1, 2)\n",
+        "  let ps: List<Point> = [p, Point(3, 4)]\n",
+        "  print(ps.contains(p))\n",           // true — same instance
+        "  print(ps.contains(Point(1, 2)))\n", // false — equal shape, distinct allocation
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_contains_ref_identity_wasm_gc",
+        b"true\nfalse\n",
+    );
+}
+
+/// Boundary sizes: an empty list literal (`array.new_fixed` with size
+/// 0), pushing onto it, and `take(0)` / `drop(0)` (zero-length
+/// `array.copy` at both offset extremes).
+#[test]
+fn empty_list_and_zero_slices_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xs: List<Int> = []\n",
+        "  print(xs.length())\n", // 0
+        "  let ys = xs.push(7)\n",
+        "  print(ys.length())\n", // 1
+        "  print(ys.get(0))\n",   // 7
+        "  let zs: List<Int> = [1, 2, 3]\n",
+        "  print(zs.take(0).length())\n", // 0
+        "  print(zs.drop(0).length())\n", // 3
+        "  print(zs.drop(0).get(2))\n",   // 3
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "empty_list_zero_slices_wasm_gc",
+        b"0\n1\n7\n0\n3\n3\n",
+    );
+}
+
+/// An `Op::ListAlloc` whose element type is still the `__generic`
+/// placeholder (an unconstrained empty literal surviving to codegen)
+/// gets the annotate-your-list diagnostic — not the
+/// internal-compiler-bug message, since the K.7 collection pass
+/// *deliberately* skips placeholders. Sema front-runs the `let xs =
+/// []` surface form ("cannot infer type … add a type annotation"), so
+/// this is built straight from IR, mirroring
+/// [`struct_field_index_out_of_range_is_rejected`].
+#[test]
+fn list_alloc_with_placeholder_element_gets_annotate_diagnostic() {
+    let mut func = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = func.create_block();
+    func.emit_value(
+        entry,
+        Op::ListAlloc(Vec::new()),
+        IrType::ListRef(Box::new(IrType::StructRef(
+            phoenix_ir::types::GENERIC_PLACEHOLDER.to_string(),
+            Vec::new(),
+        ))),
+        None,
+    );
+    func.set_terminator(entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    module.push_concrete(func);
+
+    let err = compile(&module, Target::Wasm32Gc)
+        .expect_err("a placeholder-element ListAlloc must be rejected with a user-facing hint");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("never constrained") && msg.contains("Annotate the list"),
+        "expected the annotate-your-list diagnostic, got: {msg}"
+    );
+}
+
+/// `List<Bool>.contains` — the `Cmp::I32` equality arm, which the
+/// Int/Float/String contains test cannot reach (Bool is the only
+/// i32-slot element type). Also reads a Bool element back through
+/// `get` to pin the i32 element ValType end-to-end.
+#[test]
+fn list_of_bool_contains_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let bs: List<Bool> = [true, true]\n",
+        "  print(bs.contains(true))\n",  // true
+        "  print(bs.contains(false))\n", // false
+        "  print(bs.get(1))\n",          // true
+        "  let fs: List<Bool> = [false]\n",
+        "  print(fs.contains(true))\n",  // false
+        "  print(fs.contains(false))\n", // true
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_bool_contains_wasm_gc",
+        b"true\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}
+
+/// Enum-typed list elements (K.7 scope: "Int, Float, Bool, String,
+/// structs, enums, and nested lists") — elements are `(ref null
+/// $enum_parent)` refs into the K.4 type hierarchy, declared before
+/// the list pass so the `$arr_T` element encodes the parent's index.
+/// `get`'s result flows into a `match` (EnumDiscriminant + ref.cast
+/// field read through a list-loaded value), and `contains` compares by
+/// `ref.eq` identity like structs: the same instance is found, a
+/// structurally-equal fresh instance is not.
+#[test]
+fn list_of_enum_elements_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "enum Shape {\n",
+        "  Circle(Int)\n",
+        "  Square\n",
+        "}\n",
+        "function area(s: Shape) -> Int {\n",
+        "  match s {\n",
+        "    Circle(r) -> r * r * 3\n",
+        "    Square -> 1\n",
+        "  }\n",
+        "}\n",
+        "function main() {\n",
+        "  let c: Shape = Circle(4)\n",
+        "  let shapes: List<Shape> = [c, Square, Circle(2)]\n",
+        "  print(shapes.length())\n",     // 3
+        "  print(area(shapes.get(0)))\n", // 48
+        "  print(area(shapes.get(1)))\n", // 1
+        "  for s in shapes {\n",
+        "    print(area(s))\n", // 48, 1, 12
+        "  }\n",
+        "  print(shapes.contains(c))\n", // true — same instance
+        "  print(shapes.contains(Circle(4)))\n", // false — fresh allocation
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_enum_elements_wasm_gc",
+        b"3\n48\n1\n48\n1\n12\ntrue\nfalse\n",
+    );
+}
+
+/// `ListBuilder<String>` — a ref-element builder, which the Int
+/// builder test cannot reach on two paths: `array.new_default` must
+/// null-initialize the capacity slack for a *nullable-ref* element
+/// type (the K.7 nullability rationale), and the 2× growth
+/// `array.copy` moves refs rather than i64s. 12 pushes cross one
+/// growth from the initial capacity of 8; the frozen list's `$len`
+/// (12) stays below the shared 16-slot buffer, so reading every
+/// element back also pins that no null slack slot is ever touched.
+#[test]
+fn list_builder_string_elements_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let b: ListBuilder<String> = List.builder()\n",
+        "  let s: String = \"s\"\n",
+        "  let mut i: Int = 0\n",
+        "  while (i < 12) {\n",
+        // Interpolation lowers to Op::StringConcat — a fresh `$string`
+        // allocation per push, so the `contains` probe below is a
+        // different allocation than every stored element.
+        "    b.push(\"{s}!\")\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  let frozen = b.freeze()\n",
+        "  print(frozen.length())\n",
+        "  for s in frozen {\n",
+        "    print(s)\n",
+        "  }\n",
+        "  print(frozen.contains(\"s!\"))\n", // true — byte equality, fresh probe
+        "}\n",
+    );
+    let mut expected = b"12\n".to_vec();
+    for _ in 0..12 {
+        expected.extend_from_slice(b"s!\n");
+    }
+    expected.extend_from_slice(b"true\n");
+    assert_prints(source, "list_builder_string_wasm_gc", &expected);
+}
+
+/// Lists crossing *function boundaries* — every prior list test keeps
+/// its lists inside `main`, so `wasm_valtypes_for`'s `ListRef` arm was
+/// only exercised for locals, never for the param/return positions
+/// where the signature interning order ("lists declared before any
+/// signature touching `ListRef`") actually bites. Covers a `List<Int>`
+/// param, a `List<Int>` return, a call result fed straight back into a
+/// param (no intermediate local), and a ref-element `List<String>`
+/// param.
+#[test]
+fn list_across_function_boundary_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function sum(xs: List<Int>) -> Int {\n",
+        "  let mut total: Int = 0\n",
+        "  for x in xs {\n",
+        "    total = total + x\n",
+        "  }\n",
+        "  return total\n",
+        "}\n",
+        "function tail(xs: List<Int>) -> List<Int> {\n",
+        "  return xs.drop(1)\n",
+        "}\n",
+        "function firstName(names: List<String>) -> String {\n",
+        "  return names.get(0)\n",
+        "}\n",
+        "function main() {\n",
+        "  let xs: List<Int> = [1, 2, 3, 4]\n",
+        "  print(sum(xs))\n", // 10
+        "  let t = tail(xs)\n",
+        "  print(t.length())\n",   // 3
+        "  print(t.get(0))\n",     // 2
+        "  print(sum(tail(t)))\n", // 7 — call result straight into a param
+        "  let names: List<String> = [\"ada\", \"grace\"]\n",
+        "  print(firstName(names))\n", // ada
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_across_fn_boundary_wasm_gc",
+        b"10\n3\n2\n7\nada\n",
+    );
+}
+
+/// A module whose *only* mention of `String` is inside `List<String>`
+/// — no string literal, no `print(String)`, so no instruction or
+/// signature anywhere has the bare `IrType::StringRef` type the old
+/// exact-match helper scan looked for (the empty literal is the one
+/// way to build a `List<String>` without `ConstString` instructions).
+/// Declaring `$arr_String` still needs the `$string` index, so
+/// `scan_helper_needs` must flag `string_types` from the *nested*
+/// type — the `type_contains_string` recursion. Under the old
+/// `== IrType::StringRef` check this module failed to compile.
+#[test]
+fn list_of_string_with_no_bare_string_use_compiles_and_runs() {
+    let source = concat!(
+        "function count(xs: List<String>) -> Int {\n",
+        "  return xs.length()\n",
+        "}\n",
+        "function main() {\n",
+        "  let names: List<String> = []\n",
+        "  print(count(names))\n", // 0
+        "}\n",
+    );
+    assert_prints(source, "list_string_signature_only_wasm_gc", b"0\n");
+}
+
+/// A list literal beyond `array.new_fixed`'s 10 000-operand engine cap
+/// is rejected at compile time with the build-it-with-`ListBuilder`
+/// hint, not an opaque downstream validation error. The source is
+/// generated (10 001 elements) rather than committed as a fixture.
+/// Exactly 10 000 elements is still in spec, so the guard must not
+/// fire early — pinned by compiling the boundary size too.
+#[test]
+fn list_literal_over_array_new_fixed_cap_is_rejected() {
+    let make_source = |n: usize| {
+        let elems = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        format!("function main() {{\n  let xs: List<Int> = [{elems}]\n  print(xs.length())\n}}\n")
+    };
+    let err = compile(&lower_to_ir(&make_source(10_001)), Target::Wasm32Gc)
+        .expect_err("a 10 001-element literal can never validate on this target");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("array.new_fixed") && msg.contains("ListBuilder"),
+        "expected the over-cap diagnostic with the ListBuilder hint, got: {msg}"
+    );
+    // Boundary: exactly 10 000 elements compiles and validates.
+    let bytes = compile(&lower_to_ir(&make_source(10_000)), Target::Wasm32Gc)
+        .expect("a 10 000-element literal is exactly at the engine cap and must compile");
+    validate_gc_module(&bytes, "list_literal_at_cap_wasm_gc");
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
 /// inline-synthesis decision: a module that never prints a Float
 /// carries neither the synthesized `phx_print_f64` machinery nor the
@@ -1951,10 +2548,10 @@ fn print_str_oversized_traps_under_wasmtime_gc() {
 fn struct_with_nested_struct_field_is_rejected_until_a_later_slice() {
     let source = concat!(
         "struct Inner {\n",
-        "  Int v\n",
+        "  v: Int\n",
         "}\n",
         "struct Outer {\n",
-        "  Inner inner\n",
+        "  inner: Inner\n",
         "}\n",
         "function main() {\n",
         "  let o: Outer = Outer(Inner(1))\n",
@@ -2179,12 +2776,12 @@ fn struct_in_function_signature_runs_under_wasmtime_gc() {
 fn same_shape_structs_get_distinct_wasm_types() {
     let source = concat!(
         "struct Point {\n",
-        "  Int x\n",
-        "  Int y\n",
+        "  x: Int\n",
+        "  y: Int\n",
         "}\n",
         "struct Pixel {\n",
-        "  Int x\n",
-        "  Int y\n",
+        "  x: Int\n",
+        "  y: Int\n",
         "}\n",
         "function main() {\n",
         "  let p: Point = Point(1, 2)\n",
@@ -2251,7 +2848,7 @@ fn struct_alloc_for_undeclared_struct_is_rejected() {
 /// (a swap to e.g. `i64` would push an i64 operand into an i32 field and
 /// `wasmparser` would reject `struct.new`) is unexercised.
 ///
-/// Shape: `Flags { Bool on, Int n }`; `main` builds `Flags(true, 42)` and
+/// Shape: `Flags { on: Bool, n: Int }`; `main` builds `Flags(true, 42)` and
 /// prints `n` iff `on`, else `0`.
 ///
 /// Expected stdout: `42\n`.
@@ -2259,8 +2856,8 @@ fn struct_alloc_for_undeclared_struct_is_rejected() {
 fn struct_bool_field_runs_under_wasmtime_gc() {
     let source = concat!(
         "struct Flags {\n",
-        "  Bool on\n",
-        "  Int n\n",
+        "  on: Bool\n",
+        "  n: Int\n",
         "}\n",
         "function main() {\n",
         "  let f: Flags = Flags(true, 42)\n",

@@ -26,7 +26,7 @@ trait Greet {
 }
 
 struct Dog {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "woof" }
@@ -58,7 +58,7 @@ trait Greet {
 }
 
 struct Dog {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "woof from " + self.name }
@@ -66,7 +66,7 @@ struct Dog {
 }
 
 struct Cat {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "meow from " + self.name }
@@ -99,8 +99,8 @@ trait Display {
 }
 
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 
     impl Display {
         function toString(self) -> String { return "Point" }
@@ -133,7 +133,7 @@ trait Name {
 }
 
 struct Person {
-    String first
+    first: String
 
     impl Name {
         function name(self) -> String { return self.first }
@@ -163,7 +163,7 @@ trait Combine {
 }
 
 struct Counter {
-    Int start
+    start: Int
 
     impl Combine {
         function combine(self, other: Int) -> Int { return self.start + other }
@@ -194,8 +194,8 @@ trait Size {
 }
 
 struct Box {
-    Int w
-    Int h
+    w: Int
+    h: Int
 
     impl Size {
         function size(self) -> Int { return self.w * self.h }
@@ -224,7 +224,7 @@ trait Truthy {
 }
 
 struct Flag {
-    Bool v
+    v: Bool
 
     impl Truthy {
         function isTrue(self) -> Bool { return self.v }
@@ -293,7 +293,7 @@ trait Greet {
 }
 
 struct Dog {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "woof" }
@@ -326,7 +326,7 @@ trait Stringify {
 }
 
 struct Container<T> {
-    T v
+    v: T
 
     impl Stringify {
         function stringify(self) -> String { return toString(self.v) }
@@ -358,7 +358,7 @@ trait Stringify {
 }
 
 struct Container<T> {
-    T v
+    v: T
 
     impl Stringify {
         function stringify(self) -> String { return toString(self.v) }

@@ -2457,7 +2457,7 @@ fn struct_with_string_field_roundtrips() {
     // → `phx_print_str(ptr, len)`. `print(p.value)` rules out a
     // field-order miscompile by pinning the Int field after the String
     // — a swapped offset/size would surface as a wrong integer.
-    let src = "struct Pair {\n  String name\n  Int value\n}\n\
+    let src = "struct Pair {\n  name: String\n  value: Int\n}\n\
                function main() {\n  \
                  let p = Pair(\"hello\", 42)\n  \
                  print(p.name)\n  \
@@ -2475,7 +2475,7 @@ fn struct_with_string_field_roundtrips() {
 /// landed. Hand-build the op shape to pin the path now.
 #[test]
 fn struct_set_field_compiles_and_validates() {
-    // Build `struct Pair { Int a; Int b }` and a `main` that
+    // Build `struct Pair { a: Int; b: Int }` and a `main` that
     // allocates a Pair, overwrites field 0, then reads it back so
     // both store and load are wired through StructSetField/GetField.
     let mut module = IrModule::new();
@@ -3095,7 +3095,7 @@ fn accepts_ref_typed_return_signature() {
     // construct positionally (`Box(1)`). `main` doesn't call `make`,
     // so only the signature is exercised — the body still lowers,
     // but its `Op::StructAlloc` is a supported op so codegen succeeds.
-    let src = "struct Box {\n  Int value\n}\n\
+    let src = "struct Box {\n  value: Int\n}\n\
                function main() {}\n\
                function make() -> Box {\n  return Box(1)\n}\n";
     compile_src_or_assert_ok(

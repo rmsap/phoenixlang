@@ -72,7 +72,7 @@ fn ir_user_method_ids_match_resolved_user_method_ids() {
     let (analysis, ir) = lower_program(
         r#"
 struct Counter {
-    Int v
+    v: Int
 
     function bump(self) -> Int { return self.v + 1 }
     function get(self) -> Int { return self.v }
@@ -162,7 +162,7 @@ fn no_placeholder_funcs_after_lowering() {
     let (_analysis, ir) = lower_program(
         r#"
 struct Counter {
-    Int n
+    n: Int
 
     function bump(self) -> Int { return self.n + 1 }
 }
@@ -200,9 +200,9 @@ fn orphan_methods_get_filled_placeholder_slots() {
     // assertion we're pinning is "IR doesn't crash on it", not "this
     // input is well-formed".
     let source = r#"
-struct Foo { Int x }
+struct Foo { x: Int }
 struct Foo {
-    String y
+    y: String
     function bar(self) -> Int { return 1 }
 }
 function main() {}

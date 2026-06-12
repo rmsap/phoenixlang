@@ -156,8 +156,8 @@ fn specialize_at_struct_type() {
     let out = compile_and_run(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function identity<T>(v: T) -> T { v }
 function main() {
@@ -176,7 +176,7 @@ fn generic_method_on_non_generic_struct() {
     let out = compile_and_run(
         r#"
 struct Holder {
-    Int tag
+    tag: Int
 
     function wrap<U>(self, x: U) -> U { x }
 }

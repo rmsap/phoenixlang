@@ -352,7 +352,7 @@ fn walk_type(ty: &IrType, result: &mut HashSet<EnumInstantiationKey>) {
 /// resolve it. The recursive arms catch the parameter nested inside
 /// enum / struct type args, list / map element types, and closure
 /// signatures. See §Phase 2.4 K.4 Known limitation.
-fn contains_generic_placeholder(ty: &IrType) -> bool {
+pub(super) fn contains_generic_placeholder(ty: &IrType) -> bool {
     if ty.is_generic_placeholder() || matches!(ty, IrType::TypeVar(_)) {
         return true;
     }

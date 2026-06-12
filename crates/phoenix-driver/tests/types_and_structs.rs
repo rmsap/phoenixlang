@@ -6,8 +6,8 @@ fn struct_and_methods() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   function sum(self) -> Int {
     return self.x + self.y
@@ -50,8 +50,8 @@ fn generics() {
     run_expect(
         r#"
 struct Pair<A, B> {
-  A first
-  B second
+  first: A
+  second: B
 }
 
 function identity<T>(x: T) -> T {
@@ -174,8 +174,8 @@ function main() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let p: Point = Point(1, 2)
@@ -204,8 +204,8 @@ function main() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function take(p: Point) { print(p.x) }
 function main() {
@@ -234,7 +234,7 @@ function main() {
     run_expect(
         r#"
 struct Counter {
-  Int value
+  value: Int
 
   function get(self) -> Int { return self.value }
 }
@@ -257,8 +257,8 @@ fn values_shared_freely() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function both(a: Point, b: Point) { print(a.x) }
 function main() {
@@ -273,8 +273,8 @@ function main() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let p: Point = Point(1, 2)
@@ -290,8 +290,8 @@ function main() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function take(p: Point) -> Point { return p }
 function main() {
@@ -306,7 +306,7 @@ function main() {
     // Variable used after being passed to a function inside an if branch
     run_expect(
         r#"
-struct Data { Int value }
+struct Data { value: Int }
 function take(d: Data) { print(d.value) }
 function main() {
   let d: Data = Data(42)
@@ -327,8 +327,8 @@ fn field_assignment_basic() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let mut p: Point = Point(1, 2)
@@ -346,8 +346,8 @@ fn field_assignment_multiple_fields() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let mut p: Point = Point(0, 0)
@@ -365,7 +365,7 @@ function main() {
 fn field_assignment_immutable_error() {
     expect_type_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let p: Point = Point(1, 2)
   p.x = 10
@@ -379,7 +379,7 @@ function main() {
 fn field_assignment_wrong_type_error() {
     expect_type_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let mut p: Point = Point(1, 2)
   p.x = "hello"
@@ -393,7 +393,7 @@ function main() {
 fn field_assignment_unknown_field_error() {
     expect_type_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let mut p: Point = Point(1, 2)
   p.z = 10
@@ -408,10 +408,10 @@ fn field_assignment_nested() {
     run_expect(
         r#"
 struct Inner {
-  Int value
+  value: Int
 }
 struct Outer {
-  Inner inner
+  inner: Inner
 }
 function main() {
   let mut o: Outer = Outer(Inner(1))
@@ -428,7 +428,7 @@ fn field_assignment_with_expression() {
     run_expect(
         r#"
 struct Counter {
-  Int count
+  count: Int
 }
 function main() {
   let mut c: Counter = Counter(0)
@@ -535,8 +535,8 @@ fn type_alias_in_struct() {
         r#"
 type Name = String
 struct User {
-  Name name
-  Int age
+  name: Name
+  age: Int
 }
 function main() {
   let u: User = User("Alice", 30)
@@ -552,8 +552,8 @@ fn field_assignment_with_interpolation() {
     run_expect(
         r#"
 struct Person {
-  String name
-  Int age
+  name: String
+  age: Int
 }
 function main() {
   let mut p: Person = Person("Alice", 25)
@@ -571,9 +571,9 @@ function main() {
 fn field_assignment_deeply_nested() {
     run_expect(
         r#"
-struct D { Int val }
-struct C { D d }
-struct B { C c }
+struct D { val: Int }
+struct C { d: D }
+struct B { c: C }
 function main() {
   let mut b: B = B(C(D(0)))
   b.c.d.val = 42
@@ -603,7 +603,7 @@ function main() {
 fn field_assignment_after_reassignment() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let mut p: Point = Point(1, 2)
   let q: Point = p
@@ -652,9 +652,9 @@ function main() {
 fn deeply_nested_field_assignment() {
     run_expect(
         r#"
-struct Inner { Int value }
-struct Middle { Inner inner }
-struct Outer { Middle middle }
+struct Inner { value: Int }
+struct Middle { inner: Inner }
+struct Outer { middle: Middle }
 function main() {
   let mut o: Outer = Outer(Middle(Inner(1)))
   o.middle.inner.value = 42
@@ -683,8 +683,8 @@ fn field_assignment_wrong_type() {
     expect_type_error(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let mut p: Point = Point(1, 2)
@@ -731,8 +731,8 @@ fn struct_field_order_deterministic() {
     run_expect(
         r#"
 struct Info {
-  Int age
-  String name
+  age: Int
+  name: String
 }
 function main() {
   let i: Info = Info(30, "Alice")
@@ -759,8 +759,8 @@ fn generic_type_arg_count_mismatch() {
     expect_type_error(
         r#"
 struct Pair<A, B> {
-  A first
-  B second
+  first: A
+  second: B
 }
 function main() {
   let p: Pair<Int> = Pair<Int>(1, 2)
@@ -813,7 +813,7 @@ function main() { }
 fn struct_construction_too_many_args() {
     expect_type_error(
         r#"
-struct Point { Int x Int y }
+struct Point { x: Int y: Int }
 function main() {
     let p: Point = Point(1, 2, 3)
     print(p.x)
@@ -827,7 +827,7 @@ function main() {
 fn struct_construction_too_few_args() {
     expect_type_error(
         r#"
-struct Point { Int x Int y }
+struct Point { x: Int y: Int }
 function main() {
     let p: Point = Point(1)
     print(p.x)
@@ -843,8 +843,8 @@ function main() {
 fn nested_field_assignment() {
     run_expect(
         r#"
-struct Point { Int x Int y }
-struct Rect { Point origin Point size }
+struct Point { x: Int y: Int }
+struct Rect { origin: Point size: Point }
 function main() {
     let mut r: Rect = Rect(Point(0, 0), Point(100, 50))
     r.origin.x = 10
@@ -898,7 +898,7 @@ fn struct_method_chaining() {
     run_expect(
         r#"
 struct Counter {
-    Int value
+    value: Int
 
     function get(self) -> Int { return self.value }
 }
@@ -935,7 +935,7 @@ fn lexer_generic_type_angle_brackets() {
 fn field_assignment_on_immutable_struct_error() {
     expect_type_error(
         r#"
-struct Point { Int x Int y }
+struct Point { x: Int y: Int }
 function main() {
     let p: Point = Point(1, 2)
     p.x = 10
@@ -999,7 +999,7 @@ function main() {
 fn multiple_impl_blocks_for_same_struct() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 impl Point {
     function getX(self) -> Int { return self.x }
 }
@@ -1021,8 +1021,8 @@ fn struct_method_calls_another_method() {
     run_expect(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 
     function sum(self) -> Int { return self.x + self.y }
     function describe(self) -> String {
@@ -1042,7 +1042,7 @@ function main() {
 fn struct_as_return_type() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function makePoint(x: Int, y: Int) -> Point {
     return Point(x, y)
 }
@@ -1060,7 +1060,7 @@ function main() {
 fn struct_passed_to_function() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function sumPoint(p: Point) -> Int {
     return p.x + p.y
 }
@@ -1077,7 +1077,7 @@ function main() {
 fn generic_struct_field_access() {
     run_expect(
         r#"
-struct Wrapper<T> { T value }
+struct Wrapper<T> { value: T }
 function main() {
     let w: Wrapper<Int> = Wrapper(42)
     print(w.value)
@@ -1131,8 +1131,8 @@ fn generic_struct_same_type_both_params() {
     run_expect(
         r#"
 struct Pair<A, B> {
-    A first
-    B second
+    first: A
+    second: B
 }
 function main() {
     let p: Pair<Int, Int> = Pair(10, 20)
@@ -1148,7 +1148,7 @@ function main() {
 fn generic_type_arg_count_too_many() {
     expect_type_error(
         r#"
-struct Box<T> { T value }
+struct Box<T> { value: T }
 function main() {
     let b: Box<Int, String> = Box(42)
 }
@@ -1214,7 +1214,7 @@ function main() {
 fn for_loop_with_struct_mutation() {
     run_expect(
         r#"
-struct Counter { Int value }
+struct Counter { value: Int }
 function main() {
     let mut c: Counter = Counter(0)
     for i in 0..5 {
@@ -1231,7 +1231,7 @@ function main() {
 fn field_assignment_in_while_loop() {
     run_expect(
         r#"
-struct Counter { Int value }
+struct Counter { value: Int }
 function main() {
     let mut c: Counter = Counter(0)
     while c.value < 5 {
@@ -1275,7 +1275,7 @@ function main() {
 fn method_on_field_access_result() {
     run_expect(
         r#"
-struct Wrapper { List<Int> items }
+struct Wrapper { items: List<Int> }
 function main() {
     let w: Wrapper = Wrapper([1, 2, 3])
     print(w.items.length())
@@ -1319,7 +1319,7 @@ function main() {
 fn field_access_unknown_field_error() {
     expect_type_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let p: Point = Point(1, 2)
     print(p.z)
@@ -1335,7 +1335,7 @@ function main() {
 fn struct_display_format() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let p: Point = Point(3, 4)
     print(p)
@@ -1388,10 +1388,10 @@ fn struct_with_many_fields() {
     run_expect(
         r#"
 struct Config {
-    String host
-    Int port
-    Bool debug
-    Float timeout
+    host: String
+    port: Int
+    debug: Bool
+    timeout: Float
 }
 function main() {
     let c: Config = Config("localhost", 8080, true, 30.0)
@@ -1420,8 +1420,8 @@ fn method_with_multiple_params() {
     run_expect(
         r#"
 struct Rect {
-    Float width
-    Float height
+    width: Float
+    height: Float
 
     function scale(self, factor: Float) -> Rect {
         return Rect(self.width * factor, self.height * factor)
@@ -1479,9 +1479,9 @@ function main() {
 fn deeply_nested_field_access() {
     run_expect(
         r#"
-struct Inner { Int value }
-struct Middle { Inner inner }
-struct Outer { Middle middle }
+struct Inner { value: Int }
+struct Middle { inner: Inner }
+struct Outer { middle: Middle }
 function main() {
     let o: Outer = Outer(Middle(Inner(42)))
     print(o.middle.inner.value)
@@ -1497,7 +1497,7 @@ function main() {
 fn mutable_struct_reassignment() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let mut p: Point = Point(1, 2)
     print(p.x)
@@ -1527,7 +1527,7 @@ function main() {
 fn output_struct_fields() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let p: Point = Point(3, 7)
   print(p.x)
@@ -1549,7 +1549,7 @@ fn generic_impl_method_returns_type_param() {
     run_expect(
         r#"
 struct Wrapper<T> {
-    T value
+    value: T
 
     function get(self) -> T { self.value }
 }
@@ -1567,7 +1567,7 @@ fn generic_impl_method_uses_type_param_in_param() {
     run_expect(
         r#"
 struct Box<T> {
-    T value
+    value: T
 
     function set(self, newVal: T) -> Box<T> {
         Box(newVal)
@@ -1588,8 +1588,8 @@ fn generic_impl_two_type_params() {
     run_expect(
         r#"
 struct Pair<A, B> {
-    A first
-    B second
+    first: A
+    second: B
 
     function getFirst(self) -> A { self.first }
     function getSecond(self) -> B { self.second }
@@ -1610,7 +1610,7 @@ function main() {
 fn destructuring_struct_basic() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let p: Point = Point(3, 7)
     let Point { x, y } = p
@@ -1626,7 +1626,7 @@ function main() {
 fn destructuring_struct_from_function() {
     run_expect(
         r#"
-struct Pair { Int a  Int b }
+struct Pair { a: Int  b: Int }
 function makePair() -> Pair { Pair(10, 20) }
 function main() {
     let Pair { a, b } = makePair()
@@ -1643,8 +1643,8 @@ fn inline_method_on_struct() {
     run_expect(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 
     function magnitude(self) -> Int {
         self.x * self.x + self.y * self.y
@@ -1687,7 +1687,7 @@ function main() {
 fn standalone_impl_still_works() {
     run_expect(
         r#"
-struct Counter { Int value }
+struct Counter { value: Int }
 impl Counter {
     function increment(self) -> Counter {
         Counter(self.value + 1)
@@ -1710,7 +1710,7 @@ fn inline_method_generic_struct() {
     run_expect(
         r#"
 struct Box<T> {
-    T value
+    value: T
 
     function unwrap(self) -> T {
         self.value
@@ -1732,7 +1732,7 @@ fn inline_method_and_standalone_impl_together() {
     run_expect(
         r#"
 struct Num {
-    Int value
+    value: Int
 
     function doubled(self) -> Int {
         self.value * 2
@@ -1814,8 +1814,8 @@ fn struct_equality_same_values() {
     run_expect(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function main() {
     let a: Point = Point(1, 2)
@@ -1832,8 +1832,8 @@ fn struct_equality_different_values() {
     run_expect(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function main() {
     let a: Point = Point(1, 2)
@@ -1850,8 +1850,8 @@ fn struct_inequality() {
     run_expect(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function main() {
     let a: Point = Point(1, 2)
@@ -1868,8 +1868,8 @@ fn struct_inequality_same_values() {
     run_expect(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function main() {
     let a: Point = Point(1, 2)
@@ -1886,13 +1886,13 @@ fn deeply_nested_field_assignment_3_levels() {
     run_expect(
         r#"
 struct Inner {
-    Int value
+    value: Int
 }
 struct Middle {
-    Inner inner
+    inner: Inner
 }
 struct Outer {
-    Middle middle
+    middle: Middle
 }
 function main() {
     let mut o: Outer = Outer(Middle(Inner(1)))
@@ -1909,11 +1909,11 @@ fn struct_equality_nested() {
     run_expect(
         r#"
 struct Inner {
-    Int val
+    val: Int
 }
 struct Outer {
-    Inner inner
-    Int other
+    inner: Inner
+    other: Int
 }
 function main() {
     let a: Outer = Outer(Inner(1), 2)
@@ -1933,13 +1933,13 @@ fn deeply_nested_field_assignment_three_levels() {
     run_expect(
         r#"
 struct A {
-  Int value
+  value: Int
 }
 struct B {
-  A a
+  a: A
 }
 struct C {
-  B b
+  b: B
 }
 function main() {
   let mut c: C = C(B(A(1)))
@@ -1996,9 +1996,9 @@ function main() {
 fn nested_field_assignment_3_levels() {
     run_expect(
         r#"
-struct Inner { Int val }
-struct Middle { Inner inner }
-struct Outer { Middle mid }
+struct Inner { val: Int }
+struct Middle { inner: Inner }
+struct Outer { mid: Middle }
 function main() {
   let mut o: Outer = Outer(Middle(Inner(1)))
   o.mid.inner.val = 99
@@ -2017,10 +2017,10 @@ function main() {
 fn four_level_nested_field_assignment() {
     run_expect(
         r#"
-struct A { Int val }
-struct B { A a }
-struct C { B b }
-struct D { C c }
+struct A { val: Int }
+struct B { a: A }
+struct C { b: B }
+struct D { c: C }
 function main() {
   let mut d: D = D(C(B(A(0))))
   d.c.b.a.val = 999
@@ -2035,8 +2035,8 @@ function main() {
 fn nested_field_assignment_multiple_fields() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
-struct Rect { Point origin  Point size }
+struct Point { x: Int  y: Int }
+struct Rect { origin: Point  size: Point }
 function main() {
   let mut r: Rect = Rect(Point(0, 0), Point(100, 50))
   r.origin.x = 10

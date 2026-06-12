@@ -373,7 +373,7 @@ pub(crate) fn monomorphize(module: &mut IrModule) {
         // inference (e.g., `let x = []` with no list-element annotation).
         erase_type_vars_in_non_templates(module);
         // Generic structs can still need specialization even in programs
-        // with no generic functions (`struct Box<T> { T v }` + plain
+        // with no generic functions (`struct Box<T> { v: T }` + plain
         // instantiations).  Run struct-mono unconditionally.
         struct_mono::monomorphize_structs(module);
         debug_assert_no_unresolved_placeholder_ops(module);

@@ -636,7 +636,7 @@ mod tests {
     /// file: a struct/enum for types, plus an endpoint so client/handlers/server
     /// are non-trivial.
     const SCHEMA: &str = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     response User
 }

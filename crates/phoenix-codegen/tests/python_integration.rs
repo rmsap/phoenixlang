@@ -8,11 +8,11 @@ use phoenix_sema::checker;
 const FULL_SCHEMA: &str = r#"
 /** A registered user */
 struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    String email
-    Int age where self >= 0 && self <= 150
-    Option<String> bio
+    id: Int
+    name: String where self.length > 0 && self.length <= 100
+    email: String
+    age: Int where self >= 0 && self <= 150
+    bio: Option<String>
 }
 
 /** User permission levels */
@@ -21,9 +21,9 @@ enum Role { Admin  Editor  Viewer }
 /** List all users */
 endpoint listUsers: GET "/api/users" {
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
+        page: Int = 1
+        limit: Int = 20
+        search: Option<String>
     }
     response List<User>
 }
@@ -315,7 +315,7 @@ fn all_files_have_header() {
 #[test]
 fn pick_modifier_generates_correct_fields() {
     let source = r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint updateEmail: PATCH "/api/users/{id}" {
     body User pick { email }
     response User
@@ -336,7 +336,7 @@ endpoint updateEmail: PATCH "/api/users/{id}" {
 #[test]
 fn partial_modifier_makes_fields_optional() {
     let source = r#"
-struct User { Int id  String name  Int age }
+struct User { id: Int  name: String  age: Int }
 endpoint updateUser: PATCH "/api/users/{id}" {
     body User omit { id } partial
     response User
@@ -353,7 +353,7 @@ endpoint updateUser: PATCH "/api/users/{id}" {
 #[test]
 fn partial_with_constraints_inherited() {
     let source = r#"
-struct User { Int id  String name where self.length > 0  Int age where self >= 0 }
+struct User { id: Int  name: String where self.length > 0  age: Int where self >= 0 }
 endpoint updateUser: PATCH "/api/users/{id}" {
     body User omit { id } partial
     response User
@@ -377,7 +377,7 @@ endpoint updateUser: PATCH "/api/users/{id}" {
 #[test]
 fn map_type_in_struct() {
     let source = r#"
-struct Config { Map<String, String> settings }
+struct Config { settings: Map<String, String> }
 "#;
     let tokens = tokenize(source, SourceId(0));
     let (program, _) = parser::parse(&tokens);
@@ -389,7 +389,7 @@ struct Config { Map<String, String> settings }
 #[test]
 fn put_and_patch_methods() {
     let source = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint replaceUser: PUT "/api/users/{id}" {
     body User
     response User
@@ -412,7 +412,7 @@ endpoint patchUser: PATCH "/api/users/{id}" {
 #[test]
 fn multiple_path_params_snake_case() {
     let source = r#"
-struct Comment { Int id  String text }
+struct Comment { id: Int  text: String }
 endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
     response Comment
 }
@@ -433,12 +433,12 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
 #[test]
 fn schema_does_not_affect_python_output() {
     let with_schema = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" { response User }
 schema db { table users from User { primary key id } }
 "#;
     let without_schema = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" { response User }
 "#;
     let t1 = tokenize(with_schema, SourceId(0));
@@ -466,8 +466,8 @@ trait Renderable {
     function render(self) -> String
 }
 struct Card {
-    Int id
-    dyn Renderable hero
+    id: Int
+    hero: dyn Renderable
 }
 endpoint getCard: GET "/api/cards/{id}" {
     response Card
@@ -503,9 +503,9 @@ trait Serializable {
     function serialize(self) -> String
 }
 struct Widget {
-    Int id
-    dyn Renderable view
-    dyn Serializable data
+    id: Int
+    view: dyn Renderable
+    data: dyn Serializable
 }
 endpoint getWidget: GET "/api/widgets/{id}" {
     response Widget
@@ -543,8 +543,8 @@ trait Renderable {
     function render(self) -> String
 }
 struct Widget {
-    Int id
-    dyn Renderable body
+    id: Int
+    body: dyn Renderable
 }
 endpoint getWidget: GET "/api/widgets/{id}" {
     response Widget
@@ -583,9 +583,9 @@ trait Renderable {
     function render(self) -> String
 }
 struct Gallery {
-    Int id
-    List<dyn Renderable> items
-    Option<dyn Renderable> featured
+    id: Int
+    items: List<dyn Renderable>
+    featured: Option<dyn Renderable>
 }
 endpoint getGallery: GET "/api/galleries/{id}" {
     response Gallery

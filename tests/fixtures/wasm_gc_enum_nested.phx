@@ -6,8 +6,8 @@
 //     the self-recursive case the design doc (§Phase 2.4 K.4) claims
 //     works without special handling.
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 
 enum Holder {

@@ -282,7 +282,7 @@ fn find_definition_span_function() {
 
 #[test]
 fn find_definition_span_struct() {
-    let tokens = tokenize("struct User { Int id }\nfunction main() { }", SourceId(0));
+    let tokens = tokenize("struct User { id: Int }\nfunction main() { }", SourceId(0));
     let (program, _) = parser::parse(&tokens);
     let result = checker::check(&program);
     let span = find_definition_span(
@@ -341,7 +341,7 @@ fn find_definition_span_variable_returns_none() {
 #[test]
 fn find_definition_span_field() {
     let tokens = tokenize(
-        "struct Point { Int x  Int y }\nfunction main() { let p: Point = Point(1, 2)\nprint(p.x) }",
+        "struct Point { x: Int  y: Int }\nfunction main() { let p: Point = Point(1, 2)\nprint(p.x) }",
         SourceId(0),
     );
     let (program, _) = parser::parse(&tokens);
@@ -365,7 +365,7 @@ fn find_definition_span_field() {
 #[test]
 fn find_definition_span_struct_with_dyn_field() {
     let src = "trait Drawable { function draw(self) -> String }\n\
-               struct Scene { dyn Drawable hero }\n\
+               struct Scene { hero: dyn Drawable }\n\
                function main() { }";
     let tokens = tokenize(src, SourceId(0));
     let (program, _) = parser::parse(&tokens);
@@ -384,7 +384,7 @@ fn find_definition_span_struct_with_dyn_field() {
 #[test]
 fn find_definition_span_dyn_field() {
     let src = "trait Drawable { function draw(self) -> String }\n\
-               struct Scene { dyn Drawable hero }\n\
+               struct Scene { hero: dyn Drawable }\n\
                function main() { }";
     let tokens = tokenize(src, SourceId(0));
     let (program, _) = parser::parse(&tokens);
@@ -404,7 +404,7 @@ fn find_definition_span_dyn_field() {
 
 #[test]
 fn find_definition_span_method() {
-    let src = "struct Point { Int x  Int y }\nimpl Point {\n  function display(self) -> String {\n    return \"hello\"\n  }\n}\nfunction main() { }";
+    let src = "struct Point { x: Int  y: Int }\nimpl Point {\n  function display(self) -> String {\n    return \"hello\"\n  }\n}\nfunction main() { }";
     let tokens = tokenize(src, SourceId(0));
     let (program, _) = parser::parse(&tokens);
     let result = checker::check(&program);

@@ -292,6 +292,22 @@ pub unsafe extern "C" fn phx_list_contains(
     0
 }
 
+/// Abort if a `take`/`drop` count is negative. A negative slice
+/// argument is a runtime error on every backend (the interpreters
+/// already aborted; the pre-2026-06-10 native clamp on this path was
+/// the cross-backend divergence — see design-decisions §Phase 2.4 K.7
+/// "Semantics mapping"). Clamping remains only for `n > length`
+/// ("take/skip at most n"). Internal (non-`extern`) so unit tests can
+/// exercise the abort without panicking across the FFI boundary —
+/// same pattern as `list_builder_methods::assert_unfrozen`.
+fn assert_slice_arg_non_negative(n: i64, method: &str) {
+    if n < 0 {
+        runtime_abort(&format!(
+            "{method}() argument must be non-negative, got {n}"
+        ));
+    }
+}
+
 /// Create a new list containing the first `n` elements of the source list.
 ///
 /// If `n >= length`, returns a copy of the entire list.
@@ -304,9 +320,10 @@ pub unsafe extern "C" fn phx_list_contains(
 ///   header for the rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_list_take(list: *const u8, n: i64) -> *mut u8 {
+    assert_slice_arg_non_negative(n, "take");
     let (length, es) = unsafe { list_header(list) };
     let elem_size = es as i64;
-    let take_count = (n.max(0) as usize).min(length);
+    let take_count = (n as usize).min(length);
     let new_list = phx_list_alloc(elem_size, take_count as i64);
     let old_data = unsafe { list.add(HEADER_SIZE) };
     let new_data = unsafe { new_list.add(HEADER_SIZE) };
@@ -328,9 +345,10 @@ pub unsafe extern "C" fn phx_list_take(list: *const u8, n: i64) -> *mut u8 {
 ///   header for the rationale.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn phx_list_drop(list: *const u8, n: i64) -> *mut u8 {
+    assert_slice_arg_non_negative(n, "drop");
     let (length, es) = unsafe { list_header(list) };
     let elem_size = es as i64;
-    let skip = (n.max(0) as usize).min(length);
+    let skip = (n as usize).min(length);
     let new_len = length - skip;
     let new_list = phx_list_alloc(elem_size, new_len as i64);
     let old_data = unsafe { list.add(HEADER_SIZE + skip * es) };
@@ -626,5 +644,37 @@ mod tests {
         assert_eq!(unsafe { read_split_elem(list, 1) }, "a");
         assert_eq!(unsafe { read_split_elem(list, 2) }, "b");
         assert_eq!(unsafe { read_split_elem(list, 3) }, "");
+    }
+
+    /// Negative `take` aborts — the 2026-06-10 unification (K.7
+    /// "Semantics mapping"): every backend errors on a negative slice
+    /// argument; the pre-existing clamp on this path was the
+    /// interpreter/native divergence. Calls the internal check
+    /// directly rather than `phx_list_take` because the latter is
+    /// `extern "C"` (cannot unwind) — same pattern as
+    /// `assert_unfrozen_panics_when_frozen`.
+    #[test]
+    #[should_panic(expected = "take() argument must be non-negative")]
+    fn take_negative_aborts() {
+        assert_slice_arg_non_negative(-2, "take");
+    }
+
+    /// Negative `drop` aborts — same unification as `take`.
+    #[test]
+    #[should_panic(expected = "drop() argument must be non-negative")]
+    fn drop_negative_aborts() {
+        assert_slice_arg_non_negative(-2, "drop");
+    }
+
+    /// Over-length `take` / `drop` still clamp to the list length —
+    /// the clamp removed for negatives stays for the "at most n" /
+    /// "skip at most n" upper side.
+    #[test]
+    fn take_drop_over_length_clamp() {
+        let list = phx_list_alloc(8, 3);
+        let whole = unsafe { phx_list_take(list, 99) };
+        assert_eq!(unsafe { phx_list_length(whole) }, 3);
+        let empty = unsafe { phx_list_drop(list, 99) };
+        assert_eq!(unsafe { phx_list_length(empty) }, 0);
     }
 }

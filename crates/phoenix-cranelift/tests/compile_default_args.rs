@@ -155,7 +155,7 @@ fn default_on_method_parameter() {
     three_way_roundtrip(
         r#"
 struct Counter {
-    Int n
+    n: Int
 
     function bump(self, by: Int = 1) -> Int {
         return self.n + by
@@ -179,7 +179,7 @@ fn method_default_overridden_by_positional() {
     three_way_roundtrip(
         r#"
 struct Counter {
-    Int n
+    n: Int
 
     function bump(self, by: Int = 1) -> Int {
         return self.n + by
@@ -208,7 +208,7 @@ function defaultBump() -> Int {
     return 1
 }
 struct Counter {
-    Int n
+    n: Int
 
     function bump(self, by: Int = defaultBump()) -> Int {
         return self.n + by
@@ -241,7 +241,7 @@ fn method_default_on_generic_struct() {
     three_way_roundtrip(
         r#"
 struct Box<T> {
-    T value
+    value: T
 
     function padded(self, width: Int = 5) -> Int {
         return width
@@ -266,7 +266,7 @@ fn method_default_with_method_level_type_params() {
     three_way_roundtrip(
         r#"
 struct Counter {
-    Int n
+    n: Int
 
     function label<U>(self, item: U, prefix: Int = 0) -> Int {
         return self.n + prefix
@@ -292,7 +292,7 @@ fn method_default_calls_function_returning_same_struct_type() {
     three_way_roundtrip(
         r#"
 struct Counter {
-    Int n
+    n: Int
 
     function add(self, other: Counter = fresh()) -> Int {
         return self.n + other.n

@@ -159,7 +159,7 @@ function main() {
 fn list_of_structs() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let points: List<Point> = [Point(1, 2), Point(3, 4)]
     print(points.length())
@@ -250,8 +250,8 @@ fn list_in_struct() {
     run_expect(
         r#"
 struct Team {
-    String name
-    List<String> members
+    name: String
+    members: List<String>
 }
 function main() {
     let t: Team = Team("Phoenix", ["Alice", "Bob", "Charlie"])

@@ -13,8 +13,8 @@
 // stable sort, elements with the same key must appear in ascending
 // `idx` order.  An unstable sort would shuffle ties.
 struct Tagged {
-  Int key
-  Int idx
+  key: Int
+  idx: Int
 }
 
 function main() {

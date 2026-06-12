@@ -945,7 +945,7 @@ function main() {
 fn to_string_on_struct() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let p: Point = Point(3, 4)
     print(toString(p))

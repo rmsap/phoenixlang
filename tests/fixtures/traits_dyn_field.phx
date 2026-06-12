@@ -23,8 +23,8 @@ trait Shape {
 }
 
 struct Rect {
-  Int w
-  Int h
+  w: Int
+  h: Int
 
   impl Shape {
     function kind(self) -> String { "rect" }
@@ -33,7 +33,7 @@ struct Rect {
 }
 
 struct Circle {
-  Int r
+  r: Int
 
   impl Shape {
     function kind(self) -> String { "circle" }
@@ -45,9 +45,9 @@ struct Circle {
 // fixture also pins the field offsets on either side of the 8-byte
 // fat pointer.
 struct Boxed {
-  Int before
-  dyn Shape shape
-  Int after
+  before: Int
+  shape: dyn Shape
+  after: Int
 }
 
 function main() {

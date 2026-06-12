@@ -149,14 +149,14 @@ fn for_loop_valid() {
 #[test]
 fn struct_valid() {
     assert_no_errors(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.x) }",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.x) }",
     );
 }
 
 #[test]
 fn struct_wrong_field_count() {
     assert_has_error(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1) }",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() { let p: Point = Point(1) }",
         "has 2 field(s), got 1",
     );
 }
@@ -186,14 +186,14 @@ fn while_loop_with_return() {
 #[test]
 fn struct_field_access_valid() {
     assert_no_errors(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.x) }",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.x) }",
     );
 }
 
 #[test]
 fn struct_field_access_invalid() {
     assert_has_error(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.z) }",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() { let p: Point = Point(1, 2)\n print(p.z) }",
         "has no field `z`",
     );
 }
@@ -201,21 +201,21 @@ fn struct_field_access_invalid() {
 #[test]
 fn struct_field_type_check() {
     assert_no_errors(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction main() { let p: Point = Point(1, 2)\n let val: Int = p.x }",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() { let p: Point = Point(1, 2)\n let val: Int = p.x }",
     );
 }
 
 #[test]
 fn method_call_valid() {
     assert_no_errors(
-        "struct Counter {\n  Int value\n}\nimpl Counter {\n  function get(self) -> Int { return self.value }\n}\nfunction main() { let c: Counter = Counter(0)\n let v: Int = c.get() }",
+        "struct Counter {\n  value: Int\n}\nimpl Counter {\n  function get(self) -> Int { return self.value }\n}\nfunction main() { let c: Counter = Counter(0)\n let v: Int = c.get() }",
     );
 }
 
 #[test]
 fn method_call_undefined() {
     assert_has_error(
-        "struct Counter {\n  Int value\n}\nfunction main() { let c: Counter = Counter(0)\n c.reset() }",
+        "struct Counter {\n  value: Int\n}\nfunction main() { let c: Counter = Counter(0)\n c.reset() }",
         "no method `reset`",
     );
 }
@@ -223,7 +223,7 @@ fn method_call_undefined() {
 #[test]
 fn method_wrong_args() {
     assert_has_error(
-        "struct Counter {\n  Int value\n}\nimpl Counter {\n  function add(self, n: Int) -> Int { return self.value + n }\n}\nfunction main() { let c: Counter = Counter(0)\n c.add(1, 2) }",
+        "struct Counter {\n  value: Int\n}\nimpl Counter {\n  function add(self, n: Int) -> Int { return self.value + n }\n}\nfunction main() { let c: Counter = Counter(0)\n c.add(1, 2) }",
         "takes 1 argument",
     );
 }
@@ -296,7 +296,7 @@ fn break_in_nested_if_inside_loop() {
 #[test]
 fn struct_type_as_param() {
     assert_no_errors(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction show(p: Point) { print(p.x) }\nfunction main() { let p: Point = Point(1, 2)\n show(p) }",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction show(p: Point) { print(p.x) }\nfunction main() { let p: Point = Point(1, 2)\n show(p) }",
     );
 }
 
@@ -358,7 +358,7 @@ fn generic_function_identity() {
 #[test]
 fn generic_struct_valid() {
     assert_no_errors(
-        "struct Pair<A, B> {\n  A first\n  B second\n}\nfunction main() { let p: Pair<Int, String> = Pair(1, \"hi\") }",
+        "struct Pair<A, B> {\n  first: A\n  second: B\n}\nfunction main() { let p: Pair<Int, String> = Pair(1, \"hi\") }",
     );
 }
 
@@ -518,7 +518,7 @@ let b: Bool = r.isOk() }"#,
 #[test]
 fn generic_wrong_type_arg_count() {
     assert_has_error(
-        "struct Pair<A, B> {\n  A first\n  B second\n}\nfunction main() { let p: Pair<Int> = Pair(1, \"hi\") }",
+        "struct Pair<A, B> {\n  first: A\n  second: B\n}\nfunction main() { let p: Pair<Int> = Pair(1, \"hi\") }",
         "type mismatch",
     );
 }
@@ -586,8 +586,8 @@ trait Display {
   function toString(self) -> String
 }
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   impl Display {
 function toString(self) -> String { return "Point" }
@@ -610,8 +610,8 @@ trait Display {
   function toString(self) -> String
 }
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   impl Display {
   }
@@ -632,8 +632,8 @@ trait Display {
   function toString(self) -> String
 }
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   impl Display {
 function toString(self) -> String { return "Point" }
@@ -660,8 +660,8 @@ trait Display {
   function toString(self) -> String
 }
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function show<T: Display>(item: T) -> String {
   return item.toString()
@@ -681,8 +681,8 @@ fn unknown_trait_in_impl() {
     assert_has_error(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   impl FakeTrait {
 function foo(self) -> Int { return 0 }
@@ -704,7 +704,7 @@ trait Shape {
   function name(self) -> String
 }
 struct Circle {
-  Float radius
+  radius: Float
 
   impl Shape {
 function area(self) -> Float { return 3.14 }
@@ -730,7 +730,7 @@ trait Shape {
   function name(self) -> String
 }
 struct Circle {
-  Float radius
+  radius: Float
 
   impl Shape {
 function area(self) -> Float { return 3.14 }
@@ -755,7 +755,7 @@ fn type_inference_literal() {
 fn type_inference_struct() {
     assert_no_errors(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let p = Point(1, 2)
   print(p.x)
@@ -853,8 +853,8 @@ fn struct_reusable_after_assignment() {
     assert_no_errors(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let p: Point = Point(1, 2)
@@ -901,8 +901,8 @@ fn function_arg_does_not_consume() {
     assert_no_errors(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function take(p: Point) { print(p.x) }
 function main() {
@@ -920,8 +920,8 @@ fn closure_capture_does_not_consume() {
     assert_no_errors(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let p: Point = Point(1, 2)
@@ -939,8 +939,8 @@ fn same_var_passed_twice() {
     assert_no_errors(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function both(a: Point, b: Point) { print(a.x) }
 function main() {
@@ -956,7 +956,7 @@ function main() {
 fn use_after_assign_in_if_branch() {
     assert_no_errors(
         r#"
-struct Data { Int value }
+struct Data { value: Int }
 function take(d: Data) { print(d.value) }
 function main() {
   let d: Data = Data(42)
@@ -1245,7 +1245,7 @@ fn method_on_void_error() {
 fn field_assignment_immutable_error() {
     assert_has_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let p: Point = Point(1, 2)
   p.x = 10
@@ -1260,7 +1260,7 @@ function main() {
 fn field_assignment_wrong_type_error() {
     assert_has_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
   let mut p: Point = Point(1, 2)
   p.x = "hello"
@@ -1345,7 +1345,7 @@ fn generic_type_alias_missing_args() {
 #[test]
 fn field_assignment_type_mismatch() {
     assert_has_error(
-        "struct Point {\n  Int x\n  Int y\n}\nfunction main() {\n  let mut p: Point = Point(1, 2)\n  p.x = \"hello\"\n}",
+        "struct Point {\n  x: Int\n  y: Int\n}\nfunction main() {\n  let mut p: Point = Point(1, 2)\n  p.x = \"hello\"\n}",
         "type mismatch",
     );
 }
@@ -1371,8 +1371,8 @@ trait Display {
   function toString(self) -> String
 }
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   impl Display {
 function toString(self) -> String { return "point" }
@@ -1443,7 +1443,7 @@ trait Greet {
   function hello(self) -> String
 }
 struct Person {
-  String name
+  name: String
 
   impl Greet {
 function hello(self, extra: Int) -> String { return "hi" }
@@ -1462,7 +1462,7 @@ trait Greet {
   function hello(self) -> String
 }
 struct Person {
-  String name
+  name: String
 
   impl Greet {
 function hello(self) -> Int { return 42 }
@@ -1481,7 +1481,7 @@ trait Adder {
   function add(self, x: Int) -> Int
 }
 struct Foo {
-  Int val
+  val: Int
 
   impl Adder {
 function add(self, x: String) -> Int { return 42 }
@@ -1611,8 +1611,8 @@ fn struct_destructuring_valid() {
     assert_no_errors(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let p: Point = Point(3, 4)
@@ -1628,8 +1628,8 @@ fn struct_destructuring_unknown_field() {
     let diags = check_source(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 }
 function main() {
   let p: Point = Point(3, 4)
@@ -1860,8 +1860,8 @@ function main() { }
 fn check_result_contains_structs() {
     let result = check_full(
         r#"
-struct Point { Int x  Int y }
-struct Named { String name }
+struct Point { x: Int  y: Int }
+struct Named { name: String }
 function main() { }
 "#,
     );
@@ -1885,7 +1885,7 @@ function main() { }
 fn check_result_contains_generic_struct() {
     let result = check_full(
         r#"
-struct Wrapper<T> { T value }
+struct Wrapper<T> { value: T }
 function main() { }
 "#,
     );
@@ -1933,7 +1933,7 @@ fn check_result_contains_builtin_enums() {
 fn check_result_contains_methods() {
     let result = check_full(
         r#"
-struct Counter { Int val }
+struct Counter { val: Int }
 impl Counter {
 function get(self) -> Int { return self.val }
 function inc(self) -> Counter { return Counter(self.val + 1) }
@@ -1967,8 +1967,8 @@ trait Display {
 function toString(self) -> String
 }
 struct Point {
-Int x
-Int y
+x: Int
+y: Int
 
 impl Display {
     function toString(self) -> String { return "point" }
@@ -2038,7 +2038,7 @@ function main() { }
 fn check_result_method_with_defaults() {
     let result = check_full(
         r#"
-struct Counter { Int n }
+struct Counter { n: Int }
 impl Counter {
     function bump(self, by: Int = 1, factor: Int = 2) -> Int {
         return self.n * factor + by
@@ -2073,7 +2073,7 @@ function main() { }
 fn method_default_cannot_reference_self() {
     assert_has_error(
         r#"
-struct Counter { Int n }
+struct Counter { n: Int }
 impl Counter {
     function bump(self, by: Int = self.n) -> Int {
         return self.n + by
@@ -2091,7 +2091,7 @@ function main() { }
 fn method_default_cannot_reference_earlier_parameter() {
     assert_has_error(
         r#"
-struct Counter { Int n }
+struct Counter { n: Int }
 impl Counter {
     function bump(self, x: Int, y: Int = x + 1) -> Int {
         return self.n + x + y
@@ -2110,7 +2110,7 @@ function main() { }
 fn method_too_many_args_on_defaulted_method() {
     assert_has_error(
         r#"
-struct Counter { Int n }
+struct Counter { n: Int }
 impl Counter {
     function bump(self, by: Int = 1) -> Int {
         return self.n + by
@@ -2135,7 +2135,7 @@ function main() {
 fn method_missing_required_arg_names_the_parameter() {
     assert_has_error(
         r#"
-struct Counter { Int n }
+struct Counter { n: Int }
 impl Counter {
     function bump(self, factor: Int, by: Int = 1) -> Int {
         return self.n * factor + by
@@ -2213,7 +2213,7 @@ let x: Int = add(1, 2)
 fn expr_types_populated_for_method_calls() {
     let result = check_full(
         r#"
-struct Counter { Int val }
+struct Counter { val: Int }
 impl Counter {
 function get(self) -> Int { return self.val }
 }
@@ -2286,7 +2286,7 @@ fn snapshot_error_wrong_arg_count() {
 #[test]
 fn snapshot_error_trait_not_implemented() {
     let diags = check_source(
-        "trait Display {\n  function toString(self) -> String\n}\nstruct Point { Int x  Int y }\nfunction show<T: Display>(item: T) -> String { return item.toString() }\nfunction main() { show(Point(1, 2)) }",
+        "trait Display {\n  function toString(self) -> String\n}\nstruct Point { x: Int  y: Int }\nfunction show<T: Display>(item: T) -> String { return item.toString() }\nfunction main() { show(Point(1, 2)) }",
     );
     let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
     insta::assert_debug_snapshot!(messages);
@@ -2299,7 +2299,7 @@ fn snapshot_error_trait_not_implemented() {
 fn endpoint_valid_no_errors() {
     assert_no_errors(
         r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint createUser: POST "/api/users" {
 body User
 response User
@@ -2317,7 +2317,7 @@ error {
 fn endpoint_body_on_get() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
 body User
 response User
@@ -2332,7 +2332,7 @@ response User
 fn endpoint_body_on_delete() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint deleteUser: DELETE "/api/users/{id}" {
 body User
 }
@@ -2372,7 +2372,7 @@ body Widget
 fn endpoint_omit_nonexistent_field() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User omit { nonexistent }
 }
@@ -2386,7 +2386,7 @@ body User omit { nonexistent }
 fn endpoint_pick_nonexistent_field() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User pick { nonexistent }
 }
@@ -2400,7 +2400,7 @@ body User pick { nonexistent }
 fn endpoint_partial_nonexistent_field() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint updateUser: PATCH "/api/users/{id}" {
 body User partial { nonexistent }
 }
@@ -2414,7 +2414,7 @@ body User partial { nonexistent }
 fn endpoint_duplicate_error_variant() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User
 error {
@@ -2432,7 +2432,7 @@ error {
 fn endpoint_status_code_out_of_range() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User
 error {
@@ -2449,12 +2449,12 @@ error {
 fn endpoint_valid_with_query_params() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint listUsers: GET "/api/users" {
 query {
-    Int page = 1
-    Int limit = 20
-    String search
+    page: Int = 1
+    limit: Int = 20
+    search: String
 }
 response User
 }
@@ -2468,7 +2468,7 @@ response User
 fn endpoint_valid_omit_pick_partial() {
     assert_no_errors(
         r#"
-struct User { Int id  String name  String email  String bio }
+struct User { id: Int  name: String  email: String  bio: String }
 endpoint updateUser: PATCH "/api/users/{id}" {
 body User omit { id } partial
 response User
@@ -2506,7 +2506,7 @@ response Status
 fn endpoint_list_response() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint listUsers: GET "/api/users" {
 response List<User>
 }
@@ -2519,7 +2519,7 @@ response List<User>
 fn endpoint_option_response() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint findUser: GET "/api/users/{id}" {
 response Option<User>
 }
@@ -2532,7 +2532,7 @@ response Option<User>
 fn endpoint_error_status_code_400() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User
 error { BadRequest(400) }
@@ -2546,7 +2546,7 @@ error { BadRequest(400) }
 fn endpoint_error_status_code_599() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User
 error { InternalError(599) }
@@ -2560,7 +2560,7 @@ error { InternalError(599) }
 fn endpoint_error_status_code_399() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User
 error { Redirect(399) }
@@ -2575,7 +2575,7 @@ error { Redirect(399) }
 fn endpoint_error_status_code_600() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User
 error { TooHigh(600) }
@@ -2591,7 +2591,7 @@ fn endpoint_body_on_post_put_patch() {
     for method in ["POST", "PUT", "PATCH"] {
         assert_no_errors(&format!(
             r#"
-struct User {{ Int id  String name }}
+struct User {{ id: Int  name: String }}
 endpoint testEndpoint: {method} "/api/users" {{
 body User
 response User
@@ -2606,7 +2606,7 @@ response User
 fn endpoint_pick_then_selective_partial() {
     assert_no_errors(
         r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint patchUser: PATCH "/api/users/{id}" {
 body User pick { name, email, age } partial { age }
 response User
@@ -2620,7 +2620,7 @@ response User
 fn endpoint_selective_partial_nonexistent_after_omit() {
     assert_has_error(
         r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint updateUser: PATCH "/api/users/{id}" {
 body User omit { id } partial { name, nonexistent }
 }
@@ -2636,8 +2636,8 @@ fn endpoint_query_only() {
         r#"
 endpoint search: GET "/api/search" {
 query {
-    String term
-    Int page = 1
+    term: String
+    page: Int = 1
 }
 }
 "#,
@@ -2649,7 +2649,7 @@ query {
 fn endpoint_multiple_path_params() {
     assert_no_errors(
         r#"
-struct Comment { Int id  String text }
+struct Comment { id: Int  text: String }
 endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
 response Comment
 }
@@ -2665,7 +2665,7 @@ fn endpoint_default_value_int() {
     let result = check_full(
         r#"
 endpoint list: GET "/api/items" {
-query { Int page = 1 }
+query { page: Int = 1 }
 }
 "#,
     );
@@ -2682,7 +2682,7 @@ fn endpoint_default_value_string() {
     let result = check_full(
         r#"
 endpoint list: GET "/api/items" {
-query { String sort = "name" }
+query { sort: String = "name" }
 }
 "#,
     );
@@ -2699,7 +2699,7 @@ fn endpoint_default_value_bool() {
     let result = check_full(
         r#"
 endpoint list: GET "/api/items" {
-query { Bool verbose = false }
+query { verbose: Bool = false }
 }
 "#,
     );
@@ -2716,7 +2716,7 @@ fn endpoint_no_default_value() {
     let result = check_full(
         r#"
 endpoint search: GET "/api/search" {
-query { String term }
+query { term: String }
 }
 "#,
     );
@@ -2732,9 +2732,9 @@ fn endpoint_mixed_defaults() {
         r#"
 endpoint list: GET "/api/items" {
 query {
-    Int page = 1
-    String term
-    Bool verbose = true
+    page: Int = 1
+    term: String
+    verbose: Bool = true
 }
 }
 "#,
@@ -2760,8 +2760,8 @@ fn constraint_valid_numeric_and_string() {
     assert_no_errors(
         r#"
 struct User {
-Int age where self >= 0 && self <= 150
-String name where self.length > 0 && self.length <= 100
+age: Int where self >= 0 && self <= 150
+name: String where self.length > 0 && self.length <= 100
 }
 "#,
     );
@@ -2773,7 +2773,7 @@ fn constraint_valid_string_contains() {
     assert_no_errors(
         r#"
 struct User {
-String email where self.contains("@") && self.length > 3
+email: String where self.contains("@") && self.length > 3
 }
 "#,
     );
@@ -2785,7 +2785,7 @@ fn constraint_must_be_bool() {
     assert_has_error(
         r#"
 struct User {
-Int age where self + 1
+age: Int where self + 1
 }
 "#,
         "constraint on field `age` must evaluate to Bool",
@@ -2798,9 +2798,9 @@ fn constraint_inherited_by_derived_type() {
     let result = check_full(
         r#"
 struct User {
-Int id
-String name where self.length > 0
-Int age where self >= 0
+id: Int
+name: String where self.length > 0
+age: Int where self >= 0
 }
 endpoint createUser: POST "/api/users" {
 body User omit { id }
@@ -2824,9 +2824,9 @@ fn constraint_omitted_fields_removed() {
     let result = check_full(
         r#"
 struct User {
-Int id
-String name where self.length > 0
-Int age where self >= 0
+id: Int
+name: String where self.length > 0
+age: Int where self >= 0
 }
 endpoint createUser: POST "/api/users" {
 body User omit { id, age }
@@ -2847,8 +2847,8 @@ fn constraint_stored_in_struct_info() {
     let result = check_full(
         r#"
 struct Item {
-Int price where self > 0
-String name
+price: Int where self > 0
+name: String
 }
 function main() { }
 "#,
@@ -2863,7 +2863,7 @@ function main() { }
 fn constraint_valid_or() {
     assert_no_errors(
         r#"
-struct Range { Int x where self < 0 || self > 100 }
+struct Range { x: Int where self < 0 || self > 100 }
 "#,
     );
 }
@@ -2873,7 +2873,7 @@ struct Range { Int x where self < 0 || self > 100 }
 fn constraint_valid_float() {
     assert_no_errors(
         r#"
-struct Item { Float price where self > 0.0 && self < 1000.0 }
+struct Item { price: Float where self > 0.0 && self < 1000.0 }
 "#,
     );
 }
@@ -2884,10 +2884,10 @@ fn constraint_inherited_through_pick() {
     let result = check_full(
         r#"
 struct User {
-Int id
-String name where self.length > 0
-String email where self.contains("@")
-Int age where self >= 0
+id: Int
+name: String where self.length > 0
+email: String where self.contains("@")
+age: Int where self >= 0
 }
 endpoint updateEmail: PATCH "/api/users/{id}" {
 body User pick { email }
@@ -2908,9 +2908,9 @@ fn constraint_preserved_through_partial() {
     let result = check_full(
         r#"
 struct User {
-Int id
-String name where self.length > 0
-Int age where self >= 0
+id: Int
+name: String where self.length > 0
+age: Int where self >= 0
 }
 endpoint updateUser: PATCH "/api/users/{id}" {
 body User omit { id } partial
@@ -2935,7 +2935,7 @@ response User
 fn schema_no_errors() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 schema db {
 table users from User {
     primary key id
@@ -2951,7 +2951,7 @@ table users from User {
 fn schema_coexists_with_other_decls() {
     assert_no_errors(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
 response User
 }
@@ -3001,7 +3001,7 @@ table events { String eventType  Int timestamp }
 fn definition_span_on_struct() {
     let result = check_full(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 function main() { }
 "#,
     );
@@ -3091,7 +3091,7 @@ function main() { let r: Int = add(1, 2) }
 fn symbol_references_tracks_field_access() {
     let result = check_full(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
 let p: Point = Point(1, 2)
 print(p.x)
@@ -3119,7 +3119,7 @@ print(p.x)
 fn endpoint_duplicate_name() {
     assert_has_error(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
 response User
 }
@@ -3138,7 +3138,7 @@ response User
 fn endpoint_empty_omit() {
     let result = check_full(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User omit { }
 response User
@@ -3155,7 +3155,7 @@ response User
 fn endpoint_empty_pick() {
     let result = check_full(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User pick { }
 response User
@@ -3174,7 +3174,7 @@ response User
 fn endpoint_omit_all_fields() {
     let result = check_full(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
 body User omit { id, name }
 response User
@@ -3194,7 +3194,7 @@ fn constraint_on_list_type() {
     assert_no_errors(
         r#"
 struct Config {
-List<Int> tags where self.length > 0
+tags: List<Int> where self.length > 0
 }
 "#,
     );
@@ -3207,7 +3207,7 @@ fn constraint_on_option_type() {
     assert_no_errors(
         r#"
 struct Config {
-Option<Int> maxRetries where self.isSome()
+maxRetries: Option<Int> where self.isSome()
 }
 "#,
     );
@@ -3221,7 +3221,7 @@ fn endpoint_query_default_type_mismatch() {
     assert_has_error(
         r#"
 endpoint search: GET "/api/search" {
-query { Int page = "hello" }
+query { page: Int = "hello" }
 }
 "#,
         "default value for query param `page` does not match type `Int`",
@@ -3234,7 +3234,7 @@ fn endpoint_query_default_bool_int_mismatch() {
     assert_has_error(
         r#"
 endpoint search: GET "/api/search" {
-query { Bool verbose = 42 }
+query { verbose: Bool = 42 }
 }
 "#,
         "default value for query param `verbose` does not match type `Bool`",
@@ -3247,7 +3247,7 @@ fn endpoint_query_default_string_match() {
     assert_no_errors(
         r#"
 endpoint search: GET "/api/search" {
-query { String sort = "name" }
+query { sort: String = "name" }
 }
 "#,
     );
@@ -3438,7 +3438,7 @@ fn generic_method_on_non_generic_struct_records_call_type_args() {
     let tokens = tokenize(
         r#"
 struct Holder {
-    Int tag
+    tag: Int
 }
 impl Holder {
     function wrap<U>(self, x: U) -> U { x }
@@ -3492,8 +3492,8 @@ fn generic_method_on_generic_struct_records_only_method_type_args() {
     let tokens = tokenize(
         r#"
 struct Pair<A, B> {
-    A first
-    B second
+    first: A
+    second: B
 }
 impl Pair {
     function swap<U>(self, x: U) -> U { x }
@@ -3547,7 +3547,7 @@ trait Tag {
     function tagged(self) -> Int
 }
 struct Point {
-    Int x
+    x: Int
 
     impl Tag {
         function tagged(self) -> Int { self.x }
@@ -3651,7 +3651,7 @@ fn dyn_unknown_trait_in_let_annotation_is_rejected() {
 #[test]
 fn dyn_unknown_trait_in_struct_field_is_rejected() {
     assert_has_error(
-        "struct Holder { dyn Unknown value }
+        "struct Holder { value: dyn Unknown }
          function main() { }",
         "unknown trait `Unknown`",
     );
@@ -3671,7 +3671,7 @@ fn dyn_unknown_trait_in_list_element_is_rejected() {
 fn dyn_non_object_safe_trait_self_in_param_is_rejected() {
     assert_has_error(
         "trait Eq { function eq(self, other: Self) -> Bool }
-         struct Point { Int x }
+         struct Point { x: Int }
          function main() { let e: dyn Eq = Point(0) }",
         "not object-safe",
     );
@@ -3683,7 +3683,7 @@ fn dyn_non_object_safe_trait_self_in_param_is_rejected() {
 fn dyn_non_object_safe_trait_self_in_return_is_rejected() {
     assert_has_error(
         "trait Cloneable { function duplicate(self) -> Self }
-         struct Point { Int x }
+         struct Point { x: Int }
          function main() { let c: dyn Cloneable = Point(0) }",
         "not object-safe",
     );
@@ -3695,7 +3695,7 @@ fn dyn_non_object_safe_trait_self_in_return_is_rejected() {
 fn dyn_non_object_safe_trait_self_nested_in_generic_arg() {
     assert_has_error(
         "trait MaybeSelf { function maybe(self) -> Option<Self> }
-         struct Point { Int x }
+         struct Point { x: Int }
          function main() { let m: dyn MaybeSelf = Point(0) }",
         "not object-safe",
     );
@@ -3720,7 +3720,7 @@ fn non_object_safe_trait_still_usable_as_generic_bound() {
 fn dyn_rejects_concrete_that_does_not_impl_trait() {
     assert_has_error(
         "trait Drawable { function draw(self) -> String }
-         struct Point { Int x }
+         struct Point { x: Int }
          // Point has no `impl Drawable`, so the coercion must fail.
          function main() { let d: dyn Drawable = Point(0) }",
         "type mismatch",
@@ -3758,7 +3758,7 @@ fn empty_list_of_dyn_literal_is_rejected() {
 fn populated_list_of_dyn_literal_is_currently_accepted_by_sema() {
     assert_no_errors(
         "trait Drawable { function draw(self) -> String }
-         struct Circle { Int r }
+         struct Circle { r: Int }
          impl Drawable for Circle {
              function draw(self) -> String { return \"c\" }
          }
@@ -3923,11 +3923,11 @@ fn dyn_coercion_with_mismatched_trait_bound_is_rejected() {
 // to the existing rejection tests, so the next regression is loud.
 
 const DRAWABLE_PRELUDE: &str = "trait Drawable { function draw(self) -> String }
-                                struct Circle { Int radius }
+                                struct Circle { radius: Int }
                                 impl Drawable for Circle {
                                     function draw(self) -> String { return \"c\" }
                                 }
-                                struct Square { Int side }
+                                struct Square { side: Int }
                                 impl Drawable for Square {
                                     function draw(self) -> String { return \"s\" }
                                 }";
@@ -3998,7 +3998,7 @@ fn dyn_coercion_in_return_value_typechecks() {
 #[test]
 fn dyn_coercion_in_struct_field_typechecks() {
     assert_no_errors(&with_drawable_prelude(
-        "struct Scene { dyn Drawable hero }
+        "struct Scene { hero: dyn Drawable }
          function main() { Scene(Circle(1)) }",
     ));
 }
@@ -4038,7 +4038,7 @@ fn dyn_over_generic_trait_is_rejected() {
 fn dyn_reassignment_with_non_implementor_is_rejected() {
     assert_has_error(
         &with_drawable_prelude(
-            "struct Plain { Int v }
+            "struct Plain { v: Int }
              function main() {
                  let mut d: dyn Drawable = Circle(1)
                  d = Plain(0)

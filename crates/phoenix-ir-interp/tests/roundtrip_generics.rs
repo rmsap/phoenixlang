@@ -155,8 +155,8 @@ fn specialize_at_struct_type() {
     roundtrip(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function identity<T>(v: T) -> T { v }
 function main() {
@@ -176,7 +176,7 @@ fn generic_method_on_non_generic_struct() {
     roundtrip(
         r#"
 struct Holder {
-    Int tag
+    tag: Int
 
     function wrap<U>(self, x: U) -> U { x }
 }

@@ -869,6 +869,90 @@ impl<'src> Parser<'src> {
         self.diagnostics.push(Diagnostic::error(message, span));
     }
 
+    /// Migration aid for the 2026-06-10 field-syntax unification: if the
+    /// cursor sits on the *old* type-first shape (`Int x`,
+    /// `Option<String> bio`, `dyn Drawable hero` — a plausible type
+    /// directly followed by an identifier), emit a targeted "write
+    /// `x: Int`" diagnostic before the generic expect-failures fire.
+    /// Detection is a bounded-lookahead heuristic (a type keyword,
+    /// capitalized type name, or `dyn Trait`, plus an optional balanced
+    /// `<...>` argument list); it adds a clearer first line, and the
+    /// caller's recovery path keeps the parse moving either way.
+    /// Returns `true` if it fired (callers skip the field parse and go
+    /// straight to recovery, so the targeted hint isn't followed by a
+    /// redundant generic "expected identifier").
+    fn note_type_first_field(&mut self, what: &str) -> bool {
+        let is_upper_ident = |tok: &Token| {
+            tok.kind == TokenKind::Ident
+                && tok
+                    .text
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+        };
+        // Offset just past the plausible type's head token(s).
+        let mut end = match self.peek().kind {
+            TokenKind::IntType
+            | TokenKind::FloatType
+            | TokenKind::StringType
+            | TokenKind::BoolType => 1,
+            TokenKind::Ident if is_upper_ident(self.peek()) => 1,
+            TokenKind::Dyn if is_upper_ident(self.peek_at(1)) => 2,
+            _ => return false,
+        };
+        // Optional generic argument list: scan a balanced `<...>` (the
+        // lexer has no `>>` token, so nested closers are plain `Gt`s).
+        // Bounded so a stray `<` can't drag the lookahead across the
+        // whole body; on anything that can't appear inside a type
+        // argument list, this isn't the old field shape — bail.
+        if self.peek_at(end).kind == TokenKind::Lt {
+            let mut depth = 0usize;
+            loop {
+                match self.peek_at(end).kind {
+                    TokenKind::Lt => depth += 1,
+                    TokenKind::Gt => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end += 1;
+                            break;
+                        }
+                    }
+                    TokenKind::Ident
+                    | TokenKind::IntType
+                    | TokenKind::FloatType
+                    | TokenKind::StringType
+                    | TokenKind::BoolType
+                    | TokenKind::Dyn
+                    | TokenKind::Comma => {}
+                    _ => return false,
+                }
+                end += 1;
+                if end > 24 {
+                    return false;
+                }
+            }
+        }
+        if self.peek_at(end).kind == TokenKind::Ident {
+            let mut ty = String::new();
+            for i in 0..end {
+                let tok = self.peek_at(i);
+                match tok.kind {
+                    TokenKind::Dyn => ty.push_str("dyn "),
+                    TokenKind::Comma => ty.push_str(", "),
+                    _ => ty.push_str(&tok.text),
+                }
+            }
+            let name = self.peek_at(end).text.to_string();
+            self.error_at_current(&format!(
+                "{what} declarations use `name: Type` — write `{name}: {ty}`, \
+                 not `{ty} {name}` (field syntax was unified with parameter / \
+                 `let` annotations)"
+            ));
+            return true;
+        }
+        false
+    }
+
     /// Parses a struct declaration: `struct Name { fields, methods, impl blocks }`.
     ///
     /// The optional `doc_comment` parameter carries the text of a preceding
@@ -928,7 +1012,10 @@ impl<'src> Parser<'src> {
                     self.synchronize_stmt();
                 }
             } else {
-                // Field: [doc_comment] [public] Type name [where <constraint-expr>]
+                // Field: [doc_comment] [public] name ':' Type [where <constraint-expr>]
+                // — colon syntax, unified with params / let bindings / the
+                // endpoint DSL (see design-decisions §Field declarations,
+                // 2026-06-10).
                 let field_doc = self.try_consume_doc_comment();
                 let fstart = self.peek().span;
                 let field_vis = if self.eat(TokenKind::Public) {
@@ -936,8 +1023,11 @@ impl<'src> Parser<'src> {
                 } else {
                     Visibility::Private
                 };
-                if let Some(type_expr) = self.parse_type_expr()
-                    && let Some(name_tok) = self.expect_ident_or_contextual()
+                if self.note_type_first_field("struct field") {
+                    self.synchronize_stmt();
+                } else if let Some(name_tok) = self.expect_ident_or_contextual()
+                    && self.expect(TokenKind::Colon).is_some()
+                    && let Some(type_expr) = self.parse_type_expr()
                 {
                     let constraint = if self.peek().kind == TokenKind::Where {
                         self.advance(); // consume 'where'
@@ -948,7 +1038,7 @@ impl<'src> Parser<'src> {
                     let end_span = constraint
                         .as_ref()
                         .map(|e| e.span())
-                        .unwrap_or(name_tok.span);
+                        .unwrap_or_else(|| type_expr.span());
                     let span = fstart.merge(end_span);
                     fields.push(FieldDecl {
                         type_annotation: type_expr,
@@ -958,6 +1048,12 @@ impl<'src> Parser<'src> {
                         visibility: field_vis,
                         span,
                     });
+                } else {
+                    // Guaranteed progress: a malformed field used to leave
+                    // the cursor untouched, spinning this loop forever (the
+                    // parser-hang bug surfaced 2026-06-10). Skip to the next
+                    // newline / `}` so every iteration consumes something.
+                    self.synchronize_stmt();
                 }
             }
             self.skip_newlines();
@@ -1777,8 +1873,13 @@ impl<'src> Parser<'src> {
         self.skip_newlines();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
             let pstart = self.peek().span;
-            if let Some(type_expr) = self.parse_type_expr()
-                && let Some(name_tok) = self.expect(TokenKind::Ident)
+            // `name ':' Type ['=' default]` — colon syntax, unified with
+            // struct fields (design-decisions §Field declarations).
+            if self.note_type_first_field("query parameter") {
+                self.synchronize_stmt();
+            } else if let Some(name_tok) = self.expect(TokenKind::Ident)
+                && self.expect(TokenKind::Colon).is_some()
+                && let Some(type_expr) = self.parse_type_expr()
             {
                 let default_value = if self.eat(TokenKind::Eq) {
                     self.parse_expr()
@@ -1788,13 +1889,17 @@ impl<'src> Parser<'src> {
                 let pend = default_value
                     .as_ref()
                     .map(|e| e.span())
-                    .unwrap_or(name_tok.span);
+                    .unwrap_or_else(|| type_expr.span());
                 params.push(QueryParam {
                     type_annotation: type_expr,
                     name: name_tok.text.clone(),
                     default_value,
                     span: pstart.merge(pend),
                 });
+            } else {
+                // Guaranteed progress on malformed entries (same
+                // no-progress-hang fix as struct fields).
+                self.synchronize_stmt();
             }
             self.skip_newlines();
         }
@@ -1809,13 +1914,13 @@ impl<'src> Parser<'src> {
     ///
     /// ```text
     /// headers {
-    ///     String authorization
-    ///     String rateLimit as "X-RateLimit-Limit"
-    ///     String contentType as "Content-Type" = "application/json"
+    ///     authorization: String
+    ///     rateLimit: String as "X-RateLimit-Limit"
+    ///     contentType: String as "Content-Type" = "application/json"
     /// }
     /// ```
     ///
-    /// Each entry is `Type name [as "Wire-Name"] [= default]`. The `as "..."`
+    /// Each entry is `name: Type [as "Wire-Name"] [= default]`. The `as "..."`
     /// clause records an explicit wire-name override (quotes stripped); when
     /// absent the wire name is auto-derived later in sema. The `= default`
     /// clause is meaningful only for request headers but is accepted for both.
@@ -1834,11 +1939,16 @@ impl<'src> Parser<'src> {
         self.skip_newlines();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
             let pstart = self.peek().span;
-            if let Some(type_expr) = self.parse_type_expr()
-                && let Some(name_tok) = self.expect(TokenKind::Ident)
+            // `name ':' Type [as "Wire-Name"] ['=' default]` — colon
+            // syntax, unified with struct fields (design-decisions
+            // §Field declarations).
+            if self.note_type_first_field("header") {
+                self.synchronize_stmt();
+            } else if let Some(name_tok) = self.expect(TokenKind::Ident)
+                && self.expect(TokenKind::Colon).is_some()
+                && let Some(type_expr) = self.parse_type_expr()
             {
                 let name = name_tok.text.clone();
-                let name_span = name_tok.span;
 
                 // Optional explicit wire-name override: `as "Wire-Name"`.
                 let mut wire_name = None;
@@ -1862,7 +1972,7 @@ impl<'src> Parser<'src> {
                     .as_ref()
                     .map(|e| e.span())
                     .or(wire_span)
-                    .unwrap_or(name_span);
+                    .unwrap_or_else(|| type_expr.span());
                 params.push(HeaderParam {
                     type_annotation: type_expr,
                     name,
@@ -1870,6 +1980,10 @@ impl<'src> Parser<'src> {
                     default_value,
                     span: pstart.merge(pend),
                 });
+            } else {
+                // Guaranteed progress on malformed entries (same
+                // no-progress-hang fix as struct fields).
+                self.synchronize_stmt();
             }
             self.skip_newlines();
         }
@@ -2796,7 +2910,7 @@ mod tests {
 
     #[test]
     fn parse_struct_decl() {
-        let source = "struct Point { Int x\n Int y }";
+        let source = "struct Point { x: Int\n y: Int }";
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         assert_eq!(program.declarations.len(), 1);
@@ -2816,6 +2930,86 @@ mod tests {
                 }
             }
             _ => panic!("expected Struct"),
+        }
+    }
+
+    /// The pre-2026-06-10 type-first field syntax (`Int x`) gets the
+    /// targeted migration diagnostic, not just a generic expect
+    /// failure — and the parse terminates (regression pin for the
+    /// struct-body infinite loop on malformed fields).
+    #[test]
+    fn struct_type_first_field_gets_migration_diagnostic() {
+        let (_, diagnostics) = parse_source("struct Point { Int x\n Int y }");
+        assert!(
+            !diagnostics.is_empty(),
+            "type-first fields must be a parse error"
+        );
+        assert!(
+            diagnostics[0].message.contains("`x: Int`"),
+            "expected the migration hint naming `x: Int`, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// The migration hint also covers generic-typed old-syntax fields
+    /// (`Option<String> bio`) — the balanced `<...>` lookahead — and
+    /// reconstructs the full type in the suggested rewrite.
+    #[test]
+    fn struct_type_first_generic_field_gets_migration_diagnostic() {
+        let (_, diagnostics) = parse_source("struct S { Option<String> bio }");
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics[0].message.contains("`bio: Option<String>`"),
+            "expected the migration hint naming `bio: Option<String>`, got: {}",
+            diagnostics[0].message
+        );
+        // Nested arguments (two-`Gt` closer) and commas survive the
+        // reconstruction, in a query block as well as a struct body.
+        let (_, diagnostics) = parse_source(
+            "endpoint e: GET \"/x\" { query { Map<String, List<Int>> m = 1 } response Int }",
+        );
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("`m: Map<String, List<Int>>`"),
+            "expected the migration hint naming the full generic type, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// The migration hint also covers `dyn Trait`-typed old-syntax
+    /// fields (`dyn Drawable hero`).
+    #[test]
+    fn struct_type_first_dyn_field_gets_migration_diagnostic() {
+        let (_, diagnostics) = parse_source("struct Scene { dyn Drawable hero }");
+        assert!(!diagnostics.is_empty());
+        assert!(
+            diagnostics[0].message.contains("`hero: dyn Drawable`"),
+            "expected the migration hint naming `hero: dyn Drawable`, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// Arbitrary garbage in a struct body produces diagnostics and
+    /// terminates — every loop iteration must consume at least one
+    /// token. (The pre-fix parser spun forever re-peeking the first
+    /// unexpected token; surfaced 2026-06-10 via a hung test suite.)
+    #[test]
+    fn struct_body_garbage_terminates_with_diagnostics() {
+        for source in [
+            "struct P { : }",
+            "struct P { 42 }",
+            "struct P { x = 1 }",
+            "struct P { where }",
+            "endpoint e: GET \"/x\" { query { ??? } response Int }",
+            "endpoint e: GET \"/x\" { headers { 12 34 } response Int }",
+        ] {
+            let (_, diagnostics) = parse_source(source);
+            assert!(
+                !diagnostics.is_empty(),
+                "expected diagnostics for {source:?}"
+            );
         }
     }
 
@@ -3257,7 +3451,8 @@ mod tests {
     /// A generic struct declaration parses multiple type parameters.
     #[test]
     fn parse_generic_struct() {
-        let (program, diagnostics) = parse_source("struct Pair<A, B> {\n  A first\n  B second\n}");
+        let (program, diagnostics) =
+            parse_source("struct Pair<A, B> {\n  first: A\n  second: B\n}");
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
             Declaration::Struct(s) => {
@@ -3896,8 +4091,8 @@ mod tests {
     fn parse_endpoint_query_params() {
         let source = r#"endpoint listUsers: GET "/api/users" {
             query {
-                Int page = 1
-                String search
+                page: Int = 1
+                search: String
             }
             response User
         }"#;
@@ -4040,7 +4235,7 @@ mod tests {
     fn parse_endpoint_full() {
         let source = r#"endpoint createUser: POST "/api/users" {
             query {
-                Bool verbose = false
+                verbose: Bool = false
             }
             body User omit { id }
             response User
@@ -4131,7 +4326,7 @@ mod tests {
 
     #[test]
     fn parse_doc_comment_on_struct() {
-        let source = "/** A 2D point. */\nstruct Point { Int x\n Int y }";
+        let source = "/** A 2D point. */\nstruct Point { x: Int\n y: Int }";
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
@@ -4208,7 +4403,7 @@ mod tests {
     #[test]
     fn parse_endpoint_body_pick_then_partial() {
         let source = r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint updateEmail: PATCH "/api/users/{id}" {
     body User pick { name, email } partial { email }
     response User
@@ -4234,7 +4429,7 @@ endpoint updateEmail: PATCH "/api/users/{id}" {
     #[test]
     fn parse_endpoint_selective_partial() {
         let source = r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint patchUser: PATCH "/api/users/{id}" {
     body User omit { id } partial { email, age }
     response User
@@ -4263,7 +4458,7 @@ endpoint patchUser: PATCH "/api/users/{id}" {
     #[test]
     fn parse_endpoint_multiple_path_params() {
         let source = r#"
-struct Comment { Int id  String text }
+struct Comment { id: Int  text: String }
 endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId}" {
     response Comment
 }"#;
@@ -4285,8 +4480,8 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     fn parse_endpoint_query_only() {
         let source = r#"endpoint search: GET "/api/search" {
     query {
-        String term
-        Int page = 1
+        term: String
+        page: Int = 1
     }
 }"#;
         let (program, diagnostics) = parse_source(source);
@@ -4351,8 +4546,8 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     fn parse_endpoint_query_option_type() {
         let source = r#"endpoint list: GET "/api/items" {
     query {
-        Option<String> search
-        Int limit = 10
+        search: Option<String>
+        limit: Int = 10
     }
 }"#;
         let (program, diagnostics) = parse_source(source);
@@ -4375,8 +4570,8 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_field_with_where_constraint() {
         let source = r#"struct User {
-    Int age where self >= 0 && self <= 150
-    String name
+    age: Int where self >= 0 && self <= 150
+    name: String
 }"#;
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -4399,7 +4594,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_field_with_string_constraint() {
         let source = r#"struct User {
-    String email where self.contains("@") && self.length > 3
+    email: String where self.contains("@") && self.length > 3
 }"#;
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -4415,10 +4610,10 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_struct_mixed_constraints() {
         let source = r#"struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    String email where self.contains("@")
-    Int age where self >= 0
+    id: Int
+    name: String where self.length > 0 && self.length <= 100
+    email: String where self.contains("@")
+    age: Int where self >= 0
 }"#;
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -4436,7 +4631,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     /// Single constraint (no `and`).
     #[test]
     fn parse_field_single_constraint() {
-        let source = "struct Item { Int price where self > 0 }";
+        let source = "struct Item { price: Int where self > 0 }";
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
@@ -4450,7 +4645,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     /// `or` constraint parses.
     #[test]
     fn parse_field_or_constraint() {
-        let source = "struct Range { Int x where self < 0 || self > 100 }";
+        let source = "struct Range { x: Int where self < 0 || self > 100 }";
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
@@ -4462,7 +4657,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     /// Float field with constraint.
     #[test]
     fn parse_field_float_constraint() {
-        let source = "struct Item { Float price where self > 0.0 && self < 1000.0 }";
+        let source = "struct Item { price: Float where self > 0.0 && self < 1000.0 }";
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
@@ -4653,7 +4848,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_api_version_rejects_non_endpoint() {
         let source = r#"api version "v1" {
-            struct Nope { Int id }
+            struct Nope { id: Int }
             endpoint a: GET "/posts" { response Post }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -4846,7 +5041,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}/comments/{commentId
     #[test]
     fn parse_schema_basic() {
         let source = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 schema db {
     table users from User {
         primary key id
@@ -4898,8 +5093,8 @@ schema db {
         let source = r#"
 schema db {
     table sessions {
-        String token primary key
-        Int userId
+        token: String primary key
+        userId: Int
     }
 }"#;
         let (program, diagnostics) = parse_source(source);
@@ -4932,7 +5127,7 @@ schema db {
     #[test]
     fn parse_schema_alongside_other_declarations() {
         let source = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     response User
 }
@@ -5059,8 +5254,8 @@ schema db {
     #[test]
     fn parse_endpoint_duplicate_query() {
         let source = r#"endpoint listUsers: GET "/api/users" {
-            query { Int page = 1 }
-            query { Int limit = 20 }
+            query { page: Int = 1 }
+            query { limit: Int = 20 }
         }"#;
         let (_, diagnostics) = parse_source(source);
         assert!(
@@ -5095,8 +5290,8 @@ schema db {
     fn parse_endpoint_request_headers() {
         let source = r#"endpoint createUser: POST "/api/users" {
             headers {
-                String authorization
-                String idempotencyKey
+                authorization: String
+                idempotencyKey: String
             }
             response User
         }"#;
@@ -5124,7 +5319,7 @@ schema db {
     fn parse_endpoint_header_wire_override() {
         let source = r#"endpoint createUser: POST "/api/users" {
             headers {
-                String rateLimit as "X-RateLimit-Limit"
+                rateLimit: String as "X-RateLimit-Limit"
             }
             response User
         }"#;
@@ -5148,7 +5343,7 @@ schema db {
     fn parse_endpoint_header_override_and_default() {
         let source = r#"endpoint createUser: POST "/api/users" {
             headers {
-                String contentType as "Content-Type" = "application/json"
+                contentType: String as "Content-Type" = "application/json"
             }
             response User
         }"#;
@@ -5178,7 +5373,7 @@ schema db {
     fn parse_endpoint_response_headers() {
         let source = r#"endpoint getPost: GET "/api/posts/{id}" {
             response Post headers {
-                Int ratelimitRemaining as "X-RateLimit-Remaining"
+                ratelimitRemaining: Int as "X-RateLimit-Remaining"
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5210,10 +5405,10 @@ schema db {
     fn parse_endpoint_request_and_response_headers() {
         let source = r#"endpoint getPost: GET "/api/posts/{id}" {
             headers {
-                String authorization
+                authorization: String
             }
             response Post headers {
-                Int ratelimitRemaining as "X-RateLimit-Remaining"
+                ratelimitRemaining: Int as "X-RateLimit-Remaining"
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5240,8 +5435,8 @@ schema db {
     #[test]
     fn parse_endpoint_duplicate_headers() {
         let source = r#"endpoint listUsers: GET "/api/users" {
-            headers { String authorization }
-            headers { String idempotencyKey }
+            headers { authorization: String }
+            headers { idempotencyKey: String }
         }"#;
         let (_, diagnostics) = parse_source(source);
         assert!(
@@ -5347,7 +5542,7 @@ schema db {
         let source = r#"endpoint getPost: GET "/api/posts/{id}" {
             response Post
             headers {
-                String authorization
+                authorization: String
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5377,7 +5572,7 @@ schema db {
         // dangling response-headers section behind.
         let source = r#"endpoint ping: GET "/api/ping" {
             response headers {
-                Int ratelimitRemaining as "X-RateLimit-Remaining"
+                ratelimitRemaining: Int as "X-RateLimit-Remaining"
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5512,7 +5707,7 @@ schema db {
     fn parse_bare_response_with_headers_unchanged() {
         let source = r#"endpoint getUser: GET "/api/users/{id}" {
             response User headers {
-                String x
+                x: String
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5574,7 +5769,7 @@ schema db {
         // headers into handler/client inputs).
         let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
             response { 200: User } headers {
-                String x
+                x: String
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5609,7 +5804,7 @@ schema db {
         let source = r#"endpoint upsertUser: PUT "/api/users/{id}" {
             response { 200: User }
             headers {
-                String x
+                x: String
             }
         }"#;
         let (program, diagnostics) = parse_source(source);
@@ -5724,8 +5919,8 @@ schema db {
     fn parse_struct_field_doc_comment() {
         let source = r#"struct User {
             /** The user's full name */
-            String name
-            Int age
+            name: String
+            age: Int
         }"#;
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -5746,10 +5941,10 @@ schema db {
     fn parse_struct_multiple_field_doc_comments() {
         let source = r#"struct User {
             /** Unique identifier */
-            Int id
+            id: Int
             /** Display name */
-            String name
-            Int age
+            name: String
+            age: Int
         }"#;
         let (program, diagnostics) = parse_source(source);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -5805,7 +6000,7 @@ schema db {
 
     #[test]
     fn parse_dyn_in_struct_field() {
-        let (program, diagnostics) = parse_source("struct Scene { dyn Drawable hero }");
+        let (program, diagnostics) = parse_source("struct Scene { hero: dyn Drawable }");
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
         match &program.declarations[0] {
             Declaration::Struct(s) => {
@@ -5988,8 +6183,8 @@ schema db {
     #[test]
     fn parse_public_struct_with_field_visibilities() {
         let src = "public struct User {
-            public String name
-            String passwordHash
+            public name: String
+            passwordHash: String
         }";
         let (program, diagnostics) = parse_source(src);
         assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
@@ -6029,7 +6224,7 @@ public type UserId = Int";
     #[test]
     fn public_on_impl_block_rejected() {
         let (_, diagnostics) =
-            parse_source("struct P { Int x }\npublic impl P { function f(self) {} }");
+            parse_source("struct P { x: Int }\npublic impl P { function f(self) {} }");
         assert!(
             diagnostics
                 .iter()
@@ -6152,7 +6347,7 @@ public type UserId = Int";
     #[test]
     fn parse_public_method_in_struct_body() {
         let src = "struct Counter {
-            Int n
+            n: Int
             public function bump(self) -> Int { self.n + 1 }
             function reset(self) { }
         }";
@@ -6193,7 +6388,7 @@ public type UserId = Int";
 
     #[test]
     fn parse_public_method_in_inherent_impl_block() {
-        let src = "struct P { Int x }\nimpl P {
+        let src = "struct P { x: Int }\nimpl P {
             public function get(self) -> Int { self.x }
             function helper(self) -> Int { self.x + 1 }
         }";
@@ -6214,7 +6409,7 @@ public type UserId = Int";
 
     #[test]
     fn public_method_in_trait_impl_rejected() {
-        let src = "struct P { Int x }
+        let src = "struct P { x: Int }
 trait T { function f(self) -> Int }
 impl T for P {
     public function f(self) -> Int { self.x }
@@ -6232,7 +6427,7 @@ impl T for P {
     #[test]
     fn public_method_in_inline_trait_impl_rejected() {
         let src = "trait Greet { function hello(self) -> String }
-struct P { Int x
+struct P { x: Int
     impl Greet {
         public function hello(self) -> String { \"hi\" }
     }
@@ -6252,7 +6447,7 @@ struct P { Int x
         // `public impl Trait { ... }` inside a struct body is not valid —
         // inline trait impls do not carry visibility (the trait does).
         let src = "trait T { function f(self) }
-struct P { Int x
+struct P { x: Int
     public impl T { function f(self) {} }
 }";
         let (_, diagnostics) = parse_source(src);

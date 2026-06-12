@@ -7,11 +7,11 @@ endpoint createUser: POST "/api/users" {
 //                        ^^^^^^^^^^^^^ string.quoted.double.phoenix
   query {
 //^^^^^ keyword.other.endpoint.phoenix
-    Int page = 1
-//  ^^^ support.type.primitive.phoenix
-//             ^ constant.numeric.integer.phoenix
-    Option<String> search
-//  ^^^^^^ support.type.generic.phoenix
+    page: Int = 1
+//        ^^^ support.type.primitive.phoenix
+//              ^ constant.numeric.integer.phoenix
+    search: Option<String>
+//          ^^^^^^ support.type.generic.phoenix
   }
   body User omit { id } partial
 //^^^^ keyword.other.endpoint.phoenix

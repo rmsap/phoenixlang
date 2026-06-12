@@ -18,7 +18,7 @@ trait Greet {
     function greet(self) -> String
 }
 struct Dog {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "woof" }
@@ -40,7 +40,7 @@ trait Mix {
     function mix(self, a: Int, b: String) -> String
 }
 struct Bowl {
-    Int scale
+    scale: Int
 
     impl Mix {
         function mix(self, a: Int, b: String) -> String {
@@ -66,14 +66,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int side
+    side: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -99,7 +99,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -126,7 +126,7 @@ trait Drawable {
 }
 type Drawn = dyn Drawable
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -151,7 +151,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -186,14 +186,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Scene {
-    dyn Drawable hero
+    hero: dyn Drawable
 }
 function main() {
     let s = Scene(Circle(3))
@@ -215,14 +215,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int side
+    side: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -251,7 +251,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -278,7 +278,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -307,14 +307,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int s
+    s: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -342,7 +342,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -409,7 +409,7 @@ fn dyn_asymmetric_if_branches() {
         r#"
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -513,7 +513,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -535,20 +535,20 @@ fn dyn_field_reassignment_coerces_roundtrips() {
         r#"
 trait Drawable { function draw(self) -> String }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int side
+    side: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
     }
 }
-struct Scene { dyn Drawable hero }
+struct Scene { hero: dyn Drawable }
 function main() {
     let mut s: Scene = Scene(Circle(3))
     print(s.hero.draw())

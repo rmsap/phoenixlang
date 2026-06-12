@@ -12,8 +12,8 @@ trait Display {
 }
 
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   impl Display {
     function toString(self) -> String {
@@ -49,7 +49,7 @@ trait Shape {
 }
 
 struct Circle {
-  Float radius
+  radius: Float
 
   impl Shape {
     function area(self) -> Float { return 3.14 }
@@ -83,7 +83,7 @@ trait Greet {
   function greet(self) -> String
 }
 struct Dog {
-  String name
+  name: String
 
   impl Greet {
     function greet(self) -> String { return "woof" }
@@ -126,8 +126,8 @@ trait Display {
     function toString(self) -> String
 }
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function show<T: Display>(item: T) -> String {
     return item.toString()
@@ -149,7 +149,7 @@ trait Describable {
     function describe(self) -> String
 }
 struct Color {
-    String name
+    name: String
 
     impl Describable {
         function describe(self) -> String {
@@ -178,7 +178,7 @@ trait Shape {
     function name(self) -> String
 }
 struct Square {
-    Float side
+    side: Float
 
     impl Shape {
         function area(self) -> Float {
@@ -213,7 +213,7 @@ trait Describable {
     function describe(self) -> String
 }
 struct Dog {
-    String name
+    name: String
 
     impl Display {
         function toString(self) -> String { return self.name }
@@ -243,14 +243,14 @@ trait Greet {
     function greet(self) -> String
 }
 struct Dog {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "Woof from " + self.name }
     }
 }
 struct Cat {
-    String name
+    name: String
 
     impl Greet {
         function greet(self) -> String { return "Meow from " + self.name }
@@ -278,8 +278,8 @@ trait Named {
     function name(self) -> String
 }
 struct User {
-    String first
-    String last
+    first: String
+    last: String
 
     impl Named {
         function name(self) -> String {
@@ -311,7 +311,7 @@ trait Shape {
     function name(self) -> String
 }
 struct Circle {
-    Float radius
+    radius: Float
 
     impl Shape {
         function area(self) -> Float { return 3.14 }
@@ -331,7 +331,7 @@ trait Greet {
     function hello(self) -> String
 }
 struct Person {
-    String name
+    name: String
 
     impl Greet {
         function hello(self, extra: Int) -> String { return "hi" }
@@ -351,7 +351,7 @@ trait Greet {
     function hello(self) -> String
 }
 struct Person {
-    String name
+    name: String
 
     impl Greet {
         function hello(self) -> Int { return 42 }
@@ -368,8 +368,8 @@ fn unknown_trait_in_impl_error() {
     expect_type_error(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 
     impl NonexistentTrait {
         function foo(self) -> Int { return 0 }
@@ -391,7 +391,7 @@ trait Mappable {
     function value(self) -> Int
 }
 struct Box {
-    Int val
+    val: Int
 
     impl Mappable {
         function value(self) -> Int { return self.val }
@@ -419,7 +419,7 @@ trait Greetable {
 }
 
 struct Person {
-    String name
+    name: String
 
     impl Greetable {
         function greet(self) -> String {
@@ -482,7 +482,7 @@ struct Doubler {
     }
 }
 struct Adder {
-    Int offset
+    offset: Int
 
     impl Transformer {
         function transform(self, x: Int) -> Int { return x + self.offset }
@@ -512,7 +512,7 @@ trait Printable {
     function toStr(self) -> String
 }
 struct Num {
-    Int val
+    val: Int
 
     impl Printable {
         function toStr(self) -> String { return toString(self.val) }
@@ -618,7 +618,7 @@ struct SmallBox {
     }
 }
 struct BigBox {
-    Int items
+    items: Int
 
     impl Sizeable {
         function size(self) -> Int { return self.items }
@@ -648,13 +648,13 @@ function main() {
 fn trait_method_returning_struct() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 trait Locatable {
     function location(self) -> Point
 }
 struct Marker {
-    Int px
-    Int py
+    px: Int
+    py: Int
 
     impl Locatable {
         function location(self) -> Point {
@@ -685,9 +685,9 @@ trait Summary {
     function summarize(self) -> String
 }
 struct Article {
-    String title
-    String author
-    Int words
+    title: String
+    author: String
+    words: Int
 
     impl Summary {
         function summarize(self) -> String {
@@ -717,7 +717,7 @@ trait Label {
     function label(self) -> String
 }
 struct Named {
-    String name
+    name: String
 
     impl Label {
         function label(self) -> String { return self.name }
@@ -780,7 +780,7 @@ trait Stringable {
     function toStr(self) -> String
 }
 struct Wrapper {
-    Int val
+    val: Int
 
     function doubled(self) -> Wrapper {
         return Wrapper(self.val * 2)
@@ -811,7 +811,7 @@ trait Finder {
     function find(self, target: Int) -> Option<Int>
 }
 struct Numbers {
-    List<Int> data
+    data: List<Int>
 
     impl Finder {
         function find(self, target: Int) -> Option<Int> {
@@ -880,7 +880,7 @@ trait HasValue {
     function value(self) -> Int
 }
 struct Item {
-    Int v
+    v: Int
 
     impl HasValue {
         function value(self) -> Int { return self.v }
@@ -906,8 +906,8 @@ trait Display {
     function toString(self) -> String
 }
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 
     impl Display {
         function toString(self) -> String {

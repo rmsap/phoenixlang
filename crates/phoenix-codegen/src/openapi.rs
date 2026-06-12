@@ -747,9 +747,9 @@ mod tests {
         let spec = generate_from_source(
             r#"
 struct User {
-    Int id
-    String name
-    Option<String> bio
+    id: Int
+    name: String
+    bio: Option<String>
 }
 "#,
         );
@@ -762,8 +762,8 @@ struct User {
             r#"
 /** A registered user account */
 struct User {
-    Int id
-    String name
+    id: Int
+    name: String
 }
 "#,
         );
@@ -776,7 +776,7 @@ struct User {
     fn derived_type_body_omit() {
         let spec = generate_from_source(
             r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint createUser: POST "/api/users" {
     body User omit { id }
     response User
@@ -793,7 +793,7 @@ endpoint createUser: POST "/api/users" {
         // guard for the `is_option` exclusion in `derived_type_to_schema`.
         let spec = generate_from_source(
             r#"
-struct Note { String title  Option<String> body  Int priority }
+struct Note { title: String  body: Option<String>  priority: Int }
 endpoint createNote: POST "/api/notes" {
     body Note
     response Note
@@ -839,8 +839,8 @@ endpoint createNote: POST "/api/notes" {
         let spec = generate_from_source(
             r#"
 struct Product {
-    Int price where self >= 0 && self <= 10000
-    String name
+    price: Int where self >= 0 && self <= 10000
+    name: String
 }
 "#,
         );
@@ -852,8 +852,8 @@ struct Product {
         let spec = generate_from_source(
             r#"
 struct Profile {
-    String username where self.length >= 3 && self.length <= 50
-    String bio
+    username: String where self.length >= 3 && self.length <= 50
+    bio: String
 }
 "#,
         );
@@ -866,12 +866,12 @@ struct Profile {
     fn endpoint_with_query_params_and_defaults() {
         let spec = generate_from_source(
             r#"
-struct Item { Int id  String name }
+struct Item { id: Int  name: String }
 endpoint listItems: GET "/api/items" {
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
+        page: Int = 1
+        limit: Int = 20
+        search: Option<String>
     }
     response List<Item>
 }
@@ -884,7 +884,7 @@ endpoint listItems: GET "/api/items" {
     fn endpoint_with_path_params_and_errors() {
         let spec = generate_from_source(
             r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     response User
     error { NotFound(404) }
@@ -903,10 +903,10 @@ endpoint getUser: GET "/api/users/{id}" {
         // required: true.
         let spec = generate_from_source(
             r#"
-struct Order { Int id }
+struct Order { id: Int }
 endpoint createOrder: POST "/api/orders" {
     headers {
-        String idempotencyKey
+        idempotencyKey: String
     }
     response Order
 }
@@ -920,10 +920,10 @@ endpoint createOrder: POST "/api/orders" {
         // An explicit `as "..."` override pins the exact wire name verbatim.
         let spec = generate_from_source(
             r#"
-struct Order { Int id }
+struct Order { id: Int }
 endpoint createOrder: POST "/api/orders" {
     headers {
-        String rateLimit as "X-RateLimit-Limit"
+        rateLimit: String as "X-RateLimit-Limit"
     }
     response Order
 }
@@ -938,11 +938,11 @@ endpoint createOrder: POST "/api/orders" {
         // (required: false); a bare required type → required: true.
         let spec = generate_from_source(
             r#"
-struct Order { Int id }
+struct Order { id: Int }
 endpoint createOrder: POST "/api/orders" {
     headers {
-        String idempotencyKey
-        Option<String> traceId
+        idempotencyKey: String
+        traceId: Option<String>
     }
     response Order
 }
@@ -957,9 +957,9 @@ endpoint createOrder: POST "/api/orders" {
         // success (200) response object.
         let spec = generate_from_source(
             r#"
-struct Post { Int id }
+struct Post { id: Int }
 endpoint getPost: GET "/api/posts/{id}" {
-    response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }
+    response Post headers { ratelimitRemaining: Int as "X-RateLimit-Remaining" }
 }
 "#,
         );
@@ -972,9 +972,9 @@ endpoint getPost: GET "/api/posts/{id}" {
         // `default` baked into its schema (the `default_to_json` insertion path).
         let spec = generate_from_source(
             r#"
-struct Order { Int id }
+struct Order { id: Int }
 endpoint createOrder: POST "/api/orders" {
-    headers { Int maxStale = 60 }
+    headers { maxStale: Int = 60 }
     response Order
 }
 "#,
@@ -1012,9 +1012,9 @@ endpoint createOrder: POST "/api/orders" {
         let spec = generate_from_source(
             r#"
 struct AvatarUpload {
-    File avatar
-    String caption
-    Option<String> alt
+    avatar: File
+    caption: String
+    alt: Option<String>
 }
 endpoint uploadAvatar: POST "/api/avatar" {
     body AvatarUpload
@@ -1031,7 +1031,7 @@ endpoint uploadAvatar: POST "/api/avatar" {
         // `format: binary` schema instead of `application/json`.
         let spec = generate_from_source(
             r#"
-struct Doc { File data }
+struct Doc { data: File }
 endpoint downloadDoc: GET "/api/doc/{id}" {
     response Doc
 }
@@ -1049,7 +1049,7 @@ endpoint downloadDoc: GET "/api/doc/{id}" {
     fn api_version_prefixes_openapi_path() {
         let spec = generate_from_source(
             r#"
-struct Post { Int id }
+struct Post { id: Int }
 api version "v2" {
     endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" { response Post }
 }
@@ -1076,7 +1076,7 @@ api version "v2" {
         // `List<Post>` no longer appears as the response schema.
         let spec = generate_from_source(
             r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
     response List<Post>
     pagination { offset }
@@ -1120,7 +1120,7 @@ endpoint listPosts: GET "/api/posts" {
         // page) and a required `items` array.
         let spec = generate_from_source(
             r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
     response List<Post>
     pagination { cursor }
@@ -1164,7 +1164,7 @@ endpoint listPosts: GET "/api/posts" {
         // component is emitted. Guards the byte-for-byte-unchanged invariant.
         let spec = generate_from_source(
             r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
     response List<Post>
 }
@@ -1194,7 +1194,7 @@ endpoint listPosts: GET "/api/posts" {
         // OpenAPI — no envelope.
         let spec = generate_from_source(
             r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1223,7 +1223,7 @@ endpoint upsertUser: PUT "/api/users/{id}" {
         // schema; the typeless `204` has a description but NO `content` (no body).
         let spec = generate_from_source(
             r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint updateUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1280,7 +1280,7 @@ endpoint enqueueJob: POST "/api/jobs" {
         // other — pin all three keys on the same operation.
         let spec = generate_from_source(
             r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint updateUser: PUT "/api/users/{id}" {
     response {
         200: User

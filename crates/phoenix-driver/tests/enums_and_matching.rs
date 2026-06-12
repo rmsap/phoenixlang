@@ -668,7 +668,7 @@ function main() {
 fn struct_field_type_mismatch_in_construction() {
     expect_type_error(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let p: Point = Point("hello", 2)
 }

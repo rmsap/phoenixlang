@@ -179,7 +179,7 @@ fn lower_compound_assignment() {
 #[test]
 fn lower_struct_construction() {
     let ir = lower_to_string(
-        "struct Point { Int x  Int y }
+        "struct Point { x: Int  y: Int }
          function main() -> Int {
              let p: Point = Point(10, 20)
              p.x
@@ -191,7 +191,7 @@ fn lower_struct_construction() {
 #[test]
 fn lower_struct_field_assignment() {
     let ir = lower_to_string(
-        "struct Point { Int x  Int y }
+        "struct Point { x: Int  y: Int }
          function main() {
              let mut p: Point = Point(1, 2)
              p.x = 42
@@ -203,7 +203,7 @@ fn lower_struct_field_assignment() {
 #[test]
 fn lower_struct_destructuring() {
     let ir = lower_to_string(
-        "struct Point { Int x  Int y }
+        "struct Point { x: Int  y: Int }
          function main() -> Int {
              let p: Point = Point(3, 4)
              let Point { x, y } = p
@@ -276,7 +276,7 @@ fn lower_lambda() {
 fn lower_user_method_call() {
     let ir = lower_to_string(
         "struct Counter {
-             Int value
+             value: Int
              function get(self) -> Int { self.value }
          }
          function main() -> Int {
@@ -665,7 +665,7 @@ fn lower_match_string_literal() {
 #[test]
 fn lower_impl_block_method() {
     let ir = lower_to_string(
-        "struct Pair { Int first  Int second }
+        "struct Pair { first: Int  second: Int }
          impl Pair {
              function sum(self) -> Int { self.first + self.second }
          }
@@ -793,7 +793,7 @@ fn lower_trait_method() {
         "trait Greetable {
              function greet(self) -> String
          }
-         struct Person { String name }
+         struct Person { name: String }
          impl Greetable for Person {
              function greet(self) -> String { self.name }
          }
@@ -1246,7 +1246,7 @@ fn generic_method_specializations_appear_in_module() {
     let module = lower_source(
         r#"
 struct Holder {
-    Int tag
+    tag: Int
 }
 impl Holder {
     function wrap<U>(self, x: U) -> U { x }
@@ -1282,7 +1282,7 @@ fn generic_method_call_retargets_to_specialization() {
     let module = lower_source(
         r#"
 struct Holder {
-    Int tag
+    tag: Int
 }
 impl Holder {
     function wrap<U>(self, x: U) -> U { x }
@@ -2211,7 +2211,7 @@ fn method_default_wrapper_synthesized() {
     // (A method call site is exercised separately by the
     // multi-module privacy test below.)
     let src = "function helper() -> Int { 7 }\n\
-               struct Counter { Int n }\n\
+               struct Counter { n: Int }\n\
                impl Counter {\n\
                    public function bump(self, by: Int = helper()) -> Int { self.n + by }\n\
                }\n\

@@ -1,7 +1,7 @@
 function defaultPrefix() -> String { ">>" }
 
 public struct Greeter {
-  public String name
+  public name: String
 
   public function greet(self, prefix: String = defaultPrefix()) -> String {
     prefix + " hello " + self.name

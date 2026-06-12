@@ -306,11 +306,11 @@ fn rename_does_not_conflate_same_named_function_in_other_module() {
 fn rename_does_not_conflate_same_named_field_across_modules() {
     let td = tempfile::TempDir::new().unwrap();
     let lib_path = td.path().join("lib.phx");
-    let lib_text = "public struct Point { Int x  Int y }\n\
+    let lib_text = "public struct Point { x: Int  y: Int }\n\
                     public function libUse() -> Int { let p: Point = Point(1, 2)\nreturn p.x }\n";
     std::fs::write(&lib_path, lib_text).unwrap();
     let main_path = td.path().join("main.phx");
-    let main_text = "struct Point { Int x  Int y }\n\
+    let main_text = "struct Point { x: Int  y: Int }\n\
                      function main() { let q: Point = Point(3, 4)\nlet _ = q.x }\n";
     std::fs::write(&main_path, main_text).unwrap();
 

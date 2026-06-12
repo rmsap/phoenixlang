@@ -141,6 +141,10 @@ The runtime exposes `phx_print_i64`, `phx_print_f64`, `phx_print_bool`, `phx_pri
 
 ## Decided
 
+### Field declarations use `name: Type` colon syntax
+
+**Decided 2026-06-10.** Every named, typed field in the language declares as `name: Type`: struct fields (`x: Int`, with `public`, `where` constraints, and doc comments unchanged), endpoint `query` parameters (`page: Int = 1`), and endpoint `headers` entries (`rateLimit: String as "X-RateLimit-Limit" = default`). The previous type-first form (`Int x`) was the lone holdout against the rest of the language — function parameters, return annotations, `let` bindings, and map literals all already used colon syntax — and it actively trapped users: writing the natural `x: Int` in a struct didn't error, it **hung the parser** (see the Phase 2.4 "Bugs closed" entry). The old form is a hard parse error with a targeted migration diagnostic ("write `x: Int`, not `Int x`"); no dual-syntax transition period (pre-1.0, single-user — dual grammar would be pure debt against the consistency goal). The phase-4 `schema`/`table` DSL sketch was updated to match so the future column grammar starts consistent. Out of scope: enum variants stay positional (`Circle(Float)` — they mirror constructor calls, not field declarations).
+
 ### `Map<Float, V>` uses byte-wise key comparison
 
 `Map<Float, V>` compares keys using byte-wise equality, not IEEE 754 floating-point equality. This means `-0.0` and `0.0` are treated as different keys, and `NaN` equals itself (unlike IEEE 754 where `NaN != NaN`). This is deliberate — byte-wise comparison provides consistent, deterministic behavior for map lookups.
@@ -1120,7 +1124,7 @@ Each target's `module_builder.rs` owns its own section-state struct because the 
 
 `struct.get`/`struct.set` resolve the WASM struct-type index by reading the *receiver value's* binding `ValType` (which carries `HeapType::Concrete(idx)`), so the get/set ops don't have to thread the struct name themselves — the type that the receiver was bound with is authoritative. Equivalent to threading the name, but avoids a parallel `ValueId → struct_name` map.
 
-**Why nominal (one WASM struct per Phoenix struct), not structural sharing.** WASM-GC's type system is nominal — even if two structs declare the same field shape, they are distinct types and a `(ref $A)` is not assignable to a `(ref $B)`. That property maps directly onto Phoenix's nominal structs (`Point { Int x, Int y }` and `Pixel { Int x, Int y }` are distinct in Phoenix too — assigning a `Point` into a `Pixel`-typed slot is a sema error). A structural-sharing scheme — "one WASM struct per distinct field layout, multiple Phoenix structs alias the same WASM type" — would be smaller (one declaration where two would be), but it'd require runtime tag bytes to distinguish the Phoenix-level types when they meet a `dyn Trait` or a pattern match, re-inventing the tagged-union machinery that the WASM GC target was supposed to elide. The size savings are real but small for MVP fixtures (one struct per fixture).
+**Why nominal (one WASM struct per Phoenix struct), not structural sharing.** WASM-GC's type system is nominal — even if two structs declare the same field shape, they are distinct types and a `(ref $A)` is not assignable to a `(ref $B)`. That property maps directly onto Phoenix's nominal structs (`Point { x: Int, y: Int }` and `Pixel { x: Int, y: Int }` are distinct in Phoenix too — assigning a `Point` into a `Pixel`-typed slot is a sema error). A structural-sharing scheme — "one WASM struct per distinct field layout, multiple Phoenix structs alias the same WASM type" — would be smaller (one declaration where two would be), but it'd require runtime tag bytes to distinguish the Phoenix-level types when they meet a `dyn Trait` or a pattern match, re-inventing the tagged-union machinery that the WASM GC target was supposed to elide. The size savings are real but small for MVP fixtures (one struct per fixture).
 
 **Why declare-before-any-function-signature.** Function signatures that take or return struct refs encode the struct's WASM type index inside their `ValType::Ref { heap_type: HeapType::Concrete(idx) }`. The WASM type section is a flat, position-indexed list; resolving the index requires the struct's declaration to precede the function signature in section order. The pipeline calls `declare_phoenix_structs(ir_module)` first, then the print-helper / function-signature declarations.
 
@@ -1495,6 +1499,49 @@ Code locations:
 - Native `format_f64`: `crates/phoenix-runtime/src/lib.rs`.
 - `ryu` crate dep: `crates/phoenix-runtime/Cargo.toml` (workspace dep declared in root `Cargo.toml`; also a `phoenix-cranelift` dev-dependency as the Phase 3 test oracle). Linking the crate imposes no source-form obligations on this repo; only copying its source would have (see the `ryu_tables.rs` module doc).
 
+#### K.7. wasm32-gc `List<T>` / `ListBuilder<T>`: length-carrying wrapper struct over a shared mutable array; zero-copy freeze
+
+**Decided 2026-06-10 (PR 6 slice 7 design lock).**
+
+**Chosen shape.** One pair of WASM-GC types per distinct concrete element type `T` (codegen-time monomorphization, mirroring K.4's `EnumInstantiationKey` pattern), plus a builder type when the module uses `ListBuilder<T>`:
+
+```
+$arr_T     = (array (mut T_wasm))
+$list_T    = (struct (field $len i64)
+                     (field $data (ref null $arr_T)))
+$builder_T = (struct (field $len (mut i64))
+                     (field $frozen (mut i32))
+                     (field $data (mut (ref null $arr_T))))
+```
+
+- `T_wasm` is the existing `IrType` → `ValType` mapping: `i64` / `f64` / `i32` for Int/Float/Bool; `(ref null $string)` / `(ref null $struct)` / `(ref null $enum_parent)` for reference types; `(ref null $list_U)` for nested lists. Reference elements are **nullable** because builder buffers need a defaultable element type for `array.new_default` (the capacity slack is null-initialized); sema guarantees no null element is ever read, the same invariant K.1/K.2 lean on for struct fields. The `$data` field is nullable for the same convention (and so intermediate values round-trip through nullable locals without casts); the array ops trap on null, which never fires.
+- The array is `mut` and Phoenix-level list immutability is a **sema invariant, not a WASM one** — exactly K.2's `$bytes` precedent. No list op emits `array.set` against a frozen list's array.
+- `$len` is i64 to match `List.length`'s IR result type (no width conversion on the hot read); the data array's own length is the **capacity** and may exceed `$len`.
+
+**Why a wrapper struct (not a bare array).** A bare `(array T)` would be one allocation and the simplest lowering, but it forces `length == array.len` — which forces `ListBuilder.freeze()` to copy into an exact-size array (O(n)) and leaves no room for `$len < capacity`. The wrapper costs a second allocation and one `struct.get` per access, and buys:
+
+- **Zero-copy `freeze()`** — `freeze` sets `$frozen = 1` and returns `struct.new $list_T($len, $data)` sharing the builder's buffer: **O(1)**, vs. native's O(n) memcpy (decision F). Behavior is identical — the frozen flag (runtime-checked, as on native) blocks all further builder mutation, so the shared buffer is never written again; only the cost model improves. The trade: up to 2× growth slack stays live until the frozen list is collected.
+- Consistency with K.2's `String` shape (wrapper struct + backing array), and room for future O(1) `take`/`drop` views if a later slice wants them (today both copy, matching native's clamped-copy semantics).
+
+**Semantics mapping (native parity).**
+
+- `List.get` with `index < 0 || index >= len` **traps** (`unreachable` after an unsigned i64 compare — negative indices wrap to huge unsigned values, one check covers both). Native prints `runtime error: list index … out of bounds` and exits 1; wasm32-gc follows the established trap precedent (divide-by-zero, K.3-era) — non-zero exit, no message, until the panic-routing slice gives traps a `proc_exit` + stderr story.
+- `List.push` copies: `array.new_default` at `len + 1`, `array.copy`, `array.set`, fresh `$list_T` — O(n), matching native immutability.
+- `List.take(n)` / `List.drop(n)`: a **negative `n` is a runtime error** (interpreters abort with `take()/drop() argument must be non-negative`; native aborts in `phx_list_take`/`phx_list_drop`; wasm32-gc traps); `n > len` clamps to `len` ("take/skip at most n") and copies. **Divergence resolved 2026-06-10 (confirmed with user):** implementing this slice surfaced that the backends disagreed — both interpreters errored on negative `n` while the native runtime silently clamped to 0 (`n.max(0)`), a divergence no fixture exercised. The error semantic won (loud failure matches `List.get`'s OOB philosophy); the native clamp was removed in the same slice and pinned by `take_negative_aborts` / `drop_negative_aborts` in phoenix-runtime plus `list_take_drop_negative_traps_under_wasmtime_gc` in compile_wasm_gc.rs.
+- `List.contains` equality per element type, matching native's `elements_equal`: i64/i32 compare for Int/Bool, `f64.eq` for Float (IEEE — `NaN != NaN`, `-0.0 == 0.0`), `phx_str_eq` for String (byte equality), and `ref.eq` for struct/enum elements (native compares the stored 8-byte pointer — identity, not structural — so `ref.eq` is the exact analogue).
+- `ListBuilder.push` grows the buffer 2× (saturating, min 1) when `$len == array.len($data)`, like native; push or freeze on a frozen builder **traps** (native aborts with `builder was already frozen`).
+- For-in iteration needs no new machinery — the frontend lowers it to `List.length` + `List.get`.
+
+**Scope (slice 7).** `Op::ListAlloc` (literals, via `array.new_fixed`), `List.length` / `get` / `push` / `contains` / `take` / `drop`, for-in, `ListBuilder.alloc` / `push` / `freeze`. Element types: Int, Float, Bool, String, structs, enums, and nested `List<U>` (instantiations declared inner-before-outer). **Deferred:** `first`/`last` (closure-free but return `Option<T>` — they ride with a slice that wires the `Option<elem>` enum instantiation interplay), every closure-taking method (`map`/`filter`/`reduce`/`flatMap`/`sortBy`/`find`/`any`/`all` — blocked on the closure slice), `String.split` (returns `List<String>`; small follow-up), and **list-typed struct/enum fields** (the slice-3 field restriction stands — lifting it is its own slice because it makes type-section declaration order a dependency sort across structs/enums/lists).
+
+**Alternatives rejected:**
+
+- **Bare `(array T)` as the list.** One allocation and `array.len` as the length, but forces O(n) freeze and admits no metadata. Rejected with user 2026-06-10.
+- **Wrapper + explicit capacity field** (the original PR 5 sketch `(struct len, cap, data)`). Capacity is the data array's own length — a stored copy is dead weight on every immutable list. Rejected.
+- **Copying `freeze()`** (exact-size array, native cost model). No behavioral difference from zero-copy, strictly worse constant factor; the slack-retention trade was judged acceptable. Rejected with user 2026-06-10.
+
+Code locations: `crates/phoenix-cranelift/src/wasm/wasm_gc/lists.rs` (the whole K.7 surface: instantiation collection + type declaration mirroring `enums.rs`, plus the `Op::ListAlloc` / `List.*` / `ListBuilder.*` lowering helpers), `translate.rs` (just the dispatch arms routing into `lists.rs`), `module_builder.rs` (declaration pipeline ordering: structs → strings → enums → lists).
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)
@@ -1569,7 +1616,7 @@ them. Locked decisions:
 
 5. **Response-header declaration site.** Response headers attach to the response,
    distinct from the request `headers { }` block. Finalized surface:
-   `response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }`,
+   `response Post headers { ratelimitRemaining: Int as "X-RateLimit-Remaining" }`,
    where the `headers` keyword must appear **on the same line as the response
    type** to bind as response headers. A `headers` block on its own line is always
    the standalone request section, regardless of whether it comes before or after
@@ -1606,7 +1653,7 @@ them. Locked decisions:
      (checked case-insensitively, since HTTP header names are). Request and
      response headers are different directions and share no namespace.
 
-**Known limitation (defaulted inputs).** A defaulted request header (`Int maxStale
+**Known limitation (defaulted inputs).** A defaulted request header (`maxStale: Int
 = 60`) does not produce a uniform client shape across targets — it inherits each
 target's existing defaulted *query*-param behavior, which itself diverges (Go/Python
 always send it, TypeScript omits it when unset). This is a pre-existing,
@@ -1630,7 +1677,7 @@ request bodies) and downloads (binary response bodies). Locked decisions
 
 2. **Implicit multipart — no new body grammar.** A multipart/binary body is a
    normal struct that *contains* a `File` field; there is NO dedicated
-   `multipart { }` block. `struct AvatarUpload { File avatar  String caption }` +
+   `multipart { }` block. `struct AvatarUpload { avatar: File  caption: String }` +
    `body AvatarUpload` IS the multipart upload. Rationale: matches the type-driven
    model of every target (OpenAPI `format: binary`, FastAPI `UploadFile`, Go
    `multipart.FileHeader`), composes with the existing derived-body machinery

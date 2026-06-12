@@ -837,7 +837,7 @@ pub enum PaginationMode {
 /// /** Creates a new user account. */
 /// endpoint createUser: POST "/api/users" {
 ///     body User omit { id }
-///     response User headers { Int rateLimit as "X-RateLimit-Limit" }
+///     response User headers { rateLimit: Int as "X-RateLimit-Limit" }
 ///     query {
 ///         Bool notify = true
 ///     }

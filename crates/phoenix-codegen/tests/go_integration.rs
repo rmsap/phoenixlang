@@ -8,11 +8,11 @@ use phoenix_sema::checker;
 const FULL_SCHEMA: &str = r#"
 /** A registered user */
 struct User {
-    Int id
-    String name
-    String email
-    Int age
-    Option<String> bio
+    id: Int
+    name: String
+    email: String
+    age: Int
+    bio: Option<String>
 }
 
 /** User permission levels */
@@ -21,8 +21,8 @@ enum Role { Admin  Editor  Viewer }
 /** List all users */
 endpoint listUsers: GET "/api/users" {
     query {
-        Int page = 1
-        Int limit = 20
+        page: Int = 1
+        limit: Int = 20
     }
     response List<User>
 }
@@ -231,12 +231,12 @@ fn pascal_case_in_generated_code() {
 #[test]
 fn schema_does_not_affect_go_output() {
     let with_schema = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" { response User }
 schema db { table users from User { primary key id } }
 "#;
     let without_schema = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" { response User }
 "#;
     let t1 = tokenize(with_schema, SourceId(0));
@@ -258,7 +258,7 @@ endpoint getUser: GET "/api/users/{id}" { response User }
 #[test]
 fn pick_modifier_correct_fields() {
     let source = r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint updateEmail: PATCH "/api/users/{id}" {
     body User pick { email }
     response User
@@ -284,7 +284,7 @@ endpoint updateEmail: PATCH "/api/users/{id}" {
 #[test]
 fn partial_modifier_pointer_types() {
     let source = r#"
-struct User { Int id  String name  Int age }
+struct User { id: Int  name: String  age: Int }
 endpoint updateUser: PATCH "/api/users/{id}" {
     body User omit { id } partial
     response User
@@ -301,7 +301,7 @@ endpoint updateUser: PATCH "/api/users/{id}" {
 
 #[test]
 fn map_type_in_struct() {
-    let source = "struct Config { Map<String, String> settings  Bool enabled }";
+    let source = "struct Config { settings: Map<String, String>  enabled: Bool }";
     let tokens = tokenize(source, SourceId(0));
     let (program, _) = parser::parse(&tokens);
     let result = checker::check(&program);
@@ -313,7 +313,7 @@ fn map_type_in_struct() {
 #[test]
 fn put_and_patch_methods() {
     let source = r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint replaceUser: PUT "/api/users/{id}" {
     body User
     response User
@@ -336,7 +336,7 @@ endpoint patchUser: PATCH "/api/users/{id}" {
 #[test]
 fn multiple_path_params_in_server() {
     let source = r#"
-struct Comment { Int id  String text }
+struct Comment { id: Int  text: String }
 endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
     response Comment
 }
@@ -360,8 +360,8 @@ trait Renderable {
     function render(self) -> String
 }
 struct Card {
-    Int id
-    dyn Renderable hero
+    id: Int
+    hero: dyn Renderable
 }
 endpoint getCard: GET "/api/cards/{id}" {
     response Card
@@ -401,9 +401,9 @@ trait Serializable {
     function serialize(self) -> String
 }
 struct Widget {
-    Int id
-    dyn Renderable view
-    dyn Serializable data
+    id: Int
+    view: dyn Renderable
+    data: dyn Serializable
 }
 endpoint getWidget: GET "/api/widgets/{id}" {
     response Widget
@@ -441,8 +441,8 @@ trait Renderable {
     function render(self) -> String
 }
 struct Widget {
-    Int id
-    dyn Renderable body
+    id: Int
+    body: dyn Renderable
 }
 endpoint getWidget: GET "/api/widgets/{id}" {
     response Widget
@@ -480,9 +480,9 @@ trait Renderable {
     function render(self) -> String
 }
 struct Gallery {
-    Int id
-    List<dyn Renderable> items
-    Option<dyn Renderable> featured
+    id: Int
+    items: List<dyn Renderable>
+    featured: Option<dyn Renderable>
 }
 endpoint getGallery: GET "/api/galleries/{id}" {
     response Gallery

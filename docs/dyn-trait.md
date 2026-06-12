@@ -21,12 +21,12 @@ trait Drawable {
     function draw(self) -> String
 }
 
-struct Circle { Int radius }
+struct Circle { radius: Int }
   impl Drawable for Circle {
       function draw(self) -> String { return "circle" }
 }
 
-struct Square { Int side }
+struct Square { side: Int }
   impl Drawable for Square {
       function draw(self) -> String { return "square" }
 }
@@ -69,7 +69,7 @@ function main() {
     let f = function() -> dyn Drawable { Circle(1) }
 
     // 5. Struct field typed `dyn`:
-    let s = Scene(Circle(1))   // where Scene { dyn Drawable hero }
+    let s = Scene(Circle(1))   // where Scene { hero: dyn Drawable }
 
     // 6. Enum variant field typed `dyn`:
     let v = Held(Circle(1))    // where Held(dyn Drawable)

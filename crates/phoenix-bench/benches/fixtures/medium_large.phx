@@ -10,8 +10,8 @@
 //   [4, 8, 12, 16, 20]
 
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 
     function add(self, other: Point) -> Point {
         Point(self.x + other.x, self.y + other.y)

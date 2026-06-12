@@ -1086,7 +1086,7 @@ mod tests {
     #[test]
     fn api_version_prefixes_path() {
         let src = r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v1" {
                 endpoint listPosts: GET "/posts" { response Post }
                 endpoint getPost: GET "/posts/{id}" { response Post }
@@ -1101,7 +1101,7 @@ mod tests {
         // `"/v1"` prefix and a path without a leading slash both normalize to a
         // single seam slash.
         let src = r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "/v1" {
                 endpoint p: GET "posts" { response Post }
             }
@@ -1113,7 +1113,7 @@ mod tests {
     fn api_version_path_params_extracted_after_prefix() {
         // The version prefix has no params; path params are still extracted.
         let src = r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v1" {
                 endpoint getPost: GET "/posts/{id}" { response Post }
             }
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn multiple_api_version_blocks_and_unversioned() {
         let src = r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v1" {
                 endpoint a: GET "/posts" { response Post }
             }
@@ -1145,7 +1145,7 @@ mod tests {
         // Endpoint names are globally unique even across version blocks.
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v1" { endpoint dup: GET "/a" { response Post } }
             api version "v2" { endpoint dup: GET "/b" { response Post } }
             "#,
@@ -1186,7 +1186,7 @@ mod tests {
         // A version string may itself contain `/` to declare a multi-segment
         // prefix; it splices in verbatim ahead of the endpoint path.
         let src = r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v1/beta" {
                 endpoint getPost: GET "/posts/{id}" { response Post }
             }
@@ -1222,7 +1222,7 @@ mod tests {
         // Two endpoints with distinct names but the same method + path collide.
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" { response Post }
             endpoint allPosts: GET "/posts" { response Post }
             "#,
@@ -1235,7 +1235,7 @@ mod tests {
         // `/posts/{id}` and `/posts/{slug}` match the same URLs -> collision.
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint getById: GET "/posts/{id}" { response Post }
             endpoint getBySlug: GET "/posts/{slug}" { response Post }
             "#,
@@ -1248,7 +1248,7 @@ mod tests {
         // A shared path with distinct methods is a normal REST pattern.
         assert_no_errors(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" { response Post }
             endpoint createPost: POST "/posts" { response Post }
             "#,
@@ -1261,7 +1261,7 @@ mod tests {
         // top-level endpoint whose path was written out as `/v2/posts`.
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v2" {
                 endpoint listV2: GET "/posts" { response Post }
             }
@@ -1277,7 +1277,7 @@ mod tests {
         // routes (`/v1/posts` vs `/v2/posts`) and must not collide.
         assert_no_errors(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             api version "v1" {
                 endpoint listV1: GET "/posts" { response Post }
             }
@@ -1294,7 +1294,7 @@ mod tests {
         // the duplicate-name error fires, not also a redundant route conflict.
         let errors = check_source(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" { response Post }
             endpoint listPosts: GET "/posts" { response Post }
             "#,
@@ -1317,7 +1317,7 @@ mod tests {
     fn valid_get_endpoint_with_response() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint getUser: GET "/api/users/{id}" {
                 response User
             }
@@ -1329,7 +1329,7 @@ mod tests {
     fn valid_post_endpoint_with_body_and_response() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint createUser: POST "/api/users" {
                 body User
                 response User
@@ -1342,7 +1342,7 @@ mod tests {
     fn valid_put_endpoint() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint updateUser: PUT "/api/users/{id}" {
                 body User
                 response User
@@ -1355,7 +1355,7 @@ mod tests {
     fn valid_patch_endpoint() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint patchUser: PATCH "/api/users/{id}" {
                 body User
                 response User
@@ -1368,7 +1368,7 @@ mod tests {
     fn valid_delete_endpoint_no_body() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint deleteUser: DELETE "/api/users/{id}" {
                 response User
             }
@@ -1380,12 +1380,12 @@ mod tests {
     fn valid_endpoint_with_all_sections() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name  String email }
+            struct User { id: Int  name: String  email: String }
             endpoint createUser: POST "/api/users" {
                 body User omit { id }
                 response User
                 query {
-                    Bool notify = true
+                    notify: Bool = true
                 }
                 error {
                     Conflict(409)
@@ -1412,7 +1412,7 @@ mod tests {
     fn duplicate_endpoint_name() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 response User
             }
@@ -1430,7 +1430,7 @@ mod tests {
     fn body_on_get_endpoint() {
         assert_has_error(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint getUser: GET "/api/users/{id}" {
                 body User
                 response User
@@ -1444,7 +1444,7 @@ mod tests {
     fn body_on_delete_endpoint() {
         assert_has_error(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint deleteUser: DELETE "/api/users/{id}" {
                 body User
             }
@@ -1487,7 +1487,7 @@ mod tests {
     fn omit_nonexistent_field() {
         assert_has_error(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint createUser: POST "/api/users" {
                 body User omit { nonexistent }
                 response User
@@ -1503,7 +1503,7 @@ mod tests {
     fn pick_nonexistent_field() {
         assert_has_error(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint createUser: POST "/api/users" {
                 body User pick { nonexistent }
                 response User
@@ -1519,7 +1519,7 @@ mod tests {
     fn partial_nonexistent_field() {
         assert_has_error(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint patchUser: PATCH "/api/users/{id}" {
                 body User partial { nonexistent }
                 response User
@@ -1533,7 +1533,7 @@ mod tests {
     fn valid_partial_all_fields() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint patchUser: PATCH "/api/users/{id}" {
                 body User partial
                 response User
@@ -1548,7 +1548,7 @@ mod tests {
     fn valid_omit_then_partial() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name  String email }
+            struct User { id: Int  name: String  email: String }
             endpoint patchUser: PATCH "/api/users/{id}" {
                 body User omit { id } partial
                 response User
@@ -1563,7 +1563,7 @@ mod tests {
         // Trying to make "id" partial should fail because it was already removed.
         assert_has_error(
             r#"
-            struct User { Int id  String name  String email }
+            struct User { id: Int  name: String  email: String }
             endpoint patchUser: PATCH "/api/users/{id}" {
                 body User omit { id } partial { id }
                 response User
@@ -1579,7 +1579,7 @@ mod tests {
     fn duplicate_error_variant() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/api/users" {
                 body User
                 error {
@@ -1596,7 +1596,7 @@ mod tests {
     fn error_status_code_below_400() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/api/users" {
                 body User
                 error {
@@ -1612,7 +1612,7 @@ mod tests {
     fn error_status_code_above_599() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/api/users" {
                 body User
                 error {
@@ -1628,7 +1628,7 @@ mod tests {
     fn valid_error_status_codes_at_boundaries() {
         assert_no_errors(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/api/users" {
                 body User
                 error {
@@ -1646,13 +1646,13 @@ mod tests {
     fn valid_query_params_with_defaults() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint listUsers: GET "/api/users" {
                 query {
-                    Int page = 1
-                    Int limit = 20
-                    String search = "default"
-                    Bool active = true
+                    page: Int = 1
+                    limit: Int = 20
+                    search: String = "default"
+                    active: Bool = true
                 }
                 response User
             }
@@ -1665,12 +1665,12 @@ mod tests {
         // Auto-derived wire names: camelCase identifier -> Title-Case-Kebab.
         let ep = first_endpoint(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    String authorization
-                    String idempotencyKey
-                    Option<String> xRequestId
+                    authorization: String
+                    idempotencyKey: String
+                    xRequestId: Option<String>
                 }
                 response User
             }
@@ -1696,11 +1696,11 @@ mod tests {
         // An `as "..."` override is taken verbatim, bypassing the transform.
         let ep = first_endpoint(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    String rateLimit as "X-RateLimit-Limit"
-                    String etag as "ETag"
+                    rateLimit: String as "X-RateLimit-Limit"
+                    etag: String as "ETag"
                 }
                 response User
             }
@@ -1721,10 +1721,10 @@ mod tests {
     fn response_headers_resolved() {
         let ep = first_endpoint(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint getPost: GET "/api/posts/{id}" {
                 response Post headers {
-                    Int ratelimitRemaining as "X-RateLimit-Remaining"
+                    ratelimitRemaining: Int as "X-RateLimit-Remaining"
                 }
             }
             "#,
@@ -1739,10 +1739,10 @@ mod tests {
     fn header_default_type_mismatch() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    Int retries = "nope"
+                    retries: Int = "nope"
                 }
                 response User
             }
@@ -1757,10 +1757,10 @@ mod tests {
         // is meaningless and rejected (not silently ignored).
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 response User headers {
-                    Int ratelimitRemaining = 100
+                    ratelimitRemaining: Int = 100
                 }
             }
             "#,
@@ -1775,11 +1775,11 @@ mod tests {
         // overwrite each other on the wire.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    String xRequestId
-                    String tracing as "X-Request-Id"
+                    xRequestId: String
+                    tracing: String as "X-Request-Id"
                 }
                 response User
             }
@@ -1794,11 +1794,11 @@ mod tests {
         // collide.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    String a as "X-Trace"
-                    String b as "x-trace"
+                    a: String as "X-Trace"
+                    b: String as "x-trace"
                 }
                 response User
             }
@@ -1816,11 +1816,11 @@ mod tests {
         // other on send and read the same value on parse.
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint getPost: GET "/api/posts/{id}" {
                 response Post headers {
-                    Int rateLimit as "X-Limit"
-                    Int ceiling as "x-limit"
+                    rateLimit: Int as "X-Limit"
+                    ceiling: Int as "x-limit"
                 }
             }
             "#,
@@ -1835,10 +1835,10 @@ mod tests {
         // generated parameters of the same name.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    String id as "X-Id"
+                    id: String as "X-Id"
                 }
                 response User
             }
@@ -1851,13 +1851,13 @@ mod tests {
     fn request_header_collides_with_query_param() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint listUsers: GET "/api/users" {
                 query {
-                    Option<String> trace
+                    trace: Option<String>
                 }
                 headers {
-                    String trace as "X-Trace"
+                    trace: String as "X-Trace"
                 }
                 response User
             }
@@ -1870,11 +1870,11 @@ mod tests {
     fn request_header_duplicate_local_name() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    String token as "X-A"
-                    String token as "X-B"
+                    token: String as "X-A"
+                    token: String as "X-B"
                 }
                 response User
             }
@@ -1889,11 +1889,11 @@ mod tests {
         // fields of the same name.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 response User headers {
-                    Int rate as "X-A"
-                    Int rate as "X-B"
+                    rate: Int as "X-A"
+                    rate: Int as "X-B"
                 }
             }
             "#,
@@ -1905,10 +1905,10 @@ mod tests {
     fn query_param_default_type_mismatch() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint listUsers: GET "/api/users" {
                 query {
-                    Int page = "not_a_number"
+                    page: Int = "not_a_number"
                 }
                 response User
             }
@@ -1921,10 +1921,10 @@ mod tests {
     fn query_param_bool_default_on_int_type() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint listUsers: GET "/api/users" {
                 query {
-                    Int active = true
+                    active: Int = true
                 }
                 response User
             }
@@ -1938,7 +1938,7 @@ mod tests {
     #[test]
     fn path_params_are_extracted() {
         let source = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}/posts/{postId}" {
                 response User
             }
@@ -1970,7 +1970,7 @@ mod tests {
         // POST, PUT, and PATCH should all accept body without errors.
         assert_no_errors(
             r#"
-            struct Payload { String data }
+            struct Payload { data: String }
 
             endpoint postIt: POST "/a" {
                 body Payload
@@ -1993,7 +1993,7 @@ mod tests {
     fn valid_pick_subset() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name  String email  Int age }
+            struct User { id: Int  name: String  email: String  age: Int }
             endpoint createUser: POST "/api/users" {
                 body User pick { name, email }
                 response User
@@ -2008,7 +2008,7 @@ mod tests {
     fn endpoint_with_doc_comment() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             /** Retrieves a single user by ID. */
             endpoint getUser: GET "/api/users/{id}" {
                 response User
@@ -2023,7 +2023,7 @@ mod tests {
     fn multiple_distinct_endpoints() {
         assert_no_errors(
             r#"
-            struct User { Int id  String name }
+            struct User { id: Int  name: String }
             endpoint listUsers: GET "/api/users" {
                 response User
             }
@@ -2045,18 +2045,18 @@ mod tests {
         assert_no_errors(
             r#"
             struct User {
-                Int id
-                String name where self.length > 0 && self.length <= 100
-                String email
-                Int age where self >= 0 && self <= 150
-                Option<String> bio
+                id: Int
+                name: String where self.length > 0 && self.length <= 100
+                email: String
+                age: Int where self >= 0 && self <= 150
+                bio: Option<String>
             }
 
             endpoint createUser: POST "/api/users" {
                 body User omit { id, bio }
                 response User
                 query {
-                    Bool notify = true
+                    notify: Bool = true
                 }
                 error {
                     ValidationError(400)
@@ -2078,8 +2078,8 @@ mod tests {
     fn file_accept_request_body_mixed() {
         assert_no_errors(
             r#"
-            struct AvatarUpload { File avatar  String caption }
-            struct UploadResult { String url }
+            struct AvatarUpload { avatar: File  caption: String }
+            struct UploadResult { url: String }
             endpoint uploadAvatar: POST "/api/avatar" {
                 body AvatarUpload
                 response UploadResult
@@ -2093,7 +2093,7 @@ mod tests {
     fn file_accept_response_single_file() {
         assert_no_errors(
             r#"
-            struct Doc { File data }
+            struct Doc { data: File }
             endpoint download: GET "/api/doc/{id}" {
                 response Doc
             }
@@ -2106,7 +2106,7 @@ mod tests {
     fn file_accept_optional_file_field() {
         assert_no_errors(
             r#"
-            struct MaybeUpload { Option<File> avatar  String caption }
+            struct MaybeUpload { avatar: Option<File>  caption: String }
             endpoint upload: POST "/api/maybe" {
                 body MaybeUpload
             }
@@ -2119,7 +2119,7 @@ mod tests {
     fn file_flag_body_is_multipart() {
         let ep = first_endpoint(
             r#"
-            struct AvatarUpload { File avatar  String caption }
+            struct AvatarUpload { avatar: File  caption: String }
             endpoint uploadAvatar: POST "/api/avatar" {
                 body AvatarUpload
             }
@@ -2134,7 +2134,7 @@ mod tests {
     fn file_flag_body_multipart_cleared_by_omit() {
         let ep = first_endpoint(
             r#"
-            struct AvatarUpload { File avatar  String caption }
+            struct AvatarUpload { avatar: File  caption: String }
             endpoint uploadAvatar: POST "/api/avatar" {
                 body AvatarUpload omit { avatar }
             }
@@ -2151,7 +2151,7 @@ mod tests {
     fn file_flag_response_is_binary() {
         let ep = first_endpoint(
             r#"
-            struct Doc { File data }
+            struct Doc { data: File }
             endpoint download: GET "/api/doc/{id}" {
                 response Doc
             }
@@ -2166,7 +2166,7 @@ mod tests {
     fn file_flag_optional_file_body_is_multipart() {
         let ep = first_endpoint(
             r#"
-            struct MaybeUpload { Option<File> avatar  String caption }
+            struct MaybeUpload { avatar: Option<File>  caption: String }
             endpoint upload: POST "/api/maybe" {
                 body MaybeUpload
             }
@@ -2216,10 +2216,10 @@ mod tests {
     fn file_reject_query_param() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 query {
-                    File f
+                    f: File
                 }
                 response User
             }
@@ -2233,10 +2233,10 @@ mod tests {
     fn file_reject_header() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/api/users/{id}" {
                 headers {
-                    File token
+                    token: File
                 }
                 response User
             }
@@ -2261,7 +2261,7 @@ mod tests {
     fn file_reject_list_of_file_field() {
         assert_has_error(
             r#"
-            struct Gallery { List<File> photos }
+            struct Gallery { photos: List<File> }
             "#,
             "`File` is only allowed",
         );
@@ -2272,7 +2272,7 @@ mod tests {
     fn file_reject_map_of_file_field() {
         assert_has_error(
             r#"
-            struct Bucket { Map<String, File> blobs }
+            struct Bucket { blobs: Map<String, File> }
             "#,
             "`File` is only allowed",
         );
@@ -2294,7 +2294,7 @@ mod tests {
     fn file_reject_bearing_struct_as_param() {
         assert_has_error(
             r#"
-            struct AvatarUpload { File avatar  String caption }
+            struct AvatarUpload { avatar: File  caption: String }
             function f(a: AvatarUpload) -> Int { return 0 }
             "#,
             "body-only type",
@@ -2306,8 +2306,8 @@ mod tests {
     fn file_reject_bearing_struct_nested() {
         assert_has_error(
             r#"
-            struct AvatarUpload { File avatar }
-            struct Profile { AvatarUpload upload  String name }
+            struct AvatarUpload { avatar: File }
+            struct Profile { upload: AvatarUpload  name: String }
             "#,
             "body-only type",
         );
@@ -2321,8 +2321,8 @@ mod tests {
     fn file_reject_bearing_struct_nested_forward_ref() {
         assert_has_error(
             r#"
-            struct Profile { AvatarUpload upload  String name }
-            struct AvatarUpload { File avatar }
+            struct Profile { upload: AvatarUpload  name: String }
+            struct AvatarUpload { avatar: File }
             "#,
             "body-only type",
         );
@@ -2335,7 +2335,7 @@ mod tests {
         assert_has_error(
             r#"
             function f(a: AvatarUpload) -> Int { return 0 }
-            struct AvatarUpload { File avatar  String caption }
+            struct AvatarUpload { avatar: File  caption: String }
             "#,
             "body-only type",
         );
@@ -2346,7 +2346,7 @@ mod tests {
     fn file_reject_response_mixed_body() {
         assert_has_error(
             r#"
-            struct Bad { File data  String name }
+            struct Bad { data: File  name: String }
             endpoint download: GET "/api/bad/{id}" {
                 response Bad
             }
@@ -2360,7 +2360,7 @@ mod tests {
     fn file_reject_response_multiple_files() {
         assert_has_error(
             r#"
-            struct TwoFiles { File a  File b }
+            struct TwoFiles { a: File  b: File }
             endpoint download: GET "/api/two/{id}" {
                 response TwoFiles
             }
@@ -2378,10 +2378,10 @@ mod tests {
     fn file_reject_binary_response_with_response_headers() {
         assert_has_error(
             r#"
-            struct Doc { File data }
+            struct Doc { data: File }
             endpoint download: GET "/api/doc/{id}" {
                 response Doc headers {
-                    String etag as "ETag"
+                    etag: String as "ETag"
                 }
             }
             "#,
@@ -2396,7 +2396,7 @@ mod tests {
     fn file_reject_bearing_struct_in_list_response() {
         assert_has_error(
             r#"
-            struct Doc { File data }
+            struct Doc { data: File }
             endpoint download: GET "/api/docs" {
                 response List<Doc>
             }
@@ -2410,7 +2410,7 @@ mod tests {
     fn file_reject_bearing_struct_in_option_response() {
         assert_has_error(
             r#"
-            struct Doc { File data }
+            struct Doc { data: File }
             endpoint download: GET "/api/docs/{id}" {
                 response Option<Doc>
             }
@@ -2424,7 +2424,7 @@ mod tests {
     fn file_accept_multipart_scalar_fields() {
         assert_no_errors(
             r#"
-            struct Upload { File avatar  Int rotation  Bool crop  Option<String> caption }
+            struct Upload { avatar: File  rotation: Int  crop: Bool  caption: Option<String> }
             endpoint upload: POST "/api/upload" {
                 body Upload
             }
@@ -2437,7 +2437,7 @@ mod tests {
     fn file_reject_multipart_list_field() {
         assert_has_error(
             r#"
-            struct Upload { File avatar  List<String> tags }
+            struct Upload { avatar: File  tags: List<String> }
             endpoint upload: POST "/api/upload" {
                 body Upload
             }
@@ -2451,8 +2451,8 @@ mod tests {
     fn file_reject_multipart_nested_struct_field() {
         assert_has_error(
             r#"
-            struct Meta { String key }
-            struct Upload { File avatar  Meta meta }
+            struct Meta { key: String }
+            struct Upload { avatar: File  meta: Meta }
             endpoint upload: POST "/api/upload" {
                 body Upload
             }
@@ -2468,7 +2468,7 @@ mod tests {
         use phoenix_parser::ast::PaginationMode;
         let ep = first_endpoint(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" {
                 response List<Post>
                 pagination { offset }
@@ -2486,7 +2486,7 @@ mod tests {
         use phoenix_parser::ast::PaginationMode;
         let ep = first_endpoint(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" {
                 response List<Post>
                 pagination { cursor }
@@ -2501,7 +2501,7 @@ mod tests {
     fn pagination_absent_is_none() {
         let ep = first_endpoint(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" { response List<Post> }
             "#,
         );
@@ -2512,7 +2512,7 @@ mod tests {
     fn pagination_rejects_non_list_response() {
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint getPost: GET "/posts/{id}" {
                 response Post
                 pagination { offset }
@@ -2526,7 +2526,7 @@ mod tests {
     fn pagination_rejects_option_list_response() {
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" {
                 response Option<List<Post>>
                 pagination { offset }
@@ -2540,9 +2540,9 @@ mod tests {
     fn pagination_rejects_combination_with_response_headers() {
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/posts" {
-                response List<Post> headers { Int totalCount as "X-Total" }
+                response List<Post> headers { totalCount: Int as "X-Total" }
                 pagination { offset }
             }
             "#,
@@ -2555,7 +2555,7 @@ mod tests {
     #[test]
     fn multi_status_two_typed_same_type_accepts() {
         let src = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/users" {
                 response { 200: User  201: User }
             }
@@ -2580,7 +2580,7 @@ mod tests {
     #[test]
     fn multi_status_typed_and_typeless_accepts() {
         let src = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/users" {
                 response { 200: User  204 }
             }
@@ -2605,7 +2605,7 @@ mod tests {
         // not the first entry: a typeless status listed before the typed one
         // must still mirror `T` into `response`.
         let src = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/users" {
                 response { 204  200: User }
             }
@@ -2645,7 +2645,7 @@ mod tests {
     fn bare_response_leaves_statuses_empty() {
         // Regression: the common bare-response case is untouched.
         let src = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/users/{id}" {
                 response User
             }
@@ -2660,8 +2660,8 @@ mod tests {
     fn multi_status_differing_body_types_rejected() {
         assert_has_error(
             r#"
-            struct User { Int id }
-            struct Receipt { Int id }
+            struct User { id: Int }
+            struct Receipt { id: Int }
             endpoint createUser: POST "/users" {
                 response { 200: User  201: Receipt }
             }
@@ -2674,8 +2674,8 @@ mod tests {
     fn multi_status_non_2xx_rejected() {
         assert_has_error(
             r#"
-            struct User { Int id }
-            struct NotFound { Int id }
+            struct User { id: Int }
+            struct NotFound { id: Int }
             endpoint getUser: GET "/users/{id}" {
                 response { 200: User  404: NotFound }
             }
@@ -2688,7 +2688,7 @@ mod tests {
     fn multi_status_duplicate_status_rejected() {
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/users/{id}" {
                 response { 200: User  200: User }
             }
@@ -2707,9 +2707,9 @@ mod tests {
         // defensive; this test instead pins that a standalone (request)
         // `headers` block coexists cleanly with a multi-status block.
         let src = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/users" {
-                headers { String x }
+                headers { x: String }
                 response { 200: User  201: User }
             }
         "#;
@@ -2726,7 +2726,7 @@ mod tests {
         // that silently drops the handler-supplied body.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint deleteUser: DELETE "/users/{id}" {
                 response { 204: User }
             }
@@ -2744,7 +2744,7 @@ mod tests {
         // sema letting a typeless 205 through is what makes that path live.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint resetUser: PUT "/users/{id}" {
                 response { 205: User }
             }
@@ -2752,7 +2752,7 @@ mod tests {
             "cannot declare a body type",
         );
         let src = r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint resetUser: PUT "/users/{id}" {
                 response { 200: User  205 }
             }
@@ -2794,8 +2794,8 @@ mod tests {
         // both errors must surface in ONE pass, not one per fix-recompile.
         let errors = check_source(
             r#"
-            struct User { Int id }
-            struct Receipt { Int id }
+            struct User { id: Int }
+            struct Receipt { id: Int }
             endpoint createUser: POST "/users" {
                 response { 200: Bogus  201: User  202: Receipt }
             }
@@ -2822,7 +2822,7 @@ mod tests {
         // cascade.
         let errors = check_source(
             r#"
-            struct Doc { File data }
+            struct Doc { data: File }
             endpoint getDoc: GET "/docs/{id}" {
                 response { 200: Doc  204 }
             }
@@ -2853,7 +2853,7 @@ mod tests {
         // top of the per-entry rejections.
         let errors = check_source(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint syncPosts: POST "/posts/sync" {
                 response { 200: List<Post>  201: List<Post> }
             }
@@ -2890,7 +2890,7 @@ mod tests {
         // requires a `List<T>` response" error.
         let errors = check_source(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint listUsers: GET "/users" {
                 response { 200: User  201: User }
                 pagination { offset }

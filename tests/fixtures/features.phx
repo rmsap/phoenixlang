@@ -1,8 +1,8 @@
 // Showcase of Phoenix language features
 
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   function display(self) -> String {
     "({self.x}, {self.y})"

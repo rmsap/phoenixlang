@@ -267,7 +267,7 @@ fn field_visibility_public_field_accessible_from_other_module() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -286,7 +286,7 @@ fn field_visibility_private_field_rejected_from_other_module() {
     // Phoenix struct fields are newline-separated, not `;`-separated.
     let other = non_entry(
         "lib",
-        "public struct User {\npublic String name\nString password\n}",
+        "public struct User {\npublic name: String\npassword: String\n}",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -317,7 +317,7 @@ fn field_visibility_private_field_rejected_from_other_module() {
 #[test]
 fn own_module_can_access_own_private_field() {
     let entry = entry_only(
-        "struct User {\nString name\nString password\n}\n\
+        "struct User {\nname: String\npassword: String\n}\n\
          function main() { let u: User = User(\"alice\", \"hash\") print(u.password) }",
     );
     let analysis = check_modules(&[entry]);
@@ -371,7 +371,7 @@ fn endpoint_with_imported_struct_body_resolves() {
     );
     let other = non_entry(
         "lib",
-        "public struct User { public String name }",
+        "public struct User { public name: String }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -398,7 +398,7 @@ fn construction_with_private_field_from_other_module_is_rejected() {
     );
     let other = non_entry(
         "lib",
-        "public struct User {\npublic String name\nString password\n}",
+        "public struct User {\npublic name: String\npassword: String\n}",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -435,7 +435,7 @@ fn construction_with_only_public_fields_from_other_module_is_allowed() {
     );
     let other = non_entry(
         "lib",
-        "public struct User {\npublic String name\n}",
+        "public struct User {\npublic name: String\n}",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -451,7 +451,7 @@ fn own_module_can_construct_with_private_fields() {
     // Same module's construction sets its own private fields freely —
     // the gate only fires across module boundaries.
     let entry = entry_only(
-        "struct User {\nString name\nString password\n}\n\
+        "struct User {\nname: String\npassword: String\n}\n\
          function main() { let u: User = User(\"alice\", \"hash\") print(u.name) }",
     );
     let analysis = check_modules(&[entry]);
@@ -502,7 +502,7 @@ fn field_assignment_private_field_from_other_module_is_rejected() {
     );
     let other = non_entry(
         "lib",
-        "public struct User {\npublic String name\nString password\n}\n\
+        "public struct User {\npublic name: String\npassword: String\n}\n\
          public function makeUser(n: String) -> User { User(n, \"\") }",
         SourceId(1),
     );
@@ -539,7 +539,7 @@ fn field_assignment_public_field_from_other_module_is_allowed() {
     );
     let other = non_entry(
         "lib",
-        "public struct User {\npublic String name\n}\n\
+        "public struct User {\npublic name: String\n}\n\
          public function makeUser(n: String) -> User { User(n) }",
         SourceId(1),
     );
@@ -563,7 +563,7 @@ fn import_of_cross_namespace_collision_emits_ambiguity_diagnostic() {
     let entry = entry_only("import lib { Foo }\nfunction main() {}");
     let other = non_entry(
         "lib",
-        "public function Foo() -> Int { 1 }\npublic struct Foo { Int x }",
+        "public function Foo() -> Int { 1 }\npublic struct Foo { x: Int }",
         SourceId(1),
     );
     let analysis = check_modules(&[entry, other]);
@@ -602,7 +602,7 @@ fn field_assignment_own_module_private_field_is_allowed() {
     // Same-module mutation of a private field must not trip the
     // cross-module gate — only writes from *other* modules are blocked.
     let entry = entry_only(
-        "struct User {\nString name\nString password\n}\n\
+        "struct User {\nname: String\npassword: String\n}\n\
          function main() { let mut u: User = User(\"alice\", \"\") u.password = \"hash\" print(u.password) }",
     );
     let analysis = check_modules(&[entry]);

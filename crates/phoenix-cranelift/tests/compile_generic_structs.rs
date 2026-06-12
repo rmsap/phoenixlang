@@ -6,7 +6,7 @@
 //!   get(self) -> T { self.value } }`).
 //! - Two instantiations coexist without collision (struct-mono mangles
 //!   their names to distinguish `Container__i64` from `Container__str`).
-//! - Nested generics (`struct Nested<T> { Pair<T> p }`).
+//! - Nested generics (`struct Nested<T> { p: Pair<T> }`).
 //! - `dyn Trait` over a generic struct — vtable keying disambiguates
 //!   `Box<Int>: Show` and `Box<String>: Show`.
 
@@ -22,7 +22,7 @@ fn generic_struct_baseline_field_access() {
     let output = compile_and_run(
         r#"
 struct Container<T> {
-    T value
+    value: T
 }
 
 function main() {
@@ -44,7 +44,7 @@ fn generic_struct_method_using_type_param() {
     let output = compile_and_run(
         r#"
 struct Container<T> {
-    T value
+    value: T
 
     function get(self) -> T { self.value }
 }
@@ -69,7 +69,7 @@ fn generic_struct_two_instantiations_coexist() {
     let output = compile_and_run(
         r#"
 struct Box<T> {
-    T v
+    v: T
 
     function unwrap(self) -> T { self.v }
 }
@@ -94,11 +94,11 @@ fn generic_struct_nested() {
     let output = compile_and_run(
         r#"
 struct Pair<T> {
-    T first
-    T second
+    first: T
+    second: T
 }
 struct Nested<T> {
-    Pair<T> p
+    p: Pair<T>
 }
 
 function main() {
@@ -124,7 +124,7 @@ trait Show {
 }
 
 struct Box<T> {
-    T v
+    v: T
 
     impl Show {
         function show(self) -> String {
@@ -152,7 +152,7 @@ fn generic_struct_three_way_agreement() {
     roundtrip(
         r#"
 struct Container<T> {
-    T value
+    value: T
 }
 
 function main() {
@@ -171,8 +171,8 @@ fn generic_struct_multi_type_param() {
     let output = compile_and_run(
         r#"
 struct Pair<A, B> {
-    A first
-    B second
+    first: A
+    second: B
 }
 
 function main() {
@@ -197,7 +197,7 @@ fn generic_struct_inside_list() {
     let output = compile_and_run(
         r#"
 struct Container<T> {
-    T value
+    value: T
 }
 
 function main() {
@@ -221,7 +221,7 @@ fn generic_fn_over_generic_struct() {
     let output = compile_and_run(
         r#"
 struct Container<T> {
-    T value
+    value: T
 }
 
 function unwrap<T>(c: Container<T>) -> T {
@@ -249,8 +249,8 @@ fn generic_struct_self_recursive_via_option() {
     let output = compile_and_run(
         r#"
 struct Node<T> {
-    T val
-    Option<Node<T>> next
+    val: T
+    next: Option<Node<T>>
 }
 
 function main() {
@@ -276,10 +276,10 @@ fn generic_struct_two_level_nesting() {
     let output = compile_and_run(
         r#"
 struct Box<T> {
-    T v
+    v: T
 }
 struct Container<T> {
-    T value
+    value: T
 }
 
 function main() {

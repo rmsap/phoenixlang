@@ -174,8 +174,8 @@ Each `.phx` file is a module. Declarations are private by default; mark them `pu
 ```phoenix
 // models/user.phx
 public struct User {
-  public String name
-  Int passwordHash             // private — set via the constructor, not readable from outside
+  public name: String
+  passwordHash: Int            // private — set via the constructor, not readable from outside
 }
 
 public function createUser(name: String) -> User {
@@ -205,10 +205,10 @@ Write an API schema once in `.phx`; generate typed clients and servers across mu
 
 ```phoenix
 struct Post {
-  Int id
-  String title where self.length > 0 && self.length <= 200
-  String body where self.length > 0
-  List<String> tags
+  id: Int
+  title: String where self.length > 0 && self.length <= 200
+  body: String where self.length > 0
+  tags: List<String>
 }
 
 endpoint createPost: POST "/api/posts" {

@@ -3,7 +3,7 @@ public function greet(name: String) -> String {
 }
 
 public struct User {
-  public String name
+  public name: String
 
   public function describe(self) -> String {
     "user: " + self.name

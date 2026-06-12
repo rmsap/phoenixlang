@@ -51,30 +51,30 @@
 #^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
 >//     ^^^^ entity.name.type.phoenix
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
->  Int id
+>  id: Int
 #^^ source.phoenix
-#  ^^^ source.phoenix support.type.primitive.phoenix
-#     ^ source.phoenix
-#      ^^ source.phoenix variable.other.phoenix
->//^^^ support.type.primitive.phoenix
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
->  String name
+#  ^^ source.phoenix variable.other.phoenix
+#    ^^ source.phoenix
+#      ^^^ source.phoenix support.type.primitive.phoenix
+>//    ^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  name: String
 #^^ source.phoenix
-#  ^^^^^^ source.phoenix support.type.primitive.phoenix
-#        ^ source.phoenix
-#         ^^^^ source.phoenix variable.other.phoenix
->//^^^^^^ support.type.primitive.phoenix
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
->  Option<String> bio
+#  ^^^^ source.phoenix variable.other.phoenix
+#      ^^ source.phoenix
+#        ^^^^^^ source.phoenix support.type.primitive.phoenix
+>//      ^^^^^^ support.type.primitive.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+>  bio: Option<String>
 #^^ source.phoenix
-#  ^^^^^^ source.phoenix support.type.generic.phoenix
-#        ^ source.phoenix keyword.operator.comparison.phoenix
-#         ^^^^^^ source.phoenix support.type.primitive.phoenix
-#               ^ source.phoenix keyword.operator.comparison.phoenix
-#                ^ source.phoenix
-#                 ^^^ source.phoenix variable.other.phoenix
->//^^^^^^ support.type.generic.phoenix
-#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
+#  ^^^ source.phoenix variable.other.phoenix
+#     ^^ source.phoenix
+#       ^^^^^^ source.phoenix support.type.generic.phoenix
+#             ^ source.phoenix keyword.operator.comparison.phoenix
+#              ^^^^^^ source.phoenix support.type.primitive.phoenix
+#                    ^ source.phoenix keyword.operator.comparison.phoenix
+>//     ^^^^^^ support.type.generic.phoenix
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ source.phoenix comment.line.double-slash.phoenix
 >}
 #^^ source.phoenix
 >

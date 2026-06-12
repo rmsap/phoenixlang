@@ -14,11 +14,11 @@ use phoenix_sema::checker;
 const FULL_SCHEMA: &str = r#"
 /** A registered user */
 struct User {
-    Int id
-    String name
-    String email
-    Int age
-    Option<String> bio
+    id: Int
+    name: String
+    email: String
+    age: Int
+    bio: Option<String>
 }
 
 /** User permission levels */
@@ -27,9 +27,9 @@ enum Role { Admin  Editor  Viewer }
 /** List all users, optionally filtered by search query */
 endpoint listUsers: GET "/api/users" {
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
+        page: Int = 1
+        limit: Int = 20
+        search: Option<String>
     }
     response List<User>
 }
@@ -418,7 +418,7 @@ fn server_has_routes_for_all_endpoints() {
 #[test]
 fn server_parses_query_params_with_defaults() {
     let files = generate_full_schema();
-    // listUsers has query { Int page = 1, Int limit = 20, Option<String> search }
+    // listUsers has query { page: Int = 1, limit: Int = 20, search: Option<String> }
     assert!(files.server.contains("handlers.listUsers("));
 }
 
@@ -674,9 +674,9 @@ fn openapi_optional_field_not_required() {
 fn openapi_query_without_default_is_required() {
     // Build a schema with a required query param (no default, not Option)
     let source = r#"
-struct Item { Int id  String name }
+struct Item { id: Int  name: String }
 endpoint search: GET "/api/search" {
-    query { String term }
+    query { term: String }
     response List<Item>
 }
 "#;
@@ -765,10 +765,10 @@ fn server_has_correct_route_count() {
 
 const CONSTRAINED_SCHEMA: &str = r#"
 struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    String email where self.contains("@") && self.length > 3
-    Int age where self >= 0 && self <= 150
+    id: Int
+    name: String where self.length > 0 && self.length <= 100
+    email: String where self.contains("@") && self.length > 3
+    age: Int where self >= 0 && self <= 150
 }
 
 endpoint createUser: POST "/api/users" {
@@ -812,8 +812,8 @@ fn generate_constrained_openapi() -> String {
 fn constraint_unicode_field_name_wraps_without_panic() {
     let schema = r#"
 struct Perfil {
-    Int id
-    String descripciónMuyLargaConCaracteresÑoÑoParaForzarElAjusteDeLínea where self.length > 0 && self.length <= 100
+    id: Int
+    descripciónMuyLargaConCaracteresÑoÑoParaForzarElAjusteDeLínea: String where self.length > 0 && self.length <= 100
 }
 
 endpoint createPerfil: POST "/api/perfiles" {
@@ -944,7 +944,7 @@ fn constraint_openapi_derived_body_inherits_constraints() {
 fn constraint_openapi_exclusive_bounds() {
     // self > 0 → exclusiveMinimum, self < 100 → exclusiveMaximum
     let source = r#"
-struct Item { Int id  Int score where self > 0 && self < 100 }
+struct Item { id: Int  score: Int where self > 0 && self < 100 }
 endpoint create: POST "/api/items" { body Item omit { id }  response Item }
 "#;
     let tokens = tokenize(source, SourceId(0));
@@ -960,7 +960,7 @@ endpoint create: POST "/api/items" { body Item omit { id }  response Item }
 #[test]
 fn constraint_openapi_float_bounds() {
     let source = r#"
-struct Item { Float price where self >= 0.5 && self <= 999.99 }
+struct Item { price: Float where self >= 0.5 && self <= 999.99 }
 "#;
     let tokens = tokenize(source, SourceId(0));
     let (program, _) = parser::parse(&tokens);
@@ -976,10 +976,10 @@ struct Item { Float price where self >= 0.5 && self <= 999.99 }
 fn constraint_openapi_pick_inherits_constraints() {
     let source = r#"
 struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 50
-    String email where self.contains("@")
-    Int age where self >= 0
+    id: Int
+    name: String where self.length > 0 && self.length <= 50
+    email: String where self.contains("@")
+    age: Int where self >= 0
 }
 endpoint updateName: PATCH "/api/users/{id}" {
     body User pick { name }
@@ -1017,7 +1017,7 @@ fn constraint_openapi_field_without_constraint_no_extra_keywords() {
 // ── Schema declaration codegen tests (no-op) ────────────────────────
 
 const SCHEMA_SOURCE: &str = r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 
 endpoint listUsers: GET "/api/users" {
     response List<User>
@@ -1045,7 +1045,7 @@ fn generate_with_schema() -> phoenix_codegen::GeneratedFiles {
 
 fn generate_without_schema() -> phoenix_codegen::GeneratedFiles {
     let source = r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 
 endpoint listUsers: GET "/api/users" {
     response List<User>
@@ -1105,7 +1105,7 @@ fn schema_does_not_affect_openapi() {
     let openapi_with = phoenix_codegen::generate_openapi(&program_with, &result_with);
 
     let source_without = r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint listUsers: GET "/api/users" {
     response List<User>
 }
@@ -1134,8 +1134,8 @@ trait Renderable {
     function render(self) -> String
 }
 struct Card {
-    Int id
-    dyn Renderable hero
+    id: Int
+    hero: dyn Renderable
 }
 endpoint getCard: GET "/api/cards/{id}" {
     response Card
@@ -1172,8 +1172,8 @@ trait Renderable {
     function render(self) -> String
 }
 struct Widget {
-    Int id
-    dyn Renderable body
+    id: Int
+    body: dyn Renderable
 }
 endpoint getWidget: GET "/api/widgets/{id}" {
     response Widget
@@ -1218,9 +1218,9 @@ trait Serializable {
     function serialize(self) -> String
 }
 struct Widget {
-    Int id
-    dyn Renderable view
-    dyn Serializable data
+    id: Int
+    view: dyn Renderable
+    data: dyn Serializable
 }
 endpoint getWidget: GET "/api/widgets/{id}" {
     response Widget
@@ -1260,9 +1260,9 @@ trait Renderable {
     function render(self) -> String
 }
 struct Gallery {
-    Int id
-    List<dyn Renderable> items
-    Option<dyn Renderable> featured
+    id: Int
+    items: List<dyn Renderable>
+    featured: Option<dyn Renderable>
 }
 endpoint getGallery: GET "/api/galleries/{id}" {
     response Gallery

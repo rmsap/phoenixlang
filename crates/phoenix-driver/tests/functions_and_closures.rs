@@ -155,8 +155,8 @@ fn implicit_return_method() {
     run_expect(
         r#"
 struct Point {
-  Int x
-  Int y
+  x: Int
+  y: Int
 
   function sum(self) -> Int {
     self.x + self.y
@@ -238,7 +238,7 @@ function main() {
 fn implicit_return_struct_literal() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function origin() -> Point {
   Point(0, 0)
 }
@@ -746,7 +746,7 @@ function main() {
 fn closure_with_struct_capture() {
     run_expect(
         r#"
-struct Config { Int multiplier }
+struct Config { multiplier: Int }
 function main() {
     let cfg: Config = Config(3)
     let multiply: (Int) -> Int = function(x: Int) -> Int { return x * cfg.multiplier }
@@ -1390,8 +1390,8 @@ fn generic_struct_with_closure_field_usage() {
     run_expect(
         r#"
 struct Pair<A, B> {
-  A first
-  B second
+  first: A
+  second: B
 }
 function main() {
   let p: Pair<Int, String> = Pair(10, "hello")

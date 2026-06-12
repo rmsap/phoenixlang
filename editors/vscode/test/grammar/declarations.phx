@@ -14,12 +14,12 @@ function add(a: Int, b: Int) -> Int {
 struct User {
 // <- storage.type.phoenix
 //     ^^^^ entity.name.type.phoenix
-  Int id
-//^^^ support.type.primitive.phoenix
-  String name
-//^^^^^^ support.type.primitive.phoenix
-  Option<String> bio
-//^^^^^^ support.type.generic.phoenix
+  id: Int
+//    ^^^ support.type.primitive.phoenix
+  name: String
+//      ^^^^^^ support.type.primitive.phoenix
+  bio: Option<String>
+//     ^^^^^^ support.type.generic.phoenix
 }
 
 enum Shape {

@@ -149,8 +149,8 @@ fn string_interpolation_with_field_access() {
     run_expect(
         r#"
 struct User {
-  String name
-  Int age
+  name: String
+  age: Int
 }
 function main() {
   let u: User = User("Bob", 25)

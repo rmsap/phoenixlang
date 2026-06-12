@@ -8,8 +8,8 @@ fn struct_int_fields() {
     roundtrip(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function main() {
     let p: Point = Point(3, 4)
@@ -27,8 +27,8 @@ fn struct_string_field() {
     roundtrip(
         r#"
 struct User {
-    String name
-    Int age
+    name: String
+    age: Int
 }
 function main() {
     let u: User = User("Alice", 30)
@@ -45,9 +45,9 @@ fn struct_multiple_string_fields() {
     roundtrip(
         r#"
 struct Contact {
-    String first
-    String last
-    String email
+    first: String
+    last: String
+    email: String
 }
 function main() {
     let c: Contact = Contact("Jane", "Doe", "jane@example.com")
@@ -65,10 +65,10 @@ fn struct_mixed_fields() {
     roundtrip(
         r#"
 struct Record {
-    Int id
-    String label
-    Bool active
-    String note
+    id: Int
+    label: String
+    active: Bool
+    note: String
 }
 function main() {
     let r: Record = Record(42, "hello", true, "world")
@@ -86,7 +86,7 @@ fn struct_field_assignment() {
     roundtrip(
         r#"
 struct Counter {
-    Int value
+    value: Int
 }
 function main() {
     let mut c: Counter = Counter(0)
@@ -103,8 +103,8 @@ fn struct_string_field_assignment() {
     roundtrip(
         r#"
 struct Named {
-    String name
-    Int count
+    name: String
+    count: Int
 }
 function main() {
     let mut n: Named = Named("old", 1)
@@ -122,11 +122,11 @@ fn struct_nested() {
     roundtrip(
         r#"
 struct Inner {
-    Int value
+    value: Int
 }
 struct Outer {
-    Inner inner
-    Int extra
+    inner: Inner
+    extra: Int
 }
 function main() {
     let i: Inner = Inner(42)
@@ -143,8 +143,8 @@ fn struct_method_call() {
     roundtrip(
         r#"
 struct Pair {
-    Int a
-    Int b
+    a: Int
+    b: Int
 
     function sum(self) -> Int {
         self.a + self.b
@@ -164,8 +164,8 @@ fn struct_string_field_mutation() {
     roundtrip(
         r#"
 struct User {
-    String name
-    Int age
+    name: String
+    age: Int
 }
 function main() {
     let mut u: User = User("Alice", 30)

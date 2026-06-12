@@ -35,7 +35,7 @@ fn lexer_range_operator() {
 fn destructuring_partial_fields() {
     run_expect(
         r#"
-struct Point { Int x  Int y  Int z }
+struct Point { x: Int  y: Int  z: Int }
 function main() {
     let p: Point = Point(1, 2, 3)
     let Point { x, z } = p
@@ -53,7 +53,7 @@ function main() {
 fn destructuring_with_mut() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let p: Point = Point(1, 2)
     let mut Point { x, y } = p
@@ -72,7 +72,7 @@ function main() {
 fn destructuring_in_loop_body() {
     run_expect(
         r#"
-struct Point { Int x  Int y }
+struct Point { x: Int  y: Int }
 function main() {
     let points: List<Point> = [Point(1, 2), Point(3, 4)]
     for p in points {

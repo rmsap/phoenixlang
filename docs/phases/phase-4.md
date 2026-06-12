@@ -161,8 +161,8 @@ for i in 0..1000000 {
 
 // Custom iterators
 struct Fibonacci {
-    Int a
-    Int b
+    a: Int
+    b: Int
 }
 
 impl Iterator for Fibonacci {
@@ -222,9 +222,9 @@ Create a copy of a struct with some fields changed, without mutating the origina
 
 ```phoenix
 struct User {
-    String name
-    String email
-    Int age
+    name: String
+    email: String
+    age: Int
 }
 
 let alice: User = User("Alice", "alice@example.com", 30)
@@ -266,14 +266,14 @@ Type-safe configuration loading from environment variables, `.env` files, and co
 @config(prefix: "APP")
 struct AppConfig {
     @config(env: "DATABASE_URL")
-    String databaseUrl
+    databaseUrl: String
 
-    Int port               // reads APP_PORT, defaults to env var name based on prefix + field name
+    port: Int  // reads APP_PORT, defaults to env var name based on prefix + field name
 
     @config(default: "info")
-    String logLevel       // reads APP_LOG_LEVEL, falls back to "info" if missing
+    logLevel: String  // reads APP_LOG_LEVEL, falls back to "info" if missing
 
-    Option<String> secret  // reads APP_SECRET, None if missing (optional fields don't fail)
+    secret: Option<String>  // reads APP_SECRET, None if missing (optional fields don't fail)
 }
 
 // Load config — validates all required fields are present
@@ -293,7 +293,7 @@ match config {
 - All required fields (non-`Option`, no `@config(default: ...)`) must be present — a missing value is an error
 - Type coercion: environment variables are strings, but `Int`, `Float`, `Bool` fields are automatically parsed (invalid format is a `ConfigError`)
 - All validation happens at once — the error reports all missing/invalid fields, not just the first one
-- When refinement types (5.2) are available, config fields can have constraints: `Int port where port > 0 and port < 65536`
+- When refinement types (5.2) are available, config fields can have constraints: `port: Int where port > 0 and port < 65536`
 - **Complexity:** Small-medium — the config loader is a library function, annotations provide the metadata, and serialization (4.6) provides the type coercion machinery.
 - **Depends on:** Annotations (4.5), Built-in serialization (4.6/5.1)
 
@@ -372,8 +372,8 @@ async function fetchFirst(url1: String, url2: String) -> Result<String, HttpErro
 - `TaskGroup.any(fn)` — run all spawned tasks, return first `Ok`, cancel remaining (ignores errors unless all fail)
 - `Task.cancel()` — request cancellation of a specific task
 - `Task.isCancelled() -> Bool` — check if cancellation was requested
-- `sleep(Int ms)` — suspend for a duration (also a cancellation point)
-- `timeout(Int ms, async fn) -> Result<T, TimeoutError>` — cancel a task if it exceeds a deadline
+- `sleep(ms: Int)` — suspend for a duration (also a cancellation point)
+- `timeout(ms: Int, async fn) -> Result<T, TimeoutError>` — cancel a task if it exceeds a deadline
 
 ### Additional runtime features
 
@@ -615,14 +615,14 @@ A general-purpose annotation/attribute system for attaching metadata to declarat
 @jsonSerializable
 struct User {
     @primary
-    Int id
+    id: Int
 
     @unique
     @jsonName("user_name")
-    String name
+    name: String
 
     @skip
-    String cachedDisplayName
+    cachedDisplayName: String
 }
 ```
 
@@ -644,7 +644,7 @@ Database-hint annotations (`@primary`, `@unique`, `@index`) may also be recogniz
 ### Implementation notes
 
 - Adds `@` as a new token kind in the lexer
-- `@` suppresses the following newline (so `@primary\nInt id` parses as one annotated field)
+- `@` suppresses the following newline (so `@primary\nid: Int` parses as one annotated field)
 - AST: new `Annotation` and `AnnotationArg` types; `annotations: Vec<Annotation>` added to `FieldDecl` and `StructDecl`
 - Semantic checker validates known annotations (correct target, argument types) and warns on unknowns
 - The interpreter ignores annotations — they are compile-time metadata only
@@ -672,19 +672,19 @@ Tables can either declare columns inline or reference an existing struct with `f
 
 ```phoenix
 struct User {
-    Int id
-    String name
-    String email
-    Int age
+    id: Int
+    name: String
+    email: String
+    age: Int
     @skip
-    String cachedDisplayName
+    cachedDisplayName: String
 }
 
 struct Post {
-    Int id
-    Int authorId
-    String title
-    String body
+    id: Int
+    authorId: Int
+    title: String
+    body: String
 }
 
 schema db {
@@ -705,9 +705,9 @@ schema db {
 
   // Standalone table — declares columns inline (for join tables, audit logs, etc.)
   table sessions {
-    String token primary key
-    Int userId references users(id)
-    Int expiresAt
+    token: String primary key
+    userId: Int references users(id)
+    expiresAt: Int
   }
 }
 ```

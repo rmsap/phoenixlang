@@ -18,14 +18,14 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
     }
 }
 struct Square {
-    Int side
+    side: Int
 
     impl Drawable {
         function draw(self) -> String { return "square" }
@@ -96,7 +96,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int radius
+    radius: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -133,8 +133,8 @@ fn struct_name_in_dyn_position_rejected() {
     expect_type_error(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function f(x: dyn Point) -> Int { return 0 }
 function main() { print(1) }
@@ -238,7 +238,7 @@ trait Drawable {
     function draw(self) -> String
 }
 struct Circle {
-    Int r
+    r: Int
 
     impl Drawable {
         function draw(self) -> String { return "circle" }
@@ -276,7 +276,7 @@ trait Display {
 }
 
 struct Tag {
-    String label
+    label: String
 
     impl Display {
         function toString(self) -> String { return self.label }

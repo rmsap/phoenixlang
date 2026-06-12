@@ -3,7 +3,7 @@ public trait Drawable {
 }
 
 public struct Circle {
-  public Int radius
+  public radius: Int
 
   impl Drawable {
     function draw(self) -> String { "circle" }
@@ -11,7 +11,7 @@ public struct Circle {
 }
 
 public struct Square {
-  public Int side
+  public side: Int
 
   impl Drawable {
     function draw(self) -> String { "square" }

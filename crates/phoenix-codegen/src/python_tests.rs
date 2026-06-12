@@ -39,9 +39,9 @@ fn struct_to_model() {
         r#"
 /** A registered user */
 struct User {
-    Int id
-    String name
-    Option<String> bio
+    id: Int
+    name: String
+    bio: Option<String>
 }
 "#,
     );
@@ -59,9 +59,9 @@ fn model_with_constraints() {
     let files = generate_from_source(
         r#"
 struct User {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    Int age where self >= 0 && self <= 150
+    id: Int
+    name: String where self.length > 0 && self.length <= 100
+    age: Int where self >= 0 && self <= 150
 }
 "#,
     );
@@ -72,7 +72,7 @@ struct User {
 fn get_with_path_param() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint getUser: GET "/api/users/{id}" {
     response User
 }
@@ -87,7 +87,7 @@ endpoint getUser: GET "/api/users/{id}" {
 fn post_with_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint createUser: POST "/api/users" {
     body User omit { id }
     response User
@@ -104,12 +104,12 @@ endpoint createUser: POST "/api/users" {
 fn query_params_with_defaults() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint listUsers: GET "/api/users" {
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> search
+        page: Int = 1
+        limit: Int = 20
+        search: Option<String>
     }
     response List<User>
 }
@@ -128,11 +128,11 @@ endpoint listUsers: GET "/api/users" {
 fn required_aliased_query_param_sorts_after_plain() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint searchUsers: GET "/api/users" {
     query {
-        Int maxResults
-        Int page
+        maxResults: Int
+        page: Int
     }
     response List<User>
 }
@@ -171,9 +171,9 @@ endpoint deleteUser: DELETE "/api/users/{id}" {
 fn request_header_auto_wire_name() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
-    headers { String idempotencyKey }
+    headers { idempotencyKey: String }
     response User
 }
 "#,
@@ -202,9 +202,9 @@ endpoint createUser: POST "/api/users" {
 fn request_header_as_override() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
-    headers { String token as "X-Auth" }
+    headers { token: String as "X-Auth" }
     response User
 }
 "#,
@@ -230,9 +230,9 @@ endpoint createUser: POST "/api/users" {
 fn optional_request_header() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
-    headers { Option<String> traceId }
+    headers { traceId: Option<String> }
     response User
 }
 "#,
@@ -268,9 +268,9 @@ endpoint createUser: POST "/api/users" {
 fn bool_request_header_serializes_lowercase() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
-    headers { Bool debug }
+    headers { debug: Bool }
     response User
 }
 "#,
@@ -297,9 +297,9 @@ endpoint createUser: POST "/api/users" {
 fn defaulted_request_header_binds_default() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint createUser: POST "/api/users" {
-    headers { Int maxStale = 60 }
+    headers { maxStale: Int = 60 }
     response User
 }
 "#,
@@ -333,9 +333,9 @@ endpoint createUser: POST "/api/users" {
 fn response_header_envelope() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint getPost: GET "/api/posts/{id}" {
-    response Post headers { Int ratelimitRemaining as "X-RateLimit-Remaining" }
+    response Post headers { ratelimitRemaining: Int as "X-RateLimit-Remaining" }
 }
 "#,
     );
@@ -396,8 +396,8 @@ endpoint getPost: GET "/api/posts/{id}" {
 fn multipart_request_body() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
-struct UploadResult { String url }
+struct AvatarUpload { avatar: File  caption: String }
+struct UploadResult { url: String }
 endpoint uploadAvatar: POST "/api/avatar" {
     body AvatarUpload
     response UploadResult
@@ -484,7 +484,7 @@ endpoint uploadAvatar: POST "/api/avatar" {
 fn multipart_optional_file() {
     let files = generate_from_source(
         r#"
-struct MaybeUpload { Option<File> avatar  String caption }
+struct MaybeUpload { avatar: Option<File>  caption: String }
 endpoint upload: POST "/api/maybe" {
     body MaybeUpload
 }
@@ -525,7 +525,7 @@ endpoint upload: POST "/api/maybe" {
 fn multipart_aliased_file_uses_annotated() {
     let files = generate_from_source(
         r#"
-struct Upload { File avatarImage  String caption }
+struct Upload { avatarImage: File  caption: String }
 endpoint upload: POST "/api/upload" {
     body Upload
 }
@@ -569,7 +569,7 @@ endpoint upload: POST "/api/upload" {
 fn binary_response_download() {
     let files = generate_from_source(
         r#"
-struct Doc { File data }
+struct Doc { data: File }
 endpoint download: GET "/api/doc/{id}" {
     response Doc
 }
@@ -632,7 +632,7 @@ endpoint download: GET "/api/doc/{id}" {
 fn multipart_only_no_response_emits_dataclass_only() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
+struct AvatarUpload { avatar: File  caption: String }
 endpoint upload: POST "/api/upload" { body AvatarUpload }
 "#,
     );
@@ -668,8 +668,8 @@ endpoint upload: POST "/api/upload" { body AvatarUpload }
 fn multipart_with_path_param_orders_route_params() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
-struct UploadResult { String url }
+struct AvatarUpload { avatar: File  caption: String }
+struct UploadResult { url: String }
 endpoint uploadAvatar: POST "/api/authors/{id}/avatar" {
     body AvatarUpload
     response UploadResult
@@ -709,7 +709,7 @@ endpoint uploadAvatar: POST "/api/authors/{id}/avatar" {
 fn multipart_partial_file_is_optional() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
+struct AvatarUpload { avatar: File  caption: String }
 endpoint uploadAvatar: POST "/api/avatar" {
     body AvatarUpload partial { avatar }
 }
@@ -749,7 +749,7 @@ endpoint uploadAvatar: POST "/api/avatar" {
 fn multipart_scalar_bool_data_line_is_paren_free() {
     let files = generate_from_source(
         r#"
-struct Upload { File avatar  Int rotation  Bool crop }
+struct Upload { avatar: File  rotation: Int  crop: Bool }
 endpoint upload: POST "/api/upload" { body Upload }
 "#,
     );
@@ -778,8 +778,8 @@ endpoint upload: POST "/api/upload" { body Upload }
 fn multipart_upload_with_binary_response() {
     let files = generate_from_source(
         r#"
-struct AvatarUpload { File avatar  String caption }
-struct Thumbnail { File data }
+struct AvatarUpload { avatar: File  caption: String }
+struct Thumbnail { data: File }
 endpoint convertAvatar: POST "/api/avatar/convert" {
     body AvatarUpload
     response Thumbnail
@@ -834,7 +834,7 @@ endpoint convertAvatar: POST "/api/avatar/convert" {
 fn multiline_doc_comment_is_fully_commented() {
     let files = generate_from_source(
         r#"
-struct Widget { Int id }
+struct Widget { id: Int }
 /**
  * Fetch a widget by id
  * with extra detail on the second line
@@ -879,7 +879,7 @@ fn screaming_snake_conversion() {
 fn multiple_endpoints() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  String email }
+struct User { id: Int  name: String  email: String }
 endpoint listUsers: GET "/api/users" {
     response List<User>
 }
@@ -907,7 +907,7 @@ endpoint deleteUser: DELETE "/api/users/{id}" {
 fn body_pick_only() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name  String email  Int age }
+struct User { id: Int  name: String  email: String  age: Int }
 endpoint updateEmail: PATCH "/api/users/{id}" {
     body User pick { email }
     response User
@@ -923,7 +923,7 @@ endpoint updateEmail: PATCH "/api/users/{id}" {
 fn body_partial() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name where self.length > 0  Int age where self >= 0 }
+struct User { id: Int  name: String where self.length > 0  age: Int where self >= 0 }
 endpoint updateUser: PATCH "/api/users/{id}" {
     body User omit { id } partial
     response User
@@ -941,7 +941,7 @@ endpoint updateUser: PATCH "/api/users/{id}" {
 fn body_partial_inner_optional_container() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  List<Option<String>> tags }
+struct Post { id: Int  tags: List<Option<String>> }
 endpoint updatePost: PATCH "/api/posts/{id}" {
     body Post omit { id } partial
     response Post
@@ -962,7 +962,7 @@ endpoint updatePost: PATCH "/api/posts/{id}" {
 fn multiple_path_params() {
     let files = generate_from_source(
         r#"
-struct Comment { Int id  String text }
+struct Comment { id: Int  text: String }
 endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
     response Comment
 }
@@ -977,7 +977,7 @@ endpoint getComment: GET "/api/users/{userId}/posts/{postId}" {
 fn float_constraints() {
     let files = generate_from_source(
         r#"
-struct Measurement { Float value where self >= 0.0 && self <= 100.5 }
+struct Measurement { value: Float where self >= 0.0 && self <= 100.5 }
 "#,
     );
     insta::assert_snapshot!("py_float_constraints", files.models);
@@ -988,12 +988,12 @@ struct Measurement { Float value where self >= 0.0 && self <= 100.5 }
 fn bool_string_defaults() {
     let files = generate_from_source(
         r#"
-struct Item { Int id  String name }
+struct Item { id: Int  name: String }
 endpoint listItems: GET "/api/items" {
     query {
-        String sortBy = "name"
-        Bool ascending = true
-        Int limit = 50
+        sortBy: String = "name"
+        ascending: Bool = true
+        limit: Int = 50
     }
     response List<Item>
 }
@@ -1008,7 +1008,7 @@ endpoint listItems: GET "/api/items" {
 fn map_type() {
     let files = generate_from_source(
         r#"
-struct Config { Map<String, String> settings  Int version }
+struct Config { settings: Map<String, String>  version: Int }
 "#,
     );
     insta::assert_snapshot!("py_map_type", files.models);
@@ -1033,7 +1033,7 @@ endpoint getStatus: GET "/api/status" {
 fn put_method() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint replaceUser: PUT "/api/users/{id}" {
     body User
     response User
@@ -1086,9 +1086,9 @@ fn dyn_type_records_import() {
 fn offset_pagination_envelope() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
-    query { Int page  Int limit }
+    query { page: Int  limit: Int }
     response List<Post>
     pagination { offset }
 }
@@ -1153,9 +1153,9 @@ endpoint listPosts: GET "/api/posts" {
 fn cursor_pagination_envelope() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
-    query { Option<String> cursor  Int limit }
+    query { cursor: Option<String>  limit: Int }
     response List<Post>
     pagination { cursor }
 }
@@ -1192,7 +1192,7 @@ endpoint listPosts: GET "/api/posts" {
 fn plain_list_response_unchanged_by_pagination() {
     let files = generate_from_source(
         r#"
-struct Post { Int id  String title }
+struct Post { id: Int  title: String }
 endpoint listPosts: GET "/api/posts" {
     response List<Post>
 }
@@ -1224,7 +1224,7 @@ endpoint listPosts: GET "/api/posts" {
 fn multi_status_shared_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1315,7 +1315,7 @@ endpoint upsertUser: PUT "/api/users/{id}" {
 fn multi_status_typed_and_typeless() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint updateUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1452,7 +1452,7 @@ endpoint enqueueJob: POST "/api/jobs" {
 fn multi_status_with_errors() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     response {
         200: User
@@ -1496,7 +1496,7 @@ endpoint upsertUser: PUT "/api/users/{id}" {
 fn multi_status_single_entry() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint registerUser: POST "/api/users" {
     response { 201: User }
 }
@@ -1526,14 +1526,14 @@ endpoint registerUser: POST "/api/users" {
 fn multi_status_with_inputs() {
     let files = generate_from_source(
         r#"
-struct Job { Int id  String state }
+struct Job { id: Int  state: String }
 endpoint restartJob: POST "/api/jobs/{id}/restart" {
     headers {
-        String authorization
-        Option<String> traceId
+        authorization: String
+        traceId: Option<String>
     }
     query {
-        Int priority = 5
+        priority: Int = 5
     }
     response {
         200: Job
@@ -1571,7 +1571,7 @@ endpoint restartJob: POST "/api/jobs/{id}/restart" {
 fn multi_status_typeless_205() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint resetUser: PUT "/api/users/{id}/reset" {
     response {
         200: User
@@ -1607,7 +1607,7 @@ endpoint resetUser: PUT "/api/users/{id}/reset" {
 fn multi_status_with_request_body() {
     let files = generate_from_source(
         r#"
-struct User { Int id  String name }
+struct User { id: Int  name: String }
 endpoint upsertUser: PUT "/api/users/{id}" {
     body User omit { id }
     response {

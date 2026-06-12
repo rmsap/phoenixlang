@@ -3,7 +3,7 @@
 // method, verifying both run identically across all three backends.
 
 struct Container<T> {
-  T value
+  value: T
 
   function get(self) -> T { self.value }
 }

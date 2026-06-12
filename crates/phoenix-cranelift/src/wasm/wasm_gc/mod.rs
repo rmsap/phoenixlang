@@ -64,6 +64,7 @@ use crate::error::CompileError;
 
 mod enums;
 mod float_helpers;
+mod lists;
 mod module_builder;
 mod ryu_tables;
 mod string_helpers;
@@ -125,6 +126,12 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // can encode their indices) and before function signatures or the
     // memory declaration. See §Phase 2.4 decision K.4.
     builder.declare_phoenix_enums(ir_module)?;
+    // Lists come after structs / strings / enums (element types of
+    // those kinds encode their indices) and before any signature
+    // touching `ListRef` / `ListBuilderRef` is interned. Nested
+    // `List<List<T>>` instantiations are declared inner-first inside
+    // this pass. See §Phase 2.4 decision K.7.
+    builder.declare_phoenix_lists(ir_module)?;
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();

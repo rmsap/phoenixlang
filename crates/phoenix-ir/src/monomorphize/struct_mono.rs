@@ -9,7 +9,7 @@
 //! the mangled form.
 //!
 //! Runs as a fixed-point worklist so recursive generic types
-//! (`Node<T> { T val, Option<Node<T>> next }`) and nested
+//! (`Node<T> { val: T, next: Option<Node<T>> }`) and nested
 //! instantiations (`Container<List<Int>>`) both converge — each newly
 //! specialized layout / method body is re-scanned for further generic
 //! struct uses and enqueued.
@@ -271,7 +271,7 @@ fn rewrite_all_references(
     }
 
     // Also rewrite StructRef types inside specialized struct_layouts
-    // field-type slots, so a `Nested<T> { Pair<T> p }` specialization
+    // field-type slots, so a `Nested<T> { p: Pair<T> }` specialization
     // stores `StructRef("Pair__i64", [])` rather than the unresolved
     // `StructRef("Pair", [I64])`. Cranelift's current layout code
     // treats all StructRefs as 1-slot opaque pointers regardless of

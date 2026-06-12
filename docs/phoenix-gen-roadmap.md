@@ -86,8 +86,8 @@ The current schema language handles structs, enums (simple and ADT), endpoints w
 
 ### Must-add for v1.0
 
-- **Headers.** Both request (`headers { String authorization }`) and response. Auth tokens, idempotency keys, content negotiation, custom request IDs all live here.
-- **File uploads / multipart.** `body multipart { File avatar, String caption }`. Generated code wires up the framework's multipart handling (multer, fastapi UploadFile, Go `multipart.Reader`).
+- **Headers.** Both request (`headers { authorization: String }`) and response. Auth tokens, idempotency keys, content negotiation, custom request IDs all live here.
+- **File uploads / multipart.** `body multipart { avatar: File, caption: String }`. Generated code wires up the framework's multipart handling (multer, fastapi UploadFile, Go `multipart.Reader`).
 - **Pagination patterns.** First-class support for cursor and offset pagination, since this is the single most common API shape and every team reinvents it. Probably a `paginated` modifier on response types.
 - **Multiple content types per response.** `response { 200: User, 200 text: String }` — content negotiation by Accept header. *Update 2026-06: the multi-status half shipped (`response { 200: User, 201: User, 204 }`, JSON-only); the content-negotiation half is deferred indefinitely — see `design-decisions.md` (multi-status responses design).*
 - **API versioning prefix.** `api version "v1" { ... endpoints ... }` so `/v1` doesn't have to be repeated on every path.

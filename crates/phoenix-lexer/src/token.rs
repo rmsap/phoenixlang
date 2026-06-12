@@ -117,12 +117,12 @@ pub enum TokenKind {
     Partial,
     /// The `query` keyword, introducing a query-parameter block inside an endpoint.
     ///
-    /// Appears as `query { Type name [= default], ... }`.
+    /// Appears as `query { name: Type [= default], ... }`.
     Query,
     /// The `headers` keyword, introducing a header block inside an endpoint.
     ///
     /// Request headers appear as a top-level endpoint section
-    /// `headers { Type name [as "Wire-Name"] [= default], ... }`; response
+    /// `headers { name: Type [as "Wire-Name"] [= default], ... }`; response
     /// headers appear immediately after a response type as
     /// `response TypeExpr headers { ... }`.
     Headers,

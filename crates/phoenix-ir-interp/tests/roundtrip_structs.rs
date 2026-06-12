@@ -10,8 +10,8 @@ fn struct_basic() {
     roundtrip(
         r#"
 struct Point {
-    Int x
-    Int y
+    x: Int
+    y: Int
 }
 function main() {
     let p: Point = Point(3, 4)
@@ -28,8 +28,8 @@ fn struct_method() {
     roundtrip(
         r#"
 struct Rect {
-    Int width
-    Int height
+    width: Int
+    height: Int
 
     function area(self) -> Int {
         return self.width * self.height
@@ -48,7 +48,7 @@ fn struct_field_mutation() {
     roundtrip(
         r#"
 struct Counter {
-    Int value
+    value: Int
 }
 function main() {
     let mut c: Counter = Counter(0)
@@ -117,7 +117,7 @@ trait Describable {
     function describe(self) -> String
 }
 struct Dog {
-    String name
+    name: String
 
     impl Describable {
         function describe(self) -> String {

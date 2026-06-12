@@ -3,29 +3,29 @@
 // ── Domain types ──────────────────────────────────────────────
 
 struct Author {
-    Int id
-    String name where self.length > 0 && self.length <= 100
-    String email where self.contains("@") && self.length > 3
-    Option<String> avatarUrl where self.length > 0
+    id: Int
+    name: String where self.length > 0 && self.length <= 100
+    email: String where self.contains("@") && self.length > 3
+    avatarUrl: Option<String> where self.length > 0
 }
 
 enum PostStatus { Draft  Published  Archived }
 
 struct Post {
-    Int id
-    String title where self.length > 0 && self.length <= 200
-    String body where self.length > 0
-    Author author
-    PostStatus status
-    List<String> tags
+    id: Int
+    title: String where self.length > 0 && self.length <= 200
+    body: String where self.length > 0
+    author: Author
+    status: PostStatus
+    tags: List<String>
 }
 
 struct Comment {
-    Int id
-    Int postId
-    String text where self.length > 0 && self.length <= 2000
-    String authorName where self.length > 0
-    Option<Int> parentId
+    id: Int
+    postId: Int
+    text: String where self.length > 0 && self.length <= 2000
+    authorName: String where self.length > 0
+    parentId: Option<Int>
 }
 
 // ── Endpoints ─────────────────────────────────────────────────
@@ -33,13 +33,13 @@ struct Comment {
 /** List published posts with pagination and optional tag filter */
 endpoint listPosts: GET "/api/posts" {
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> tag
-        Option<String> search
-        Bool featured = false
-        Float minScore = 0.0
-        Option<Float> maxScore
+        page: Int = 1
+        limit: Int = 20
+        tag: Option<String>
+        search: Option<String>
+        featured: Bool = false
+        minScore: Float = 0.0
+        maxScore: Option<Float>
     }
     response List<Post>
 }
@@ -57,8 +57,8 @@ endpoint getPost: GET "/api/posts/{id}" {
  */
 endpoint searchPosts: GET "/api/search" {
     query {
-        Int maxResults
-        String sortField
+        maxResults: Int
+        sortField: String
     }
     response List<Post>
 }
@@ -108,8 +108,8 @@ endpoint deletePost: DELETE "/api/posts/{id}" {
 /** List comments for a post */
 endpoint listComments: GET "/api/posts/{postId}/comments" {
     query {
-        Int page = 1
-        Int limit = 50
+        page: Int = 1
+        limit: Int = 50
     }
     response List<Comment>
     error { NotFound(404) }
@@ -155,14 +155,14 @@ endpoint updateAuthorProfile: PATCH "/api/authors/{id}" {
  */
 endpoint getPostMetered: GET "/api/posts/{id}/metered" {
     headers {
-        String authorization
-        String requestId as "X-Request-Id"
-        Option<String> ifNoneMatch
-        Int maxStale = 60
+        authorization: String
+        requestId: String as "X-Request-Id"
+        ifNoneMatch: Option<String>
+        maxStale: Int = 60
     }
     response Post headers {
-        Int ratelimitRemaining as "X-RateLimit-Remaining"
-        Option<String> etag
+        ratelimitRemaining: Int as "X-RateLimit-Remaining"
+        etag: Option<String>
     }
     error { NotFound(404) }
 }
@@ -176,16 +176,16 @@ endpoint getPostMetered: GET "/api/posts/{id}/metered" {
  * `"true"`/`"false"`) and server `strconv.ParseInt`/`ParseBool` (Go),
  * `Form(...)` (Python), `Number(...)`/`=== "true"` (TS). */
 struct AvatarUpload {
-    File avatar
-    String caption where self.length > 0
-    Int rotation
-    Bool crop
-    Option<File> thumbnail
+    avatar: File
+    caption: String where self.length > 0
+    rotation: Int
+    crop: Bool
+    thumbnail: Option<File>
 }
 
 /** A pure binary download body (exactly one File field). */
 struct FileDownload {
-    File data
+    data: File
 }
 
 /** Upload an avatar via multipart/form-data (file + caption + optional thumbnail). */
@@ -214,8 +214,8 @@ endpoint downloadAvatar: GET "/api/authors/{id}/avatar" {
  */
 endpoint listPostsOffset: GET "/api/posts/paged" {
     query {
-        Int page = 1
-        Int limit = 20
+        page: Int = 1
+        limit: Int = 20
     }
     response List<Post>
     pagination { offset }
@@ -229,8 +229,8 @@ endpoint listPostsOffset: GET "/api/posts/paged" {
  */
 endpoint listPostsCursor: GET "/api/posts/feed" {
     query {
-        Option<String> cursor
-        Int limit = 20
+        cursor: Option<String>
+        limit: Int = 20
     }
     response List<Post>
     pagination { cursor }
@@ -287,7 +287,7 @@ api version "v2" {
     /** List posts filtered by tag, under the v2 prefix. */
     endpoint listTaggedPosts: GET "/api/posts/tagged/{tag}" {
         query {
-            Int limit = 20
+            limit: Int = 20
         }
         response List<Post>
         error { NotFound(404) }
