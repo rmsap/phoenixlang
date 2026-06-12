@@ -67,7 +67,7 @@ jobs:
       - run: cargo build -p phoenix-runtime --target wasm32-wasip1 --release
       # Force the wasm tiers to fail loudly rather than silently skip,
       # on both the driver matrix (which reaches wasm via
-      # `three_backend_matrix`) and the cranelift wasm tests:
+      # `backend_matrix`) and the cranelift wasm tests:
       # REQUIRE_RUNTIME_WASM if the wasm runtime artifact is missing,
       # REQUIRE_WASMTIME if the `wasmtime` binary isn't on PATH. Both
       # are provisioned above, so a skip here means a real regression.

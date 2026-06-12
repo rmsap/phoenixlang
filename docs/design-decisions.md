@@ -899,7 +899,7 @@ Cranelift's `cranelift-wasm` crate exists, but it goes the *other direction*: it
 #### B. Exit-criteria runtime: wasmtime CLI
 
 **Decided:** 2026-05-15
-**Rationale:** wasmtime is the simplest CI integration (subprocess, same shape as `phoenix build && ./out`) and supports WASM GC as of 18.0 (Jan 2024). The four-and-then-five-backend matrix becomes one more column on `phoenix-driver/tests/three_backend_matrix.rs`. Browser execution is real positioning value but slots into Phase 2.5 (JS interop), not 2.4 — getting WASM modules to run on *something* is the 2.4 gate.
+**Rationale:** wasmtime is the simplest CI integration (subprocess, same shape as `phoenix build && ./out`) and supports WASM GC as of 18.0 (Jan 2024). The four-and-then-five-backend matrix becomes one more column on `phoenix-driver/tests/backend_matrix.rs`. Browser execution is real positioning value but slots into Phase 2.5 (JS interop), not 2.4 — getting WASM modules to run on *something* is the 2.4 gate.
 
 - Linux CI gate: `phoenix build --target wasm32-{linear,gc} <file>` then `wasmtime <out.wasm>` and assert stdout byte-equality with native.
 - Skip-with-warning pattern mirrors the §2.3 valgrind gate: `PHOENIX_REQUIRE_WASMTIME=1` turns the skip into a hard failure so a misconfigured CI runner can't silently bypass the gate.

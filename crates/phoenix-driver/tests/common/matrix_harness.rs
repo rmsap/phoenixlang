@@ -1,6 +1,6 @@
 //! Shared harness for the backend-agreement roundtrip matrices.
 //!
-//! Both `three_backend_matrix.rs` (single-file fixtures) and
+//! Both `backend_matrix.rs` (single-file fixtures) and
 //! `multi_module_matrix.rs` (multi-file projects) assert that every
 //! fixture produces byte-identical stdout under `phoenix run`,
 //! `phoenix run-ir`, `phoenix build` (native), `phoenix build

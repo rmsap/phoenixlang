@@ -1,7 +1,7 @@
 //! CLI integration tests for `phoenix build`'s `--target` flag.
 //!
 //! Default-target behavior (no `--target`) is exercised by
-//! `three_backend_matrix.rs` for every fixture, so these tests focus
+//! `backend_matrix.rs` for every fixture, so these tests focus
 //! on the new flag: explicit `native` parity, the `wasm32-linear`
 //! success path (PR 2 of Phase 2.4) under both explicit `-o` and the
 //! implicit `.wasm` suffix branch, the still-not-implemented
@@ -29,7 +29,7 @@ fn phoenix_bin() -> Command {
 
 /// RAII guard: removes its path on drop so a compiled binary doesn't
 /// leak when a downstream assertion panics. Mirrors `TempBin` in
-/// `three_backend_matrix.rs`.
+/// `backend_matrix.rs`.
 struct TempBin(PathBuf);
 
 impl Drop for TempBin {

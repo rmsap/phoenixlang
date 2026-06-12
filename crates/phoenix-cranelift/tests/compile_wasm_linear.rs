@@ -16,7 +16,7 @@
 //!    gate (`PHOENIX_REQUIRE_VALGRIND`).
 //!
 //! Multi-fixture matrix coverage lands in PR 4
-//! (`phoenix-driver/tests/three_backend_matrix.rs` adds a
+//! (`phoenix-driver/tests/backend_matrix.rs` adds a
 //! `wasm32-linear` column). This file pins the hello-world and a
 //! handful of corner-case fixtures that gate PR 2 — a regression
 //! here means the WASM emitter is broken at the structural or

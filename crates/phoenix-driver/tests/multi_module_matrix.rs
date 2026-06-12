@@ -6,7 +6,7 @@
 //! and `phoenix build --target wasm32-gc` + execute under
 //! `wasmtime -W gc=y` all produce byte-identical stdout, plus a check
 //! against the project's `expected.txt`. The harness is shared with
-//! the single-file `three_backend_matrix.rs` via
+//! the single-file `backend_matrix.rs` via
 //! [`common::backend_matrix`]; this file only supplies the multi-file
 //! [`MatrixCfg`] conventions (including the `expected.txt` pin) and
 //! the project list.
@@ -25,7 +25,7 @@
 
 mod common;
 
-use common::backend_matrix::MatrixCfg;
+use common::matrix_harness::MatrixCfg;
 
 fn source_rel(project: &str) -> String {
     format!("tests/fixtures/multi/{project}/main.phx")
@@ -55,7 +55,7 @@ macro_rules! multi_matrix_test {
     ($name:ident, $project:literal) => {
         #[test]
         fn $name() {
-            common::backend_matrix::assert_backend_agreement(&CFG, $project, None);
+            common::matrix_harness::assert_backend_agreement(&CFG, $project, None);
         }
     };
     // Skip only the wasm32-gc column — for features wasm32-linear
@@ -66,7 +66,7 @@ macro_rules! multi_matrix_test {
     ($name:ident, $project:literal, skip_wasm_gc: $reason:literal) => {
         #[test]
         fn $name() {
-            common::backend_matrix::assert_backend_agreement(&CFG, $project, Some($reason));
+            common::matrix_harness::assert_backend_agreement(&CFG, $project, Some($reason));
         }
     };
 }

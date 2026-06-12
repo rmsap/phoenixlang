@@ -43,7 +43,7 @@
 
 mod common;
 
-use common::backend_matrix::MatrixCfg;
+use common::matrix_harness::MatrixCfg;
 
 fn source_rel(fixture: &str) -> String {
     format!("tests/fixtures/{fixture}")
@@ -69,7 +69,7 @@ macro_rules! backend_matrix_test {
     ($name:ident, $fixture:literal) => {
         #[test]
         fn $name() {
-            common::backend_matrix::assert_backend_agreement(&CFG, $fixture, None);
+            common::matrix_harness::assert_backend_agreement(&CFG, $fixture, None);
         }
     };
     // Skip only the wasm32-gc column — for features wasm32-linear
@@ -80,7 +80,7 @@ macro_rules! backend_matrix_test {
     ($name:ident, $fixture:literal, skip_wasm_gc: $reason:literal) => {
         #[test]
         fn $name() {
-            common::backend_matrix::assert_backend_agreement(&CFG, $fixture, Some($reason));
+            common::matrix_harness::assert_backend_agreement(&CFG, $fixture, Some($reason));
         }
     };
 }
@@ -201,7 +201,7 @@ backend_matrix_test!(matrix_closures_over_generic_cross_width, "closures_over_ge
 /// zero matrix coverage.
 #[test]
 fn every_fixture_has_a_matrix_entry() {
-    let src = include_str!("three_backend_matrix.rs");
+    let src = include_str!("backend_matrix.rs");
     let dir = common::compiled_fixtures::workspace_root().join("tests/fixtures");
     let mut missing = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap() {

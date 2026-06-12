@@ -5,8 +5,8 @@
 
 #![allow(dead_code)]
 
-pub mod backend_matrix;
 pub mod compiled_fixtures;
+pub mod matrix_harness;
 
 use phoenix_common::span::SourceId;
 use phoenix_interp::interpreter;

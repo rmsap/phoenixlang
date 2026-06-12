@@ -1,5 +1,5 @@
 //! Verifies that compiled Phoenix programs reclaim heap memory under
-//! load — the regression the three-backend matrix can't catch.
+//! load — the regression the backend matrix can't catch.
 //!
 //! The matrix only compares stdout. If the GC silently stopped
 //! collecting (e.g. `phx_gc_enable` got dropped from the C `main`
