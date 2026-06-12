@@ -1936,6 +1936,169 @@ fn string_interpolation_runs_under_wasmtime_gc() {
     assert_prints(source, "interpolation_wasm_gc", b"n=3 f=2.5 b=true\n");
 }
 
+/// String-typed struct fields (§Phase 2.4 K.1): `$string` is declared
+/// ahead of the structs, so a `name: String` field encodes
+/// `(ref null $string)` directly.
+/// Exercises the full field lifecycle — construct with a literal,
+/// read + print, reassign via `struct.set` (with a concat-built
+/// value so the new ref is a fresh allocation), pass the struct
+/// through a user function, and mix with primitive fields.
+#[test]
+fn struct_string_field_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "struct User {\n",
+        "  name: String\n",
+        "  age: Int\n",
+        "}\n",
+        "function describe(u: User) -> String {\n",
+        "  u.name + \":\" + toString(u.age)\n",
+        "}\n",
+        "function main() {\n",
+        "  let mut u: User = User(\"ada\", 36)\n",
+        "  print(u.name)\n",
+        "  print(u.age)\n",
+        "  u.name = u.name + \"!\"\n",
+        "  print(u.name)\n",
+        "  print(describe(u))\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "struct_string_field_wasm_gc",
+        b"ada\n36\nada!\nada!:36\n",
+    );
+}
+
+/// Pins the `scan_helper_needs` struct-layout backstop: a struct
+/// whose `String` field is the *only*
+/// string in the program. No literal, concat, or `print(String)`
+/// appears anywhere the function-body walk would find — `age`'s param
+/// is `StructRef("User", [])`, whose `type_contains_string` only
+/// inspects generic args — so `HelperNeeds::string_types` is set
+/// solely by the layout scan. Without that scan,
+/// `declare_phoenix_structs` would hit `wasm_field_type_for`'s
+/// internal-compiler-bug error for the missing `$string` index.
+/// Compile-only: the structural assertion doesn't need wasmtime.
+#[test]
+fn string_field_struct_without_string_ops_compiles() {
+    let source = concat!(
+        "struct User {\n",
+        "  name: String\n",
+        "  age: Int\n",
+        "}\n",
+        "function age(u: User) -> Int {\n",
+        "  u.age\n",
+        "}\n",
+        "function main() {\n",
+        "  print(7)\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "string_field_no_string_ops");
+    // `User` + `$string` — both nominal struct declarations must be
+    // present (`$bytes` is an array type and doesn't count).
+    assert_eq!(
+        count_struct_type_decls(&bytes),
+        2,
+        "expected the `User` struct and `$string` to both be declared"
+    );
+}
+
+/// The enum twin of the backstop test above: declaring an enum
+/// instantiation declares *every* variant struct (§Phase 2.4 K.4), so
+/// `S(String)`'s field needs the `$string` index even though `S` is
+/// never constructed and the program touches no string otherwise.
+/// `e`'s type is `EnumRef("E", [])`, whose `type_contains_string`
+/// only inspects generic args, and no match arm binds the payload —
+/// so `HelperNeeds::string_types` is set solely by
+/// `scan_helper_needs`'s enum-instantiation scan. Without that scan,
+/// `wasm_enum_field_type_for` would hit its internal-compiler-bug
+/// error for the missing `$string` index. Compile-only, like the
+/// struct twin.
+#[test]
+fn string_variant_enum_without_string_ops_compiles() {
+    let source = concat!(
+        "enum E {\n",
+        "  N\n",
+        "  S(String)\n",
+        "}\n",
+        "function tag(e: E) -> Int {\n",
+        "  7\n",
+        "}\n",
+        "function main() {\n",
+        "  let e: E = N\n",
+        "  print(tag(e))\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "string_variant_no_string_ops");
+    // One parent + two variant subtypes — `S` must be declared (with
+    // its `$string`-typed field) even though it is never constructed.
+    let (parents, variants) = count_enum_type_decls(&bytes);
+    assert_eq!(parents, 1, "expected 1 enum parent type, got {parents}");
+    assert_eq!(variants, 2, "expected 2 variant subtypes, got {variants}");
+}
+
+/// Generic struct *templates* survive in `struct_layouts` alongside
+/// their monomorphized instances (`Container` with a `TypeVar("T")`
+/// field next to `Container__i64`). `declare_phoenix_structs` must
+/// skip the template rather than trip the field-type restriction on
+/// `TypeVar` — concrete code only ever references the instances.
+/// The decl count pins both directions: a regression that declares
+/// the template fails compilation (loud), one that drops an instance
+/// shifts the count.
+#[test]
+fn generic_struct_template_is_skipped_not_declared() {
+    let source = concat!(
+        "struct Container<T> {\n",
+        "  value: T\n",
+        "}\n",
+        "function main() {\n",
+        "  let a: Container<Int> = Container(42)\n",
+        "  let b: Container<String> = Container(\"hi\")\n",
+        "  print(a.value)\n",
+        "  print(b.value)\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    let decls = count_struct_type_decls(&bytes);
+    assert_eq!(
+        decls, 3,
+        "expected `Container__i64` + `Container__string` + `$string` \
+         (template skipped), got {decls}"
+    );
+    assert_wasm_prints(&bytes, "generic_struct_template_wasm_gc", b"42\nhi\n");
+}
+
+/// A template whose type param appears in *no* field (`struct
+/// Phantom<T> { name: String }`) leaves no generic placeholder for a
+/// field scan to find — it is identified as a template solely by its
+/// `IrModule::struct_type_params` entry. Uninstantiated, it must
+/// neither be declared (a dead WASM type) nor have its String field
+/// force `$bytes`/`$string` into the module via `scan_helper_needs`'s
+/// layout scan. The zero decl count pins both: a regression to
+/// field-based template detection declares `Phantom` *and* drags
+/// `$string` in, shifting the count to 2.
+#[test]
+fn phantom_param_template_is_skipped_and_forces_no_string_types() {
+    let source = concat!(
+        "struct Phantom<T> {\n",
+        "  name: String\n",
+        "}\n",
+        "function main() {\n",
+        "  print(7)\n",
+        "}\n",
+    );
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "phantom_param_template");
+    assert_eq!(
+        count_struct_type_decls(&bytes),
+        0,
+        "expected no struct type decls: the phantom-param template is \
+         skipped and its String field must not force `$string` in"
+    );
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
 /// inline-synthesis decision: a module that never prints a Float —
 /// and never `toString`s one, the second trigger for the formatter
@@ -2627,12 +2790,12 @@ fn print_str_oversized_traps_under_wasmtime_gc() {
     assert_traps(&source, "print_str_oversized_wasm_gc");
 }
 
-/// A struct field whose type isn't yet on the slice-3 surface (here a
-/// nested `StructRef`) must surface a clear per-slice diagnostic — not
+/// A struct field whose type isn't yet supported (here a nested
+/// `StructRef`) must surface a clear per-field diagnostic — not
 /// silently emit a partial declaration that later trips up
 /// `wasmparser` with an "unexpected field type" deep inside the binary
-/// format. The error keeps the slice from masking work that belongs to
-/// follow-up slices.
+/// format. The error keeps the backend from masking work that belongs
+/// to follow-up slices.
 #[test]
 fn struct_with_nested_struct_field_is_rejected_until_a_later_slice() {
     let source = concat!(
@@ -2649,10 +2812,35 @@ fn struct_with_nested_struct_field_is_rejected_until_a_later_slice() {
     );
     let ir_module = lower_to_ir(source);
     let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("nested struct fields are outside slice 3's MVP scope");
+        .expect_err("nested struct fields are not yet supported on wasm32-gc");
     let msg = err.to_string();
     assert!(
         msg.contains("Outer") && msg.contains("inner"),
+        "expected a per-field diagnostic naming the unsupported field, got: {msg}"
+    );
+}
+
+/// A `List<String>` field is the shape where `scan_helper_needs`'s
+/// struct-layout backstop fires (`type_contains_string` recurses into
+/// the element type) but the field itself is still unsupported: the
+/// compile must fail on `wasm_field_type_for`'s per-field diagnostic,
+/// not slip past it because `$string` happens to be declared.
+#[test]
+fn struct_with_list_string_field_is_rejected_until_a_later_slice() {
+    let source = concat!(
+        "struct Doc {\n",
+        "  tags: List<String>\n",
+        "}\n",
+        "function main() {\n",
+        "  print(7)\n",
+        "}\n",
+    );
+    let ir_module = lower_to_ir(source);
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("a List-typed struct field is not yet supported on wasm32-gc");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Doc") && msg.contains("tags"),
         "expected a per-field diagnostic naming the unsupported field, got: {msg}"
     );
 }

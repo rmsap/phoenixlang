@@ -74,14 +74,14 @@ macro_rules! multi_matrix_test {
 multi_matrix_test!(matrix_basic_import, "basic_import");
 multi_matrix_test!(matrix_import_alias, "import_alias");
 multi_matrix_test!(matrix_import_wildcard, "import_wildcard");
-multi_matrix_test!(matrix_nested_modules, "nested_modules", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
+multi_matrix_test!(matrix_nested_modules, "nested_modules");
 // The §2.6 tripwire: a public function whose default arg references a
 // private symbol in its own module. Without wrapper synthesis the
 // caller would inline the private symbol directly into the entry's
 // IR; with wrapper synthesis (Task #7) the call site emits a zero-arg
 // `Op::Call(__default_*)` instead.
 multi_matrix_test!(matrix_default_wrapper, "default_wrapper");
-multi_matrix_test!(matrix_visibility_struct_pub, "visibility_struct_pub", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
+multi_matrix_test!(matrix_visibility_struct_pub, "visibility_struct_pub");
 multi_matrix_test!(matrix_visibility_enum_pub, "visibility_enum_pub");
 // A method invocation on an imported struct: catches regressions
 // where the value's runtime type tag drifts from the methods table's
@@ -93,7 +93,7 @@ multi_matrix_test!(matrix_struct_methods, "struct_methods");
 // the method's own module: validates that the callee's module is
 // pushed before evaluating defaults, so the private helper resolves
 // through the callee's scope rather than the caller's.
-multi_matrix_test!(matrix_method_default_helper, "method_default_helper", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
+multi_matrix_test!(matrix_method_default_helper, "method_default_helper");
 // A cross-module enum whose variants carry payload fields, both
 // constructed and pattern-matched in the entry. Catches
 // regressions where the enum's qualified key (`lib::Outcome`)

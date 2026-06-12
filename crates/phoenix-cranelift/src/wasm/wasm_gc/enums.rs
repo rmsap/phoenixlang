@@ -255,7 +255,10 @@ fn wasm_enum_field_type_for(
 /// Walk every IR type in the module, recursively collecting every
 /// distinct `EnumRef(name, args)` tuple. Each tuple becomes one
 /// concrete enum declaration in the WASM type section per the K.4
-/// codegen-time monomorphization step.
+/// codegen-time monomorphization step. `scan_helper_needs` reuses the
+/// same walk so its string-types backstop fires for exactly the
+/// instantiations this pass will declare — keep the two callers in
+/// sync if the walk's sources change.
 ///
 /// Sources walked: function param/return types, block params,
 /// instruction `result_type`s, struct field types, and (recursively)
@@ -264,7 +267,10 @@ fn wasm_enum_field_type_for(
 /// directly because the alloc's result_type already carries the
 /// concrete `EnumRef(name, args)` — visiting it as part of the
 /// instruction's result_type covers both sides.
-fn collect_enum_instantiations(ir_module: &IrModule, result: &mut HashSet<EnumInstantiationKey>) {
+pub(super) fn collect_enum_instantiations(
+    ir_module: &IrModule,
+    result: &mut HashSet<EnumInstantiationKey>,
+) {
     for func in ir_module.concrete_functions() {
         walk_type(&func.return_type, result);
         for ty in &func.param_types {

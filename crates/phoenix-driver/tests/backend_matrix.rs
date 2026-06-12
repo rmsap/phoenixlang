@@ -89,8 +89,8 @@ backend_matrix_test!(matrix_hello, "hello.phx");
 backend_matrix_test!(matrix_fibonacci, "fibonacci.phx");
 backend_matrix_test!(matrix_fizzbuzz, "fizzbuzz.phx");
 backend_matrix_test!(matrix_features, "features.phx");
-backend_matrix_test!(matrix_generics, "generics.phx", skip_wasm_gc: "generic struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
-backend_matrix_test!(matrix_traits_static, "traits_static.phx", skip_wasm_gc: "string-typed struct fields hit the K.1 slice-3 field-type restriction on wasm32-gc");
+backend_matrix_test!(matrix_generics, "generics.phx");
+backend_matrix_test!(matrix_traits_static, "traits_static.phx");
 backend_matrix_test!(matrix_traits_dyn, "traits_dyn.phx", skip_wasm_gc: "`dyn Trait` is not lowered on wasm32-gc yet");
 // Multi-method trait: reaches vtable slots beyond 0 and passes Int /
 // String arguments through `dyn` dispatch — paths `traits_dyn.phx`

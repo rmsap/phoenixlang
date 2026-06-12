@@ -107,21 +107,20 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // literals there regardless of whether the program prints.
     let needs_print = translate::module_calls_print(ir_module);
     let helper_needs = scan_helper_needs(ir_module);
-    // Declare every Phoenix struct's nominal WASM-GC type first, so
-    // any subsequent function signature whose params/returns include
-    // `IrType::StructRef(name, _)` can encode the right
-    // `HeapType::Concrete(struct_idx)` at intern time. See §Phase 2.4
-    // decision K.1.
-    //
-    // String types (`$bytes` + `$string`) come right after — same
-    // ordering constraint, with the user-program structs preceding so
-    // their declarations don't need to forward-reference `$string` (no
-    // struct in slice 1 has a String field; the cross-cutting case is
-    // a follow-up slice). See §Phase 2.4 decision K.2.
-    builder.declare_phoenix_structs(ir_module)?;
+    // String types (`$bytes` + `$string`) are declared first: they
+    // reference no other type, while struct fields may reference
+    // `$string` — a `name: String` field encodes
+    // `HeapType::Concrete($string_idx)` inline, so the index must
+    // exist before the struct is declared. See §Phase 2.4 K.1 / K.2.
     if helper_needs.string_types {
         builder.declare_string_types();
     }
+    // Then every Phoenix struct's nominal WASM-GC type, so any
+    // subsequent function signature whose params/returns include
+    // `IrType::StructRef(name, _)` can encode the right
+    // `HeapType::Concrete(struct_idx)` at intern time. See §Phase 2.4
+    // decision K.1.
+    builder.declare_phoenix_structs(ir_module)?;
     // Declare every Phoenix enum's parent + per-variant subtypes after
     // structs and string types (so enum variant fields of those types
     // can encode their indices) and before function signatures or the

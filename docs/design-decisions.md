@@ -1120,7 +1120,10 @@ Each target's `module_builder.rs` owns its own section-state struct because the 
 **Chosen.** Each Phoenix struct (post-monomorphization name — e.g. `Point`, `Container__i64`) gets one nominal WASM struct type, declared once in the type section before any function signature references it. Fields are declared in Phoenix source declaration order (matching `IrModule::struct_layouts`'s ordered `Vec<(String, IrType)>`), all marked mutable (Phoenix supports `p.x = 5` and has no syntax to declare a field immutable). Phoenix `IrType::StructRef(name, _)` lowers to `(ref null $name_struct_idx)`:
 
 - **Nullable** so `Op::Alloca(StructRef(...))`'s WASM-local default state (which WASM zero-initializes) is well-typed without an explicit init instruction. `Op::Store` then writes the post-`struct.new` non-nullable reference into the same slot (subtype: `(ref $T) <: (ref null $T)`).
-- **Field types**: Phoenix `Int` → WASM `i64`, `F64` → `f64`, `Bool` → `i32`. Nested `StructRef` lowers to `(ref null $other_struct_idx)` once cross-struct layouts ship — slice 3 itself errors on nested struct fields, since none of the slice's fixtures use them and a stub that pretends to handle them would mask a real layout gap. The error pushes the work to the slice where a fixture actually needs it.
+- **Field types**: Phoenix `Int` → WASM `i64`, `F64` → `f64`, `Bool` → `i32`.
+  - **String fields lifted 2026-06-12**: `StringRef` → `(ref null $string)`, enabled by flipping the type-section order so `$bytes`/`$string` (which reference no other type) are declared *before* the structs — the field encodes a concrete index that now exists. `scan_helper_needs` backstops the helper scan from both layout tables: a String field in a non-template struct layout, or in any variant of an enum instantiation that will be declared, forces the string types in even when no function body touches a string. This unblocked `traits_static.phx` and three multi-module matrix fixtures.
+  - **Generic templates skipped, same date**: `struct_layouts` retains the generic *template* (`Container` with a `TypeVar("T")` field) alongside its monomorphized instances; `declare_phoenix_structs` skips any template rather than declaring it — concrete code only references the instances, mirroring how the native backend resolves layouts by concrete name on demand and how K.4's enum declaration treats templates. Templates are identified by their `IrModule::struct_type_params` entry (registered for every generic declaration, never cleared), not by scanning fields for placeholders: a phantom param (`struct Tag<T> { id: Int }`) leaves no placeholder in any field but is still a template. This unblocked `generics.phx` (whose instances' fields are `i64` / `StringRef`, both supported).
+  - **Still deferred**: nested `StructRef` lowers to `(ref null $other_struct_idx)` once cross-struct layouts ship — struct↔struct (and struct↔enum) references need a dependency sort or WASM rec groups, so they error with a per-field diagnostic until that slice; same for list / map / closure / dyn fields. The error pushes the work to the slice where a fixture actually needs it.
 
 `struct.get`/`struct.set` resolve the WASM struct-type index by reading the *receiver value's* binding `ValType` (which carries `HeapType::Concrete(idx)`), so the get/set ops don't have to thread the struct name themselves — the type that the receiver was bound with is authoritative. Equivalent to threading the name, but avoids a parallel `ValueId → struct_name` map.
 
@@ -1203,7 +1206,7 @@ The per-op cost is a small bounded constant in the present, and the substring / 
 **Deferred to follow-up slices:** substring (carries the substring decision K.3, locked when the slice lands), `String.trim()` / case mapping (each its own helper), interpolation (already lowers to `Op::StringConcat`-chains today, but multi-arg concat may want its own optimized helper rather than N-1 chained `phx_str_concat` calls — open question for the slice), `print(Bool)` / `print(Float)` (separate primitive-to-string conversion helpers), `Op::StringLt` / `Op::StringLe` / `Op::StringGt` / `Op::StringGe` (lexicographic comparison helpers).
 
 **Implementation pointers (slice 1):**
-- `$string` and `$bytes` declarations: `crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs::declare_string_types` (new) — called in `compile_wasm_gc` after `declare_phoenix_structs` and before `declare_imports` so the type-section indices are stable for any function signature that mentions `StringRef`.
+- `$string` and `$bytes` declarations: `crates/phoenix-cranelift/src/wasm/wasm_gc/module_builder.rs::declare_string_types` (new) — called in `compile_wasm_gc` before `declare_phoenix_structs` (since the 2026-06-12 string-field lift, so struct fields can encode the `$string` index) and before `declare_imports`, so the type-section indices are stable for any declaration that mentions `StringRef`.
 - `IrType::StringRef` → `ValType::Ref` mapping: `crates/phoenix-cranelift/src/wasm/wasm_gc/translate.rs::wasm_valtypes_for`, alongside the K.1 `StructRef` arm.
 - Synthesized helpers (`phx_print_str`, `phx_str_concat`, `phx_str_eq`): `crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs` (each helper's instruction emission), dispatched by `module_builder::ModuleBuilder::declare_string_helpers`, which decides which to emit and records their indices. Mirrors the `synthesize_print_i64_helper` pattern in `module_builder.rs`.
 - Fixture: `tests/fixtures/wasm_gc_string.phx` — focused fixture exercising literal printing, concat (interpolation), equality (both directions), and length.
@@ -1342,8 +1345,8 @@ A *user-defined* generic enum like `enum Pair<T, U> { Both(T, U), Single(T) }` w
 
 **Type-section ordering.** All enum *parent* types must be declared before any variant struct (so variants can subtype them) and before any function signature touching `IrType::EnumRef` (so signatures can encode the parent index). Variant structs are declared right after the parents, in (enum name × variant index) sorted order for determinism. The pipeline:
 
-1. `declare_phoenix_structs` (K.1)
-2. `declare_string_types` (K.2)
+1. `declare_string_types` (K.2) — first since the 2026-06-12 string-field lift, so struct fields can reference `$string`
+2. `declare_phoenix_structs` (K.1)
 3. `declare_phoenix_enums` (K.4) — parents first, then variants
 4. `declare_imports` / `declare_print_helper` / `declare_string_helpers`
 5. `declare_phoenix_functions`
@@ -1540,7 +1543,7 @@ $builder_T = (struct (field $len (mut i64))
 - **Wrapper + explicit capacity field** (the original PR 5 sketch `(struct len, cap, data)`). Capacity is the data array's own length — a stored copy is dead weight on every immutable list. Rejected.
 - **Copying `freeze()`** (exact-size array, native cost model). No behavioral difference from zero-copy, strictly worse constant factor; the slack-retention trade was judged acceptable. Rejected with user 2026-06-10.
 
-Code locations: `crates/phoenix-cranelift/src/wasm/wasm_gc/lists.rs` (the whole K.7 surface: instantiation collection + type declaration mirroring `enums.rs`, plus the `Op::ListAlloc` / `List.*` / `ListBuilder.*` lowering helpers), `translate.rs` (just the dispatch arms routing into `lists.rs`), `module_builder.rs` (declaration pipeline ordering: structs → strings → enums → lists).
+Code locations: `crates/phoenix-cranelift/src/wasm/wasm_gc/lists.rs` (the whole K.7 surface: instantiation collection + type declaration mirroring `enums.rs`, plus the `Op::ListAlloc` / `List.*` / `ListBuilder.*` lowering helpers), `translate.rs` (just the dispatch arms routing into `lists.rs`), `module_builder.rs` (declaration pipeline ordering: strings → structs → enums → lists, per the 2026-06-12 string-field lift).
 
 ---
 

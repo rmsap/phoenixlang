@@ -28,7 +28,7 @@
 //! Section emission order follows the WASM spec: type → import →
 //! function → table → memory → global → export → code → data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use phoenix_ir::instruction::{FuncId, Op, ValueId};
 use phoenix_ir::module::IrModule;
@@ -496,10 +496,12 @@ impl ModuleBuilder {
     /// a signature whose param or return is `IrType::StringRef` encodes
     /// `HeapType::Concrete($string_idx)` inline — declaring the string
     /// types afterwards would have the signature reference an
-    /// unallocated type-section slot. (The struct types declared by
-    /// `declare_phoenix_structs` are still emitted first, so the type
-    /// section reads: Phoenix structs → `$bytes` → `$string` → function
-    /// signatures.)
+    /// unallocated type-section slot. It also runs *before*
+    /// `declare_phoenix_structs`, so struct fields can reference
+    /// `$string` the same way — the type section reads: `$bytes` →
+    /// `$string` → Phoenix structs → enums → lists → function
+    /// signatures. (`$bytes`/`$string` reference no other type, so
+    /// first is always safe.)
     pub(super) fn declare_string_types(&mut self) {
         debug_assert!(
             self.bytes_type_idx.is_none() && self.string_type_idx.is_none(),
@@ -603,11 +605,11 @@ impl ModuleBuilder {
     /// would have the signature reference an unallocated type-section
     /// slot. See §Phase 2.4 decision K.1.
     ///
-    /// **Field-type restriction for slice 3.** Slice 3's fixtures only
-    /// exercise primitive-typed fields (`Int`, `Float`, `Bool`). Nested
-    /// struct fields, list / map / enum / closure fields, and string
-    /// fields all error here — they need follow-up slices that pin
-    /// their own type mappings before they can lower correctly. The
+    /// **Field-type restriction.** Supported field types are `Int`,
+    /// `Float`, `Bool`, and `String`. Nested struct / list / map /
+    /// enum / closure / dyn fields error here — each needs a follow-up
+    /// slice that
+    /// pins its own type mapping before it can lower correctly. The
     /// error keeps a fixture-driven slice from silently producing a
     /// malformed module on inputs the slice hasn't been designed for.
     pub(super) fn declare_phoenix_structs(
@@ -622,9 +624,31 @@ impl ModuleBuilder {
         names.sort();
         for name in names {
             let layout = &ir_module.struct_layouts[name];
+            // Generic struct *templates* survive in `struct_layouts`
+            // alongside their monomorphized instances (`Container` with
+            // a `TypeVar("T")` field next to `Container__i64`). Concrete
+            // code only ever references the instances — the native
+            // backend resolves layouts by concrete name on demand and
+            // never touches templates — so templates are skipped, not
+            // declared. Templates are identified by their
+            // `struct_type_params` entry (registered for every generic
+            // declaration, never cleared), not by scanning fields for
+            // placeholders — a phantom param (`struct Tag<T> { id: Int }`)
+            // leaves no placeholder in any field but is still a
+            // template. A concrete struct that wrongly retains a
+            // placeholder field still fails loudly, in
+            // `wasm_field_type_for`'s unsupported-field-type arm.
+            if ir_module.struct_type_params.contains_key(name) {
+                continue;
+            }
             let mut fields = Vec::with_capacity(layout.len());
             for (field_name, field_ty) in layout {
-                fields.push(wasm_field_type_for(name, field_name, field_ty)?);
+                fields.push(wasm_field_type_for(
+                    name,
+                    field_name,
+                    field_ty,
+                    self.string_type_idx,
+                )?);
             }
             let idx = self.types.declare_struct(&fields);
             self.phx_structs.insert(name.clone(), idx);
@@ -1662,8 +1686,10 @@ impl ModuleBuilder {
 pub(super) struct HelperNeeds {
     /// True iff `$bytes` and `$string` must be declared. Set whenever
     /// any `IrType::StringRef` appears anywhere in the module — as an
-    /// instruction's `result_type`, a function param/return, or a
-    /// block param.
+    /// instruction's `result_type`, a function param/return, a block
+    /// param, a field in a non-template struct layout, or a variant
+    /// field of a declared enum instantiation (struct and enum-variant
+    /// declarations encode the `$string` index directly).
     pub(super) string_types: bool,
     /// True iff at least one `BuiltinCall("print", args)` site has an
     /// `args[0]` whose IR type is `StringRef`.
@@ -1723,6 +1749,44 @@ pub(super) struct HelperNeeds {
 /// carries no `$bytes` / `$string` types and no dead helper bodies.
 pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
     let mut needs = HelperNeeds::default();
+    // Struct layouts contribute directly: a `name: String` field needs
+    // `$string` declared before the struct itself, even if no walked
+    // function type mentions a String. Generic templates are excluded
+    // the same way `declare_phoenix_structs` excludes them — by their
+    // `struct_type_params` entry — so a String field in an
+    // uninstantiated template doesn't force `$string` into the module.
+    if ir_module.struct_layouts.iter().any(|(name, fields)| {
+        !ir_module.struct_type_params.contains_key(name)
+            && fields.iter().any(|(_, ty)| type_contains_string(ty))
+    }) {
+        needs.string_types = true;
+    }
+    // Enum variant fields contribute the same way: declaring an enum
+    // instantiation declares *every* variant struct (K.4), so a
+    // `S(String)` variant needs `$string` even when `S` is never
+    // constructed and no walked type mentions a String — `EnumRef`'s
+    // `type_contains_string` only inspects generic args. Mirror
+    // `enums::declare`'s pass 0 exactly (same instantiation walk), so
+    // this fires iff a declaration will actually encode the `$string`
+    // index: an enum nobody references is never declared and doesn't
+    // force the string types in. A String arriving through a type arg
+    // (`Option<String>`) lives in the instantiation key's args, not
+    // the template's fields, hence the two-sided check.
+    let mut enum_instantiations = HashSet::new();
+    enums::collect_enum_instantiations(ir_module, &mut enum_instantiations);
+    if enum_instantiations.iter().any(|(template_name, args)| {
+        args.iter().any(type_contains_string)
+            || ir_module
+                .enum_layouts
+                .get(template_name)
+                .is_some_and(|variants| {
+                    variants
+                        .iter()
+                        .any(|(_, fields)| fields.iter().any(type_contains_string))
+                })
+    }) {
+        needs.string_types = true;
+    }
     for func in ir_module.concrete_functions() {
         // Built on first use (see the lazy `get_or_insert_with` below).
         let mut vid_types: Option<HashMap<ValueId, IrType>> = None;
@@ -1876,31 +1940,50 @@ fn build_vid_type_map(func: &phoenix_ir::module::IrFunction) -> HashMap<ValueId,
 }
 
 /// Map one Phoenix field's `IrType` to a WASM-GC `FieldType` for the
-/// containing struct's nominal declaration. Slice 3 only supports
-/// primitive-typed fields (Int / Float / Bool); nested struct / list /
-/// map / enum / closure / string field types are rejected with a
+/// containing struct's nominal declaration. Supports primitives
+/// (Int / Float / Bool) and `StringRef` as `(ref null $string)` —
+/// the same nullable-ref convention as K.2/K.4 fields, encodable
+/// because `$string` is declared ahead of the structs in the type
+/// section. Nested struct / list /
+/// map / enum / closure / dyn fields are still rejected with a
 /// per-slice diagnostic — each needs its own follow-up sub-decision
-/// before the layout can be pinned (e.g. nested struct fields require
-/// the inner struct to be declared first in the type section; lists
-/// need the `(array T)` mapping settled). Mutability is unconditional:
+/// (nested structs and struct↔enum references need a dependency sort
+/// or rec groups; lists need the K.7 instantiations declared, which
+/// happens *after* structs today). Mutability is unconditional:
 /// Phoenix supports `p.x = 5` and has no syntax to mark a field
 /// immutable. See §Phase 2.4 decision K.1.
 fn wasm_field_type_for(
     struct_name: &str,
     field_name: &str,
     field_ty: &IrType,
+    string_type_idx: Option<u32>,
 ) -> Result<wasm_encoder::FieldType, CompileError> {
     let val_type = match field_ty {
         IrType::I64 => wasm_encoder::ValType::I64,
         IrType::F64 => wasm_encoder::ValType::F64,
         IrType::Bool => wasm_encoder::ValType::I32,
+        IrType::StringRef => {
+            let idx = string_type_idx.ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: struct `{struct_name}` field `{field_name}` \
+                     is `StringRef` but `declare_string_types` did not run \
+                     first — `scan_helper_needs` should flag `string_types` \
+                     for any module whose struct layouts contain a String \
+                     field (internal compiler bug)"
+                ))
+            })?;
+            wasm_encoder::ValType::Ref(wasm_encoder::RefType {
+                nullable: true,
+                heap_type: wasm_encoder::HeapType::Concrete(idx),
+            })
+        }
         other => {
             return Err(CompileError::new(format!(
-                "wasm32-gc slice 3: struct `{struct_name}` field \
-                 `{field_name}` has type `{other:?}`, but the slice only \
-                 supports primitive fields (Int / Float / Bool). Nested \
-                 struct / list / map / enum / closure / string fields \
-                 land in follow-up slices (each carries its own \
+                "wasm32-gc: struct `{struct_name}` field \
+                 `{field_name}` has type `{other:?}`, which is not yet \
+                 supported as a struct field (Int / Float / Bool / String \
+                 are). Nested struct / list / map / enum / closure / dyn \
+                 fields land in follow-up slices (each carries its own \
                  type-mapping sub-decision under §Phase 2.4 decision K)"
             )));
         }
