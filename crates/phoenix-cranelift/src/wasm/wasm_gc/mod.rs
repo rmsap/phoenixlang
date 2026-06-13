@@ -62,6 +62,7 @@ use phoenix_ir::module::IrModule;
 
 use crate::error::CompileError;
 
+mod closures;
 mod enums;
 mod float_helpers;
 mod lists;
@@ -132,6 +133,11 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // `List<List<T>>` instantiations are declared inner-first inside
     // this pass. See §Phase 2.4 decision K.7.
     builder.declare_phoenix_lists(ir_module)?;
+    // Closures last among the type declarations: capture fields and
+    // user param/result types may reference any of the above. (The
+    // reverse — `List<Closure>` elements — is deferred until a fixture
+    // needs it; see §Phase 2.4 K.8.)
+    builder.declare_phoenix_closures(ir_module)?;
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();
@@ -171,6 +177,10 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // each body. `_start` is declared last so it can call `main` by
     // index after all user functions are in place.
     builder.declare_phoenix_functions(ir_module)?;
+    // `ref.func` validation requires every closure target in an
+    // `(elem declare func …)` segment — emitted now that the function
+    // indices exist. See §Phase 2.4 K.8.
+    builder.emit_closure_elem_decls()?;
     builder.declare_start();
     builder.emit_exports();
     builder.emit_phoenix_bodies(ir_module)?;

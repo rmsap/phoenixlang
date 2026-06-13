@@ -792,7 +792,7 @@ fn struct_mono_no_op_when_no_generic_structs() {
 /// result type, the return type, and nested `ClosureRef` params.
 #[test]
 fn for_each_type_mut_substitutes_capture_types_and_load_result() {
-    use crate::module::IrFunction;
+    use crate::module::{ENV_PARAM_NAME, IrFunction};
 
     // A toy closure function shaped like `__closure(env) -> T` whose
     // single capture is of type `T` and whose body performs
@@ -805,7 +805,7 @@ fn for_each_type_mut_substitutes_capture_types_and_load_result() {
         FuncId(0),
         "__closure_under_T".into(),
         vec![env_ty.clone()],
-        vec!["__env".into()],
+        vec![ENV_PARAM_NAME.into()],
         tv("T"),
         None,
         vec![tv("T")],
@@ -859,7 +859,7 @@ fn for_each_type_mut_substitutes_capture_types_and_load_result() {
 /// machinery in `function_mono.rs`.
 #[test]
 fn for_each_type_mut_substitutes_capture_types_at_string() {
-    use crate::module::IrFunction;
+    use crate::module::{ENV_PARAM_NAME, IrFunction};
 
     let env_ty = IrType::ClosureRef {
         param_types: vec![],
@@ -869,7 +869,7 @@ fn for_each_type_mut_substitutes_capture_types_at_string() {
         FuncId(0),
         "__closure_under_T_str".into(),
         vec![env_ty],
-        vec!["__env".into()],
+        vec![ENV_PARAM_NAME.into()],
         tv("T"),
         None,
         vec![tv("T")],

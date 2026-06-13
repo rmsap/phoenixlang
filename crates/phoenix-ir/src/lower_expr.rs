@@ -5,7 +5,7 @@
 
 use crate::instruction::{FuncId, Op, VOID_SENTINEL, ValueId};
 use crate::lower::{LoweringContext, VarBinding, lower_type};
-use crate::module::IrFunction;
+use crate::module::{ENV_PARAM_NAME, IrFunction};
 use crate::terminator::Terminator;
 use crate::types::IrType;
 use phoenix_common::span::Span;
@@ -1262,7 +1262,7 @@ impl<'a> LoweringContext<'a> {
         // access is in-bounds by construction (parallel with
         // `lambda.params`).
         let mut param_types: Vec<IrType> = vec![closure_self_type];
-        let mut param_names: Vec<String> = vec!["__env".to_string()];
+        let mut param_names: Vec<String> = vec![ENV_PARAM_NAME.to_string()];
         for (i, p) in lambda.params.iter().enumerate() {
             param_types.push(user_param_types[i].clone());
             param_names.push(p.name.clone());

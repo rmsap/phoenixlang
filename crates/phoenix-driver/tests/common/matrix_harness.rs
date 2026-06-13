@@ -5,7 +5,8 @@
 //! fixture produces byte-identical stdout under `phoenix run`,
 //! `phoenix run-ir`, `phoenix build` (native), `phoenix build
 //! --target wasm32-linear` executed under `wasmtime`, and `phoenix
-//! build --target wasm32-gc` executed under `wasmtime -W gc=y`. The only
+//! build --target wasm32-gc` executed under `wasmtime` with the
+//! function-references + GC proposals enabled. The only
 //! per-suite differences are how a fixture *key* maps onto the
 //! filesystem / into diagnostics and whether an `expected.txt` pin
 //! exists — captured in [`MatrixCfg`]. Everything else (process
@@ -21,8 +22,9 @@
 //! there means a real regression (see `.github/workflows/ci.yml`).
 //!
 //! The availability probe only checks that `wasmtime` is *present*: a
-//! wasmtime too old to accept `-W gc=y` fails the wasm32-gc column
-//! with a "wasmtime exited non-zero" panic rather than soft-skipping.
+//! wasmtime too old to accept `-W function-references=y,gc=y` fails
+//! the wasm32-gc column with a "wasmtime exited non-zero" panic
+//! rather than soft-skipping.
 //! That's deliberate (a version check would mask real failures), but
 //! if you hit it locally, upgrade wasmtime.
 
@@ -157,7 +159,8 @@ fn wasmtime_available() -> bool {
 
 /// Compile via `phoenix build --target <target>`, run the resulting
 /// `.wasm` under `wasmtime` (with `wasmtime_args` prepended — the
-/// wasm32-gc column passes `-W gc=y`), and return its stdout. Returns
+/// wasm32-gc column passes `-W function-references=y,gc=y`), and
+/// return its stdout. Returns
 /// `None` when `wasmtime` isn't on `$PATH` (soft skip), with a stderr
 /// warning; `PHOENIX_REQUIRE_WASMTIME=1` turns the skip into a panic
 /// instead. The `.wasm` is removed via the [`TempBin`] guard on every
@@ -293,7 +296,9 @@ pub fn assert_backend_agreement(cfg: &MatrixCfg, key: &str, wasm_gc_skip: Option
             );
             None
         }
-        None => build_and_execute_wasm(cfg, key, "wasm32-gc", &["-W", "gc=y"]),
+        None => {
+            build_and_execute_wasm(cfg, key, "wasm32-gc", &["-W", "function-references=y,gc=y"])
+        }
     };
     assert_stdout_agreement(
         &label,

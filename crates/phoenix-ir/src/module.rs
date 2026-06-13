@@ -507,6 +507,20 @@ impl Default for IrModule {
     }
 }
 
+/// Name of the synthesized first parameter every closure function
+/// carries under the env-pointer calling convention (the closure heap
+/// object itself; see `lower_expr.rs`'s lambda lowering). Backends use
+/// it — together with a `ClosureRef`-typed first param — to recognize
+/// closure-shaped functions and make skip/emit decisions, so treat the
+/// name as reserved: no lowering may give a *user* parameter this
+/// name. (The surface language does lex leading-underscore
+/// identifiers, so a user `__env: (Int) -> Int` param is writable —
+/// today it cannot be misclassified because the backend checks
+/// additionally require unresolved generic placeholders, which never
+/// survive into concrete user functions, but new consumers of this
+/// constant must not rely on the name alone.)
+pub const ENV_PARAM_NAME: &str = "__env";
+
 /// An IR function.  Methods are lowered as functions with an explicit
 /// `self` parameter as the first argument.
 #[derive(Debug, Clone)]

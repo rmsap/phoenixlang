@@ -786,6 +786,7 @@ mod closure_load_capture_tests {
     //! of the lowering path so an IR-side regression surfaces here even
     //! if frontend lowering happens to mask it.
     use super::*;
+    use phoenix_ir::module::ENV_PARAM_NAME;
     use phoenix_ir::types::IrType;
 
     /// Build a minimal closure function `__closure(env: ClosureRef) -> Int`
@@ -806,7 +807,7 @@ mod closure_load_capture_tests {
             FuncId(u32::MAX),
             "__closure_test".into(),
             vec![env_ty.clone()],
-            vec!["__env".into()],
+            vec![ENV_PARAM_NAME.into()],
             return_type.clone(),
             None,
             capture_types,

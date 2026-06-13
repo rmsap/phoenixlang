@@ -127,9 +127,12 @@ backend_matrix_test!(matrix_defaults, "defaults.phx");
 // gated per-backend in `compile_wasm_linear.rs`; the matrix entry adds
 // the cross-backend agreement check on top.
 backend_matrix_test!(matrix_enum_predicates, "enum_predicates.phx", skip_wasm_gc: "stdlib-enum predicate builtins (`Result.isOk` et al.) are not lowered on wasm32-gc yet (K.7 builtin surface)");
-backend_matrix_test!(matrix_closures, "closures.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_closures_ambiguous_captures, "closures_ambiguous_captures.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
+backend_matrix_test!(matrix_closures, "closures.phx");
+backend_matrix_test!(
+    matrix_closures_ambiguous_captures,
+    "closures_ambiguous_captures.phx"
+);
+backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx");
 // GC stress fixtures.
 //
 // **Limit of this gate:** the matrix only checks stdout equality across
@@ -160,7 +163,7 @@ backend_matrix_test!(matrix_list_sortby_stable, "list_sortby_stable.phx", skip_w
 backend_matrix_test!(matrix_defer_lazy_capture, "defer_lazy_capture.phx");
 backend_matrix_test!(matrix_defer_method, "defer_method.phx");
 backend_matrix_test!(matrix_defer_heap, "defer_heap.phx");
-backend_matrix_test!(matrix_defer_closure, "defer_closure.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
+backend_matrix_test!(matrix_defer_closure, "defer_closure.phx");
 backend_matrix_test!(matrix_defer_try, "defer_try.phx", skip_wasm_gc: "`Result` instantiation with an unresolved generic type arg (K.4 known limitation) fails wasm32-gc enum declaration");
 backend_matrix_test!(matrix_defer_multiple_returns, "defer_multiple_returns.phx");
 backend_matrix_test!(
@@ -193,7 +196,10 @@ backend_matrix_test!(
 // `capture_types` / return type rather than the shared `__generic`
 // placeholder the Cranelift backend used to mis-size. Expected output
 // is `15\nhi:there\n`.
-backend_matrix_test!(matrix_closures_over_generic_cross_width, "closures_over_generic_cross_width.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
+backend_matrix_test!(
+    matrix_closures_over_generic_cross_width,
+    "closures_over_generic_cross_width.phx"
+);
 
 /// Tripwire: every `tests/fixtures/*.phx` outside the two excluded
 /// families documented in the module header (`gen_*.phx`,

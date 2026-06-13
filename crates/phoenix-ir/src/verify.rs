@@ -446,7 +446,7 @@ mod structural_verifier_tests {
 
     use crate::block::BlockId;
     use crate::instruction::{FuncId, Op, VOID_SENTINEL, ValueId};
-    use crate::module::{FunctionSlot, IrFunction, IrModule};
+    use crate::module::{ENV_PARAM_NAME, FunctionSlot, IrFunction, IrModule};
     use crate::terminator::Terminator;
     use crate::types::IrType;
     use crate::verify::verify;
@@ -645,7 +645,7 @@ mod structural_verifier_tests {
             FuncId(0),
             "__closure_oob".into(),
             vec![IrType::I64], // env-ptr; type detail doesn't matter for this check
-            vec!["__env".into()],
+            vec![ENV_PARAM_NAME.into()],
             IrType::Void,
             None,
         );
@@ -674,7 +674,7 @@ mod structural_verifier_tests {
             FuncId(0),
             "__closure_ok".into(),
             vec![IrType::I64],
-            vec!["__env".into()],
+            vec![ENV_PARAM_NAME.into()],
             IrType::Void,
             None,
         );

@@ -4,7 +4,8 @@
 //! pipeline end-to-end. The structural tier always runs (it just
 //! asks `wasmparser` whether the module parses with the GC proposal
 //! enabled); the execution tier runs whenever `wasmtime` is on
-//! `$PATH`, invoking it with `-W gc=y` to enable the GC proposal.
+//! `$PATH`, invoking it with `-W function-references=y,gc=y` to
+//! enable the function-references and GC proposals.
 //!
 //! `PHOENIX_REQUIRE_WASMTIME=1` turns the soft-skip on missing
 //! wasmtime into a hard failure — same gating shape as the
@@ -257,7 +258,7 @@ fn wasmtime_output(bytes: &[u8], label: &str) -> Option<std::process::Output> {
     let path = dir.path().join(format!("{label}.wasm"));
     std::fs::write(&path, bytes).expect("write wasm");
     let out = Command::new("wasmtime")
-        .args(["-W", "gc=y"])
+        .args(["-W", "function-references=y,gc=y"])
         .arg(&path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2097,6 +2098,180 @@ fn phantom_param_template_is_skipped_and_forces_no_string_types() {
         "expected no struct type decls: the phantom-param template is \
          skipped and its String field must not force `$string` in"
     );
+}
+
+/// K.8 closures: the core surface — a no-capture closure, capturing
+/// closures (Int + String), and the phi-unification property the
+/// per-signature parent hierarchy exists for: two closures with the
+/// same user signature but *different capture layouts* flowing
+/// through one variable and called at one site.
+#[test]
+fn closures_core_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let plain = function(x: Int) -> Int { x * 2 }\n",
+        "  print(plain(21))\n",
+        "  let base: Int = 100\n",
+        "  let addbase = function(x: Int) -> Int { x + base }\n",
+        "  print(addbase(7))\n",
+        "  let tag: String = \"v=\"\n",
+        "  let label = function(x: Int) -> String { tag + toString(x) }\n",
+        "  print(label(9))\n",
+        "}\n",
+    );
+    assert_prints(source, "closures_core_wasm_gc", b"42\n107\nv=9\n");
+}
+
+/// The phi-unification property the K.8 per-signature parent exists
+/// for: two closures with one user signature but different capture
+/// layouts (no captures vs. an Int capture) join through an
+/// if-expression block param and dispatch through one call site.
+#[test]
+fn closures_phi_unification_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function choose(c: Bool, a: (Int) -> Int, b: (Int) -> Int) -> (Int) -> Int {\n",
+        "  if c { a } else { b }\n",
+        "}\n",
+        "function main() {\n",
+        "  let base: Int = 100\n",
+        "  let plain = function(x: Int) -> Int { x * 2 }\n",
+        "  let addbase = function(x: Int) -> Int { x + base }\n",
+        "  let f = choose(true, plain, addbase)\n",
+        "  let g = choose(false, plain, addbase)\n",
+        "  print(f(5))\n",
+        "  print(g(5))\n",
+        "}\n",
+    );
+    assert_prints(source, "closures_phi_wasm_gc", b"10\n105\n");
+}
+
+/// Closures crossing function boundaries — passed as a parameter and
+/// returned from a factory (the captured value outliving its defining
+/// frame, which the host GC keeps alive through the `$site` struct).
+#[test]
+fn closures_as_values_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function apply(f: (Int) -> Int, x: Int) -> Int {\n",
+        "  f(x)\n",
+        "}\n",
+        "function makeAdder(n: Int) -> (Int) -> Int {\n",
+        "  function(x: Int) -> Int { x + n }\n",
+        "}\n",
+        "function main() {\n",
+        "  let add5 = makeAdder(5)\n",
+        "  print(apply(add5, 10))\n",
+        "  print(apply(makeAdder(100), 1))\n",
+        "  print(apply(function(x: Int) -> Int { x - 1 }, 3))\n",
+        "}\n",
+    );
+    assert_prints(source, "closures_values_wasm_gc", b"15\n101\n2\n");
+}
+
+/// Higher-order closures: closure literals whose *own signature*
+/// carries a closure type — as a parameter (`twice`) and as a return
+/// (`makeAdd`). Pins the inner-before-outer declaration order of the
+/// K.8 signature pass: `([ClosureRef …], I64)` sorts lexically before
+/// its inner `([I64], I64)` (`'C' < 'I'`), so a depth-blind
+/// debug-string sort would declare the outer signature first and fail
+/// to resolve the inner parent ref.
+#[test]
+fn higher_order_closures_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let inc = function(x: Int) -> Int { x + 1 }\n",
+        "  let twice = function(f: (Int) -> Int) -> Int { f(f(10)) }\n",
+        "  print(twice(inc))\n",
+        "  let makeAdd = function(n: Int) -> (Int) -> Int {\n",
+        "    function(x: Int) -> Int { x + n }\n",
+        "  }\n",
+        "  let add3 = makeAdd(3)\n",
+        "  print(add3(4))\n",
+        "}\n",
+    );
+    assert_prints(source, "closures_higher_order_wasm_gc", b"12\n7\n");
+}
+
+/// `List<Closure>` is deferred (§Phase 2.4 K.8): the list pass runs
+/// before the closure pass, so a closure-typed element reaches the
+/// shared type mapping before any signature is recorded. Pin that the
+/// failure is the `require_closure_sig` diagnostic naming the
+/// deferral, not a panic or a silently-wrong module.
+#[test]
+fn list_of_closures_is_rejected_until_a_later_slice() {
+    let source = concat!(
+        "function main() {\n",
+        "  let fs: List<(Int) -> Int> = [function(x: Int) -> Int { x }]\n",
+        "  print(fs.length())\n",
+        "}\n",
+    );
+    let ir_module = lower_to_ir(source);
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("a List with closure elements is deferred on wasm32-gc");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("closure signature") && msg.contains("List<Closure>"),
+        "expected the K.8 deferred-`List<Closure>` diagnostic, got: {msg}"
+    );
+}
+
+/// Pins the `capture_types` arm of `is_dead_placeholder_closure`: a
+/// closure whose user signature is fully *concrete* (`() -> Int`) but
+/// whose captures carry the enclosing generic's `T`. The template
+/// leftover such a closure produces is invisible to the param/return
+/// placeholder checks (both concrete) — only the capture scan catches
+/// it. The other generic-closure fixtures all put `T` in the closure
+/// signature itself, so without this test a regression of the capture
+/// arm passes the suite and then fails loud here: the leftover reaches
+/// `translate_function`, whose `ClosureLoadCapture` lowering can't map
+/// the placeholder capture type. Two instantiations at different
+/// capture widths (Int, String) keep the live clones honest too.
+#[test]
+fn concrete_sig_generic_capture_template_is_skipped() {
+    let source = concat!(
+        "function makeConst<T>(x: T, n: Int) -> () -> Int {\n",
+        "  function() -> Int {\n",
+        "    let keep: T = x\n",
+        "    n\n",
+        "  }\n",
+        "}\n",
+        "function main() {\n",
+        "  let a = makeConst(42, 7)\n",
+        "  let b = makeConst(\"hi\", 9)\n",
+        "  print(a())\n",
+        "  print(b())\n",
+        "}\n",
+    );
+    assert_prints(source, "closures_generic_capture_wasm_gc", b"7\n9\n");
+}
+
+/// Pins the **multi-parameter** `$fn_SIG` arm every other K.8 unit
+/// fixture here misses — all of them are single- or zero-param. A
+/// `(Int, Int) -> Int` closure exercises the per-param
+/// `single_slot_for` loop in the signature pass and the multi-arg
+/// `Op::CallIndirect` lowering (more than one user arg pushed before
+/// the `$code` ref). Covered cross-backend by
+/// `closures_over_generic_cross_width`'s `(T, T) -> T` callee; this is
+/// the localized wasm32-gc pin, mirroring
+/// `concrete_sig_generic_capture_template_is_skipped`.
+///
+/// The sibling Void-return arm (`IrType::Void => Vec::new()` /
+/// `(None, IrType::Void)`) is left to `defer_closure.phx` in the
+/// backend matrix: a clean standalone Void closure trips an unrelated
+/// frontend lowering bug — a `() ->` Void closure whose body's
+/// trailing expression is itself a void call (`print(...)`) panics in
+/// `lower_dyn.rs::coerce_value_to_expected` with a VOID_SENTINEL
+/// cross-function leak, on `run-ir` and every IR-backed backend.
+/// `defer_closure` sidesteps it (a trailing `defer` statement leaves
+/// no trailing value expression).
+#[test]
+fn multi_arg_closure_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let add = function(a: Int, b: Int) -> Int { a + b }\n",
+        "  print(add(20, 22))\n",
+        "}\n",
+    );
+    assert_prints(source, "closures_multi_arg_wasm_gc", b"42\n");
 }
 
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's

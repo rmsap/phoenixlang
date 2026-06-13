@@ -1545,6 +1545,37 @@ $builder_T = (struct (field $len (mut i64))
 
 Code locations: `crates/phoenix-cranelift/src/wasm/wasm_gc/lists.rs` (the whole K.7 surface: instantiation collection + type declaration mirroring `enums.rs`, plus the `Op::ListAlloc` / `List.*` / `ListBuilder.*` lowering helpers), `translate.rs` (just the dispatch arms routing into `lists.rs`), `module_builder.rs` (declaration pipeline ordering: strings → structs → enums → lists, per the 2026-06-12 string-field lift).
 
+#### K.8. wasm32-gc closures: per-signature subtype hierarchy over typed function references (`call_ref`)
+
+**Decided 2026-06-12 (closure design lock, confirmed with user); ✅ implemented 2026-06-12 (same day), exactly as locked.** Code: `crates/phoenix-cranelift/src/wasm/wasm_gc/closures.rs` (collection + declaration + the three op lowerings, mirroring `lists.rs`); the dead template-copy closures are skipped in lockstep by `declare_phoenix_functions` / `emit_phoenix_bodies` (`is_dead_placeholder_closure`); both wasmtime harnesses now pass `-W function-references=y,gc=y`. Matrix: `closures`, `closures_ambiguous_captures`, `closures_over_generic`, `closures_over_generic_cross_width`, and `defer_closure` run five-backend byte-identical.
+
+**Context.** Phoenix's IR closure ABI is the env-pointer calling convention (locked during the Phase 2.4 closure-capture-ambiguity fix): a closure value's heap object *is* the environment; `Op::CallIndirect(closure, args)` passes the closure verbatim as the callee's first argument; the callee reads captures via `Op::ClosureLoadCapture(env, idx)` against its `capture_types`. Call sites never know capture layouts — that is what lets two closures with the same user signature but different captures unify through a phi. The wasm32-gc mapping must preserve exactly that property. There is no capture-store op: captures are by-value and immutable once allocated.
+
+**Chosen shapes.** One *function type* + one open *parent struct* per distinct closure **signature** `(param_types, return_type)` (codegen-time collection over `ClosureRef` types and `ClosureAlloc` sites, mirroring K.4/K.7; declared inner-first by closure-nesting depth so higher-order signatures — a closure taking or returning a closure — resolve their nested parent refs, the K.7 list-depth pattern; signatures still carrying generic placeholders are skipped — they belong to dead template copies, same guard as K.4). One final *site subtype* per `ClosureAlloc` **target function**, carrying that closure's capture fields:
+
+```
+$fn_SIG   = (func (param (ref null struct))      ;; env — abstract, see below
+                  (param P_wasm ...)
+                  (result R_wasm))
+$clo_SIG  = (sub (struct (field $code (ref $fn_SIG))))
+$site_F   = (sub final $clo_SIG
+              (struct (field $code (ref $fn_SIG))
+                      (field $cap0 T0_wasm) ...))   ;; immutable capture fields
+```
+
+- `IrType::ClosureRef { .. }` → `(ref null $clo_SIG)`.
+- `Op::ClosureAlloc(F, caps)` → `ref.func $F` + capture values + `struct.new $site_F`. (`ref.func` requires the target in an `(elem declare func …)` segment; the collection pass emits one.)
+- `Op::CallIndirect(clo, args)` → `struct.get $clo_SIG $code` + `call_ref $fn_SIG`, passing `clo` as the env argument — statically signature-checked, no table, no runtime signature test.
+- `Op::ClosureLoadCapture(env, idx)` → `ref.cast $site_F` + `struct.get` field `idx + 1` — the K.4 enum parent→variant get-field pattern reapplied. The cast target is known statically: the op only occurs inside `F`'s own body.
+
+**Env parameter is abstract `(ref null struct)`, not `(ref null $clo_SIG)`.** The precise typing would make `$fn_SIG` and `$clo_SIG` mutually recursive, requiring `(rec …)` group emission in the type interner. The abstract typing breaks the cycle with no interner changes, and loses nothing real: the callee must `ref.cast` the env down to its concrete `$site_F` either way (parent → site), and every *user-controlled* param/result stays precisely typed, so `call_ref` still statically checks everything a caller can get wrong. Revisit-trigger: if the interner grows rec-group support for another reason (struct↔enum field cycles are the likely customer), tightening the env type is a mechanical follow-up.
+
+**Dispatch mechanism: `call_ref`, not a funcref table.** Verified empirically (2026-06-12) on the pinned wasmtime v45: `call_ref` validates and runs with `-W function-references=y,gc=y` and is rejected under `-W gc=y` alone — wasmtime gates the two proposals separately even though GC formally builds on function-references. The slice therefore adds `function-references=y` to every wasmtime invocation that runs wasm32-gc modules (the backend-matrix harness, the `compile_wasm_gc.rs` harness; CI inherits both). The rejected alternative — module-wide funcref table + `call_indirect` — works under today's flags but re-implements wasm32-linear's machinery (table, element segments, index bookkeeping, per-call runtime signature checks) inside the backend whose type system exists to make that unnecessary.
+
+**Alternatives rejected** (2026-06-12, with user): funcref table + `call_indirect` (above); uniform boxed env `(struct funcref (ref array anyref))` — every scalar capture boxes on alloc and unbox-casts on read, exactly the overhead typed fields eliminate; precise env typing via rec groups (deferred, not rejected outright — see revisit-trigger).
+
+**Scope.** The K.8 slice ships the core only: `ClosureAlloc` / `CallIndirect` / `ClosureLoadCapture` + the `ClosureRef` type mapping — unblocking `closures.phx`, `closures_ambiguous_captures.phx`, `defer_closure.phx`, and the generic-closure fixtures (monomorphization already clones closure bodies per specialization at the IR level; the backend sees concrete types). **Deferred to follow-up slices:** Option/Result closure-taking builtins (`option_result.phx`), then the List closure methods (`collections.phx` + the five sortBy fixtures — sortBy's bottom-up merge sort is the substantial port), each reusing this call machinery unchanged.
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)

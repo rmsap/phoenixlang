@@ -364,6 +364,26 @@ pub(super) struct ModuleBuilder {
     /// purpose for `ListBuilder.push` (Void result).
     phx_builder_elem_by_struct: HashMap<u32, IrType>,
 
+    /// Closure signature `(params, return)` → `($fn_SIG type idx,
+    /// $clo_SIG parent struct idx)` per §Phase 2.4 decision K.8.
+    /// Populated by [`Self::declare_phoenix_closures`].
+    phx_closure_sigs: HashMap<super::closures::ClosureSigKey, (u32, u32)>,
+
+    /// Reverse index `$clo_SIG` parent idx → `$fn_SIG` type idx, for
+    /// `Op::CallIndirect` (which recovers the signature from the
+    /// receiver's binding type). Lockstep with [`Self::phx_closure_sigs`].
+    phx_closure_parent_to_fn: HashMap<u32, u32>,
+
+    /// `ClosureAlloc` target `FuncId` → `$site_F` struct idx (the
+    /// final subtype carrying that closure's capture fields).
+    phx_closure_sites: HashMap<FuncId, u32>,
+
+    /// Element section holding the `(elem declare func …)` segment
+    /// that `ref.func` requires for every closure target. Emitted by
+    /// [`Self::emit_closure_elem_decls`] once function indices exist;
+    /// only written into the module when non-empty.
+    elements: wasm_encoder::ElementSection,
+
     /// True once [`Self::declare_bool_data`] has emitted the
     /// `"true\n"` / `"false\n"` active data segments. The inline
     /// `print(Bool)` lowering in `translate.rs` stages iovecs at the
@@ -420,6 +440,10 @@ impl ModuleBuilder {
             str_length_idx: None,
             phx_enums: HashMap::new(),
             phx_enum_parent_to_key: HashMap::new(),
+            phx_closure_sigs: HashMap::new(),
+            phx_closure_parent_to_fn: HashMap::new(),
+            phx_closure_sites: HashMap::new(),
+            elements: wasm_encoder::ElementSection::new(),
             phx_lists: HashMap::new(),
             phx_list_builders: HashMap::new(),
             phx_list_elem_by_struct: HashMap::new(),
@@ -856,6 +880,141 @@ impl ModuleBuilder {
         super::lists::declare(self, ir_module)
     }
 
+    /// Declare WASM-GC types for every closure signature and
+    /// allocation site per §Phase 2.4 decision K.8. Thin wrapper over
+    /// [`closures::declare`] — mirrors [`Self::declare_phoenix_lists`].
+    /// Runs after structs / strings / enums / lists and before any
+    /// function signature touching `IrType::ClosureRef` is interned.
+    pub(super) fn declare_phoenix_closures(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        super::closures::declare(self, ir_module)
+    }
+
+    /// Declare a closure signature's open parent struct (`$clo_SIG`).
+    /// Narrow [`TypeInterner`] wrapper for [`super::closures::declare`].
+    pub(super) fn declare_closure_parent_struct(
+        &mut self,
+        fields: &[wasm_encoder::FieldType],
+    ) -> u32 {
+        self.types.declare_open_struct(fields)
+    }
+
+    /// Declare a closure allocation site's final subtype (`$site_F`).
+    pub(super) fn declare_closure_site_struct(
+        &mut self,
+        fields: &[wasm_encoder::FieldType],
+        parent_idx: u32,
+    ) -> u32 {
+        self.types.declare_subtype_struct(fields, parent_idx)
+    }
+
+    /// Record one declared closure signature; keeps the reverse index
+    /// in lockstep.
+    pub(super) fn record_closure_sig(
+        &mut self,
+        key: super::closures::ClosureSigKey,
+        fn_type_idx: u32,
+        parent_idx: u32,
+    ) {
+        self.phx_closure_parent_to_fn
+            .insert(parent_idx, fn_type_idx);
+        self.phx_closure_sigs.insert(key, (fn_type_idx, parent_idx));
+    }
+
+    /// Record one declared closure allocation site.
+    pub(super) fn record_closure_site(&mut self, target: FuncId, site_idx: u32) {
+        self.phx_closure_sites.insert(target, site_idx);
+    }
+
+    /// `($fn_SIG, $clo_SIG)` indices for a closure signature.
+    pub(super) fn require_closure_sig(
+        &self,
+        key: &super::closures::ClosureSigKey,
+    ) -> Result<(u32, u32), CompileError> {
+        self.phx_closure_sigs.get(key).copied().ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: closure signature `{key:?}` was not declared by \
+                 `declare_phoenix_closures` — the signature collection pass \
+                 missed it, or a `List<Closure>` element reached the list \
+                 pass (which runs before closures; that combination is \
+                 deferred — §Phase 2.4 K.8)"
+            ))
+        })
+    }
+
+    /// `$site_F` struct idx for a closure allocation target.
+    pub(super) fn require_closure_site(&self, target: FuncId) -> Result<u32, CompileError> {
+        self.phx_closure_sites.get(&target).copied().ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: closure target `{target:?}` has no declared \
+                 `$site` type (internal compiler bug — K.8 collection walks \
+                 every `Op::ClosureAlloc`)"
+            ))
+        })
+    }
+
+    /// Non-erroring site lookup — used to detect closure functions
+    /// (their `FuncId` is an allocation target) when declaring
+    /// signatures and binding the abstract env param.
+    pub(super) fn closure_site_idx_if_set(&self, target: FuncId) -> Option<u32> {
+        self.phx_closure_sites.get(&target).copied()
+    }
+
+    /// Reverse-lookup `$fn_SIG` from a receiver's `$clo_SIG` parent
+    /// index (`Op::CallIndirect`).
+    pub(super) fn closure_fn_by_parent(&self, parent_idx: u32) -> Option<u32> {
+        self.phx_closure_parent_to_fn.get(&parent_idx).copied()
+    }
+
+    /// Emit the `(elem declare func …)` segment covering every closure
+    /// allocation target — `ref.func` validation requires it. Must run
+    /// after [`Self::declare_phoenix_functions`] (indices) and before
+    /// [`Self::finish`].
+    pub(super) fn emit_closure_elem_decls(&mut self) -> Result<(), CompileError> {
+        if self.phx_closure_sites.is_empty() {
+            return Ok(());
+        }
+        let mut targets: Vec<FuncId> = self.phx_closure_sites.keys().copied().collect();
+        targets.sort_by_key(|fid| fid.0);
+        let mut indices = Vec::with_capacity(targets.len());
+        for fid in targets {
+            indices.push(self.require_phx_user_func(fid)?);
+        }
+        self.elements
+            .declared(wasm_encoder::Elements::Functions(indices.into()));
+        Ok(())
+    }
+
+    /// Whether `func` is a dead template-copy closure: a closure-shaped
+    /// function (first param `ClosureRef`) whose signature or captures
+    /// still carry generic placeholders. Monomorphization leaves these
+    /// behind (see the K.4 known-limitation note); they are never
+    /// referenced, can't be declared on wasm32-gc (placeholders have no
+    /// type mapping), and are skipped by **both**
+    /// [`Self::declare_phoenix_functions`] and
+    /// [`Self::emit_phoenix_bodies`] — the two skips must stay in
+    /// lockstep or the function/code sections desynchronize. A live
+    /// reference to a skipped function fails loud via
+    /// [`Self::require_phx_user_func`].
+    pub(super) fn is_dead_placeholder_closure(func: &phoenix_ir::module::IrFunction) -> bool {
+        let closure_shaped = matches!(func.param_types.first(), Some(IrType::ClosureRef { .. }))
+            && !func.param_names.is_empty()
+            && func.param_names[0] == phoenix_ir::module::ENV_PARAM_NAME;
+        if !closure_shaped {
+            return false;
+        }
+        func.param_types
+            .iter()
+            .any(super::enums::contains_generic_placeholder)
+            || super::enums::contains_generic_placeholder(&func.return_type)
+            || func
+                .capture_types
+                .iter()
+                .any(super::enums::contains_generic_placeholder)
+    }
+
     /// Declare a list element array type (`$arr_T`) and return its
     /// type-section index. Narrow [`TypeInterner`] wrapper for
     /// [`super::lists::declare`], same pattern as
@@ -1227,9 +1386,35 @@ impl ModuleBuilder {
         ir_module: &IrModule,
     ) -> Result<(), CompileError> {
         for func in ir_module.concrete_functions() {
-            let params = translate::flatten_param_types(&func.param_types, self)?;
-            let returns = translate::wasm_return_valtypes(&func.return_type, self)?;
-            let sig = self.types.intern(&params, &returns);
+            // Dead template-copy closures (placeholder-typed) are
+            // skipped here AND in `emit_phoenix_bodies` — see
+            // `is_dead_placeholder_closure`'s lockstep contract.
+            if Self::is_dead_placeholder_closure(func) {
+                continue;
+            }
+            // Closure functions (allocation targets) must be declared
+            // with exactly their `$fn_SIG` — abstract env param — so
+            // `ref.func` produces a reference `call_ref $fn_SIG`
+            // accepts. Interning the same shape would dedup to the
+            // same index anyway; using the recorded index makes the
+            // K.8 contract explicit.
+            let sig = if self.closure_site_idx_if_set(func.id).is_some() {
+                let key = super::closures::sig_key_of(
+                    func.param_types.first().ok_or_else(|| {
+                        CompileError::new(format!(
+                            "wasm32-gc: closure function `{}` has no env \
+                             parameter (internal compiler bug)",
+                            func.name
+                        ))
+                    })?,
+                    "closure function env parameter",
+                )?;
+                self.require_closure_sig(&key)?.0
+            } else {
+                let params = translate::flatten_param_types(&func.param_types, self)?;
+                let returns = translate::wasm_return_valtypes(&func.return_type, self)?;
+                self.types.intern(&params, &returns)
+            };
             let wasm_idx = self.add_local_function(sig);
             // A duplicate `FuncId` would silently overwrite the map
             // entry, so `Op::Call` lowering would resolve recursion /
@@ -1310,6 +1495,11 @@ impl ModuleBuilder {
     /// [`translate::translate_function`].
     pub(super) fn emit_phoenix_bodies(&mut self, ir_module: &IrModule) -> Result<(), CompileError> {
         for func in ir_module.concrete_functions() {
+            // Lockstep with `declare_phoenix_functions`'s skip — see
+            // `is_dead_placeholder_closure`.
+            if Self::is_dead_placeholder_closure(func) {
+                continue;
+            }
             let body = translate::translate_function(self, ir_module, func)?;
             self.code.function(&body);
         }
@@ -1657,6 +1847,12 @@ impl ModuleBuilder {
         module.section(&self.functions);
         module.section(&self.memories);
         module.section(&self.exports);
+        // Element section (the `(elem declare func …)` segment closure
+        // `ref.func` sites require) sits between exports and code per
+        // the section ordering. Only emitted when a segment exists.
+        if !self.elements.is_empty() {
+            module.section(&self.elements);
+        }
         // The DataCount section is REQUIRED by WASM validation when
         // any instruction references a data segment (`array.new_data`,
         // `memory.init`, `data.drop`). Validators read DataCount

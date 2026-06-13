@@ -53,6 +53,7 @@ use phoenix_ir::terminator::Terminator;
 use phoenix_ir::types::IrType;
 use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType};
 
+use super::closures;
 use super::lists;
 use super::module_builder::{self, ModuleBuilder};
 use crate::error::CompileError;
@@ -155,6 +156,19 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(builder_idx),
             })])
         }
+        IrType::ClosureRef {
+            param_types,
+            return_type,
+        } => {
+            // Nullable ref to the K.8 signature parent — call sites
+            // hold the parent and never see capture layouts.
+            let key = (param_types.clone(), (**return_type).clone());
+            let (_, parent_idx) = b.require_closure_sig(&key)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(parent_idx),
+            })])
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
              (Phase 2.4 PR 5 slices 1-3 + PR 6 slices cover Int / Bool / \
@@ -221,6 +235,11 @@ pub(super) struct FuncCtx {
     pending_locals: Vec<(u32, ValType)>,
     /// Next free WASM local index (past the function-param locals).
     next_local: u32,
+    /// The current function's `$site_F` struct index when it is a
+    /// closure function (a `ClosureAlloc` target) — the statically
+    /// known `ref.cast` target for `Op::ClosureLoadCapture`. `None`
+    /// for ordinary functions. See §Phase 2.4 K.8.
+    closure_site: Option<u32>,
     /// Per-block destination locals for non-entry blocks, in param
     /// declaration order. `Jump` / `Branch` lowering reads this to find
     /// where to copy arg values when control transfers to the block.
@@ -247,9 +266,21 @@ impl FuncCtx {
         let mut bindings = HashMap::new();
         let mut binding_types = HashMap::new();
         let mut next_local: u32 = 0;
+        let closure_site = b.closure_site_idx_if_set(func.id);
         // Entry block's params bind to function-parameter locals.
         if let Some(entry) = func.blocks.first() {
-            for (vid, ty) in &entry.params {
+            for (idx, (vid, ty)) in entry.params.iter().enumerate() {
+                // A closure function's env parameter (param 0) is the
+                // abstract `(ref null struct)` per K.8's `$fn_SIG` —
+                // not the `(ref null $clo_SIG)` the `ClosureRef`
+                // mapping would yield. The body casts it down at each
+                // `ClosureLoadCapture`.
+                if idx == 0 && closure_site.is_some() {
+                    bindings.insert(*vid, next_local);
+                    binding_types.insert(*vid, super::closures::env_valtype());
+                    next_local += 1;
+                    continue;
+                }
                 let slots = wasm_valtypes_for(ty, b)?;
                 // MVP surface is single-slot only; multi-slot types
                 // (StringRef, DynRef) land in later slices.
@@ -274,6 +305,7 @@ impl FuncCtx {
             binding_types,
             pending_locals: Vec::new(),
             next_local,
+            closure_site,
             block_param_locals: HashMap::new(),
         })
     }
@@ -368,6 +400,12 @@ impl FuncCtx {
                  (internal compiler bug)"
             ))
         })
+    }
+
+    /// The current function's closure `$site_F` index, when inside a
+    /// closure body. See [`Self::closure_site`] (the field doc).
+    pub(super) fn closure_site(&self) -> Option<u32> {
+        self.closure_site
     }
 
     fn into_function(self) -> Function {
@@ -814,6 +852,17 @@ fn translate_instruction(
             translate_struct_set(ctx, b, *obj, *field_idx, *val)
         }
         Op::ListAlloc(elems) => lists::translate_list_alloc(ctx, b, elems, instr),
+        // Closure ops — §Phase 2.4 decision K.8: per-signature subtype
+        // hierarchy over typed function references (`call_ref`).
+        Op::ClosureAlloc(target, captures) => {
+            closures::translate_closure_alloc(ctx, b, *target, captures, instr)
+        }
+        Op::CallIndirect(closure, args) => {
+            closures::translate_call_indirect(ctx, b, *closure, args, instr)
+        }
+        Op::ClosureLoadCapture(env, capture_idx) => {
+            closures::translate_closure_load_capture(ctx, b, *env, *capture_idx, instr)
+        }
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR op `{other:?}` not yet supported \
              (Phase 2.4 PR 5 slices 1-3 cover arithmetic / control \
