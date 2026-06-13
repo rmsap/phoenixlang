@@ -1,12 +1,14 @@
 # Phoenix
 
-**A strict, statically typed programming language for full-stack web development.**
+**Type-safe from database to DOM. One language, no drift.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-3%2C300%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Phoenix combines functional and object-oriented programming with a clean, familiar syntax and a focus on safe concurrency, async-first design, and developer productivity. Programs run on a tree-walk interpreter (`phoenix run`) or compile to native binaries via Cranelift (`phoenix build`), and API schemas can be code-generated to TypeScript, Python, Go, or OpenAPI.
+**Phoenix is a statically typed language for full-stack web development where one sound type system spans your whole app — database query, API endpoint, and browser — and the compiler checks every boundary between them.** Write your data model once and the compiler keeps the SQL, the serialization, the API client, and the server handler in agreement: if the two ends drift, the build fails, not production. It feels like the TypeScript and Python you already write — garbage-collected, async-first, familiar syntax — and it's safe in a way neither of them is.
+
+*Today:* a compiled language (native via Cranelift, GC, full type system, LSP) plus **Phoenix Gen**, a codegen tool that brings the type-safety story to TypeScript / Python / Go teams right now. *Coming:* typed endpoints, compile-time SQL, a WASM frontend, and refinement types — the full DB-to-DOM vision. See the [roadmap](docs/roadmap.md) and [vision](docs/vision.md).
 
 > When searching online, use **phoenixlang** to distinguish this project from the [Phoenix Framework](https://www.phoenixframework.org/) for Elixir.
 
