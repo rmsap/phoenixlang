@@ -1352,6 +1352,13 @@ fn translate_builtin_call(
         "List.contains" => lists::translate_list_contains(ctx, b, args, instr),
         "List.take" => lists::translate_list_take_drop(ctx, b, args, instr, lists::ListSlice::Take),
         "List.drop" => lists::translate_list_take_drop(ctx, b, args, instr, lists::ListSlice::Drop),
+        // Closure-taking List methods (§K.8 follow-up): each walks the
+        // receiver's array calling a user closure per element.
+        "List.map" => lists::translate_list_map(ctx, b, args, instr),
+        "List.filter" => lists::translate_list_filter(ctx, b, args, instr),
+        "List.reduce" => lists::translate_list_reduce(ctx, b, args, instr),
+        "List.flatMap" => lists::translate_list_flat_map(ctx, b, args, instr),
+        "List.sortBy" => lists::translate_list_sort_by(ctx, b, args, instr),
         "ListBuilder.alloc" => lists::translate_list_builder_alloc(ctx, b, instr),
         "ListBuilder.push" => lists::translate_list_builder_push(ctx, b, args),
         "ListBuilder.freeze" => lists::translate_list_builder_freeze(ctx, b, args, instr),

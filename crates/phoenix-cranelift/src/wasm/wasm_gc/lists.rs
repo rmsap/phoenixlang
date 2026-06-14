@@ -40,9 +40,10 @@ use wasm_encoder::{BlockType, HeapType, Instruction, RefType, ValType};
 
 use crate::error::CompileError;
 
+use super::closures::emit_closure_call;
 use super::enums::contains_generic_placeholder;
 use super::module_builder::ModuleBuilder;
-use super::translate::{FuncCtx, expect_result, wasm_valtypes_for};
+use super::translate::{FuncCtx, expect_result, single_slot, wasm_valtypes_for};
 
 /// Declare WASM-GC types for every `List<T>` / `ListBuilder<T>`
 /// instantiation in the IR module per §Phase 2.4 decision K.7.
@@ -104,10 +105,7 @@ pub(super) fn declare(
             mutable: true,
         };
         let arr_idx = builder.declare_list_array(elem_field);
-        let arr_ref = wasm_encoder::ValType::Ref(wasm_encoder::RefType {
-            nullable: true,
-            heap_type: wasm_encoder::HeapType::Concrete(arr_idx),
-        });
+        let arr_ref = arr_ref(arr_idx);
         // $list_T: both fields immutable — no list op ever struct.sets
         // a frozen list (mirrors the enum `$tag` field's immutability).
         let i64_field = wasm_encoder::FieldType {
@@ -361,10 +359,7 @@ pub(super) fn translate_list_alloc(
         array_size: elems.len() as u32,
     });
     ctx.emit(Instruction::StructNew(list_idx));
-    let wasm_ty = ValType::Ref(RefType {
-        nullable: true,
-        heap_type: HeapType::Concrete(list_idx),
-    });
+    let wasm_ty = list_ref(list_idx);
     let local = ctx.allocate_local(vid, wasm_ty);
     ctx.emit(Instruction::LocalSet(local));
     Ok(())
@@ -453,10 +448,7 @@ pub(super) fn translate_list_push(
     let (arr_idx, list_idx) = b.require_list_types(elem_ty)?;
     let list_local = ctx.binding_of(args[0])?;
     let elem_local = ctx.binding_of(args[1])?;
-    let wasm_ty = ValType::Ref(RefType {
-        nullable: true,
-        heap_type: HeapType::Concrete(list_idx),
-    });
+    let wasm_ty = list_ref(list_idx);
     // len = list.$len
     let len_local = ctx.scratch_local(ValType::I64);
     ctx.emit(Instruction::LocalGet(list_local));
@@ -640,10 +632,7 @@ pub(super) fn translate_list_take_drop(
     let (arr_idx, list_idx) = b.require_list_types(elem_ty)?;
     let list_local = ctx.binding_of(args[0])?;
     let n_local = ctx.binding_of(args[1])?;
-    let wasm_ty = ValType::Ref(RefType {
-        nullable: true,
-        heap_type: HeapType::Concrete(list_idx),
-    });
+    let wasm_ty = list_ref(list_idx);
     let result_local = ctx.allocate_local(vid, wasm_ty);
     // if n < 0 { trap } — negative slice arguments are runtime errors
     // on every backend (2026-06-10 unification).
@@ -751,10 +740,7 @@ pub(super) fn translate_list_builder_alloc(
     ctx.emit(Instruction::I32Const(8)); // initial capacity (native parity)
     ctx.emit(Instruction::ArrayNewDefault(arr_idx));
     ctx.emit(Instruction::StructNew(builder_idx));
-    let wasm_ty = ValType::Ref(RefType {
-        nullable: true,
-        heap_type: HeapType::Concrete(builder_idx),
-    });
+    let wasm_ty = list_ref(builder_idx);
     let local = ctx.allocate_local(vid, wasm_ty);
     ctx.emit(Instruction::LocalSet(local));
     Ok(())
@@ -808,11 +794,7 @@ pub(super) fn translate_list_builder_push(
     ctx.emit(Instruction::I64Eq);
     ctx.emit(Instruction::If(BlockType::Empty));
     {
-        let arr_ref_ty = ValType::Ref(RefType {
-            nullable: true,
-            heap_type: HeapType::Concrete(arr_idx),
-        });
-        let grown_local = ctx.scratch_local(arr_ref_ty);
+        let grown_local = ctx.scratch_local(arr_ref(arr_idx));
         // grown = array.new_default(capacity * 2). Capacity starts at
         // 8 and only doubles, so it is never 0 here (native's
         // saturating min-1 guard exists for a 0-capacity case this
@@ -931,11 +913,497 @@ pub(super) fn translate_list_builder_freeze(
         field_index: BUILDER_DATA,
     });
     ctx.emit(Instruction::StructNew(list_idx));
-    let wasm_ty = ValType::Ref(RefType {
-        nullable: true,
-        heap_type: HeapType::Concrete(list_idx),
-    });
+    let wasm_ty = list_ref(list_idx);
     let local = ctx.allocate_local(vid, wasm_ty);
     ctx.emit(Instruction::LocalSet(local));
     Ok(())
+}
+
+// ─────────────── K.8 follow-up: List closure methods ───────────────
+//
+// `map` / `filter` / `reduce` / `flatMap` / `sortBy` — each walks the
+// receiver's `$data` array, calling a user closure per element via the
+// K.8 env-pointer ABI (`emit_closure_call`), and builds a fresh
+// `$list_U`. No GC rooting (the host VM traces); no runtime merge
+// (decision I) — unlike wasm32-linear these are synthesized inline.
+//
+// Array indices are i32 (`array.get` / `array.set` operands); the
+// list `$len` is i64, wrapped to i32 for the loop bound. `filter`
+// relies on the K.7 invariant that `$list.$len` may be < the backing
+// array's capacity (it sizes the array at the input length and reports
+// the kept count). See §Phase 2.4 decisions K.7 / K.8.
+
+/// Receiver list facts: the `$list_T` struct index, the input `$arr_T`
+/// array index, and the element ValType — everything the
+/// closure-method walks need. Returning `list_idx` here saves each
+/// caller a second `concrete_ref_idx` lookup.
+fn recv_list(
+    ctx: &FuncCtx,
+    b: &ModuleBuilder,
+    recv: ValueId,
+    what: &str,
+) -> Result<(u32, u32, ValType), CompileError> {
+    let list_idx = concrete_ref_idx(ctx, recv, what)?;
+    let elem_ir = b
+        .list_elem_by_struct_idx(list_idx)
+        .ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: {what} receiver's struct type is not a recorded \
+                 list instantiation (internal compiler bug)"
+            ))
+        })?
+        .clone();
+    let (arr_idx, _) = b.require_list_types(&elem_ir)?;
+    let elem_vt = single_slot(&elem_ir, b, "list element")?;
+    Ok((list_idx, arr_idx, elem_vt))
+}
+
+/// Emit `dst = wrap_i32(list_local.$len)`, leaving the i32 length in
+/// `dst_local`. Reads field `$len` off the list struct; the receiver
+/// ref is non-null (Phoenix lists are always initialized), so the
+/// `struct.get` is safe — including for an empty list, whose `$len`
+/// is 0.
+fn emit_len_i32(ctx: &mut FuncCtx, list_local: u32, list_idx: u32, dst_local: u32) {
+    ctx.emit(Instruction::LocalGet(list_local));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: list_idx,
+        field_index: LIST_LEN,
+    });
+    ctx.emit(Instruction::I32WrapI64);
+    ctx.emit(Instruction::LocalSet(dst_local));
+}
+
+/// Emit `dst = list_local.$data[i]` — load element `i` of the
+/// receiver's backing array (type `arr_idx`) into scratch `dst`. The
+/// shared head of every closure-method loop body.
+fn emit_load_elem(
+    ctx: &mut FuncCtx,
+    list_local: u32,
+    list_idx: u32,
+    arr_idx: u32,
+    i: u32,
+    dst: u32,
+) {
+    ctx.emit(Instruction::LocalGet(list_local));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: list_idx,
+        field_index: LIST_DATA,
+    });
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::ArrayGet(arr_idx));
+    ctx.emit(Instruction::LocalSet(dst));
+}
+
+/// `List.map(list, f: T -> U) -> List<U>` — `out[i] = f(data[i])` over
+/// a fresh `$arr_U` of the same length.
+pub(super) fn translate_list_map(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("List.map", args, 2)?;
+    let vid = expect_result(instr, "List.map")?;
+    let (list_idx, in_arr, in_elem_vt) = recv_list(ctx, b, args[0], "`List.map`")?;
+    let list_local = ctx.binding_of(args[0])?;
+    let out_elem = list_elem_of_result(instr, "List.map")?;
+    let (out_arr, out_list) = b.require_list_types(out_elem)?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let in_scratch = ctx.scratch_local(in_elem_vt);
+    let out_arr_local = ctx.scratch_local(arr_ref(out_arr));
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    // out_arr = array.new_default $arr_U (len)
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::ArrayNewDefault(out_arr));
+    ctx.emit(Instruction::LocalSet(out_arr_local));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+
+    emit_count_loop(ctx, i, len, |ctx| {
+        emit_load_elem(ctx, list_local, list_idx, in_arr, i, in_scratch);
+        // out_arr[i] = f(in_scratch)
+        ctx.emit(Instruction::LocalGet(out_arr_local));
+        ctx.emit(Instruction::LocalGet(i));
+        emit_closure_call(ctx, b, args[1], &[in_scratch])?;
+        ctx.emit(Instruction::ArraySet(out_arr));
+        Ok(())
+    })?;
+
+    emit_wrap_list(ctx, len, out_arr_local, out_list, vid);
+    Ok(())
+}
+
+/// `List.filter(list, p: T -> Bool) -> List<T>` — keep elements where
+/// `p` holds. The output array is sized at the input length (K.7
+/// allows `$len < capacity`) and the result reports the kept count.
+pub(super) fn translate_list_filter(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("List.filter", args, 2)?;
+    let vid = expect_result(instr, "List.filter")?;
+    let (list_idx, in_arr, in_elem_vt) = recv_list(ctx, b, args[0], "`List.filter`")?;
+    let list_local = ctx.binding_of(args[0])?;
+    let out_elem = list_elem_of_result(instr, "List.filter")?;
+    let (out_arr, out_list) = b.require_list_types(out_elem)?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let count = ctx.scratch_local(ValType::I32);
+    let elem_scratch = ctx.scratch_local(in_elem_vt);
+    let out_arr_local = ctx.scratch_local(arr_ref(out_arr));
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::ArrayNewDefault(out_arr));
+    ctx.emit(Instruction::LocalSet(out_arr_local));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(count));
+
+    emit_count_loop(ctx, i, len, |ctx| {
+        emit_load_elem(ctx, list_local, list_idx, in_arr, i, elem_scratch);
+        // if p(elem) { out_arr[count] = elem; count += 1 }
+        emit_closure_call(ctx, b, args[1], &[elem_scratch])?;
+        ctx.emit(Instruction::If(BlockType::Empty));
+        ctx.emit(Instruction::LocalGet(out_arr_local));
+        ctx.emit(Instruction::LocalGet(count));
+        ctx.emit(Instruction::LocalGet(elem_scratch));
+        ctx.emit(Instruction::ArraySet(out_arr));
+        ctx.emit(Instruction::LocalGet(count));
+        ctx.emit(Instruction::I32Const(1));
+        ctx.emit(Instruction::I32Add);
+        ctx.emit(Instruction::LocalSet(count));
+        ctx.emit(Instruction::End);
+        Ok(())
+    })?;
+
+    // result = struct.new $list_T(count, out_arr) — count, not len.
+    emit_wrap_list(ctx, count, out_arr_local, out_list, vid);
+    Ok(())
+}
+
+/// `List.reduce(list, init, f: (Acc, T) -> Acc) -> Acc` — left fold.
+pub(super) fn translate_list_reduce(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("List.reduce", args, 3)?;
+    let vid = expect_result(instr, "List.reduce")?;
+    let (list_idx, in_arr, in_elem_vt) = recv_list(ctx, b, args[0], "`List.reduce`")?;
+    let list_local = ctx.binding_of(args[0])?;
+    let acc_vt = single_slot(&instr.result_type, b, "reduce accumulator")?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let elem_scratch = ctx.scratch_local(in_elem_vt);
+    let init_local = ctx.binding_of(args[1])?;
+    // The accumulator *is* the result binding: it holds the fold value
+    // each iteration and the final value at loop exit, so no trailing
+    // copy into a separate result local is needed.
+    let acc = ctx.allocate_local(vid, acc_vt);
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    ctx.emit(Instruction::LocalGet(init_local));
+    ctx.emit(Instruction::LocalSet(acc));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+
+    emit_count_loop(ctx, i, len, |ctx| {
+        emit_load_elem(ctx, list_local, list_idx, in_arr, i, elem_scratch);
+        // acc = f(acc, elem)
+        emit_closure_call(ctx, b, args[2], &[acc, elem_scratch])?;
+        ctx.emit(Instruction::LocalSet(acc));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// `List.flatMap(list, f: T -> List<U>) -> List<U>` — concatenate the
+/// per-element sublists. Each *non-empty* step reallocates the output
+/// to exactly `out_len + sub_len` and `array.copy`s the running output
+/// plus the new sublist in (O(n²) on total length, fine for the small
+/// lists the method sees; avoids a growable-buffer dance and needs only
+/// `$arr_U` / `$list_U`, both already declared for `List<U>`). Empty
+/// sublists are skipped, so they cost nothing.
+pub(super) fn translate_list_flat_map(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("List.flatMap", args, 2)?;
+    let vid = expect_result(instr, "List.flatMap")?;
+    let (list_idx, in_arr, in_elem_vt) = recv_list(ctx, b, args[0], "`List.flatMap`")?;
+    let list_local = ctx.binding_of(args[0])?;
+    let out_elem = list_elem_of_result(instr, "List.flatMap")?;
+    let (out_arr, out_list) = b.require_list_types(out_elem)?;
+    // The closure returns `List<U>`, whose `$list_U` struct is the
+    // output list type's index.
+    let sub_list_idx = out_list;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let out_len = ctx.scratch_local(ValType::I32);
+    let out_arr_local = ctx.scratch_local(arr_ref(out_arr));
+    let sub_local = ctx.scratch_local(list_ref(sub_list_idx));
+    let sub_len = ctx.scratch_local(ValType::I32);
+    let new_arr = ctx.scratch_local(arr_ref(out_arr));
+    let elem_in = ctx.scratch_local(in_elem_vt);
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    // out_arr = array.new_default $arr_U (0); out_len = 0
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::ArrayNewDefault(out_arr));
+    ctx.emit(Instruction::LocalSet(out_arr_local));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(out_len));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+
+    emit_count_loop(ctx, i, len, |ctx| {
+        // sub = f(data[i])
+        emit_load_elem(ctx, list_local, list_idx, in_arr, i, elem_in);
+        emit_closure_call(ctx, b, args[1], &[elem_in])?;
+        ctx.emit(Instruction::LocalSet(sub_local));
+        // sub_len = wrap(sub.$len)
+        ctx.emit(Instruction::LocalGet(sub_local));
+        ctx.emit(Instruction::StructGet {
+            struct_type_index: sub_list_idx,
+            field_index: LIST_LEN,
+        });
+        ctx.emit(Instruction::I32WrapI64);
+        ctx.emit(Instruction::LocalSet(sub_len));
+        // An empty sublist contributes nothing: skip the realloc +
+        // copy, which would otherwise allocate a fresh `out_len`-sized
+        // array and copy every existing element to produce an identical
+        // one. The `sparse` test hits this branch three times in a row.
+        ctx.emit(Instruction::LocalGet(sub_len));
+        ctx.emit(Instruction::If(BlockType::Empty));
+        // new = array.new_default(out_len + sub_len)
+        ctx.emit(Instruction::LocalGet(out_len));
+        ctx.emit(Instruction::LocalGet(sub_len));
+        ctx.emit(Instruction::I32Add);
+        ctx.emit(Instruction::ArrayNewDefault(out_arr));
+        ctx.emit(Instruction::LocalSet(new_arr));
+        // array.copy new[0..out_len] <- out_arr[0..out_len]
+        ctx.emit(Instruction::LocalGet(new_arr));
+        ctx.emit(Instruction::I32Const(0));
+        ctx.emit(Instruction::LocalGet(out_arr_local));
+        ctx.emit(Instruction::I32Const(0));
+        ctx.emit(Instruction::LocalGet(out_len));
+        ctx.emit(Instruction::ArrayCopy {
+            array_type_index_dst: out_arr,
+            array_type_index_src: out_arr,
+        });
+        // array.copy new[out_len..] <- sub.$data[0..sub_len]
+        ctx.emit(Instruction::LocalGet(new_arr));
+        ctx.emit(Instruction::LocalGet(out_len));
+        ctx.emit(Instruction::LocalGet(sub_local));
+        ctx.emit(Instruction::StructGet {
+            struct_type_index: sub_list_idx,
+            field_index: LIST_DATA,
+        });
+        ctx.emit(Instruction::I32Const(0));
+        ctx.emit(Instruction::LocalGet(sub_len));
+        ctx.emit(Instruction::ArrayCopy {
+            array_type_index_dst: out_arr,
+            array_type_index_src: out_arr,
+        });
+        // out_arr = new; out_len += sub_len
+        ctx.emit(Instruction::LocalGet(new_arr));
+        ctx.emit(Instruction::LocalSet(out_arr_local));
+        ctx.emit(Instruction::LocalGet(out_len));
+        ctx.emit(Instruction::LocalGet(sub_len));
+        ctx.emit(Instruction::I32Add);
+        ctx.emit(Instruction::LocalSet(out_len));
+        ctx.emit(Instruction::End); // if sub_len != 0
+        Ok(())
+    })?;
+
+    emit_wrap_list(ctx, out_len, out_arr_local, out_list, vid);
+    Ok(())
+}
+
+/// `List.sortBy(list, cmp: (T, T) -> Int) -> List<T>` — stable
+/// insertion sort (matching wasm32-linear and the interpreters; `cmp
+/// <= 0` keeps ties in input order) over a fresh copy of the input
+/// array. No GC rooting — the host VM traces the in-flight `key`.
+pub(super) fn translate_list_sort_by(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("List.sortBy", args, 2)?;
+    let vid = expect_result(instr, "List.sortBy")?;
+    let (list_idx, in_arr, elem_vt) = recv_list(ctx, b, args[0], "`List.sortBy`")?;
+    let list_local = ctx.binding_of(args[0])?;
+    let out_elem = list_elem_of_result(instr, "List.sortBy")?;
+    let (out_arr, out_list) = b.require_list_types(out_elem)?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let j = ctx.scratch_local(ValType::I32);
+    let key = ctx.scratch_local(elem_vt);
+    let cmp_a = ctx.scratch_local(elem_vt);
+    let cmp_res = ctx.scratch_local(ValType::I64);
+    let copy = ctx.scratch_local(arr_ref(out_arr));
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    // copy = array.new_default(len); array.copy copy[0..len] <- data[0..len]
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::ArrayNewDefault(out_arr));
+    ctx.emit(Instruction::LocalSet(copy));
+    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalGet(list_local));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: list_idx,
+        field_index: LIST_DATA,
+    });
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::ArrayCopy {
+        array_type_index_dst: out_arr,
+        array_type_index_src: in_arr,
+    });
+
+    // i = 1
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::LocalSet(i));
+    // outer: while i < len
+    ctx.emit(Instruction::Block(BlockType::Empty));
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::BrIf(1)); // break outer
+    // key = copy[i]
+    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::ArrayGet(out_arr));
+    ctx.emit(Instruction::LocalSet(key));
+    // j = i - 1
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Sub);
+    ctx.emit(Instruction::LocalSet(j));
+    // inner: while j >= 0 && cmp(copy[j], key) > 0: copy[j+1]=copy[j]; j--
+    ctx.emit(Instruction::Block(BlockType::Empty));
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    // j < 0 → break inner
+    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::I32LtS);
+    ctx.emit(Instruction::BrIf(1));
+    // cmp_a = copy[j]
+    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::ArrayGet(out_arr));
+    ctx.emit(Instruction::LocalSet(cmp_a));
+    // cmp_res = cmp(cmp_a, key)
+    emit_closure_call(ctx, b, args[1], &[cmp_a, key])?;
+    ctx.emit(Instruction::LocalSet(cmp_res));
+    // cmp_res <= 0 → break inner (stable)
+    ctx.emit(Instruction::LocalGet(cmp_res));
+    ctx.emit(Instruction::I64Const(0));
+    ctx.emit(Instruction::I64LeS);
+    ctx.emit(Instruction::BrIf(1));
+    // copy[j+1] = copy[j]  (cmp_a holds copy[j])
+    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalGet(cmp_a));
+    ctx.emit(Instruction::ArraySet(out_arr));
+    // j -= 1
+    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Sub);
+    ctx.emit(Instruction::LocalSet(j));
+    ctx.emit(Instruction::Br(0)); // continue inner
+    ctx.emit(Instruction::End); // loop inner
+    ctx.emit(Instruction::End); // block inner
+    // copy[j+1] = key
+    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalGet(key));
+    ctx.emit(Instruction::ArraySet(out_arr));
+    // i += 1
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalSet(i));
+    ctx.emit(Instruction::Br(0)); // continue outer
+    ctx.emit(Instruction::End); // loop outer
+    ctx.emit(Instruction::End); // block outer
+
+    emit_wrap_list(ctx, len, copy, out_list, vid);
+    Ok(())
+}
+
+/// `for i in 0..bound { body }` over an i32 counter `i` already
+/// initialized to 0, with `bound` an i32 local. The body must leave
+/// the stack balanced.
+fn emit_count_loop(
+    ctx: &mut FuncCtx,
+    i: u32,
+    bound: u32,
+    body: impl FnOnce(&mut FuncCtx) -> Result<(), CompileError>,
+) -> Result<(), CompileError> {
+    ctx.emit(Instruction::Block(BlockType::Empty));
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::LocalGet(bound));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::BrIf(1)); // break
+    body(ctx)?;
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalSet(i));
+    ctx.emit(Instruction::Br(0)); // continue
+    ctx.emit(Instruction::End); // loop
+    ctx.emit(Instruction::End); // block
+    Ok(())
+}
+
+/// `result = struct.new $list(extend_i64_u(len_i32), arr)` bound to
+/// `vid` (the standard list-producing tail).
+fn emit_wrap_list(ctx: &mut FuncCtx, len_i32: u32, arr_local: u32, list_idx: u32, vid: ValueId) {
+    ctx.emit(Instruction::LocalGet(len_i32));
+    ctx.emit(Instruction::I64ExtendI32U);
+    ctx.emit(Instruction::LocalGet(arr_local));
+    ctx.emit(Instruction::StructNew(list_idx));
+    let wasm_ty = list_ref(list_idx);
+    let local = ctx.allocate_local(vid, wasm_ty);
+    ctx.emit(Instruction::LocalSet(local));
+}
+
+/// `(ref null $arr)` ValType for an array type index.
+fn arr_ref(arr_idx: u32) -> ValType {
+    ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(arr_idx),
+    })
+}
+
+/// `(ref null $struct)` ValType for a list-family struct index —
+/// `$list_T` or the structurally-identical `$builder_T`.
+fn list_ref(list_idx: u32) -> ValType {
+    ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(list_idx),
+    })
 }

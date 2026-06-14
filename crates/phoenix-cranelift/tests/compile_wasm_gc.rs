@@ -2420,6 +2420,134 @@ fn option_result_unwrap_on_empty_traps_under_wasmtime_gc() {
     );
 }
 
+/// List closure methods (§K.8 follow-up): `map` / `filter` /
+/// `reduce` / `flatMap`. `collections.phx` exercises these too but
+/// stays matrix-skipped on `Map` (not yet lowered), so this pins them
+/// directly. Covers ref-typed elements (String) built through every
+/// method's `array.new_default` / `array.set` / `array.copy` path,
+/// `flatMap` with interleaved empty sublists, and empty-list edges.
+#[test]
+fn list_closure_methods_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xs: List<Int> = [1, 2, 3, 4, 5]\n",
+        "  let doubled = xs.map(function(x: Int) -> Int { x * 2 })\n",
+        "  let evens = doubled.filter(function(x: Int) -> Bool { x > 4 })\n",
+        "  print(evens.reduce(0, function(acc: Int, x: Int) -> Int { acc + x }))\n",
+        "  for x in evens { print(x) }\n",
+        "  let flat = xs.flatMap(function(n: Int) -> List<Int> { [n, n * 10] })\n",
+        "  print(flat.length())\n",
+        "  print(flat.get(7))\n",
+        // flatMap with interleaved empty sublists: the first three
+        // elements yield the empty list, so the running offset must
+        // survive zero-length `array.copy`s before the non-empty tail
+        // lands. `none` is captured so the empty branch has a concrete
+        // element type (a bare `[]` literal would be unconstrained).
+        "  let none: List<Int> = []\n",
+        "  let sparse = xs.flatMap(function(n: Int) -> List<Int> { if n > 3 { [n] } else { none } })\n",
+        "  print(sparse.length())\n",
+        "  print(sparse.get(0))\n",
+        "  print(sparse.get(1))\n",
+        // Ref-typed (String) elements: `map` / `filter` / `flatMap`
+        // each build a `$arr_string` whose slots are ref values.
+        "  let strs: List<String> = [\"a\", \"bb\", \"ccc\"]\n",
+        "  let same = strs.map(function(s: String) -> String { s })\n",
+        "  print(same.get(2))\n",
+        "  print(same.length())\n",
+        "  let kept = strs.filter(function(s: String) -> Bool { true })\n",
+        "  print(kept.get(1))\n",
+        "  let dup = strs.flatMap(function(s: String) -> List<String> { [s, s] })\n",
+        "  print(dup.length())\n",
+        "  print(dup.get(5))\n",
+        "  let empty: List<Int> = []\n",
+        "  print(empty.map(function(x: Int) -> Int { x }).length())\n",
+        "  print(empty.flatMap(function(x: Int) -> List<Int> { [x] }).length())\n",
+        "  print(empty.reduce(7, function(acc: Int, x: Int) -> Int { acc + x }))\n",
+        "  print(empty.filter(function(x: Int) -> Bool { x > 0 }).length())\n",
+        "}\n",
+    );
+    // sum(evens)=6+8+10=24; evens=6,8,10; flat len=10, flat[7]=40
+    // (xs[3]=4 → [4,40], index 7 = 40); sparse keeps 4,5 → len 2;
+    // strs=["a","bb","ccc"]: same.get(2)=ccc, len 3; filter-all
+    // kept.get(1)=bb; dup duplicates each → len 6, dup[5]=ccc;
+    // empty map/flatMap 0,0; empty reduce returns the init 7; empty
+    // filter keeps 0.
+    assert_prints(
+        source,
+        "list_closure_methods_wasm_gc",
+        b"24\n6\n8\n10\n10\n40\n2\n4\n5\nccc\n3\nbb\n6\nccc\n0\n0\n7\n0\n",
+    );
+}
+
+/// `List.sortBy` — stable insertion sort matching the interpreters.
+/// This pins the core shape directly under wasmtime: ascending and
+/// descending comparators, and a duplicate key (`1` twice) the sort
+/// must not drop or duplicate. Stability is *not* observable here —
+/// equal `Int`s are indistinguishable — so it isn't claimed; the
+/// `list_sortby_stable.phx` matrix fixture (now five-backend) verifies
+/// stability properly via struct-tagged paired keys.
+#[test]
+fn list_sortby_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let xs: List<Int> = [3, 1, 4, 1, 5, 9, 2, 6]\n",
+        "  let sorted = xs.sortBy(function(a: Int, b: Int) -> Int { a - b })\n",
+        "  for x in sorted { print(x) }\n",
+        "  let desc = xs.sortBy(function(a: Int, b: Int) -> Int { b - a })\n",
+        "  print(desc.get(0))\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "list_sortby_core_wasm_gc",
+        b"1\n1\n2\n3\n4\n5\n6\n9\n9\n",
+    );
+}
+
+/// `List.reduce` with a *ref-typed* accumulator. The `list_closure_methods`
+/// test only folds into `Int` (an i64 slot), so the accumulator's
+/// `single_slot(result_type)` resolution and `allocate_local` are never
+/// exercised on a ref slot. `collections.phx` — which would — stays
+/// matrix-skipped on `Map`. This pins both ref-accumulator shapes:
+/// folding a `List<String>` into a single `String` (the closure threads
+/// the running `String` through `+`), and folding a `List<Int>` into a
+/// fresh `List<Int>` (the accumulator is itself a GC `$list` ref, rebuilt
+/// each step via `push`). Empty-list folds return the seed unchanged,
+/// confirming the loop-skipped path leaves the ref init in place.
+#[test]
+fn list_reduce_ref_accumulator_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        // String accumulator: acc is a ref slot threaded through `+`.
+        "  let strs: List<String> = [\"a\", \"bb\", \"ccc\"]\n",
+        "  let joined = strs.reduce(\"\", function(acc: String, s: String) -> String { acc + s })\n",
+        "  print(joined)\n",
+        // List<Int> accumulator: acc is a `$list_Int` ref, rebuilt each
+        // step. `push` returns a fresh list (Phoenix lists are immutable),
+        // so the fold reconstructs [10, 20, 30] in order.
+        "  let xs: List<Int> = [10, 20, 30]\n",
+        "  let seed: List<Int> = []\n",
+        "  let rebuilt = xs.reduce(seed, function(acc: List<Int>, x: Int) -> List<Int> { acc.push(x) })\n",
+        "  print(rebuilt.length())\n",
+        "  for v in rebuilt { print(v) }\n",
+        // Empty-list folds: the loop never runs, so the ref seed is
+        // returned untouched (the empty String, and the empty seed list).
+        "  let none: List<String> = []\n",
+        "  print(none.reduce(\"seed\", function(acc: String, s: String) -> String { acc + s }))\n",
+        "  let noints: List<Int> = []\n",
+        "  print(noints.reduce(seed, function(acc: List<Int>, x: Int) -> List<Int> { acc.push(x) }).length())\n",
+        "}\n",
+    );
+    // joined = "a"+"bb"+"ccc" = abbccc; rebuilt = [10,20,30] (len 3);
+    // empty String fold returns the "seed" init; empty List fold returns
+    // the empty seed (length 0).
+    assert_prints(
+        source,
+        "list_reduce_ref_accumulator_wasm_gc",
+        b"abbccc\n3\n10\n20\n30\nseed\n0\n",
+    );
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
 /// inline-synthesis decision: a module that never prints a Float —
 /// and never `toString`s one, the second trigger for the formatter

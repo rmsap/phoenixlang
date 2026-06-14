@@ -119,7 +119,7 @@ backend_matrix_test!(matrix_traits_dyn_ret, "traits_dyn_ret.phx", skip_wasm_gc: 
 // which the other dyn fixtures (locals / params / fields / elements)
 // never exercise.
 backend_matrix_test!(matrix_traits_dyn_factory, "traits_dyn_factory.phx", skip_wasm_gc: "`dyn Trait` is not lowered on wasm32-gc yet");
-backend_matrix_test!(matrix_collections, "collections.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
+backend_matrix_test!(matrix_collections, "collections.phx", skip_wasm_gc: "maps (`Op::MapAlloc`) are not lowered on wasm32-gc yet (the List closure methods it uses now lower; maps are the last blocker)");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 // The four stdlib-enum discriminant predicates (`Result.isOk`/`isErr`,
@@ -155,11 +155,17 @@ backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
 backend_matrix_test!(matrix_defer_basic, "defer_basic.phx");
 backend_matrix_test!(matrix_defer_explicit_return, "defer_explicit_return.phx");
 backend_matrix_test!(matrix_map_hash_many_keys, "map_hash_many_keys.phx", skip_wasm_gc: "maps (`Op::MapAlloc`) are not lowered on wasm32-gc yet");
-backend_matrix_test!(matrix_list_sortby_merge, "list_sortby_merge.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_list_sortby_alloc_comparator, "list_sortby_alloc_comparator.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_list_sortby_edge_lengths, "list_sortby_edge_lengths.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_list_sortby_strings, "list_sortby_strings.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_list_sortby_stable, "list_sortby_stable.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
+backend_matrix_test!(matrix_list_sortby_merge, "list_sortby_merge.phx");
+backend_matrix_test!(
+    matrix_list_sortby_alloc_comparator,
+    "list_sortby_alloc_comparator.phx"
+);
+backend_matrix_test!(
+    matrix_list_sortby_edge_lengths,
+    "list_sortby_edge_lengths.phx"
+);
+backend_matrix_test!(matrix_list_sortby_strings, "list_sortby_strings.phx");
+backend_matrix_test!(matrix_list_sortby_stable, "list_sortby_stable.phx");
 backend_matrix_test!(matrix_defer_lazy_capture, "defer_lazy_capture.phx");
 backend_matrix_test!(matrix_defer_method, "defer_method.phx");
 backend_matrix_test!(matrix_defer_heap, "defer_heap.phx");
