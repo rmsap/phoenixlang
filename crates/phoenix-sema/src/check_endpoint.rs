@@ -3137,8 +3137,8 @@ mod tests {
     fn envelope_collision_multi_status_response_rejected() {
         assert_has_error(
             r#"
-            struct User { Int id }
-            struct UpsertUserResponse { Int x }
+            struct User { id: Int }
+            struct UpsertUserResponse { x: Int }
             endpoint upsertUser: PUT "/u/{id}" {
                 response { 200: User  201: User }
             }
@@ -3151,8 +3151,8 @@ mod tests {
     fn envelope_collision_pagination_page_rejected() {
         assert_has_error(
             r#"
-            struct Post { Int id }
-            struct ListPostsPage { Int x }
+            struct Post { id: Int }
+            struct ListPostsPage { x: Int }
             endpoint listPosts: GET "/p" {
                 response List<Post>
                 pagination { offset }
@@ -3166,10 +3166,10 @@ mod tests {
     fn envelope_collision_response_headers_result_rejected() {
         assert_has_error(
             r#"
-            struct User { Int id }
-            struct GetUserResult { Int x }
+            struct User { id: Int }
+            struct GetUserResult { x: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             "#,
             "collides with a user-defined type",
@@ -3181,7 +3181,7 @@ mod tests {
         // The collision check covers enums too, not just structs.
         assert_has_error(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             enum ListPostsPage { A  B }
             endpoint listPosts: GET "/p" {
                 response List<Post>
@@ -3198,8 +3198,8 @@ mod tests {
         // pagination; a like-named struct alongside a plain endpoint is fine.
         assert_no_errors(
             r#"
-            struct Post { Int id }
-            struct ListPostsPage { Int x }
+            struct Post { id: Int }
+            struct ListPostsPage { x: Int }
             endpoint listPosts: GET "/p" {
                 response List<Post>
             }
@@ -3214,12 +3214,12 @@ mod tests {
         // `GetUserResult` type collision is the same mistake, suppressed.
         let errors = check_source(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             endpoint GetUser: GET "/uu/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             "#,
         );
@@ -3246,7 +3246,7 @@ mod tests {
         // generates a single type.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/u/{id}" {
                 response User
             }
@@ -3265,7 +3265,7 @@ mod tests {
         // check must not over-reject by comparing full-lowercased names.
         assert_no_errors(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/u/{id}" {
                 response User
             }
@@ -3280,12 +3280,12 @@ mod tests {
     fn distinct_endpoint_envelopes_do_not_collide() {
         assert_no_errors(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             endpoint getAdmin: GET "/a/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             "#,
         );
@@ -3299,12 +3299,12 @@ mod tests {
         // declaration either.
         let errors = check_source(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             endpoint getUser: GET "/uu/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             "#,
         );
@@ -3334,13 +3334,13 @@ mod tests {
         // mistake, already diagnosed as such.
         let errors = check_source(
             r#"
-            struct User { Int id }
-            struct GetUserResult { Int x }
+            struct User { id: Int }
+            struct GetUserResult { x: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             endpoint getUser: GET "/uu/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             "#,
         );
@@ -3363,13 +3363,13 @@ mod tests {
         // mistake already diagnosed.
         let errors = check_source(
             r#"
-            struct User { Int id }
-            struct GetUserResult { Int x }
+            struct User { id: Int }
+            struct GetUserResult { x: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             endpoint GetUser: GET "/uu/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             "#,
         );
@@ -3396,10 +3396,10 @@ mod tests {
         // a single name-level diagnostic — not a double report, not a crash.
         let errors = check_source(
             r#"
-            struct User { Int id }
-            struct GetUserBody { Int x }
+            struct User { id: Int }
+            struct GetUserBody { x: Int }
             endpoint getUser: GET "/u/{id}" {
-                response User headers { Int total as "X-Total" }
+                response User headers { total: Int as "X-Total" }
             }
             endpoint GetUser: POST "/uu/{id}" {
                 body User
@@ -3427,8 +3427,8 @@ mod tests {
         // Any `body` clause generates `<Endpoint>Body` in every backend.
         assert_has_error(
             r#"
-            struct User { Int id }
-            struct CreateUserBody { Int x }
+            struct User { id: Int }
+            struct CreateUserBody { x: Int }
             endpoint createUser: POST "/u" {
                 body User
             }
@@ -3442,8 +3442,8 @@ mod tests {
         // A multipart body additionally generates `<Endpoint>ClientBody` (Go).
         assert_has_error(
             r#"
-            struct AvatarUpload { File avatar  String caption }
-            struct UploadAvatarClientBody { Int x }
+            struct AvatarUpload { avatar: File  caption: String }
+            struct UploadAvatarClientBody { x: Int }
             endpoint uploadAvatar: POST "/api/avatar" {
                 body AvatarUpload
             }
@@ -3458,8 +3458,8 @@ mod tests {
         // body; a like-named struct alongside a bodyless endpoint is fine.
         assert_no_errors(
             r#"
-            struct User { Int id }
-            struct CreateUserBody { Int x }
+            struct User { id: Int }
+            struct CreateUserBody { x: Int }
             endpoint createUser: POST "/u" {
                 response User
             }
@@ -3473,8 +3473,8 @@ mod tests {
         // plain JSON body does not claim it.
         assert_no_errors(
             r#"
-            struct User { Int id }
-            struct CreateUserClientBody { Int x }
+            struct User { id: Int }
+            struct CreateUserClientBody { x: Int }
             endpoint createUser: POST "/u" {
                 body User
             }
@@ -3491,7 +3491,7 @@ mod tests {
         // method/handler name before any type is even considered.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint createUser: POST "/u" {
                 body User
             }
@@ -3510,8 +3510,8 @@ mod tests {
         // `<Endpoint>Body`, and a user type colliding with either is rejected.
         assert_has_error(
             r#"
-            struct User { Int id }
-            struct UpsertUserBody { Int x }
+            struct User { id: Int }
+            struct UpsertUserBody { x: Int }
             endpoint upsertUser: PUT "/u/{id}" {
                 body User
                 response { 200: User  201: User }
@@ -3530,7 +3530,7 @@ mod tests {
         // collision suppressed as the same mistake.
         let errors = check_source(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint upsertUser: PUT "/u/{id}" {
                 body User
                 response { 200: User  201: User }
@@ -3564,7 +3564,7 @@ mod tests {
         // `ListPostsPage` type collision is suppressed.
         let errors = check_source(
             r#"
-            struct Post { Int id }
+            struct Post { id: Int }
             endpoint listPosts: GET "/p" {
                 response List<Post>
                 pagination { offset }
@@ -3598,8 +3598,8 @@ mod tests {
         // the other's struct.
         assert_has_error(
             r#"
-            struct FileDoc { File data }
-            struct Note { String text }
+            struct FileDoc { data: File }
+            struct Note { text: String }
             endpoint upload: POST "/up" {
                 body FileDoc
             }
@@ -3618,8 +3618,8 @@ mod tests {
         // `ClientBody` is the late claimant.
         assert_has_error(
             r#"
-            struct FileDoc { File data }
-            struct Note { String text }
+            struct FileDoc { data: File }
+            struct Note { text: String }
             endpoint uploadClient: POST "/upc" {
                 body Note
             }
@@ -3642,8 +3642,8 @@ mod tests {
         // `UploadBody` hit, which the name-level error already covers.
         let errors = check_source(
             r#"
-            struct FileDoc { File data }
-            struct Note { String text }
+            struct FileDoc { data: File }
+            struct Note { text: String }
             endpoint Upload: POST "/a" {
                 body Note
             }
@@ -3684,11 +3684,11 @@ mod tests {
         // `lookup_struct` call relies on.
         assert_has_error(
             r#"
-            struct User { Int id }
+            struct User { id: Int }
             endpoint upsertUser: PUT "/u/{id}" {
                 response { 200: User  201: User }
             }
-            struct UpsertUserResponse { Int x }
+            struct UpsertUserResponse { x: Int }
             "#,
             "collides with a user-defined type",
         );
@@ -3703,8 +3703,8 @@ mod tests {
         // in the generated output.
         assert_has_error(
             r#"
-            struct FileUpload { Int x }
-            struct Doc { File data }
+            struct FileUpload { x: Int }
+            struct Doc { data: File }
             endpoint upload: POST "/up" {
                 body Doc
             }
@@ -3719,8 +3719,8 @@ mod tests {
         // plain JSON body the name is free.
         assert_no_errors(
             r#"
-            struct FileUpload { Int x }
-            struct Note { String text }
+            struct FileUpload { x: Int }
+            struct Note { text: String }
             endpoint create: POST "/n" {
                 body Note
             }
@@ -3735,8 +3735,8 @@ mod tests {
         // first multipart endpoint, not one per endpoint.
         let errors = check_source(
             r#"
-            struct FileUpload { Int x }
-            struct Doc { File data }
+            struct FileUpload { x: Int }
+            struct Doc { data: File }
             endpoint upload: POST "/a" {
                 body Doc
             }
@@ -3765,9 +3765,9 @@ mod tests {
         // a double report.
         let errors = check_source(
             r#"
-            struct FileUpload { Int x }
-            struct Note { String text }
-            struct Doc { File data }
+            struct FileUpload { x: Int }
+            struct Note { text: String }
+            struct Doc { data: File }
             endpoint upload: POST "/a" {
                 body Note
             }
