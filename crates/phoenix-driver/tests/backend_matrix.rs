@@ -211,9 +211,23 @@ backend_matrix_test!(
     "closures_over_generic_cross_width.phx"
 );
 
-/// Tripwire: every `tests/fixtures/*.phx` outside the two excluded
-/// families documented in the module header (`gen_*.phx`,
-/// `wasm_gc_*.phx`) must have a `backend_matrix_test!` entry above.
+/// The realistic schema library — inputs to `phoenix gen`/`phoenix check`,
+/// not runnable stdout-producing programs, so they're outside the matrix.
+/// Guarded by `gen_schema_fixtures.rs` instead (its `check_*` tests). Keep
+/// in sync with that suite's fixture list.
+const SCHEMA_LIBRARY: &[&str] = &[
+    "payments.phx",
+    "multitenant_saas.phx",
+    "webhooks.phx",
+    "file_storage.phx",
+    "social.phx",
+    "internal_admin.phx",
+];
+
+/// Tripwire: every `tests/fixtures/*.phx` outside the three excluded
+/// families documented in the module header (`gen_*.phx`, the realistic
+/// schema library guarded by `gen_schema_fixtures.rs`, and `wasm_gc_*.phx`)
+/// must have a `backend_matrix_test!` entry above.
 /// The registered set is checked by scanning this file's own source
 /// for the quoted fixture name, so a fixture dropped into the
 /// directory without an entry fails here instead of silently getting
@@ -229,7 +243,11 @@ fn every_fixture_has_a_matrix_entry() {
             continue;
         }
         let name = entry.file_name().into_string().unwrap();
-        if !name.ends_with(".phx") || name.starts_with("gen_") || name.starts_with("wasm_gc_") {
+        if !name.ends_with(".phx")
+            || name.starts_with("gen_")
+            || name.starts_with("wasm_gc_")
+            || SCHEMA_LIBRARY.contains(&name.as_str())
+        {
             continue;
         }
         if !src.contains(&format!("\"{name}\"")) {
