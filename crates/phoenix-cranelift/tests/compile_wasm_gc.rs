@@ -2274,6 +2274,152 @@ fn multi_arg_closure_runs_under_wasmtime_gc() {
     assert_prints(source, "closures_multi_arg_wasm_gc", b"42\n");
 }
 
+/// Option/Result method builtins (the `option_result.phx` surface):
+/// `map` / `andThen` (closure-taking, via K.8), `unwrap` / `unwrapOr`,
+/// and the `isOk` / `isErr` predicates. Output must match the other
+/// backends byte-for-byte — the methods lower in terms of the K.4 enum
+/// representation, so this also exercises the partial-generic enum
+/// resolution that `divide`'s `Ok`/`Err` join needs.
+#[test]
+fn option_result_builtins_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function divide(a: Int, b: Int) -> Result<Int, String> {\n",
+        "  if b == 0 { Err(\"div by zero\") } else { Ok(a / b) }\n",
+        "}\n",
+        "function main() {\n",
+        "  let some: Option<Int> = Some(10)\n",
+        "  let none: Option<Int> = None\n",
+        "  print(some.map(function(x: Int) -> Int { x + 1 }).unwrap())\n",
+        "  print(none.unwrapOr(-1))\n",
+        "  print(some.andThen(function(x: Int) -> Option<Int> {\n",
+        "    if x > 5 { Some(x * 2) } else { None }\n",
+        "  }).unwrap())\n",
+        "  let ok = divide(20, 4)\n",
+        "  let err = divide(1, 0)\n",
+        "  print(ok.unwrap())\n",
+        "  print(err.unwrapOr(0))\n",
+        "  print(ok.map(function(x: Int) -> Int { x * 10 }).unwrap())\n",
+        "  print(err.andThen(function(x: Int) -> Result<Int, String> { Ok(x + 1) }).unwrapOr(-99))\n",
+        "  print(ok.isOk())\n",
+        "  print(err.isErr())\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "option_result_builtins_wasm_gc",
+        b"11\n-1\n20\n5\n0\n50\n-99\ntrue\ntrue\n",
+    );
+}
+
+/// Type-changing `map`: the closure's return type differs from the
+/// receiver's payload, so the result is a *distinct* WASM enum
+/// (`Option<Int>` → `Option<Bool>`, `Result<Int, String>` →
+/// `Result<Bool, String>`). This is the path `option_result.rs`'s
+/// rebuild logic exists for — the positive side `struct.new`s into the
+/// output variant, and the `Err`/`None` negative side rebuilds into the
+/// output enum rather than handing back the receiver ref (a different
+/// nominal type), carrying the `Err` payload across for `Result`. Kept
+/// separate from `option_result_builtins_run_under_wasmtime_gc` because
+/// that fixture's `divide` introduces a partial-generic
+/// `Result<__generic, String>` whose unique-sibling resolution would be
+/// ambiguated by a second concrete `Result<_, String>` instantiation.
+#[test]
+fn option_result_map_type_change_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let some: Option<Int> = Some(10)\n",
+        "  let none: Option<Int> = None\n",
+        "  let ok: Result<Int, String> = Ok(7)\n",
+        "  let err: Result<Int, String> = Err(\"boom\")\n",
+        // Positive side: payload Int → Bool, distinct output enum.
+        "  print(some.map(function(x: Int) -> Bool { x > 5 }).unwrap())\n",
+        "  print(ok.map(function(x: Int) -> Bool { x > 100 }).unwrap())\n",
+        // Negative side: rebuild None/Err into the distinct output enum
+        // (Err carries its String payload across).
+        "  print(none.map(function(x: Int) -> Bool { x > 0 }).unwrapOr(true))\n",
+        "  print(err.map(function(x: Int) -> Bool { x > 0 }).unwrapOr(false))\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "option_result_map_type_change_wasm_gc",
+        b"true\nfalse\ntrue\nfalse\n",
+    );
+}
+
+/// `None.andThen(...)` — the one negative-rebuild combination the other
+/// fixtures miss. `map`'s `None` path is covered by
+/// `option_result_map_type_change`, and `andThen`'s negative path is
+/// covered for `Result` (`err.andThen`), but `Option`'s payload-free
+/// `None` rebuild through `andThen` (`emit_negative_rebuild` with
+/// `negative_has_payload == false`) was never exercised. The closure
+/// returns `Some`, so `unwrapOr(-1)` yielding `-1` proves the closure
+/// was skipped and `None` was rebuilt rather than the closure's result
+/// flowing through. Same-type (`Option<Int>` → `Option<Int>`) so it
+/// stays clear of partial-generic resolution.
+#[test]
+fn option_none_and_then_rebuilds_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let none: Option<Int> = None\n",
+        "  print(none.andThen(function(x: Int) -> Option<Int> { Some(x * 2) }).unwrapOr(-1))\n",
+        "}\n",
+    );
+    assert_prints(source, "option_none_and_then_wasm_gc", b"-1\n");
+}
+
+/// The `Err` payload `E` must cross `map` / `andThen`'s negative
+/// rebuild *intact* — not just structurally (wasmtime would reject a
+/// wrong-typed field), but value-for-value. The other Option/Result
+/// tests only ever `unwrapOr` the rebuilt `Err`, discarding the
+/// payload; here we `match` it back out and print the carried string,
+/// so a rebuild that copied the wrong field (or a stale local) would
+/// surface as wrong output rather than passing silently.
+#[test]
+fn option_result_err_payload_survives_rebuild_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let err: Result<Int, String> = Err(\"boom\")\n",
+        // Type-changing map (Result<Int,String> → Result<Bool,String>):
+        // the Err payload is extracted and re-wrapped in the output enum.
+        "  match err.map(function(x: Int) -> Bool { x > 0 }) {\n",
+        "    Ok(b) -> print(\"unexpected-ok\")\n",
+        "    Err(e) -> print(e)\n",
+        "  }\n",
+        // andThen on Err carries the payload through unchanged.
+        "  match err.andThen(function(x: Int) -> Result<Int, String> { Ok(x + 1) }) {\n",
+        "    Ok(n) -> print(\"unexpected-ok\")\n",
+        "    Err(e) -> print(e)\n",
+        "  }\n",
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "option_result_err_payload_survives_wasm_gc",
+        b"boom\nboom\n",
+    );
+}
+
+/// `unwrap()` on `None` / `Err` traps (the wasm32-gc panic
+/// convention), matching the interpreters' `called unwrap() on
+/// None`/`Err` runtime error as a non-zero exit.
+#[test]
+fn option_result_unwrap_on_empty_traps_under_wasmtime_gc() {
+    assert_traps(
+        "function main() {\n  let n: Option<Int> = None\n  print(n.unwrap())\n}\n",
+        "option_unwrap_none_wasm_gc",
+    );
+    assert_traps(
+        concat!(
+            "function divide(a: Int, b: Int) -> Result<Int, String> {\n",
+            "  if b == 0 { Err(\"x\") } else { Ok(a / b) }\n",
+            "}\n",
+            "function main() {\n  print(divide(1, 0).unwrap())\n}\n",
+        ),
+        "result_unwrap_err_wasm_gc",
+    );
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
 /// inline-synthesis decision: a module that never prints a Float —
 /// and never `toString`s one, the second trigger for the formatter

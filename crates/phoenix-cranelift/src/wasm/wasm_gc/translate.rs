@@ -56,6 +56,7 @@ use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType}
 use super::closures;
 use super::lists;
 use super::module_builder::{self, ModuleBuilder};
+use super::option_result;
 use crate::error::CompileError;
 
 /// Does any concrete function call the `print` builtin? The `fd_write`
@@ -1162,7 +1163,7 @@ fn translate_enum_get_field(
 /// [`struct_idx_of_binding`]: enum values are bound at their parent
 /// type, so the binding's `ValType` carries
 /// `HeapType::Concrete(parent_idx)` directly.
-fn enum_parent_idx_of_binding(
+pub(super) fn enum_parent_idx_of_binding(
     ctx: &FuncCtx,
     vid: ValueId,
     label: &str,
@@ -1335,6 +1336,16 @@ fn translate_builtin_call(
         "String.length" => translate_string_length(ctx, b, args, instr),
         "String.substring" => translate_string_substring(ctx, b, args, instr),
         "toString" => translate_to_string(ctx, b, args, instr),
+        // Option/Result method builtins (`Option.map`, `Result.unwrap`,
+        // …) — lowered in terms of the K.4 enum representation + K.8
+        // closure calls. Dispatched by template prefix so the
+        // per-method routing lives in `option_result.rs`.
+        _ if name.starts_with("Option.") || name.starts_with("Result.") => {
+            let (enum_name, method) = name
+                .split_once('.')
+                .expect("name starts with `Option.`/`Result.`");
+            option_result::translate_builtin(ctx, b, enum_name, method, args, instr)
+        }
         "List.length" => lists::translate_list_length(ctx, args, instr),
         "List.get" => lists::translate_list_get(ctx, b, args, instr),
         "List.push" => lists::translate_list_push(ctx, b, args, instr),
@@ -1806,7 +1817,11 @@ pub(super) fn expect_result(
     })
 }
 
-fn single_slot(ty: &IrType, b: &ModuleBuilder, label: &str) -> Result<ValType, CompileError> {
+pub(super) fn single_slot(
+    ty: &IrType,
+    b: &ModuleBuilder,
+    label: &str,
+) -> Result<ValType, CompileError> {
     let slots = wasm_valtypes_for(ty, b)?;
     if slots.len() != 1 {
         return Err(CompileError::new(format!(

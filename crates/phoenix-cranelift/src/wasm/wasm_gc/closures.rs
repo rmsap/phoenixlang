@@ -376,38 +376,11 @@ pub(super) fn translate_call_indirect(
     args: &[ValueId],
     instr: &phoenix_ir::instruction::Instruction,
 ) -> Result<(), CompileError> {
-    let clo_local = ctx.binding_of(closure)?;
-    let parent_idx = match ctx.binding_type_of(closure)? {
-        ValType::Ref(RefType {
-            heap_type: HeapType::Concrete(idx),
-            ..
-        }) => idx,
-        other => {
-            return Err(CompileError::new(format!(
-                "wasm32-gc: `Op::CallIndirect` receiver lowered to `{other:?}`, \
-                 expected a closure parent ref (internal compiler bug)"
-            )));
-        }
-    };
-    let fn_type_idx = b.closure_fn_by_parent(parent_idx).ok_or_else(|| {
-        CompileError::new(
-            "wasm32-gc: `Op::CallIndirect` receiver's struct type is not a \
-             recorded closure signature parent (internal compiler bug)"
-                .to_string(),
-        )
-    })?;
-    // env, user args, then the function reference.
-    ctx.emit(Instruction::LocalGet(clo_local));
-    for arg in args {
-        let local = ctx.binding_of(*arg)?;
-        ctx.emit(Instruction::LocalGet(local));
-    }
-    ctx.emit(Instruction::LocalGet(clo_local));
-    ctx.emit(Instruction::StructGet {
-        struct_type_index: parent_idx,
-        field_index: CLO_CODE,
-    });
-    ctx.emit(Instruction::CallRef(fn_type_idx));
+    let arg_locals = args
+        .iter()
+        .map(|a| ctx.binding_of(*a))
+        .collect::<Result<Vec<_>, _>>()?;
+    emit_closure_call(ctx, b, closure, &arg_locals)?;
     match (instr.result, &instr.result_type) {
         (Some(_), IrType::Void) => Err(CompileError::new(
             "wasm32-gc: `Op::CallIndirect` has a result binding but a Void \
@@ -426,6 +399,58 @@ pub(super) fn translate_call_indirect(
              binding (internal compiler bug)"
         ))),
     }
+}
+
+/// Emit a `call_ref` to the closure bound to `closure`, taking the
+/// arguments already staged in `arg_locals` (in user-parameter
+/// order), and leaving the call's result on the WASM stack. Factored
+/// out of `translate_call_indirect` so the Option/Result closure
+/// builtins (`map` / `andThen`) can invoke a user closure on an
+/// extracted payload without a synthetic `Op::CallIndirect`.
+///
+/// Stack effect: pushes nothing it doesn't consume except the single
+/// result value — so a caller may push an enum discriminant *before*
+/// calling this and `struct.new` *after*, with the discriminant
+/// surviving underneath (the env-pointer ABI's `call_ref` consumes
+/// only env + args + funcref from the top).
+pub(super) fn emit_closure_call(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    closure: ValueId,
+    arg_locals: &[u32],
+) -> Result<(), CompileError> {
+    let clo_local = ctx.binding_of(closure)?;
+    let parent_idx = match ctx.binding_type_of(closure)? {
+        ValType::Ref(RefType {
+            heap_type: HeapType::Concrete(idx),
+            ..
+        }) => idx,
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc: closure call receiver lowered to `{other:?}`, \
+                 expected a closure parent ref (internal compiler bug)"
+            )));
+        }
+    };
+    let fn_type_idx = b.closure_fn_by_parent(parent_idx).ok_or_else(|| {
+        CompileError::new(
+            "wasm32-gc: closure call receiver's struct type is not a recorded \
+             closure signature parent (internal compiler bug)"
+                .to_string(),
+        )
+    })?;
+    // env, user args, then the function reference (the env-pointer ABI).
+    ctx.emit(Instruction::LocalGet(clo_local));
+    for &local in arg_locals {
+        ctx.emit(Instruction::LocalGet(local));
+    }
+    ctx.emit(Instruction::LocalGet(clo_local));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: parent_idx,
+        field_index: CLO_CODE,
+    });
+    ctx.emit(Instruction::CallRef(fn_type_idx));
+    Ok(())
 }
 
 /// `Op::ClosureLoadCapture(env, idx)` — `ref.cast` the abstract env

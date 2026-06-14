@@ -120,7 +120,7 @@ backend_matrix_test!(matrix_traits_dyn_ret, "traits_dyn_ret.phx", skip_wasm_gc: 
 // never exercise.
 backend_matrix_test!(matrix_traits_dyn_factory, "traits_dyn_factory.phx", skip_wasm_gc: "`dyn Trait` is not lowered on wasm32-gc yet");
 backend_matrix_test!(matrix_collections, "collections.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
-backend_matrix_test!(matrix_option_result, "option_result.phx", skip_wasm_gc: "closures (`ClosureRef`) are not lowered on wasm32-gc yet (K.8 pending)");
+backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 // The four stdlib-enum discriminant predicates (`Result.isOk`/`isErr`,
 // `Option.isSome`/`isNone`) on both variants of each enum. Already
@@ -164,7 +164,7 @@ backend_matrix_test!(matrix_defer_lazy_capture, "defer_lazy_capture.phx");
 backend_matrix_test!(matrix_defer_method, "defer_method.phx");
 backend_matrix_test!(matrix_defer_heap, "defer_heap.phx");
 backend_matrix_test!(matrix_defer_closure, "defer_closure.phx");
-backend_matrix_test!(matrix_defer_try, "defer_try.phx", skip_wasm_gc: "`Result` instantiation with an unresolved generic type arg (K.4 known limitation) fails wasm32-gc enum declaration");
+backend_matrix_test!(matrix_defer_try, "defer_try.phx");
 backend_matrix_test!(matrix_defer_multiple_returns, "defer_multiple_returns.phx");
 backend_matrix_test!(
     matrix_defer_shadowed_at_return,

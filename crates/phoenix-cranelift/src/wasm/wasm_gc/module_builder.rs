@@ -167,6 +167,43 @@ const MEMORY_PAGES: u64 = 1;
 /// build here, not trap at runtime.
 const _: () = assert!(RYU_TABLES_END <= MEMORY_PAGES as u32 * 65536);
 
+/// Outcome of [`ModuleBuilder::canonical_enum_key`]: either a concrete
+/// `(name, type_args)` to look up in `phx_enums`, or a placeholder-bearing
+/// key that matched no *unique* concrete sibling (the count distinguishes
+/// "missing" from "genuinely ambiguous" in the caller's diagnostic).
+enum EnumKeyResolution {
+    Concrete(EnumInstantiationKey),
+    Ambiguous { sibling_count: usize },
+}
+
+/// Diagnostic for a partially-generic enum key that didn't resolve to a
+/// unique concrete sibling. `sibling_count == 0` is the K.4 known
+/// limitation (no declared instantiation pins the placeholder slot);
+/// `>= 2` is reachable from *user* code — a partial-generic `Result`
+/// plus two concrete `Result<_, SameE>` instantiations — so it's called
+/// out distinctly rather than buried under "internal compiler bug".
+fn ambiguous_enum_key_error(
+    name: &str,
+    type_args: &[IrType],
+    sibling_count: usize,
+) -> CompileError {
+    if sibling_count == 0 {
+        CompileError::new(format!(
+            "wasm32-gc: partially-generic enum key `{name}{type_args:?}` has no \
+             concrete sibling instantiation to resolve its `__generic` slot(s) \
+             against — the enum-collection pass declared no matching \
+             `{name}<…>` (K.4 partial-generic limitation)"
+        ))
+    } else {
+        CompileError::new(format!(
+            "wasm32-gc: partially-generic enum key `{name}{type_args:?}` is \
+             ambiguous — {sibling_count} concrete sibling instantiations share \
+             its non-placeholder slot(s), so the `__generic` slot(s) can't be \
+             pinned to a unique nominal type (K.4 partial-generic limitation)"
+        ))
+    }
+}
+
 pub(super) struct ModuleBuilder {
     /// Function-signature interning. Shared with the wasm32-linear
     /// backend via `super::super::type_interner` — dedup is target-
@@ -772,18 +809,78 @@ impl ModuleBuilder {
         &self.phx_structs
     }
 
+    /// Resolve a possibly-partially-generic enum key to the concrete
+    /// instantiation it denotes. A type-arg slot may carry the
+    /// `__generic` placeholder when sema's branch-join inference
+    /// couldn't pin it — e.g. a `Result`-returning function whose
+    /// `Err` branch leaves the `T` slot unconstrained widens the join
+    /// block param to `Result<__generic, E>`. Such a key has no
+    /// declared nominal type (the K.4 collection skips placeholder
+    /// instantiations), but at runtime it *is* the unique concrete
+    /// `Result<T, E>` the program declares with the same `E`. This
+    /// finds that sibling: same name and arity, every non-placeholder
+    /// slot equal, no placeholders of its own. See §Phase 2.4 decision
+    /// K.4 (partial-generic resolution, 2026-06-12).
+    ///
+    /// A query slot is treated as a wildcard whenever it *contains* a
+    /// placeholder anywhere — including nested, e.g. `List<__generic>` —
+    /// not only when the slot is exactly `__generic`. That intentionally
+    /// widens what counts as a sibling; the current Option/Result
+    /// surface only ever produces top-level `__generic` slots, but the
+    /// nested case is wildcarded so deeper partial keys resolve the same
+    /// way rather than failing to match.
+    ///
+    /// Returns [`EnumKeyResolution::Ambiguous`] (with the sibling count)
+    /// when a placeholder-bearing key matches zero or more than one
+    /// concrete sibling, so the caller's `require_*` can report the real
+    /// cause rather than a generic "missing instantiation".
+    ///
+    /// The result is independent of `phx_enums`'s (unordered) key
+    /// iteration: `Concrete` is returned only when exactly one candidate
+    /// matches, and the `Ambiguous` sibling count is a total over all
+    /// matches — neither depends on which key the scan visits first.
+    fn canonical_enum_key(&self, name: &str, type_args: &[IrType]) -> EnumKeyResolution {
+        if !type_args.iter().any(enums::contains_generic_placeholder) {
+            return EnumKeyResolution::Concrete((name.to_string(), type_args.to_vec()));
+        }
+        let mut matches = self.phx_enums.keys().filter(|(n, a)| {
+            n == name
+                && a.len() == type_args.len()
+                && !a.iter().any(enums::contains_generic_placeholder)
+                && a.iter().zip(type_args).all(|(concrete, query)| {
+                    enums::contains_generic_placeholder(query) || concrete == query
+                })
+        });
+        match (matches.next(), matches.next()) {
+            (Some((_, concrete)), None) => {
+                EnumKeyResolution::Concrete((name.to_string(), concrete.clone()))
+            }
+            (None, _) => EnumKeyResolution::Ambiguous { sibling_count: 0 },
+            // Two pulled; count the rest so the diagnostic is exact.
+            (Some(_), Some(_)) => EnumKeyResolution::Ambiguous {
+                sibling_count: 2 + matches.count(),
+            },
+        }
+    }
+
     /// WASM type-section index of the parent type for the concrete
     /// enum instantiation `(name, type_args)`. Used by
     /// `Op::EnumDiscriminant` (reads `$tag` through this type) and by
     /// the `IrType::EnumRef` → WASM `ValType` mapping. Different
     /// `type_args` for the same template are *separate* WASM enums
-    /// per K.4 codegen-time monomorphization.
+    /// per K.4 codegen-time monomorphization. Partially-generic keys
+    /// are first run through [`Self::canonical_enum_key`].
     pub(super) fn require_enum_parent_idx(
         &self,
         name: &str,
         type_args: &[IrType],
     ) -> Result<u32, CompileError> {
-        let key = (name.to_string(), type_args.to_vec());
+        let key = match self.canonical_enum_key(name, type_args) {
+            EnumKeyResolution::Concrete(key) => key,
+            EnumKeyResolution::Ambiguous { sibling_count } => {
+                return Err(ambiguous_enum_key_error(name, type_args, sibling_count));
+            }
+        };
         self.phx_enums
             .get(&key)
             .map(|(parent, _)| *parent)
@@ -809,7 +906,12 @@ impl ModuleBuilder {
         type_args: &[IrType],
         variant_idx: u32,
     ) -> Result<u32, CompileError> {
-        let key = (name.to_string(), type_args.to_vec());
+        let key = match self.canonical_enum_key(name, type_args) {
+            EnumKeyResolution::Concrete(key) => key,
+            EnumKeyResolution::Ambiguous { sibling_count } => {
+                return Err(ambiguous_enum_key_error(name, type_args, sibling_count));
+            }
+        };
         let (_, variants) = self.phx_enums.get(&key).ok_or_else(|| {
             CompileError::new(format!(
                 "wasm32-gc: enum instantiation `{name}{type_args:?}` was not \

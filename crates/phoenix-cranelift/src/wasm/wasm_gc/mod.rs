@@ -67,6 +67,7 @@ mod enums;
 mod float_helpers;
 mod lists;
 mod module_builder;
+mod option_result;
 mod ryu_tables;
 mod string_helpers;
 mod tostring_helpers;
