@@ -4,20 +4,7 @@ expression: spec
 ---
 {
   "components": {
-    "schemas": {
-      "Doc": {
-        "properties": {
-          "data": {
-            "format": "binary",
-            "type": "string"
-          }
-        },
-        "required": [
-          "data"
-        ],
-        "type": "object"
-      }
-    }
+    "schemas": {}
   },
   "info": {
     "title": "API",

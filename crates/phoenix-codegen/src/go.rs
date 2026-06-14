@@ -49,6 +49,116 @@ pub fn generate_go(program: &Program, check_result: &Analysis) -> GoFiles {
     generator.generate(program)
 }
 
+/// Returns `preferred` if it is free of `taken`, else `preferred` with enough
+/// trailing `_`s appended to clear it. Phoenix identifiers share Go's
+/// `[A-Za-z_][A-Za-z0-9_]*` shape, so no fixed name is collision-proof; this is
+/// how every generated Go local dodges the user's parameter identifiers.
+fn pick_free_local(preferred: &str, taken: &BTreeSet<String>) -> String {
+    let mut name = preferred.to_string();
+    while taken.contains(&name) {
+        name.push('_');
+    }
+    name
+}
+
+/// The parameter identifiers a generated local must avoid colliding with: path
+/// params, the body, query params, and request headers — all emitted verbatim
+/// via `to_camel` (which is the identity). The client and the server both
+/// uniquify their locals against this same set, so they share one source of
+/// truth here rather than rebuilding it independently.
+fn endpoint_param_idents(ep: &EndpointInfo) -> BTreeSet<String> {
+    let mut taken = BTreeSet::new();
+    for pp in &ep.path_params {
+        taken.insert(to_camel(pp));
+    }
+    if ep.body.is_some() {
+        taken.insert("body".to_string());
+    }
+    for qp in &ep.query_params {
+        taken.insert(to_camel(&qp.name));
+    }
+    for h in &ep.headers {
+        taken.insert(to_camel(&h.name));
+    }
+    taken
+}
+
+/// Names for the function-scoped locals a client method emits, each derived to
+/// avoid colliding with the method's parameter identifiers.
+///
+/// Every generated Go client method declares a handful of locals around the
+/// HTTP round-trip — `u` (the URL), a `url.Values` query builder, `data` (the
+/// marshaled body), `req`/`resp`, the decoded `result`, and `buf`/`writer` for
+/// multipart uploads. They share Go's function scope with the method's
+/// parameters, whose names are the user's Phoenix identifiers verbatim
+/// (`to_camel` is the identity). A generated local whose fixed name equals a
+/// parameter is a redeclare — `q := url.Values{}` beside a `q` query param is
+/// "no new variables on left side of :=", and `var result T` beside a `result`
+/// param is "result redeclared in this block" — and the generated Go won't
+/// compile. `q` (a search query), `u`, `data`, `req`, `resp`, `result` are all
+/// reachable param names. Phoenix identifiers share Go's `[A-Za-z_][A-Za-z0-9_]*`
+/// shape, so no fixed name is collision-proof; each local is derived to dodge
+/// this method's parameter identifiers (and the other locals already chosen).
+///
+/// `err` is deliberately NOT uniquified: every `err` site is a `x, err :=` with
+/// a fresh `x` (or an `if`-init in a nested scope), so colliding with an `err`
+/// parameter reuses it legally rather than redeclaring — and threading a renamed
+/// `err` through every error check would be pure churn. When nothing collides —
+/// the overwhelmingly common case — every field keeps its natural name, so
+/// existing output is byte-for-byte unchanged.
+///
+/// `recv` is the method's receiver (`c` by default, as in `func (c *ApiClient)`),
+/// referenced as `c.BaseURL` / `c.Client.Do`. It shares the function scope with
+/// the parameters too, so a param named `c` (a cursor/count param is plausible)
+/// would shadow the receiver — `c.BaseURL` would then read the param, not the
+/// client. It is uniquified here like every other local. (This is the client's
+/// only fixed generated identifier; the server's `w`/`r`/`h`/`mux` are the
+/// analogous fixed identifiers there and are NOT yet uniquified — see
+/// `emit_server_route`.)
+struct ClientLocals {
+    recv: String,
+    url: String,
+    query: String,
+    data: String,
+    req: String,
+    resp: String,
+    result: String,
+    buf: String,
+    writer: String,
+}
+
+impl ClientLocals {
+    fn new(ep: &EndpointInfo) -> Self {
+        // The parameter identifiers a generated local must avoid (shared with the
+        // server route emitter — see [`endpoint_param_idents`]).
+        let mut taken = endpoint_param_idents(ep);
+        // Every local is derived eagerly, even ones this endpoint won't emit (a
+        // bodyless GET still reserves `data`/`buf`/`writer`). A reserved-but-unused
+        // name never reaches the output, so this can't widen the diff; deriving the
+        // full set up front keeps the struct a plain value rather than threading
+        // endpoint shape through every emit site.
+        //
+        // Pick the preferred name if free, else append `_` until it is; reserve
+        // each choice so two locals can't land on the same fallback.
+        let mut pick = |preferred: &str| -> String {
+            let name = pick_free_local(preferred, &taken);
+            taken.insert(name.clone());
+            name
+        };
+        ClientLocals {
+            recv: pick("c"),
+            url: pick("u"),
+            query: pick("q"),
+            data: pick("data"),
+            req: pick("req"),
+            resp: pick("resp"),
+            result: pick("result"),
+            buf: pick("buf"),
+            writer: pick("writer"),
+        }
+    }
+}
+
 /// Internal Go code generator.
 struct GoGenerator<'a> {
     check_result: &'a Analysis,
@@ -357,7 +467,12 @@ impl<'a> GoGenerator<'a> {
         if let Some(ref doc) = s.doc_comment {
             self.types_out.push_str(&render_line_comment(
                 "// ",
-                &format!("{} is {}.", s.name, doc.to_lowercase()),
+                &format!(
+                    "{} is {}{}",
+                    s.name,
+                    doc.to_lowercase(),
+                    doc_terminator(doc)
+                ),
             ));
         }
         let rows: Vec<(String, String, String)> = self
@@ -393,7 +508,12 @@ impl<'a> GoGenerator<'a> {
         if let Some(ref doc) = e.doc_comment {
             self.types_out.push_str(&render_line_comment(
                 "// ",
-                &format!("{} is {}.", e.name, doc.to_lowercase()),
+                &format!(
+                    "{} is {}{}",
+                    e.name,
+                    doc.to_lowercase(),
+                    doc_terminator(doc)
+                ),
             ));
         }
         self.types_out
@@ -740,6 +860,12 @@ impl<'a> GoGenerator<'a> {
         let is_multi_status = !ep.response_statuses.is_empty();
         let multi_status_type = multi_status_type_name(ep);
 
+        // Names for the method's function-scoped locals, each derived to avoid
+        // colliding with this endpoint's parameter identifiers (see
+        // [`ClientLocals`]). The common no-collision case leaves every name
+        // unchanged.
+        let locals = ClientLocals::new(ep);
+
         // Build parameter list
         let mut params = Vec::new();
         for pp in &ep.path_params {
@@ -794,27 +920,39 @@ impl<'a> GoGenerator<'a> {
             self.client_out.push('\n');
             self.client_out.push_str(&render_line_comment(
                 "// ",
-                &format!("{} {}.", method_name, doc.to_lowercase()),
+                &format!(
+                    "{} {}{}",
+                    method_name,
+                    doc.to_lowercase(),
+                    doc_terminator(doc)
+                ),
             ));
         }
         self.client_out.push_str(&format!(
-            "func (c *ApiClient) {}({}) {} {{\n",
-            method_name, params_str, return_sig
+            "func ({} *ApiClient) {}({}) {} {{\n",
+            locals.recv, method_name, params_str, return_sig
         ));
 
         // Build URL. Every method formats its URL with `fmt.Sprintf` and (below)
         // wraps HTTP errors with `fmt.Errorf`, so emitting any method needs `fmt`.
         self.client_needs_fmt = true;
         let url_expr = build_go_url(&ep.path, &ep.path_params);
+        let url = &locals.url;
+        let recv = &locals.recv;
         self.client_out.push_str(&format!(
-            "\tu := fmt.Sprintf(\"%s{}\", c.BaseURL{})\n",
+            "\t{url} := fmt.Sprintf(\"%s{}\", {recv}.BaseURL{})\n",
             url_expr.0, url_expr.1
         ));
 
         // Query params
         if !ep.query_params.is_empty() {
             self.client_needs_url = true;
-            self.client_out.push_str("\tq := url.Values{}\n");
+            // The query builder's `url.Values` local (`q` by default) is one of
+            // the method's function-scoped locals uniquified against the
+            // parameter names — see [`ClientLocals`].
+            let qv = &locals.query;
+            self.client_out
+                .push_str(&format!("\t{qv} := url.Values{{}}\n"));
             for qp in &ep.query_params {
                 let name = to_camel(&qp.name);
                 let (optional, inner) = query_param_shape(&qp.ty);
@@ -829,23 +967,26 @@ impl<'a> GoGenerator<'a> {
                     Type::Int => {
                         self.client_needs_strconv = true;
                         format!(
-                            "q.Set(\"{}\", strconv.FormatInt({}, 10))",
+                            "{qv}.Set(\"{}\", strconv.FormatInt({}, 10))",
                             qp.name, value_expr
                         )
                     }
                     Type::Float => {
                         self.client_needs_strconv = true;
                         format!(
-                            "q.Set(\"{}\", strconv.FormatFloat({}, 'f', -1, 64))",
+                            "{qv}.Set(\"{}\", strconv.FormatFloat({}, 'f', -1, 64))",
                             qp.name, value_expr
                         )
                     }
                     Type::Bool => {
                         self.client_needs_strconv = true;
-                        format!("q.Set(\"{}\", strconv.FormatBool({}))", qp.name, value_expr)
+                        format!(
+                            "{qv}.Set(\"{}\", strconv.FormatBool({}))",
+                            qp.name, value_expr
+                        )
                     }
-                    Type::String => format!("q.Set(\"{}\", {})", qp.name, value_expr),
-                    _ => format!("q.Set(\"{}\", fmt.Sprint({}))", qp.name, value_expr),
+                    Type::String => format!("{qv}.Set(\"{}\", {})", qp.name, value_expr),
+                    _ => format!("{qv}.Set(\"{}\", fmt.Sprint({}))", qp.name, value_expr),
                 };
                 if optional {
                     self.client_out
@@ -854,7 +995,8 @@ impl<'a> GoGenerator<'a> {
                     self.client_out.push_str(&format!("\t{set_expr}\n"));
                 }
             }
-            self.client_out.push_str("\tu += \"?\" + q.Encode()\n");
+            self.client_out
+                .push_str(&format!("\t{url} += \"?\" + {qv}.Encode()\n"));
         }
 
         // Build request. A JSON request body pulls in `bytes` (for the reader) and
@@ -872,29 +1014,33 @@ impl<'a> GoGenerator<'a> {
         // having no response type.
         let err_ret = if returns_value { "nil, err" } else { "err" };
         if ep.body_is_multipart {
-            self.emit_client_multipart_body(ep, http_method, err_ret);
+            self.emit_client_multipart_body(ep, http_method, err_ret, &locals);
         } else if ep.body.is_some() {
             self.client_needs_bytes = true;
             self.client_needs_json = true;
+            let data = &locals.data;
+            let req = &locals.req;
             self.client_out
-                .push_str("\tdata, err := json.Marshal(body)\n");
+                .push_str(&format!("\t{data}, err := json.Marshal(body)\n"));
             self.client_out.push_str(&format!(
                 "\tif err != nil {{\n\t\treturn {}\n\t}}\n",
                 err_ret
             ));
             self.client_out.push_str(&format!(
-                "\treq, err := http.NewRequest(\"{}\", u, bytes.NewReader(data))\n",
+                "\t{req}, err := http.NewRequest(\"{}\", {url}, bytes.NewReader({data}))\n",
                 http_method
             ));
             self.client_out.push_str(&format!(
                 "\tif err != nil {{\n\t\treturn {}\n\t}}\n",
                 err_ret
             ));
-            self.client_out
-                .push_str("\treq.Header.Set(\"Content-Type\", \"application/json\")\n");
-        } else {
             self.client_out.push_str(&format!(
-                "\treq, err := http.NewRequest(\"{}\", u, nil)\n",
+                "\t{req}.Header.Set(\"Content-Type\", \"application/json\")\n"
+            ));
+        } else {
+            let req = &locals.req;
+            self.client_out.push_str(&format!(
+                "\t{req}, err := http.NewRequest(\"{}\", {url}, nil)\n",
                 http_method
             ));
             self.client_out.push_str(&format!(
@@ -915,7 +1061,10 @@ impl<'a> GoGenerator<'a> {
                 name.clone()
             };
             let str_expr = header_string_expr(inner, &value_expr, &mut self.client_needs_strconv);
-            let set_expr = format!("req.Header.Set(\"{}\", {})", h.wire_name, str_expr);
+            let set_expr = format!(
+                "{}.Header.Set(\"{}\", {})",
+                locals.req, h.wire_name, str_expr
+            );
             if optional {
                 self.client_out
                     .push_str(&format!("\tif {name} != nil {{\n\t\t{set_expr}\n\t}}\n"));
@@ -926,8 +1075,11 @@ impl<'a> GoGenerator<'a> {
 
         // Execute
         let err_ret = if returns_value { "nil, " } else { "" };
-        self.client_out
-            .push_str("\tresp, err := c.Client.Do(req)\n");
+        let resp = &locals.resp;
+        self.client_out.push_str(&format!(
+            "\t{resp}, err := {}.Client.Do({})\n",
+            locals.recv, locals.req
+        ));
         self.client_out.push_str(&format!(
             "\tif err != nil {{\n\t\treturn {}err\n\t}}\n",
             err_ret
@@ -940,14 +1092,13 @@ impl<'a> GoGenerator<'a> {
             // are already returning a more useful HTTP-status error, and the
             // bare `resp.Body.Close()` would otherwise be flagged by errcheck.
             self.client_out.push_str(&format!(
-                "\tif resp.StatusCode >= 400 {{\n\t\t_ = resp.Body.Close()\n\t\treturn {}fmt.Errorf(\"HTTP %d\", resp.StatusCode)\n\t}}\n",
-                err_ret
+                "\tif {resp}.StatusCode >= 400 {{\n\t\t_ = {resp}.Body.Close()\n\t\treturn {err_ret}fmt.Errorf(\"HTTP %d\", {resp}.StatusCode)\n\t}}\n",
             ));
         } else {
-            self.client_out.push_str("\tdefer resp.Body.Close()\n");
+            self.client_out
+                .push_str(&format!("\tdefer {resp}.Body.Close()\n"));
             self.client_out.push_str(&format!(
-                "\tif resp.StatusCode >= 400 {{\n\t\treturn {}fmt.Errorf(\"HTTP %d\", resp.StatusCode)\n\t}}\n",
-                err_ret
+                "\tif {resp}.StatusCode >= 400 {{\n\t\treturn {err_ret}fmt.Errorf(\"HTTP %d\", {resp}.StatusCode)\n\t}}\n",
             ));
         }
 
@@ -959,8 +1110,9 @@ impl<'a> GoGenerator<'a> {
             // comes from the HTTP response; the optional shared body is decoded into
             // `*T` only when the response actually carries one. An all-typeless block
             // (no `T`) has no `Body` field, so just record the status.
+            let result = &locals.result;
             self.client_out.push_str(&format!(
-                "\tresult := {}{{Status: resp.StatusCode}}\n",
+                "\t{result} := {}{{Status: {resp}.StatusCode}}\n",
                 multi_status_type
             ));
             if let Some(ref rt) = response_type {
@@ -970,45 +1122,54 @@ impl<'a> GoGenerator<'a> {
                 // explicit empty case; `io.EOF` from the decoder covers a streamed
                 // empty body (chunked / unknown length).
                 self.client_needs_io = true;
-                self.client_out.push_str("\tif resp.ContentLength != 0 {\n");
+                self.client_out
+                    .push_str(&format!("\tif {resp}.ContentLength != 0 {{\n"));
                 self.client_out.push_str(&format!("\t\tvar body {}\n", rt));
-                self.client_out.push_str(
-                    "\t\tif err := json.NewDecoder(resp.Body).Decode(&body); err != nil && err != io.EOF {\n\t\t\treturn nil, err\n\t\t} else if err == nil {\n\t\t\tresult.Body = &body\n\t\t}\n",
-                );
+                self.client_out.push_str(&format!(
+                    "\t\tif err := json.NewDecoder({resp}.Body).Decode(&body); err != nil && err != io.EOF {{\n\t\t\treturn nil, err\n\t\t}} else if err == nil {{\n\t\t\t{result}.Body = &body\n\t\t}}\n",
+                ));
                 self.client_out.push_str("\t}\n");
             }
-            self.client_out.push_str("\treturn &result, nil\n");
+            self.client_out
+                .push_str(&format!("\treturn &{result}, nil\n"));
         } else if ep.response_is_binary {
             self.client_needs_io = true;
-            self.client_out.push_str("\treturn resp.Body, nil\n");
+            self.client_out
+                .push_str(&format!("\treturn {resp}.Body, nil\n"));
         } else if has_resp_headers {
             self.client_needs_json = true;
+            let result = &locals.result;
             self.client_out
-                .push_str(&format!("\tvar result {}\n", result_type));
-            self.client_out.push_str(
-                "\tif err := json.NewDecoder(resp.Body).Decode(&result.Body); err != nil {\n\t\treturn nil, err\n\t}\n",
-            );
+                .push_str(&format!("\tvar {result} {}\n", result_type));
+            self.client_out.push_str(&format!(
+                "\tif err := json.NewDecoder({resp}.Body).Decode(&{result}.Body); err != nil {{\n\t\treturn nil, err\n\t}}\n",
+            ));
             for h in &ep.response_headers {
-                self.emit_client_response_header_read(h);
+                self.emit_client_response_header_read(h, &locals);
             }
-            self.client_out.push_str("\treturn &result, nil\n");
+            self.client_out
+                .push_str(&format!("\treturn &{result}, nil\n"));
         } else if is_paginated {
             // The whole response body is the page object (`{items, <metadata>}`),
             // decoded into the `<Endpoint>Page` envelope like any struct response.
             self.client_needs_json = true;
+            let result = &locals.result;
             self.client_out
-                .push_str(&format!("\tvar result {}\n", page_type));
-            self.client_out.push_str(
-                "\tif err := json.NewDecoder(resp.Body).Decode(&result); err != nil {\n\t\treturn nil, err\n\t}\n",
-            );
-            self.client_out.push_str("\treturn &result, nil\n");
-        } else if let Some(ref rt) = response_type {
-            self.client_out.push_str(&format!("\tvar result {}\n", rt));
+                .push_str(&format!("\tvar {result} {}\n", page_type));
             self.client_out.push_str(&format!(
-                "\tif err := json.NewDecoder(resp.Body).Decode(&result); err != nil {{\n\t\treturn {}err\n\t}}\n",
-                err_ret
+                "\tif err := json.NewDecoder({resp}.Body).Decode(&{result}); err != nil {{\n\t\treturn nil, err\n\t}}\n",
             ));
-            self.client_out.push_str("\treturn &result, nil\n");
+            self.client_out
+                .push_str(&format!("\treturn &{result}, nil\n"));
+        } else if let Some(ref rt) = response_type {
+            let result = &locals.result;
+            self.client_out
+                .push_str(&format!("\tvar {result} {}\n", rt));
+            self.client_out.push_str(&format!(
+                "\tif err := json.NewDecoder({resp}.Body).Decode(&{result}); err != nil {{\n\t\treturn {err_ret}err\n\t}}\n",
+            ));
+            self.client_out
+                .push_str(&format!("\treturn &{result}, nil\n"));
         } else {
             self.client_out.push_str("\treturn nil\n");
         }
@@ -1025,15 +1186,27 @@ impl<'a> GoGenerator<'a> {
     /// — a multipart upload with no `response` is legal (see the
     /// `multipart_upload_no_response` test) and its client method returns bare
     /// `error`, so a hardcoded `nil, err` would not compile there.
-    fn emit_client_multipart_body(&mut self, ep: &EndpointInfo, http_method: &str, err_ret: &str) {
+    fn emit_client_multipart_body(
+        &mut self,
+        ep: &EndpointInfo,
+        http_method: &str,
+        err_ret: &str,
+        locals: &ClientLocals,
+    ) {
         let Some(ref body) = ep.body else { return };
         self.client_needs_bytes = true;
         self.client_needs_multipart = true;
         self.client_needs_io = true;
 
-        self.client_out.push_str("\tvar buf bytes.Buffer\n");
+        // `buf`/`writer`/`req` and the URL local are uniquified against the
+        // parameter names (see [`ClientLocals`]); the per-file `part` lives in
+        // its own block and only ever shadows.
+        let buf = &locals.buf;
+        let writer = &locals.writer;
         self.client_out
-            .push_str("\twriter := multipart.NewWriter(&buf)\n");
+            .push_str(&format!("\tvar {buf} bytes.Buffer\n"));
+        self.client_out
+            .push_str(&format!("\t{writer} := multipart.NewWriter(&{buf})\n"));
 
         for f in &body.fields {
             let field = to_pascal_case(&f.name);
@@ -1057,7 +1230,7 @@ impl<'a> GoGenerator<'a> {
                 };
                 self.client_out.push_str(&open);
                 self.client_out.push_str(&format!(
-                    "\t\tpart, err := writer.CreateFormFile(\"{wire}\", body.{field}.Filename)\n\t\tif err != nil {{\n\t\t\treturn {err_ret}\n\t\t}}\n\t\tif _, err := io.Copy(part, body.{field}.Content); err != nil {{\n\t\t\treturn {err_ret}\n\t\t}}\n"
+                    "\t\tpart, err := {writer}.CreateFormFile(\"{wire}\", body.{field}.Filename)\n\t\tif err != nil {{\n\t\t\treturn {err_ret}\n\t\t}}\n\t\tif _, err := io.Copy(part, body.{field}.Content); err != nil {{\n\t\t\treturn {err_ret}\n\t\t}}\n"
                 ));
                 self.client_out.push_str("\t}\n");
             } else {
@@ -1075,7 +1248,7 @@ impl<'a> GoGenerator<'a> {
                 // error-checked (matching the file path) and satisfies errcheck.
                 let i = if optional { "\t\t" } else { "\t" };
                 let write = format!(
-                    "{i}if err := writer.WriteField(\"{wire}\", {str_expr}); err != nil {{\n{i}\treturn {err_ret}\n{i}}}\n"
+                    "{i}if err := {writer}.WriteField(\"{wire}\", {str_expr}); err != nil {{\n{i}\treturn {err_ret}\n{i}}}\n"
                 );
                 if optional {
                     self.client_out
@@ -1086,16 +1259,19 @@ impl<'a> GoGenerator<'a> {
             }
         }
 
+        let req = &locals.req;
         self.client_out.push_str(&format!(
-            "\tif err := writer.Close(); err != nil {{\n\t\treturn {err_ret}\n\t}}\n"
+            "\tif err := {writer}.Close(); err != nil {{\n\t\treturn {err_ret}\n\t}}\n"
         ));
         self.client_out.push_str(&format!(
-            "\treq, err := http.NewRequest(\"{http_method}\", u, &buf)\n",
+            "\t{req}, err := http.NewRequest(\"{http_method}\", {}, &{buf})\n",
+            locals.url
         ));
         self.client_out
             .push_str(&format!("\tif err != nil {{\n\t\treturn {err_ret}\n\t}}\n"));
-        self.client_out
-            .push_str("\treq.Header.Set(\"Content-Type\", writer.FormDataContentType())\n");
+        self.client_out.push_str(&format!(
+            "\t{req}.Header.Set(\"Content-Type\", {writer}.FormDataContentType())\n"
+        ));
     }
 
     /// Emits client-side parsing of one response header from `resp.Header` into
@@ -1103,39 +1279,44 @@ impl<'a> GoGenerator<'a> {
     /// directly; numeric/bool are parsed; optional (`Option<T>`) headers parse
     /// into a `*T` left nil when the header is absent — mirroring the server-side
     /// request-header parse and the query-param parse.
-    fn emit_client_response_header_read(&mut self, h: &HeaderParamInfo) {
+    fn emit_client_response_header_read(&mut self, h: &HeaderParamInfo, locals: &ClientLocals) {
         let field = to_pascal_case(&h.name);
         let wire = &h.wire_name;
+        // `resp`/`result` are the method's uniquified locals (see
+        // [`ClientLocals`]); the per-header `v`/`n`/`b`/`cv` live in their own
+        // `if`-init block and only ever shadow.
+        let resp = &locals.resp;
+        let result = &locals.result;
         let (optional, inner) = query_param_shape(&h.ty);
         let body = if optional {
             match inner {
                 Type::Int => {
                     self.client_needs_strconv = true;
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif n, err := strconv.ParseInt(v, 10, 64); err == nil {{\n\t\t\tresult.{field} = &n\n\t\t}}\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif n, err := strconv.ParseInt(v, 10, 64); err == nil {{\n\t\t\t{result}.{field} = &n\n\t\t}}\n\t}}\n"
                     )
                 }
                 Type::Float => {
                     self.client_needs_strconv = true;
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif n, err := strconv.ParseFloat(v, 64); err == nil {{\n\t\t\tresult.{field} = &n\n\t\t}}\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif n, err := strconv.ParseFloat(v, 64); err == nil {{\n\t\t\t{result}.{field} = &n\n\t\t}}\n\t}}\n"
                     )
                 }
                 Type::Bool => {
                     self.client_needs_strconv = true;
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif b, err := strconv.ParseBool(v); err == nil {{\n\t\t\tresult.{field} = &b\n\t\t}}\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tif b, err := strconv.ParseBool(v); err == nil {{\n\t\t\t{result}.{field} = &b\n\t\t}}\n\t}}\n"
                     )
                 }
                 Type::String => {
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field} = &v\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t{result}.{field} = &v\n\t}}\n"
                     )
                 }
                 other => {
                     let go_type = type_to_go(other);
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tcv := {go_type}(v)\n\t\tresult.{field} = &cv\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tcv := {go_type}(v)\n\t\t{result}.{field} = &cv\n\t}}\n"
                     )
                 }
             }
@@ -1144,27 +1325,27 @@ impl<'a> GoGenerator<'a> {
                 Type::Int => {
                     self.client_needs_strconv = true;
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field}, _ = strconv.ParseInt(v, 10, 64)\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t{result}.{field}, _ = strconv.ParseInt(v, 10, 64)\n\t}}\n"
                     )
                 }
                 Type::Float => {
                     self.client_needs_strconv = true;
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field}, _ = strconv.ParseFloat(v, 64)\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t{result}.{field}, _ = strconv.ParseFloat(v, 64)\n\t}}\n"
                     )
                 }
                 Type::Bool => {
                     self.client_needs_strconv = true;
                     format!(
-                        "if v := resp.Header.Get(\"{wire}\"); v != \"\" {{\n\t\tresult.{field}, _ = strconv.ParseBool(v)\n\t}}\n"
+                        "if v := {resp}.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t{result}.{field}, _ = strconv.ParseBool(v)\n\t}}\n"
                     )
                 }
                 Type::String => {
-                    format!("result.{field} = resp.Header.Get(\"{wire}\")\n")
+                    format!("{result}.{field} = {resp}.Header.Get(\"{wire}\")\n")
                 }
                 other => {
                     let go_type = type_to_go(other);
-                    format!("result.{field} = {go_type}(resp.Header.Get(\"{wire}\"))\n")
+                    format!("{result}.{field} = {go_type}({resp}.Header.Get(\"{wire}\"))\n")
                 }
             }
         };
@@ -1222,7 +1403,12 @@ impl<'a> GoGenerator<'a> {
         if let Some(ref doc) = ep.doc_comment {
             self.handlers_out.push_str(&render_line_comment(
                 "\t// ",
-                &format!("{} {}.", method_name, doc.to_lowercase()),
+                &format!(
+                    "{} {}{}",
+                    method_name,
+                    doc.to_lowercase(),
+                    doc_terminator(doc)
+                ),
             ));
         }
         self.handlers_out.push_str(&format!(
@@ -1316,6 +1502,28 @@ impl<'a> GoGenerator<'a> {
         let handler_name = to_pascal_case(&ep.name);
         let has_resp_headers = !ep.response_headers.is_empty();
 
+        // The handler-result local (`result`) shares the closure's scope with the
+        // path/query/header input locals, which carry the parameter names verbatim
+        // (`to_camel` is the identity). Derive it so `result, err := h.X(...)` can't
+        // redeclare a same-named input — a `result` query param would otherwise turn
+        // `result, err := …` into an assignment to the `*string` query local
+        // ("cannot use … as *string"). Mirrors the client-side [`ClientLocals`].
+        //
+        // NOT covered here: the closure's *fixed* identifiers — `w`
+        // (`http.ResponseWriter`), `r` (`*http.Request`), and the captured `h`
+        // (`Handlers`) / `mux` from `NewRouter`. A parameter named `w`/`r`/`h`/`mux`
+        // shadows or redeclares one of those (`w := r.PathValue("w")` beside the
+        // `w` writer is "no new variables on left side of :="). Uniquifying them
+        // would mean threading renamed `w`/`r`/`h` through every server emit site
+        // (~6 helpers, ~40 sites); deferred as a separate edge until a real schema
+        // needs it. The client's only fixed identifier — the receiver `c` — IS
+        // uniquified (see [`ClientLocals`]) because it costs three sites.
+        //
+        // Uniquified against the same parameter-identifier set the client uses
+        // (see [`endpoint_param_idents`]).
+        let taken = endpoint_param_idents(ep);
+        let result = pick_free_local("result", &taken);
+
         // Error mapping uses `strings.Contains`; encoding a response uses
         // `encoding/json`. Record both so the import block stays minimal.
         if !ep.errors.is_empty() {
@@ -1328,7 +1536,7 @@ impl<'a> GoGenerator<'a> {
             // when present (a typeless status — or an all-typeless block — leaves
             // `result.Body` nil and writes a bodyless response).
             self.server_out.push_str(&format!(
-                "\t\tresult, err := h.{}({})\n",
+                "\t\t{result}, err := h.{}({})\n",
                 handler_name, args_str
             ));
             self.server_out.push_str("\t\tif err != nil {\n");
@@ -1336,9 +1544,9 @@ impl<'a> GoGenerator<'a> {
             // A `(nil, nil)` return is a handler bug Go's type system can't
             // prevent; without this guard `result.Status` below panics the
             // route. Same guard as the binary and response-header paths.
-            self.server_out.push_str(
-                "\t\tif result == nil {\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
-            );
+            self.server_out.push_str(&format!(
+                "\t\tif {result} == nil {{\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}}\n",
+            ));
             // Validate the handler-chosen envelope against the DECLARED contract
             // before writing it — all three mismatches are handler bugs, reported
             // as a 500 instead of written to the wire (mirrors the TS/Python
@@ -1367,15 +1575,16 @@ impl<'a> GoGenerator<'a> {
                 .filter(|rs| rs.ty.is_none())
                 .map(|rs| rs.status.to_string())
                 .collect();
-            self.server_out.push_str("\t\tswitch result.Status {\n");
+            self.server_out
+                .push_str(&format!("\t\tswitch {result}.Status {{\n"));
             if ep.response.is_some() {
                 self.server_out.push_str(&format!(
-                    "\t\tcase {}:\n\t\t\tif result.Body == nil {{\n\t\t\t\thttp.Error(w, \"handler returned no body for a typed status\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}}\n",
+                    "\t\tcase {}:\n\t\t\tif {result}.Body == nil {{\n\t\t\t\thttp.Error(w, \"handler returned no body for a typed status\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}}\n",
                     typed.join(", ")
                 ));
                 if !typeless.is_empty() {
                     self.server_out.push_str(&format!(
-                        "\t\tcase {}:\n\t\t\tif result.Body != nil {{\n\t\t\t\thttp.Error(w, \"handler returned a body for a bodyless status\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}}\n",
+                        "\t\tcase {}:\n\t\t\tif {result}.Body != nil {{\n\t\t\t\thttp.Error(w, \"handler returned a body for a bodyless status\", http.StatusInternalServerError)\n\t\t\t\treturn\n\t\t\t}}\n",
                         typeless.join(", ")
                     ));
                 }
@@ -1391,38 +1600,39 @@ impl<'a> GoGenerator<'a> {
                 // a `Body *T`. Set the content type, write the status, then encode
                 // the body when the handler supplied one.
                 self.server_needs_json = true;
-                self.server_out.push_str(
-                    "\t\tif result.Body != nil {\n\t\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n\t\t\tw.WriteHeader(result.Status)\n\t\t\tjson.NewEncoder(w).Encode(result.Body)\n\t\t} else {\n\t\t\tw.WriteHeader(result.Status)\n\t\t}\n",
-                );
+                self.server_out.push_str(&format!(
+                    "\t\tif {result}.Body != nil {{\n\t\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n\t\t\tw.WriteHeader({result}.Status)\n\t\t\tjson.NewEncoder(w).Encode({result}.Body)\n\t\t}} else {{\n\t\t\tw.WriteHeader({result}.Status)\n\t\t}}\n",
+                ));
             } else {
                 // All-typeless block: no `Body` field, just write the status.
                 self.server_out
-                    .push_str("\t\tw.WriteHeader(result.Status)\n");
+                    .push_str(&format!("\t\tw.WriteHeader({result}.Status)\n"));
             }
         } else if ep.response_is_binary {
             // Binary download: the handler returns an `io.Reader`; stream it to
             // the wire as `application/octet-stream` (no JSON encoding).
             self.server_needs_io = true;
             self.server_out.push_str(&format!(
-                "\t\tresult, err := h.{}({})\n",
+                "\t\t{result}, err := h.{}({})\n",
                 handler_name, args_str
             ));
             self.server_out.push_str("\t\tif err != nil {\n");
             self.emit_server_error_mapping(ep);
             // A `(nil, nil)` return is a handler bug Go's type system can't
             // prevent; `io.Copy` from a nil reader would panic the route.
-            self.server_out.push_str(
-                "\t\tif result == nil {\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
-            );
+            self.server_out.push_str(&format!(
+                "\t\tif {result} == nil {{\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}}\n",
+            ));
             self.server_out
                 .push_str("\t\tw.Header().Set(\"Content-Type\", \"application/octet-stream\")\n");
             // The status line and headers are already committed, so a streaming
             // failure here is unrecoverable — discard the error explicitly.
-            self.server_out.push_str("\t\t_, _ = io.Copy(w, result)\n");
+            self.server_out
+                .push_str(&format!("\t\t_, _ = io.Copy(w, {result})\n"));
         } else if ep.response.is_some() {
             self.server_needs_json = true;
             self.server_out.push_str(&format!(
-                "\t\tresult, err := h.{}({})\n",
+                "\t\t{result}, err := h.{}({})\n",
                 handler_name, args_str
             ));
             self.server_out.push_str("\t\tif err != nil {\n");
@@ -1432,22 +1642,22 @@ impl<'a> GoGenerator<'a> {
             // would panic the route. The plain-response case needs no guard —
             // `Encode` renders a nil pointer as `null` without panicking.
             if has_resp_headers {
-                self.server_out.push_str(
-                    "\t\tif result == nil {\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n",
-                );
+                self.server_out.push_str(&format!(
+                    "\t\tif {result} == nil {{\n\t\t\thttp.Error(w, \"handler returned nil result\", http.StatusInternalServerError)\n\t\t\treturn\n\t\t}}\n",
+                ));
             }
             // Response headers: set each on `w.Header()` (stringified, optional
             // guarded) before the body is encoded. With an envelope the body
             // lives in `result.Body`; otherwise `result` is the body itself.
             for h in &ep.response_headers {
-                self.emit_response_header_set(h);
+                self.emit_response_header_set(h, &result);
             }
             self.server_out
                 .push_str("\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n");
             let encode_target = if has_resp_headers {
-                "result.Body"
+                format!("{result}.Body")
             } else {
-                "result"
+                result.clone()
             };
             self.server_out
                 .push_str(&format!("\t\tjson.NewEncoder(w).Encode({encode_target})\n"));
@@ -1802,20 +2012,20 @@ impl<'a> GoGenerator<'a> {
     /// `result.<PascalName>` onto `w.Header()`. Non-string values are stringified
     /// like query params; optional (`*T`) headers are nil-guarded and
     /// dereferenced. Uses the exact wire name from sema.
-    fn emit_response_header_set(&mut self, h: &HeaderParamInfo) {
+    fn emit_response_header_set(&mut self, h: &HeaderParamInfo, result: &str) {
         let field = to_pascal_case(&h.name);
         let wire = &h.wire_name;
         let (optional, inner) = query_param_shape(&h.ty);
         let value_expr = if optional {
-            format!("*result.{field}")
+            format!("*{result}.{field}")
         } else {
-            format!("result.{field}")
+            format!("{result}.{field}")
         };
         let str_expr = header_string_expr(inner, &value_expr, &mut self.server_needs_strconv);
         let set_expr = format!("w.Header().Set(\"{wire}\", {str_expr})");
         if optional {
             self.server_out.push_str(&format!(
-                "\t\tif result.{field} != nil {{\n\t\t\t{set_expr}\n\t\t}}\n"
+                "\t\tif {result}.{field} != nil {{\n\t\t\t{set_expr}\n\t\t}}\n"
             ));
         } else {
             self.server_out.push_str(&format!("\t\t{set_expr}\n"));
@@ -1834,10 +2044,36 @@ impl<'a> GoGenerator<'a> {
 fn render_line_comment(prefix: &str, body: &str) -> String {
     let mut out = String::new();
     for line in body.split('\n') {
+        // Strip each line's own leading whitespace before applying the prefix. A
+        // multi-line doc comment carries the visual indentation of its source
+        // `/** … *  continuation */` into `body` (the ` * ` leader is stripped but
+        // the author's alignment spaces survive). Emitted after the `// ` prefix
+        // that indent becomes `//  continuation` (two+ spaces), which gofmt 1.19+
+        // reads as an indented *code block* and rewrites — inserting a blank `//`
+        // and re-tabbing the body, so `gofmt -l` flags the file. The prefix already
+        // carries any intended Go-level indentation (e.g. the leading `\t` for an
+        // interface-method doc); the comment text itself must sit flush against it.
+        // Tradeoff: this also flattens any *authored* indentation inside the doc
+        // text (a nested list, an aligned table) — gofmt would reject preserving
+        // it anyway, so doc prose can't rely on leading-whitespace layout.
+        let line = line.trim_start();
         out.push_str(format!("{prefix}{line}").trim_end());
         out.push('\n');
     }
     out
+}
+
+/// Returns the sentence-ending period to append after a doc comment, or `""` when
+/// the comment already ends in `.`/`!`/`?`. The Go doc renderers add a period so a
+/// bare phrase reads as a sentence; without this guard a doc that already ends in
+/// punctuation would render a doubled `..` (sloppy, and flagged by doc-style
+/// linters). Checks the trimmed tail so trailing whitespace/newlines don't hide
+/// the punctuation.
+fn doc_terminator(doc: &str) -> &'static str {
+    match doc.trim_end().chars().last() {
+        Some('.') | Some('!') | Some('?') => "",
+        _ => ".",
+    }
 }
 
 /// Renders the Go type for a derived body field and reports whether it is a

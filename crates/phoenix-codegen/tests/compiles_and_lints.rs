@@ -218,15 +218,15 @@ endpoint updateAccount: PATCH "/api/accounts/{id}" {
 /// `getPostMetered` (a *mix* of required + optional request headers) cannot
 /// reach:
 ///
-///   * **all request headers optional** → the TS client's `headers` param itself
-///     becomes nullable (`headers?: { … }`), so the per-header send guard accesses
-///     it via the optional chain (`if (headers?.x !== undefined) …`). This is the
-///     one shape that exercises the `headers_nullable` access path in
-///     `emit_header_set`, and it must type-check under `tsc` strict (the access of
-///     `headers.x` inside the guard relies on TypeScript narrowing the optional
-///     chain) AND lint clean under `eslint` strict-type-checked (no
-///     `no-unnecessary-condition` complaint). The Go/Python equivalents (`*T`
-///     params, `| None` kwargs) ride the same all-optional path.
+///   * **all request headers optional** → the TS client renders the `headers`
+///     param as a `= {}` default (`headers: { … } = {}`, not `headers?:`), so it
+///     is omittable yet never `undefined` and the per-header send guard reads it
+///     via a plain access (`if (headers.x !== undefined) …`). This is the one
+///     shape that exercises the all-optional bag in `emit_header_set` /
+///     `format_signature`, and it must type-check under `tsc` strict AND lint
+///     clean under `eslint` strict-type-checked (a `headers?.x` chain on the
+///     non-nullable bag would trip `no-unnecessary-condition`). The Go/Python
+///     equivalents (`*T` params, `| None` kwargs) ride the same all-optional path.
 ///   * **all response headers optional** → every `<Endpoint>Result` envelope field
 ///     is optional (`*T` / `| None` / `?`), and the client read maps an absent
 ///     header to nil/None/undefined for each.
@@ -254,15 +254,14 @@ endpoint getThing: GET "/api/things/{id}" {
 
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
-/// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`;
-/// running the library through THIS harness is gated behind
-/// `PHOENIX_GEN_FIXTURE_LIB=1` because three known generator bugs make it red
-/// (Go `q`-param local collision, TypeScript optional-before-required param
-/// order (TS1016), Python non-`black`-clean client — all in
-/// docs/known-issues.md). When the last of those closes, delete
-/// [`fixture_lib_enabled`] and run these unconditionally. (This is the
-/// canonical copy of that close-out instruction; the three bug entries and
-/// design-decisions.md point here.)
+/// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
+/// fixture here is also run through THIS harness — generated, compiled, linted,
+/// and format-checked on all four targets — unconditionally (under the
+/// `PHOENIX_GEN_E2E` gate shared with the inline schemas). It was once gated
+/// behind a `PHOENIX_GEN_FIXTURE_LIB` env var while a handful of generator bugs
+/// (surfaced by these dense fixtures) made it red; those are all fixed — Go
+/// passes `go build`/`gofmt`/`golangci-lint`, TypeScript `tsc`/`eslint`/`prettier`,
+/// Python `black`/`ruff`/`mypy`, and OpenAPI `redocly lint` — so the gate is gone.
 ///
 /// This list and the per-fixture test list in `phoenix-driver`'s
 /// `gen_schema_fixtures.rs` must name the same fixtures; the
@@ -296,34 +295,6 @@ const FILE_FIXTURES: &[(&str, &str)] = &[
         include_str!("../../../tests/fixtures/internal_admin.phx"),
     ),
 ];
-
-/// Opt-in gate for the [`FILE_FIXTURES`] loops. An env var (not `#[ignore]`d
-/// tests) because the TypeScript/Python checks mutate their committed
-/// scaffold's `generated/` dir and MUST stay funneled through the single
-/// `#[test]` per target — a separate ignored test would race the regular one
-/// under `--include-ignored`.
-///
-/// Panics on any value other than `"1"`/`"0"`/empty (including a non-unicode
-/// value): someone who sets `PHOENIX_GEN_FIXTURE_LIB=true` to reproduce the
-/// known bugs must get an error, not a silently green run and a wrong
-/// conclusion.
-fn fixture_lib_enabled() -> bool {
-    match std::env::var("PHOENIX_GEN_FIXTURE_LIB") {
-        Ok(v) => match v.as_str() {
-            "1" => true,
-            "" | "0" => false,
-            other => panic!(
-                "PHOENIX_GEN_FIXTURE_LIB must be \"1\" (run the fixture library) \
-                 or \"0\"/unset (skip it); got {other:?}"
-            ),
-        },
-        Err(std::env::VarError::NotPresent) => false,
-        Err(e @ std::env::VarError::NotUnicode(_)) => panic!(
-            "PHOENIX_GEN_FIXTURE_LIB must be \"1\" (run the fixture library) \
-             or \"0\"/unset (skip it); {e}"
-        ),
-    }
-}
 
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    roundtrip.rs), as does the schema → AST + analysis pipeline. ──
@@ -433,13 +404,10 @@ fn go_output_compiles_and_lints() {
     // send / nil-able envelope-field paths).
     check_go_output(&generate_go_files(HEADER_SCHEMA));
 
-    // Realistic schema fixture library — opt-in until its known generator
-    // bugs are fixed; see FILE_FIXTURES.
-    if fixture_lib_enabled() {
-        for (name, schema) in FILE_FIXTURES.iter().copied() {
-            eprintln!("fixture library: {name}");
-            check_go_output(&generate_go_files(schema));
-        }
+    // Realistic schema fixture library (see FILE_FIXTURES).
+    for (name, schema) in FILE_FIXTURES.iter().copied() {
+        eprintln!("fixture library: {name}");
+        check_go_output(&generate_go_files(schema));
     }
 }
 
@@ -492,14 +460,12 @@ fn openapi_output_lints() {
     check_openapi_output("FEATURE_SCHEMA", FEATURE_SCHEMA);
     check_openapi_output("HEADER_SCHEMA", HEADER_SCHEMA);
 
-    // Realistic schema fixture library — opt-in until its known generator
-    // bugs are fixed; see FILE_FIXTURES. NOTE: redocly's WASM runtime needs a
-    // large address space; do not run this under a tight `ulimit -v` (it OOMs
-    // under a 6 GB cap — a false failure unrelated to the generated specs).
-    if fixture_lib_enabled() {
-        for (name, schema) in FILE_FIXTURES.iter().copied() {
-            check_openapi_output(name, schema);
-        }
+    // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
+    // runtime needs a large address space; do not run this under a tight
+    // `ulimit -v` (it OOMs under a 6 GB cap — a false failure unrelated to the
+    // generated specs).
+    for (name, schema) in FILE_FIXTURES.iter().copied() {
+        check_openapi_output(name, schema);
     }
 }
 
@@ -597,13 +563,10 @@ fn typescript_output_compiles_and_lints() {
     // `getPostMetered` in SCHEMA never reaches.
     check_typescript_output(&scaffold, &generate_typescript_files(HEADER_SCHEMA));
 
-    // Realistic schema fixture library — opt-in until its known generator
-    // bugs are fixed; see FILE_FIXTURES.
-    if fixture_lib_enabled() {
-        for (name, schema) in FILE_FIXTURES.iter().copied() {
-            eprintln!("fixture library: {name}");
-            check_typescript_output(&scaffold, &generate_typescript_files(schema));
-        }
+    // Realistic schema fixture library (see FILE_FIXTURES).
+    for (name, schema) in FILE_FIXTURES.iter().copied() {
+        eprintln!("fixture library: {name}");
+        check_typescript_output(&scaffold, &generate_typescript_files(schema));
     }
 }
 
@@ -708,12 +671,9 @@ fn python_output_compiles_and_lints() {
     // sends, and an all-optional envelope).
     check_python_output(&scaffold, &venv_bin, &generate_python_files(HEADER_SCHEMA));
 
-    // Realistic schema fixture library — opt-in until its known generator
-    // bugs are fixed; see FILE_FIXTURES.
-    if fixture_lib_enabled() {
-        for (name, schema) in FILE_FIXTURES.iter().copied() {
-            eprintln!("fixture library: {name}");
-            check_python_output(&scaffold, &venv_bin, &generate_python_files(schema));
-        }
+    // Realistic schema fixture library (see FILE_FIXTURES).
+    for (name, schema) in FILE_FIXTURES.iter().copied() {
+        eprintln!("fixture library: {name}");
+        check_python_output(&scaffold, &venv_bin, &generate_python_files(schema));
     }
 }

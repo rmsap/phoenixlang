@@ -2286,18 +2286,65 @@ projection) are smaller, additive, and demand-rankable. None of these block the
 existing slices — they are the natural "what's next for the schema language after
 the v1.0 must-adds" backlog, surfaced empirically rather than guessed.
 
-**Harness wiring status (opt-in).** All six fixtures parse and check clean —
-the parse/sema-clean invariant is guarded by
+**Harness wiring status (green; gate removed).** All six fixtures parse and check
+clean — the parse/sema-clean invariant is guarded by
 `crates/phoenix-driver/tests/gen_schema_fixtures.rs`, which runs `phoenix check`
-over each fixture — but running them through the compile-and-lint harness is
-RED today: the first dense fixture (payments) immediately surfaced three real
-generator bugs (Go `q`-param collision, TS optional-before-required param
-order, Python non-`black`-clean client; all in known-issues.md). The wiring is
-committed rather than described: `compiles_and_lints.rs` carries a
-`FILE_FIXTURES` const of `include_str!` pairs plus a loop appended to each of
-the four target tests, gated behind `PHOENIX_GEN_FIXTURE_LIB=1` so default CI
-stays green (set the var to reproduce the bugs). The close-out instruction —
-delete the gate once all three bugs are fixed — lives on `FILE_FIXTURES`' doc
-comment, the canonical copy. (Note: a run must NOT impose a tight `ulimit -v`
-— redocly's WASM runtime needs a large address space and OOMs under a 6 GB
-cap, a false failure unrelated to the generated specs.)
+over each fixture — and they now run through the full compile-and-lint harness on
+all four targets, **unconditionally** (under the same `PHOENIX_GEN_E2E` gate as
+the inline schemas). Getting there was a stage-by-stage bug hunt: the dense
+fixtures surfaced a Go `q`-param collision, then a Go wrapped-doc-comment `gofmt`
+issue once the build reached `gofmt`; a TS optional-before-required (TS1016)
+order bug, then two TS `prettier` divergences (redundant parens around a negated
+method-call constraint; response-header-envelope long-line breaking) once TS1016
+let the TS leg reach `prettier`; and a Python `black`/`ruff` pair (an unwrapped
+multi-status `return` line and a case-sensitive import sort). All are fixed, each
+with a regression test, and the full harness passes (`go build`/`gofmt`/
+`golangci-lint`; `tsc`/`eslint`/`prettier`; `black`/`ruff`/`mypy`;
+`redocly lint`). The `PHOENIX_GEN_FIXTURE_LIB` opt-in gate that held the library
+out while those bugs were open has been deleted — `compiles_and_lints.rs` carries
+a `FILE_FIXTURES` const of `include_str!` pairs and loops over it in each of the
+four target tests directly. (Note: a run must NOT impose a tight `ulimit -v` —
+redocly's WASM runtime needs a large address space and OOMs under a 6 GB cap, a
+false failure unrelated to the generated specs.) The generated specs are also
+warning-clean: unreferenced component schemas are pruned, so `redocly lint`
+reports zero `no-unused-components` warnings.
+
+**Bugs closed (known-issues.md entries deleted in this slice).** The Gen track
+has no `docs/phases/phase-N.md` of its own, so this is its closure record — each
+deleted entry maps to the regression test that keeps it closed (the same "delete
+the stub, point at a test" discipline the language phases use):
+
+- **Parser error-recovery OOM** (three malformed-input triggers) — bounded now;
+  `gen_schema_fixtures.rs::{poisoned_keyword_field_rejected,
+  poisoned_doc_comment_in_query_rejected, poisoned_response_projection_rejected}`
+  (run un-ignored; each must exit non-zero with a diagnostic, not die by rlimit).
+- **Go generated-local collision** — `q` was one instance of a class: every
+  function-scoped *local* that shares a method/handler scope with the user's
+  parameters could redeclare one. Generalized on both sides — the client locals
+  (`u`/`q`/`req`/`resp`/`result`/`data`/`buf`/`writer`) and the server's
+  handler-result local — each derived via `pick_free_local` to dodge the
+  parameter names. The client's one *fixed* identifier, the receiver `c`, is
+  uniquified the same way (a `c` cursor/count param would otherwise shadow
+  `c.BaseURL`). `go_tests.rs::{query_param_named_q_does_not_collide_with_builder,
+  generated_locals_dodge_colliding_param_names, client_receiver_dodges_colliding_param_name}`
+  (the locals one verified end-to-end with `go build`/`go vet`/`gofmt`/`golangci-lint`
+  on a collision schema). **Known remaining edge:** the server closure's fixed
+  identifiers — `w`/`r`/`h`/`mux` — are not yet uniquified, so a *param* named
+  `w`/`r`/`h`/`mux` still breaks the generated server (deferred until a real
+  schema needs it; tracked in `emit_server_route`'s scope note).
+- **Go wrapped-doc-comment `gofmt` rewrite** — continuation indentation is
+  stripped per line; `go_tests.rs::render_line_comment_strips_continuation_indentation`.
+- **TS optional-before-required param (TS1016)** — a fully-optional bag now
+  renders `= {}`-defaulted, not `?:`; the three regenerated client snapshots
+  (`*get_with_query_all_optional_client`, `*multi_status_inputs_client`,
+  `*request_header_optional_client`) plus the end-to-end `tsc` leg of
+  `compiles_and_lints.rs`.
+- **TS `prettier` redundant parens on a negated constraint** —
+  `typescript_tests.rs::struct_validation_bare_method_call_constraint_has_no_redundant_parens`.
+- **TS `prettier` response-header-envelope long-line break** —
+  `typescript/format.rs::{emit_object_property_breaks_call_args_not_after_colon,
+  split_breakable_call_matches_only_call_shaped_values}`.
+- **Python multi-status `return` not `black`-wrapped** —
+  `python_tests.rs::multi_status_long_response_name_wraps_client_return`.
+- **Python case-sensitive import sort (`ruff` I001)** —
+  `python/format.rs::format_from_import_orders_names_case_insensitively`.

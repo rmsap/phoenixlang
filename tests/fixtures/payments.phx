@@ -21,81 +21,81 @@ enum Currency { USD  EUR  GBP  JPY }
  *  and brand, as returned by the vault */
 struct Card {
     /** Opaque card token id (no native UUID type — using String) */
-    String id where self.length > 0
-    CardBrand brand
-    String last4 where self.length == 4
+    id: String where self.length > 0
+    brand: CardBrand
+    last4: String where self.length == 4
     /** Expiry month, 1..12 */
-    Int expMonth where self >= 1 && self <= 12
+    expMonth: Int where self >= 1 && self <= 12
     /** Expiry year, full 4-digit */
-    Int expYear where self >= 2000
+    expYear: Int where self >= 2000
 }
 
 /** A customer record */
 struct Customer {
     /** Opaque customer id (no native UUID type — using String) */
-    String id where self.length > 0
-    String name where self.length > 0 && self.length <= 200
-    String email where self.contains("@") && self.length > 3
+    id: String where self.length > 0
+    name: String where self.length > 0 && self.length <= 200
+    email: String where self.contains("@") && self.length > 3
     /** Default card token, if the customer has one on file */
-    Option<String> defaultCardId
+    defaultCardId: Option<String>
 }
 
 /** A charge against a customer's payment method */
 struct Charge {
     /** Opaque charge id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** Customer the charge belongs to */
-    String customerId where self.length > 0
+    customerId: String where self.length > 0
     /** Amount in MINOR UNITS (e.g. cents). No native Money/Decimal type */
-    Int amount where self >= 0
-    Currency currency
-    PaymentStatus status
+    amount: Int where self >= 0
+    currency: Currency
+    status: PaymentStatus
     /** Free-form, human-readable description */
-    String description where self.length <= 500
+    description: String where self.length <= 500
     /** The card snapshot used for this charge */
-    Card card
+    card: Card
     /** Whether funds have been captured (vs. auth-only) */
-    Bool captured
+    captured: Bool
     /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
     /** Arbitrary key/value metadata attached at creation */
-    Map<String, String> metadata
+    metadata: Map<String, String>
 }
 
 /** A refund issued against a prior charge */
 struct Refund {
     /** Opaque refund id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** The charge being refunded */
-    String chargeId where self.length > 0
+    chargeId: String where self.length > 0
     /** Amount refunded in MINOR UNITS. No native Money/Decimal type */
-    Int amount where self >= 0
-    Currency currency
-    PaymentStatus status
+    amount: Int where self >= 0
+    currency: Currency
+    status: PaymentStatus
     /** Optional reason code/string */
-    Option<String> reason where self.length > 0
+    reason: Option<String> where self.length > 0
     /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
 }
 
 /** A line-item breakdown used when quoting an itemized charge */
 struct LineItem {
-    String label where self.length > 0 && self.length <= 200
+    label: String where self.length > 0 && self.length <= 200
     /** Unit price in MINOR UNITS. No native Money/Decimal type */
-    Int unitAmount where self >= 0
-    Int quantity where self >= 1
+    unitAmount: Int where self >= 0
+    quantity: Int where self >= 1
 }
 
 /** Request body for an itemized charge quote: the line items to total plus
  *  the charge context the preview is computed against. The `List<LineItem>`
  *  field exercises list-of-struct fields in a body position */
 struct QuoteRequest {
-    String customerId where self.length > 0
-    Currency currency
+    customerId: String where self.length > 0
+    currency: Currency
     /** The items to total */
-    List<LineItem> items
+    items: List<LineItem>
     /** Optional free-form note carried onto the quoted charge preview */
-    Option<String> description where self.length <= 500
+    description: Option<String> where self.length <= 500
 }
 
 // ── Customer endpoints ────────────────────────────────────────
@@ -103,8 +103,8 @@ struct QuoteRequest {
 /** Create a customer. Idempotency-Key header protects against double-submit */
 endpoint createCustomer: POST "/customers" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     body Customer omit { id }
     response Customer
@@ -118,7 +118,7 @@ endpoint createCustomer: POST "/customers" {
 /** Fetch a customer by id */
 endpoint getCustomer: GET "/customers/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response Customer
     error {
@@ -130,12 +130,12 @@ endpoint getCustomer: GET "/customers/{id}" {
 /** List customers (cursor-paginated) */
 endpoint listCustomers: GET "/customers" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Option<String> cursor
-        Int limit = 20
-        Option<String> q
+        cursor: Option<String>
+        limit: Int = 20
+        q: Option<String>
     }
     response List<Customer>
     pagination { cursor }
@@ -147,9 +147,9 @@ endpoint listCustomers: GET "/customers" {
 /** Create a charge. Idempotency-Key protects against duplicate charges */
 endpoint createCharge: POST "/charges" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
-        Option<String> trace as "X-Trace-Id"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
+        trace: Option<String> as "X-Trace-Id"
     }
     body Charge omit { id, status, captured, createdAt, card }
     response Charge
@@ -167,8 +167,8 @@ endpoint createCharge: POST "/charges" {
  *  same Charge body (multi-status block — all typed entries share one type) */
 endpoint createOrGetCharge: POST "/charges/idempotent" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     body Charge omit { id, status, captured, createdAt, card }
     response {
@@ -186,7 +186,7 @@ endpoint createOrGetCharge: POST "/charges/idempotent" {
 /** Fetch a charge by id */
 endpoint getCharge: GET "/charges/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response Charge
     error {
@@ -198,13 +198,13 @@ endpoint getCharge: GET "/charges/{id}" {
 /** List charges (offset-paginated), optionally filtered by customer/status */
 endpoint listCharges: GET "/charges" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> customerId
-        Bool capturedOnly = false
+        page: Int = 1
+        limit: Int = 20
+        customerId: Option<String>
+        capturedOnly: Bool = false
     }
     response List<Charge>
     pagination { offset }
@@ -215,15 +215,15 @@ endpoint listCharges: GET "/charges" {
  *  amount than authorized. Returns rate-limit info via response headers */
 endpoint captureCharge: POST "/charges/{id}/capture" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     query {
-        Option<Int> amount
+        amount: Option<Int>
     }
     response Charge headers {
-        Int ratelimitRemaining as "X-RateLimit-Remaining"
-        Option<String> requestId as "X-Request-Id"
+        ratelimitRemaining: Int as "X-RateLimit-Remaining"
+        requestId: Option<String> as "X-Request-Id"
     }
     error {
         Unauthorized(401)
@@ -238,8 +238,8 @@ endpoint captureCharge: POST "/charges/{id}/capture" {
  *  duplicate refunds */
 endpoint createRefund: POST "/refunds" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     body Refund omit { id, status, createdAt }
     response Refund
@@ -254,7 +254,7 @@ endpoint createRefund: POST "/refunds" {
 /** Fetch a refund by id */
 endpoint getRefund: GET "/refunds/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response Refund
     error {
@@ -266,11 +266,11 @@ endpoint getRefund: GET "/refunds/{id}" {
 /** List refunds for a charge (offset-paginated) */
 endpoint listRefunds: GET "/charges/{chargeId}/refunds" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Int page = 1
-        Int limit = 20
+        page: Int = 1
+        limit: Int = 20
     }
     response List<Refund>
     pagination { offset }
@@ -286,7 +286,7 @@ endpoint listRefunds: GET "/charges/{chargeId}/refunds" {
  *  editable here; everything else is read-only */
 endpoint setDefaultCard: PATCH "/customers/{id}/default-card" {
     headers {
-        String authorization
+        authorization: String
     }
     body Customer pick { defaultCardId }
     response Customer
@@ -305,7 +305,7 @@ api version "v1" {
      *  persisting anything. Returns the computed Charge preview */
     endpoint quoteCharge: POST "/charges/quote" {
         headers {
-            String authorization
+            authorization: String
         }
         body QuoteRequest
         response Charge
@@ -318,11 +318,11 @@ api version "v1" {
     /** List a customer's saved cards */
     endpoint listCards: GET "/customers/{id}/cards" {
         headers {
-            String authorization
+            authorization: String
         }
         query {
-            Int page = 1
-            Int limit = 20
+            page: Int = 1
+            limit: Int = 20
         }
         response List<Card>
         pagination { offset }

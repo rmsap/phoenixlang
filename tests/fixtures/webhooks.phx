@@ -40,73 +40,73 @@ enum AckOutcome { Accepted  Duplicate  Ignored }
  *  the raw body; we re-expose the parsed envelope here */
 struct InboundEvent {
     /** Opaque provider event id (no native UUID type — using String) */
-    String id where self.length > 0
-    EventType eventType
+    id: String where self.length > 0
+    eventType: EventType
     /** Provider account/tenant this event belongs to */
-    String accountId where self.length > 0
+    accountId: String where self.length > 0
     /** Event creation time as Unix epoch SECONDS. No native DateTime type */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
     /** Monotonic schema version of the event payload */
-    Int apiVersion where self >= 1
+    apiVersion: Int where self >= 1
     /** Flattened, stringified payload (no native JSON/Any type — Map of
      *  String→String keeps it codegen-safe across targets) */
-    Map<String, String> data
+    data: Map<String, String>
     /** True when re-sent by the provider after a prior delivery failed */
-    Bool resent
+    resent: Bool
 }
 
 /** A destination we deliver outbound events to */
 struct Subscription {
     /** Opaque subscription id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** Human-readable label for dashboards */
-    String description where self.length <= 200
+    description: String where self.length <= 200
     /** HTTPS destination URL (no native URL type — validated String) */
-    String url where self.contains("https://") && self.length > 8
-    SubscriptionState state
+    url: String where self.contains("https://") && self.length > 8
+    state: SubscriptionState
     /** The event types this destination is subscribed to. Empty = all events */
-    List<EventType> eventTypes
+    eventTypes: List<EventType>
     /** Shared secret used to sign our outbound deliveries to this URL */
-    String secret where self.length >= 16
+    secret: String where self.length >= 16
     /** Custom headers injected on every delivery to this destination */
-    Map<String, String> customHeaders
+    customHeaders: Map<String, String>
     /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
 }
 
 /** One delivery attempt of one event to one subscription */
 struct Delivery {
     /** Opaque delivery id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** The subscription this delivery targets */
-    String subscriptionId where self.length > 0
+    subscriptionId: String where self.length > 0
     /** The source event being delivered */
-    String eventId where self.length > 0
-    EventType eventType
-    DeliveryStatus status
+    eventId: String where self.length > 0
+    eventType: EventType
+    status: DeliveryStatus
     /** Number of attempts made so far */
-    Int attempts where self >= 0
+    attempts: Int where self >= 0
     /** HTTP status code returned by the destination on the last attempt, if any.
      *  No numeric `where` here: a constraint on an `Option<Int>` cannot compare
      *  the optional to an Int (sema rejects `Option<Int> >= Int`) */
-    Option<Int> responseCode
+    responseCode: Option<Int>
     /** Truncated response body captured from the destination, if any */
-    Option<String> responseBody where self.length > 0
+    responseBody: Option<String> where self.length > 0
     /** Unix epoch SECONDS of the next scheduled retry, if still retrying */
-    Option<Int> nextRetryAt
+    nextRetryAt: Option<Int>
     /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
 }
 
 /** The acknowledgement a receiver returns after validating an inbound event */
 struct AckReceipt {
     /** Echoes the provider event id we accepted */
-    String eventId where self.length > 0
-    AckOutcome outcome
+    eventId: String where self.length > 0
+    outcome: AckOutcome
     /** Our internal ingestion id assigned to the accepted event, if stored */
-    Option<String> ingestId where self.length > 0
+    ingestId: Option<String> where self.length > 0
     /** Receipt time as Unix epoch SECONDS. No native DateTime type */
-    Int receivedAt where self >= 0
+    receivedAt: Int where self >= 0
 }
 
 // ── Inbound receiver endpoints (signature + timestamp headers) ──
@@ -118,9 +118,9 @@ struct AckReceipt {
  *  that all typed entries share one type */
 endpoint receiveEvent: POST "/webhooks/inbound" {
     headers {
-        String signature as "X-Webhook-Signature"
-        Int timestamp as "X-Webhook-Timestamp"
-        Option<String> idempotencyKey as "X-Idempotency-Key"
+        signature: String as "X-Webhook-Signature"
+        timestamp: Int as "X-Webhook-Timestamp"
+        idempotencyKey: Option<String> as "X-Idempotency-Key"
     }
     body InboundEvent
     response {
@@ -139,8 +139,8 @@ endpoint receiveEvent: POST "/webhooks/inbound" {
  *  so clients must detect the empty body by CONTENT, not by the status code */
 endpoint receiveLegacyEvent: POST "/webhooks/inbound/legacy" {
     headers {
-        String signature as "X-Signature"
-        Option<Int> timestamp as "X-Signature-Timestamp"
+        signature: String as "X-Signature"
+        timestamp: Option<Int> as "X-Signature-Timestamp"
     }
     body InboundEvent
     response {
@@ -158,8 +158,8 @@ endpoint receiveLegacyEvent: POST "/webhooks/inbound/legacy" {
 /** Create a subscription. Server assigns id/state/createdAt, so omit them */
 endpoint createSubscription: POST "/subscriptions" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     body Subscription omit { id, state, createdAt }
     response Subscription
@@ -173,7 +173,7 @@ endpoint createSubscription: POST "/subscriptions" {
 /** Fetch a subscription by id */
 endpoint getSubscription: GET "/subscriptions/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response Subscription
     error {
@@ -185,13 +185,13 @@ endpoint getSubscription: GET "/subscriptions/{id}" {
 /** List subscriptions (offset-paginated), optionally filtered by event type */
 endpoint listSubscriptions: GET "/subscriptions" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Int page = 1
-        Int limit = 20
-        Option<String> eventType
-        Bool activeOnly = false
+        page: Int = 1
+        limit: Int = 20
+        eventType: Option<String>
+        activeOnly: Bool = false
     }
     response List<Subscription>
     pagination { offset }
@@ -201,7 +201,7 @@ endpoint listSubscriptions: GET "/subscriptions" {
 /** Full replace of a subscription's mutable fields */
 endpoint updateSubscription: PUT "/subscriptions/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     body Subscription omit { id, createdAt }
     response Subscription
@@ -215,7 +215,7 @@ endpoint updateSubscription: PUT "/subscriptions/{id}" {
 /** Partial update — every mutable field optional (e.g. flip state, swap URL) */
 endpoint patchSubscription: PATCH "/subscriptions/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     body Subscription omit { id, createdAt } partial
     response Subscription
@@ -229,7 +229,7 @@ endpoint patchSubscription: PATCH "/subscriptions/{id}" {
 /** Rotate a subscription's signing secret — only the secret is editable here */
 endpoint rotateSecret: PATCH "/subscriptions/{id}/secret" {
     headers {
-        String authorization
+        authorization: String
     }
     body Subscription pick { secret }
     response Subscription
@@ -243,7 +243,7 @@ endpoint rotateSecret: PATCH "/subscriptions/{id}/secret" {
 /** Delete a subscription */
 endpoint deleteSubscription: DELETE "/subscriptions/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     error {
         Unauthorized(401)
@@ -257,12 +257,12 @@ endpoint deleteSubscription: DELETE "/subscriptions/{id}" {
  *  filtered by status */
 endpoint listDeliveries: GET "/subscriptions/{id}/deliveries" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Option<String> cursor
-        Int limit = 20
-        Option<String> status
+        cursor: Option<String>
+        limit: Int = 20
+        status: Option<String>
     }
     response List<Delivery>
     pagination { cursor }
@@ -275,7 +275,7 @@ endpoint listDeliveries: GET "/subscriptions/{id}/deliveries" {
 /** Fetch a single delivery record by id */
 endpoint getDelivery: GET "/deliveries/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response Delivery
     error {
@@ -289,8 +289,8 @@ endpoint getDelivery: GET "/deliveries/{id}" {
  *  Both typed entries share the one Delivery type, per the multi-status rule */
 endpoint replayDelivery: POST "/deliveries/{id}/replay" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     response {
         200: Delivery
@@ -312,14 +312,14 @@ api version "v1" {
      *  surfaced via response headers */
     endpoint testSubscription: POST "/subscriptions/{id}/test" {
         headers {
-            String authorization
+            authorization: String
         }
         query {
-            Option<String> eventType
+            eventType: Option<String>
         }
         response Delivery headers {
-            Int ratelimitRemaining as "X-RateLimit-Remaining"
-            Option<String> requestId as "X-Request-Id"
+            ratelimitRemaining: Int as "X-RateLimit-Remaining"
+            requestId: Option<String> as "X-Request-Id"
         }
         error {
             Unauthorized(401)

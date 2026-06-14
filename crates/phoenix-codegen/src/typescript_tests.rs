@@ -875,6 +875,112 @@ struct User {
     insta::assert_snapshot!("struct_validation_contains_types", files.types);
 }
 
+/// A bare method-call constraint negates *without* redundant parens: `!` binds
+/// looser than member/call, so `!obj.path.includes("/")` is correct and
+/// `!(obj.path.includes("/"))` is what `prettier --check` rejects. (The compound
+/// `&&` case above keeps its parens — `!` over a low-precedence operator needs
+/// them.) Regression for the redundant-parens prettier divergence.
+#[test]
+fn struct_validation_bare_method_call_constraint_has_no_redundant_parens() {
+    let files = generate_from_source(
+        r#"
+struct Key {
+    path: String where self.contains("/")
+}
+"#,
+    );
+    assert!(
+        files.types.contains(r#"if (!obj.path.includes("/"))"#),
+        "expected a paren-free negated method-call guard:\n{}",
+        files.types
+    );
+    assert!(
+        !files.types.contains(r#"!(obj.path.includes("/"))"#),
+        "negated method-call constraint kept redundant parens (prettier rejects):\n{}",
+        files.types
+    );
+}
+
+/// A constraint that is itself a `!x` collapses to `x` in the violation guard
+/// rather than the double negation `!!x` — `where !self` on a Bool field guards
+/// with `if (obj.active)`, not `if (!!obj.active)` (which eslint's
+/// `no-unnecessary-condition`/`no-extra-boolean-cast` flags). Regression for the
+/// double-negation guard.
+#[test]
+fn struct_validation_negated_constraint_collapses_double_negation() {
+    let files = generate_from_source(
+        r#"
+struct Flag {
+    active: Bool where !self
+}
+"#,
+    );
+    assert!(
+        files.types.contains("if (obj.active) throw"),
+        "expected the `!x` constraint to collapse to a bare `obj.active` guard:\n{}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("!!obj.active"),
+        "negated `!x` constraint produced a double negation `!!obj.active`:\n{}",
+        files.types
+    );
+}
+
+/// A `!(a || b)` constraint collapses to the bare `a || b` violation guard — NOT
+/// the `!!(a || b)` double negation eslint flags. Because the collapsed guard is
+/// `||`-rooted (looser than `&&`), it must be parenthesized ONLY where it's
+/// AND-joined with an optional field's presence check, and left bare as a
+/// standalone guard so prettier doesn't reject a redundant `if ((a || b))`:
+///
+///   * required `n` → `if (obj.n < 0 || obj.n > 100)` (bare, no parens)
+///   * optional `m` → `if (obj.m !== undefined && (obj.m.length < 3 || …))`
+///
+/// Regression for the `||`-rooted negated-constraint double-negation / conjunct
+/// precedence gap.
+#[test]
+fn struct_validation_negated_or_constraint_parenthesizes_only_as_conjunct() {
+    let files = generate_from_source(
+        r#"
+struct Bounded {
+    n: Int where !(self < 0 || self > 100)
+    m: Option<String> where !(self.length < 3 || self.length > 20)
+}
+"#,
+    );
+    // No double negation anywhere.
+    assert!(
+        !files.types.contains("!!"),
+        "negated `!(a || b)` constraint produced a double negation:\n{}",
+        files.types
+    );
+    // Required field: bare guard, no redundant `if ((…))` parens.
+    assert!(
+        files.types.contains("if (obj.n < 0 || obj.n > 100)"),
+        "expected a bare `||` guard for the required field:\n{}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("if ((obj.n"),
+        "standalone `||` guard kept redundant parens (prettier rejects):\n{}",
+        files.types
+    );
+    // Optional field: the `||` guard is parenthesized so the `&&` conjunction
+    // parses as `presence && (a || b)`, not `(presence && a) || b`.
+    assert!(
+        files
+            .types
+            .contains("(obj.m.length < 3 || obj.m.length > 20)"),
+        "expected the optional-field `||` guard to be parenthesized as a conjunct:\n{}",
+        files.types
+    );
+    assert!(
+        files.types.contains("obj.m !== undefined"),
+        "expected an optional-field presence check:\n{}",
+        files.types
+    );
+}
+
 /// No struct-level validation when no fields have constraints.
 #[test]
 fn no_struct_validation_without_constraints() {

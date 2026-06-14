@@ -13,9 +13,11 @@ export function setBaseUrl(url: string): void {
 }
 
 export const api = {
-  async listUsers(headers?: { traceId?: string | undefined }): Promise<User[]> {
+  async listUsers(
+    headers: { traceId?: string | undefined } = {},
+  ): Promise<User[]> {
     const requestHeaders = new Headers();
-    if (headers?.traceId !== undefined)
+    if (headers.traceId !== undefined)
       requestHeaders.set("Trace-Id", String(headers.traceId));
     const response = await fetch(`${baseUrl}/api/users`, {
       method: "GET",

@@ -627,10 +627,14 @@ impl<'a> TsGenerator<'a> {
                     }
                 })
                 .collect();
-            let prefix = if opts_nullable { "opts?: " } else { "opts: " };
+            // A fully-optional query bag renders as `opts: {...} = {}` (a default),
+            // not `opts?: {...}`. Both are omittable, but a defaulted param — unlike
+            // a `?:` one — may legally precede a required parameter, so `opts` keeps
+            // its slot ahead of a required `headers` without tripping TS1016.
             params.push(Param::Object {
-                prefix: prefix.to_string(),
+                prefix: "opts: ".to_string(),
                 fields,
+                default_empty: opts_nullable,
             });
         }
         if has_req_headers {
@@ -646,14 +650,13 @@ impl<'a> TsGenerator<'a> {
                     }
                 })
                 .collect();
-            let prefix = if req_headers_nullable {
-                "headers?: "
-            } else {
-                "headers: "
-            };
+            // Same as `opts`: a fully-optional header bag renders as
+            // `headers: {...} = {}` (defaulted, omittable) rather than `headers?:`,
+            // so it can sit in a stable slot without violating TS1016.
             params.push(Param::Object {
-                prefix: prefix.to_string(),
+                prefix: "headers: ".to_string(),
                 fields,
+                default_empty: req_headers_nullable,
             });
         }
 
@@ -672,17 +675,16 @@ impl<'a> TsGenerator<'a> {
         if has_query {
             self.client_out
                 .push_str("    const params = new URLSearchParams();\n");
-            // `opts_nullable` (computed once above) and each param's own
-            // optionality feed `emit_param_set` so it never emits an
-            // eslint-flagged redundant optional chain or `!== undefined` guard on
-            // an always-present value.
+            // `opts` is always non-nullable in the emitted client (a fully-optional
+            // bag is a `= {}` default, not `opts?:`), so `emit_param_set` only needs
+            // each param's own optionality to decide whether to guard with
+            // `!== undefined` — it never emits an eslint-flagged redundant chain.
             for qp in &ep.query_params {
                 emit_param_set(
                     &mut self.client_out,
                     "    ",
                     &qp.name,
                     is_query_param_optional(qp),
-                    opts_nullable,
                 );
             }
             self.client_out
@@ -733,7 +735,6 @@ impl<'a> TsGenerator<'a> {
                     &h.name,
                     &h.wire_name,
                     is_header_client_optional(h),
-                    req_headers_nullable,
                 );
             }
             init_lines.push("headers: requestHeaders".to_string());
@@ -961,6 +962,7 @@ impl<'a> TsGenerator<'a> {
             params.push(Param::Object {
                 prefix: "query: ".to_string(),
                 fields,
+                default_empty: false,
             });
         }
         if !ep.headers.is_empty() {
@@ -981,6 +983,7 @@ impl<'a> TsGenerator<'a> {
             params.push(Param::Object {
                 prefix: "headers: ".to_string(),
                 fields,
+                default_empty: false,
             });
         }
 
@@ -1592,8 +1595,54 @@ fn validation_field(
         name: name.to_string(),
         optional: extra_optional || is_option,
         ts_typeof: ts_typeof_of(inner_ty),
-        constraint: constraint.map(|c| constraint_expr_to_ts(c, name)),
+        constraint_guard: constraint.map(|c| {
+            let (code, needs_conjunct_parens) = negated_constraint_to_ts(c, name);
+            ConstraintGuard {
+                code,
+                needs_conjunct_parens,
+            }
+        }),
     }
+}
+
+/// Renders the negated constraint for a validation guard, with minimal
+/// parentheses (Prettier style), returning the guard code plus whether it must be
+/// wrapped in parens when AND-joined with an optional field's presence check (see
+/// [`ValidationField::constraint_guard`]).
+///
+/// `!` (`PREC_UNARY`) only needs to wrap an operand whose precedence is lower, so
+/// a method-call/atom constraint negates as `!obj.x.includes("/")` (no parens —
+/// `!` binds looser than member/call) while a comparison negates as
+/// `!(obj.x > 5)`. Emitting `!(…)` unconditionally would leave redundant parens
+/// that `prettier --check` rejects. These `!`-rooted guards are unary-tight, so
+/// they never need conjunct parens.
+///
+/// A constraint that is itself a `!x` collapses to `x` rather than the double
+/// negation `!!x` (which eslint's `no-unnecessary-condition`/`no-extra-boolean-cast`
+/// flags). `x` is emitted bare — clean standalone (`if (x)`) and as the right of
+/// an `&&` (`if (obj.f !== undefined && x)`) for any `x` that binds at least as
+/// tight as `&&`. The one exception is a `||`-rooted `x` (`!(a || b)` → `a || b`):
+/// bare, `obj.f !== undefined && a || b` mis-parses as `(… && a) || b`, so the
+/// `needs_conjunct_parens` flag is set and the caller wraps it to `(a || b)` in
+/// the conjunct position only — wrapping it unconditionally would instead leave
+/// the redundant `if ((a || b))` parens prettier rejects in the standalone case.
+fn negated_constraint_to_ts(expr: &phoenix_parser::ast::Expr, field_name: &str) -> (String, bool) {
+    use phoenix_parser::ast::{Expr, UnaryOp};
+    if let Expr::Unary(un) = expr
+        && matches!(un.op, UnaryOp::Not)
+    {
+        // Negating a `!x` constraint is just `x`. It needs conjunct parens exactly
+        // when it binds looser than `&&` — i.e. a top-level `||`.
+        let (code, prec) = constraint_expr_prec(&un.operand, field_name);
+        return (code, prec < PREC_AND);
+    }
+    let (code, prec) = constraint_expr_prec(expr, field_name);
+    let guard = if prec < PREC_UNARY {
+        format!("!({code})")
+    } else {
+        format!("!{code}")
+    };
+    (guard, false)
 }
 
 /// Recursively converts a Phoenix constraint `Expr` to a TypeScript expression

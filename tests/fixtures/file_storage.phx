@@ -34,84 +34,84 @@ enum ChecksumAlgorithm { Md5  Sha1  Sha256  Crc32c }
 /** A top-level storage bucket (namespace for objects) */
 struct Bucket {
     /** Opaque bucket id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** Globally unique bucket name, DNS-ish, 3..63 chars */
-    String name where self.length >= 3 && self.length <= 63
+    name: String where self.length >= 3 && self.length <= 63
     /** Geographic region the bucket lives in, e.g. "us-east-1" */
-    String region where self.length > 0
+    region: String where self.length > 0
     /** Default storage class applied to newly uploaded objects */
-    StorageClass defaultStorageClass
+    defaultStorageClass: StorageClass
     /** Whether object versioning is enabled on this bucket */
-    Bool versioningEnabled
+    versioningEnabled: Bool
     /** Whether the bucket is publicly readable */
-    Bool publicAccess
+    publicAccess: Bool
     /** Number of objects currently stored (non-negative) */
-    Int objectCount where self >= 0
+    objectCount: Int where self >= 0
     /** Total bytes stored across all objects (non-negative) */
-    Int totalBytes where self >= 0
+    totalBytes: Int where self >= 0
     /** Bucket creation time, Unix epoch SECONDS (no native DateTime type) */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
 }
 
 /** A logical folder/prefix inside a bucket */
 struct Folder {
     /** Opaque folder id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** Bucket this folder belongs to */
-    String bucketId where self.length > 0
+    bucketId: String where self.length > 0
     /** Full key prefix, e.g. "photos/2024/" — must contain a separator */
-    String prefix where self.contains("/")
+    prefix: String where self.contains("/")
     /** Human-friendly folder name (last path segment) */
-    String name where self.length > 0
+    name: String where self.length > 0
     /** Parent folder prefix; absent for a top-level folder */
-    Option<String> parentPrefix where self.length > 0
+    parentPrefix: Option<String> where self.length > 0
     /** Folder creation time, Unix epoch SECONDS */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
 }
 
 /** Metadata describing a stored object (no payload bytes — see download endpoint) */
 struct StoredObject {
     /** Opaque object id (no native UUID type — using String) */
-    String id where self.length > 0
+    id: String where self.length > 0
     /** Bucket the object lives in */
-    String bucketId where self.length > 0
+    bucketId: String where self.length > 0
     /** Full object key/path within the bucket, e.g. "photos/cat.jpg" */
-    String objectKey where self.length > 0
+    objectKey: String where self.length > 0
     /** Original client filename */
-    String filename where self.length > 0
+    filename: String where self.length > 0
     /** MIME content type, e.g. "image/jpeg" (NOT a reserved keyword: mimeType) */
-    String mimeType where self.contains("/")
+    mimeType: String where self.contains("/")
     /** Object size in bytes (non-negative) */
-    Int sizeBytes where self >= 0
+    sizeBytes: Int where self >= 0
     /** Integrity checksum as a hex digest string (no native bytes/hash type) */
-    String checksum where self.length > 0
+    checksum: String where self.length > 0
     /** Algorithm used to compute the checksum above */
-    ChecksumAlgorithm checksumAlgorithm
+    checksumAlgorithm: ChecksumAlgorithm
     /** Opaque entity tag for conditional requests / cache validation */
-    String etag where self.length > 0
-    StorageClass storageClass
-    ObjectState state
-    EncryptionMode encryption
+    etag: String where self.length > 0
+    storageClass: StorageClass
+    state: ObjectState
+    encryption: EncryptionMode
     /** Optional opaque version id when bucket versioning is enabled */
-    Option<String> versionId where self.length > 0
+    versionId: Option<String> where self.length > 0
     /** Upload (creation) time, Unix epoch SECONDS (no native DateTime type) */
-    Int createdAt where self >= 0
+    createdAt: Int where self >= 0
     /** Last modification time, Unix epoch SECONDS */
-    Int updatedAt where self >= 0
+    updatedAt: Int where self >= 0
     /** Arbitrary user-supplied key/value tags attached to the object */
-    Map<String, String> userMetadata
+    userMetadata: Map<String, String>
 }
 
 /** Aggregate usage stats for a bucket, surfaced on a stats endpoint */
 struct BucketUsage {
-    String bucketId where self.length > 0
-    Int objectCount where self >= 0
-    Int totalBytes where self >= 0
-    Int folderCount where self >= 0
+    bucketId: String where self.length > 0
+    objectCount: Int where self >= 0
+    totalBytes: Int where self >= 0
+    folderCount: Int where self >= 0
     /** Bytes counted under the Archive + Cold tiers combined */
-    Int archivedBytes where self >= 0
+    archivedBytes: Int where self >= 0
     /** Time the usage snapshot was computed, Unix epoch SECONDS */
-    Int computedAt where self >= 0
+    computedAt: Int where self >= 0
 }
 
 /** A multipart upload body: the binary payload plus scalar metadata and an
@@ -120,27 +120,27 @@ struct BucketUsage {
  *  per-target form-field coercion paths (Int/Bool stringify + parse) */
 struct ObjectUpload {
     /** The object's binary payload (drives multipart upload) */
-    File content
+    content: File
     /** Destination key/path for the object within the bucket */
-    String objectKey where self.length > 0
+    objectKey: String where self.length > 0
     /** Original filename to record alongside the object */
-    String filename where self.length > 0
+    filename: String where self.length > 0
     /** MIME content type of the payload */
-    String mimeType where self.contains("/")
+    mimeType: String where self.contains("/")
     /** Storage tier name to place the object in, e.g. "Standard" (sent as a
      *  form field, so a String rather than the StorageClass enum — multipart
      *  bodies can only carry File/scalar/Option-of-scalar fields) */
-    String storageClassName where self.length > 0
+    storageClassName: String where self.length > 0
     /** Whether to overwrite an existing object at the same key */
-    Bool overwrite
+    overwrite: Bool
     /** Optional small preview/thumbnail image (optional multipart file) */
-    Option<File> thumbnail
+    thumbnail: Option<File>
 }
 
 /** A pure binary download body: EXACTLY one File field and nothing else, which
  *  generates a binary streaming download (not a JSON envelope) */
 struct ObjectDownload {
-    File payload
+    payload: File
 }
 
 // ── Bucket endpoints ──────────────────────────────────────────
@@ -148,8 +148,8 @@ struct ObjectDownload {
 /** Create a bucket. Idempotency-Key protects against double-submit */
 endpoint createBucket: POST "/buckets" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     body Bucket omit { id, objectCount, totalBytes, createdAt }
     response Bucket
@@ -163,7 +163,7 @@ endpoint createBucket: POST "/buckets" {
 /** Fetch a bucket by id */
 endpoint getBucket: GET "/buckets/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response Bucket
     error {
@@ -175,12 +175,12 @@ endpoint getBucket: GET "/buckets/{id}" {
 /** List buckets (cursor-paginated) */
 endpoint listBuckets: GET "/buckets" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Option<String> cursor
-        Int limit = 20
-        Option<String> region
+        cursor: Option<String>
+        limit: Int = 20
+        region: Option<String>
     }
     response List<Bucket>
     pagination { cursor }
@@ -190,7 +190,7 @@ endpoint listBuckets: GET "/buckets" {
 /** Aggregate usage stats for a bucket */
 endpoint getBucketUsage: GET "/buckets/{id}/usage" {
     headers {
-        String authorization
+        authorization: String
     }
     response BucketUsage
     error {
@@ -203,7 +203,7 @@ endpoint getBucketUsage: GET "/buckets/{id}/usage" {
  *  (partial over a picked subset — ids and counters are not editable) */
 endpoint updateBucket: PATCH "/buckets/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     body Bucket pick { defaultStorageClass, versioningEnabled, publicAccess } partial
     response Bucket
@@ -218,7 +218,7 @@ endpoint updateBucket: PATCH "/buckets/{id}" {
  *  was emptied and removed, or 204 when it was already gone (idempotent) */
 endpoint deleteBucket: DELETE "/buckets/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     response {
         200: BucketUsage
@@ -235,8 +235,8 @@ endpoint deleteBucket: DELETE "/buckets/{id}" {
 /** Create a folder (key prefix) inside a bucket */
 endpoint createFolder: POST "/buckets/{bucketId}/folders" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
     }
     body Folder omit { id, bucketId, createdAt }
     response Folder
@@ -251,12 +251,12 @@ endpoint createFolder: POST "/buckets/{bucketId}/folders" {
 /** List folders within a bucket (offset-paginated), optionally by prefix */
 endpoint listFolders: GET "/buckets/{bucketId}/folders" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Int page = 1
-        Int limit = 50
-        Option<String> prefix
+        page: Int = 1
+        limit: Int = 50
+        prefix: Option<String>
     }
     response List<Folder>
     pagination { offset }
@@ -269,7 +269,7 @@ endpoint listFolders: GET "/buckets/{bucketId}/folders" {
 /** Move/rename a folder prefix. Only the prefix and name are editable */
 endpoint moveFolder: PATCH "/buckets/{bucketId}/folders/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     body Folder pick { prefix, name } partial { name }
     response Folder
@@ -289,9 +289,9 @@ endpoint moveFolder: PATCH "/buckets/{bucketId}/folders/{id}" {
  *  uploads on retry. THIS IS THE HEADLINE MULTIPART-UPLOAD ENDPOINT */
 endpoint uploadObject: POST "/buckets/{bucketId}/objects" {
     headers {
-        String authorization
-        String idemKey as "Idempotency-Key"
-        Option<String> contentMd5 as "Content-MD5"
+        authorization: String
+        idemKey: String as "Idempotency-Key"
+        contentMd5: Option<String> as "Content-MD5"
     }
     body ObjectUpload
     response StoredObject
@@ -308,9 +308,9 @@ endpoint uploadObject: POST "/buckets/{bucketId}/objects" {
  *  envelope, and therefore no response-header envelope can ride along here) */
 endpoint downloadObject: GET "/buckets/{bucketId}/objects/{id}/content" {
     headers {
-        String authorization
-        Option<String> ifNoneMatch as "If-None-Match"
-        Option<String> ifMatch as "If-Match"
+        authorization: String
+        ifNoneMatch: Option<String> as "If-None-Match"
+        ifMatch: Option<String> as "If-Match"
     }
     response ObjectDownload
     error {
@@ -324,13 +324,13 @@ endpoint downloadObject: GET "/buckets/{bucketId}/objects/{id}/content" {
  *  the header envelope is allowed here (unlike the binary download above) */
 endpoint headObject: GET "/buckets/{bucketId}/objects/{id}" {
     headers {
-        String authorization
-        Option<String> ifNoneMatch as "If-None-Match"
+        authorization: String
+        ifNoneMatch: Option<String> as "If-None-Match"
     }
     response StoredObject headers {
-        String etag as "ETag"
-        Int contentLength as "X-Content-Length"
-        Option<String> versionId as "X-Version-Id"
+        etag: String as "ETag"
+        contentLength: Int as "X-Content-Length"
+        versionId: Option<String> as "X-Version-Id"
     }
     error {
         Unauthorized(401)
@@ -342,14 +342,14 @@ endpoint headObject: GET "/buckets/{bucketId}/objects/{id}" {
  *  prefix and storage class */
 endpoint listObjects: GET "/buckets/{bucketId}/objects" {
     headers {
-        String authorization
+        authorization: String
     }
     query {
-        Int page = 1
-        Int limit = 50
-        Option<String> prefix
-        Option<String> storageClass
-        Bool availableOnly = false
+        page: Int = 1
+        limit: Int = 50
+        prefix: Option<String>
+        storageClass: Option<String>
+        availableOnly: Bool = false
     }
     response List<StoredObject>
     pagination { offset }
@@ -363,7 +363,7 @@ endpoint listObjects: GET "/buckets/{bucketId}/objects" {
  *  tags. Every supplied field is optional (partial over a picked subset) */
 endpoint updateObjectMetadata: PATCH "/buckets/{bucketId}/objects/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     body StoredObject pick { mimeType, storageClass, userMetadata } partial
     response StoredObject
@@ -377,7 +377,7 @@ endpoint updateObjectMetadata: PATCH "/buckets/{bucketId}/objects/{id}" {
 /** Delete an object. Returns 204 on success (idempotent) */
 endpoint deleteObject: DELETE "/buckets/{bucketId}/objects/{id}" {
     headers {
-        String authorization
+        authorization: String
     }
     error {
         Unauthorized(401)
@@ -394,8 +394,8 @@ api version "v1" {
      *  destination key was overwritten (multi-status — shared body type) */
     endpoint copyObject: POST "/buckets/{bucketId}/objects/{id}/copy" {
         headers {
-            String authorization
-            String idemKey as "Idempotency-Key"
+            authorization: String
+            idemKey: String as "Idempotency-Key"
         }
         body StoredObject pick { objectKey }
         response {
@@ -414,7 +414,7 @@ api version "v1" {
      *  (single-File response struct — binary download) */
     endpoint downloadThumbnail: GET "/buckets/{bucketId}/objects/{id}/thumbnail" {
         headers {
-            String authorization
+            authorization: String
         }
         response ObjectDownload
         error {

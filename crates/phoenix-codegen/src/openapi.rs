@@ -11,6 +11,7 @@ use phoenix_sema::Analysis;
 use phoenix_sema::checker::{DefaultValue, EndpointInfo, PaginationInfo};
 use phoenix_sema::types::Type;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 
 use crate::capitalize;
 
@@ -58,6 +59,15 @@ pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
 
     let paths = build_paths(&check_result.endpoints);
 
+    // Drop component schemas no operation references. A component is emitted for
+    // every declared struct/enum, but some are never `$ref`d — a struct used only
+    // as a binary-download response (rendered `application/octet-stream`), a
+    // multipart body (inlined as `multipart/form-data`), or a plain JSON body (the
+    // operation `$ref`s the derived `<Endpoint>Body` instead of the source struct).
+    // redocly flags those as `no-unused-components`; pruning keeps the spec
+    // reference-clean without changing any referenced schema.
+    prune_unreferenced_schemas(&paths, &mut schemas);
+
     let spec = json!({
         "openapi": "3.1.0",
         "info": {
@@ -74,6 +84,77 @@ pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
     });
 
     serde_json::to_string_pretty(&spec).expect("OpenAPI spec serialization should not fail")
+}
+
+/// Removes component schemas not reachable (transitively via `$ref`) from the
+/// operations in `paths`. Roots are the schema names referenced anywhere in
+/// `paths`; the reachable set is grown by following each kept schema's own
+/// `$ref`s (a struct's fields can reference other structs/enums), then anything
+/// outside it is dropped. Mirrors redocly's `no-unused-components` reachability,
+/// so an emitted-but-unreferenced schema (binary/multipart/plain-JSON-body source
+/// struct) no longer lingers in `components.schemas`.
+///
+/// Rooting only in `paths` is valid because `components.schemas` is the only
+/// component section this generator emits (the spec has no shared
+/// `parameters`/`requestBodies`/`responses`/`securitySchemes` that could `$ref` a
+/// schema from outside `paths`). If such a section is ever added, its `$ref`s must
+/// be folded into the root set here, or it would silently drop still-referenced
+/// schemas.
+fn prune_unreferenced_schemas(paths: &Value, schemas: &mut Map<String, Value>) {
+    // Collects every `#/components/schemas/<name>` `$ref` reachable under `v`. The
+    // only `$ref`s this generator emits point at `#/components/schemas/`; any other
+    // `$ref` shape is simply not collected (it can't name a component schema).
+    fn collect_schema_refs(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map {
+                    if k == "$ref"
+                        && let Value::String(s) = val
+                        && let Some(name) = s.strip_prefix("#/components/schemas/")
+                    {
+                        out.push(name.to_string());
+                    } else {
+                        collect_schema_refs(val, out);
+                    }
+                }
+            }
+            Value::Array(arr) => arr.iter().for_each(|e| collect_schema_refs(e, out)),
+            _ => {}
+        }
+    }
+
+    // A spec with no operations at all (a types-only spec / the struct-only unit
+    // fixtures) has nothing to prune *against* — the schemas are the whole point,
+    // so keep them rather than emptying `components.schemas`. Gate on `paths`
+    // being empty, NOT on the root set: a spec that *has* operations but happens
+    // to `$ref` no schema (e.g. only binary/void endpoints) should still prune its
+    // unreferenced structs — otherwise they'd re-trip `no-unused-components`.
+    if paths.as_object().is_none_or(Map::is_empty) {
+        return;
+    }
+
+    let mut roots = Vec::new();
+    collect_schema_refs(paths, &mut roots);
+
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    for r in roots {
+        if reachable.insert(r.clone()) {
+            queue.push(r);
+        }
+    }
+    while let Some(name) = queue.pop() {
+        if let Some(schema) = schemas.get(&name) {
+            let mut nested = Vec::new();
+            collect_schema_refs(schema, &mut nested);
+            for r in nested {
+                if reachable.insert(r.clone()) {
+                    queue.push(r);
+                }
+            }
+        }
+    }
+    schemas.retain(|name, _| reachable.contains(name));
 }
 
 /// Builds the `paths` object from endpoint definitions.
@@ -1038,6 +1119,107 @@ endpoint downloadDoc: GET "/api/doc/{id}" {
 "#,
         );
         insta::assert_snapshot!("openapi_binary_response", spec);
+    }
+
+    /// Component schemas no operation references are pruned (matching redocly's
+    /// `no-unused-components`). A struct used only as a binary-download response
+    /// (octet-stream, never `$ref`d) or only as a JSON request body (the operation
+    /// `$ref`s the derived `<Endpoint>Body`, not the source struct) is dropped,
+    /// while a struct an operation actually `$ref`s — and the derived body
+    /// component itself — are kept. Regression for the unused-component gap.
+    #[test]
+    fn unreferenced_component_schemas_are_pruned() {
+        let spec = generate_from_source(
+            r#"
+struct Item { id: Int  name: String }
+struct Blob { data: File }
+struct CreateItemReq { name: String }
+endpoint getItem: GET "/items/{id}" { response Item }
+endpoint downloadBlob: GET "/blobs/{id}" { response Blob }
+endpoint createItem: POST "/items" { body CreateItemReq  response Item }
+"#,
+        );
+        // Referenced by getItem/createItem responses -> kept.
+        assert!(
+            spec.contains("\"Item\":"),
+            "a referenced struct must stay in components:\n{spec}"
+        );
+        // The derived body the createItem operation actually `$ref`s -> kept.
+        assert!(
+            spec.contains("\"CreateItemBody\":"),
+            "the derived <Endpoint>Body component must stay:\n{spec}"
+        );
+        // Only a binary-download response -> octet-stream, never `$ref`d -> pruned.
+        assert!(
+            !spec.contains("\"Blob\""),
+            "a binary-only response struct must be pruned:\n{spec}"
+        );
+        // Only a JSON-body source -> operation `$ref`s CreateItemBody -> pruned.
+        assert!(
+            !spec.contains("\"CreateItemReq\""),
+            "a JSON-body-only source struct must be pruned:\n{spec}"
+        );
+    }
+
+    /// Reachability is transitive: a struct no operation references directly is
+    /// kept when a referenced struct reaches it through a field `$ref`. Here only
+    /// `Order` is named by an operation; `Order` has a `customer: Customer` field
+    /// and `Customer` an `address: Address` field, so both survive the prune via
+    /// the BFS over each kept schema's own `$ref`s — while a sibling struct nothing
+    /// reaches is still dropped. Guards the queue-following branch of the prune.
+    #[test]
+    fn transitively_referenced_component_schemas_are_kept() {
+        let spec = generate_from_source(
+            r#"
+struct Address { street: String  city: String }
+struct Customer { id: Int  address: Address }
+struct Order { id: Int  customer: Customer }
+struct Orphan { note: String }
+endpoint getOrder: GET "/orders/{id}" { response Order }
+"#,
+        );
+        // Directly referenced by the operation response.
+        assert!(
+            spec.contains("\"Order\":"),
+            "the directly-referenced struct must stay:\n{spec}"
+        );
+        // Reached only via Order.customer -> kept transitively.
+        assert!(
+            spec.contains("\"Customer\":"),
+            "a struct reached via a field `$ref` must stay (transitive):\n{spec}"
+        );
+        // Reached only via Customer.address (two hops) -> kept transitively.
+        assert!(
+            spec.contains("\"Address\":"),
+            "a struct reached via a two-hop field `$ref` must stay:\n{spec}"
+        );
+        // Reached by nothing -> pruned, even alongside the transitive keeps.
+        assert!(
+            !spec.contains("\"Orphan\""),
+            "a struct nothing reaches must still be pruned:\n{spec}"
+        );
+    }
+
+    /// Pruning is gated on the *operation set* being empty, not on the *root ref
+    /// set*: a spec that has operations but `$ref`s no schema (here, a lone
+    /// binary-download endpoint) must still prune its unreferenced struct, or that
+    /// struct re-trips redocly's `no-unused-components`. The earlier "keep all when
+    /// no roots" guard wrongly kept it. A types-only spec (no operations) is the
+    /// case that legitimately keeps every schema — exercised by the unit fixtures.
+    #[test]
+    fn operations_present_but_no_refs_still_prunes() {
+        let spec = generate_from_source(
+            r#"
+struct Blob { data: File }
+endpoint downloadBlob: GET "/blobs/{id}" { response Blob }
+"#,
+        );
+        // The only operation streams octet-stream and never `$ref`s `Blob`, so the
+        // schema is unreferenced and must be pruned despite a non-empty `paths`.
+        assert!(
+            !spec.contains("\"Blob\""),
+            "an unreferenced struct must be pruned even when operations exist:\n{spec}"
+        );
     }
 
     /// An `api version` block prefixes the `paths` key in the generated OpenAPI

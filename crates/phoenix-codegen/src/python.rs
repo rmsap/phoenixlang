@@ -926,13 +926,27 @@ impl<'a> PyGenerator<'a> {
                 self.client_out.push_str(&format!(
                     "        response_body: {body_ty} | None = None\n        if response.content:\n            response_body = {body_ty}.model_validate(response.json())\n"
                 ));
-                self.client_out.push_str(&format!(
-                    "        return {response_type}(status=response.status_code, body=response_body)\n"
-                ));
+                // Through `format_call` so a long `<Endpoint>Response` name wraps
+                // the way black does (`Response(\n    status=…, body=…\n)`) instead
+                // of overflowing the line length (black reformat + ruff E501).
+                let ret = format_call(
+                    "        ",
+                    &format!("return {response_type}"),
+                    &[
+                        "status=response.status_code".to_string(),
+                        "body=response_body".to_string(),
+                    ],
+                    "",
+                );
+                self.client_out.push_str(&ret);
             } else {
-                self.client_out.push_str(&format!(
-                    "        return {response_type}(status=response.status_code)\n"
-                ));
+                let ret = format_call(
+                    "        ",
+                    &format!("return {response_type}"),
+                    &["status=response.status_code".to_string()],
+                    "",
+                );
+                self.client_out.push_str(&ret);
             }
             return;
         }

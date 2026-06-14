@@ -61,13 +61,26 @@ pub(crate) fn pydantic_field_line(
 /// Formats a `from <module> import <names>` statement the way `black` would:
 /// one line if it fits in the line length, otherwise a parenthesized block with
 /// one name per line and a magic trailing comma.
+///
+/// `names` are re-sorted case-insensitively to match isort (ruff's `I` rules),
+/// which orders e.g. `Reaction` before `ReactToPostBody` (comparing "reacti…" <
+/// "reactt…"). The callers collect names through a `BTreeSet`, whose ASCII order
+/// instead puts the uppercase `T` first — which `ruff check` flags as an unsorted
+/// import block (I001). All callers pass `.models` imports (PascalCase class
+/// names), so a plain lowercase key matches isort's `order-by-type` grouping too.
 pub(crate) fn format_from_import(module: &str, names: &[String]) -> String {
+    let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+    // Case-insensitive primary key, original ASCII as the tiebreaker (so a casing
+    // difference alone is still ordered deterministically). `sort_by_cached_key`
+    // lowercases each name once rather than on every comparison.
+    names.sort_by_cached_key(|n| (n.to_lowercase(), *n));
+
     let one_line = format!("from {module} import {}", names.join(", "));
     if one_line.len() <= LINE_LENGTH {
         return format!("{one_line}\n");
     }
     let mut out = format!("from {module} import (\n");
-    for n in names {
+    for n in &names {
         out.push_str(&format!("    {n},\n"));
     }
     out.push_str(")\n");
@@ -225,6 +238,25 @@ mod tests {
         assert!(
             !sig.contains(&format!("{param},")),
             "overflowing param should not be emitted on a single line:\n{sig}"
+        );
+    }
+
+    /// Import names are ordered case-insensitively to match isort (ruff's `I`
+    /// rules): `Reaction` precedes `ReactToPostBody` (comparing "reacti…" <
+    /// "reactt…"), where a `BTreeSet`'s ASCII order would put the uppercase `T`
+    /// first and trip ruff I001. Regression for the un-sorted-import-block gap.
+    #[test]
+    fn format_from_import_orders_names_case_insensitively() {
+        // Passed in ASCII (BTreeSet) order, which puts `ReactTo…` before `Reaction`.
+        let names = [
+            "PublicProfile".to_string(),
+            "ReactToPostBody".to_string(),
+            "Reaction".to_string(),
+            "SearchUsersPage".to_string(),
+        ];
+        assert_eq!(
+            format_from_import(".models", &names),
+            "from .models import PublicProfile, Reaction, ReactToPostBody, SearchUsersPage\n"
         );
     }
 }

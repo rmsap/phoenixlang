@@ -1307,6 +1307,42 @@ endpoint upsertUser: PUT "/api/users/{id}" {
     insta::assert_snapshot!("py_multi_status_shared_body_server", files.server);
 }
 
+/// A long `<Endpoint>Response` envelope name pushes the client's
+/// `return <Endpoint>Response(status=…, body=…)` past black's 88-column limit, so
+/// it must wrap (call opens, args collapse to one indented line, `)` closes back)
+/// rather than overflow — otherwise black reformats it and ruff flags E501.
+/// Regression for the multi-status return-line black/ruff gap.
+#[test]
+fn multi_status_long_response_name_wraps_client_return() {
+    let files = generate_from_source(
+        r#"
+struct Charge { id: Int  amount: Int }
+endpoint createOrGetCharge: POST "/api/charges/idempotent" {
+    response {
+        200: Charge
+        201: Charge
+    }
+}
+"#,
+    );
+    assert!(
+        files.client.contains(
+            "        return CreateOrGetChargeResponse(\n            \
+             status=response.status_code, body=response_body\n        )\n"
+        ),
+        "overflowing multi-status return must wrap black-style:\n{}",
+        files.client
+    );
+    // The unwrapped >88-col form must NOT survive.
+    assert!(
+        !files.client.contains(
+            "return CreateOrGetChargeResponse(status=response.status_code, body=response_body)"
+        ),
+        "overflowing return must not be emitted on a single line:\n{}",
+        files.client
+    );
+}
+
 /// A multi-status endpoint mixing a TYPED status with a TYPELESS one
 /// (`response { 200: User  204 }`): the envelope still carries `body: User |
 /// None = None` (at least one typed status). The client guards the body parse

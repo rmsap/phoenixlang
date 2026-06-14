@@ -166,7 +166,15 @@ fn client_has_base_url_config() {
 #[test]
 fn client_list_users_has_query_params() {
     let files = generate_full_schema();
-    assert!(files.client.contains("async listUsers(opts?:"));
+    // A fully-optional query bag renders as a `= {}` default rather than `opts?:`
+    // — a defaulted param is omittable yet may legally precede a required one, so
+    // `opts` keeps a stable slot without tripping `tsc`'s TS1016.
+    assert!(files.client.contains("async listUsers("));
+    assert!(
+        files.client.contains("opts: {") && files.client.contains("} = {}"),
+        "fully-optional opts bag should be a `= {{}}` default, not `opts?:`:\n{}",
+        files.client
+    );
     assert!(files.client.contains("page?: number"));
     assert!(files.client.contains("limit?: number"));
     assert!(files.client.contains("search?: string"));
@@ -523,9 +531,16 @@ fn openapi_has_component_schemas() {
     let parsed: serde_json::Value = serde_json::from_str(&spec).unwrap();
     let schemas = parsed["components"]["schemas"].as_object().unwrap();
     assert!(schemas.contains_key("User"));
-    assert!(schemas.contains_key("Role"));
     assert!(schemas.contains_key("CreateUserBody"));
     assert!(schemas.contains_key("UpdateUserBody"));
+    // `Role` is declared in FULL_SCHEMA but referenced by no struct field or
+    // operation, so it is pruned as an unused component (matching redocly's
+    // `no-unused-components`). The referenced-enum-survives-pruning path is
+    // covered by `openapi_role_enum_is_string`.
+    assert!(
+        !schemas.contains_key("Role"),
+        "an unreferenced enum must be pruned from components:\n{spec}"
+    );
 }
 
 #[test]
@@ -541,7 +556,28 @@ fn openapi_user_schema_has_fields() {
 
 #[test]
 fn openapi_role_enum_is_string() {
-    let spec = generate_full_openapi();
+    // A unit enum referenced by a struct field renders into components as a
+    // `type: string` with its variants in `enum`. The field's `$ref` keeps it
+    // reachable through the unused-component prune (see
+    // `openapi_has_component_schemas`, where the same enum is pruned because
+    // nothing references it).
+    let source = r#"
+enum Role { Admin  Editor  Viewer }
+struct Member { id: Int  role: Role }
+endpoint getMember: GET "/api/members/{id}" {
+    response Member
+}
+"#;
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    let spec = phoenix_codegen::generate_openapi(&program, &result);
     let parsed: serde_json::Value = serde_json::from_str(&spec).unwrap();
     let role = &parsed["components"]["schemas"]["Role"];
     assert_eq!(role["type"], "string");

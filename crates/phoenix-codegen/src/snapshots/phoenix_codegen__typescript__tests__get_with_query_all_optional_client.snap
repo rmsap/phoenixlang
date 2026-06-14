@@ -13,15 +13,13 @@ export function setBaseUrl(url: string): void {
 }
 
 export const api = {
-  async listUsers(opts?: {
-    page?: number;
-    limit?: number;
-    search?: string | undefined;
-  }): Promise<User[]> {
+  async listUsers(
+    opts: { page?: number; limit?: number; search?: string | undefined } = {},
+  ): Promise<User[]> {
     const params = new URLSearchParams();
-    if (opts?.page !== undefined) params.set("page", String(opts.page));
-    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
-    if (opts?.search !== undefined) params.set("search", String(opts.search));
+    if (opts.page !== undefined) params.set("page", String(opts.page));
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.search !== undefined) params.set("search", String(opts.search));
     const query = params.toString();
     const response = await fetch(
       `${baseUrl}/api/users${query ? `?${query}` : ""}`,

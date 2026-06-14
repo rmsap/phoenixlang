@@ -33,6 +33,25 @@ fn render_line_comment_keeps_indent_on_empty_lines() {
     );
 }
 
+/// A doc comment's continuation lines arrive indented (the author's alignment in
+/// the source `/** … *  continuation */` survives into the body). That indent
+/// must be stripped per line so it isn't emitted as `//  continuation` — gofmt
+/// 1.19+ would read the extra space as an indented code block and rewrite the
+/// file, failing the format check. The prefix still carries any Go-level indent.
+#[test]
+fn render_line_comment_strips_continuation_indentation() {
+    assert_eq!(
+        render_line_comment("// ", "first line\n  second line\n   third line"),
+        "// first line\n// second line\n// third line\n"
+    );
+    // The prefix's own indentation (interface-method docs use `\t// `) is kept;
+    // only the line *content's* leading whitespace is trimmed.
+    assert_eq!(
+        render_line_comment("\t// ", "first\n  second"),
+        "\t// first\n\t// second\n"
+    );
+}
+
 fn generate_from_source(source: &str) -> GoFiles {
     let tokens = tokenize(source, SourceId(0));
     let (program, parse_errors) = parser::parse(&tokens);
@@ -44,6 +63,37 @@ fn generate_from_source(source: &str) -> GoFiles {
         result.diagnostics
     );
     generate_go(&program, &result)
+}
+
+/// A doc comment that already ends in sentence-ending punctuation must not render
+/// a doubled terminator (`..`/`.!`/`.?`): the Go renderers append a period only
+/// when the comment doesn't already end in one. A comment NOT ending in
+/// punctuation still gets one appended. Regression for the doc-comment
+/// double-period gap.
+#[test]
+fn doc_comment_ending_in_period_is_not_doubled() {
+    let files = generate_from_source(
+        r#"
+/** Fetch a charge by id. */
+struct Charge { id: Int }
+/** List all charges */
+endpoint listCharges: GET "/charges" {
+    response Charge
+}
+"#,
+    );
+    // Struct doc already ends in `.` -> single period, never `..`.
+    assert!(
+        files.types.contains("// Charge is fetch a charge by id.\n") && !files.types.contains(".."),
+        "struct doc ending in a period must render exactly one `.`:\n{}",
+        files.types
+    );
+    // Endpoint doc has NO trailing punctuation -> a period is appended.
+    assert!(
+        files.client.contains("// ListCharges list all charges.\n"),
+        "endpoint doc without punctuation should get one appended period:\n{}",
+        files.client
+    );
 }
 
 #[test]
@@ -116,6 +166,156 @@ endpoint listUsers: GET "/api/users" {
     );
     insta::assert_snapshot!("go_query_client", files.client);
     insta::assert_snapshot!("go_query_server", files.server);
+}
+
+/// A query param that camel-cases to `q` collides with the query builder's
+/// `q := url.Values{}` local — Go rejects the redeclare ("no new variables on
+/// left side of :="). The builder local must be renamed to dodge the param.
+/// Regression for the Go client query-var collision (docs/known-issues.md).
+#[test]
+fn query_param_named_q_does_not_collide_with_builder() {
+    let files = generate_from_source(
+        r#"
+struct Item { id: Int  name: String }
+endpoint listItems: GET "/api/items" {
+    query {
+        q: Option<String>
+        limit: Int = 20
+    }
+    response List<Item>
+}
+"#,
+    );
+    // The method takes a `q *string` param, so the builder cannot also be `q`.
+    assert!(
+        files
+            .client
+            .contains("func (c *ApiClient) ListItems(q *string"),
+        "expected a `q *string` method param:\n{}",
+        files.client
+    );
+    assert!(
+        !files.client.contains("q := url.Values{}"),
+        "builder local `q` collides with the `q` query param:\n{}",
+        files.client
+    );
+    // It falls back to the next free name, `q_`, and uses it consistently.
+    assert!(
+        files.client.contains("q_ := url.Values{}")
+            && files.client.contains("u += \"?\" + q_.Encode()"),
+        "expected the builder to use the renamed local `q_`:\n{}",
+        files.client
+    );
+}
+
+/// The query builder's `q` is not the only generated local that shares scope
+/// with user-named parameters. On the **client**, `u` (URL), `req`/`resp` and the
+/// decoded `result` are all reachable param names; on the **server**, the
+/// handler-result local `result` shares the closure with the query/header/path
+/// input locals. A fixed-name local beside a same-named param is a Go redeclare
+/// (`var result T` → "result redeclared", or `result, err := h.X()` reassigning a
+/// `*string` query local → "cannot use … as *string"). Every generated *local*
+/// must dodge the parameter set, not just `q`. Regression for the generalized
+/// client + server local collision — verified end-to-end with `go build`/`gofmt`.
+///
+/// Scope note: this covers the generated *locals*. The *fixed* identifiers the
+/// generated code emits — the client receiver `c` (covered separately by
+/// [`client_receiver_dodges_colliding_param_name`]) and the server closure's
+/// `w`/`r`/`h`/`mux` (NOT yet uniquified; see `emit_server_route`) — are a
+/// distinct class: there a *param* named like the fixed identifier collides,
+/// rather than a local colliding with a param.
+#[test]
+fn generated_locals_dodge_colliding_param_names() {
+    let files = generate_from_source(
+        r#"
+struct Item { id: Int  name: String }
+endpoint getItem: GET "/api/items/{u}" {
+    query {
+        resp: Option<String>
+        result: Option<String>
+    }
+    response Item
+}
+"#,
+    );
+    // CLIENT: path param `u` forces the URL local to rename; query params
+    // `resp`/`result` force the response + decode locals to rename.
+    assert!(
+        files.client.contains("u_ := fmt.Sprintf(") && files.client.contains("u_ += \"?\""),
+        "URL local must dodge the `u` path param:\n{}",
+        files.client
+    );
+    assert!(
+        !files.client.contains("u := fmt.Sprintf("),
+        "URL local `u` collides with the `u` path param:\n{}",
+        files.client
+    );
+    assert!(
+        files.client.contains("resp_, err := c.Client.Do(")
+            && files.client.contains("var result_ Item"),
+        "response/decode locals must dodge the `resp`/`result` query params:\n{}",
+        files.client
+    );
+    assert!(
+        !files.client.contains("resp, err := c.Client.Do(")
+            && !files.client.contains("var result Item"),
+        "generated `resp`/`result` locals collide with the same-named params:\n{}",
+        files.client
+    );
+
+    // SERVER: the handler-result local must dodge the `result` query input it is
+    // declared alongside, so `result_, err := h.GetItem(…, result, …)` passes the
+    // query param without reassigning it.
+    assert!(
+        files.server.contains("result_, err := h.GetItem(")
+            && files.server.contains("json.NewEncoder(w).Encode(result_)"),
+        "server result local must dodge the `result` query param:\n{}",
+        files.server
+    );
+    assert!(
+        !files.server.contains("result, err := h.GetItem("),
+        "server `result` local collides with the `result` query param:\n{}",
+        files.server
+    );
+}
+
+/// The client method's receiver (`c` by default, `func (c *ApiClient)`) shares
+/// the function scope with the parameters, so a param named `c` (a cursor/count
+/// param is plausible) would shadow it — `c.BaseURL` would read the param, not
+/// the client. The receiver is uniquified against the param set like every other
+/// client local. Regression for the receiver-vs-param collision edge.
+#[test]
+fn client_receiver_dodges_colliding_param_name() {
+    let files = generate_from_source(
+        r#"
+struct Item { id: Int  name: String }
+endpoint listItems: GET "/api/items" {
+    query {
+        c: Option<String>
+    }
+    response List<Item>
+}
+"#,
+    );
+    // The method takes a `c *string` param, so the receiver cannot also be `c`.
+    assert!(
+        files
+            .client
+            .contains("func (c_ *ApiClient) ListItems(c *string"),
+        "receiver must dodge the `c` query param (expected `c_`):\n{}",
+        files.client
+    );
+    // The renamed receiver is used consistently for the client's fields.
+    assert!(
+        files.client.contains("c_.BaseURL") && files.client.contains("c_.Client.Do("),
+        "the renamed receiver `c_` must be used for `BaseURL`/`Client.Do`:\n{}",
+        files.client
+    );
+    assert!(
+        !files.client.contains("c.BaseURL") && !files.client.contains("c.Client.Do("),
+        "receiver `c` collides with the `c` query param:\n{}",
+        files.client
+    );
 }
 
 #[test]

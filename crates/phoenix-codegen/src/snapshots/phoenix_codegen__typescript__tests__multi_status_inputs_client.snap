@@ -15,11 +15,11 @@ export function setBaseUrl(url: string): void {
 export const api = {
   async restartJob(
     id: string,
-    opts?: { priority?: number },
+    opts: { priority?: number } = {},
     headers: { authorization: string; traceId?: string | undefined },
   ): Promise<RestartJobResponse> {
     const params = new URLSearchParams();
-    if (opts?.priority !== undefined)
+    if (opts.priority !== undefined)
       params.set("priority", String(opts.priority));
     const query = params.toString();
     const requestHeaders = new Headers();

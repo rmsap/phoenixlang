@@ -4,34 +4,7 @@ expression: spec
 ---
 {
   "components": {
-    "schemas": {
-      "AvatarUpload": {
-        "properties": {
-          "alt": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "avatar": {
-            "format": "binary",
-            "type": "string"
-          },
-          "caption": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "avatar",
-          "caption"
-        ],
-        "type": "object"
-      }
-    }
+    "schemas": {}
   },
   "info": {
     "title": "API",

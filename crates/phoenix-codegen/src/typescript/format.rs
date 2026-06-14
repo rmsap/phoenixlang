@@ -110,6 +110,30 @@ pub(crate) fn emit_object_property(out: &mut String, indent: &str, key: &str, va
         return;
     }
 
+    // `callee(args)` or `callee(args) as Type`: break the call's argument(s),
+    // keeping `key: callee(` on the first line and `) as Type,` on the close
+    // line. Prettier prefers breaking a call's arguments to dropping the whole
+    // value onto its own line — `response.headers.get("X-Long-Name") as string`
+    // and `Number(response.headers.get("X-Long-Name"))` both break here. A binary
+    // value (`… === "true"`, `… ?? undefined`) has a non-`as` tail and is handled
+    // by the value-on-own-line cases below instead.
+    // Only take this layout when the single broken-out argument line actually
+    // fits — the coercions that reach here have short args (header wire-names,
+    // type names), so it always does today. Guarding on the fit means a future
+    // wider coercion can't silently emit an over-width line: it falls through to
+    // the value-on-own-line / last-resort layouts below (and would be caught by
+    // the e2e `prettier --check`) instead of producing quietly-wrong output that
+    // needs per-argument breaking this helper doesn't do.
+    if let Some((callee, args, tail)) = split_breakable_call(value) {
+        let args_line = format!("{indent}  {args},");
+        if args_line.len() <= PRINT_WIDTH {
+            out.push_str(&format!("{indent}{key}: {callee}(\n"));
+            out.push_str(&format!("{args_line}\n"));
+            out.push_str(&format!("{indent}){tail},\n"));
+            return;
+        }
+    }
+
     // The whole value on its own indented line, if it fits there.
     let value_line = format!("{indent}  {value},");
     if value_line.len() <= PRINT_WIDTH {
@@ -142,6 +166,57 @@ pub(crate) fn split_as_union(value: &str) -> Option<(&str, Vec<&str>)> {
     let members: Vec<&str> = value[pos + 4..].split(" | ").collect();
     if members.len() > 1 {
         Some((expr, members))
+    } else {
+        None
+    }
+}
+
+/// Splits a value of the form `callee(args)` or `callee(args) as Type` into
+/// (`callee`, `args`, `tail`), where `tail` is `""` or ` as Type`, for Prettier's
+/// "break the call's arguments" overflow layout. Returns `None` when the value
+/// isn't a single call with an empty-or-`as` tail — a binary expression such as
+/// `… === "true"` or `… ?? undefined` (non-`as` tail, Prettier breaks it
+/// differently), a value that doesn't start with a call (`callee` empty or, like
+/// `(await response.json()) as T`, not a plain identifier/member chain), or
+/// unbalanced parens. `args` is emitted on one indented line, which matches
+/// Prettier for the single-argument calls the coercions produce; a multi-arg call
+/// would need per-argument breaking.
+pub(crate) fn split_breakable_call(value: &str) -> Option<(&str, &str, &str)> {
+    let open = value.find('(')?;
+    let callee = &value[..open];
+    // The callee must be a plain identifier/member chain. A space means the `(`
+    // opens a sub-expression rather than a call (e.g. `(await response.json())`),
+    // so this is not the call-break shape.
+    if callee.is_empty() || callee.contains(char::is_whitespace) {
+        return None;
+    }
+    // Find the `)` matching the first `(`. The scan is intentionally
+    // string-unaware — it counts every `(`/`)`, including any inside a string
+    // literal. That is sound for the only values reaching here: coercions over
+    // HTTP header wire-names and resolved type names, neither of which can embed
+    // a stray/unbalanced paren. An unbalanced paren inside such a literal would
+    // leave `close` unmatched and fall through to `None` (no break), never a
+    // mis-split.
+    let mut depth = 0u32;
+    let mut close = None;
+    for (i, ch) in value[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let args = &value[open + 1..close];
+    let tail = &value[close + 1..];
+    if tail.is_empty() || tail.starts_with(" as ") {
+        Some((callee, args, tail))
     } else {
         None
     }
@@ -185,26 +260,19 @@ pub(crate) fn emit_if_stmt(out: &mut String, indent: &str, cond: &str, stmt: &st
 
 /// Emits a query param's `params.set(...)` line for the client.
 ///
-/// A **required** param (`optional == false`) is always present on a
-/// non-nullable `opts`, so it is set unconditionally — emitting a
-/// `!== undefined` guard or `opts?.` chain there trips eslint's
+/// The `opts` bag is always non-nullable in the generated client: a fully-optional
+/// bag is a `= {}` default rather than `opts?:`, so `opts` is never `undefined`.
+/// A **required** param (`optional == false`) is therefore set unconditionally;
+/// emitting a `!== undefined` guard there would trip eslint's
 /// `no-unnecessary-condition`. An **optional** param keeps the
-/// `if (… !== undefined)` guard; the access uses `opts?.` only when `opts`
-/// itself is nullable (`opts_nullable`, i.e. every param is optional), and a
-/// plain `opts.` otherwise (a redundant `?.` on a non-nullable `opts` would also
-/// trip eslint).
+/// `if (… !== undefined)` guard but accesses via a plain `opts.` — a `?.` on the
+/// non-nullable `opts` would itself be a redundant chain eslint flags.
 ///
 /// Matches Prettier's layouts as the line lengthens: everything on one line; the
 /// `params.set(...)` call dropped onto the next line; then the call broken one
 /// argument per line with a magic trailing comma. (The condition is short for
 /// any realistic field name, so its own overflow layout is not emulated.)
-pub(crate) fn emit_param_set(
-    out: &mut String,
-    indent: &str,
-    name: &str,
-    optional: bool,
-    opts_nullable: bool,
-) {
+pub(crate) fn emit_param_set(out: &mut String, indent: &str, name: &str, optional: bool) {
     let arg0 = format!("\"{name}\"");
     let arg1 = format!("String(opts.{name})");
 
@@ -223,12 +291,7 @@ pub(crate) fn emit_param_set(
         return;
     }
 
-    let access = if opts_nullable {
-        format!("opts?.{name}")
-    } else {
-        format!("opts.{name}")
-    };
-    let cond = format!("{access} !== undefined");
+    let cond = format!("opts.{name} !== undefined");
 
     let one_line = format!("{indent}if ({cond}) params.set({arg0}, {arg1});");
     if one_line.len() <= PRINT_WIDTH {
@@ -257,13 +320,13 @@ pub(crate) fn emit_param_set(
 /// the camelCase field on the `headers` param the value is read from; `wire` is
 /// the exact HTTP header name. The value is stringified via `String(...)`.
 ///
-/// A **required** header is set unconditionally (the `headers` param is
-/// non-nullable and the field is always present); emitting a `!== undefined`
-/// guard or `headers?.` chain there would trip eslint's
-/// `no-unnecessary-condition`. An **optional** header keeps the
-/// `if (… !== undefined)` guard, accessing via `headers?.` only when the
-/// `headers` param itself is nullable (every header optional) and a plain
-/// `headers.` otherwise. Matches Prettier's wrapping as the line lengthens.
+/// Like [`emit_param_set`], the `headers` bag is always non-nullable in the
+/// generated client (a fully-optional bag is a `= {}` default, not `headers?:`).
+/// A **required** header is set unconditionally; a `!== undefined` guard there
+/// would trip eslint's `no-unnecessary-condition`. An **optional** header keeps
+/// the `if (… !== undefined)` guard but accesses via a plain `headers.` — a `?.`
+/// on the non-nullable `headers` would itself be a redundant chain eslint flags.
+/// Matches Prettier's wrapping as the line lengthens.
 pub(crate) fn emit_header_set(
     out: &mut String,
     indent: &str,
@@ -271,7 +334,6 @@ pub(crate) fn emit_header_set(
     local: &str,
     wire: &str,
     optional: bool,
-    headers_nullable: bool,
 ) {
     let arg0 = format!("\"{wire}\"");
     let arg1 = format!("String(headers.{local})");
@@ -290,12 +352,7 @@ pub(crate) fn emit_header_set(
         return;
     }
 
-    let access = if headers_nullable {
-        format!("headers?.{local}")
-    } else {
-        format!("headers.{local}")
-    };
-    let cond = format!("{access} !== undefined");
+    let cond = format!("headers.{local} !== undefined");
 
     let one_line = format!("{indent}if ({cond}) {target}.set({arg0}, {arg1});");
     if one_line.len() <= PRINT_WIDTH {
@@ -356,6 +413,13 @@ pub(crate) enum Param {
         prefix: String,
         /// The object's `field: type` members.
         fields: Vec<String>,
+        /// When set, the parameter is rendered with a `= {}` default rather than
+        /// the `?:` optional marker (the prefix is then the required `name:`
+        /// form). A defaulted parameter is omittable yet — unlike `?:` — may
+        /// legally precede a required parameter, so this keeps the param order
+        /// stable (`opts` always before `headers`) without tripping `tsc`'s
+        /// TS1016 ("a required parameter cannot follow an optional parameter").
+        default_empty: bool,
     },
 }
 
@@ -364,8 +428,13 @@ impl Param {
     fn inline(&self) -> String {
         match self {
             Param::Simple(s) => s.clone(),
-            Param::Object { prefix, fields } => {
-                format!("{prefix}{{ {} }}", fields.join("; "))
+            Param::Object {
+                prefix,
+                fields,
+                default_empty,
+            } => {
+                let suffix = if *default_empty { " = {}" } else { "" };
+                format!("{prefix}{{ {} }}{suffix}", fields.join("; "))
             }
         }
     }
@@ -396,9 +465,18 @@ pub(crate) fn format_signature(
         return format!("{one_line}\n");
     }
 
-    // Single object parameter: expand its braces, keep it as the only arg.
+    // Single object parameter: expand its braces, keep it hugged against the
+    // parens (Prettier's "hug a sole object-typed argument" layout). Prettier does
+    // NOT hug a parameter that carries a default value, though — a `= {}` defaulted
+    // bag is instead broken onto its own line like any other parameter — so a
+    // defaulted sole param falls through to the one-per-line path below.
     if params.len() == 1
-        && let Param::Object { prefix, fields } = &params[0]
+        && let Param::Object {
+            prefix,
+            fields,
+            default_empty,
+        } = &params[0]
+        && !*default_empty
     {
         let mut out = format!("{head}({prefix}{{\n");
         for f in fields {
@@ -416,12 +494,17 @@ pub(crate) fn format_signature(
     for p in params {
         let inline_line = format!("{base_indent}  {},", p.inline());
         match p {
-            Param::Object { prefix, fields } if inline_line.len() > PRINT_WIDTH => {
+            Param::Object {
+                prefix,
+                fields,
+                default_empty,
+            } if inline_line.len() > PRINT_WIDTH => {
+                let suffix = if *default_empty { " = {}" } else { "" };
                 out.push_str(&format!("{base_indent}  {prefix}{{\n"));
                 for f in fields {
                     out.push_str(&format!("{base_indent}    {f};\n"));
                 }
-                out.push_str(&format!("{base_indent}  }},\n"));
+                out.push_str(&format!("{base_indent}  }}{suffix},\n"));
             }
             _ => {
                 out.push_str(&format!("{inline_line}\n"));
@@ -494,8 +577,25 @@ pub(crate) struct ValidationField {
     /// The `typeof` string (`"number"`, `"string"`, `"boolean"`) for primitive
     /// fields, or `None` for non-primitive fields (no typeof check emitted).
     pub(crate) ts_typeof: Option<&'static str>,
-    /// The TypeScript boolean expression for a `constraint`, if any.
-    pub(crate) constraint: Option<String>,
+    /// The TypeScript boolean *guard* for a `constraint`, if any — already negated
+    /// (`!constraint`), so it reads true exactly when the constraint is violated.
+    /// The negation is rendered with minimal parens at build time (a method-call
+    /// constraint negates as `!obj.x.includes(…)`, a comparison as `!(obj.x > 5)`),
+    /// so this drops straight into the violation guard without re-wrapping.
+    pub(crate) constraint_guard: Option<ConstraintGuard>,
+}
+
+/// A constraint's negated violation guard plus how it composes in a conjunction.
+pub(crate) struct ConstraintGuard {
+    /// The negated guard expression, minimally parenthesized for STANDALONE use
+    /// (`if (code) …`).
+    pub(crate) code: String,
+    /// True when `code` binds looser than `&&` (a top-level `||`), so it must be
+    /// wrapped in parens when AND-joined with an optional field's presence check —
+    /// `obj.f !== undefined && (a || b)`. Bare it would mis-parse as
+    /// `(… && a) || b`; for a standalone guard the wrap is omitted so prettier
+    /// doesn't reject the redundant `if ((a || b))`.
+    pub(crate) needs_conjunct_parens: bool,
 }
 
 /// Returns the JS `typeof` tag for a primitive resolved [`Type`], or `None`.
@@ -719,12 +819,21 @@ pub(crate) fn emit_validation_body(out: &mut String, fields: &[ValidationField])
             emit_guard(out, "  ", &conds, &format!("{name}: expected {ty}"));
         }
 
-        if let Some(ref expr) = f.constraint {
+        if let Some(ref guard) = f.constraint_guard {
             let mut conds = Vec::new();
             if f.optional {
                 conds.push(format!("obj.{name} !== undefined"));
             }
-            conds.push(format!("!({expr})"));
+            // `guard.code` is the negated `!constraint`, minimally parenthesized
+            // for standalone use. When it's AND-joined with the presence check
+            // above and binds looser than `&&` (a top-level `||`), wrap it so the
+            // conjunction parses correctly — otherwise push it as-is so a
+            // standalone guard keeps no redundant parens.
+            if guard.needs_conjunct_parens && f.optional {
+                conds.push(format!("({})", guard.code));
+            } else {
+                conds.push(guard.code.clone());
+            }
             emit_guard(out, "  ", &conds, &format!("{name}: constraint violated"));
         }
     }
@@ -739,7 +848,7 @@ mod tests {
     #[test]
     fn emit_param_set_required_is_unconditional() {
         let mut out = String::new();
-        emit_param_set(&mut out, "    ", "term", false, false);
+        emit_param_set(&mut out, "    ", "term", false);
         assert_eq!(out, "    params.set(\"term\", String(opts.term));\n");
     }
 
@@ -751,30 +860,66 @@ mod tests {
     fn emit_param_set_required_breaks_when_overflowing() {
         let mut out = String::new();
         let name = "aReallyExtremelyLongRequiredQueryParameterNameThatOverflows";
-        emit_param_set(&mut out, "    ", name, false, false);
+        emit_param_set(&mut out, "    ", name, false);
         assert_eq!(
             out,
             format!("    params.set(\n      \"{name}\",\n      String(opts.{name}),\n    );\n")
         );
     }
 
-    /// An optional param on a *nullable* `opts` (every param optional) guards with
-    /// `opts?.`; on a non-nullable `opts` (some param required) a plain `opts.` is
-    /// used so the `?.` is not a redundant chain.
+    /// An optional param guards with `if (… !== undefined)` and accesses via a
+    /// plain `opts.` — never `opts?.`. The `opts` bag is always non-nullable in the
+    /// generated client (a fully-optional bag is a `= {}` default, not `opts?:`), so
+    /// a `?.` on it would be a redundant chain eslint's `no-unnecessary-condition`
+    /// rejects.
     #[test]
-    fn emit_param_set_optional_access_tracks_opts_nullability() {
-        let mut nullable = String::new();
-        emit_param_set(&mut nullable, "    ", "page", true, true);
+    fn emit_param_set_optional_uses_plain_non_null_access() {
+        let mut out = String::new();
+        emit_param_set(&mut out, "    ", "page", true);
         assert_eq!(
-            nullable,
-            "    if (opts?.page !== undefined) params.set(\"page\", String(opts.page));\n"
-        );
-
-        let mut non_nullable = String::new();
-        emit_param_set(&mut non_nullable, "    ", "page", true, false);
-        assert_eq!(
-            non_nullable,
+            out,
             "    if (opts.page !== undefined) params.set(\"page\", String(opts.page));\n"
+        );
+    }
+
+    /// An overflowing `key: callee(arg) as Type` property breaks the call's
+    /// argument (keeping `key: callee(` and `) as Type,` on their own lines), the
+    /// layout Prettier prefers over dropping the whole value to its own line.
+    /// Regression for the response-header-envelope prettier divergence.
+    #[test]
+    fn emit_object_property_breaks_call_args_not_after_colon() {
+        let mut out = String::new();
+        let value = "response.headers.get(\"X-Impersonation-Token\") as string";
+        emit_object_property(&mut out, "      ", "impersonationToken", value);
+        assert_eq!(
+            out,
+            "      impersonationToken: response.headers.get(\n\
+             \x20       \"X-Impersonation-Token\",\n\
+             \x20     ) as string,\n"
+        );
+    }
+
+    /// `split_breakable_call` matches a bare call and an `as`-cast call (the latter
+    /// keeping ` as Type` as its tail), but rejects a binary tail (`… === "true"`)
+    /// and a value that opens with a parenthesized sub-expression rather than a
+    /// callee — those break via other layouts.
+    #[test]
+    fn split_breakable_call_matches_only_call_shaped_values() {
+        assert_eq!(
+            split_breakable_call("Number(response.headers.get(\"X-Y\"))"),
+            Some(("Number", "response.headers.get(\"X-Y\")", ""))
+        );
+        assert_eq!(
+            split_breakable_call("response.headers.get(\"X-Y\") as string"),
+            Some(("response.headers.get", "\"X-Y\"", " as string"))
+        );
+        assert_eq!(
+            split_breakable_call("response.headers.get(\"X-Y\") === \"true\""),
+            None
+        );
+        assert_eq!(
+            split_breakable_call("(await response.json()) as Post"),
+            None
         );
     }
 }

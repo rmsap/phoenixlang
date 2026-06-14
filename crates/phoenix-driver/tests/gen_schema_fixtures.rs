@@ -12,18 +12,18 @@
 //! One `#[test]` per fixture so a failure names the offending schema directly
 //! in `cargo test` output.
 //!
-//! Each `phoenix check` runs under two bounds, because the parser's
-//! error-recovery OOM bug (known-issues.md) means a poisoned fixture can
-//! balloon memory instead of exiting: a wall-clock timeout (kill and fail
-//! rather than hang the suite), and — on Linux — an `RLIMIT_AS` cap so the
-//! runaway dies on allocation failure in seconds instead of thrashing the
-//! host for the full timeout (the WSL2 failure mode). Both bounds stay even
-//! after the parser bug is fixed — they're what turns a regression into a
+//! Each `phoenix check` runs under two bounds — a wall-clock timeout (kill and
+//! fail rather than hang the suite) and, on Linux, an `RLIMIT_AS` cap. These
+//! guard against a parser error-recovery memory blowup that *was* live (a
+//! poisoned input ballooned to 662 MB+ instead of exiting; the WSL2 failure
+//! mode thrashed the host). That blowup is RESOLVED as of 2026-06-12 — the
+//! bounds stay as a regression backstop: they turn any reintroduction into a
 //! fast, attributable failure instead of a hung suite.
 //!
-//! The bug's known repro inputs are committed as `tests/fixtures/poisoned/`
-//! and guarded here by `#[ignore]`d tests (see [`assert_rejected_with_diagnostic`])
-//! so they become its regression tests the day it's fixed.
+//! The known repro inputs are committed as `tests/fixtures/poisoned/` and run
+//! un-ignored (see [`assert_rejected_with_diagnostic`]) as the regression tests
+//! that keep the parser's error recovery bounded — each must exit non-zero with
+//! a diagnostic, not die by rlimit signal.
 
 mod common;
 
@@ -207,20 +207,15 @@ schema_fixture_checks! {
 // ── Parser error-recovery OOM repros ──────────────────────────────────────
 //
 // `tests/fixtures/poisoned/` preserves the known triggers of the parser
-// error-recovery OOM (docs/known-issues.md) as minimal committed inputs, so
-// whoever fixes the parser doesn't have to re-derive them from the prose.
-// The still-live triggers are `#[ignore]`d (today each dies by rlimit
-// signal, or by timeout where there's no rlimit); when the fix lands, drop
-// the `#[ignore]`s and they become its regression tests. Unlike the
-// `PHOENIX_GEN_FIXTURE_LIB` env gate in `phoenix-codegen`, `#[ignore]` is
-// safe here — each test only spawns an independent `phoenix check`, so
-// `--include-ignored` can't race anything.
+// error-recovery OOM as minimal committed inputs, so the fix can't silently
+// regress. The OOM is resolved (see the note on `poisoned_fixture_checks!`
+// below); these run un-ignored as the regression tests that keep the parser's
+// error recovery bounded — each only spawns an independent `phoenix check`.
 
 macro_rules! poisoned_fixture_checks {
     ($($test_name:ident => $fixture:literal),+ $(,)?) => {
         $(
             #[test]
-            #[ignore = "parser error-recovery OOM (docs/known-issues.md) — un-ignore when fixed"]
             fn $test_name() {
                 assert_rejected_with_diagnostic($fixture);
             }
@@ -228,17 +223,15 @@ macro_rules! poisoned_fixture_checks {
     };
 }
 
+// All three parser error-recovery OOM triggers are RESOLVED as of 2026-06-12:
+// each poisoned input now emits a bounded run of diagnostics and exits non-zero
+// (~7 MB RSS, no rlimit-signal death), rather than ballooning to 662 MB+.
+// Verified against the committed `tests/fixtures/poisoned/` inputs and against
+// re-introducing each trigger into its full source fixture. Likely closed by the
+// recent endpoint-parser error-recovery changes. These run un-ignored as the
+// regression tests that keep the parser bounded.
 poisoned_fixture_checks! {
     poisoned_keyword_field_rejected => "keyword_field.phx",
     poisoned_doc_comment_in_query_rejected => "doc_comment_in_query.phx",
-}
-
-/// Trigger 3 (`response … pick`) no longer reproduces the OOM: recovery now
-/// emits a bounded diagnostic run and exits non-zero (verified 2026-06-12,
-/// including with the projection re-introduced into the full social.phx —
-/// likely fixed incidentally by the recent endpoint-parser changes). Runs
-/// un-ignored as the regression test that keeps it that way.
-#[test]
-fn poisoned_response_projection_rejected() {
-    assert_rejected_with_diagnostic("response_projection.phx");
+    poisoned_response_projection_rejected => "response_projection.phx",
 }
