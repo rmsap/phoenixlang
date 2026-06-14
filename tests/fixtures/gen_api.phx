@@ -28,6 +28,23 @@ struct Comment {
     parentId: Option<Int>
 }
 
+/** One entry of a Catalog — a struct nested inside a list field, itself carrying
+ *  an enum, so the round-trip covers nested list-of-struct (and enum-in-struct). */
+struct CatalogEntry {
+    key: String where self.length > 0
+    status: PostStatus
+}
+
+/** A catalog payload exercising the three composite type shapes the rest of
+ *  gen_api.phx doesn't round-trip: a `Map<String, String>`, a `List<enum>`, and
+ *  a `List<struct>` as a FIELD (not a top-level list response). */
+struct Catalog {
+    id: Int
+    labels: Map<String, String>
+    allowedStatuses: List<PostStatus>
+    entries: List<CatalogEntry>
+}
+
 // ── Endpoints ─────────────────────────────────────────────────
 
 /** List published posts with pagination and optional tag filter */
@@ -274,6 +291,17 @@ endpoint requeuePost: POST "/api/posts/{id}/requeue" {
         202
         204
     }
+}
+
+/**
+ * Round-trips a Catalog in (request body) and back out (response), so the three
+ * composite shapes (Map, List<enum>, nested List<struct>) are exercised on both
+ * the client->server and server->client legs. The handler echoes the decoded
+ * body, so one deep-equality assertion proves both directions at once.
+ */
+endpoint syncCatalog: POST "/api/catalog" {
+    body Catalog
+    response Catalog
 }
 
 // ── API versioning (path-prefix block) ────────────────────────

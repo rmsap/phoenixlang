@@ -100,9 +100,34 @@ fn go_roundtrip() {
     let go_mod =
         std::fs::read_to_string(driver_dir.join("go.mod.template")).expect("read go.mod.template");
     std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
-    let driver = std::fs::read_to_string(driver_dir.join("roundtrip_test.go"))
-        .expect("read roundtrip_test.go");
-    std::fs::write(root.join("roundtrip_test.go"), driver).expect("write driver");
+    // Copy every committed `*_test.go` driver file into the module: the
+    // per-schema driver (`roundtrip_test.go`) plus the schema-agnostic boilerplate
+    // split out into sibling `*_test.go` files (e.g. `harness_test.go`). All share
+    // package `roundtrip_test`, so a new split file is picked up without touching
+    // this. The `_test.go` suffix is required: only test files may declare the
+    // `roundtrip_test` package, so a plain `*.go` here would fail to compile.
+    let mut copied_driver = false;
+    for entry in std::fs::read_dir(&driver_dir).expect("read go driver dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().expect("go file name");
+        if name.to_str().is_some_and(|n| n.ends_with("_test.go")) {
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            std::fs::write(root.join(name), contents)
+                .unwrap_or_else(|e| panic!("write {name:?}: {e}"));
+            if name == "roundtrip_test.go" {
+                copied_driver = true;
+            }
+        }
+    }
+    // The per-schema driver carries the only `Test*` function; without it `go
+    // test` would run zero tests and pass silently. Fail loudly if it's gone
+    // (rename/bad merge) instead of reporting a false green.
+    assert!(
+        copied_driver,
+        "no roundtrip_test.go found in {}; go module would have no tests to run",
+        driver_dir.display()
+    );
     std::fs::write(root.join("contract.json"), CONTRACT_JSON).expect("write contract.json");
 
     let (ok, out) = run(root, "go", &["test", "./..."]);

@@ -1055,5 +1055,34 @@
       "status": 299,
       "ok_absent": true
     }
+  },
+  {
+    "name": "syncCatalog_roundtrips_composite_types",
+    "endpoint": "syncCatalog",
+    "kind": "ok",
+    "_note": "Composite type-shape round-trip the rest of gen_api.phx doesn't cover: a Map<String,String> (labels), a List<enum> (allowedStatuses), and a List<struct> as a FIELD (entries, each carrying an enum). The stub ECHOES the decoded body into the Catalog response, so expect_client.ok == call.body and the existing deep-JSON assertion proves the shapes survive BOTH the client->server and server->client legs. The `ownerTeam` label key is deliberately camelCase: it is a Map VALUE key (data, not a struct field), so generators must pass it through verbatim. The Go/TS drivers deep-equal exactly and prove that; the Python driver normalizes both sides symmetrically (it can't distinguish a map key from a field), so it can't catch map-key mangling on its own — Go/TS cover it.",
+    "call": {
+      "body": {
+        "id": 7,
+        "labels": { "env": "prod", "team": "payments", "ownerTeam": "core" },
+        "allowedStatuses": ["Published", "Draft"],
+        "entries": [
+          { "key": "alpha", "status": "Published" },
+          { "key": "beta", "status": "Archived" }
+        ]
+      }
+    },
+    "handler": {},
+    "expect_client": {
+      "ok": {
+        "id": 7,
+        "labels": { "env": "prod", "team": "payments", "ownerTeam": "core" },
+        "allowedStatuses": ["Published", "Draft"],
+        "entries": [
+          { "key": "alpha", "status": "Published" },
+          { "key": "beta", "status": "Archived" }
+        ]
+      }
+    }
   }
 ]

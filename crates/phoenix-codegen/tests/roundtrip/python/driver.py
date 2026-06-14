@@ -62,6 +62,19 @@ from generated import models as m
 from generated.client import ApiClient
 from generated.server import create_router
 
+from harness import (
+    DriverError,
+    assert_download,
+    assert_error_status,
+    assert_multi_status,
+    assert_ok,
+    assert_ok_headers,
+    assert_received,
+    enum_value,
+    normalize,
+    to_snake,
+)
+
 # The constraint case builds an invalid body via `model_construct` (bypassing
 # pydantic validation on purpose); dumping that unvalidated model emits a benign
 # "Expected enum but got str" serializer warning. Silence it so the only output
@@ -69,12 +82,6 @@ from generated.server import create_router
 import warnings  # noqa: E402
 
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
-
-TARGET = "python"
-
-
-class DriverError(Exception):
-    """A contract assertion failed."""
 
 
 # ── fixture-driven stub ──────────────────────────────────────────────────────
@@ -158,7 +165,7 @@ class Stub:
         self.hit = True
         self.received = {"page": page, "limit": limit}
         self._maybe_raise()
-        return m.ListPostsOffsetPage.model_validate(_normalize(self._returns()))
+        return m.ListPostsOffsetPage.model_validate(normalize(self._returns()))
 
     async def list_posts_cursor(
         self, *, cursor: str | None = None, limit: int
@@ -169,7 +176,7 @@ class Stub:
         self.hit = True
         self.received = {"cursor": cursor, "limit": limit}
         self._maybe_raise()
-        return m.ListPostsCursorPage.model_validate(_normalize(self._returns()))
+        return m.ListPostsCursorPage.model_validate(normalize(self._returns()))
 
     async def get_post(self, id: str) -> m.Post:
         self.hit = True
@@ -182,7 +189,7 @@ class Stub:
         self.received = {
             "title": body.title,
             "body": body.body,
-            "status": _enum_value(body.status),
+            "status": enum_value(body.status),
             "tags": body.tags,
         }
         self._maybe_raise()
@@ -195,20 +202,20 @@ class Stub:
         # envelope { status, body }. The stub sets the status from
         # handler.returns_status; the generated server writes that status to the
         # wire. body is a Post built from the contract's camelCase `returns` when
-        # present (REUSE _normalize to map camelCase→snake_case, since the Post
+        # present (REUSE normalize to map camelCase→snake_case, since the Post
         # model uses snake_case fields with no alias), else None (the 204 case).
         self.hit = True
         self.received = {
             "id": id,
             "title": body.title,
             "body": body.body,
-            "status": _enum_value(body.status),
+            "status": enum_value(body.status),
             "tags": body.tags,
         }
         self._maybe_raise()
         returns_status = self.case["handler"]["returns_status"]
         returns = self.case["handler"].get("returns")
-        post = m.Post.model_validate(_normalize(returns)) if returns is not None else None
+        post = m.Post.model_validate(normalize(returns)) if returns is not None else None
         return m.UpsertPost2Response(status=returns_status, body=post)
 
     async def requeue_post(self, id: str) -> m.RequeuePostResponse:
@@ -308,7 +315,7 @@ class Stub:
         # The contract's returns uses camelCase keys (avatarUrl); the generated
         # Author model uses snake_case fields with no alias, so map keys before
         # constructing (same divergence handled in updateAuthorProfile's invoke).
-        returns = {_to_snake(k): v for k, v in self._returns().items()}
+        returns = {to_snake(k): v for k, v in self._returns().items()}
         return m.Author(**returns)
 
     async def download_avatar(self, id: str) -> bytes:
@@ -317,6 +324,22 @@ class Stub:
         self.received = {"id": id}
         self._maybe_raise()
         return self.case["handler"]["returns_file"].encode()
+
+    # sync_catalog exercises the composite shapes (Map / List<enum> / nested
+    # List<struct>). The stub echoes the decoded body into the Catalog response,
+    # so assert_ok's deep compare validates the full round-trip — no per-field
+    # expect_received needed. body is already a parsed SyncCatalogBody, so its
+    # fields copy straight across (labels: dict, allowed_statuses: list[enum],
+    # entries: list[CatalogEntry]).
+    async def sync_catalog(self, body: m.SyncCatalogBody) -> m.Catalog:
+        self.hit = True
+        self._maybe_raise()
+        return m.Catalog(
+            id=body.id,
+            labels=body.labels,
+            allowed_statuses=body.allowed_statuses,
+            entries=body.entries,
+        )
 
     # Unused endpoints — present to satisfy the Protocol; loud if ever routed.
     async def update_post(self, id: str, body: m.UpdatePostBody) -> m.Post:
@@ -340,12 +363,6 @@ class Stub:
 
     async def get_author_profile(self, id: str) -> m.Author:
         raise AssertionError("unexpected call to get_author_profile")
-
-
-def _enum_value(v: Any) -> Any:
-    """The status field is a PostStatus enum; expose its string value so it can
-    be compared numerically/stringly against the contract."""
-    return v.value if hasattr(v, "value") else v
 
 
 # ── invoke (mirror of the Go driver's `invoke`) ──────────────────────────────
@@ -410,7 +427,7 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
         raw_body = call["body"]
         # Generated Python models use snake_case field names (no camelCase
         # alias), so map the contract's camelCase body keys before constructing.
-        snake_body = {_to_snake(k): v for k, v in raw_body.items()}
+        snake_body = {to_snake(k): v for k, v in raw_body.items()}
         if case["kind"] == "constraint":
             # Bypass client-side pydantic validation so the invalid body reaches
             # the server, which rejects it with 422 before the handler runs.
@@ -486,182 +503,21 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
             kwargs["cursor"] = q["cursor"]
         return await client.list_posts_cursor(**kwargs)
 
+    if endpoint == "syncCatalog":
+        # Composite-shape body: Map (labels), List<enum> (allowedStatuses), and
+        # List<struct> as a field (entries). Map only the TOP-LEVEL struct field
+        # names camelCase→snake_case (allowedStatuses→allowed_statuses); the
+        # nested entry fields (key/status) are single-word and the `labels` VALUE
+        # is a data map whose keys must NOT be touched. pydantic coerces the enum
+        # strings and nested dicts into the typed model.
+        raw_body = {to_snake(k): v for k, v in call["body"].items()}
+        body = m.SyncCatalogBody(**raw_body)
+        return await client.sync_catalog(body)
+
     if endpoint == "downloadAvatar":
         return await client.download_avatar(call["path_params"]["id"])
 
     raise DriverError(f"driver has no invoke mapping for endpoint {endpoint!r}")
-
-
-# ── assertions ───────────────────────────────────────────────────────────────
-
-
-def _to_snake(key: str) -> str:
-    out = []
-    for ch in key:
-        if ch.isupper():
-            out.append("_")
-            out.append(ch.lower())
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _normalize(value: Any) -> Any:
-    """Recursively snake_case dict keys and coerce enums/bools so the contract's
-    camelCase expectations compare equal to the Python generator's snake_case
-    wire format. Numbers are left as-is and compared numerically below."""
-    if isinstance(value, dict):
-        return {_to_snake(k): _normalize(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_normalize(v) for v in value]
-    return _enum_value(value)
-
-
-def _values_equal(want: Any, got: Any) -> bool:
-    """Compare a contract value against an observed value. Numbers compare
-    numerically (int vs float agnostic); None matches None; containers recurse."""
-    if want is None:
-        return got is None
-    if isinstance(want, bool) or isinstance(got, bool):
-        return want == got
-    if isinstance(want, (int, float)) and isinstance(got, (int, float)):
-        return float(want) == float(got)
-    if isinstance(want, dict) and isinstance(got, dict):
-        if set(want.keys()) != set(got.keys()):
-            return False
-        return all(_values_equal(want[k], got[k]) for k in want)
-    if isinstance(want, list) and isinstance(got, list):
-        return len(want) == len(got) and all(
-            _values_equal(w, g) for w, g in zip(want, got)
-        )
-    return want == got
-
-
-def assert_received(case: dict[str, Any], got: dict[str, Any] | None) -> None:
-    expected = case["handler"].get("expect_received")
-    if expected is None:
-        return
-    if got is None:
-        raise DriverError(f"[{case['name']}] handler recorded no args")
-    for key, want in expected.items():
-        if key not in got:
-            raise DriverError(
-                f"[{case['name']}] handler did not receive arg {key!r}"
-            )
-        if not _values_equal(want, got[key]):
-            raise DriverError(
-                f"[{case['name']}] handler arg {key!r}: got {got[key]!r}, "
-                f"want {want!r}"
-            )
-
-
-def _result_to_plain(result: Any) -> Any:
-    """Convert the client's typed result (pydantic model or list of models) to
-    plain JSON-able data with snake_case keys."""
-    if isinstance(result, list):
-        return [item.model_dump(mode="json") for item in result]
-    return result.model_dump(mode="json")
-
-
-def assert_ok(case: dict[str, Any], result: Any) -> None:
-    want = _normalize(case["expect_client"]["ok"])
-    got = _result_to_plain(result)
-    if not _values_equal(want, got):
-        raise DriverError(
-            f"[{case['name']}] client result mismatch:\n"
-            f" got: {json.dumps(got)}\n"
-            f"want: {json.dumps(want)}"
-        )
-
-
-def assert_download(case: dict[str, Any], result: Any) -> None:
-    """Compare the bytes the client read off a binary response (decoded as
-    UTF-8) against expect_client.expect_download."""
-    want = case["expect_client"]["expect_download"]
-    if not isinstance(result, (bytes, bytearray)):
-        raise DriverError(
-            f"[{case['name']}] expected bytes from client, got "
-            f"{type(result).__name__}"
-        )
-    got = result.decode()
-    if got != want:
-        raise DriverError(
-            f"[{case['name']}] download mismatch: got {got!r}, want {want!r}"
-        )
-
-
-def assert_ok_headers(case: dict[str, Any], result: Any) -> None:
-    """Compare the response-header fields the client read off the typed envelope
-    against expect_client.ok_headers. The contract uses camelCase header keys
-    (ratelimitRemaining, etag); the generated Python envelope exposes snake_case
-    attributes (ratelimit_remaining, etag). ratelimitRemaining is a required int
-    compared numerically; etag is an optional string that must equal the expected
-    value or be None when the contract value is JSON null."""
-    want = case["expect_client"].get("ok_headers")
-    if not want:
-        return
-    for key, expected in want.items():
-        if key == "ratelimitRemaining":
-            got = result.ratelimit_remaining
-        elif key == "etag":
-            got = result.etag
-        else:
-            raise DriverError(f"[{case['name']}] unknown ok_header {key!r}")
-        if not _values_equal(expected, got):
-            raise DriverError(
-                f"[{case['name']}] ok_header {key!r}: got {got!r}, "
-                f"want {expected!r}"
-            )
-
-
-def assert_multi_status(case: dict[str, Any], result: Any) -> None:
-    """Multi-status endpoints return an <Endpoint>Response envelope carrying the
-    handler-chosen status plus an optional body. Assert the client observed the
-    expected status (expect_client.status) and either an absent body
-    (expect_client.ok_absent) or a body matching expect_client.ok (compared via
-    the same camelCase→snake_case normalization as assert_ok)."""
-    expect = case["expect_client"]
-    want_status = expect["status"]
-    got_status = result.status
-    if got_status != want_status:
-        raise DriverError(
-            f"[{case['name']}] envelope status: got {got_status}, "
-            f"want {want_status}"
-        )
-    # An ALL-TYPELESS envelope (e.g. RequeuePostResponse) has no `body`
-    # attribute at all — getattr treats that the same as an absent body.
-    result_body = getattr(result, "body", None)
-    if expect.get("ok_absent"):
-        if result_body is not None:
-            raise DriverError(
-                f"[{case['name']}] expected absent body, got {result_body!r}"
-            )
-        return
-    assert_ok(case, result_body)
-
-
-def assert_error_status(case: dict[str, Any], err: Exception | None) -> None:
-    if err is None:
-        raise DriverError(f"[{case['name']}] expected an error, got success")
-    if not isinstance(err, httpx.HTTPStatusError):
-        raise DriverError(
-            f"[{case['name']}] expected httpx.HTTPStatusError, got "
-            f"{type(err).__name__}: {err}"
-        )
-    expect_error = case["expect_client"].get("error")
-    if expect_error is None:
-        raise DriverError(f"[{case['name']}] case has no expect_client.error")
-    want_status = expect_error["status_per_target"].get(TARGET)
-    if want_status is None:
-        raise DriverError(
-            f"[{case['name']}] no status_per_target[{TARGET!r}]"
-        )
-    got_status = err.response.status_code
-    if got_status != want_status:
-        raise DriverError(
-            f"[{case['name']}] error status: got {got_status}, "
-            f"want {want_status}"
-        )
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
@@ -684,7 +540,7 @@ async def run_case(case: dict[str, Any]) -> None:
             if body is None:
                 return Response(status_code=raw["status"])
             return Response(
-                content=json.dumps(_normalize(body)),
+                content=json.dumps(normalize(body)),
                 status_code=raw["status"],
                 media_type="application/json",
             )

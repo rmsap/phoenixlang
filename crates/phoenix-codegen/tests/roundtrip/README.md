@@ -12,11 +12,23 @@ roundtrip/
   contract.json        # language-agnostic interaction cases (THE shared contract)
   README.md            # this file
   go/                  # Go driver
-    roundtrip_test.go
+    roundtrip_test.go  # per-schema: the api.Handlers stub + invoke() dispatch
+    harness_test.go    # schema-agnostic: contract types, assertions, value/query/header/json helpers
     go.mod.template
-  typescript/          # TypeScript driver (driver.ts + pinned npm project)
-  python/              # Python driver (driver.py + pinned venv)
+  typescript/          # TypeScript driver (pinned npm project)
+    driver.ts          # per-schema: makeStub + invoke + server-mount/client-drive loop
+    harness.ts         # schema-agnostic boilerplate (imported by driver.ts)
+  python/              # Python driver (pinned venv)
+    driver.py          # per-schema: Stub + invoke + FastAPI mount/ASGI drive loop
+    harness.py         # schema-agnostic boilerplate (imported by driver.py)
 ```
+
+Each driver is split into a **per-schema** half (the `Handlers` stub and the
+`invoke` dispatch — inherently tied to the schema's endpoint set and the
+generated client/server, so it's hand-authored as an independent oracle) and a
+**schema-agnostic** `harness` half (contract-case types, generic assertions, and
+value/query/header/json helpers). Adding a new endpoint or type shape touches
+only the per-schema half plus a `contract.json` case; the harness stays put.
 
 ## `contract.json` schema
 
