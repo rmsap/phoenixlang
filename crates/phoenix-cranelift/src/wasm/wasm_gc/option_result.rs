@@ -111,13 +111,47 @@ fn emit_positive_payload(ctx: &mut FuncCtx, recv_local: u32, info: &EnumInfo) {
     });
 }
 
+/// Emit the negative payload extraction: `ref.cast` the receiver to its
+/// negative variant and `struct.get` field 1, leaving the payload on the
+/// stack. Only valid when the negative variant carries a payload — i.e.
+/// `Result`'s `Err(E)`, never `Option`'s payload-free `None`. The
+/// mirror of [`emit_positive_payload`].
+fn emit_negative_payload(ctx: &mut FuncCtx, recv_local: u32, info: &EnumInfo) {
+    let variant_idx = info.variant_indices[NEGATIVE as usize];
+    ctx.emit(Instruction::LocalGet(recv_local));
+    ctx.emit(Instruction::RefCastNonNull(HeapType::Concrete(variant_idx)));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: variant_idx,
+        field_index: 1,
+    });
+}
+
+/// Rebuild the positive variant in the output enum, carrying the
+/// receiver's positive payload across unchanged (`T` is shared between
+/// input and output for `mapErr` / `orElse`, which only transform the
+/// negative side). Leaves `struct.new out_pos(0, payload)` on the stack.
+fn emit_positive_rebuild(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    recv_local: u32,
+    info: &EnumInfo,
+    out_name: &str,
+    out_args: &[IrType],
+) -> Result<(), CompileError> {
+    let out_pos = b.require_enum_variant_idx(out_name, out_args, POSITIVE)?;
+    ctx.emit(Instruction::I32Const(POSITIVE as i32));
+    emit_positive_payload(ctx, recv_local, info);
+    ctx.emit(Instruction::StructNew(out_pos));
+    Ok(())
+}
+
 /// Dispatch an `Option.<m>` / `Result.<m>` builtin. `enum_name` is the
 /// template (`"Option"` / `"Result"`), `method` the bare method name.
-/// The wasm32-gc surface covers exactly the closure-and-unwrap family
-/// the `option_result.phx` fixture exercises (matching the IR
-/// interpreter); rarer combinators (`mapErr` / `orElse` / `filter` /
-/// `ok` / `okOr` / …) error with a clear per-slice diagnostic until a
-/// fixture needs them.
+/// The wasm32-gc surface covers the full combinator family the IR
+/// interpreter does — `map` / `andThen` / `mapErr` / `orElse` /
+/// `filter` / `unwrap` / `unwrapOr` / `unwrapOrElse` / `okOr` / `ok` /
+/// `err` / `isOk` / `isErr` / `isSome` / `isNone` — pinned cross-backend
+/// by `option_result.phx` + `option_result_combinators.phx`.
 pub(super) fn translate_builtin(
     ctx: &mut FuncCtx,
     b: &ModuleBuilder,
@@ -133,11 +167,21 @@ pub(super) fn translate_builtin(
         "unwrapOr" => translate_unwrap_or(ctx, b, args, instr),
         "isOk" | "isSome" => translate_is_variant(ctx, b, args, instr, POSITIVE),
         "isErr" | "isNone" => translate_is_variant(ctx, b, args, instr, NEGATIVE),
+        "mapErr" => translate_map_err(ctx, b, args, instr),
+        "orElse" => translate_or_else(ctx, b, args, instr),
+        "unwrapOrElse" => translate_unwrap_or_else(ctx, b, args, instr),
+        "okOr" => translate_ok_or(ctx, b, args, instr),
+        // `Result.ok()` keeps the positive side as `Some`; `Result.err()`
+        // keeps the negative side. Both map the other side to `None`.
+        "ok" => translate_result_to_option(ctx, b, args, instr, POSITIVE),
+        "err" => translate_result_to_option(ctx, b, args, instr, NEGATIVE),
+        "filter" => translate_filter(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc: `{enum_name}.{other}` is not yet supported — the \
-             current slice covers `map` / `andThen` / `unwrap` / `unwrapOr` \
-             / `isOk` / `isErr` / `isSome` / `isNone` (the `option_result.phx` \
-             surface); other combinators land when a fixture needs them"
+             covered surface is `map` / `andThen` / `mapErr` / `orElse` / \
+             `filter` / `unwrap` / `unwrapOr` / `unwrapOrElse` / `okOr` / \
+             `ok` / `err` / `isOk` / `isErr` / `isSome` / `isNone` (the full \
+             IR-interpreter combinator set)"
         ))),
     }
 }
@@ -244,13 +288,7 @@ fn emit_negative_rebuild(
     ctx.emit(Instruction::I32Const(NEGATIVE as i32));
     if negative_has_payload {
         // `Err(e)` — carry the error payload across (E is shared).
-        let in_neg = info.variant_indices[NEGATIVE as usize];
-        ctx.emit(Instruction::LocalGet(recv_local));
-        ctx.emit(Instruction::RefCastNonNull(HeapType::Concrete(in_neg)));
-        ctx.emit(Instruction::StructGet {
-            struct_type_index: in_neg,
-            field_index: 1,
-        });
+        emit_negative_payload(ctx, recv_local, info);
     }
     ctx.emit(Instruction::StructNew(out_neg));
     Ok(())
@@ -347,6 +385,283 @@ fn parent_ref(parent_idx: u32) -> ValType {
         nullable: true,
         heap_type: HeapType::Concrete(parent_idx),
     })
+}
+
+/// `Option.filter(p)` — `Some(x)` stays `Some(x)` iff `p(x)` holds,
+/// else becomes `None`; `None` stays `None`. The output `Option<T>` is
+/// the same type as the receiver.
+fn translate_filter(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("filter", args, 2)?;
+    let vid = expect_result(instr, "Option.filter")?;
+    let (recv, closure) = (args[0], args[1]);
+    let info = enum_info(ctx, b, recv)?;
+    let (out_name, out_args) = result_enum(instr, "filter")?;
+    let (out_name, out_args) = (out_name.to_string(), out_args.to_vec());
+    let out_parent = b.require_enum_parent_idx(&out_name, &out_args)?;
+    let out_some = b.require_enum_variant_idx(&out_name, &out_args, POSITIVE)?;
+    let out_none = b.require_enum_variant_idx(&out_name, &out_args, NEGATIVE)?;
+    let out_ref = parent_ref(out_parent);
+    let payload_ty = single_slot(&info.type_args[0], b, "filter payload")?;
+    let recv_local = ctx.binding_of(recv)?;
+    let payload_scratch = ctx.scratch_local(payload_ty);
+
+    emit_tag(ctx, recv_local, info.parent_idx);
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(out_ref)));
+    // Some(x): keep iff p(x).
+    emit_positive_payload(ctx, recv_local, &info);
+    ctx.emit(Instruction::LocalSet(payload_scratch));
+    emit_closure_call(ctx, b, closure, &[payload_scratch])?;
+    ctx.emit(Instruction::If(BlockType::Result(out_ref)));
+    ctx.emit(Instruction::I32Const(POSITIVE as i32));
+    ctx.emit(Instruction::LocalGet(payload_scratch));
+    ctx.emit(Instruction::StructNew(out_some));
+    ctx.emit(Instruction::Else);
+    ctx.emit(Instruction::I32Const(NEGATIVE as i32));
+    ctx.emit(Instruction::StructNew(out_none));
+    ctx.emit(Instruction::End);
+    ctx.emit(Instruction::Else);
+    // None → None
+    ctx.emit(Instruction::I32Const(NEGATIVE as i32));
+    ctx.emit(Instruction::StructNew(out_none));
+    ctx.emit(Instruction::End);
+
+    let local = ctx.allocate_local(vid, out_ref);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `Result.mapErr(f)` — `Ok(x)` unchanged (rebuilt in the output type,
+/// `T` shared); `Err(e)` becomes `Err(f(e))`.
+fn translate_map_err(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("mapErr", args, 2)?;
+    let vid = expect_result(instr, "Result.mapErr")?;
+    let (recv, closure) = (args[0], args[1]);
+    let info = enum_info(ctx, b, recv)?;
+    let (out_name, out_args) = result_enum(instr, "mapErr")?;
+    let (out_name, out_args) = (out_name.to_string(), out_args.to_vec());
+    let out_parent = b.require_enum_parent_idx(&out_name, &out_args)?;
+    let out_neg = b.require_enum_variant_idx(&out_name, &out_args, NEGATIVE)?;
+    let out_ref = parent_ref(out_parent);
+    // E = receiver's negative payload type (`Result<T, E>` → `[T, E]`).
+    let err_ty = single_slot(&info.type_args[1], b, "mapErr error payload")?;
+    let recv_local = ctx.binding_of(recv)?;
+    let err_scratch = ctx.scratch_local(err_ty);
+
+    emit_tag(ctx, recv_local, info.parent_idx);
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(out_ref)));
+    emit_positive_rebuild(ctx, b, recv_local, &info, &out_name, &out_args)?;
+    ctx.emit(Instruction::Else);
+    // Err(e) → Err(f(e)): stage e, then `struct.new out_neg(1, f(e))`.
+    emit_negative_payload(ctx, recv_local, &info);
+    ctx.emit(Instruction::LocalSet(err_scratch));
+    ctx.emit(Instruction::I32Const(NEGATIVE as i32));
+    emit_closure_call(ctx, b, closure, &[err_scratch])?;
+    ctx.emit(Instruction::StructNew(out_neg));
+    ctx.emit(Instruction::End);
+
+    let local = ctx.allocate_local(vid, out_ref);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `orElse(f)` on `Option` / `Result` — the positive side is kept
+/// (rebuilt in the output type, payload shared); on the negative side
+/// the closure's return *is* the result (it already produces the output
+/// enum). `Result.orElse`'s closure takes the error payload; `Option`'s
+/// takes no argument.
+fn translate_or_else(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("orElse", args, 2)?;
+    let vid = expect_result(instr, "Option/Result.orElse")?;
+    let (recv, closure) = (args[0], args[1]);
+    let info = enum_info(ctx, b, recv)?;
+    let (out_name, out_args) = result_enum(instr, "orElse")?;
+    let (out_name, out_args) = (out_name.to_string(), out_args.to_vec());
+    let out_parent = b.require_enum_parent_idx(&out_name, &out_args)?;
+    let out_ref = parent_ref(out_parent);
+    let recv_local = ctx.binding_of(recv)?;
+
+    emit_tag(ctx, recv_local, info.parent_idx);
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(out_ref)));
+    emit_positive_rebuild(ctx, b, recv_local, &info, &out_name, &out_args)?;
+    ctx.emit(Instruction::Else);
+    emit_negative_closure_call(ctx, b, recv_local, &info, closure)?;
+    ctx.emit(Instruction::End);
+
+    let local = ctx.allocate_local(vid, out_ref);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `unwrapOrElse(f)` on `Option` / `Result` — positive payload, or the
+/// closure's return on the negative side. `Result`'s closure takes the
+/// error payload; `Option`'s takes none.
+fn translate_unwrap_or_else(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("unwrapOrElse", args, 2)?;
+    let vid = expect_result(instr, "Option/Result.unwrapOrElse")?;
+    let (recv, closure) = (args[0], args[1]);
+    let info = enum_info(ctx, b, recv)?;
+    let payload_ty = single_slot(&instr.result_type, b, "unwrapOrElse result")?;
+    let recv_local = ctx.binding_of(recv)?;
+
+    emit_tag(ctx, recv_local, info.parent_idx);
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(payload_ty)));
+    emit_positive_payload(ctx, recv_local, &info);
+    ctx.emit(Instruction::Else);
+    emit_negative_closure_call(ctx, b, recv_local, &info, closure)?;
+    ctx.emit(Instruction::End);
+
+    let local = ctx.allocate_local(vid, payload_ty);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Emit the negative-side closure call shared by `orElse` /
+/// `unwrapOrElse`: `Result` stages the `Err` payload and calls `f(e)`;
+/// `Option`'s `None` calls the zero-argument `f()`. Leaves the closure's
+/// return on the stack.
+fn emit_negative_closure_call(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    recv_local: u32,
+    info: &EnumInfo,
+    closure: ValueId,
+) -> Result<(), CompileError> {
+    if info.name == "Result" {
+        let err_ty = single_slot(&info.type_args[1], b, "negative closure error payload")?;
+        let err_scratch = ctx.scratch_local(err_ty);
+        emit_negative_payload(ctx, recv_local, info);
+        ctx.emit(Instruction::LocalSet(err_scratch));
+        emit_closure_call(ctx, b, closure, &[err_scratch])
+    } else {
+        emit_closure_call(ctx, b, closure, &[])
+    }
+}
+
+/// `Option.okOr(e)` — `Some(x)` → `Ok(x)`; `None` → `Err(e)`, where `e`
+/// is a plain value (not a closure).
+fn translate_ok_or(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("okOr", args, 2)?;
+    let vid = expect_result(instr, "Option.okOr")?;
+    let info = enum_info(ctx, b, args[0])?;
+    let (out_name, out_args) = result_enum(instr, "okOr")?;
+    let (out_name, out_args) = (out_name.to_string(), out_args.to_vec());
+    let out_parent = b.require_enum_parent_idx(&out_name, &out_args)?;
+    let out_pos = b.require_enum_variant_idx(&out_name, &out_args, POSITIVE)?;
+    let out_neg = b.require_enum_variant_idx(&out_name, &out_args, NEGATIVE)?;
+    let out_ref = parent_ref(out_parent);
+    let recv_local = ctx.binding_of(args[0])?;
+    let err_local = ctx.binding_of(args[1])?;
+
+    emit_tag(ctx, recv_local, info.parent_idx);
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(out_ref)));
+    // Some(x) → Ok(x)
+    ctx.emit(Instruction::I32Const(POSITIVE as i32));
+    emit_positive_payload(ctx, recv_local, &info);
+    ctx.emit(Instruction::StructNew(out_pos));
+    ctx.emit(Instruction::Else);
+    // None → Err(e)
+    ctx.emit(Instruction::I32Const(NEGATIVE as i32));
+    ctx.emit(Instruction::LocalGet(err_local));
+    ctx.emit(Instruction::StructNew(out_neg));
+    ctx.emit(Instruction::End);
+
+    let local = ctx.allocate_local(vid, out_ref);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `Result.ok()` (`keep == POSITIVE`) / `Result.err()` (`keep ==
+/// NEGATIVE`) → `Option`. The kept side's payload becomes `Some`; the
+/// other side becomes `None`.
+fn translate_result_to_option(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+    keep: u32,
+) -> Result<(), CompileError> {
+    let label = if keep == POSITIVE {
+        "Result.ok"
+    } else {
+        "Result.err"
+    };
+    expect_args(label, args, 1)?;
+    let vid = expect_result(instr, label)?;
+    let info = enum_info(ctx, b, args[0])?;
+    let (out_name, out_args) = result_enum(instr, label)?;
+    let (out_name, out_args) = (out_name.to_string(), out_args.to_vec());
+    let out_parent = b.require_enum_parent_idx(&out_name, &out_args)?;
+    let out_some = b.require_enum_variant_idx(&out_name, &out_args, POSITIVE)?;
+    let out_none = b.require_enum_variant_idx(&out_name, &out_args, NEGATIVE)?;
+    let out_ref = parent_ref(out_parent);
+    let recv_local = ctx.binding_of(args[0])?;
+
+    // `tag == 0` is the `Ok` side; the kept side wraps its payload in
+    // `Some`, the dropped side emits `None`.
+    let emit_some_positive = |ctx: &mut FuncCtx| {
+        ctx.emit(Instruction::I32Const(POSITIVE as i32));
+        emit_positive_payload(ctx, recv_local, &info);
+        ctx.emit(Instruction::StructNew(out_some));
+    };
+    let emit_some_negative = |ctx: &mut FuncCtx| {
+        ctx.emit(Instruction::I32Const(POSITIVE as i32));
+        emit_negative_payload(ctx, recv_local, &info);
+        ctx.emit(Instruction::StructNew(out_some));
+    };
+    let emit_none = |ctx: &mut FuncCtx| {
+        ctx.emit(Instruction::I32Const(NEGATIVE as i32));
+        ctx.emit(Instruction::StructNew(out_none));
+    };
+
+    emit_tag(ctx, recv_local, info.parent_idx);
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(out_ref)));
+    if keep == POSITIVE {
+        emit_some_positive(ctx); // ok(): Ok(x) → Some(x)
+    } else {
+        emit_none(ctx); // err(): Ok → None
+    }
+    ctx.emit(Instruction::Else);
+    if keep == NEGATIVE {
+        emit_some_negative(ctx); // err(): Err(e) → Some(e)
+    } else {
+        emit_none(ctx); // ok(): Err → None
+    }
+    ctx.emit(Instruction::End);
+
+    let local = ctx.allocate_local(vid, out_ref);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
 }
 
 /// Arity guard shared by the lowerings.

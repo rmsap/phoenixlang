@@ -145,7 +145,24 @@ backend_matrix_test!(matrix_struct_closure_field, "struct_closure_field.phx");
 // struct itself, a forward reference legal only inside the rec group.
 backend_matrix_test!(matrix_struct_recursive_field, "struct_recursive_field.phx");
 backend_matrix_test!(matrix_collections, "collections.phx");
+// List query methods: `first`/`last`/`find` (→ `Option<T>`) and
+// `any`/`all` (short-circuiting → `Bool`), with empty-list cases and
+// printing predicates on `find`/`any`/`all` that pin identical
+// short-circuit evaluation order across all five backends — each stops
+// at a decisive element that is neither first nor last, so both
+// "no short-circuit" and "stops too early" regressions surface in the
+// printed prefix (wasm32-gc lowering added 2026-06-15).
+backend_matrix_test!(matrix_list_query_methods, "list_query_methods.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
+// The Option/Result combinators the original `option_result.phx` slice
+// deferred on wasm32-gc — `mapErr` / `orElse` / `okOr` / `unwrapOrElse`
+// / `ok` / `err`, each on both variants (lowering added 2026-06-15).
+// Single `Result<Int,String>` instantiation by design (a second sibling
+// would trip the orthogonal K.4 partial-generic enum-key limitation).
+backend_matrix_test!(
+    matrix_option_result_combinators,
+    "option_result_combinators.phx"
+);
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 // The four stdlib-enum discriminant predicates (`Result.isOk`/`isErr`,
 // `Option.isSome`/`isNone`) on both variants of each enum. Lowered on

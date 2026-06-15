@@ -1,0 +1,53 @@
+// wasm32-gc parity for the Option/Result combinators that the original
+// `option_result.phx` slice deferred: `mapErr` / `orElse` (Option and
+// Result) / `okOr` / `unwrapOrElse` (Option and Result) / `ok` / `err`.
+// Each is exercised on *both* variants of its receiver so the positive
+// and negative arms of every lowering run.
+//
+// The program deliberately uses a single `Result<Int, String>`
+// instantiation: `mapErr` keeps the error type `String` rather than
+// changing it to (say) `Int`, which would create a second nominal
+// `Result` sibling and trip the orthogonal K.4 partial-generic enum-key
+// limitation on wasm32-gc (unrelated to these combinators).
+
+function main() {
+  let ok: Result<Int, String> = Ok(5)
+  let err: Result<Int, String> = Err("bad")
+  let some: Option<Int> = Some(7)
+  let none: Option<Int> = None
+
+  // Result.mapErr — transforms only the Err payload (String -> String).
+  print(ok.mapErr(function(e: String) -> String { e + "!" }).unwrapOr(-1))
+  print(err.mapErr(function(e: String) -> String { e + "!" }).err().unwrapOr("none"))
+
+  // Result.orElse — Err recovers via the closure (which gets the error).
+  print(ok.orElse(function(e: String) -> Result<Int, String> { Ok(99) }).unwrapOr(-1))
+  print(err.orElse(function(e: String) -> Result<Int, String> { Ok(e.length()) }).unwrapOr(-1))
+
+  // Option.orElse — None recovers via a zero-arg closure.
+  print(some.orElse(function() -> Option<Int> { Some(0) }).unwrapOr(-1))
+  print(none.orElse(function() -> Option<Int> { Some(42) }).unwrapOr(-1))
+
+  // Result.unwrapOrElse — Err computes a fallback from the error.
+  print(ok.unwrapOrElse(function(e: String) -> Int { e.length() }))
+  print(err.unwrapOrElse(function(e: String) -> Int { e.length() }))
+
+  // Option.unwrapOrElse — None computes a fallback (zero-arg).
+  print(some.unwrapOrElse(function() -> Int { 100 }))
+  print(none.unwrapOrElse(function() -> Int { 100 }))
+
+  // Option.filter — Some kept iff the predicate holds, else None.
+  print(some.filter(function(x: Int) -> Bool { x > 5 }).unwrapOr(-1))
+  print(some.filter(function(x: Int) -> Bool { x > 9 }).unwrapOr(-1))
+  print(none.filter(function(x: Int) -> Bool { x > 0 }).unwrapOr(-1))
+
+  // Option.okOr — Some -> Ok, None -> Err(value).
+  print(some.okOr("missing").unwrapOr(-1))
+  print(none.okOr("missing").unwrapOr(-1))
+
+  // Result.ok / Result.err — convert to Option, then collapse via unwrapOr.
+  print(ok.ok().unwrapOr(-1))
+  print(err.ok().unwrapOr(-1))
+  print(ok.err().unwrapOr("none"))
+  print(err.err().unwrapOr("none"))
+}

@@ -1100,6 +1100,175 @@ pub(super) fn translate_list_filter(
     Ok(())
 }
 
+/// `(some_variant_idx, none_variant_idx, Option<T> valtype)` for the
+/// `Option<T>` a `List<T>` query returns. Shared by `first` / `last` /
+/// `find`. The `Option` variant order is Some = 0 (tag/discriminant 0),
+/// None = 1 — the K.4 convention the predicate / `Map.get` lowerings
+/// also rely on. Everything is derived from `result_type` (which is
+/// `EnumRef("Option", [T])` and already carries the element type `T`),
+/// so this needs no second lookup against the receiver's list struct.
+fn list_option_info(
+    b: &ModuleBuilder,
+    result_type: &IrType,
+) -> Result<(u32, u32, ValType), CompileError> {
+    let (name, opt_args) = match result_type {
+        IrType::EnumRef(name, args) => (name.as_str(), args.as_slice()),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc: List query result type is `{other:?}`, expected \
+                 `EnumRef(\"Option\", [T])` (internal compiler bug)"
+            )));
+        }
+    };
+    let some_idx = b.require_enum_variant_idx(name, opt_args, 0)?;
+    let none_idx = b.require_enum_variant_idx(name, opt_args, 1)?;
+    // The valtype is the `(ref null $opt_parent)` both arms settle into.
+    let opt_ref = single_slot(result_type, b, "List query `Option` result")?;
+    Ok((some_idx, none_idx, opt_ref))
+}
+
+/// `List.first(list) -> Option<T>` / `List.last(list) -> Option<T>` —
+/// the boundary element wrapped in `Option`, or `None` on an empty
+/// list. No closure; `last` reads index `len - 1`, `first` index 0.
+pub(super) fn translate_list_first_last(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+    last: bool,
+) -> Result<(), CompileError> {
+    let label = if last { "`List.last`" } else { "`List.first`" };
+    expect_args(if last { "List.last" } else { "List.first" }, args, 1)?;
+    let vid = expect_result(instr, "List.first/last")?;
+    let (list_idx, in_arr, elem_vt) = recv_list(ctx, b, args[0], label)?;
+    let list_local = ctx.binding_of(args[0])?;
+    let (some_idx, none_idx, opt_ref) = list_option_info(b, &instr.result_type)?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let idx = ctx.scratch_local(ValType::I32);
+    let elem = ctx.scratch_local(elem_vt);
+    emit_len_i32(ctx, list_local, list_idx, len);
+
+    // if len == 0 { None } else { Some(elem[last ? len-1 : 0]) }
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::I32Eqz);
+    ctx.emit(Instruction::If(BlockType::Result(opt_ref)));
+    ctx.emit(Instruction::I32Const(1)); // None tag
+    ctx.emit(Instruction::StructNew(none_idx));
+    ctx.emit(Instruction::Else);
+    if last {
+        ctx.emit(Instruction::LocalGet(len));
+        ctx.emit(Instruction::I32Const(1));
+        ctx.emit(Instruction::I32Sub);
+    } else {
+        ctx.emit(Instruction::I32Const(0));
+    }
+    ctx.emit(Instruction::LocalSet(idx));
+    emit_load_elem(ctx, list_local, list_idx, in_arr, idx, elem);
+    ctx.emit(Instruction::I32Const(0)); // Some tag
+    ctx.emit(Instruction::LocalGet(elem));
+    ctx.emit(Instruction::StructNew(some_idx));
+    ctx.emit(Instruction::End);
+    let local = ctx.allocate_local(vid, opt_ref);
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// `List.find(list, p: T -> Bool) -> Option<T>` — the first element
+/// satisfying `p`, wrapped in `Some`, or `None`. Short-circuits on the
+/// first match (matching native), so a side-effecting predicate runs
+/// exactly as many times as on the other backends: the result local
+/// seeds to `None`, and the first matching iteration writes `Some` and
+/// `br`s out of the loop.
+pub(super) fn translate_list_find(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("List.find", args, 2)?;
+    let vid = expect_result(instr, "List.find")?;
+    let (list_idx, in_arr, elem_vt) = recv_list(ctx, b, args[0], "`List.find`")?;
+    let list_local = ctx.binding_of(args[0])?;
+    let (some_idx, none_idx, opt_ref) = list_option_info(b, &instr.result_type)?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let elem = ctx.scratch_local(elem_vt);
+    // The result binding holds `None` until (and unless) a match writes
+    // `Some` into it; it is the final value at loop exit, so no copy.
+    let result = ctx.allocate_local(vid, opt_ref);
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    ctx.emit(Instruction::I32Const(1)); // None tag
+    ctx.emit(Instruction::StructNew(none_idx));
+    ctx.emit(Instruction::LocalSet(result));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+
+    emit_count_loop(ctx, i, len, |ctx| {
+        emit_load_elem(ctx, list_local, list_idx, in_arr, i, elem);
+        emit_closure_call(ctx, b, args[1], &[elem])?;
+        ctx.emit(Instruction::If(BlockType::Empty));
+        ctx.emit(Instruction::I32Const(0)); // Some tag
+        ctx.emit(Instruction::LocalGet(elem));
+        ctx.emit(Instruction::StructNew(some_idx));
+        ctx.emit(Instruction::LocalSet(result));
+        // Break the loop: if=0, loop=1, block=2 (see `emit_count_loop`).
+        ctx.emit(Instruction::Br(2));
+        ctx.emit(Instruction::End);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// `List.any(list, p) -> Bool` / `List.all(list, p) -> Bool` —
+/// short-circuiting quantifiers (matching native). `any` seeds `false`
+/// and `br`s out on the first element where `p` holds; `all` seeds
+/// `true` and `br`s out on the first where `p` fails (`i32.eqz` of the
+/// predicate). `Bool` is an `i32`.
+pub(super) fn translate_list_any_all(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+    want_all: bool,
+) -> Result<(), CompileError> {
+    let label = if want_all { "`List.all`" } else { "`List.any`" };
+    expect_args(if want_all { "List.all" } else { "List.any" }, args, 2)?;
+    let vid = expect_result(instr, "List.any/all")?;
+    let (list_idx, in_arr, elem_vt) = recv_list(ctx, b, args[0], label)?;
+    let list_local = ctx.binding_of(args[0])?;
+
+    let len = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32);
+    let elem = ctx.scratch_local(elem_vt);
+    let result = ctx.allocate_local(vid, ValType::I32); // Bool
+
+    emit_len_i32(ctx, list_local, list_idx, len);
+    // any seeds false, all seeds true.
+    ctx.emit(Instruction::I32Const(if want_all { 1 } else { 0 }));
+    ctx.emit(Instruction::LocalSet(result));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+
+    emit_count_loop(ctx, i, len, |ctx| {
+        emit_load_elem(ctx, list_local, list_idx, in_arr, i, elem);
+        emit_closure_call(ctx, b, args[1], &[elem])?;
+        // any breaks when p holds; all breaks when p fails (¬p).
+        if want_all {
+            ctx.emit(Instruction::I32Eqz);
+        }
+        ctx.emit(Instruction::If(BlockType::Empty));
+        ctx.emit(Instruction::I32Const(if want_all { 0 } else { 1 }));
+        ctx.emit(Instruction::LocalSet(result));
+        ctx.emit(Instruction::Br(2));
+        ctx.emit(Instruction::End);
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// `List.reduce(list, init, f: (Acc, T) -> Acc) -> Acc` — left fold.
 pub(super) fn translate_list_reduce(
     ctx: &mut FuncCtx,
@@ -1367,6 +1536,12 @@ pub(super) fn translate_list_sort_by(
 /// `for i in 0..bound { body }` over an i32 counter `i` already
 /// initialized to 0, with `bound` an i32 local. The body must leave
 /// the stack balanced.
+///
+/// The loop is `block(loop(...))` (two nesting levels), so body code may
+/// short-circuit by emitting `Br(2)` to exit the whole loop — `if` =
+/// depth 0, `loop` = 1, the outer `block` = 2 (see `find` / `any` /
+/// `all`). Anything that wraps this in another block must adjust that
+/// depth.
 fn emit_count_loop(
     ctx: &mut FuncCtx,
     i: u32,

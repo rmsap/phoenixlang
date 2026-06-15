@@ -1,0 +1,58 @@
+// wasm32-gc parity for the List query methods: `first` / `last` /
+// `find` (→ Option<T>) and `any` / `all` (→ Bool). Exercises the
+// non-empty and empty cases for each, plus a side-effecting predicate
+// to pin that `find` / `any` / `all` short-circuit identically across
+// every backend (the predicate's prints would diverge if one backend
+// scanned the whole list instead of stopping at the decisive element).
+
+function main() {
+  let xs: List<Int> = [10, 20, 30, 40]
+  let empty: List<Int> = []
+
+  // first / last → Option<T>, with the empty-list None case.
+  print(xs.first().unwrapOr(-1))
+  print(xs.last().unwrapOr(-1))
+  print(empty.first().unwrapOr(-1))
+  print(empty.last().unwrapOr(-1))
+
+  // find → Option<T>: a hit and a miss.
+  print(xs.find(function(x: Int) -> Bool { x > 25 }).unwrapOr(-1))
+  print(xs.find(function(x: Int) -> Bool { x > 99 }).unwrapOr(-1))
+  print(empty.find(function(x: Int) -> Bool { x > 0 }).unwrapOr(-1))
+
+  // any / all on non-empty, both truth values, plus empty-list
+  // identities (any [] = false, all [] = true).
+  print(xs.any(function(x: Int) -> Bool { x > 35 }))
+  print(xs.any(function(x: Int) -> Bool { x > 99 }))
+  print(xs.all(function(x: Int) -> Bool { x > 5 }))
+  print(xs.all(function(x: Int) -> Bool { x > 15 }))
+  print(empty.any(function(x: Int) -> Bool { x > 0 }))
+  print(empty.all(function(x: Int) -> Bool { x > 0 }))
+
+  // Short-circuit, pinned with side-effecting predicates: each must
+  // stop at the *decisive* element, so the prints would diverge if any
+  // backend scanned the whole list. The decisive element is chosen to
+  // be neither first nor last, so both "no short-circuit" and "stops
+  // too early" regressions show up in the printed prefix.
+
+  // `find` stops at the first match — prints 10, 20 (stops at 20).
+  let hit: Option<Int> = xs.find(function(x: Int) -> Bool {
+    print(x)
+    x >= 20
+  })
+  print(hit.unwrapOr(-1))
+
+  // `any` stops at the first element where the predicate holds —
+  // prints 10, 20 (stops at 20), then true.
+  print(xs.any(function(x: Int) -> Bool {
+    print(x)
+    x > 15
+  }))
+
+  // `all` stops at the first element where the predicate fails —
+  // prints 10, 20, 30 (stops at 30), then false.
+  print(xs.all(function(x: Int) -> Bool {
+    print(x)
+    x < 25
+  }))
+}

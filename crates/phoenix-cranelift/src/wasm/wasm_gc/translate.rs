@@ -1366,6 +1366,13 @@ fn translate_builtin_call(
         "List.reduce" => lists::translate_list_reduce(ctx, b, args, instr),
         "List.flatMap" => lists::translate_list_flat_map(ctx, b, args, instr),
         "List.sortBy" => lists::translate_list_sort_by(ctx, b, args, instr),
+        // Query methods (§K.7 follow-up): `first`/`last`/`find` return
+        // `Option<T>`; `any`/`all` short-circuit to `Bool`.
+        "List.first" => lists::translate_list_first_last(ctx, b, args, instr, false),
+        "List.last" => lists::translate_list_first_last(ctx, b, args, instr, true),
+        "List.find" => lists::translate_list_find(ctx, b, args, instr),
+        "List.any" => lists::translate_list_any_all(ctx, b, args, instr, false),
+        "List.all" => lists::translate_list_any_all(ctx, b, args, instr, true),
         // Map methods (§K.9): ordered association over parallel arrays.
         "Map.length" => maps::translate_map_length(ctx, b, args, instr),
         "Map.get" => maps::translate_map_get(ctx, b, args, instr),
@@ -1378,12 +1385,13 @@ fn translate_builtin_call(
         "ListBuilder.push" => lists::translate_list_builder_push(ctx, b, args),
         "ListBuilder.freeze" => lists::translate_list_builder_freeze(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
-            "wasm32-gc MVP: builtin `{other}` not yet supported \
-             (PR 5 slice 1 covers `print(Int)`; PR 6 slices add \
-              `print(String)` / `print(Bool)` / `print(Float)`, the \
-              `String.*` surface, and the closure-free `List.*` / \
-              `ListBuilder.*` surface; closure-taking list methods land \
-              after the closure slice — §Phase 2.4 K.7)"
+            "wasm32-gc: builtin `{other}` not yet supported. Covered: \
+             `print` / `toString` / the `String.*` surface; the full \
+             `List.*` query + closure surface (`map` / `filter` / \
+             `reduce` / `flatMap` / `sortBy` / `find` / `first` / `last` \
+             / `any` / `all` / `length` / `get` / `push` / `contains` / \
+             `take` / `drop`), `ListBuilder.*`, `Map.*`, and the \
+             `Option.*` / `Result.*` combinators (see `option_result.rs`)"
         ))),
     }
 }
