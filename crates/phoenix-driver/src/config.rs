@@ -64,6 +64,10 @@ pub struct GenConfig {
     pub out_dir: Option<String>,
     /// Default generation mode: `"client"`, `"server"`, or `"both"`.
     pub mode: Option<String>,
+    /// Default TypeScript server framework: `"express"` (default) or `"fastify"`.
+    /// Ignored by non-TypeScript targets. Named to match the `--ts-framework` CLI
+    /// flag (TOML key: `ts_framework`).
+    pub ts_framework: Option<String>,
     /// Per-target configuration for multi-target generation.
     pub targets: Option<HashMap<String, TargetConfig>>,
 }
@@ -76,6 +80,9 @@ pub struct TargetConfig {
     pub out_dir: Option<String>,
     /// Generation mode for this target: `"client"`, `"server"`, or `"both"`.
     pub mode: Option<String>,
+    /// TypeScript server framework for this target: `"express"` (default) or
+    /// `"fastify"`. Ignored by non-TypeScript targets (TOML key: `ts_framework`).
+    pub ts_framework: Option<String>,
 }
 
 /// A resolved target ready for code generation.
@@ -87,6 +94,8 @@ pub struct ResolvedTarget {
     pub out_dir: String,
     /// Generation mode string (e.g. `"client"`, `"server"`, `"both"`), or `None` for default.
     pub mode: Option<String>,
+    /// TypeScript server framework (`"express"`/`"fastify"`), or `None` for default.
+    pub ts_framework: Option<String>,
 }
 
 impl GenConfig {
@@ -111,6 +120,10 @@ impl GenConfig {
                         .clone()
                         .unwrap_or_else(|| format!("{}/{}", default_out_dir, name)),
                     mode: cfg.mode.clone().or_else(|| self.mode.clone()),
+                    ts_framework: cfg
+                        .ts_framework
+                        .clone()
+                        .or_else(|| self.ts_framework.clone()),
                 })
                 .collect();
             // Sort for deterministic output order
@@ -124,6 +137,7 @@ impl GenConfig {
                     .clone()
                     .unwrap_or_else(|| "./generated".to_string()),
                 mode: self.mode.clone(),
+                ts_framework: self.ts_framework.clone(),
             }])
         } else {
             None
@@ -320,6 +334,48 @@ mode = "server"
         // typescript inherits top-level mode
         assert_eq!(resolved[1].target, "typescript");
         assert_eq!(resolved[1].mode.as_deref(), Some("client"));
+    }
+
+    #[test]
+    fn resolve_multi_targets_ts_framework_override_and_inherit() {
+        let config: PhoenixConfig = toml::from_str(
+            r#"
+[gen]
+ts_framework = "express"
+
+[gen.targets.typescript]
+out_dir = "ts"
+
+[gen.targets.go]
+out_dir = "go"
+ts_framework = "fastify"
+"#,
+        )
+        .unwrap();
+        let resolved = config.codegen.resolve_targets().unwrap();
+        // go carries its explicit per-target framework override (even though Go
+        // ignores it — resolution is target-agnostic).
+        assert_eq!(resolved[0].target, "go");
+        assert_eq!(resolved[0].ts_framework.as_deref(), Some("fastify"));
+        // typescript has no per-target value, so it inherits the top-level default.
+        assert_eq!(resolved[1].target, "typescript");
+        assert_eq!(resolved[1].ts_framework.as_deref(), Some("express"));
+    }
+
+    #[test]
+    fn resolve_single_target_inherits_top_level_ts_framework() {
+        let config: PhoenixConfig = toml::from_str(
+            r#"
+[gen]
+schema = "api.phx"
+target = "typescript"
+ts_framework = "fastify"
+"#,
+        )
+        .unwrap();
+        let resolved = config.codegen.resolve_targets().unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].ts_framework.as_deref(), Some("fastify"));
     }
 
     #[test]

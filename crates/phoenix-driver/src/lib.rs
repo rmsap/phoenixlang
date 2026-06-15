@@ -47,6 +47,7 @@ pub fn run_gen(
     client: bool,
     server: bool,
     watch: bool,
+    ts_framework: Option<String>,
 ) {
     // Load phoenix.toml if present
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -84,25 +85,35 @@ pub fn run_gen(
     // 3. Config single target
     // 4. Default: typescript
     if let Some(cli_target) = target {
-        // CLI specifies a single target — use it with CLI out/mode
+        // CLI specifies a single target — use it with CLI out/mode. Framework:
+        // CLI `--ts-framework` overrides the config default.
         let out = out
             .or(config.codegen.out_dir)
             .unwrap_or_else(|| "./generated".to_string());
         let mode = cli_mode.unwrap_or_else(|| parse_mode(config.codegen.mode.as_deref()));
+        let framework = parse_framework_or_exit(
+            ts_framework
+                .as_deref()
+                .or(config.codegen.ts_framework.as_deref()),
+        );
         if watch {
-            cmd_gen_watch(&file, &[(&cli_target, out.as_str(), mode)]);
+            cmd_gen_watch(&file, &[(&cli_target, out.as_str(), mode, framework)]);
         } else {
-            cmd_gen(&file, &cli_target, &out, mode);
+            cmd_gen(&file, &cli_target, &out, mode, framework);
         }
     } else if let Some(resolved) = config.codegen.resolve_targets() {
-        // Config provides target(s) — run them all
+        // Config provides target(s) — run them all. A CLI `--ts-framework`
+        // overrides each target's configured framework.
         if watch {
-            let targets: Vec<(&str, &str, GenMode)> = resolved
+            let targets: Vec<(&str, &str, GenMode, phoenix_codegen::TsServerFramework)> = resolved
                 .iter()
                 .map(|rt| {
                     let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
                     let mode = cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
-                    (rt.target.as_str(), out_dir, mode)
+                    let framework = parse_framework_or_exit(
+                        ts_framework.as_deref().or(rt.ts_framework.as_deref()),
+                    );
+                    (rt.target.as_str(), out_dir, mode, framework)
                 })
                 .collect();
             cmd_gen_watch(&file, &targets);
@@ -110,17 +121,20 @@ pub fn run_gen(
             for rt in &resolved {
                 let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
                 let mode = cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
-                cmd_gen(&file, &rt.target, out_dir, mode);
+                let framework =
+                    parse_framework_or_exit(ts_framework.as_deref().or(rt.ts_framework.as_deref()));
+                cmd_gen(&file, &rt.target, out_dir, mode, framework);
             }
         }
     } else {
         // No config targets — fall back to defaults
         let out = out.unwrap_or_else(|| "./generated".to_string());
         let mode = cli_mode.unwrap_or(GenMode::Both);
+        let framework = parse_framework_or_exit(ts_framework.as_deref());
         if watch {
-            cmd_gen_watch(&file, &[("typescript", out.as_str(), mode)]);
+            cmd_gen_watch(&file, &[("typescript", out.as_str(), mode, framework)]);
         } else {
-            cmd_gen(&file, "typescript", &out, mode);
+            cmd_gen(&file, "typescript", &out, mode, framework);
         }
     }
 }
@@ -360,20 +374,55 @@ pub fn cmd_run_ir(path: &str) {
 /// [`parse_and_check`], which exits); generation/IO errors print `error: …` and
 /// exit. The actual file emission is shared with the watch path via
 /// [`emit_target`] so the two cannot drift.
-fn cmd_gen(path: &str, target: &str, out_dir: &str, mode: GenMode) {
+fn cmd_gen(
+    path: &str,
+    target: &str,
+    out_dir: &str,
+    mode: GenMode,
+    framework: phoenix_codegen::TsServerFramework,
+) {
     let (program, check_result) = parse_and_check(path);
 
     if target == "openapi" && mode != GenMode::Both {
         eprintln!("warning: --client/--server flags have no effect on OpenAPI target");
     }
 
-    match emit_target(&program, &check_result, target, out_dir, mode) {
+    match emit_target(&program, &check_result, target, out_dir, mode, framework) {
         Ok(generated) => println!("Generated {}", generated.join(", ")),
         Err(e) => {
             eprintln!("error: {}", e);
             process::exit(1);
         }
     }
+}
+
+/// Parses the TypeScript server-framework selector (CLI `--ts-framework` or
+/// config `ts_framework`). Returns an error message for an unknown value so a
+/// typo can't silently fall back to Express; `None` is the default (Express).
+/// Only the TypeScript target consults the resulting value (non-TypeScript
+/// targets ignore it), but it is validated eagerly at every call site so a typo
+/// is reported up front rather than silently dropped. The caller turns the error
+/// into an exit (see
+/// [`parse_framework_or_exit`]); keeping the mapping pure makes it unit-testable.
+fn parse_framework(framework: Option<&str>) -> Result<phoenix_codegen::TsServerFramework, String> {
+    match framework {
+        None | Some("express") => Ok(phoenix_codegen::TsServerFramework::Express),
+        Some("fastify") => Ok(phoenix_codegen::TsServerFramework::Fastify),
+        Some(other) => Err(format!(
+            "unknown ts framework '{}' (supported: express, fastify)",
+            other
+        )),
+    }
+}
+
+/// [`parse_framework`] wrapper that prints `error: …` and exits on an unknown
+/// value — the behavior every `run_gen` call site wants. Mirrors how an
+/// unsupported target is surfaced.
+fn parse_framework_or_exit(framework: Option<&str>) -> phoenix_codegen::TsServerFramework {
+    parse_framework(framework).unwrap_or_else(|err| {
+        eprintln!("error: {}", err);
+        process::exit(1);
+    })
 }
 
 /// Emits the generated files for one target into `out_dir`, returning the paths
@@ -390,6 +439,7 @@ fn emit_target(
     target: &str,
     out_dir: &str,
     mode: GenMode,
+    framework: phoenix_codegen::TsServerFramework,
 ) -> Result<Vec<String>, String> {
     fs::create_dir_all(out_dir)
         .map_err(|err| format!("could not create output directory '{}': {}", out_dir, err))?;
@@ -397,7 +447,7 @@ fn emit_target(
     let mut generated = Vec::new();
     match target {
         "typescript" => {
-            let files = phoenix_codegen::generate_typescript(program, check_result);
+            let files = phoenix_codegen::generate_typescript_with(program, check_result, framework);
             generated.push(write_file(out_dir, "types.ts", &files.types)?);
             if mode != GenMode::ServerOnly {
                 generated.push(write_file(out_dir, "client.ts", &files.client)?);
@@ -482,9 +532,15 @@ fn try_parse_and_check(
 /// on failure. Unlike [`cmd_gen`], this does not call `process::exit` — errors
 /// are reported to stderr and the caller decides whether to continue (e.g., in
 /// watch mode). The file emission itself is shared via [`emit_target`].
-fn generate_once(path: &str, target: &str, out_dir: &str, mode: GenMode) -> Result<(), String> {
+fn generate_once(
+    path: &str,
+    target: &str,
+    out_dir: &str,
+    mode: GenMode,
+    framework: phoenix_codegen::TsServerFramework,
+) -> Result<(), String> {
     let (program, result) = try_parse_and_check(path)?;
-    emit_target(&program, &result, target, out_dir, mode)?;
+    emit_target(&program, &result, target, out_dir, mode, framework)?;
     Ok(())
 }
 
@@ -504,14 +560,17 @@ fn write_file(out_dir: &str, name: &str, content: &str) -> Result<String, String
 ///
 /// Events are debounced with a 100 ms delay so that multiple rapid file-system
 /// events from a single save are coalesced into one regeneration pass.
-fn cmd_gen_watch(path: &str, targets: &[(&str, &str, GenMode)]) {
+fn cmd_gen_watch(
+    path: &str,
+    targets: &[(&str, &str, GenMode, phoenix_codegen::TsServerFramework)],
+) {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     use std::path::Path;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     // Validate all targets before starting watch
-    for (target, _, mode) in targets {
+    for (target, _, mode, _) in targets {
         if !matches!(*target, "typescript" | "python" | "go" | "openapi") {
             eprintln!(
                 "error: unsupported target '{}' (supported: typescript, python, go, openapi)",
@@ -533,15 +592,15 @@ fn cmd_gen_watch(path: &str, targets: &[(&str, &str, GenMode)]) {
         .to_path_buf();
 
     // Initial generation
-    let target_list: Vec<&str> = targets.iter().map(|(t, _, _)| *t).collect();
+    let target_list: Vec<&str> = targets.iter().map(|(t, _, _, _)| *t).collect();
     eprintln!(
         "[phoenix gen] targets={}, watching {}",
         target_list.join(", "),
         watch_dir.display()
     );
     let mut had_error = false;
-    for (target, out_dir, mode) in targets {
-        match generate_once(path, target, out_dir, *mode) {
+    for (target, out_dir, mode, framework) in targets {
+        match generate_once(path, target, out_dir, *mode, *framework) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!(
@@ -605,8 +664,8 @@ fn cmd_gen_watch(path: &str, targets: &[(&str, &str, GenMode)]) {
             last_relevant_event = None;
             eprintln!("[phoenix gen] change detected, regenerating...");
             let mut had_error = false;
-            for (target, out_dir, mode) in targets {
-                match generate_once(path, target, out_dir, *mode) {
+            for (target, out_dir, mode, framework) in targets {
+                match generate_once(path, target, out_dir, *mode, *framework) {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("[phoenix gen] regeneration failed ({}): {}", target, e);
@@ -659,6 +718,38 @@ endpoint getUser: GET "/api/users/{id}" {
             .collect()
     }
 
+    // `parse_framework` maps the CLI/config selector to the codegen enum. The
+    // unknown-value path is an error (not a silent Express fallback); the
+    // `_or_exit` wrapper turns that into a process exit, so the testable mapping
+    // lives in the `Result`-returning core.
+
+    #[test]
+    fn parse_framework_defaults_to_express() {
+        assert_eq!(
+            parse_framework(None),
+            Ok(phoenix_codegen::TsServerFramework::Express)
+        );
+    }
+
+    #[test]
+    fn parse_framework_accepts_known_values() {
+        assert_eq!(
+            parse_framework(Some("express")),
+            Ok(phoenix_codegen::TsServerFramework::Express)
+        );
+        assert_eq!(
+            parse_framework(Some("fastify")),
+            Ok(phoenix_codegen::TsServerFramework::Fastify)
+        );
+    }
+
+    #[test]
+    fn parse_framework_rejects_unknown_value() {
+        let err = parse_framework(Some("koa")).expect_err("unknown framework must error");
+        assert!(err.contains("koa"), "got: {err}");
+        assert!(err.contains("express, fastify"), "got: {err}");
+    }
+
     // The watch path goes through `generate_once`, which shares `emit_target`
     // with the one-shot `cmd_gen` path. These tests pin that shared matrix so a
     // filename / mode regression in either entry point is caught.
@@ -667,7 +758,14 @@ endpoint getUser: GET "/api/users/{id}" {
     fn generate_once_go_both_writes_all_files() {
         let (schema_dir, schema) = schema_in_tmp();
         let out = schema_dir.path().join("out");
-        generate_once(&schema, "go", &out.to_string_lossy(), GenMode::Both).expect("generate");
+        generate_once(
+            &schema,
+            "go",
+            &out.to_string_lossy(),
+            GenMode::Both,
+            phoenix_codegen::TsServerFramework::Express,
+        )
+        .expect("generate");
         assert_eq!(
             files_in(&out),
             BTreeSet::from([
@@ -683,8 +781,14 @@ endpoint getUser: GET "/api/users/{id}" {
     fn generate_once_go_client_only_omits_server_files() {
         let (schema_dir, schema) = schema_in_tmp();
         let out = schema_dir.path().join("out");
-        generate_once(&schema, "go", &out.to_string_lossy(), GenMode::ClientOnly)
-            .expect("generate");
+        generate_once(
+            &schema,
+            "go",
+            &out.to_string_lossy(),
+            GenMode::ClientOnly,
+            phoenix_codegen::TsServerFramework::Express,
+        )
+        .expect("generate");
         assert_eq!(
             files_in(&out),
             BTreeSet::from(["types.go".to_string(), "client.go".to_string()])
@@ -695,8 +799,14 @@ endpoint getUser: GET "/api/users/{id}" {
     fn generate_once_go_server_only_omits_client_file() {
         let (schema_dir, schema) = schema_in_tmp();
         let out = schema_dir.path().join("out");
-        generate_once(&schema, "go", &out.to_string_lossy(), GenMode::ServerOnly)
-            .expect("generate");
+        generate_once(
+            &schema,
+            "go",
+            &out.to_string_lossy(),
+            GenMode::ServerOnly,
+            phoenix_codegen::TsServerFramework::Express,
+        )
+        .expect("generate");
         assert_eq!(
             files_in(&out),
             BTreeSet::from([
@@ -711,16 +821,67 @@ endpoint getUser: GET "/api/users/{id}" {
     fn generate_once_openapi_writes_spec() {
         let (schema_dir, schema) = schema_in_tmp();
         let out = schema_dir.path().join("out");
-        generate_once(&schema, "openapi", &out.to_string_lossy(), GenMode::Both).expect("generate");
+        generate_once(
+            &schema,
+            "openapi",
+            &out.to_string_lossy(),
+            GenMode::Both,
+            phoenix_codegen::TsServerFramework::Express,
+        )
+        .expect("generate");
         assert_eq!(files_in(&out), BTreeSet::from(["openapi.json".to_string()]));
+    }
+
+    // The codegen crate proves each framework's `server.ts` is correct; these
+    // tests pin only the driver glue — that the selected `TsServerFramework`
+    // actually reaches `generate_typescript_with` and lands in the written
+    // `server.ts` (rather than being dropped on the way through `emit_target`).
+    #[test]
+    fn generate_once_typescript_default_emits_express_server() {
+        let (schema_dir, schema) = schema_in_tmp();
+        let out = schema_dir.path().join("out");
+        generate_once(
+            &schema,
+            "typescript",
+            &out.to_string_lossy(),
+            GenMode::ServerOnly,
+            phoenix_codegen::TsServerFramework::Express,
+        )
+        .expect("generate");
+        let server = fs::read_to_string(out.join("server.ts")).expect("read server.ts");
+        assert!(server.contains("from \"express\""), "got: {server}");
+        assert!(!server.contains("from \"fastify\""), "got: {server}");
+    }
+
+    #[test]
+    fn generate_once_typescript_fastify_emits_fastify_server() {
+        let (schema_dir, schema) = schema_in_tmp();
+        let out = schema_dir.path().join("out");
+        generate_once(
+            &schema,
+            "typescript",
+            &out.to_string_lossy(),
+            GenMode::ServerOnly,
+            phoenix_codegen::TsServerFramework::Fastify,
+        )
+        .expect("generate");
+        let server = fs::read_to_string(out.join("server.ts")).expect("read server.ts");
+        assert!(server.contains("from \"fastify\""), "got: {server}");
+        assert!(!server.contains("from \"express\""), "got: {server}");
     }
 
     #[test]
     fn generate_once_unsupported_target_errors() {
         let (schema_dir, schema) = schema_in_tmp();
         let out = schema_dir.path().join("out");
-        let err = generate_once(&schema, "cobol", &out.to_string_lossy(), GenMode::Both)
-            .expect_err("unsupported target must error");
+        let err = generate_once(
+            &schema,
+            "cobol",
+            &out.to_string_lossy(),
+            GenMode::Both,
+            phoenix_codegen::TsServerFramework::Express,
+        )
+        .expect_err("unsupported target must error");
         assert!(err.contains("unsupported target 'cobol'"), "got: {err}");
     }
 }

@@ -252,6 +252,26 @@ endpoint getThing: GET "/api/things/{id}" {
 }
 "#;
 
+/// A multi-status endpoint with three *typed* statuses. The generated multi-status
+/// guard `if ([200, 201, 202].includes(result.status) && result.body === undefined)`
+/// crosses the print width once the route nests at Fastify's depth (one level
+/// deeper than Express), so the generator must break it the way prettier does.
+/// No other linted schema has a 3-typed-status block, so without this fixture a
+/// regression in that wrapping would only surface as a `prettier --check`
+/// failure on real user output. Linted under Fastify (the framework that
+/// triggers the wrap).
+const MULTI_STATUS_WRAP_SCHEMA: &str = r#"
+struct Thing {
+    id: Int
+    name: String
+}
+
+endpoint upsertThing: PUT "/api/things/{id}" {
+    body Thing
+    response { 200: Thing  201: Thing  202: Thing  204 }
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -476,6 +496,19 @@ fn generate_typescript_files(schema: &str) -> phoenix_codegen::GeneratedFiles {
     phoenix_codegen::generate_typescript(&program, &result)
 }
 
+/// Like [`generate_typescript_files`] but emits the Fastify `server.ts` variant.
+/// `types.ts`/`client.ts`/`handlers.ts` are framework-independent, so the only
+/// file that differs from the Express output is `server.ts` (which imports
+/// `fastify` — installed in the scaffold's `devDependencies`).
+fn generate_typescript_fastify_files(schema: &str) -> phoenix_codegen::GeneratedFiles {
+    let (program, result) = parse_and_check(schema);
+    phoenix_codegen::generate_typescript_with(
+        &program,
+        &result,
+        phoenix_codegen::TsServerFramework::Fastify,
+    )
+}
+
 /// Writes the four generated `.ts` files into a fresh `generated/` dir under
 /// `scaffold`, then runs `tsc`, `eslint`, and `prettier --check` against them.
 ///
@@ -567,6 +600,26 @@ fn typescript_output_compiles_and_lints() {
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("fixture library: {name}");
         check_typescript_output(&scaffold, &generate_typescript_files(schema));
+    }
+
+    // Fastify server.ts variant. Only `server.ts` differs from Express, so we
+    // re-lint the same rich schemas (full surface, all-optional headers) plus the
+    // fixture library — covering every Fastify route shape (path/query/body/
+    // headers/multi-status/binary/multipart/errors) through tsc + eslint +
+    // prettier, not just the snapshot.
+    eprintln!("fastify: gen_api full surface");
+    check_typescript_output(&scaffold, &generate_typescript_fastify_files(SCHEMA));
+    check_typescript_output(&scaffold, &generate_typescript_fastify_files(HEADER_SCHEMA));
+    // Locks the multi-status guard wrap (3 typed statuses) against prettier at
+    // Fastify's deeper route indent — see MULTI_STATUS_WRAP_SCHEMA.
+    eprintln!("fastify: multi-status guard wrap");
+    check_typescript_output(
+        &scaffold,
+        &generate_typescript_fastify_files(MULTI_STATUS_WRAP_SCHEMA),
+    );
+    for (name, schema) in FILE_FIXTURES.iter().copied() {
+        eprintln!("fastify fixture library: {name}");
+        check_typescript_output(&scaffold, &generate_typescript_fastify_files(schema));
     }
 }
 

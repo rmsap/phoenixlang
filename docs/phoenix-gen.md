@@ -380,6 +380,17 @@ export interface Handlers {
 export function createRouter(handlers: Handlers): Router { ... }
 ```
 
+**Server framework:** `server.ts` targets Express by default. Pass
+`--ts-framework fastify` (or set `ts_framework = "fastify"` in `phoenix.toml`) to
+emit a Fastify plugin instead — `createRouter` returns a `FastifyPluginCallback`
+registering one route per endpoint. Only `server.ts` changes; `types.ts`,
+`client.ts`, and `handlers.ts` are identical across frameworks. The flag is
+ignored by non-TypeScript targets.
+
+```bash
+phoenix gen schema.phx --target typescript --ts-framework fastify --out ./generated
+```
+
 ### Python
 
 ```bash
@@ -491,7 +502,12 @@ schema = "api/schema.phx"
 target = "typescript"
 out_dir = "./generated"
 mode = "both"                 # "client", "server", or "both"
+ts_framework = "express"      # TypeScript server framework: "express" (default) or "fastify"
 ```
+
+`ts_framework` only affects the TypeScript `server.ts`; non-TypeScript targets
+ignore it. In a multi-target config it can be set per target (under
+`[gen.targets.<name>]`) and falls back to the top-level `[gen]` value.
 
 ### Multiple targets
 
@@ -526,6 +542,9 @@ phoenix gen --client
 
 # Override output directory
 phoenix gen --out ./custom-dir
+
+# Override the TypeScript server framework for every target
+phoenix gen --ts-framework fastify
 ```
 
 ---

@@ -38,6 +38,9 @@ struct Cli {
     /// Generate only server code (types + handlers + router)
     #[arg(long)]
     server: bool,
+    /// TypeScript server framework: `express` (default) or `fastify`
+    #[arg(long)]
+    ts_framework: Option<String>,
 }
 
 fn main() {
@@ -53,6 +56,12 @@ fn main() {
 fn run() {
     let cli = Cli::parse();
     run_gen(
-        cli.file, cli.target, cli.out, cli.client, cli.server, cli.watch,
+        cli.file,
+        cli.target,
+        cli.out,
+        cli.client,
+        cli.server,
+        cli.watch,
+        cli.ts_framework,
     );
 }

@@ -50,6 +50,127 @@ fn generate_from_source(source: &str) -> GeneratedFiles {
     generate_typescript(&program, &result)
 }
 
+/// Like [`generate_from_source`] but emits `server.ts` for the given framework.
+fn generate_from_source_with(source: &str, framework: TsServerFramework) -> GeneratedFiles {
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(
+        parse_errors.is_empty(),
+        "unexpected parse errors: {parse_errors:?}"
+    );
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected check errors: {:?}",
+        result.diagnostics
+    );
+    generate_typescript_with(&program, &result, framework)
+}
+
+// ── Fastify server.ts ───────────────────────────────────────────
+
+/// The Fastify server exercises the full surface in one snapshot: path params,
+/// a validated body, an unconstrained (cast-only) body, query params with
+/// defaults + an optional, request headers, response headers, a multi-status
+/// endpoint, a binary download, a multipart upload, and an error→status map.
+/// `types.ts`/`client.ts`/`handlers.ts` are framework-independent (covered by
+/// the Express tests), so only `server.ts` is snapshotted here.
+#[test]
+fn fastify_server_full_surface() {
+    let files = generate_from_source_with(
+        r#"
+struct User { id: Int  name: String where self.length > 0 }
+enum Status { Active  Archived }
+struct Upload { avatar: File  caption: String }
+struct Doc { data: File }
+struct Note { text: String }
+
+endpoint getUser: GET "/users/{id}" {
+    response User
+    error { NotFound(404) }
+}
+endpoint createUser: POST "/users" {
+    body User
+    response User
+    error { Conflict(409) }
+}
+endpoint createNote: POST "/notes" {
+    body Note
+    response Note
+}
+endpoint listUsers: GET "/users" {
+    query { page: Int = 1  q: Option<String>  active: Bool = true }
+    response List<User>
+}
+endpoint patchUser: PATCH "/users/{id}" {
+    headers { authorization: String  trace: Option<String> as "X-Trace" }
+    response User headers { remaining: Int as "X-Rate-Remaining" }
+}
+endpoint upsertUser: PUT "/users/{id}" {
+    body User
+    response { 200: User  201: User  204 }
+}
+endpoint uploadAvatar: POST "/users/{id}/avatar" {
+    body Upload
+    response User
+}
+endpoint downloadDoc: GET "/docs/{id}" {
+    response Doc
+}
+endpoint deleteUser: DELETE "/users/{id}" {
+    error { NotFound(404) }
+}
+"#,
+        TsServerFramework::Fastify,
+    );
+    insta::assert_snapshot!("ts_fastify_server_full_surface", files.server);
+}
+
+/// The framework selector is documented to affect *only* `server.ts` —
+/// `types.ts`, `client.ts`, and `handlers.ts` are framework-independent. Pin that
+/// invariant so a future change that accidentally makes one of those three files
+/// depend on the framework is caught (the rest of the suite snapshots only one
+/// framework per file, so nothing else would notice).
+#[test]
+fn framework_only_changes_server_ts() {
+    let source = r#"
+struct User { id: Int  name: String where self.length > 0 }
+endpoint getUser: GET "/users/{id}" {
+    response User
+    error { NotFound(404) }
+}
+endpoint createUser: POST "/users" {
+    body User
+    query { page: Int = 1  q: Option<String> }
+    headers { authorization: String }
+    response User headers { remaining: Int as "X-Rate-Remaining" }
+}
+endpoint upsertUser: PUT "/users/{id}" {
+    body User
+    response { 200: User  204 }
+}
+"#;
+    let express = generate_from_source_with(source, TsServerFramework::Express);
+    let fastify = generate_from_source_with(source, TsServerFramework::Fastify);
+
+    assert_eq!(
+        express.types, fastify.types,
+        "types.ts must be framework-independent"
+    );
+    assert_eq!(
+        express.client, fastify.client,
+        "client.ts must be framework-independent"
+    );
+    assert_eq!(
+        express.handlers, fastify.handlers,
+        "handlers.ts must be framework-independent"
+    );
+    assert_ne!(
+        express.server, fastify.server,
+        "server.ts must differ between frameworks"
+    );
+}
+
 // ── types.ts tests ──────────────────────────────────────────────
 
 #[test]

@@ -25,7 +25,9 @@ pub mod typescript;
 pub use go::{GoFiles, generate_go};
 pub use openapi::generate_openapi;
 pub use python::{PythonFiles, generate_python};
-pub use typescript::{GeneratedFiles, generate_typescript};
+pub use typescript::{
+    GeneratedFiles, TsServerFramework, generate_typescript, generate_typescript_with,
+};
 
 /// Controls which subset of files to generate.
 ///
