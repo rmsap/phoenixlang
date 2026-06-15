@@ -1073,7 +1073,7 @@ impl ModuleBuilder {
     /// Finalize the module. Section order matches the WASM spec:
     /// types → imports → funcs → table → memory → global → exports →
     /// code → data.
-    pub(super) fn finish(self) -> Vec<u8> {
+    pub(super) fn finish(mut self) -> Vec<u8> {
         assert_eq!(
             self.functions.len(),
             self.code.len(),

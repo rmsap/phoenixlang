@@ -3928,3 +3928,188 @@ fn print_negative_runs_under_wasmtime_gc() {
         assert_wasm_prints(&bytes, &format!("print_negative_{n}_wasm_gc"), want);
     }
 }
+
+// ───────────────────────── K.10 `dyn Trait` ─────────────────────────
+
+/// Basic `dyn Trait` dispatch (§Phase 2.4 K.10): a `dyn Drawable`
+/// parameter built at two concrete call sites (`Circle` / `Square`)
+/// reaches each concrete `draw` through the per-`(trait, concrete)`
+/// vtable global and a `call_ref` over the typed `$dynfn` funcref. Pins
+/// that the abstract `(ref null struct)` self is `ref.cast` back to the
+/// concrete struct in the trampoline before the real method runs.
+#[test]
+fn dyn_dispatch_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "trait Drawable {\n",
+        "  function draw(self) -> String\n",
+        "}\n",
+        "struct Circle {\n",
+        "  radius: Int\n",
+        "  impl Drawable {\n",
+        "    function draw(self) -> String { \"circle\" }\n",
+        "  }\n",
+        "}\n",
+        "struct Square {\n",
+        "  side: Int\n",
+        "  impl Drawable {\n",
+        "    function draw(self) -> String { \"square\" }\n",
+        "  }\n",
+        "}\n",
+        "function render(s: dyn Drawable) -> String {\n",
+        "  s.draw()\n",
+        "}\n",
+        "function main() {\n",
+        "  print(render(Circle(3)))\n",
+        "  print(render(Square(5)))\n",
+        "}\n",
+    );
+    assert_prints(source, "dyn_dispatch_wasm_gc", b"circle\nsquare\n");
+}
+
+/// A multi-method trait reaches vtable slots beyond 0 and threads an
+/// `Int` argument through `dyn` dispatch — exercising the `$vtable_T`
+/// struct's heterogeneous-funcref fields and the per-slot `$dynfn`
+/// signatures (param/return shapes differ across slots).
+#[test]
+fn dyn_multi_method_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "trait Shape {\n",
+        "  function name(self) -> String\n",
+        "  function scaled(self, factor: Int) -> Int\n",
+        "}\n",
+        "struct Box {\n",
+        "  size: Int\n",
+        "  impl Shape {\n",
+        "    function name(self) -> String { \"box\" }\n",
+        "    function scaled(self, factor: Int) -> Int { self.size * factor }\n",
+        "  }\n",
+        "}\n",
+        "function describe(s: dyn Shape) -> String {\n",
+        "  s.name() + \":\" + toString(s.scaled(4))\n",
+        "}\n",
+        "function main() {\n",
+        "  print(describe(Box(3)))\n",
+        "}\n",
+    );
+    assert_prints(source, "dyn_multi_method_wasm_gc", b"box:12\n");
+}
+
+/// `dyn Trait` as a `List` element (§Phase 2.4 K.10): the per-trait
+/// `$dyn_T` index is *reserved* before the list type is declared, so the
+/// `$arr_(dyn Shape)` element can embed `(ref null $dyn_T)` even though
+/// the trait's `$vtable_T` is only defined afterward — the whole GC type
+/// graph emits as one rec group, which makes that forward reference
+/// legal. Iterating the list dispatches each element through its vtable.
+#[test]
+fn dyn_list_element_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "trait Shape {\n",
+        "  function label(self) -> String\n",
+        "}\n",
+        "struct Dot {\n",
+        "  x: Int\n",
+        "  impl Shape {\n",
+        "    function label(self) -> String { \"dot\" }\n",
+        "  }\n",
+        "}\n",
+        "struct Line {\n",
+        "  len: Int\n",
+        "  impl Shape {\n",
+        "    function label(self) -> String { \"line\" }\n",
+        "  }\n",
+        "}\n",
+        "function main() {\n",
+        "  let a: dyn Shape = Dot(1)\n",
+        "  let b: dyn Shape = Line(2)\n",
+        "  let shapes: List<dyn Shape> = [a, b]\n",
+        "  for s in shapes {\n",
+        "    print(s.label())\n",
+        "  }\n",
+        "}\n",
+    );
+    assert_prints(source, "dyn_list_element_wasm_gc", b"dot\nline\n");
+}
+
+/// Two *distinct* traits each coerced to `dyn` in the same module
+/// (§Phase 2.4 K.10): `dyn Drawable` and `dyn Named` both flow through
+/// the pipeline, so `dyn_traits()` returns two entries and two `$dyn_T`
+/// indices are reserved consecutively before the structs are declared.
+/// Pins that `reserve_types` and `define_types` agree on the per-trait
+/// reserve→define index pairing (both iterate the same sorted set) and
+/// that each trait's vtable global / trampolines dispatch to the right
+/// concrete — the single-trait fixtures never exercise multi-reserve.
+#[test]
+fn dyn_two_traits_one_module_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "trait Drawable {\n",
+        "  function draw(self) -> String\n",
+        "}\n",
+        "trait Named {\n",
+        "  function name(self) -> String\n",
+        "}\n",
+        "struct Circle {\n",
+        "  radius: Int\n",
+        "  impl Drawable {\n",
+        "    function draw(self) -> String { \"circle\" }\n",
+        "  }\n",
+        "  impl Named {\n",
+        "    function name(self) -> String { \"Circle\" }\n",
+        "  }\n",
+        "}\n",
+        "function render(d: dyn Drawable) -> String {\n",
+        "  d.draw()\n",
+        "}\n",
+        "function label(n: dyn Named) -> String {\n",
+        "  n.name()\n",
+        "}\n",
+        "function main() {\n",
+        "  let c = Circle(3)\n",
+        "  print(render(c))\n",
+        "  print(label(c))\n",
+        "}\n",
+    );
+    assert_prints(source, "dyn_two_traits_wasm_gc", b"circle\nCircle\n");
+}
+
+/// `dyn` over a *non-struct* concrete (an enum that `impl`s the trait)
+/// is deferred on wasm32-gc: the trampoline `ref.cast`s the abstract
+/// self to the concrete's K.1 struct index, but an enum has no struct
+/// index (it lowers to a parent + variant subtypes, not a plain
+/// struct). Until a fixture needs it (K.10), the backend must reject it
+/// with a diagnostic naming the trait, the concrete, and the
+/// non-struct reason — not emit a bogus cast that trips `wasmparser`
+/// deep in the binary. This is reachable from valid source (sema
+/// permits an enum to `impl` a trait and coerce to `dyn`), so it guards
+/// a real user-facing limitation, not an internal invariant. Unskips
+/// with the same slice that lands `ref.cast` over enum parents.
+#[test]
+fn dyn_over_enum_concrete_is_rejected_until_a_later_slice() {
+    let source = concat!(
+        "trait Named {\n",
+        "  function name(self) -> String\n",
+        "}\n",
+        "enum Color {\n",
+        "  Red\n",
+        "  Green\n",
+        "  impl Named {\n",
+        "    function name(self) -> String { \"color\" }\n",
+        "  }\n",
+        "}\n",
+        "function label(n: dyn Named) -> String {\n",
+        "  n.name()\n",
+        "}\n",
+        "function main() {\n",
+        "  let c: Color = Red\n",
+        "  print(label(c))\n",
+        "}\n",
+    );
+    let ir_module = lower_to_ir(source);
+    let err = compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("dyn over a non-struct (enum) concrete is deferred on wasm32-gc");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Named") && msg.contains("Color") && msg.contains("not a declared struct"),
+        "expected a diagnostic naming the trait, the enum concrete, and the \
+         non-struct reason, got: {msg}"
+    );
+}

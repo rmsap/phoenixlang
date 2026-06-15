@@ -54,6 +54,7 @@ use phoenix_ir::types::IrType;
 use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType};
 
 use super::closures;
+use super::dyn_trait;
 use super::lists;
 use super::maps;
 use super::module_builder::{self, ModuleBuilder};
@@ -165,6 +166,10 @@ pub(super) fn wasm_valtypes_for(
                 nullable: true,
                 heap_type: HeapType::Concrete(map_idx),
             })])
+        }
+        IrType::DynRef(trait_name) => {
+            // Nullable ref to the K.10 `$dyn_T` fat-pointer struct.
+            Ok(vec![dyn_trait::dyn_valtype(b, trait_name)?])
         }
         IrType::ClosureRef {
             param_types,
@@ -723,23 +728,7 @@ fn translate_instruction(
                 ctx.emit(Instruction::LocalGet(local));
             }
             ctx.emit(Instruction::Call(target_idx));
-            match (instr.result, &instr.result_type) {
-                (Some(_), IrType::Void) => Err(CompileError::new(format!(
-                    "wasm32-gc: `Op::Call({func_id:?})` has a result binding but a \
-                     Void return type (internal compiler bug)"
-                ))),
-                (Some(vid), ty) => {
-                    let wasm_ty = single_slot(ty, b, "call result")?;
-                    let local = ctx.allocate_local(vid, wasm_ty);
-                    ctx.emit(Instruction::LocalSet(local));
-                    Ok(())
-                }
-                (None, IrType::Void) => Ok(()),
-                (None, ty) => Err(CompileError::new(format!(
-                    "wasm32-gc: `Op::Call({func_id:?})` returns `{ty:?}` but has \
-                     no result binding (internal compiler bug)"
-                ))),
-            }
+            bind_call_result(ctx, b, instr, &format!("Op::Call({func_id:?})"))
         }
         Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr),
         // Struct ops — see §Phase 2.4 decision K.1. Each Phoenix struct
@@ -863,6 +852,13 @@ fn translate_instruction(
         }
         Op::ListAlloc(elems) => lists::translate_list_alloc(ctx, b, elems, instr),
         Op::MapAlloc(pairs) => maps::translate_map_alloc(ctx, b, pairs, instr),
+        // dyn-trait ops — §Phase 2.4 decision K.10.
+        Op::DynAlloc(trait_name, concrete, value) => {
+            dyn_trait::translate_dyn_alloc(ctx, b, trait_name, concrete, *value, instr)
+        }
+        Op::DynCall(trait_name, slot, receiver, args) => {
+            dyn_trait::translate_dyn_call(ctx, b, trait_name, *slot, *receiver, args, instr)
+        }
         // Closure ops — §Phase 2.4 decision K.8: per-signature subtype
         // hierarchy over typed function references (`call_ref`).
         Op::ClosureAlloc(target, captures) => {
@@ -1856,4 +1852,36 @@ pub(super) fn single_slot(
         )));
     }
     Ok(slots[0])
+}
+
+/// Bind the result of a `call` / `call_ref` whose single result value
+/// (if any) is already on the operand stack, following the WASM calling
+/// convention's four `(result binding, return type)` cases. Shared by
+/// `Op::Call` and `Op::DynCall` (the cast-and-`call` trampoline path) so
+/// the two stay in lockstep — a change to one return shape can't drift
+/// from the other. `op_label` names the op for the
+/// internal-compiler-bug diagnostics.
+pub(super) fn bind_call_result(
+    ctx: &mut FuncCtx,
+    b: &ModuleBuilder,
+    instr: &phoenix_ir::instruction::Instruction,
+    op_label: &str,
+) -> Result<(), CompileError> {
+    match (instr.result, &instr.result_type) {
+        (Some(_), IrType::Void) => Err(CompileError::new(format!(
+            "wasm32-gc: `{op_label}` has a result binding but a Void return \
+             type (internal compiler bug)"
+        ))),
+        (Some(vid), ty) => {
+            let wasm_ty = single_slot(ty, b, op_label)?;
+            let local = ctx.allocate_local(vid, wasm_ty);
+            ctx.emit(Instruction::LocalSet(local));
+            Ok(())
+        }
+        (None, IrType::Void) => Ok(()),
+        (None, ty) => Err(CompileError::new(format!(
+            "wasm32-gc: `{op_label}` returns `{ty:?}` but has no result \
+             binding (internal compiler bug)"
+        ))),
+    }
 }

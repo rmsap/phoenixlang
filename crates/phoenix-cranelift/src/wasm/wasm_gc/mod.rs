@@ -63,6 +63,7 @@ use phoenix_ir::module::IrModule;
 use crate::error::CompileError;
 
 mod closures;
+mod dyn_trait;
 mod enums;
 mod float_helpers;
 mod lists;
@@ -118,6 +119,13 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     if helper_needs.string_types {
         builder.declare_string_types();
     }
+    // Reserve each `dyn Trait`'s `$dyn_T` type-section index *before*
+    // structs and lists, so a `dyn` struct field or a `List<dyn T>`
+    // element — declared below — can embed `(ref null $dyn_T)`. The
+    // slots are filled later by `declare_phoenix_dyn`; the whole GC type
+    // graph lands in one rec group (closed below), which makes the
+    // forward reference legal. See §Phase 2.4 decision K.10.
+    builder.reserve_phoenix_dyn(ir_module);
     // Then every Phoenix struct's nominal WASM-GC type, so any
     // subsequent function signature whose params/returns include
     // `IrType::StructRef(name, _)` can encode the right
@@ -145,6 +153,19 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // `keys()`/`values()`) and after closures, before signatures
     // touching `MapRef` are interned. See §Phase 2.4 decision K.9.
     builder.declare_phoenix_maps(ir_module)?;
+    // dyn-trait types last among the type declarations: method
+    // param/return types may reference any of the above. See §Phase 2.4
+    // decision K.10.
+    builder.declare_phoenix_dyn(ir_module)?;
+    // All WASM-GC types (and the `$fn_SIG` / `$dynfn` func types they
+    // reference) are now declared; seal them into one `(rec …)` group so
+    // they may mutually forward-reference — a `dyn` field in a struct, a
+    // `List<dyn T>` element, a `dyn` method returning a `List`. Every
+    // func type interned after this point (the WASI `fd_write` import,
+    // user functions, helpers, trampolines, `_start`) emits standalone,
+    // so the import stays type-compatible with the host. See §Phase 2.4
+    // decision K.10.
+    builder.close_type_rec_group();
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();
@@ -184,13 +205,32 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // each body. `_start` is declared last so it can call `main` by
     // index after all user functions are in place.
     builder.declare_phoenix_functions(ir_module)?;
-    // `ref.func` validation requires every closure target in an
-    // `(elem declare func …)` segment — emitted now that the function
-    // indices exist. See §Phase 2.4 K.8.
+    // The deterministic `(concrete, trait)` vtable order, computed once
+    // and threaded through the three deferred dyn passes below
+    // (declare → vtable globals → bodies) so they provably iterate in
+    // lockstep — the function/code sections stay parallel only if all
+    // three agree on order. See §Phase 2.4 K.10.
+    let dyn_vtable_keys = dyn_trait::ordered_vtable_keys(ir_module);
+    // dyn trampolines are deferred-body functions that `call` user
+    // functions — declare their signatures right after the user
+    // functions (so the function/code sections stay parallel) and emit
+    // their bodies right after the user bodies. See §Phase 2.4 K.10.
+    builder.declare_dyn_trampolines(ir_module, &dyn_vtable_keys)?;
+    // `ref.func` validation requires every closure target and dyn
+    // trampoline in an `(elem declare func …)` segment — emitted now
+    // that the function indices exist. See §Phase 2.4 K.8 / K.10.
     builder.emit_closure_elem_decls()?;
+    builder.emit_dyn_trampoline_elem_decls();
+    // Vtable globals are built now (the trampoline indices they
+    // `ref.func` exist) so each `DynAlloc`'s `global.get` resolves
+    // when its body is emitted below.
+    builder.emit_dyn_vtable_globals(ir_module, &dyn_vtable_keys)?;
     builder.declare_start();
     builder.emit_exports();
     builder.emit_phoenix_bodies(ir_module)?;
+    // dyn trampoline bodies last among the deferred bodies (after the
+    // user bodies), keeping the function/code sections parallel.
+    builder.emit_dyn_trampoline_bodies(ir_module, &dyn_vtable_keys)?;
     builder.emit_start_body()?;
 
     builder.finish()

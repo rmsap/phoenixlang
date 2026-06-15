@@ -422,6 +422,35 @@ pub(super) struct ModuleBuilder {
     /// such collisions can't occur.
     phx_map_kv_by_struct: HashMap<u32, (IrType, IrType)>,
 
+    /// Per trait coerced to `dyn`: `(dyn_struct_idx, vtable_struct_idx,
+    /// per-method `$dynfn` func-type indices)` per §Phase 2.4 decision
+    /// K.10. Populated by [`Self::declare_phoenix_dyn`].
+    phx_dyn_traits: HashMap<String, (u32, u32, Vec<u32>)>,
+
+    /// `trait → concrete →` slot-indexed trampoline WASM function
+    /// indices (the inner `Vec` is indexed by method slot and filled in
+    /// slot order). Nested rather than keyed on a `(String, String, u32)`
+    /// tuple so a lookup keys on `&str` / `&str` without allocating an
+    /// owned tuple. Populated by [`Self::declare_dyn_trampolines`].
+    phx_dyn_trampolines: HashMap<String, HashMap<String, Vec<u32>>>,
+
+    /// `trait → concrete →` vtable global index (a `(ref null
+    /// $vtable_T)` built once per pair). Nested so a lookup keys on
+    /// `&str` without allocating an owned tuple. Populated by
+    /// [`Self::emit_dyn_vtable_globals`].
+    phx_dyn_vtable_globals: HashMap<String, HashMap<String, u32>>,
+
+    /// Trampoline function indices, collected so they can be added to
+    /// an `(elem declare func …)` segment (the vtable globals
+    /// `ref.func` them). Filled by [`Self::declare_dyn_trampolines`].
+    dyn_trampoline_targets: Vec<u32>,
+
+    /// The global section (vtable instances). Emitted between the
+    /// memory and export sections per the WASM section order. Bumped
+    /// by [`Self::emit_dyn_vtable_globals`].
+    globals: wasm_encoder::GlobalSection,
+    global_count: u32,
+
     /// Closure signature `(params, return)` → `($fn_SIG type idx,
     /// $clo_SIG parent struct idx)` per §Phase 2.4 decision K.8.
     /// Populated by [`Self::declare_phoenix_closures`].
@@ -467,7 +496,7 @@ pub(super) struct ModuleBuilder {
 impl ModuleBuilder {
     pub(super) fn new() -> Self {
         Self {
-            types: TypeInterner::default(),
+            types: TypeInterner::buffered(),
             imports: wasm_encoder::ImportSection::new(),
             functions: wasm_encoder::FunctionSection::new(),
             memories: wasm_encoder::MemorySection::new(),
@@ -505,6 +534,12 @@ impl ModuleBuilder {
             phx_lists: HashMap::new(),
             phx_maps: HashMap::new(),
             phx_map_kv_by_struct: HashMap::new(),
+            phx_dyn_traits: HashMap::new(),
+            phx_dyn_trampolines: HashMap::new(),
+            phx_dyn_vtable_globals: HashMap::new(),
+            dyn_trampoline_targets: Vec::new(),
+            globals: wasm_encoder::GlobalSection::new(),
+            global_count: 0,
             phx_list_builders: HashMap::new(),
             phx_list_elem_by_struct: HashMap::new(),
             phx_builder_elem_by_struct: HashMap::new(),
@@ -1289,6 +1324,247 @@ impl ModuleBuilder {
         self.phx_map_kv_by_struct.get(&map_idx)
     }
 
+    // ── dyn Trait (§Phase 2.4 decision K.10) ──
+
+    /// Reserve each trait's `$dyn_T` index, early — before structs and
+    /// lists — so `dyn` struct fields / `List<dyn T>` elements can embed
+    /// it. Thin wrapper over [`dyn_trait::reserve_types`]. See §Phase 2.4
+    /// decision K.10.
+    pub(super) fn reserve_phoenix_dyn(&mut self, ir_module: &IrModule) {
+        super::dyn_trait::reserve_types(self, ir_module);
+    }
+
+    /// Define the per-trait `$dynfn_T_i` / `$vtable_T` / `$dyn_T` types
+    /// for every trait coerced to `dyn`, filling the `$dyn_T` slots
+    /// reserved by [`Self::reserve_phoenix_dyn`]. Thin wrapper over
+    /// [`dyn_trait::define_types`]. Runs after structs / enums / lists /
+    /// maps / closures (method param/return types reference them) and
+    /// before the rec group is closed.
+    pub(super) fn declare_phoenix_dyn(&mut self, ir_module: &IrModule) -> Result<(), CompileError> {
+        super::dyn_trait::define_types(self, ir_module)
+    }
+
+    /// Declare a trait's `$dynfn_T_i` func type (abstract self + user
+    /// params → return). Narrow [`TypeInterner`] wrapper.
+    pub(super) fn intern_dyn_fn_type(&mut self, params: &[ValType], returns: &[ValType]) -> u32 {
+        self.types.intern(params, returns)
+    }
+
+    /// Declare a `$vtable_T` / `$dyn_T` struct (a plain immutable
+    /// struct, no subtyping). Narrow [`TypeInterner`] wrapper.
+    pub(super) fn declare_dyn_struct(&mut self, fields: &[wasm_encoder::FieldType]) -> u32 {
+        self.types.declare_struct(fields)
+    }
+
+    /// Close the GC rec group (§Phase 2.4 K.10): every WASM-GC type and
+    /// the `$fn_SIG` / `$dynfn` func types they reference are emitted as
+    /// one `(rec …)` group so they may mutually forward-reference. Must
+    /// run after the last GC-type declaration (`declare_phoenix_dyn`)
+    /// and before the WASI `fd_write` import type is interned, so that
+    /// import keeps a standalone identity compatible with the host.
+    pub(super) fn close_type_rec_group(&mut self) {
+        self.types.close_rec_group();
+    }
+
+    /// Reserve a `$dyn_T` type-section index before the trait's other
+    /// dyn types exist, so a `dyn` struct field or `List<dyn T>` element
+    /// declared earlier can embed it. Filled later by
+    /// [`Self::define_dyn_struct`]. See [`dyn_trait::reserve_types`].
+    pub(super) fn reserve_dyn_struct(&mut self) -> u32 {
+        self.types.reserve()
+    }
+
+    /// Fill a `$dyn_T` slot previously reserved by
+    /// [`Self::reserve_dyn_struct`].
+    pub(super) fn define_dyn_struct(&mut self, idx: u32, fields: &[wasm_encoder::FieldType]) {
+        self.types.define_struct(idx, fields);
+    }
+
+    /// Record a trait's declared dyn types.
+    pub(super) fn record_dyn_trait(
+        &mut self,
+        trait_name: String,
+        dyn_idx: u32,
+        vtable_idx: u32,
+        fn_type_idxs: Vec<u32>,
+    ) {
+        self.phx_dyn_traits
+            .insert(trait_name, (dyn_idx, vtable_idx, fn_type_idxs));
+    }
+
+    /// `(dyn_struct_idx, vtable_struct_idx, per-method $dynfn indices)`
+    /// for a trait coerced to `dyn`.
+    pub(super) fn require_dyn_trait(
+        &self,
+        trait_name: &str,
+    ) -> Result<(u32, u32, &[u32]), CompileError> {
+        self.phx_dyn_traits
+            .get(trait_name)
+            .map(|(d, v, f)| (*d, *v, f.as_slice()))
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: trait `{trait_name}` was not declared by \
+                     `declare_phoenix_dyn` — no `Op::DynAlloc` registered a \
+                     vtable for it (internal compiler bug; K.10)"
+                ))
+            })
+    }
+
+    /// Synthesize the per-`(trait, concrete, slot)` trampoline function
+    /// signatures and reserve their indices. Deferred-body (the bodies
+    /// `call` user functions, emitted later by
+    /// [`Self::emit_dyn_trampoline_bodies`]); must run *after*
+    /// [`Self::declare_phoenix_functions`].
+    pub(super) fn declare_dyn_trampolines(
+        &mut self,
+        ir_module: &IrModule,
+        keys: &[(String, String)],
+    ) -> Result<(), CompileError> {
+        super::dyn_trait::declare_trampolines(self, ir_module, keys)
+    }
+
+    /// Reserve a deferred trampoline function index with `$dynfn` sig
+    /// `fn_type_idx`; record it under `(trait, concrete, slot)` and add
+    /// it to the elem-declare set.
+    pub(super) fn add_dyn_trampoline(
+        &mut self,
+        trait_name: String,
+        concrete: String,
+        slot: u32,
+        fn_type_idx: u32,
+    ) -> u32 {
+        let wasm_idx = self.add_local_function(fn_type_idx);
+        let slots = self
+            .phx_dyn_trampolines
+            .entry(trait_name)
+            .or_default()
+            .entry(concrete)
+            .or_default();
+        // Slots are declared in order (0..n) per `(trait, concrete)` —
+        // `declare_trampolines` iterates `entries.iter().enumerate()` —
+        // so the next push lands at index `slot`. The `Vec` index *is*
+        // the slot; this guards that contract.
+        debug_assert_eq!(
+            slots.len(),
+            slot as usize,
+            "dyn trampolines must be added in slot order per (trait, concrete)"
+        );
+        slots.push(wasm_idx);
+        self.dyn_trampoline_targets.push(wasm_idx);
+        wasm_idx
+    }
+
+    /// Trampoline WASM index for `(trait, concrete, slot)`.
+    pub(super) fn require_dyn_trampoline(
+        &self,
+        trait_name: &str,
+        concrete: &str,
+        slot: u32,
+    ) -> Result<u32, CompileError> {
+        self.phx_dyn_trampolines
+            .get(trait_name)
+            .and_then(|by_concrete| by_concrete.get(concrete))
+            .and_then(|slots| slots.get(slot as usize))
+            .copied()
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: trampoline for `{concrete}` as `dyn {trait_name}` \
+                     slot {slot} was not declared (internal compiler bug; K.10)"
+                ))
+            })
+    }
+
+    /// Emit a trampoline's body into the code section (deferred-body
+    /// pass, after the user function bodies). Returns nothing — appends
+    /// to `code`, keeping the function/code parallelism.
+    pub(super) fn emit_dyn_trampoline_body(&mut self, body: &wasm_encoder::Function) {
+        self.code.function(body);
+    }
+
+    /// Build the vtable globals. Runs after
+    /// [`Self::declare_dyn_trampolines`] (the globals `ref.func` the
+    /// now-indexed trampolines) and *before* [`Self::emit_phoenix_bodies`]
+    /// — the global index a `DynAlloc` `global.get`s must exist when its
+    /// body is emitted. (The globals' *init exprs* need only the
+    /// trampoline indices, not their bodies, which come later.)
+    pub(super) fn emit_dyn_vtable_globals(
+        &mut self,
+        ir_module: &IrModule,
+        keys: &[(String, String)],
+    ) -> Result<(), CompileError> {
+        super::dyn_trait::emit_vtable_globals(self, ir_module, keys)
+    }
+
+    /// Emit the trampoline bodies into the code section. Runs after
+    /// [`Self::emit_phoenix_bodies`] so the user bodies precede the
+    /// trampoline bodies, keeping the function/code parallelism.
+    pub(super) fn emit_dyn_trampoline_bodies(
+        &mut self,
+        ir_module: &IrModule,
+        keys: &[(String, String)],
+    ) -> Result<(), CompileError> {
+        super::dyn_trait::emit_trampoline_bodies(self, ir_module, keys)
+    }
+
+    /// Add a vtable global `(ref null $vtable_T)` with `init` and
+    /// record it under `(trait, concrete)`; returns the global index.
+    pub(super) fn add_dyn_vtable_global(
+        &mut self,
+        trait_name: String,
+        concrete: String,
+        vtable_idx: u32,
+        init: &wasm_encoder::ConstExpr,
+    ) -> u32 {
+        let gidx = self.global_count;
+        self.globals.global(
+            wasm_encoder::GlobalType {
+                val_type: wasm_encoder::ValType::Ref(wasm_encoder::RefType {
+                    nullable: true,
+                    heap_type: wasm_encoder::HeapType::Concrete(vtable_idx),
+                }),
+                mutable: false,
+                shared: false,
+            },
+            init,
+        );
+        self.global_count += 1;
+        self.phx_dyn_vtable_globals
+            .entry(trait_name)
+            .or_default()
+            .insert(concrete, gidx);
+        gidx
+    }
+
+    /// Vtable global index for `(trait, concrete)`.
+    pub(super) fn require_dyn_vtable_global(
+        &self,
+        trait_name: &str,
+        concrete: &str,
+    ) -> Result<u32, CompileError> {
+        self.phx_dyn_vtable_globals
+            .get(trait_name)
+            .and_then(|by_concrete| by_concrete.get(concrete))
+            .copied()
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: vtable global for `{concrete}` as `dyn \
+                     {trait_name}` was not emitted (internal compiler bug; K.10)"
+                ))
+            })
+    }
+
+    /// Add the trampoline functions to an `(elem declare func …)`
+    /// segment (the vtable globals' `ref.func`s require it). Runs after
+    /// [`Self::declare_dyn_trampolines`].
+    pub(super) fn emit_dyn_trampoline_elem_decls(&mut self) {
+        if self.dyn_trampoline_targets.is_empty() {
+            return;
+        }
+        let indices = std::mem::take(&mut self.dyn_trampoline_targets);
+        self.elements
+            .declared(wasm_encoder::Elements::Functions(indices.into()));
+    }
+
     /// Declare the WASI imports the synthesized helpers and `_start`
     /// need. WASI's module name is `wasi_snapshot_preview1` and the
     /// signature is fixed by the spec:
@@ -1566,9 +1842,15 @@ impl ModuleBuilder {
             // Closure functions (allocation targets) must be declared
             // with exactly their `$fn_SIG` — abstract env param — so
             // `ref.func` produces a reference `call_ref $fn_SIG`
-            // accepts. Interning the same shape would dedup to the
-            // same index anyway; using the recorded index makes the
-            // K.8 contract explicit.
+            // accepts. Reusing the recorded index is load-bearing, not
+            // cosmetic: since K.10 the wasm32-gc type interner buffers
+            // GC types into one rec group and `close_rec_group` (which
+            // ran before this point) cleared the dedup cache, so
+            // re-interning the same shape here would land a *standalone*
+            // func type at a fresh index — distinct from the in-group
+            // `$fn_SIG`. `ref.func` over that type would not be storable
+            // into the `$clo_SIG.$code` field `(ref $fn_SIG)`, failing
+            // validation. So look the index up; never re-intern.
             let sig = if self.closure_site_idx_if_set(func.id).is_some() {
                 let key = super::closures::sig_key_of(
                     func.param_types.first().ok_or_else(|| {
@@ -1993,7 +2275,7 @@ impl ModuleBuilder {
 
     /// Finalize the module and return the raw bytes. Section order
     /// follows the WASM spec.
-    pub(super) fn finish(self) -> Result<Vec<u8>, CompileError> {
+    pub(super) fn finish(mut self) -> Result<Vec<u8>, CompileError> {
         // The function section (signatures) and code section (bodies)
         // must stay positionally parallel: `code[i]` is the body of the
         // i-th local function. That holds only because every
@@ -2017,6 +2299,12 @@ impl ModuleBuilder {
         module.section(&self.imports);
         module.section(&self.functions);
         module.section(&self.memories);
+        // Global section (K.10 dyn vtable instances) sits between the
+        // memory and export sections per the WASM section order. Only
+        // emitted when a global exists.
+        if self.global_count > 0 {
+            module.section(&self.globals);
+        }
         module.section(&self.exports);
         // Element section (the `(elem declare func …)` segment closure
         // `ref.func` sites require) sits between exports and code per
