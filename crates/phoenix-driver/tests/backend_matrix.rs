@@ -148,10 +148,12 @@ backend_matrix_test!(matrix_collections, "collections.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 // The four stdlib-enum discriminant predicates (`Result.isOk`/`isErr`,
-// `Option.isSome`/`isNone`) on both variants of each enum. Already
-// gated per-backend in `compile_wasm_linear.rs`; the matrix entry adds
-// the cross-backend agreement check on top.
-backend_matrix_test!(matrix_enum_predicates, "enum_predicates.phx", skip_wasm_gc: "stdlib-enum predicate builtins (`Result.isOk` et al.) are not lowered on wasm32-gc yet (K.7 builtin surface)");
+// `Option.isSome`/`isNone`) on both variants of each enum. Lowered on
+// wasm32-gc by `option_result.rs::translate_is_variant` (`i32.eqz` for
+// the positive variant, `i32.eq` against the discriminant for the
+// negative), the same surface `option_result.phx` already exercises —
+// so all five backends agree.
+backend_matrix_test!(matrix_enum_predicates, "enum_predicates.phx");
 backend_matrix_test!(matrix_closures, "closures.phx");
 backend_matrix_test!(
     matrix_closures_ambiguous_captures,
