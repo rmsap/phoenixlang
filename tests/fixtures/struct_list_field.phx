@@ -1,0 +1,19 @@
+// Reference-typed struct field: a struct holding a `List` (§Phase 2.4
+// K.11). The `tags` field is `(ref null $list_string)`; the `$list_T`
+// type is discovered from the struct layout itself (the list collector
+// walks `struct_layouts`) and declared before the struct body is
+// defined. Iterating the field exercises a `struct.get` of a list ref
+// followed by the K.7 list-iteration path.
+
+struct Doc {
+  id: Int
+  tags: List<String>
+}
+
+function main() {
+  let d: Doc = Doc(7, ["alpha", "beta", "gamma"])
+  print(d.id)
+  for t in d.tags {
+    print(t)
+  }
+}

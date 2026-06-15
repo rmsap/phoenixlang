@@ -133,12 +133,10 @@ pub(super) fn declare(
             }
         }
     }
-    // Struct / enum layouts: forward-compat only today —
-    // `wasm_field_type_for` rejects closure-typed fields (Int / Float /
-    // Bool / String are the supported field types) before this pass
-    // ever runs, so nothing collected here is reachable yet. The walk
-    // keeps collection exhaustive for the slice that lifts the field
-    // restriction.
+    // Struct / enum layouts: a closure-typed field (`f: (Int) -> Int`)
+    // declares its `$clo_sig` parent here, so the field's
+    // `(ref null $clo_sig)` type resolves when `define_phoenix_structs`
+    // builds the struct body. See §Phase 2.4 decision K.11.
     for fields in ir_module.struct_layouts.values() {
         for (_, ty) in fields {
             walk_type(ty, &mut sigs);

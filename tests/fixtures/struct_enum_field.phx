@@ -1,0 +1,17 @@
+// Reference-typed struct field: a struct holding an enum (§Phase 2.4
+// K.11). `Option<Int>` is a K.4 enum, so the `item` field is
+// `(ref null $enum_Option_Int)` (the enum *parent* type). Pins that a
+// struct field can hold an enum ref and that pattern-style access
+// (`unwrapOr`) works through the field. Both the `Some` and `None`
+// cases are exercised so the discriminant read goes through the field.
+
+struct Box {
+  item: Option<Int>
+}
+
+function main() {
+  let full: Box = Box(Some(7))
+  let empty: Box = Box(None)
+  print(full.item.unwrapOr(0))
+  print(empty.item.unwrapOr(99))
+}

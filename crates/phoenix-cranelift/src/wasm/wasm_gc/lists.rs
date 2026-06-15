@@ -48,9 +48,11 @@ use super::translate::{FuncCtx, expect_result, single_slot, wasm_valtypes_for};
 /// Declare WASM-GC types for every `List<T>` / `ListBuilder<T>`
 /// instantiation in the IR module per §Phase 2.4 decision K.7.
 ///
-/// Must run *after* `declare_phoenix_structs`, `declare_string_types`,
+/// Must run *after* `reserve_phoenix_structs`, `declare_string_types`,
 /// and `declare_phoenix_enums` (element types of those kinds encode
-/// their already-declared indices) and *before* any function signature
+/// their already-assigned indices — struct *bodies* are filled later,
+/// but the index a `List<MyStruct>` element needs already exists once
+/// the struct is reserved) and *before* any function signature
 /// touching `IrType::ListRef` / `ListBuilderRef` is interned.
 ///
 /// Element-type restriction for slice 7: anything with an existing

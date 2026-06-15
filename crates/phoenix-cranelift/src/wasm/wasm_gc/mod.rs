@@ -126,12 +126,16 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // graph lands in one rec group (closed below), which makes the
     // forward reference legal. See §Phase 2.4 decision K.10.
     builder.reserve_phoenix_dyn(ir_module);
-    // Then every Phoenix struct's nominal WASM-GC type, so any
-    // subsequent function signature whose params/returns include
-    // `IrType::StructRef(name, _)` can encode the right
-    // `HeapType::Concrete(struct_idx)` at intern time. See §Phase 2.4
-    // decision K.1.
-    builder.declare_phoenix_structs(ir_module)?;
+    // Reserve every concrete Phoenix struct's nominal WASM-GC index next,
+    // so (a) function signatures touching `StructRef` encode the right
+    // `HeapType::Concrete(struct_idx)` at intern time (K.1) and (b) the
+    // enum / list / map / closure / dyn types declared below can
+    // reference a struct (an enum payload, a `List<MyStruct>` element).
+    // The struct *bodies* are filled by `define_phoenix_structs` after
+    // those types exist, so reference-typed struct fields resolve their
+    // targets — a forward reference made legal by the single rec group.
+    // See §Phase 2.4 decisions K.1 / K.11.
+    builder.reserve_phoenix_structs(ir_module);
     // Declare every Phoenix enum's parent + per-variant subtypes after
     // structs and string types (so enum variant fields of those types
     // can encode their indices) and before function signatures or the
@@ -157,6 +161,13 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // param/return types may reference any of the above. See §Phase 2.4
     // decision K.10.
     builder.declare_phoenix_dyn(ir_module)?;
+    // Every type a struct field can reference (other structs via the
+    // reserved indices, plus enums / lists / maps / closures / dyn) now
+    // exists, so fill the struct bodies reserved above. A field whose
+    // target has a *higher* type index than the struct is a forward
+    // reference — legal inside the rec group sealed just below. See
+    // §Phase 2.4 decision K.11.
+    builder.define_phoenix_structs(ir_module)?;
     // All WASM-GC types (and the `$fn_SIG` / `$dynfn` func types they
     // reference) are now declared; seal them into one `(rec …)` group so
     // they may mutually forward-reference — a `dyn` field in a struct, a

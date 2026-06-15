@@ -1,0 +1,29 @@
+// Self-referential struct field (§Phase 2.4 K.11): a `Node` whose
+// `next` field is `Option<Node>` — an enum holding a ref back to the
+// *same* struct. This is the genuine cycle the reserve-early/define-late
+// rec group exists for: `$Node`'s index is reserved first, the
+// `$enum_Option_Node` parent (whose `Some` variant holds `(ref null
+// $Node)`) is declared next, then `$Node`'s body is defined with its
+// `next` field as `(ref null $enum_Option_Node)` — a forward reference
+// to a *higher* type index, legal only because the whole graph emits as
+// one rec group (K.10). The other `struct_*_field` fixtures exercise
+// forward refs into later collection types; this one closes the loop.
+
+struct Node {
+  value: Int
+  next: Option<Node>
+}
+
+function sumFrom(n: Option<Node>) -> Int {
+  match n {
+    Some(node) -> node.value + sumFrom(node.next)
+    None -> 0
+  }
+}
+
+function main() {
+  let third: Node = Node(3, None)
+  let second: Node = Node(2, Some(third))
+  let first: Node = Node(1, Some(second))
+  print(sumFrom(Some(first)))
+}

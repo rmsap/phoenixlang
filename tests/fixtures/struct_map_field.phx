@@ -1,0 +1,15 @@
+// Reference-typed struct field: a struct holding a `Map` (§Phase 2.4
+// K.11). The `counts` field is `(ref null $map_string_int)`; the K.9
+// map type is discovered from the struct layout and declared before the
+// struct body. Output is scalar (specific-key lookups) so it does not
+// depend on map iteration order.
+
+struct Registry {
+  counts: Map<String, Int>
+}
+
+function main() {
+  let r: Registry = Registry({"a": 1, "b": 2, "c": 3})
+  print(r.counts.get("b").unwrapOr(0))
+  print(r.counts.get("missing").unwrapOr(-1))
+}

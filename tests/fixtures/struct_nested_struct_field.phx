@@ -1,0 +1,23 @@
+// Reference-typed struct field: a struct holding another struct
+// (§Phase 2.4 K.11). On wasm32-gc the `inner` field is
+// `(ref null $Inner)`, reachable only because struct indices are
+// reserved before the bodies are defined — one struct can reference
+// another regardless of declaration order. Bracketing `Int` fields pin
+// the field offsets on either side of the nested ref.
+
+struct Inner {
+  v: Int
+}
+
+struct Outer {
+  before: Int
+  inner: Inner
+  after: Int
+}
+
+function main() {
+  let o: Outer = Outer(1, Inner(42), 2)
+  print(o.before)
+  print(o.inner.v)
+  print(o.after)
+}

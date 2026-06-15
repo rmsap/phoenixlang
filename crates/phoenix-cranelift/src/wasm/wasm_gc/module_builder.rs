@@ -253,7 +253,7 @@ pub(super) struct ModuleBuilder {
     /// Phoenix struct name (post-monomorphization, e.g. `Point` or
     /// `Container__i64`) → WASM type-section index of the nominal
     /// `(struct ...)` declaration. Populated by
-    /// [`Self::declare_phoenix_structs`]; consulted by `Op::StructAlloc`
+    /// [`Self::reserve_phoenix_structs`]; consulted by `Op::StructAlloc`
     /// lowering and by the `IrType::StructRef` → WASM `ValType` mapping
     /// in `translate::wasm_valtypes_for`. See §Phase 2.4 decision K.1
     /// for the one-WASM-struct-per-Phoenix-struct rationale.
@@ -616,11 +616,12 @@ impl ModuleBuilder {
     /// `HeapType::Concrete($string_idx)` inline — declaring the string
     /// types afterwards would have the signature reference an
     /// unallocated type-section slot. It also runs *before*
-    /// `declare_phoenix_structs`, so struct fields can reference
-    /// `$string` the same way — the type section reads: `$bytes` →
-    /// `$string` → Phoenix structs → enums → lists → function
-    /// signatures. (`$bytes`/`$string` reference no other type, so
-    /// first is always safe.)
+    /// `reserve_phoenix_structs`, so struct fields can reference
+    /// `$string` the same way — the type-section *index* order reads:
+    /// `$bytes` → `$string` → reserved `$dyn_T` → reserved Phoenix
+    /// structs → enums → lists → … (struct *bodies* fill their reserved
+    /// slots later) → function signatures. (`$bytes`/`$string` reference
+    /// no other type, so first is always safe.)
     pub(super) fn declare_string_types(&mut self) {
         debug_assert!(
             self.bytes_type_idx.is_none() && self.string_type_idx.is_none(),
@@ -711,68 +712,84 @@ impl ModuleBuilder {
         idx
     }
 
-    /// Declare one nominal WASM-GC struct type per Phoenix struct in
-    /// the IR module, in `struct_layouts` iteration order. Each
-    /// declaration takes the type-section index that the order assigns
-    /// and is recorded in [`Self::phx_structs`] so subsequent function
-    /// signatures (and `Op::StructAlloc` lowering) can reference the
-    /// index without re-walking the section.
+    /// Concrete (non-template) Phoenix struct names, sorted — the shared
+    /// iteration order of [`Self::reserve_phoenix_structs`] and
+    /// [`Self::define_phoenix_structs`] so the two passes assign and fill
+    /// the *same* type-section slots. Sorted so the layout is
+    /// deterministic across runs (HashMap iteration is otherwise
+    /// arbitrary, and a non-deterministic type section would make
+    /// golden-byte diffs in tests untrustworthy). Generic *templates*
+    /// (`Container` with a `TypeVar("T")` field, alongside its
+    /// monomorphized `Container__i64` instance) are skipped — concrete
+    /// code only ever references the instances, mirroring the native
+    /// backend and K.4's enum handling. Templates are identified by
+    /// their `struct_type_params` entry (registered for every generic
+    /// declaration, never cleared), not by scanning fields: a phantom
+    /// param (`struct Tag<T> { id: Int }`) leaves no placeholder but is
+    /// still a template.
+    fn concrete_struct_names(ir_module: &IrModule) -> Vec<&String> {
+        let mut names: Vec<&String> = ir_module
+            .struct_layouts
+            .keys()
+            .filter(|name| !ir_module.struct_type_params.contains_key(*name))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **Reserve** one nominal WASM-GC struct type-section index per
+    /// concrete Phoenix struct, recording its `name → idx` in
+    /// [`Self::phx_structs`] and its field count — *before* enums /
+    /// lists / maps / closures / dyn are declared, so every type that
+    /// references a struct (an enum variant payload, a `List<MyStruct>`
+    /// element, a `dyn` method param) resolves a real index. The bodies
+    /// are filled later by [`Self::define_phoenix_structs`]; a struct
+    /// field that forward-references a later-declared type is legal
+    /// because the whole GC type graph emits as one rec group (§Phase 2.4
+    /// decisions K.10 / K.11).
     ///
     /// Must run *before* any function signature is interned, because
     /// signatures that take or return a `(ref null $struct_idx)` encode
     /// the index inline — declaring the struct after such a signature
     /// would have the signature reference an unallocated type-section
     /// slot. See §Phase 2.4 decision K.1.
-    ///
-    /// **Field-type restriction.** Supported field types are `Int`,
-    /// `Float`, `Bool`, and `String`. Nested struct / list / map /
-    /// enum / closure / dyn fields error here — each needs a follow-up
-    /// slice that
-    /// pins its own type mapping before it can lower correctly. The
-    /// error keeps a fixture-driven slice from silently producing a
-    /// malformed module on inputs the slice hasn't been designed for.
-    pub(super) fn declare_phoenix_structs(
+    pub(super) fn reserve_phoenix_structs(&mut self, ir_module: &IrModule) {
+        for name in Self::concrete_struct_names(ir_module) {
+            let field_count = ir_module.struct_layouts[name].len() as u32;
+            let idx = self.types.reserve();
+            self.phx_structs.insert(name.clone(), idx);
+            self.phx_struct_field_counts.insert(idx, field_count);
+        }
+    }
+
+    /// **Define** each reserved struct's field layout. Runs after enums /
+    /// lists / maps / closures / dyn are declared (so a reference-typed
+    /// field resolves its target index) and fills the slots
+    /// [`Self::reserve_phoenix_structs`] reserved. Field types map
+    /// through the same single-slot `wasm_valtypes_for` path as every
+    /// other position — a reference field is `(ref null $T)` — and are
+    /// all mutable (Phoenix supports `p.x = 5` and has no immutable-field
+    /// syntax). See §Phase 2.4 decision K.11.
+    pub(super) fn define_phoenix_structs(
         &mut self,
         ir_module: &IrModule,
     ) -> Result<(), CompileError> {
-        // Iterate in sorted name order so the type-section layout is
-        // deterministic across runs (HashMap iteration is otherwise
-        // arbitrary, and a non-deterministic type section would make
-        // golden-byte diffs in tests untrustworthy).
-        let mut names: Vec<&String> = ir_module.struct_layouts.keys().collect();
-        names.sort();
-        for name in names {
+        for name in Self::concrete_struct_names(ir_module) {
             let layout = &ir_module.struct_layouts[name];
-            // Generic struct *templates* survive in `struct_layouts`
-            // alongside their monomorphized instances (`Container` with
-            // a `TypeVar("T")` field next to `Container__i64`). Concrete
-            // code only ever references the instances — the native
-            // backend resolves layouts by concrete name on demand and
-            // never touches templates — so templates are skipped, not
-            // declared. Templates are identified by their
-            // `struct_type_params` entry (registered for every generic
-            // declaration, never cleared), not by scanning fields for
-            // placeholders — a phantom param (`struct Tag<T> { id: Int }`)
-            // leaves no placeholder in any field but is still a
-            // template. A concrete struct that wrongly retains a
-            // placeholder field still fails loudly, in
-            // `wasm_field_type_for`'s unsupported-field-type arm.
-            if ir_module.struct_type_params.contains_key(name) {
-                continue;
-            }
+            let idx = self.require_phx_struct(name)?;
             let mut fields = Vec::with_capacity(layout.len());
             for (field_name, field_ty) in layout {
-                fields.push(wasm_field_type_for(
-                    name,
-                    field_name,
+                let val_type = translate::single_slot(
                     field_ty,
-                    self.string_type_idx,
-                )?);
+                    self,
+                    &format!("struct `{name}` field `{field_name}`"),
+                )?;
+                fields.push(wasm_encoder::FieldType {
+                    element_type: wasm_encoder::StorageType::Val(val_type),
+                    mutable: true,
+                });
             }
-            let idx = self.types.declare_struct(&fields);
-            self.phx_structs.insert(name.clone(), idx);
-            self.phx_struct_field_counts
-                .insert(idx, fields.len() as u32);
+            self.types.define_struct(idx, &fields);
         }
         Ok(())
     }
@@ -785,7 +802,7 @@ impl ModuleBuilder {
         self.phx_structs.get(name).copied().ok_or_else(|| {
             CompileError::new(format!(
                 "wasm32-gc: struct `{name}` was not declared by \
-                 `declare_phoenix_structs` — either an `Op::StructAlloc` / \
+                 `reserve_phoenix_structs` — either an `Op::StructAlloc` / \
                  `IrType::StructRef` references a struct missing from \
                  `IrModule::struct_layouts`, or the pipeline declared a \
                  function signature touching it before the struct itself \
@@ -810,11 +827,12 @@ impl ModuleBuilder {
     /// [`Self::declare_string_helpers`] dispatches to
     /// [`super::string_helpers`].
     ///
-    /// Must run *after* [`Self::declare_phoenix_structs`] and
+    /// Must run *after* [`Self::reserve_phoenix_structs`] and
     /// [`Self::declare_string_types`] (so variant fields of those types
-    /// can encode their indices) and *before* any function signature
-    /// touching `IrType::EnumRef` is interned (so the signature can
-    /// encode the parent's `HeapType::Concrete(idx)`).
+    /// can encode their indices — a struct payload's index exists once
+    /// reserved, even though its body is defined later) and *before* any
+    /// function signature touching `IrType::EnumRef` is interned (so the
+    /// signature can encode the parent's `HeapType::Concrete(idx)`).
     pub(super) fn declare_phoenix_enums(
         &mut self,
         ir_module: &IrModule,
@@ -2407,7 +2425,8 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
     // Struct layouts contribute directly: a `name: String` field needs
     // `$string` declared before the struct itself, even if no walked
     // function type mentions a String. Generic templates are excluded
-    // the same way `declare_phoenix_structs` excludes them — by their
+    // the same way the struct passes exclude them (see
+    // `concrete_struct_names`) — by their
     // `struct_type_params` entry — so a String field in an
     // uninstantiated template doesn't force `$string` into the module.
     if ir_module.struct_layouts.iter().any(|(name, fields)| {
@@ -2620,61 +2639,6 @@ fn build_vid_type_map(func: &phoenix_ir::module::IrFunction) -> HashMap<ValueId,
         }
     }
     map
-}
-
-/// Map one Phoenix field's `IrType` to a WASM-GC `FieldType` for the
-/// containing struct's nominal declaration. Supports primitives
-/// (Int / Float / Bool) and `StringRef` as `(ref null $string)` —
-/// the same nullable-ref convention as K.2/K.4 fields, encodable
-/// because `$string` is declared ahead of the structs in the type
-/// section. Nested struct / list /
-/// map / enum / closure / dyn fields are still rejected with a
-/// per-slice diagnostic — each needs its own follow-up sub-decision
-/// (nested structs and struct↔enum references need a dependency sort
-/// or rec groups; lists need the K.7 instantiations declared, which
-/// happens *after* structs today). Mutability is unconditional:
-/// Phoenix supports `p.x = 5` and has no syntax to mark a field
-/// immutable. See §Phase 2.4 decision K.1.
-fn wasm_field_type_for(
-    struct_name: &str,
-    field_name: &str,
-    field_ty: &IrType,
-    string_type_idx: Option<u32>,
-) -> Result<wasm_encoder::FieldType, CompileError> {
-    let val_type = match field_ty {
-        IrType::I64 => wasm_encoder::ValType::I64,
-        IrType::F64 => wasm_encoder::ValType::F64,
-        IrType::Bool => wasm_encoder::ValType::I32,
-        IrType::StringRef => {
-            let idx = string_type_idx.ok_or_else(|| {
-                CompileError::new(format!(
-                    "wasm32-gc: struct `{struct_name}` field `{field_name}` \
-                     is `StringRef` but `declare_string_types` did not run \
-                     first — `scan_helper_needs` should flag `string_types` \
-                     for any module whose struct layouts contain a String \
-                     field (internal compiler bug)"
-                ))
-            })?;
-            wasm_encoder::ValType::Ref(wasm_encoder::RefType {
-                nullable: true,
-                heap_type: wasm_encoder::HeapType::Concrete(idx),
-            })
-        }
-        other => {
-            return Err(CompileError::new(format!(
-                "wasm32-gc: struct `{struct_name}` field \
-                 `{field_name}` has type `{other:?}`, which is not yet \
-                 supported as a struct field (Int / Float / Bool / String \
-                 are). Nested struct / list / map / enum / closure / dyn \
-                 fields land in follow-up slices (each carries its own \
-                 type-mapping sub-decision under §Phase 2.4 decision K)"
-            )));
-        }
-    };
-    Ok(wasm_encoder::FieldType {
-        element_type: wasm_encoder::StorageType::Val(val_type),
-        mutable: true,
-    })
 }
 
 /// Emit a `fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET); drop`

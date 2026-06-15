@@ -1976,10 +1976,10 @@ fn struct_string_field_runs_under_wasmtime_gc() {
 /// appears anywhere the function-body walk would find — `age`'s param
 /// is `StructRef("User", [])`, whose `type_contains_string` only
 /// inspects generic args — so `HelperNeeds::string_types` is set
-/// solely by the layout scan. Without that scan,
-/// `declare_phoenix_structs` would hit `wasm_field_type_for`'s
-/// internal-compiler-bug error for the missing `$string` index.
-/// Compile-only: the structural assertion doesn't need wasmtime.
+/// solely by the layout scan. Without that scan, `define_phoenix_structs`
+/// would hit `require_string_type_idx`'s internal-compiler-bug error
+/// for the missing `$string` index when mapping the `name: String`
+/// field. Compile-only: the structural assertion doesn't need wasmtime.
 #[test]
 fn string_field_struct_without_string_ops_compiles() {
     let source = concat!(
@@ -2042,9 +2042,10 @@ fn string_variant_enum_without_string_ops_compiles() {
 
 /// Generic struct *templates* survive in `struct_layouts` alongside
 /// their monomorphized instances (`Container` with a `TypeVar("T")`
-/// field next to `Container__i64`). `declare_phoenix_structs` must
-/// skip the template rather than trip the field-type restriction on
-/// `TypeVar` — concrete code only ever references the instances.
+/// field next to `Container__i64`). The struct passes
+/// (`concrete_struct_names`) must skip the template rather than trip
+/// `single_slot` on the `TypeVar` field — concrete code only ever
+/// references the instances.
 /// The decl count pins both directions: a regression that declares
 /// the template fails compilation (loud), one that drops an instance
 /// shifts the count.
@@ -2928,7 +2929,7 @@ fn main_returning_non_void_is_rejected() {
 /// be declared *before* `main`'s signature is interned (so any future
 /// signature with a struct ref param/return encodes the right
 /// `HeapType::Concrete(idx)`). The pipeline calls
-/// `declare_phoenix_structs` before `declare_phoenix_functions`; a
+/// `reserve_phoenix_structs` before `declare_phoenix_functions`; a
 /// reordering would emit a signature referencing an unallocated type
 /// slot, which `wasmparser` would reject.
 ///
@@ -3397,14 +3398,14 @@ fn print_str_oversized_traps_under_wasmtime_gc() {
     assert_traps(&source, "print_str_oversized_wasm_gc");
 }
 
-/// A struct field whose type isn't yet supported (here a nested
-/// `StructRef`) must surface a clear per-field diagnostic — not
-/// silently emit a partial declaration that later trips up
-/// `wasmparser` with an "unexpected field type" deep inside the binary
-/// format. The error keeps the backend from masking work that belongs
-/// to follow-up slices.
+/// A nested `StructRef` field round-trips under wasmtime (§Phase 2.4
+/// K.11): `Outer`'s `inner: Inner` field is `(ref null $Inner)`, filled
+/// by `define_phoenix_structs` after both structs' indices are reserved
+/// — a `struct.get` of the field yields the inner ref, and a second
+/// `struct.get` reads its scalar. Pins that the reserve/define split
+/// lets one struct hold a reference to another.
 #[test]
-fn struct_with_nested_struct_field_is_rejected_until_a_later_slice() {
+fn struct_with_nested_struct_field_runs_under_wasmtime_gc() {
     let source = concat!(
         "struct Inner {\n",
         "  v: Int\n",
@@ -3417,39 +3418,29 @@ fn struct_with_nested_struct_field_is_rejected_until_a_later_slice() {
         "  print(o.inner.v)\n",
         "}\n",
     );
-    let ir_module = lower_to_ir(source);
-    let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("nested struct fields are not yet supported on wasm32-gc");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Outer") && msg.contains("inner"),
-        "expected a per-field diagnostic naming the unsupported field, got: {msg}"
-    );
+    assert_prints(source, "struct_nested_struct_field_wasm_gc", b"1\n");
 }
 
-/// A `List<String>` field is the shape where `scan_helper_needs`'s
-/// struct-layout backstop fires (`type_contains_string` recurses into
-/// the element type) but the field itself is still unsupported: the
-/// compile must fail on `wasm_field_type_for`'s per-field diagnostic,
-/// not slip past it because `$string` happens to be declared.
+/// A `List<String>` field round-trips (§Phase 2.4 K.11). This is also
+/// the shape where `scan_helper_needs`'s struct-layout backstop fires
+/// (`type_contains_string` recurses into the element type) so `$string`
+/// is declared even though `main` here builds the list explicitly: the
+/// `tags` field is `(ref null $list_string)`, and iterating it prints
+/// each element.
 #[test]
-fn struct_with_list_string_field_is_rejected_until_a_later_slice() {
+fn struct_with_list_string_field_runs_under_wasmtime_gc() {
     let source = concat!(
         "struct Doc {\n",
         "  tags: List<String>\n",
         "}\n",
         "function main() {\n",
-        "  print(7)\n",
+        "  let d: Doc = Doc([\"a\", \"b\"])\n",
+        "  for t in d.tags {\n",
+        "    print(t)\n",
+        "  }\n",
         "}\n",
     );
-    let ir_module = lower_to_ir(source);
-    let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("a List-typed struct field is not yet supported on wasm32-gc");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Doc") && msg.contains("tags"),
-        "expected a per-field diagnostic naming the unsupported field, got: {msg}"
-    );
+    assert_prints(source, "struct_list_string_field_wasm_gc", b"a\nb\n");
 }
 
 /// `Op::StructGetField` / `Op::StructSetField` with a field index past
@@ -3687,7 +3678,7 @@ fn same_shape_structs_get_distinct_wasm_types() {
 /// `Op::StructAlloc` naming a struct absent from `IrModule::struct_layouts`
 /// must surface `require_phx_struct`'s missing-declaration diagnostic —
 /// the guard against a signature/alloc referencing a struct the
-/// `declare_phoenix_structs` pass never saw. No Phoenix surface produces
+/// `reserve_phoenix_structs` pass never saw. No Phoenix surface produces
 /// this (sema resolves every constructor to a declared struct), so the
 /// path is only reachable via hand-built (or future buggy) IR, mirroring
 /// the out-of-range field-index tests.
@@ -3718,13 +3709,57 @@ fn struct_alloc_for_undeclared_struct_is_rejected() {
         .expect_err("a StructAlloc naming a struct absent from struct_layouts must be rejected");
     let msg = err.to_string();
     assert!(
-        msg.contains("Ghost") && msg.contains("declare_phoenix_structs"),
+        msg.contains("Ghost") && msg.contains("reserve_phoenix_structs"),
         "expected a missing-declaration diagnostic naming the struct, got: {msg}"
     );
 }
 
+/// Since K.11 lifted the struct-field type restriction, `define_phoenix_structs`
+/// maps every field through `single_slot`, which rejects any type that
+/// isn't exactly one WASM slot. `Void` is the one such type the wasm32-gc
+/// valtype mapping produces (zero slots; every other `IrType` is a single
+/// scalar or ref) — so a `Void`-typed field must surface
+/// `single_slot`'s per-field diagnostic rather than silently emit a
+/// zero-field `struct.new` slot that `wasmparser` would later reject. No
+/// Phoenix surface produces a `Void` field (sema rejects it), so the path
+/// is reachable only via hand-built IR, mirroring
+/// `struct_alloc_for_undeclared_struct_is_rejected` and the out-of-range
+/// field-index tests. The struct is never instantiated — the field walk
+/// runs from `struct_layouts` regardless, per K.11's eager-declaration note.
+#[test]
+fn struct_field_with_non_single_slot_type_is_rejected() {
+    let mut main = IrFunction::new(
+        FuncId(0),
+        "main".to_string(),
+        Vec::new(),
+        Vec::new(),
+        IrType::Void,
+        None,
+    );
+    let entry = main.create_block();
+    main.set_terminator(entry, Terminator::Return(None));
+
+    let mut module = IrModule::new();
+    // `bad: Void` is the zero-slot field; `Holder` is deliberately never
+    // instantiated, but `define_phoenix_structs` walks every concrete
+    // `struct_layouts` entry, so the field still reaches `single_slot`.
+    module.struct_layouts.insert(
+        "Holder".to_string(),
+        vec![("bad".to_string(), IrType::Void)],
+    );
+    module.push_concrete(main);
+
+    let err = compile(&module, Target::Wasm32Gc)
+        .expect_err("a struct field whose type isn't a single WASM slot must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Holder") && msg.contains("bad") && msg.contains("single-slot"),
+        "expected a single-slot diagnostic naming the struct field, got: {msg}"
+    );
+}
+
 /// Exercise a `Bool` struct field end-to-end — the `Bool → i32` arm of
-/// `wasm_field_type_for`, plus a `struct.get` whose result slot is `i32`
+/// the `wasm_valtypes_for` field mapping, plus a `struct.get` whose result slot is `i32`
 /// rather than `i64`. The fixture stores `true` into the field, reads it
 /// back, and branches on it; the read is observable because the taken
 /// arm prints a different `Int` than the untaken one. The slice-3
@@ -3760,7 +3795,7 @@ fn struct_bool_field_runs_under_wasmtime_gc() {
 }
 
 /// Exercise an `F64` struct field — the `F64 → f64` arm of
-/// `wasm_field_type_for` and a `struct.new` / `struct.get` against an
+/// the `wasm_valtypes_for` field mapping and a `struct.new` / `struct.get` against an
 /// f64 field slot. Hand-built rather than source-driven because the GC
 /// backend lowers no f64-producing op (`Op::ConstF64` is outside the
 /// slice-3 surface, and there's no float arithmetic), so the only way to

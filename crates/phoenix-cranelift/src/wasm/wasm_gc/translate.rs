@@ -732,8 +732,9 @@ fn translate_instruction(
         }
         Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr),
         // Struct ops — see §Phase 2.4 decision K.1. Each Phoenix struct
-        // has one nominal WASM-GC struct type (declared at module-build
-        // time by `declare_phoenix_structs`); the receiver value's
+        // has one nominal WASM-GC struct type (reserved then defined at
+        // module-build time by `reserve_phoenix_structs` /
+        // `define_phoenix_structs`); the receiver value's
         // binding `ValType` is `(ref null $struct_idx)`, from which
         // get/set extract the struct's WASM type index without a
         // parallel `ValueId → struct_name` map.
@@ -1226,7 +1227,7 @@ fn check_field_index(
     let field_count = b.struct_field_count(struct_idx).ok_or_else(|| {
         CompileError::new(format!(
             "wasm32-gc: {label} references WASM struct type {struct_idx}, \
-             which `declare_phoenix_structs` recorded no field count for \
+             which `reserve_phoenix_structs` recorded no field count for \
              (internal compiler bug)"
         ))
     })?;

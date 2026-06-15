@@ -1,0 +1,16 @@
+// Reference-typed struct field: a struct holding a closure (§Phase 2.4
+// K.11). The `f` field is `(ref null $clo_sig)` — the K.8 closure
+// signature parent. The closure is read out of the field into a local
+// before it is called: invoking a closure-typed field directly
+// (`o.f(x)`) parses as a method call and is a separate frontend gap on
+// every backend, unrelated to wasm32-gc codegen.
+
+struct Transform {
+  f: (Int) -> Int
+}
+
+function main() {
+  let t: Transform = Transform(function(x: Int) -> Int { x * 2 + 1 })
+  let g: (Int) -> Int = t.f
+  print(g(20))
+}

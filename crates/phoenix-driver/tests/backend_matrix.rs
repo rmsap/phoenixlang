@@ -102,17 +102,12 @@ backend_matrix_test!(matrix_traits_dyn, "traits_dyn.phx");
 backend_matrix_test!(matrix_traits_dyn_multi, "traits_dyn_multi.phx");
 // `dyn Trait` stored in a struct field: exercises the `DynRef`
 // field-storage layout (size 8 / align 4) and the two-slot field
-// load/store paths, plus offsets of the `Int`s bracketing the
-// 8-byte fat pointer — paths a `dyn` local/param never reaches. Stays
-// skipped on wasm32-gc because reference-typed *struct fields* are not
-// yet lowered there at all (a plain `struct Outer { inner: Inner }`
-// is rejected identically; see the wasm32-gc integration test
-// `struct_with_nested_struct_field_is_rejected_until_a_later_slice`).
-// The `dyn` ABI itself is complete — this fixture unskips together with
-// the reference-typed-struct-fields slice (§Phase 2.4 K.10 bugs-closed
-// note), which lands nested-struct / list / map / enum / closure / dyn
-// fields as one feature.
-backend_matrix_test!(matrix_traits_dyn_field, "traits_dyn_field.phx", skip_wasm_gc: "reference-typed struct fields (incl. `dyn`) are not lowered on wasm32-gc yet — a struct-field feature, not a `dyn` gap");
+// load/store paths on wasm32-linear, plus offsets of the `Int`s
+// bracketing the field — paths a `dyn` local/param never reaches. On
+// wasm32-gc the `dyn` field is one `(ref null $dyn_Shape)` slot, lowered
+// by the K.11 reference-typed-struct-fields work (reserve struct indices
+// early, define bodies late) — the `dyn` ABI itself needed no change.
+backend_matrix_test!(matrix_traits_dyn_field, "traits_dyn_field.phx");
 // `dyn Trait` as a `List` element: exercises `DynRef` list-element
 // storage (8-byte stride) and `List.sortBy` over a `dyn` element type,
 // pinning that the sortBy GC key-frame tripwire admits `DynRef` (slot 1
@@ -131,6 +126,24 @@ backend_matrix_test!(matrix_traits_dyn_ret, "traits_dyn_ret.phx");
 // which the other dyn fixtures (locals / params / fields / elements)
 // never exercise.
 backend_matrix_test!(matrix_traits_dyn_factory, "traits_dyn_factory.phx");
+// Reference-typed struct fields (§Phase 2.4 K.11) — one fixture per
+// field kind so a divergence names the kind. Each holds a managed
+// reference (`(ref null $T)` on wasm32-gc, a heap pointer on the linear
+// backends) whose target type is reserved before, and defined after,
+// the surrounding enum / list / map / closure / struct types.
+backend_matrix_test!(
+    matrix_struct_nested_struct_field,
+    "struct_nested_struct_field.phx"
+);
+backend_matrix_test!(matrix_struct_list_field, "struct_list_field.phx");
+backend_matrix_test!(matrix_struct_enum_field, "struct_enum_field.phx");
+backend_matrix_test!(matrix_struct_map_field, "struct_map_field.phx");
+backend_matrix_test!(matrix_struct_closure_field, "struct_closure_field.phx");
+// Self-referential struct (`Node { next: Option<Node> }`) — the genuine
+// cycle the K.11 reserve/define split exists for: the struct field's
+// target type (`$enum_Option_Node`) has a *higher* type index than the
+// struct itself, a forward reference legal only inside the rec group.
+backend_matrix_test!(matrix_struct_recursive_field, "struct_recursive_field.phx");
 backend_matrix_test!(matrix_collections, "collections.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");

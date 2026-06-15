@@ -36,10 +36,11 @@ pub(super) type EnumInstantiationKey = (String, Vec<IrType>);
 /// `supertype_idx` can reference its parent (which must already exist
 /// by type-section position).
 ///
-/// Must run *after* `declare_phoenix_structs` and
+/// Must run *after* `reserve_phoenix_structs` and
 /// `declare_string_types` (so variant fields of those types can encode
-/// their indices) and *before* any function signature touching
-/// `IrType::EnumRef` is interned (so the signature can encode the
+/// their indices — a struct payload's index exists once reserved, even
+/// though its body is defined later) and *before* any function signature
+/// touching `IrType::EnumRef` is interned (so the signature can encode the
 /// parent's `HeapType::Concrete(idx)`).
 ///
 /// Field-type restriction for slice 3: variant fields can be
