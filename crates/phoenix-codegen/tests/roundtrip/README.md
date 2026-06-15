@@ -16,8 +16,11 @@ roundtrip/
     harness_test.go    # schema-agnostic: contract types, assertions, value/query/header/json helpers
     go.mod.template
   typescript/          # TypeScript driver (pinned npm project)
-    driver.ts          # per-schema: makeStub + invoke + server-mount/client-drive loop
-    harness.ts         # schema-agnostic boilerplate (imported by driver.ts)
+    cases.ts           # per-schema: makeStub (Handlers) + invoke (client dispatch)
+    run.ts             # schema-agnostic: runCase(c, mount) + main(mount) + result asserts
+    harness.ts         # schema-agnostic boilerplate (contract types, generic assertions)
+    driver.ts          # Express mount → main(expressMount)
+    driver-fastify.ts  # Fastify mount (@fastify/multipart) → main(fastifyMount)
   python/              # Python driver (pinned venv)
     driver.py          # per-schema: Stub + invoke + FastAPI mount/ASGI drive loop
     harness.py         # schema-agnostic boilerplate (imported by driver.py)
@@ -29,6 +32,12 @@ generated client/server, so it's hand-authored as an independent oracle) and a
 **schema-agnostic** `harness` half (contract-case types, generic assertions, and
 value/query/header/json helpers). Adding a new endpoint or type shape touches
 only the per-schema half plus a `contract.json` case; the harness stays put.
+
+The TypeScript target additionally proves **both server frameworks**: `run.ts`
+factors the run loop behind a `Mount` function, so `driver.ts` (Express) and
+`driver-fastify.ts` (Fastify) share the stub/invoke/asserts and differ only in
+how they stand up the generated server. The `typescript_roundtrip` test runs the
+same contract through both.
 
 ## `contract.json` schema
 

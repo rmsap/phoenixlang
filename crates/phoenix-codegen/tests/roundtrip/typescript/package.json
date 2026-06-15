@@ -5,10 +5,13 @@
   "description": "Behavioral round-trip driver for Phoenix Gen's TypeScript target. The harness drops the generated .ts files into generated/ and runs driver.ts (via tsx) against this project's pinned toolchain (express + tsx).",
   "type": "module",
   "scripts": {
-    "roundtrip": "tsx driver.ts"
+    "roundtrip": "tsx driver.ts",
+    "roundtrip:fastify": "tsx driver-fastify.ts"
   },
   "dependencies": {
+    "@fastify/multipart": "9.0.3",
     "express": "5.0.1",
+    "fastify": "5.2.0",
     "multer": "2.0.1"
   },
   "devDependencies": {

@@ -136,9 +136,42 @@ fn go_roundtrip() {
 
 // ── TypeScript target ─────────────────────────────────────────────────────
 
-fn generate_typescript_files(schema: &str) -> phoenix_codegen::GeneratedFiles {
+/// Generates both the Express and Fastify variants from a single parse/check.
+/// Only `server.ts` differs between frameworks; `types.ts`/`client.ts`/
+/// `handlers.ts` are framework-independent. We assert that invariant here so the
+/// Fastify round-trip (which reuses the Express-generated non-server files in the
+/// shared `generated/` dir) can't silently pass against stale files if the
+/// generator ever diverges them.
+fn generate_typescript_express_and_fastify(
+    schema: &str,
+) -> (
+    phoenix_codegen::GeneratedFiles,
+    phoenix_codegen::GeneratedFiles,
+) {
     let (program, result) = parse_and_check(schema);
-    phoenix_codegen::generate_typescript(&program, &result)
+    let express = phoenix_codegen::generate_typescript_with(
+        &program,
+        &result,
+        phoenix_codegen::TsServerFramework::Express,
+    );
+    let fastify = phoenix_codegen::generate_typescript_with(
+        &program,
+        &result,
+        phoenix_codegen::TsServerFramework::Fastify,
+    );
+    assert_eq!(
+        express.types, fastify.types,
+        "types.ts must be framework-independent"
+    );
+    assert_eq!(
+        express.client, fastify.client,
+        "client.ts must be framework-independent"
+    );
+    assert_eq!(
+        express.handlers, fastify.handlers,
+        "handlers.ts must be framework-independent"
+    );
+    (express, fastify)
 }
 
 /// Generates the TypeScript client/server/types/handlers from `SCHEMA`, drops
@@ -185,7 +218,7 @@ fn typescript_roundtrip() {
         return;
     }
 
-    let files = generate_typescript_files(SCHEMA);
+    let (files, fastify) = generate_typescript_express_and_fastify(SCHEMA);
 
     let generated = driver_dir.join("generated");
     let _ = std::fs::remove_dir_all(&generated);
@@ -199,6 +232,17 @@ fn typescript_roundtrip() {
 
     let (ok, out) = run(&driver_dir, "npx", &["tsx", "driver.ts"]);
     assert!(ok, "typescript round-trip test failed:\n{out}");
+
+    // Fastify server variant: only `server.ts` differs (types/client/handlers
+    // are framework-independent — asserted in `generate_typescript_express_and_fastify`
+    // — so the ones already in `generated/` from the Express pass stand). Overwrite
+    // just the server, into the SAME `generated/` (so this must stay in this one
+    // test — a separate `#[test]` would race the shared dir), and drive the Fastify
+    // plugin via `driver-fastify.ts` against the same contract.
+    std::fs::write(generated.join("server.ts"), &fastify.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "driver-fastify.ts"]);
+    assert!(ok, "typescript fastify round-trip test failed:\n{out}");
 }
 
 // ── Python target ──────────────────────────────────────────────────────────
