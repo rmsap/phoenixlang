@@ -2548,6 +2548,164 @@ fn list_reduce_ref_accumulator_runs_under_wasmtime_gc() {
     );
 }
 
+/// `Map<K,V>` core surface (§K.9): the ordered-association
+/// representation — literal, get (Option<V>), contains, length, set
+/// (copy-on-write, overwrite-or-append), remove, keys/values
+/// (insertion order). String keys (content equality via `phx_str_eq`)
+/// plus the empty-map and missing-key edges. Byte-identical to every
+/// other backend.
+#[test]
+fn map_core_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<String, Int> = {\"a\": 1, \"b\": 2, \"c\": 3}\n",
+        "  print(m.length())\n",                // 3
+        "  print(m.get(\"a\").unwrapOr(0))\n",  // 1
+        "  print(m.get(\"z\").unwrapOr(-1))\n", // -1
+        "  print(m.contains(\"b\"))\n",         // true
+        "  print(m.contains(\"z\"))\n",         // false
+        "  for k in m.keys() { print(k) }\n",   // a b c
+        "  for v in m.values() { print(v) }\n", // 1 2 3
+        "  let m2 = m.set(\"d\", 9).set(\"b\", 20)\n",
+        "  print(m2.length())\n",               // 4
+        "  print(m2.get(\"b\").unwrapOr(0))\n", // 20 (overwrite, position kept)
+        "  let m3 = m2.remove(\"a\")\n",
+        "  print(m3.length())\n",              // 3
+        "  print(m3.contains(\"a\"))\n",       // false
+        "  for k in m3.keys() { print(k) }\n", // b c d
+        "  let empty: Map<Int, Int> = {}\n",
+        "  print(empty.length())\n",            // 0
+        "  print(empty.get(5).unwrapOr(42))\n", // 42
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_core_wasm_gc",
+        b"3\n1\n-1\ntrue\nfalse\na\nb\nc\n1\n2\n3\n4\n20\n3\nfalse\nb\nc\nd\n0\n42\n",
+    );
+}
+
+/// `Map<Int, V>` with Int keys + the copy-on-write immutability
+/// contract: `set` returns a fresh map, the original is untouched.
+#[test]
+fn map_int_keys_cow_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<Int, Int> = {1: 10, 2: 20}\n",
+        "  let m2 = m.set(3, 30)\n",
+        "  print(m.length())\n",            // 2 — original untouched
+        "  print(m2.length())\n",           // 3
+        "  print(m2.get(3).unwrapOr(0))\n", // 30
+        "  print(m.contains(3))\n",         // false (COW)
+        "}\n",
+    );
+    assert_prints(source, "map_int_cow_wasm_gc", b"2\n3\n30\nfalse\n");
+}
+
+/// `Map<String, String>` — ref-typed *values*. Stresses the paths the
+/// scalar-value tests don't: `$vals` is a ref-element array (so
+/// `array.new_default` must default it to null) and `Map.get` builds an
+/// `Option<String>` (a ref-payload K.4 enum) for the hit and `None` for
+/// the miss. `set` overwrites a ref value in place and appends another;
+/// `values()` wraps the ref array as a `List<String>`.
+#[test]
+fn map_ref_values_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<String, String> = {\"x\": \"hello\", \"y\": \"world\"}\n",
+        "  print(m.get(\"x\").unwrapOr(\"?\"))\n", // hello
+        "  print(m.get(\"z\").unwrapOr(\"?\"))\n", // ? (miss → None)
+        "  let m2 = m.set(\"y\", \"there\").set(\"z\", \"new\")\n",
+        "  print(m2.get(\"y\").unwrapOr(\"?\"))\n", // there (overwrite)
+        "  print(m2.get(\"z\").unwrapOr(\"?\"))\n", // new (append)
+        "  print(m2.length())\n",                   // 3
+        "  for v in m2.values() { print(v) }\n",    // hello there new
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_ref_values_wasm_gc",
+        b"hello\n?\nthere\nnew\n3\nhello\nthere\nnew\n",
+    );
+}
+
+/// `Map<Float, V>` — exercises the `emit_key_eq` Float arm
+/// (`i64.reinterpret_f64` + `i64.eq`), the **byte-wise** key comparison
+/// that motivated the cross-backend `map_key_eq` unification (§K.9). The
+/// critical case: `0.0` and `-0.0` are IEEE-equal but bit-distinct, so a
+/// byte-wise map keeps them as *separate* keys (length 2, distinct
+/// values) — an IEEE `f64.eq` lowering would collapse them and is the
+/// bug this pins against. Values are Ints, so float formatting never
+/// enters the expected output.
+#[test]
+fn map_float_keys_byte_wise_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<Float, Int> = {1.5: 10, 2.5: 20, 0.0: 30, -0.0: 40}\n",
+        "  print(m.length())\n", // 4 — 0.0 and -0.0 are distinct keys
+        "  print(m.get(1.5).unwrapOr(0))\n", // 10
+        "  print(m.get(2.5).unwrapOr(0))\n", // 20
+        "  print(m.get(0.0).unwrapOr(0))\n", // 30 (byte-wise: +0.0 ≠ -0.0)
+        "  print(m.get(-0.0).unwrapOr(0))\n", // 40
+        "  print(m.get(9.5).unwrapOr(-1))\n", // -1 (miss)
+        "  print(m.contains(2.5))\n", // true
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_float_keys_wasm_gc",
+        b"4\n10\n20\n30\n40\n-1\ntrue\n",
+    );
+}
+
+/// `Map<Bool, V>` — exercises the `emit_key_eq` Bool arm (`i32.eq`). Two
+/// keys (`true` / `false`); pins lookup, `contains`, and `set`-overwrite
+/// on a boolean key.
+#[test]
+fn map_bool_keys_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<Bool, Int> = {true: 1, false: 2}\n",
+        "  print(m.length())\n",               // 2
+        "  print(m.get(true).unwrapOr(0))\n",  // 1
+        "  print(m.get(false).unwrapOr(0))\n", // 2
+        "  print(m.contains(true))\n",         // true
+        "  let m2 = m.set(true, 10)\n",
+        "  print(m2.get(true).unwrapOr(0))\n", // 10 (overwrite)
+        "  print(m2.length())\n",              // 2 (position kept)
+        "}\n",
+    );
+    assert_prints(source, "map_bool_keys_wasm_gc", b"2\n1\n2\ntrue\n10\n2\n");
+}
+
+/// `Map.remove` edge cases the `map_core` test (which only removes
+/// present keys) leaves unpinned on the compiled path: removing an
+/// **absent** key — the `emit_key_eq` is never true, so the copy loop
+/// keeps every entry and `nlen == len` — and removing every entry down
+/// to an **empty** map (`nlen == 0`, then `get` on the empty map misses
+/// → `None`).
+#[test]
+fn map_remove_edges_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<Int, Int> = {1: 10, 2: 20}\n",
+        "  let m2 = m.remove(99)\n",          // absent key → unchanged
+        "  print(m2.length())\n",             // 2
+        "  print(m2.get(1).unwrapOr(0))\n",   // 10
+        "  print(m2.get(2).unwrapOr(0))\n",   // 20
+        "  let m3 = m.remove(1).remove(2)\n", // remove down to empty
+        "  print(m3.length())\n",             // 0
+        "  print(m3.contains(1))\n",          // false
+        "  print(m3.get(2).unwrapOr(-1))\n",  // -1 (miss on empty map)
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_remove_edges_wasm_gc",
+        b"2\n10\n20\n0\nfalse\n-1\n",
+    );
+}
+
 /// Pins the module-size claim at the heart of §Phase 2.4 K.6's
 /// inline-synthesis decision: a module that never prints a Float —
 /// and never `toString`s one, the second trigger for the formatter

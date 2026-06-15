@@ -2,7 +2,7 @@
 
 use crate::builtins;
 use crate::error::{IrRuntimeError, Result, error};
-use crate::value::{EnumData, IrValue, StructData};
+use crate::value::{EnumData, IrValue, StructData, map_key_eq};
 use phoenix_ir::block::BlockId;
 use phoenix_ir::instruction::{FuncId, Op, ValueId};
 use phoenix_ir::module::{IrFunction, IrModule};
@@ -426,10 +426,23 @@ impl<'m> IrInterpreter<'m> {
                 Ok(IrValue::new_list(elems))
             }
             Op::MapAlloc(pairs) => {
-                let entries: Vec<(IrValue, IrValue)> = pairs
-                    .iter()
-                    .map(|(k, v)| Ok((frame.get(*k)?.clone(), frame.get(*v)?.clone())))
-                    .collect::<Result<_>>()?;
+                // Duplicate keys in a literal dedup last-wins, keeping
+                // the first insertion position — matching the runtime's
+                // `phx_map_from_pairs` (and so native / wasm32-linear /
+                // wasm32-gc). A map can't hold two entries with the same
+                // key; the prior keep-all behavior diverged from the
+                // compiled backends (resolved 2026-06-14 with the maps
+                // slice — see the wasm32-gc K.9 decision).
+                let mut entries: Vec<(IrValue, IrValue)> = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    let kv = frame.get(*k)?.clone();
+                    let vv = frame.get(*v)?.clone();
+                    if let Some(slot) = entries.iter_mut().find(|(ek, _)| map_key_eq(ek, &kv)) {
+                        slot.1 = vv;
+                    } else {
+                        entries.push((kv, vv));
+                    }
+                }
                 Ok(IrValue::new_map(entries))
             }
 

@@ -187,6 +187,24 @@ impl PartialEq for Value {
     }
 }
 
+/// Key equality for `Map` operations (`get` / `contains` / `set` /
+/// `remove` and literal dedup).
+///
+/// Map keys compare **byte-wise** for floats: `-0.0 != 0.0`, and two
+/// `NaN`s are equal iff their bits match. This matches native's
+/// `Map<Float,V>` key comparison and the wasm32-gc lowering
+/// (`i64.reinterpret_f64` + `i64.eq`) — see §Phase 2.4 K.9 — and is
+/// deliberately *not* [`Value`]'s IEEE `==` (which treats `±0.0` as
+/// equal and `NaN` as never-equal). Routing every map-key comparison
+/// through here keeps `Map` semantics byte-identical across all five
+/// backends. Non-float keys (Int / Bool / String) fall through to `==`.
+pub(crate) fn map_key_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
+    }
+}
+
 /// Provides ordering for [`Value`]s of the same numeric or string type.
 ///
 /// Only `Int`-`Int`, `Float`-`Float`, and `String`-`String` comparisons
@@ -205,6 +223,35 @@ impl PartialOrd for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `map_key_eq` is byte-wise for floats (K.9), unlike `Value`'s IEEE
+    /// `==`. This is the cross-backend contract: native and wasm32-gc
+    /// compare float keys by bits, so the interpreter must too. Pins the
+    /// two cases where IEEE and byte-wise disagree — `±0.0` and `NaN` —
+    /// plus a sanity check that ordinary scalar keys still match.
+    #[test]
+    fn map_key_eq_is_byte_wise_for_floats() {
+        // ±0.0: IEEE-equal but bit-distinct → NOT map-key-equal.
+        let neg_zero = -0.0_f64;
+        assert!(0.0_f64 == neg_zero, "precondition: IEEE treats ±0.0 equal");
+        assert!(!map_key_eq(&Value::Float(0.0), &Value::Float(-0.0)));
+        assert!(!map_key_eq(&Value::Float(-0.0), &Value::Float(0.0)));
+
+        // NaN: IEEE-unequal but same bits → map-key-equal.
+        let nan = f64::NAN;
+        assert!(nan != nan, "precondition: IEEE treats NaN as never-equal");
+        assert!(map_key_eq(&Value::Float(nan), &Value::Float(nan)));
+
+        // Ordinary floats and non-float keys fall through to `==`.
+        assert!(map_key_eq(&Value::Float(1.5), &Value::Float(1.5)));
+        assert!(!map_key_eq(&Value::Float(1.5), &Value::Float(2.5)));
+        assert!(map_key_eq(&Value::Int(7), &Value::Int(7)));
+        assert!(map_key_eq(
+            &Value::String("a".into()),
+            &Value::String("a".into())
+        ));
+        assert!(!map_key_eq(&Value::Int(7), &Value::Float(7.0)));
+    }
 
     /// Pin the documented invariant on [`Value::type_key`] /
     /// [`Value::type_name`]: `bare_name(type_key()) == type_name()`.

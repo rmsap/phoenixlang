@@ -116,7 +116,7 @@ pub(super) fn declare(
             element_type: wasm_encoder::StorageType::Val(arr_ref),
             mutable: false,
         };
-        let list_idx = builder.declare_list_struct(&[i64_field, data_field]);
+        let list_idx = builder.declare_struct(&[i64_field, data_field]);
         builder.record_list(elem.clone(), arr_idx, list_idx);
 
         if builder_elems.contains(elem) {
@@ -134,8 +134,7 @@ pub(super) fn declare(
                 element_type: wasm_encoder::StorageType::Val(arr_ref),
                 mutable: true,
             };
-            let builder_idx =
-                builder.declare_list_struct(&[len_field, frozen_field, data_mut_field]);
+            let builder_idx = builder.declare_struct(&[len_field, frozen_field, data_mut_field]);
             builder.record_list_builder(elem.clone(), builder_idx);
         }
     }
@@ -203,6 +202,16 @@ fn walk_type(ty: &IrType, lists: &mut HashSet<IrType>, builders: &mut HashSet<Ir
             }
         }
         IrType::MapRef(k, v) | IrType::MapBuilderRef(k, v) => {
+            // A `Map<K,V>` reuses the `List<K>` / `List<V>` array + struct
+            // types for its `$keys` / `$vals` and for `keys()` / `values()`
+            // (§K.9), so K and V must be declared as list element types
+            // even when no `List<K>` / `List<V>` appears directly.
+            if !contains_generic_placeholder(k) {
+                lists.insert((**k).clone());
+            }
+            if !contains_generic_placeholder(v) {
+                lists.insert((**v).clone());
+            }
             walk_type(k, lists, builders);
             walk_type(v, lists, builders);
         }

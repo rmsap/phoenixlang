@@ -2,7 +2,7 @@
 
 use crate::error::{IrRuntimeError, Result, error};
 use crate::interpreter::IrInterpreter;
-use crate::value::{IrValue, none_val, some_val};
+use crate::value::{IrValue, map_key_eq, none_val, some_val};
 
 use super::{expect_bool, expect_int_arg, expect_one_arg, expect_string_arg};
 
@@ -246,7 +246,7 @@ pub(super) fn builtin_map(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
                 message: "get() requires 1 argument".to_string(),
             })?;
             for (k, v) in &entries {
-                if k == key {
+                if map_key_eq(k, key) {
                     return Ok(some_val(v.clone()));
                 }
             }
@@ -256,7 +256,7 @@ pub(super) fn builtin_map(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
             let key = method_args.first().ok_or_else(|| IrRuntimeError {
                 message: "contains() requires 1 argument".to_string(),
             })?;
-            let found = entries.iter().any(|(k, _)| k == key);
+            let found = entries.iter().any(|(k, _)| map_key_eq(k, key));
             Ok(IrValue::Bool(found))
         }
         "set" => {
@@ -267,7 +267,7 @@ pub(super) fn builtin_map(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
                 message: "set() requires 2 arguments".to_string(),
             })?;
             let mut new_entries = entries;
-            if let Some(entry) = new_entries.iter_mut().find(|(k, _)| k == &key) {
+            if let Some(entry) = new_entries.iter_mut().find(|(k, _)| map_key_eq(k, &key)) {
                 entry.1 = val;
             } else {
                 new_entries.push((key, val));
@@ -278,8 +278,11 @@ pub(super) fn builtin_map(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
             let key = method_args.first().ok_or_else(|| IrRuntimeError {
                 message: "remove() requires 1 argument".to_string(),
             })?;
-            let new_entries: Vec<(IrValue, IrValue)> =
-                entries.iter().filter(|(k, _)| k != key).cloned().collect();
+            let new_entries: Vec<(IrValue, IrValue)> = entries
+                .iter()
+                .filter(|(k, _)| !map_key_eq(k, key))
+                .cloned()
+                .collect();
             Ok(IrValue::new_map(new_entries))
         }
         "keys" => {

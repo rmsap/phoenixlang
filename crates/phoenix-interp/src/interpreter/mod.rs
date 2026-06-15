@@ -3,7 +3,7 @@ mod multi_module;
 pub use multi_module::run_modules;
 
 use crate::env::Environment;
-use crate::value::Value;
+use crate::value::{Value, map_key_eq};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     BinaryExpr, BinaryOp, Block, CallExpr, CaptureInfo, Declaration, ElseBranch, Expr, ForSource,
@@ -1120,11 +1120,21 @@ impl Interpreter {
             }
 
             Expr::MapLiteral(map) => {
-                let entries: Vec<(Value, Value)> = map
-                    .entries
-                    .iter()
-                    .map(|(k, v)| Ok((self.eval_expr(k)?, self.eval_expr(v)?)))
-                    .collect::<Result<_>>()?;
+                // Duplicate keys dedup last-wins, first position kept —
+                // matching the runtime's `phx_map_from_pairs` (native /
+                // wasm32-linear / wasm32-gc). A map can't hold two
+                // same-key entries; the prior keep-all behavior diverged
+                // from the compiled backends.
+                let mut entries: Vec<(Value, Value)> = Vec::with_capacity(map.entries.len());
+                for (k, v) in &map.entries {
+                    let kv = self.eval_expr(k)?;
+                    let vv = self.eval_expr(v)?;
+                    if let Some(slot) = entries.iter_mut().find(|(ek, _)| map_key_eq(ek, &kv)) {
+                        slot.1 = vv;
+                    } else {
+                        entries.push((kv, vv));
+                    }
+                }
                 Ok(Value::Map(entries))
             }
 

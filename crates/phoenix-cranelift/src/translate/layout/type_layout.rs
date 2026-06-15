@@ -192,9 +192,27 @@ impl TypeLayout {
             self.cl_types.len()
         );
         for (i, &val) in vals.iter().enumerate() {
+            // Any sub-slot-width int (today `Bool`, an `i8`; an enum tag
+            // or other narrow int would route here too) must zero-fill
+            // the rest of its 8-byte slot. List/map runtimes hash and
+            // byte-compare the *whole* element / `key_size` stride, so
+            // leaving the upper 7 bytes uninitialized makes two equal
+            // `Bool` keys hash differently (their stack-slot garbage
+            // differs) — every `Map<Bool,_>` lookup and
+            // `List<Bool>.contains` then misses. Widen to i64 so the slot
+            // is fully deterministic (low byte = 0/1, rest 0). The narrow
+            // `load` reads the low byte back unchanged (LE), so widening
+            // is transparent to every other reader regardless of int
+            // width — only the byte-hashing runtime depends on it.
+            let val_ty = builder.func.dfg.value_type(val);
+            let to_store = if val_ty.is_int() && val_ty.bytes() < SLOT_SIZE as u32 {
+                builder.ins().uextend(cl::I64, val)
+            } else {
+                val
+            };
             builder.ins().store(
                 MemFlags::new(),
-                val,
+                to_store,
                 base_ptr,
                 ((slot_offset + i) * SLOT_SIZE) as i32,
             );
@@ -375,6 +393,41 @@ mod tests {
             builder.finalize();
         }
         assert_eq!(count_opcode(&func, "store"), 1);
+        // A full-width `i64` store needs no widening — the value already
+        // fills its slot. (Contrast `store_zero_extends_sub_slot_bool`.)
+        assert_eq!(count_opcode(&func, "uextend"), 0);
+    }
+
+    /// `Bool` is an `i8` occupying a full 8-byte slot. `store` must
+    /// zero-extend it to `i64` so the upper 7 bytes are deterministic —
+    /// otherwise the type-erased list/map runtime hashes residual
+    /// stack-slot garbage and two equal `Bool` keys miss (the native
+    /// `Map<Bool,_>` / `List<Bool>.contains` bug the maps slice surfaced).
+    /// Pins the widening structurally, independent of the end-to-end
+    /// `map_bool_keys.phx` matrix fixture.
+    #[test]
+    fn store_zero_extends_sub_slot_bool() {
+        let (mut func, mut fb_ctx) = test_builder_ctx();
+        {
+            let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+            let block = builder.create_block();
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let base = builder.ins().iconst(cl::I64, 0);
+            // A genuine `i8` value, matching `Bool`'s cl_type.
+            let v = builder.ins().iconst(cl::I8, 1);
+            TypeLayout::of(&IrType::Bool).store(&mut builder, base, 0, &[v]);
+            builder.ins().return_(&[]);
+            builder.finalize();
+        }
+        // One store, preceded by a `uextend` to the full slot width.
+        assert_eq!(count_opcode(&func, "store"), 1);
+        assert_eq!(
+            count_opcode(&func, "uextend.i64"),
+            1,
+            "Bool store must zero-extend i8 -> i64; got:\n{}",
+            func.display()
+        );
     }
 
     #[test]

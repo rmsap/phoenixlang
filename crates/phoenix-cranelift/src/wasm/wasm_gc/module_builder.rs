@@ -401,6 +401,27 @@ pub(super) struct ModuleBuilder {
     /// purpose for `ListBuilder.push` (Void result).
     phx_builder_elem_by_struct: HashMap<u32, IrType>,
 
+    /// Concrete map `(K, V)` → `$map_KV` struct index per §Phase 2.4
+    /// decision K.9. The `$keys` / `$vals` array types are the K.7
+    /// list arrays for `K` / `V` (looked up via [`Self::require_list_types`]),
+    /// so only the wrapper struct index is stored here. Populated by
+    /// [`Self::declare_phoenix_maps`].
+    phx_maps: HashMap<(IrType, IrType), u32>,
+
+    /// Reverse index `$map_KV` struct idx → `(K, V)`, for lowerings
+    /// that key off the receiver's WASM binding type (e.g. `Map.get`,
+    /// whose result is `Option<V>`). Lockstep with [`Self::phx_maps`].
+    ///
+    /// The index is unambiguous because today's key types
+    /// (Int/Bool/Float/String) each map to a distinct `$arr_K`, so no two
+    /// distinct `(K, V)` produce a structurally identical `$map_KV` that
+    /// the [`TypeInterner`] would collapse onto one index. **Revisit when
+    /// ref-typed keys land** (§K.9 deferred): two structurally identical
+    /// struct/enum key types would share an `$arr_K`, hence one map idx,
+    /// making this reverse lookup last-writer-wins. Harmless only while
+    /// such collisions can't occur.
+    phx_map_kv_by_struct: HashMap<u32, (IrType, IrType)>,
+
     /// Closure signature `(params, return)` → `($fn_SIG type idx,
     /// $clo_SIG parent struct idx)` per §Phase 2.4 decision K.8.
     /// Populated by [`Self::declare_phoenix_closures`].
@@ -482,6 +503,8 @@ impl ModuleBuilder {
             phx_closure_sites: HashMap::new(),
             elements: wasm_encoder::ElementSection::new(),
             phx_lists: HashMap::new(),
+            phx_maps: HashMap::new(),
+            phx_map_kv_by_struct: HashMap::new(),
             phx_list_builders: HashMap::new(),
             phx_list_elem_by_struct: HashMap::new(),
             phx_builder_elem_by_struct: HashMap::new(),
@@ -1125,10 +1148,12 @@ impl ModuleBuilder {
         self.types.declare_array(elem)
     }
 
-    /// Declare a list / builder struct type and return its
-    /// type-section index. Narrow [`TypeInterner`] wrapper for
-    /// [`super::lists::declare`].
-    pub(super) fn declare_list_struct(&mut self, fields: &[wasm_encoder::FieldType]) -> u32 {
+    /// Declare an immutable struct type and return its type-section
+    /// index. Narrow [`TypeInterner`] wrapper shared by the list /
+    /// builder structs ([`super::lists::declare`]) and the K.9 `$map_KV`
+    /// wrapper ([`super::maps::declare`]) — all plain field structs with
+    /// no subtyping.
+    pub(super) fn declare_struct(&mut self, fields: &[wasm_encoder::FieldType]) -> u32 {
         self.types.declare_struct(fields)
     }
 
@@ -1218,6 +1243,50 @@ impl ModuleBuilder {
     /// struct index (`ListBuilder.push` → Void).
     pub(super) fn builder_elem_by_struct_idx(&self, builder_idx: u32) -> Option<&IrType> {
         self.phx_builder_elem_by_struct.get(&builder_idx)
+    }
+
+    /// Declare WASM-GC types for every `Map<K,V>` instantiation per
+    /// §Phase 2.4 decision K.9. Thin wrapper over [`maps::declare`] —
+    /// mirrors [`Self::declare_phoenix_lists`]. Runs *after* lists (the
+    /// `$map_KV` struct reuses the K.7 `List<K>` / `List<V>` array
+    /// types) and *before* any function signature touching
+    /// `IrType::MapRef` is interned.
+    pub(super) fn declare_phoenix_maps(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        super::maps::declare(self, ir_module)
+    }
+
+    /// Record one declared map instantiation: `(K, V)` → `$map_KV`
+    /// struct index, plus the reverse index.
+    pub(super) fn record_map(&mut self, key: IrType, val: IrType, map_idx: u32) {
+        self.phx_map_kv_by_struct
+            .insert(map_idx, (key.clone(), val.clone()));
+        self.phx_maps.insert((key, val), map_idx);
+    }
+
+    /// `$map_KV` struct index for the map instantiation `(K, V)`. Used
+    /// by `Op::MapAlloc` and the `Map.*` builtin lowerings.
+    pub(super) fn require_map_idx(&self, key: &IrType, val: &IrType) -> Result<u32, CompileError> {
+        self.phx_maps
+            .get(&(key.clone(), val.clone()))
+            .copied()
+            .ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: map instantiation `Map<{key:?}, {val:?}>` was \
+                     not declared by `declare_phoenix_maps` — the collection \
+                     pass missed it (internal compiler bug; K.9)"
+                ))
+            })
+    }
+
+    /// Reverse-lookup a map's `(K, V)` from its `$map_KV` struct index
+    /// (recovered from a receiver's WASM binding type). Used by
+    /// lowerings whose IR result type doesn't carry both type args
+    /// (`Map.contains` → Bool, `Map.length` → Int, `Map.get` → Option<V>).
+    pub(super) fn map_kv_by_struct_idx(&self, map_idx: u32) -> Option<&(IrType, IrType)> {
+        self.phx_map_kv_by_struct.get(&map_idx)
     }
 
     /// Declare the WASI imports the synthesized helpers and `_start`
@@ -2132,6 +2201,34 @@ pub(super) fn scan_helper_needs(ir_module: &IrModule) -> HelperNeeds {
                         if let Some(recv_vid) = args.first()
                             && let Some(IrType::ListRef(elem)) = vid_types.get(recv_vid)
                             && **elem == IrType::StringRef
+                        {
+                            needs.string_types = true;
+                            needs.str_eq = true;
+                        }
+                    }
+                    // `Map.get` / `contains` / `set` / `remove` on a
+                    // `Map<String, V>` compares keys by bytes via
+                    // `phx_str_eq` (K.9 key-equality dispatch).
+                    Op::BuiltinCall(name, args)
+                        if matches!(
+                            name.as_str(),
+                            "Map.get" | "Map.contains" | "Map.set" | "Map.remove"
+                        ) =>
+                    {
+                        let vid_types = vid_types.get_or_insert_with(|| build_vid_type_map(func));
+                        if let Some(recv_vid) = args.first()
+                            && let Some(IrType::MapRef(k, _)) = vid_types.get(recv_vid)
+                            && **k == IrType::StringRef
+                        {
+                            needs.string_types = true;
+                            needs.str_eq = true;
+                        }
+                    }
+                    // A `Map<String, V>` *literal* dedups by key
+                    // equality during build, so it too needs `phx_str_eq`.
+                    Op::MapAlloc(_) => {
+                        if let IrType::MapRef(k, _) = &instr.result_type
+                            && **k == IrType::StringRef
                         {
                             needs.string_types = true;
                             needs.str_eq = true;

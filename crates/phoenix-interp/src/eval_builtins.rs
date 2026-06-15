@@ -1,7 +1,7 @@
 use crate::interpreter::{
     Interpreter, Result, RuntimeError, err_val, error, none_val, ok_val, some_val,
 };
-use crate::value::Value;
+use crate::value::{Value, map_key_eq};
 use phoenix_parser::ast::MethodCallExpr;
 
 impl Interpreter {
@@ -103,7 +103,7 @@ impl Interpreter {
             "get" => {
                 let args = self.expect_args("get", mc, 1)?;
                 for (k, v) in &entries {
-                    if k == &args[0] {
+                    if map_key_eq(k, &args[0]) {
                         return Ok(some_val(v.clone()));
                     }
                 }
@@ -111,7 +111,7 @@ impl Interpreter {
             }
             "contains" => {
                 let args = self.expect_args("contains", mc, 1)?;
-                let found = entries.iter().any(|(k, _)| k == &args[0]);
+                let found = entries.iter().any(|(k, _)| map_key_eq(k, &args[0]));
                 Ok(Value::Bool(found))
             }
             "set" => {
@@ -120,7 +120,7 @@ impl Interpreter {
                 let key = args.next().expect("expect_args validated 2 args");
                 let val = args.next().expect("expect_args validated 2 args");
                 let mut new_entries = entries;
-                if let Some(entry) = new_entries.iter_mut().find(|(k, _)| k == &key) {
+                if let Some(entry) = new_entries.iter_mut().find(|(k, _)| map_key_eq(k, &key)) {
                     entry.1 = val;
                 } else {
                     new_entries.push((key, val));
@@ -131,7 +131,7 @@ impl Interpreter {
                 let args = self.expect_args("remove", mc, 1)?;
                 let new_entries: Vec<(Value, Value)> = entries
                     .iter()
-                    .filter(|(k, _)| k != &args[0])
+                    .filter(|(k, _)| !map_key_eq(k, &args[0]))
                     .cloned()
                     .collect();
                 Ok(Value::Map(new_entries))

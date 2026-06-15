@@ -1,0 +1,15 @@
+// Duplicate keys in a map literal dedup last-wins, keeping the first
+// insertion position — matching the runtime's `phx_map_from_pairs`
+// across native / wasm32-linear / wasm32-gc and (since 2026-06-14)
+// both interpreters. Regression for the cross-backend divergence the
+// maps slice (wasm32-gc K.9) surfaced: interpreters previously kept
+// all entries. Output is scalar/ordered so it pins the dedup + the
+// first-position iteration order without depending on hashing.
+function main() {
+  let m: Map<String, Int> = {"a": 1, "b": 2, "a": 3, "c": 4, "b": 5}
+  print(m.length())              // 3 (a, b, c)
+  print(m.get("a").unwrapOr(0))  // 3 (last-wins)
+  print(m.get("b").unwrapOr(0))  // 5
+  print(m.get("c").unwrapOr(0))  // 4
+  for k in m.keys() { print(k) }  // a b c (first-position order)
+}

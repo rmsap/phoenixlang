@@ -55,6 +55,7 @@ use wasm_encoder::{BlockType, Function, HeapType, Instruction, RefType, ValType}
 
 use super::closures;
 use super::lists;
+use super::maps;
 use super::module_builder::{self, ModuleBuilder};
 use super::option_result;
 use crate::error::CompileError;
@@ -155,6 +156,14 @@ pub(super) fn wasm_valtypes_for(
             Ok(vec![ValType::Ref(RefType {
                 nullable: true,
                 heap_type: HeapType::Concrete(builder_idx),
+            })])
+        }
+        IrType::MapRef(k, v) => {
+            // Nullable ref to the K.9 `$map_KV` wrapper struct.
+            let map_idx = b.require_map_idx(k, v)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(map_idx),
             })])
         }
         IrType::ClosureRef {
@@ -853,6 +862,7 @@ fn translate_instruction(
             translate_struct_set(ctx, b, *obj, *field_idx, *val)
         }
         Op::ListAlloc(elems) => lists::translate_list_alloc(ctx, b, elems, instr),
+        Op::MapAlloc(pairs) => maps::translate_map_alloc(ctx, b, pairs, instr),
         // Closure ops — §Phase 2.4 decision K.8: per-signature subtype
         // hierarchy over typed function references (`call_ref`).
         Op::ClosureAlloc(target, captures) => {
@@ -1359,6 +1369,14 @@ fn translate_builtin_call(
         "List.reduce" => lists::translate_list_reduce(ctx, b, args, instr),
         "List.flatMap" => lists::translate_list_flat_map(ctx, b, args, instr),
         "List.sortBy" => lists::translate_list_sort_by(ctx, b, args, instr),
+        // Map methods (§K.9): ordered association over parallel arrays.
+        "Map.length" => maps::translate_map_length(ctx, b, args, instr),
+        "Map.get" => maps::translate_map_get(ctx, b, args, instr),
+        "Map.contains" => maps::translate_map_contains(ctx, b, args, instr),
+        "Map.set" => maps::translate_map_set(ctx, b, args, instr),
+        "Map.remove" => maps::translate_map_remove(ctx, b, args, instr),
+        "Map.keys" => maps::translate_map_keys_or_values(ctx, b, args, instr, true),
+        "Map.values" => maps::translate_map_keys_or_values(ctx, b, args, instr, false),
         "ListBuilder.alloc" => lists::translate_list_builder_alloc(ctx, b, instr),
         "ListBuilder.push" => lists::translate_list_builder_push(ctx, b, args),
         "ListBuilder.freeze" => lists::translate_list_builder_freeze(ctx, b, args, instr),

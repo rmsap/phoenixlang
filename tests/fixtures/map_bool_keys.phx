@@ -1,0 +1,29 @@
+// `Map<Bool, V>` across all five backends: literal, get (hit + miss is
+// n/a with both keys present), contains, set-overwrite, and remove on
+// boolean keys. Regression pin for a native/codegen bug the maps slice
+// surfaced: `Bool` occupies a full 8-byte key slot but was stored with a
+// 1-byte `i8` write, leaving the upper 7 bytes uninitialized; the map
+// runtime hashes the whole `key_size`, so two equal `Bool` keys hashed
+// differently (their stack-slot garbage differed) and every lookup
+// missed. `TypeLayout::store` now zero-extends sub-slot scalars, so all
+// five backends agree. (The same fix repairs `List<Bool>.contains`.)
+function main() {
+  let m: Map<Bool, Int> = {true: 1, false: 2}
+  print(m.length())               // 2
+  print(m.get(true).unwrapOr(0))  // 1
+  print(m.get(false).unwrapOr(0)) // 2
+  print(m.contains(true))         // true
+  print(m.contains(false))        // true
+  let m2 = m.set(true, 10)
+  print(m2.get(true).unwrapOr(0)) // 10 (overwrite)
+  print(m2.length())              // 2 (position kept)
+  let m3 = m.remove(false)
+  print(m3.length())              // 1
+  print(m3.contains(false))       // false
+  print(m3.get(true).unwrapOr(0)) // 1
+
+  // The companion `List<Bool>.contains` path the same fix repairs.
+  let flags: List<Bool> = [true, false, true]
+  print(flags.contains(true))     // true
+  print(flags.contains(false))    // true
+}

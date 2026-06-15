@@ -1,0 +1,25 @@
+// `Map<Float, V>` exercised across all five backends: literal, get
+// (hit + miss), contains, and set-overwrite on Float keys. Native and
+// wasm32-gc compare float keys **byte-wise** (not IEEE); the two
+// interpreters now do too (via `map_key_eq`, §K.9), so all five agree.
+//
+// The byte-wise *subtlety* (`-0.0` and `0.0` distinct, `NaN`-key) is
+// pinned elsewhere, because it can't run on every column: `-0.0` lowers
+// to `FNeg`, which wasm32-linear doesn't lower yet, and there's no `NaN`
+// literal. Those cases live in the wasm32-gc `map_float_keys_*` compile
+// test and the `map_key_eq_is_byte_wise_for_floats` unit tests. This
+// fixture pins that ordinary Float-keyed maps agree across the matrix.
+// Values are Ints, so float formatting never enters stdout.
+function main() {
+  let m: Map<Float, Int> = {1.5: 10, 2.5: 20, 0.0: 30}
+  print(m.length())              // 3
+  print(m.get(1.5).unwrapOr(0))  // 10
+  print(m.get(2.5).unwrapOr(0))  // 20
+  print(m.get(0.0).unwrapOr(0))  // 30
+  print(m.get(9.5).unwrapOr(-1)) // -1 (miss)
+  print(m.contains(2.5))         // true
+  print(m.contains(9.5))         // false
+  let m2 = m.set(2.5, 99)
+  print(m2.get(2.5).unwrapOr(0)) // 99 (overwrite, position kept)
+  print(m2.length())             // 3
+}

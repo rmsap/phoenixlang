@@ -123,7 +123,7 @@ backend_matrix_test!(matrix_traits_dyn_ret, "traits_dyn_ret.phx", skip_wasm_gc: 
 // which the other dyn fixtures (locals / params / fields / elements)
 // never exercise.
 backend_matrix_test!(matrix_traits_dyn_factory, "traits_dyn_factory.phx", skip_wasm_gc: "`dyn Trait` is not lowered on wasm32-gc yet");
-backend_matrix_test!(matrix_collections, "collections.phx", skip_wasm_gc: "maps (`Op::MapAlloc`) are not lowered on wasm32-gc yet (the List closure methods it uses now lower; maps are the last blocker)");
+backend_matrix_test!(matrix_collections, "collections.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 // The four stdlib-enum discriminant predicates (`Result.isOk`/`isErr`,
@@ -158,7 +158,10 @@ backend_matrix_test!(matrix_closures_over_generic, "closures_over_generic.phx");
 backend_matrix_test!(matrix_alloc_loop, "alloc_loop.phx");
 backend_matrix_test!(matrix_defer_basic, "defer_basic.phx");
 backend_matrix_test!(matrix_defer_explicit_return, "defer_explicit_return.phx");
-backend_matrix_test!(matrix_map_hash_many_keys, "map_hash_many_keys.phx", skip_wasm_gc: "maps (`Op::MapAlloc`) are not lowered on wasm32-gc yet");
+backend_matrix_test!(matrix_map_hash_many_keys, "map_hash_many_keys.phx");
+backend_matrix_test!(matrix_map_duplicate_keys, "map_duplicate_keys.phx");
+backend_matrix_test!(matrix_map_float_keys, "map_float_keys.phx");
+backend_matrix_test!(matrix_map_bool_keys, "map_bool_keys.phx");
 backend_matrix_test!(matrix_list_sortby_merge, "list_sortby_merge.phx");
 backend_matrix_test!(
     matrix_list_sortby_alloc_comparator,

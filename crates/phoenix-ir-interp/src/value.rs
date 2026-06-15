@@ -211,6 +211,25 @@ impl PartialEq for IrValue {
     }
 }
 
+/// Key equality for `Map` operations (`get` / `contains` / `set` /
+/// `remove` and literal dedup).
+///
+/// Map keys compare **byte-wise** for floats: `-0.0 != 0.0`, and two
+/// `NaN`s are equal iff their bits match. This matches native's
+/// `Map<Float,V>` key comparison and the wasm32-gc lowering
+/// (`i64.reinterpret_f64` + `i64.eq`) — see §Phase 2.4 K.9 — and is
+/// deliberately *not* [`IrValue`]'s IEEE `==` (which treats `±0.0` as
+/// equal and `NaN` as never-equal; that IEEE rule is correct for
+/// `List.contains` but wrong for map keys). Routing every map-key
+/// comparison through here keeps `Map` semantics byte-identical across
+/// all five backends. Non-float keys fall through to `==`.
+pub(crate) fn map_key_eq(a: &IrValue, b: &IrValue) -> bool {
+    match (a, b) {
+        (IrValue::Float(x), IrValue::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
+    }
+}
+
 impl PartialOrd for IrValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -303,4 +322,37 @@ pub fn err_val(val: IrValue) -> IrValue {
         discriminant: 1,
         fields: vec![val],
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `map_key_eq` is byte-wise for floats (K.9), unlike `IrValue`'s
+    /// IEEE `==`. Native and wasm32-gc compare float keys by bits, so the
+    /// IR interpreter must too. Pins the two cases where IEEE and
+    /// byte-wise disagree — `±0.0` and `NaN` — plus a scalar sanity check.
+    #[test]
+    fn map_key_eq_is_byte_wise_for_floats() {
+        // ±0.0: IEEE-equal but bit-distinct → NOT map-key-equal.
+        let neg_zero = -0.0_f64;
+        assert!(0.0_f64 == neg_zero, "precondition: IEEE treats ±0.0 equal");
+        assert!(!map_key_eq(&IrValue::Float(0.0), &IrValue::Float(-0.0)));
+        assert!(!map_key_eq(&IrValue::Float(-0.0), &IrValue::Float(0.0)));
+
+        // NaN: IEEE-unequal but same bits → map-key-equal.
+        let nan = f64::NAN;
+        assert!(nan != nan, "precondition: IEEE treats NaN as never-equal");
+        assert!(map_key_eq(&IrValue::Float(nan), &IrValue::Float(nan)));
+
+        // Ordinary floats and non-float keys fall through to `==`.
+        assert!(map_key_eq(&IrValue::Float(1.5), &IrValue::Float(1.5)));
+        assert!(!map_key_eq(&IrValue::Float(1.5), &IrValue::Float(2.5)));
+        assert!(map_key_eq(&IrValue::Int(7), &IrValue::Int(7)));
+        assert!(map_key_eq(
+            &IrValue::String("a".into()),
+            &IrValue::String("a".into())
+        ));
+        assert!(!map_key_eq(&IrValue::Int(7), &IrValue::Float(7.0)));
+    }
 }

@@ -66,6 +66,7 @@ mod closures;
 mod enums;
 mod float_helpers;
 mod lists;
+mod maps;
 mod module_builder;
 mod option_result;
 mod ryu_tables;
@@ -139,6 +140,11 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // reverse — `List<Closure>` elements — is deferred until a fixture
     // needs it; see §Phase 2.4 K.8.)
     builder.declare_phoenix_closures(ir_module)?;
+    // Maps after lists (a `$map_KV` reuses the K.7 `List<K>`/`List<V>`
+    // array+struct types for its `$keys`/`$vals` and for
+    // `keys()`/`values()`) and after closures, before signatures
+    // touching `MapRef` are interned. See §Phase 2.4 decision K.9.
+    builder.declare_phoenix_maps(ir_module)?;
     builder.declare_memory();
     if needs_print {
         builder.declare_imports();
