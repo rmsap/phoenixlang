@@ -37,7 +37,10 @@
 use std::path::Path;
 
 mod common;
-use common::{e2e_required, gate, missing_tools, parse_and_check, run, tool_available};
+use common::{
+    chi_module_at_version, chi_scaffold_dir, e2e_required, gate, go_module_cached, missing_tools,
+    parse_and_check, run, tool_available,
+};
 
 /// The representative schema exercised end-to-end. Mirrors
 /// `tests/fixtures/gen_api.phx` (structs with constraints, an enum, optional
@@ -401,6 +404,66 @@ linters:
 
 // ── Go target ───────────────────────────────────────────────────────────
 
+/// Generates the Go files for the chi server framework. Only `server.go` differs
+/// from the net/http output (chi router/registration/`URLParam`); the other three
+/// files are framework-independent.
+fn generate_go_chi_files(schema: &str) -> phoenix_codegen::GoFiles {
+    let (program, result) = parse_and_check(schema);
+    phoenix_codegen::generate_go_with(&program, &result, phoenix_codegen::GoServerFramework::Chi)
+}
+
+/// Writes the generated `api/*.go` into the committed `go-chi` scaffold, then runs
+/// `go build`, `gofmt -l`, and `golangci-lint` against them.
+///
+/// Unlike [`check_go_output`] (which scaffolds a stdlib-only module in a fresh
+/// tempdir), the chi server imports an external module, so this reuses the
+/// committed `tests/scaffold/go-chi/` project whose `go.mod`/`go.sum` pin chi —
+/// `go build` resolves it from the module cache (or the proxy under E2E). Like
+/// the TS/Python scaffolds, it mutates the gitignored `api/` dir in place, so all
+/// calls MUST stay funneled through the single `go_output_compiles_and_lints`
+/// test to avoid a `generated`-dir race under cargo's parallel `#[test]` running.
+fn check_go_chi_output(scaffold: &Path, files: &phoenix_codegen::GoFiles) {
+    let api_dir = scaffold.join("api");
+    let _ = std::fs::remove_dir_all(&api_dir);
+    std::fs::create_dir_all(&api_dir).expect("create api dir");
+    std::fs::write(scaffold.join(".golangci.yml"), GOLANGCI_CONFIG).expect("write .golangci.yml");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    // 1. `go build ./...` must succeed (resolving chi from the module cache).
+    let (built, build_out) = run(scaffold, "go", &["build", "./..."]);
+    assert!(built, "go (chi) build failed:\n{build_out}");
+
+    // 2. `gofmt -l` over the generated files must report NOTHING.
+    let go_files = [
+        api_dir.join("types.go"),
+        api_dir.join("client.go"),
+        api_dir.join("handlers.go"),
+        api_dir.join("server.go"),
+    ];
+    let mut gofmt_args = vec!["-l".to_string()];
+    gofmt_args.extend(go_files.iter().map(|p| p.to_string_lossy().into_owned()));
+    let gofmt_arg_refs: Vec<&str> = gofmt_args.iter().map(String::as_str).collect();
+    let (_, gofmt_out) = run(scaffold, "gofmt", &gofmt_arg_refs);
+    assert!(
+        gofmt_out.trim().is_empty(),
+        "gofmt -l reported files needing formatting:\n{gofmt_out}"
+    );
+
+    // 3. `golangci-lint run ./api/...` (only the generated package — not the
+    //    chi-anchoring root file) must exit 0.
+    if tool_available("golangci-lint") {
+        let (linted, lint_out) = run(scaffold, "golangci-lint", &["run", "./api/..."]);
+        assert!(linted, "golangci-lint (chi) failed:\n{lint_out}");
+    } else if e2e_required() {
+        panic!("PHOENIX_GEN_E2E=1 but golangci-lint not found on PATH");
+    } else {
+        eprintln!("SKIP golangci-lint step (not installed)");
+    }
+}
+
 #[test]
 fn go_output_compiles_and_lints() {
     if gate(&missing_tools(&["go", "gofmt"])) {
@@ -428,6 +491,32 @@ fn go_output_compiles_and_lints() {
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("fixture library: {name}");
         check_go_output(&generate_go_files(schema));
+    }
+
+    // chi server.go variant. Only `server.go` differs from net/http, so we re-lint
+    // the same rich schemas (full surface, all-optional headers) plus the fixture
+    // library — covering every chi route shape through go build + gofmt +
+    // golangci-lint. Uses the committed `go-chi` scaffold, whose `go.mod`/`go.sum`
+    // pin chi; `go build` resolves it from the module cache (or the proxy under
+    // E2E). Skip with a log if chi isn't cached and the network isn't permitted.
+    let go_chi_scaffold = chi_scaffold_dir();
+    // Pinned chi version comes from the scaffold's own `go.mod` (the single source
+    // of truth, shared with the round-trip suite) rather than a constant here that
+    // could drift from the scaffold after a `go get …@<version>` bump.
+    let chi_at_version = chi_module_at_version(&go_chi_scaffold);
+    if !e2e_required() && !go_module_cached(&chi_at_version) {
+        eprintln!(
+            "SKIP go chi checks (set PHOENIX_GEN_E2E=1 to enforce): \
+             {chi_at_version} not in the Go module cache"
+        );
+        return;
+    }
+    eprintln!("chi: gen_api full surface");
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(HEADER_SCHEMA));
+    for (name, schema) in FILE_FIXTURES.iter().copied() {
+        eprintln!("chi fixture library: {name}");
+        check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
     }
 }
 

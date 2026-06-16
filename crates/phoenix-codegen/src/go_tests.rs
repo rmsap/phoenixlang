@@ -65,6 +65,121 @@ fn generate_from_source(source: &str) -> GoFiles {
     generate_go(&program, &result)
 }
 
+/// Like [`generate_from_source`] but emits `server.go` for the given framework.
+fn generate_from_source_with(source: &str, framework: GoServerFramework) -> GoFiles {
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "check errors: {:?}",
+        result.diagnostics
+    );
+    generate_go_with(&program, &result, framework)
+}
+
+/// The chi server exercises the full surface in one snapshot: path params, a
+/// validated body, query params, request headers, a response-header envelope, a
+/// multi-status endpoint, a binary download, a multipart upload, and an
+/// error→status map. `types.go`/`client.go`/`handlers.go` are
+/// framework-independent (covered by the net/http tests), so only `server.go` is
+/// snapshotted. chi handlers are ordinary `http.HandlerFunc`s, so the route
+/// bodies match net/http — only the router wiring, registration, and path-param
+/// accessor differ.
+#[test]
+fn chi_server_full_surface() {
+    let files = generate_from_source_with(
+        r#"
+struct User { id: Int  name: String where self.length > 0 }
+enum Status { Active  Archived }
+struct Upload { avatar: File  caption: String }
+struct Doc { data: File }
+
+endpoint getUser: GET "/users/{id}" {
+    response User
+    error { NotFound(404) }
+}
+endpoint createUser: POST "/users" {
+    body User
+    response User
+    error { Conflict(409) }
+}
+endpoint listUsers: GET "/users" {
+    query { page: Int = 1  q: Option<String>  active: Bool = true }
+    response List<User>
+}
+endpoint patchUser: PATCH "/users/{id}" {
+    headers { authorization: String  trace: Option<String> as "X-Trace" }
+    response User headers { remaining: Int as "X-Rate-Remaining" }
+}
+endpoint upsertUser: PUT "/users/{id}" {
+    body User
+    response { 200: User  201: User  204 }
+}
+endpoint uploadAvatar: POST "/users/{id}/avatar" {
+    body Upload
+    response User
+}
+endpoint downloadDoc: GET "/docs/{id}" {
+    response Doc
+}
+endpoint deleteUser: DELETE "/users/{id}" {
+    error { NotFound(404) }
+}
+"#,
+        GoServerFramework::Chi,
+    );
+    insta::assert_snapshot!("go_chi_server_full_surface", files.server);
+}
+
+/// Pins the invariant the chi support rests on: only `server.go` is
+/// framework-dependent. `types.go`, `client.go`, and `handlers.go` must be
+/// byte-identical between net/http and chi (the snapshot/compile-lint/round-trip
+/// tests only re-cover `server.go` for chi on the strength of this), and
+/// `server.go` must actually differ (otherwise the framework selector is a no-op
+/// and the snapshot above is testing nothing). A rich schema (path params,
+/// validated body, query/header params, multi-status) drives every shared
+/// renderer so a future divergence in any of them is caught here.
+#[test]
+fn go_non_server_files_are_framework_independent() {
+    let source = r#"
+struct User { id: Int  name: String where self.length > 0 }
+endpoint getUser: GET "/users/{id}" {
+    response User
+    error { NotFound(404) }
+}
+endpoint createUser: POST "/users" {
+    body User
+    response User
+}
+endpoint listUsers: GET "/users" {
+    query { page: Int = 1  q: Option<String> }
+    headers { authorization: String }
+    response List<User>
+}
+"#;
+    let net_http = generate_from_source_with(source, GoServerFramework::NetHttp);
+    let chi = generate_from_source_with(source, GoServerFramework::Chi);
+
+    assert_eq!(
+        net_http.types, chi.types,
+        "types.go must be framework-independent"
+    );
+    assert_eq!(
+        net_http.client, chi.client,
+        "client.go must be framework-independent"
+    );
+    assert_eq!(
+        net_http.handlers, chi.handlers,
+        "handlers.go must be framework-independent"
+    );
+    assert_ne!(
+        net_http.server, chi.server,
+        "server.go must differ between frameworks"
+    );
+}
+
 /// A doc comment that already ends in sentence-ending punctuation must not render
 /// a doubled terminator (`..`/`.!`/`.?`): the Go renderers append a period only
 /// when the comment doesn't already end in one. A comment NOT ending in

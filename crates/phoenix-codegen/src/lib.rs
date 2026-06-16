@@ -22,7 +22,7 @@ pub mod python;
 /// TypeScript code generation backend (interfaces, fetch client, Express router).
 pub mod typescript;
 
-pub use go::{GoFiles, generate_go};
+pub use go::{GoFiles, GoServerFramework, generate_go, generate_go_with};
 pub use openapi::generate_openapi;
 pub use python::{PythonFiles, generate_python};
 pub use typescript::{

@@ -98,9 +98,9 @@ enum Commands {
         /// Generate only server code (types + handlers + router)
         #[arg(long)]
         server: bool,
-        /// TypeScript server framework: `express` (default) or `fastify`
+        /// Server framework (per target): TypeScript express|fastify, Go net/http|chi
         #[arg(long)]
-        ts_framework: Option<String>,
+        framework: Option<String>,
     },
 }
 
@@ -138,7 +138,7 @@ fn run() {
             watch,
             client,
             server,
-            ts_framework,
-        } => run_gen(file, target, out, client, server, watch, ts_framework),
+            framework,
+        } => run_gen(file, target, out, client, server, watch, framework),
     }
 }

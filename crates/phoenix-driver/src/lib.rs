@@ -47,7 +47,7 @@ pub fn run_gen(
     client: bool,
     server: bool,
     watch: bool,
-    ts_framework: Option<String>,
+    framework: Option<String>,
 ) {
     // Load phoenix.toml if present
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -85,35 +85,65 @@ pub fn run_gen(
     // 3. Config single target
     // 4. Default: typescript
     if let Some(cli_target) = target {
-        // CLI specifies a single target — use it with CLI out/mode. Framework:
-        // CLI `--ts-framework` overrides the config default.
+        // CLI specifies a single target — use it with CLI out/mode. Strictness
+        // follows the framework's provenance (see `resolve_target_framework`): a
+        // CLI `--framework` is bound to this chosen target (a typo errors), but a
+        // value falling through to the top-level config default is bound only when
+        // it was written for this exact target — a single-target config whose
+        // `target` is the one we're generating (the same case `resolve_targets`
+        // marks `framework_explicit`). Otherwise it's tolerated, so a config whose
+        // `framework` was meant for a different target (e.g. `--target go` over a
+        // TS config) can't abort the run.
         let out = out
             .or(config.codegen.out_dir)
             .unwrap_or_else(|| "./generated".to_string());
         let mode = cli_mode.unwrap_or_else(|| parse_mode(config.codegen.mode.as_deref()));
-        let framework = parse_framework_or_exit(
-            ts_framework
-                .as_deref()
-                .or(config.codegen.ts_framework.as_deref()),
+        let strict = cli_target_framework_is_bound(
+            framework.is_some(),
+            config.codegen.targets.is_none(),
+            config.codegen.target.as_deref() == Some(cli_target.as_str()),
         );
+        let raw_fw = framework.as_deref().or(config.codegen.framework.as_deref());
+        let fw = resolve_target_framework_or_exit(&cli_target, raw_fw, strict);
         if watch {
-            cmd_gen_watch(&file, &[(&cli_target, out.as_str(), mode, framework)]);
+            cmd_gen_watch(&file, &[(&cli_target, out.as_str(), mode, fw)]);
         } else {
-            cmd_gen(&file, &cli_target, &out, mode, framework);
+            cmd_gen(&file, &cli_target, &out, mode, fw.as_deref());
         }
     } else if let Some(resolved) = config.codegen.resolve_targets() {
-        // Config provides target(s) — run them all. A CLI `--ts-framework`
-        // overrides each target's configured framework.
+        // Config provides target(s) — run them all. A CLI `--framework` overrides
+        // each target's configured framework. Framework provenance decides
+        // strictness (see `resolve_target_framework`): a per-target
+        // `[gen.targets.<name>] framework` is bound to its target (a typo errors);
+        // a top-level `[gen] framework` is a broadcast default, tolerated where a
+        // target can't use it. A global CLI `--framework` is bound only when it
+        // lands on a single target — across several it's a broadcast too.
+        let single = resolved.len() == 1;
+        let cli_framework = framework.is_some();
+        let resolve_fw = |rt: &config::ResolvedTarget| -> Option<String> {
+            let raw_fw = framework.as_deref().or(rt.framework.as_deref());
+            let strict = framework_is_bound(cli_framework, single, rt.framework_explicit);
+            resolve_target_framework_or_exit(&rt.target, raw_fw, strict)
+        };
+        // A global CLI `--framework` across several targets is a broadcast, so a
+        // value no target recognizes is dropped silently per target — right for a
+        // value meant for one of them (e.g. `chi` in a TS+Go config), but a genuine
+        // typo would then vanish without feedback. Warn once if the explicit CLI
+        // value lands on no framework-aware target. (Bound values — a single
+        // target, or a per-target config key — already error via `resolve_fw`.)
+        let target_names: Vec<&str> = resolved.iter().map(|rt| rt.target.as_str()).collect();
+        if let Some(warning) =
+            broadcast_framework_warning(framework.as_deref(), single, &target_names)
+        {
+            eprintln!("{warning}");
+        }
         if watch {
-            let targets: Vec<(&str, &str, GenMode, phoenix_codegen::TsServerFramework)> = resolved
+            let targets: Vec<(&str, &str, GenMode, Option<String>)> = resolved
                 .iter()
                 .map(|rt| {
                     let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
                     let mode = cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
-                    let framework = parse_framework_or_exit(
-                        ts_framework.as_deref().or(rt.ts_framework.as_deref()),
-                    );
-                    (rt.target.as_str(), out_dir, mode, framework)
+                    (rt.target.as_str(), out_dir, mode, resolve_fw(rt))
                 })
                 .collect();
             cmd_gen_watch(&file, &targets);
@@ -121,20 +151,20 @@ pub fn run_gen(
             for rt in &resolved {
                 let out_dir = out.as_deref().unwrap_or(&rt.out_dir);
                 let mode = cli_mode.unwrap_or_else(|| parse_mode(rt.mode.as_deref()));
-                let framework =
-                    parse_framework_or_exit(ts_framework.as_deref().or(rt.ts_framework.as_deref()));
-                cmd_gen(&file, &rt.target, out_dir, mode, framework);
+                let fw = resolve_fw(rt);
+                cmd_gen(&file, &rt.target, out_dir, mode, fw.as_deref());
             }
         }
     } else {
-        // No config targets — fall back to defaults
+        // No config targets — fall back to the default single target (typescript),
+        // which the framework is therefore bound to: validate it strictly.
         let out = out.unwrap_or_else(|| "./generated".to_string());
         let mode = cli_mode.unwrap_or(GenMode::Both);
-        let framework = parse_framework_or_exit(ts_framework.as_deref());
+        let fw = resolve_target_framework_or_exit("typescript", framework.as_deref(), true);
         if watch {
-            cmd_gen_watch(&file, &[("typescript", out.as_str(), mode, framework)]);
+            cmd_gen_watch(&file, &[("typescript", out.as_str(), mode, fw)]);
         } else {
-            cmd_gen(&file, "typescript", &out, mode, framework);
+            cmd_gen(&file, "typescript", &out, mode, fw.as_deref());
         }
     }
 }
@@ -374,13 +404,7 @@ pub fn cmd_run_ir(path: &str) {
 /// [`parse_and_check`], which exits); generation/IO errors print `error: …` and
 /// exit. The actual file emission is shared with the watch path via
 /// [`emit_target`] so the two cannot drift.
-fn cmd_gen(
-    path: &str,
-    target: &str,
-    out_dir: &str,
-    mode: GenMode,
-    framework: phoenix_codegen::TsServerFramework,
-) {
+fn cmd_gen(path: &str, target: &str, out_dir: &str, mode: GenMode, framework: Option<&str>) {
     let (program, check_result) = parse_and_check(path);
 
     if target == "openapi" && mode != GenMode::Both {
@@ -396,14 +420,11 @@ fn cmd_gen(
     }
 }
 
-/// Parses the TypeScript server-framework selector (CLI `--ts-framework` or
-/// config `ts_framework`). Returns an error message for an unknown value so a
-/// typo can't silently fall back to Express; `None` is the default (Express).
-/// Only the TypeScript target consults the resulting value (non-TypeScript
-/// targets ignore it), but it is validated eagerly at every call site so a typo
-/// is reported up front rather than silently dropped. The caller turns the error
-/// into an exit (see
-/// [`parse_framework_or_exit`]); keeping the mapping pure makes it unit-testable.
+/// Parses the TypeScript server-framework selector (CLI `--framework` or config
+/// `framework`) for the TypeScript target. Returns an error message for an
+/// unknown value so a typo can't silently fall back to Express; `None` is the
+/// default (Express). The error propagates out of [`emit_target`] as an `Err`,
+/// so the caller reports it; keeping the mapping pure makes it unit-testable.
 fn parse_framework(framework: Option<&str>) -> Result<phoenix_codegen::TsServerFramework, String> {
     match framework {
         None | Some("express") => Ok(phoenix_codegen::TsServerFramework::Express),
@@ -415,11 +436,158 @@ fn parse_framework(framework: Option<&str>) -> Result<phoenix_codegen::TsServerF
     }
 }
 
-/// [`parse_framework`] wrapper that prints `error: …` and exits on an unknown
-/// value — the behavior every `run_gen` call site wants. Mirrors how an
-/// unsupported target is surfaced.
-fn parse_framework_or_exit(framework: Option<&str>) -> phoenix_codegen::TsServerFramework {
-    parse_framework(framework).unwrap_or_else(|err| {
+/// Parses the Go server-framework selector (CLI `--framework` or config
+/// `framework`) for the Go target. Returns an error message for an unknown value
+/// so a typo can't silently fall back to net/http; `None` is the default
+/// (net/http). Both `"net/http"` and `"nethttp"` select net/http. The error
+/// propagates out of [`emit_target`] as an `Err`, so the caller reports it;
+/// keeping the mapping pure makes it unit-testable.
+fn parse_go_framework(
+    framework: Option<&str>,
+) -> Result<phoenix_codegen::GoServerFramework, String> {
+    match framework {
+        None | Some("net/http") | Some("nethttp") => {
+            Ok(phoenix_codegen::GoServerFramework::NetHttp)
+        }
+        Some("chi") => Ok(phoenix_codegen::GoServerFramework::Chi),
+        Some(other) => Err(format!(
+            "unknown go framework '{}' (supported: net/http, chi)",
+            other
+        )),
+    }
+}
+
+/// Decides whether a `framework` value reaching a config-resolved target is
+/// *bound* to it (strict — an unknown value is a typo that must error) or merely
+/// *broadcast* across heterogeneous targets (tolerant — an unrecognized value is
+/// dropped to that target's default). Pulled out of `run_gen`'s per-target
+/// closure so the rule is unit-testable:
+/// - When there's only one resolved target (`single`), any value — CLI
+///   `--framework` or inherited top-level `[gen] framework` — is unambiguously
+///   aimed at that one target, so it's bound regardless of provenance. (This is
+///   why a single-entry `[gen.targets.<name>]` map inheriting a top-level default
+///   is treated the same as a single-target `[gen]` config.)
+/// - Across several targets, a CLI `--framework` (`cli_framework`) is a broadcast.
+/// - Otherwise the value comes from config, where provenance is precomputed:
+///   `framework_explicit` is set for a per-target `[gen.targets.<name>] framework`
+///   (bound to that target) and cleared for a top-level `[gen] framework`
+///   broadcast across a multi-target config.
+fn framework_is_bound(cli_framework: bool, single: bool, framework_explicit: bool) -> bool {
+    if single {
+        true
+    } else if cli_framework {
+        false
+    } else {
+        framework_explicit
+    }
+}
+
+/// Strictness rule for the `--target` (CLI single-target) path, the analogue of
+/// [`framework_is_bound`] for the branch that never calls `resolve_targets` (so it
+/// has no precomputed `framework_explicit` to read). Pulled out of `run_gen` so
+/// the rule is unit-testable:
+/// - A CLI `--framework` (`cli_framework`) is aimed squarely at the chosen target,
+///   so it's always bound (a typo errors).
+/// - Otherwise the value comes from the top-level `[gen] framework`. It's bound
+///   only when the config is single-target (`config_is_single_target`, i.e. no
+///   `[gen.targets]` map) *and* its `target` is the one being generated
+///   (`config_target_matches`) — exactly the case `resolve_targets` marks
+///   `framework_explicit`. A multi-target config's top-level value is a broadcast,
+///   and a single-target config whose `framework` was written for a different
+///   target than the CLI `--target` override wasn't aimed here; both stay tolerant.
+fn cli_target_framework_is_bound(
+    cli_framework: bool,
+    config_is_single_target: bool,
+    config_target_matches: bool,
+) -> bool {
+    cli_framework || (config_is_single_target && config_target_matches)
+}
+
+/// Whether `target` has a server-framework vocabulary at all — only `typescript`
+/// (express/fastify) and `go` (net/http/chi) do. The python/openapi targets
+/// ignore any `framework` value, so a CLI `--framework` landing only on them has
+/// no effect; used to decide whether a broadcast CLI value went unrecognized
+/// everywhere (worth a warning). Mirrors the framework-aware arms of
+/// [`resolve_target_framework`].
+fn target_has_framework(target: &str) -> bool {
+    matches!(target, "typescript" | "go")
+}
+
+/// The warning (if any) `run_gen` emits for a broadcast CLI `--framework` over a
+/// multi-target config. A broadcast value no target recognizes is dropped
+/// silently per target (right for a value meant for one of them, e.g. `chi` in a
+/// TS+Go config), so a genuine typo would otherwise vanish without feedback.
+/// Returns `Some(message)` iff the value is explicit, broadcast (`!single`), and
+/// recognized by no framework-aware target — otherwise `None`. Pulled out of
+/// `run_gen` so the warning text and condition are unit-testable (the call site
+/// only prints the returned message).
+fn broadcast_framework_warning(
+    framework: Option<&str>,
+    single: bool,
+    targets: &[&str],
+) -> Option<String> {
+    let value = framework.filter(|_| !single)?;
+    let recognized = targets
+        .iter()
+        .any(|t| target_has_framework(t) && resolve_target_framework(t, Some(value), true).is_ok());
+    if recognized {
+        None
+    } else {
+        Some(format!(
+            "warning: --framework '{value}' is not recognized by any generated target; \
+             each target uses its own default"
+        ))
+    }
+}
+
+/// Validates the `framework` selector for one target, applying provenance-aware
+/// strictness, and returns the value to thread downstream (unchanged when the
+/// target accepts it, `None` when a broadcast value is tolerantly dropped).
+///
+/// `framework` carries one string but feeds two vocabularies (TypeScript
+/// `express`/`fastify`, Go `net/http`/`chi`), and it can be *bound* to a single
+/// target or *broadcast* across several. `strict` distinguishes the two:
+/// - **strict** (`true`) — the value is aimed at exactly this target (a per-target
+///   `[gen.targets.<name>] framework`, or a single chosen target via `--target` /
+///   a single-target config / the default fallback). An unknown value is a typo
+///   and surfaces as `Err`, so it can't silently degrade to the default.
+/// - **broadcast** (`false`) — the value is a shared default spread across
+///   heterogeneous targets (top-level `[gen] framework`, or a global `--framework`
+///   over a multi-target config). A value valid for one target is meaningless for
+///   another, so an unrecognized value is dropped to `None` (this target's
+///   default) rather than aborting the whole run.
+///
+/// The python/openapi targets have no framework vocabulary, so they ignore the
+/// value entirely (it threads through as-is and `emit_target` never consults it).
+fn resolve_target_framework(
+    target: &str,
+    framework: Option<&str>,
+    strict: bool,
+) -> Result<Option<String>, String> {
+    let accepted = match target {
+        "typescript" => parse_framework(framework).map(|_| ()),
+        "go" => parse_go_framework(framework).map(|_| ()),
+        // No framework vocabulary — accept anything; the value is ignored.
+        _ => Ok(()),
+    };
+    match accepted {
+        Ok(()) => Ok(framework.map(str::to_owned)),
+        // Broadcast value this target doesn't recognize → use its own default.
+        Err(_) if !strict => Ok(None),
+        // Bound value the target doesn't recognize → a typo; fail loud.
+        Err(e) => Err(e),
+    }
+}
+
+/// [`resolve_target_framework`] wrapper that prints `error: …` and exits on a
+/// strict (bound, unknown-for-target) value — the behavior every `run_gen` call
+/// site wants. Mirrors how an unsupported target is surfaced.
+fn resolve_target_framework_or_exit(
+    target: &str,
+    framework: Option<&str>,
+    strict: bool,
+) -> Option<String> {
+    resolve_target_framework(target, framework, strict).unwrap_or_else(|err| {
         eprintln!("error: {}", err);
         process::exit(1);
     })
@@ -439,7 +607,7 @@ fn emit_target(
     target: &str,
     out_dir: &str,
     mode: GenMode,
-    framework: phoenix_codegen::TsServerFramework,
+    framework: Option<&str>,
 ) -> Result<Vec<String>, String> {
     fs::create_dir_all(out_dir)
         .map_err(|err| format!("could not create output directory '{}': {}", out_dir, err))?;
@@ -447,7 +615,8 @@ fn emit_target(
     let mut generated = Vec::new();
     match target {
         "typescript" => {
-            let files = phoenix_codegen::generate_typescript_with(program, check_result, framework);
+            let fw = parse_framework(framework)?;
+            let files = phoenix_codegen::generate_typescript_with(program, check_result, fw);
             generated.push(write_file(out_dir, "types.ts", &files.types)?);
             if mode != GenMode::ServerOnly {
                 generated.push(write_file(out_dir, "client.ts", &files.client)?);
@@ -470,7 +639,8 @@ fn emit_target(
             }
         }
         "go" => {
-            let files = phoenix_codegen::generate_go(program, check_result);
+            let fw = parse_go_framework(framework)?;
+            let files = phoenix_codegen::generate_go_with(program, check_result, fw);
             generated.push(write_file(out_dir, "types.go", &files.types)?);
             if mode != GenMode::ServerOnly {
                 generated.push(write_file(out_dir, "client.go", &files.client)?);
@@ -537,7 +707,7 @@ fn generate_once(
     target: &str,
     out_dir: &str,
     mode: GenMode,
-    framework: phoenix_codegen::TsServerFramework,
+    framework: Option<&str>,
 ) -> Result<(), String> {
     let (program, result) = try_parse_and_check(path)?;
     emit_target(&program, &result, target, out_dir, mode, framework)?;
@@ -560,10 +730,7 @@ fn write_file(out_dir: &str, name: &str, content: &str) -> Result<String, String
 ///
 /// Events are debounced with a 100 ms delay so that multiple rapid file-system
 /// events from a single save are coalesced into one regeneration pass.
-fn cmd_gen_watch(
-    path: &str,
-    targets: &[(&str, &str, GenMode, phoenix_codegen::TsServerFramework)],
-) {
+fn cmd_gen_watch(path: &str, targets: &[(&str, &str, GenMode, Option<String>)]) {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     use std::path::Path;
     use std::sync::mpsc;
@@ -600,7 +767,7 @@ fn cmd_gen_watch(
     );
     let mut had_error = false;
     for (target, out_dir, mode, framework) in targets {
-        match generate_once(path, target, out_dir, *mode, *framework) {
+        match generate_once(path, target, out_dir, *mode, framework.as_deref()) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!(
@@ -665,7 +832,7 @@ fn cmd_gen_watch(
             eprintln!("[phoenix gen] change detected, regenerating...");
             let mut had_error = false;
             for (target, out_dir, mode, framework) in targets {
-                match generate_once(path, target, out_dir, *mode, *framework) {
+                match generate_once(path, target, out_dir, *mode, framework.as_deref()) {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("[phoenix gen] regeneration failed ({}): {}", target, e);
@@ -719,9 +886,9 @@ endpoint getUser: GET "/api/users/{id}" {
     }
 
     // `parse_framework` maps the CLI/config selector to the codegen enum. The
-    // unknown-value path is an error (not a silent Express fallback); the
-    // `_or_exit` wrapper turns that into a process exit, so the testable mapping
-    // lives in the `Result`-returning core.
+    // unknown-value path is an error (not a silent Express fallback); the error
+    // propagates out of `emit_target` so the caller reports it, while the
+    // testable mapping lives here in the `Result`-returning core.
 
     #[test]
     fn parse_framework_defaults_to_express() {
@@ -750,6 +917,285 @@ endpoint getUser: GET "/api/users/{id}" {
         assert!(err.contains("express, fastify"), "got: {err}");
     }
 
+    // `parse_go_framework` mirrors `parse_framework`: a pure mapping with an
+    // error (not a silent net/http fallback) on an unknown value. Both
+    // `net/http` and `nethttp` select the default so a TOML key can avoid the
+    // slash.
+
+    #[test]
+    fn parse_go_framework_defaults_to_nethttp() {
+        assert_eq!(
+            parse_go_framework(None),
+            Ok(phoenix_codegen::GoServerFramework::NetHttp)
+        );
+    }
+
+    #[test]
+    fn parse_go_framework_accepts_known_values() {
+        assert_eq!(
+            parse_go_framework(Some("net/http")),
+            Ok(phoenix_codegen::GoServerFramework::NetHttp)
+        );
+        assert_eq!(
+            parse_go_framework(Some("nethttp")),
+            Ok(phoenix_codegen::GoServerFramework::NetHttp)
+        );
+        assert_eq!(
+            parse_go_framework(Some("chi")),
+            Ok(phoenix_codegen::GoServerFramework::Chi)
+        );
+    }
+
+    #[test]
+    fn parse_go_framework_rejects_unknown_value() {
+        let err = parse_go_framework(Some("gin")).expect_err("unknown framework must error");
+        assert!(err.contains("gin"), "got: {err}");
+        assert!(err.contains("net/http, chi"), "got: {err}");
+    }
+
+    // `resolve_target_framework` layers provenance-aware strictness over the pure
+    // parsers. The critical case is a value that's valid for one target but not
+    // another (e.g. `fastify` reaching the Go target): bound to a target it's a
+    // typo (error); broadcast across targets it's tolerated (dropped to that
+    // target's default) so a shared `[gen] framework`/global `--framework` can't
+    // abort the whole run.
+
+    #[test]
+    fn resolve_target_framework_strict_passes_known_value() {
+        assert_eq!(
+            resolve_target_framework("go", Some("chi"), true),
+            Ok(Some("chi".to_string()))
+        );
+        assert_eq!(
+            resolve_target_framework("typescript", Some("fastify"), true),
+            Ok(Some("fastify".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_target_framework_strict_rejects_unknown_value() {
+        // A value aimed at this target that it doesn't recognize is a typo.
+        let err = resolve_target_framework("go", Some("fastify"), true)
+            .expect_err("bound, unknown-for-target value must error");
+        assert!(err.contains("fastify"), "got: {err}");
+        assert!(err.contains("net/http, chi"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_target_framework_broadcast_drops_unrecognized_value() {
+        // The reported bug: a shared `framework = "fastify"` inherited by a Go
+        // target must NOT abort the run — it's meaningless for Go, so Go falls
+        // back to its own default (None) instead.
+        assert_eq!(
+            resolve_target_framework("go", Some("fastify"), false),
+            Ok(None)
+        );
+        // Symmetric: a Go value broadcast onto the TypeScript target.
+        assert_eq!(
+            resolve_target_framework("typescript", Some("chi"), false),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn resolve_target_framework_broadcast_keeps_recognized_value() {
+        // A broadcast value the target DOES recognize is still applied.
+        assert_eq!(
+            resolve_target_framework("go", Some("chi"), false),
+            Ok(Some("chi".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_target_framework_broadcast_silently_drops_value_valid_for_no_target() {
+        // A broadcast value that no target recognizes (e.g. a typo like `expres`)
+        // is dropped to each target's default with NO error — the same tolerant
+        // path as a value meaningful for another target. This is deliberate: a
+        // broadcast carries no claim that any particular target must honor it, so
+        // we can't tell a cross-target default apart from a typo here, and aborting
+        // a mixed-target run on a value some other target might have wanted would
+        // be worse. Strictness (and thus typo-catching) is reserved for *bound*
+        // values; see `framework_is_bound`. Pinned so the silent-drop contract is
+        // a conscious choice, not an accident.
+        assert_eq!(
+            resolve_target_framework("typescript", Some("expres"), false),
+            Ok(None)
+        );
+        assert_eq!(
+            resolve_target_framework("go", Some("expres"), false),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn resolve_target_framework_ignored_targets_accept_anything() {
+        // python/openapi have no framework vocabulary: the value threads through
+        // untouched (emit_target never consults it) and is never an error, even
+        // when strict.
+        assert_eq!(
+            resolve_target_framework("openapi", Some("chi"), true),
+            Ok(Some("chi".to_string()))
+        );
+        assert_eq!(
+            resolve_target_framework("python", Some("fastify"), true),
+            Ok(Some("fastify".to_string()))
+        );
+    }
+
+    // `framework_is_bound` is the strictness rule `run_gen` applies per resolved
+    // target. The regression it guards: a single-target config (no CLI override,
+    // `framework_explicit == true`) must be BOUND, so a typo errors instead of
+    // silently degrading to the target default.
+    #[test]
+    fn framework_is_bound_rule() {
+        // Single-target config, no CLI: bound via the explicit flag.
+        assert!(framework_is_bound(false, true, true));
+        // Single resolved target inheriting a top-level `[gen] framework` (a
+        // single-entry `[gen.targets.<name>]` map, so `framework_explicit` is
+        // cleared): still bound, because the value is unambiguously aimed at the
+        // one target. Guards the inconsistency where this used to be tolerant while
+        // a single-target `[gen]` config was strict.
+        assert!(framework_is_bound(false, true, false));
+        // Top-level `[gen] framework` broadcast over a multi-target config: the
+        // flag is cleared, so it's tolerant.
+        assert!(!framework_is_bound(false, false, false));
+        // Per-target `[gen.targets.<name>] framework`: explicit → bound, even
+        // across a multi-target config.
+        assert!(framework_is_bound(false, false, true));
+        // CLI `--framework` onto a single target: bound regardless of the flag.
+        assert!(framework_is_bound(true, true, false));
+        // CLI `--framework` spread across several targets: a broadcast.
+        assert!(!framework_is_bound(true, false, true));
+    }
+
+    // `cli_target_framework_is_bound` is the strictness rule for the `--target`
+    // path (which never calls `resolve_targets`, so it has no `framework_explicit`
+    // to read). The regression it guards: a single-target config's top-level
+    // `[gen] framework` must be BOUND when the chosen `--target` matches the
+    // config's target, so a typo there errors instead of silently degrading —
+    // matching the `framework_is_bound` behavior of the config-resolved path.
+    #[test]
+    fn cli_target_framework_is_bound_rule() {
+        // CLI `--framework` is always bound to the chosen target, regardless of
+        // config shape or whether the config target matches.
+        assert!(cli_target_framework_is_bound(true, false, false));
+        assert!(cli_target_framework_is_bound(true, true, true));
+        // No CLI framework, single-target config whose target == `--target`: the
+        // inherited top-level framework is bound (a typo must error). This is the
+        // case the previous `strict = framework.is_some()` got wrong.
+        assert!(cli_target_framework_is_bound(false, true, true));
+        // Single-target config but `--target` overrides to a DIFFERENT target: the
+        // config framework was written for another target → broadcast/tolerant.
+        assert!(!cli_target_framework_is_bound(false, true, false));
+        // Multi-target config (top-level framework is a broadcast) → tolerant,
+        // even when the chosen target happens to be one of them.
+        assert!(!cli_target_framework_is_bound(false, false, true));
+        // No CLI framework and no config target at all → nothing is bound here.
+        assert!(!cli_target_framework_is_bound(false, false, false));
+    }
+
+    // Stand-ins for `run_gen`'s `--target` branch: compose the strictness rule
+    // (`cli_target_framework_is_bound`) with the validator (`resolve_target_framework`)
+    // exactly as the branch does, minus the `process::exit` that makes `run_gen`
+    // itself awkward to drive from a unit test.
+
+    #[test]
+    fn cli_target_override_mismatched_config_framework_is_tolerated() {
+        // `[gen] target = "typescript", framework = "fastify"` run as `--target go`
+        // (no CLI `--framework`): the config framework was written for TS, so
+        // reaching the overridden Go target it must be tolerated (dropped to Go's
+        // default), not abort the run.
+        let strict = cli_target_framework_is_bound(
+            false, // no CLI --framework
+            true,  // single-target config (no [gen.targets] map)
+            false, // config target ("typescript") != --target ("go")
+        );
+        assert!(!strict);
+        assert_eq!(
+            resolve_target_framework("go", Some("fastify"), strict),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn cli_target_matching_config_framework_typo_errors() {
+        // Same single-target config but run as `--target typescript` (matches): the
+        // inherited framework is bound, so a typo must error rather than silently
+        // fall back to Express.
+        let strict = cli_target_framework_is_bound(false, true, true);
+        assert!(strict);
+        assert!(resolve_target_framework("typescript", Some("expres"), strict).is_err());
+    }
+
+    // `target_has_framework` decides whether a target meaningfully consumes the
+    // `framework` value — the basis for warning when a broadcast CLI `--framework`
+    // lands nowhere.
+    #[test]
+    fn target_has_framework_rule() {
+        assert!(target_has_framework("typescript"));
+        assert!(target_has_framework("go"));
+        assert!(!target_has_framework("python"));
+        assert!(!target_has_framework("openapi"));
+        assert!(!target_has_framework("cobol"));
+    }
+
+    // The broadcast-warning condition `run_gen` evaluates for a global CLI
+    // `--framework` over a multi-target config: warn iff no framework-aware target
+    // recognizes the value (a likely typo), but stay quiet when at least one does.
+    #[test]
+    fn broadcast_cli_framework_recognition() {
+        // Drives the real `broadcast_framework_warning` (what `run_gen` prints),
+        // so both the condition AND the message are covered, not a reimplemented
+        // predicate. A `Some` return is the warning `run_gen` emits; `None` is
+        // silence.
+        let ts_go = &["typescript", "go"][..];
+
+        // `chi` is meant for the Go target in a TS+Go run → recognized, no warning.
+        assert_eq!(broadcast_framework_warning(Some("chi"), false, ts_go), None);
+        // A typo no target understands → unrecognized, warn (and name the value).
+        let warning = broadcast_framework_warning(Some("fastifyy"), false, ts_go)
+            .expect("unrecognized broadcast value must warn");
+        assert!(warning.contains("fastifyy"), "got: {warning}");
+        assert!(warning.contains("--framework"), "got: {warning}");
+        // A real framework name landing only on framework-blind targets → still
+        // unrecognized (python/openapi ignore it), warn.
+        assert!(broadcast_framework_warning(Some("chi"), false, &["python", "openapi"]).is_some());
+        // A bound value (`single == true`) is never a broadcast warning — it's
+        // validated strictly elsewhere and errors instead.
+        assert_eq!(
+            broadcast_framework_warning(Some("fastifyy"), true, ts_go),
+            None
+        );
+        // No CLI `--framework` at all → nothing to warn about.
+        assert_eq!(broadcast_framework_warning(None, false, ts_go), None);
+    }
+
+    // End-to-end stand-in for the multi-target leak: a TS framework broadcast to
+    // the Go target resolves to None (no error) and the written `server.go` is
+    // the net/http default — exactly what `run_gen` does for a shared
+    // `framework`, minus the `process::exit` that makes `run_gen` itself
+    // awkward to drive from a unit test.
+    #[test]
+    fn broadcast_ts_framework_to_go_emits_default_server() {
+        let fw = resolve_target_framework("go", Some("fastify"), false)
+            .expect("broadcast value must not error for go");
+        assert_eq!(fw, None, "broadcast TS framework must drop to Go's default");
+
+        let (schema_dir, schema) = schema_in_tmp();
+        let out = schema_dir.path().join("out");
+        generate_once(
+            &schema,
+            "go",
+            &out.to_string_lossy(),
+            GenMode::ServerOnly,
+            fw.as_deref(),
+        )
+        .expect("generate");
+        let server = fs::read_to_string(out.join("server.go")).expect("read server.go");
+        assert!(server.contains("http.NewServeMux()"), "got: {server}");
+        assert!(!server.contains("chi.NewRouter()"), "got: {server}");
+    }
+
     // The watch path goes through `generate_once`, which shares `emit_target`
     // with the one-shot `cmd_gen` path. These tests pin that shared matrix so a
     // filename / mode regression in either entry point is caught.
@@ -758,14 +1204,8 @@ endpoint getUser: GET "/api/users/{id}" {
     fn generate_once_go_both_writes_all_files() {
         let (schema_dir, schema) = schema_in_tmp();
         let out = schema_dir.path().join("out");
-        generate_once(
-            &schema,
-            "go",
-            &out.to_string_lossy(),
-            GenMode::Both,
-            phoenix_codegen::TsServerFramework::Express,
-        )
-        .expect("generate");
+        generate_once(&schema, "go", &out.to_string_lossy(), GenMode::Both, None)
+            .expect("generate");
         assert_eq!(
             files_in(&out),
             BTreeSet::from([
@@ -786,7 +1226,7 @@ endpoint getUser: GET "/api/users/{id}" {
             "go",
             &out.to_string_lossy(),
             GenMode::ClientOnly,
-            phoenix_codegen::TsServerFramework::Express,
+            None,
         )
         .expect("generate");
         assert_eq!(
@@ -804,7 +1244,7 @@ endpoint getUser: GET "/api/users/{id}" {
             "go",
             &out.to_string_lossy(),
             GenMode::ServerOnly,
-            phoenix_codegen::TsServerFramework::Express,
+            None,
         )
         .expect("generate");
         assert_eq!(
@@ -826,7 +1266,7 @@ endpoint getUser: GET "/api/users/{id}" {
             "openapi",
             &out.to_string_lossy(),
             GenMode::Both,
-            phoenix_codegen::TsServerFramework::Express,
+            None,
         )
         .expect("generate");
         assert_eq!(files_in(&out), BTreeSet::from(["openapi.json".to_string()]));
@@ -845,7 +1285,7 @@ endpoint getUser: GET "/api/users/{id}" {
             "typescript",
             &out.to_string_lossy(),
             GenMode::ServerOnly,
-            phoenix_codegen::TsServerFramework::Express,
+            None,
         )
         .expect("generate");
         let server = fs::read_to_string(out.join("server.ts")).expect("read server.ts");
@@ -862,12 +1302,50 @@ endpoint getUser: GET "/api/users/{id}" {
             "typescript",
             &out.to_string_lossy(),
             GenMode::ServerOnly,
-            phoenix_codegen::TsServerFramework::Fastify,
+            Some("fastify"),
         )
         .expect("generate");
         let server = fs::read_to_string(out.join("server.ts")).expect("read server.ts");
         assert!(server.contains("from \"fastify\""), "got: {server}");
         assert!(!server.contains("from \"express\""), "got: {server}");
+    }
+
+    // Mirror of the TS framework-glue tests for Go: the codegen crate proves each
+    // framework's `server.go` is correct; these pin only that the selected
+    // `GoServerFramework` reaches `generate_go_with` and lands in the written
+    // `server.go` (rather than being dropped passing through `emit_target`).
+    #[test]
+    fn generate_once_go_default_emits_nethttp_server() {
+        let (schema_dir, schema) = schema_in_tmp();
+        let out = schema_dir.path().join("out");
+        generate_once(
+            &schema,
+            "go",
+            &out.to_string_lossy(),
+            GenMode::ServerOnly,
+            None,
+        )
+        .expect("generate");
+        let server = fs::read_to_string(out.join("server.go")).expect("read server.go");
+        assert!(server.contains("http.NewServeMux()"), "got: {server}");
+        assert!(!server.contains("chi.NewRouter()"), "got: {server}");
+    }
+
+    #[test]
+    fn generate_once_go_chi_emits_chi_server() {
+        let (schema_dir, schema) = schema_in_tmp();
+        let out = schema_dir.path().join("out");
+        generate_once(
+            &schema,
+            "go",
+            &out.to_string_lossy(),
+            GenMode::ServerOnly,
+            Some("chi"),
+        )
+        .expect("generate");
+        let server = fs::read_to_string(out.join("server.go")).expect("read server.go");
+        assert!(server.contains("chi.NewRouter()"), "got: {server}");
+        assert!(!server.contains("http.NewServeMux()"), "got: {server}");
     }
 
     #[test]
@@ -879,7 +1357,7 @@ endpoint getUser: GET "/api/users/{id}" {
             "cobol",
             &out.to_string_lossy(),
             GenMode::Both,
-            phoenix_codegen::TsServerFramework::Express,
+            None,
         )
         .expect_err("unsupported target must error");
         assert!(err.contains("unsupported target 'cobol'"), "got: {err}");

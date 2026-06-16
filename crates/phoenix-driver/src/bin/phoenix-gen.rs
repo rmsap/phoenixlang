@@ -38,9 +38,9 @@ struct Cli {
     /// Generate only server code (types + handlers + router)
     #[arg(long)]
     server: bool,
-    /// TypeScript server framework: `express` (default) or `fastify`
+    /// Server framework (per target): TypeScript express|fastify, Go net/http|chi
     #[arg(long)]
-    ts_framework: Option<String>,
+    framework: Option<String>,
 }
 
 fn main() {
@@ -62,6 +62,6 @@ fn run() {
         cli.client,
         cli.server,
         cli.watch,
-        cli.ts_framework,
+        cli.framework,
     );
 }

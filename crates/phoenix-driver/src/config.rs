@@ -64,10 +64,11 @@ pub struct GenConfig {
     pub out_dir: Option<String>,
     /// Default generation mode: `"client"`, `"server"`, or `"both"`.
     pub mode: Option<String>,
-    /// Default TypeScript server framework: `"express"` (default) or `"fastify"`.
-    /// Ignored by non-TypeScript targets. Named to match the `--ts-framework` CLI
-    /// flag (TOML key: `ts_framework`).
-    pub ts_framework: Option<String>,
+    /// Default server framework, interpreted per target: TypeScript
+    /// `"express"` (default) or `"fastify"`, Go `"net/http"` (default) or
+    /// `"chi"`. Ignored by the python/openapi targets. Named to match the
+    /// `--framework` CLI flag (TOML key: `framework`).
+    pub framework: Option<String>,
     /// Per-target configuration for multi-target generation.
     pub targets: Option<HashMap<String, TargetConfig>>,
 }
@@ -80,9 +81,10 @@ pub struct TargetConfig {
     pub out_dir: Option<String>,
     /// Generation mode for this target: `"client"`, `"server"`, or `"both"`.
     pub mode: Option<String>,
-    /// TypeScript server framework for this target: `"express"` (default) or
-    /// `"fastify"`. Ignored by non-TypeScript targets (TOML key: `ts_framework`).
-    pub ts_framework: Option<String>,
+    /// Server framework for this target, interpreted per target: TypeScript
+    /// `"express"` (default) or `"fastify"`, Go `"net/http"` (default) or
+    /// `"chi"`. Ignored by the python/openapi targets (TOML key: `framework`).
+    pub framework: Option<String>,
 }
 
 /// A resolved target ready for code generation.
@@ -94,8 +96,17 @@ pub struct ResolvedTarget {
     pub out_dir: String,
     /// Generation mode string (e.g. `"client"`, `"server"`, `"both"`), or `None` for default.
     pub mode: Option<String>,
-    /// TypeScript server framework (`"express"`/`"fastify"`), or `None` for default.
-    pub ts_framework: Option<String>,
+    /// Server framework, interpreted per target (TypeScript
+    /// `"express"`/`"fastify"`, Go `"net/http"`/`"chi"`); `None` for default.
+    /// Ignored by the python/openapi targets.
+    pub framework: Option<String>,
+    /// Whether `framework` was set *specifically for this target* (a per-target
+    /// `[gen.targets.<name>] framework`) rather than inherited from the top-level
+    /// `[gen] framework`. The driver uses this for provenance-aware validation: a
+    /// per-target value is a typo if it's unknown for the target (error), whereas
+    /// a broadcast top-level default unknown for one target is tolerated (that
+    /// target falls back to its own default). See `run_gen` in `lib.rs`.
+    pub framework_explicit: bool,
 }
 
 impl GenConfig {
@@ -120,10 +131,10 @@ impl GenConfig {
                         .clone()
                         .unwrap_or_else(|| format!("{}/{}", default_out_dir, name)),
                     mode: cfg.mode.clone().or_else(|| self.mode.clone()),
-                    ts_framework: cfg
-                        .ts_framework
-                        .clone()
-                        .or_else(|| self.ts_framework.clone()),
+                    framework: cfg.framework.clone().or_else(|| self.framework.clone()),
+                    // Explicit only when set under this target; a value inherited
+                    // from the top-level `[gen] framework` is a broadcast default.
+                    framework_explicit: cfg.framework.is_some(),
                 })
                 .collect();
             // Sort for deterministic output order
@@ -137,7 +148,14 @@ impl GenConfig {
                     .clone()
                     .unwrap_or_else(|| "./generated".to_string()),
                 mode: self.mode.clone(),
-                ts_framework: self.ts_framework.clone(),
+                framework: self.framework.clone(),
+                // Single-target config: the framework (if any) is unambiguously
+                // bound to this one target, so it's explicit — a typo must error
+                // rather than silently fall back to the target's default, even
+                // with no CLI `--framework` (see `resolve_fw` in `run_gen`, which
+                // only derives strictness from `single` when a CLI `--framework`
+                // is present; absent that it reads this flag).
+                framework_explicit: true,
             }])
         } else {
             None
@@ -337,45 +355,52 @@ mode = "server"
     }
 
     #[test]
-    fn resolve_multi_targets_ts_framework_override_and_inherit() {
+    fn resolve_multi_targets_framework_override_and_inherit() {
         let config: PhoenixConfig = toml::from_str(
             r#"
 [gen]
-ts_framework = "express"
+framework = "express"
 
 [gen.targets.typescript]
 out_dir = "ts"
 
 [gen.targets.go]
 out_dir = "go"
-ts_framework = "fastify"
+framework = "chi"
 "#,
         )
         .unwrap();
         let resolved = config.codegen.resolve_targets().unwrap();
-        // go carries its explicit per-target framework override (even though Go
-        // ignores it — resolution is target-agnostic).
+        // go carries its explicit per-target framework override; `framework_explicit`
+        // marks it as bound to this target, so the driver validates it strictly.
         assert_eq!(resolved[0].target, "go");
-        assert_eq!(resolved[0].ts_framework.as_deref(), Some("fastify"));
-        // typescript has no per-target value, so it inherits the top-level default.
+        assert_eq!(resolved[0].framework.as_deref(), Some("chi"));
+        assert!(resolved[0].framework_explicit);
+        // typescript has no per-target value, so it inherits the top-level default —
+        // a broadcast value (`framework_explicit == false`), which the driver
+        // therefore tolerates rather than rejecting if a target can't use it.
         assert_eq!(resolved[1].target, "typescript");
-        assert_eq!(resolved[1].ts_framework.as_deref(), Some("express"));
+        assert_eq!(resolved[1].framework.as_deref(), Some("express"));
+        assert!(!resolved[1].framework_explicit);
     }
 
     #[test]
-    fn resolve_single_target_inherits_top_level_ts_framework() {
+    fn resolve_single_target_inherits_top_level_framework() {
         let config: PhoenixConfig = toml::from_str(
             r#"
 [gen]
 schema = "api.phx"
 target = "typescript"
-ts_framework = "fastify"
+framework = "fastify"
 "#,
         )
         .unwrap();
         let resolved = config.codegen.resolve_targets().unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].ts_framework.as_deref(), Some("fastify"));
+        assert_eq!(resolved[0].framework.as_deref(), Some("fastify"));
+        // A single-target config's framework is bound to that one target, so it's
+        // explicit — the driver validates it strictly even with no CLI override.
+        assert!(resolved[0].framework_explicit);
     }
 
     #[test]

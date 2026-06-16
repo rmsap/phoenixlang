@@ -381,14 +381,25 @@ export function createRouter(handlers: Handlers): Router { ... }
 ```
 
 **Server framework:** `server.ts` targets Express by default. Pass
-`--ts-framework fastify` (or set `ts_framework = "fastify"` in `phoenix.toml`) to
+`--framework fastify` (or set `framework = "fastify"` in `phoenix.toml`) to
 emit a Fastify plugin instead — `createRouter` returns a `FastifyPluginCallback`
 registering one route per endpoint. Only `server.ts` changes; `types.ts`,
-`client.ts`, and `handlers.ts` are identical across frameworks. The flag is
-ignored by non-TypeScript targets.
+`client.ts`, and `handlers.ts` are identical across frameworks. The single
+`--framework` flag is interpreted per target (and ignored by python/openapi).
 
 ```bash
-phoenix gen schema.phx --target typescript --ts-framework fastify --out ./generated
+phoenix gen schema.phx --target typescript --framework fastify --out ./generated
+```
+
+**Go server framework:** `server.go` targets `net/http` by default. Pass
+`--framework chi` (or set `framework = "chi"` in `phoenix.toml`) to emit a
+[chi](https://github.com/go-chi/chi) router instead — `NewRouter` returns a
+`chi.Router`. As with TypeScript, only `server.go` changes; `types.go`,
+`client.go`, and `handlers.go` are identical across frameworks. The same
+`--framework` flag selects the Go framework when `--target go`.
+
+```bash
+phoenix gen schema.phx --target go --framework chi --out ./generated
 ```
 
 ### Python
@@ -448,6 +459,21 @@ type Handlers interface {
 }
 ```
 
+**Server framework:** `server.go` targets the standard library `net/http`
+`ServeMux` (Go 1.22+ method-pattern routing) by default. Pass `--framework chi`
+(or set `framework = "chi"` in `phoenix.toml`) to emit a
+`github.com/go-chi/chi/v5` router instead — `NewRouter` returns a `chi.Router`
+(itself an `http.Handler`, so callers mount it exactly like a `*http.ServeMux`).
+Only `server.go` changes; `types.go`, `client.go`, and `handlers.go` are
+identical across frameworks. The chi output adds `github.com/go-chi/chi/v5` to
+your module's dependencies (`go get` it). `--framework` is the same flag used for
+TypeScript, interpreted per target. The Go default value may be written either
+`net/http` or `nethttp` (the slash-free spelling is convenient as a config key).
+
+```bash
+phoenix gen schema.phx --target go --framework chi --out ./generated
+```
+
 ### OpenAPI
 
 ```bash
@@ -502,12 +528,28 @@ schema = "api/schema.phx"
 target = "typescript"
 out_dir = "./generated"
 mode = "both"                 # "client", "server", or "both"
-ts_framework = "express"      # TypeScript server framework: "express" (default) or "fastify"
+framework = "fastify"         # server framework, per target: TS express|fastify, Go net/http|chi
 ```
 
-`ts_framework` only affects the TypeScript `server.ts`; non-TypeScript targets
+`framework` is interpreted per target — `express`/`fastify` for TypeScript's
+`server.ts`, `net/http`/`chi` for Go's `server.go`; the python/openapi targets
 ignore it. In a multi-target config it can be set per target (under
 `[gen.targets.<name>]`) and falls back to the top-level `[gen]` value.
+
+A value set **for a specific target** (a per-target `framework`, or `--framework`
+with a single `--target`) is validated against that target, so a typo is an error
+rather than a silent fallback. A **broadcast** value — the top-level `[gen]
+framework` or a global `--framework` shared across several targets — is applied
+only where it's recognized: a target that doesn't understand it (e.g. Go seeing
+`fastify`) falls back to its own default instead of failing the run. So a single
+top-level `framework = "fastify"` can drive a mixed TypeScript + Go config without
+breaking the Go target.
+
+> **Breaking change:** the selector was renamed from `ts_framework` to
+> `framework` (and the CLI flag from `--ts-framework` to `--framework`). The old
+> `ts_framework` key is no longer accepted — `phoenix.toml` validation rejects
+> unknown keys, so a stale `ts_framework = …` now fails at config load with an
+> `unknown field` error. Rename it to `framework`.
 
 ### Multiple targets
 
@@ -543,8 +585,9 @@ phoenix gen --client
 # Override output directory
 phoenix gen --out ./custom-dir
 
-# Override the TypeScript server framework for every target
-phoenix gen --ts-framework fastify
+# Override the server framework for the selected target (per target: TS
+# express|fastify, Go net/http|chi)
+phoenix gen --target typescript --framework fastify
 ```
 
 ---

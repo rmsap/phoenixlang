@@ -39,6 +39,15 @@ factors the run loop behind a `Mount` function, so `driver.ts` (Express) and
 how they stand up the generated server. The `typescript_roundtrip` test runs the
 same contract through both.
 
+Go likewise proves **both frameworks** (`net/http` and chi) with **one driver**:
+`chi.Router` is an `http.Handler`, so the driver mounts `NewRouter(stub)` the same
+way regardless. `go_chi_roundtrip` generates the chi `server.go`, adds the chi
+`require` to the throwaway module, and reuses the `go.sum` from the committed
+`tests/scaffold/go-chi/` compile-lint scaffold (the single pinned source of chi's
+hashes) so `go test` resolves chi from the local module cache — offline, no vendor
+tree. It skips with a log when chi isn't cached and `PHOENIX_GEN_E2E` (which
+permits the network) isn't set.
+
 ## `contract.json` schema
 
 A JSON **array** of interaction cases. Every target driver parses this same

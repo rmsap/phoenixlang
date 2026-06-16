@@ -34,7 +34,10 @@
 use std::path::{Path, PathBuf};
 
 mod common;
-use common::{e2e_required, gate, missing_tools, parse_and_check, run};
+use common::{
+    chi_module_at_version, chi_require_from_scaffold, chi_scaffold_dir, e2e_required, gate,
+    go_module_cached, missing_tools, parse_and_check, run,
+};
 
 /// The schema every target round-trips against. Same fixture the
 /// compile-and-lint harness uses, so the two suites stay in lock-step.
@@ -58,6 +61,15 @@ fn roundtrip_dir() -> PathBuf {
 fn generate_go_files(schema: &str) -> phoenix_codegen::GoFiles {
     let (program, result) = parse_and_check(schema);
     phoenix_codegen::generate_go(&program, &result)
+}
+
+/// Like [`generate_go_files`] but emits the chi `server.go` variant. Only the
+/// router wiring in `server.go` differs (chi handlers are ordinary
+/// `http.HandlerFunc`s); the driver mounts `NewRouter(stub)` as an `http.Handler`
+/// either way, so the round-trip driver is shared unchanged.
+fn generate_go_chi_files(schema: &str) -> phoenix_codegen::GoFiles {
+    let (program, result) = parse_and_check(schema);
+    phoenix_codegen::generate_go_with(&program, &result, phoenix_codegen::GoServerFramework::Chi)
 }
 
 /// Generates the Go `api` package from `SCHEMA`, assembles a tempdir Go module
@@ -132,6 +144,96 @@ fn go_roundtrip() {
 
     let (ok, out) = run(root, "go", &["test", "./..."]);
     assert!(ok, "go round-trip test failed:\n{out}");
+}
+
+/// Round-trips the generated **chi** server. Identical to [`go_roundtrip`] except
+/// the chi `server.go` variant is generated and the module requires chi: the
+/// driver is unchanged because it mounts `NewRouter(stub)` as an `http.Handler`,
+/// and `chi.Router` is one. The chi `require` is added to the module and the
+/// matching `go.sum` is copied from the committed `go-chi` scaffold (the single
+/// pinned source of chi's hashes); `go test` then resolves chi from the module
+/// cache (offline) or the proxy (network). If chi isn't cached and
+/// `PHOENIX_GEN_E2E=1` isn't set (which permits the network), the test skips
+/// rather than reaching for the proxy in a sandboxed/offline run.
+///
+/// One round-trip over `SCHEMA` (`gen_api.phx`) is full coverage of the chi
+/// divergence: that schema exercises all five verbs (so every `router.MethodFunc`
+/// registration runs), nine path-param endpoints across varied shapes (`{id}`,
+/// `{postId}`, `{tag}`, nested) so `chi.URLParam` is driven on each, plus request
+/// and response headers and multi-status responses — all through the real
+/// decode→handle→respond path. The chi-vs-net/http delta lives entirely in
+/// router wiring / registration / the path-param accessor, so re-running the
+/// fixture library here would add no behavioral coverage the contract doesn't
+/// already give.
+#[test]
+fn go_chi_roundtrip() {
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    // chi is resolved from the module cache (or the proxy under E2E), not
+    // vendored. Skip cleanly if it isn't cached and the network isn't permitted,
+    // so a sandboxed/offline run doesn't fail trying to download.
+    let chi_scaffold = chi_scaffold_dir();
+    // chi's pinned version comes from the scaffold's own `go.mod` (the single
+    // source of truth, shared with the compile-lint scaffold): `module version`
+    // form for the `require` directive, `module@version` for the cache gate.
+    let chi_require = chi_require_from_scaffold(&chi_scaffold);
+    let chi_at_version = chi_module_at_version(&chi_scaffold);
+    if !e2e_required() && !go_module_cached(&chi_at_version) {
+        eprintln!(
+            "SKIP go chi round-trip (set PHOENIX_GEN_E2E=1 to enforce): \
+             {chi_at_version} not in the Go module cache"
+        );
+        return;
+    }
+
+    let files = generate_go_chi_files(SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    let driver_dir = roundtrip_dir().join("go");
+    // Base module + the chi require so the chi-importing server.go resolves.
+    let base_mod =
+        std::fs::read_to_string(driver_dir.join("go.mod.template")).expect("read go.mod.template");
+    let go_mod = format!("{}\nrequire {}\n", base_mod.trim_end(), chi_require);
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+    // Copy the scaffold's go.sum (the single pinned source of chi's hashes) so
+    // `go test` verifies chi against it while resolving the module from the cache.
+    let go_sum =
+        std::fs::read_to_string(chi_scaffold.join("go.sum")).expect("read go-chi scaffold go.sum");
+    std::fs::write(root.join("go.sum"), go_sum).expect("write go.sum");
+
+    let mut copied_driver = false;
+    for entry in std::fs::read_dir(&driver_dir).expect("read go driver dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().expect("go file name");
+        if name.to_str().is_some_and(|n| n.ends_with("_test.go")) {
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            std::fs::write(root.join(name), contents)
+                .unwrap_or_else(|e| panic!("write {name:?}: {e}"));
+            if name == "roundtrip_test.go" {
+                copied_driver = true;
+            }
+        }
+    }
+    assert!(
+        copied_driver,
+        "no roundtrip_test.go found in {}; go module would have no tests to run",
+        driver_dir.display()
+    );
+    std::fs::write(root.join("contract.json"), CONTRACT_JSON).expect("write contract.json");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go chi round-trip test failed:\n{out}");
 }
 
 // ── TypeScript target ─────────────────────────────────────────────────────
