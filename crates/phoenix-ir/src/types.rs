@@ -195,6 +195,78 @@ impl IrType {
         matches!(self, IrType::StructRef(n, args) if n == GENERIC_PLACEHOLDER && args.is_empty())
     }
 
+    /// Returns `true` if this type has the [`GENERIC_PLACEHOLDER`] as an
+    /// **enum type argument**, at any nesting reached through containers
+    /// (`Result<Int, __generic>`, `Option<__generic>`,
+    /// `List<Option<__generic>>`).
+    ///
+    /// This is the precise signal of the imprecision that miscompiles on
+    /// wasm32-gc: an enum is a *nominal* type there, so a `__generic` in
+    /// its argument slot can't be pinned to a unique instantiation when
+    /// siblings of the same template exist. It arises from
+    /// **phantom-parameter constructors** (`Ok(99)` doesn't constrain the
+    /// error type, `None` constrains neither) — exactly what sema's
+    /// expected-type pinning (`pin_inferred_type_to_annotation`) resolves.
+    /// Used by the IR verifier (§Phase 2.4 K.12).
+    ///
+    /// Deliberately *not* flagged: a placeholder that is a bare type
+    /// (`__generic`), a list/map *element* (`List<__generic>`), a struct
+    /// *argument*, or a closure parameter/return — these come from inert
+    /// sources (a dead generic closure's erased capture, an unconstrained
+    /// empty literal no nominal codegen consumes) and run identically on
+    /// every backend, so rejecting them would be a regression. The walk
+    /// still *recurses through* those containers to catch an enum nested
+    /// inside them.
+    ///
+    /// The match is **asymmetric** about nesting direction: an enum *inside*
+    /// a container (`List<Option<__generic>>`) is caught — the walk recurses
+    /// through the container into the enum arg — but a container-with-an-
+    /// inert-element *inside* an enum (`Option<List<__generic>>`) is **not**:
+    /// the enum arg is the `List`, which is not itself the placeholder, and
+    /// the placeholder it holds is an inert list *element*. That is the
+    /// intended scope (the inner `List<__generic>` is always an empty,
+    /// run-identically-everywhere literal); it is not full coverage of every
+    /// nested placeholder. This shape is not known to arise in practice (it
+    /// would need a `Some(<unconstrained empty list>)`).
+    ///
+    /// The non-nesting arm (the scalars `I64`/`F64`/`Bool`/`Void`,
+    /// `StringRef`, `DynRef`, and `TypeVar`) deliberately returns `false`
+    /// without recursing: none of those nest another `IrType`. It is written
+    /// as an *explicit* enumeration rather than a `_` wildcard precisely so
+    /// the match stays exhaustive — every variant that *does* nest a type
+    /// (Struct/Enum/List/Map/ListBuilder/MapBuilder/Closure) is matched
+    /// explicitly above, so a future `IrType` with a new nesting variant
+    /// (e.g. a tuple or array type) is a compile error here rather than a
+    /// silent false-negative. Do **not** collapse it to `_ => false`.
+    pub fn contains_placeholder_in_enum_arg(&self) -> bool {
+        match self {
+            IrType::EnumRef(_, args) => args
+                .iter()
+                .any(|a| a.is_generic_placeholder() || a.contains_placeholder_in_enum_arg()),
+            IrType::StructRef(_, args) => args.iter().any(Self::contains_placeholder_in_enum_arg),
+            IrType::ListRef(e) | IrType::ListBuilderRef(e) => e.contains_placeholder_in_enum_arg(),
+            IrType::MapRef(k, v) | IrType::MapBuilderRef(k, v) => {
+                k.contains_placeholder_in_enum_arg() || v.contains_placeholder_in_enum_arg()
+            }
+            IrType::ClosureRef {
+                param_types,
+                return_type,
+            } => {
+                param_types
+                    .iter()
+                    .any(Self::contains_placeholder_in_enum_arg)
+                    || return_type.contains_placeholder_in_enum_arg()
+            }
+            IrType::I64
+            | IrType::F64
+            | IrType::Bool
+            | IrType::Void
+            | IrType::StringRef
+            | IrType::DynRef(_)
+            | IrType::TypeVar(_) => false,
+        }
+    }
+
     /// Recursively replace every [`IrType::TypeVar`] occurrence in `self`
     /// with `StructRef(GENERIC_PLACEHOLDER)`. Used by post-monomorphization
     /// cleanup (for orphan type variables that escaped sema inference,
@@ -366,6 +438,86 @@ mod tests {
                     expected_placeholder,
                 ]
             )
+        );
+    }
+
+    /// The [`GENERIC_PLACEHOLDER`] sentinel as a value type.
+    fn placeholder() -> IrType {
+        IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new())
+    }
+
+    #[test]
+    fn placeholder_in_enum_arg_flags_direct_and_nested() {
+        // `Option<__generic>` — a direct placeholder in an enum arg.
+        assert!(
+            IrType::EnumRef("Option".into(), vec![placeholder()])
+                .contains_placeholder_in_enum_arg()
+        );
+        // `Result<Int, __generic>` — phantom error slot.
+        assert!(
+            IrType::EnumRef("Result".into(), vec![IrType::I64, placeholder()])
+                .contains_placeholder_in_enum_arg()
+        );
+        // `List<Option<__generic>>` — reached by recursing through a
+        // container into a nested enum arg.
+        assert!(
+            IrType::ListRef(Box::new(IrType::EnumRef(
+                "Option".into(),
+                vec![placeholder()]
+            )))
+            .contains_placeholder_in_enum_arg()
+        );
+        // `Map<Int, Option<__generic>>` — nested in the value position.
+        assert!(
+            IrType::MapRef(
+                Box::new(IrType::I64),
+                Box::new(IrType::EnumRef("Option".into(), vec![placeholder()])),
+            )
+            .contains_placeholder_in_enum_arg()
+        );
+        // `Box<Result<Int, __generic>>` — nested through a struct arg.
+        assert!(
+            IrType::StructRef(
+                "Box".into(),
+                vec![IrType::EnumRef(
+                    "Result".into(),
+                    vec![IrType::I64, placeholder()]
+                )],
+            )
+            .contains_placeholder_in_enum_arg()
+        );
+    }
+
+    #[test]
+    fn placeholder_outside_enum_arg_is_inert() {
+        // A *bare* placeholder is inert.
+        assert!(!placeholder().contains_placeholder_in_enum_arg());
+        // `List<__generic>` — a placeholder as a list *element*, not an
+        // enum arg (an unconstrained empty literal); must stay unflagged.
+        assert!(!IrType::ListRef(Box::new(placeholder())).contains_placeholder_in_enum_arg());
+        // `Map<__generic, __generic>` — placeholders as map key/value.
+        assert!(
+            !IrType::MapRef(Box::new(placeholder()), Box::new(placeholder()))
+                .contains_placeholder_in_enum_arg()
+        );
+        // `Box<__generic>` — a placeholder as a *struct* arg (a dead
+        // generic closure's erased capture); inert.
+        assert!(
+            !IrType::StructRef("Box".into(), vec![placeholder()])
+                .contains_placeholder_in_enum_arg()
+        );
+        // A placeholder in a closure param / return — inert.
+        assert!(
+            !IrType::ClosureRef {
+                param_types: vec![placeholder()],
+                return_type: Box::new(placeholder()),
+            }
+            .contains_placeholder_in_enum_arg()
+        );
+        // A fully-concrete enum carries no placeholder.
+        assert!(
+            !IrType::EnumRef("Result".into(), vec![IrType::I64, IrType::StringRef])
+                .contains_placeholder_in_enum_arg()
         );
     }
 }

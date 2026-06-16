@@ -1,0 +1,217 @@
+// Pins the expected-type inference (§Phase 2.4 K.12) that resolves
+// phantom-parameter enum constructors — `Ok(x)` doesn't constrain the
+// error type, `None` constrains neither — from their surrounding
+// context. The program deliberately has *two* `Result` instantiations
+// (`Result<Int,String>` and `Result<Int,Int>` via `mapErr`), so a
+// `Result<Int, __generic>` left unpinned would be ambiguous on
+// wasm32-gc's nominal types and diverge from the structural backends.
+// Each construct exercises a different pinning boundary.
+
+// Generic struct whose field is a phantom-param enum: `Box(None)` pins
+// the `None` to the field type `Option<Int>` derived from the declared
+// `Box<Int>` — the generic-struct field-initializer boundary.
+struct Box<T> {
+  v: Option<T>
+}
+
+// Implicit return: `Ok(99)` pinned from the declared return type.
+function recover(r: Result<Int, String>) -> Result<Int, String> {
+  r.orElse(function(e: String) -> Result<Int, String> { Ok(99) })
+}
+
+// Explicit return: `return Ok(7)` pinned from the declared return type.
+// Also guards the `check_block_type` clobber fix: re-inferring the return
+// expression after `check_return` pinned it would reintroduce `__generic`.
+function reset(r: Result<Int, String>) -> Result<Int, String> {
+  return Ok(7)
+}
+
+// Function-level implicit return of a *bare* phantom constructor (not a
+// method call whose type is already concrete, and not a lambda body) —
+// `None` constrains neither of `Option`'s params, so its tail-expression
+// type records `Option<?>` and must be pinned to `Option<Int>` by the
+// implicit-return pin in `checker.rs::check_function`. This is the path
+// the `check_block_type` implicit-return arm must NOT clobber by moving
+// re-inference after the pin; without the pin the slot lowers to
+// `Option<__generic>` and the IR verifier rejects it.
+function bareNone() -> Option<Int> {
+  None
+}
+
+// The phantom-error analogue, bare and implicit: `Ok(8)` fixes `T` but
+// not `E`, recording `Result<Int, ?>`.
+function bareOk() -> Result<Int, String> {
+  Ok(8)
+}
+
+// Call argument + nested constructor: `Ok(Some(n))` / `Ok(None)` pinned
+// from the parameter type, recursively into the inner Option.
+function describe(r: Result<Option<Int>, String>) -> Int {
+  match r {
+    Ok(o) -> o.unwrapOr(-1)
+    Err(_) -> -2
+  }
+}
+
+// Named-argument call: a phantom-param `Ok` passed as a *named* argument
+// (`wrap(tag: 0, payload: Ok(13))`) must be pinned from the parameter type
+// too — the named-arg analogue of the positional call-arg pin, guarding
+// the named-arg branch in `check_expr_call.rs`.
+function wrap(tag: Int, payload: Result<Int, String>) -> Int {
+  payload.unwrapOr(tag)
+}
+
+// Generic struct whose phantom-typed field's parameter is fixed by a
+// *sibling* argument: in `Pair(5, None)` the first field binds `T = Int`,
+// so the second field's expected type is the concrete `Option<Int>` and
+// the call-site struct field-initializer pin resolves the `None` directly
+// — with no `let` annotation to lean on. This isolates the struct-arg pin
+// in `check_expr_call.rs` (distinct from `Box(None)` below, which is
+// pinned through the `let` annotation).
+struct Pair<T> {
+  a: T
+  b: Option<T>
+}
+
+// Non-generic struct with a phantom-typed field. `Holder(None)` routes
+// through the *non-generic* struct-literal arm, whose field-initializer
+// pin fixes the `None` to the declared field type `Option<Int>` directly —
+// there is no generic parameter to recover it from a sibling argument, so
+// only the constructor-site field pin can resolve it.
+struct Holder {
+  v: Option<Int>
+}
+
+// User-defined method taking a phantom-param constructor: `d.take(Ok(7))`
+// must pin the argument to the parameter type `Result<Int, String>`
+// through the method-call argument path — the method-call analogue of the
+// free-function call-arg pin. Without it the argument lowers to
+// `Result<Int, __generic>` and the IR verifier rejects it.
+struct Dispatcher {
+  base: Int
+
+  function take(self, payload: Result<Int, String>) -> Int {
+    payload.unwrapOr(self.base)
+  }
+}
+
+// Generic function with a phantom constructor passed as an argument,
+// exercised through *both* the positional (`combine(0, Ok(9))`) and
+// named (`combine(seed: 0, payload: Ok(9))`) generic-call arms — each
+// must pin `payload` to `Result<Int, String>` just as the non-generic
+// call path does; `seed` only makes the function generic so the call
+// routes through the generic path (it is unused, like `emptyList`'s
+// `seed` in the companion fixture).
+function combine<T>(seed: T, payload: Result<Int, String>) -> Int {
+  payload.unwrapOr(-1)
+}
+
+function main() {
+  let ok: Result<Int, String> = Ok(5)
+  let err: Result<Int, String> = Err("bad")
+
+  // Second Result sibling: Result<Int, Int> (forces the ambiguity).
+  print(ok.mapErr(function(e: String) -> Int { e.length() }).unwrapOr(-1))
+  print(err.mapErr(function(e: String) -> Int { e.length() }).unwrapOr(-7))
+
+  // orElse with a phantom-param `Ok` in the recovery closure.
+  print(recover(err).unwrapOr(-1))
+  print(recover(ok).unwrapOr(-1))
+
+  // Explicit-return phantom-param `Ok` pinned from the return type.
+  print(reset(err).unwrapOr(-1))
+
+  // Function-level implicit-return bare phantom constructors.
+  print(bareNone().unwrapOr(-5))
+  print(bareOk().unwrapOr(-1))
+
+  // Nested constructor through a call argument.
+  print(describe(Ok(Some(42))))
+  print(describe(Ok(None)))
+  print(describe(Err("x")))
+
+  // Phantom constructor passed as a *named* argument.
+  print(wrap(tag: -1, payload: Ok(13)))
+  print(wrap(tag: -4, payload: Err("e")))
+
+  // Struct field-initializer pin, isolated (no annotation): `T` is fixed
+  // by the sibling arg `5`, so the only thing that can pin the phantom
+  // `None` to `Option<Int>` is the call-site struct field pin.
+  let pair = Pair(5, None)
+  print(pair.a)
+  print(pair.b.unwrapOr(-2))
+
+  // `None` in a generic-struct field pinned from the `Box<Int>` annotation.
+  let boxed: Box<Int> = Box(None)
+  print(boxed.v.unwrapOr(-3))
+
+  // `None` in a list element pinned from the annotation.
+  let opts: List<Option<Int>> = [Some(1), None, Some(3)]
+  for o in opts {
+    print(o.unwrapOr(-9))
+  }
+
+  // Phantom-typed *first* element: `check_list_literal` records the
+  // container as `List<first_element_type>` (no cross-element
+  // unification), so a leading `None` leaves the *container*
+  // `List<Option<?>>` — the `ListAlloc` result type must still be pinned
+  // to the annotation, not just the elements.
+  let optsFirst: List<Option<Int>> = [None, Some(11), None]
+  for o in optsFirst {
+    print(o.unwrapOr(-8))
+  }
+
+  // All-phantom list: no concrete element anywhere, so both elements and
+  // container rely entirely on the annotation.
+  let optsAll: List<Option<Int>> = [None, None]
+  for o in optsAll {
+    print(o.unwrapOr(-6))
+  }
+
+  // Map with a phantom-typed first value: the container records
+  // `Map<Int, Option<?>>` from the first entry (no cross-entry
+  // unification), so the `MapAlloc` result type must be pinned from the
+  // annotation too, not just the entry values.
+  let m: Map<Int, Option<Int>> = {1: None, 2: Some(22)}
+  print(m.length())
+  print(if m.contains(1) { 1 } else { 0 })
+
+  // `None` in an if/match arm pinned from the let annotation.
+  let picked: Option<Int> = if true { Some(7) } else { None }
+  print(picked.unwrapOr(0))
+
+  // `None` in a match arm in value position pinned from the let annotation.
+  let matched: Option<Int> = match ok {
+    Ok(v) -> Some(v)
+    Err(_) -> None
+  }
+  print(matched.unwrapOr(0))
+
+  // `None` in the *middle* arm of an `else if` chain in value position —
+  // exercises the `ElseBranch::ElseIf` recursion in `pin_if_branches`
+  // (the single `if`/`else` case above only reaches the `else` block arm).
+  let chained: Option<Int> = if false { Some(1) } else if true { None } else { Some(3) }
+  print(chained.unwrapOr(-11))
+
+  // Non-generic struct, phantom field pinned at the constructor site.
+  let h = Holder(None)
+  print(h.v.unwrapOr(-12))
+
+  // Method call with a phantom-param constructor argument, at both variants.
+  let d = Dispatcher(100)
+  print(d.take(Ok(7)))
+  print(d.take(Err("e")))
+
+  // Generic function, phantom constructor as a *positional* argument, at
+  // two instantiations (T = Int, T = String) so a stray `__generic` would
+  // be ambiguous on wasm32-gc. Exercises the positional generic-call-arg
+  // pin (`infer_and_check_call_generics`), distinct from the named arm
+  // below.
+  print(combine(0, Ok(9)))
+  print(combine("x", Err("bad")))
+
+  // The same function, phantom constructor as a *named* argument, at the
+  // two instantiations — exercises the named generic-call-arg pin.
+  print(combine(seed: 0, payload: Ok(9)))
+  print(combine(seed: "x", payload: Err("bad")))
+}

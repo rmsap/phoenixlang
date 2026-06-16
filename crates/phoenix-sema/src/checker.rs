@@ -1291,6 +1291,14 @@ impl Checker {
                         expr_stmt.span,
                     );
                 }
+                // Pin a tail constructor whose inference left phantom type
+                // params unbound (`Ok(99)` in a `-> Result<Int, String>`
+                // body records `Result<Int, ?>`) to the declared return
+                // type — the implicit-return analogue of the `let`-
+                // annotation pinning. Without it the unconstrained slot
+                // lowers to the `__generic` placeholder and can't be
+                // resolved to a unique nominal enum on wasm32-gc.
+                self.pin_inferred_type_to_annotation(&expr_stmt.expr, return_type);
             }
             _ => {
                 if !func.body.statements.iter().any(Self::contains_return) {
@@ -1458,11 +1466,35 @@ impl Checker {
             self.check_statement(stmt);
             if let Statement::Return(ret) = stmt {
                 return_type = match &ret.value {
-                    Some(expr) => self.infer_expr_type(expr),
+                    // Read the type `check_statement` (→ `check_return`)
+                    // just recorded — already pinned to the function's
+                    // return type when the expression left a phantom slot
+                    // (`return None`). Re-inferring here via
+                    // `infer_expr_type` would re-run `check_expr` and
+                    // clobber that pin back to the unconstrained type,
+                    // re-introducing `__generic`. See
+                    // `pin_inferred_type_to_annotation`. Fall back to
+                    // re-inference only if `check_return` somehow left the
+                    // span unrecorded (it always records via `check_expr`),
+                    // so a missing entry never silently degrades to `Void`.
+                    Some(expr) => self
+                        .expr_types
+                        .get(&expr.span())
+                        .cloned()
+                        .unwrap_or_else(|| self.infer_expr_type(expr)),
                     None => Type::Void,
                 };
             }
-            // Last expression in block is an implicit return
+            // Last expression in block is an implicit return.
+            //
+            // Unlike the `return` path above, this re-infers via
+            // `infer_expr_type` rather than reading the recorded type —
+            // and that is safe *here* because the implicit-return pin
+            // (`validate_implicit_return`) and the branch/lambda pins run
+            // *after* `check_block_type`, so there is no pin yet to
+            // clobber. Do not "symmetrize" this with the `return` arm by
+            // reading the recorded type: that would move re-inference
+            // after the pin and reintroduce the `__generic` clobber.
             if i == block.statements.len() - 1
                 && let Statement::Expression(expr_stmt) = stmt
             {

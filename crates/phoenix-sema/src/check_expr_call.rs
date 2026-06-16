@@ -286,6 +286,12 @@ impl Checker {
                     arg.span(),
                 );
             }
+            // Pin a constructor argument whose phantom type params are
+            // unbound (`d.take(Ok(5))` where `take`'s parameter is
+            // `Result<Int, String>`) to the concrete parameter type — the
+            // method-call analogue of the free-function call-arg pin. See
+            // `pin_inferred_type_to_annotation`.
+            self.pin_inferred_type_to_annotation(arg, &expected);
         }
     }
 
@@ -372,6 +378,11 @@ impl Checker {
                             arg.span(),
                         );
                     }
+                    // Pin a field-initializer constructor whose phantom type
+                    // params are unbound (`Node(2, None)` where `next` is
+                    // `Option<Node<Int>>`) to the concrete field type. See
+                    // `pin_inferred_type_to_annotation`.
+                    self.pin_inferred_type_to_annotation(arg, &expected);
                 }
                 let result_args: Vec<Type> = struct_info
                     .type_params
@@ -398,6 +409,8 @@ impl Checker {
                             arg.span(),
                         );
                     }
+                    let field_ty = field.ty.clone();
+                    self.pin_inferred_type_to_annotation(arg, &field_ty);
                 }
             }
             return Type::Named(self.qualify_in_current(&sl.name));
@@ -455,6 +468,11 @@ impl Checker {
                             arg.span(),
                         );
                     }
+                    // Pin a nested constructor whose phantom type params are
+                    // unbound (`Some(Ok(1))` where the payload is
+                    // `Result<Int, String>`) to the concrete variant-field
+                    // type. See `pin_inferred_type_to_annotation`.
+                    self.pin_inferred_type_to_annotation(arg, &expected);
                 }
                 let result_args: Vec<Type> = type_params
                     .iter()
@@ -716,6 +734,10 @@ impl Checker {
                     arg.span(),
                 );
             }
+            // Pin a constructor argument with unbound phantom type params
+            // (`other(Ok(5))`) to the concrete parameter type. See
+            // `pin_inferred_type_to_annotation`.
+            self.pin_inferred_type_to_annotation(arg, &func_info.params[i]);
         }
         // Type-check named args
         for (name, expr) in &call.named_args {
@@ -733,6 +755,7 @@ impl Checker {
                         expr.span(),
                     );
                 }
+                self.pin_inferred_type_to_annotation(expr, &func_info.params[idx]);
             }
         }
 
@@ -847,6 +870,11 @@ impl Checker {
                     arg.span(),
                 );
             }
+            // Pin a constructor argument whose phantom type params are
+            // unbound (`other(Ok(5))` where `other` takes
+            // `Result<Int, String>`) to the concrete parameter type. See
+            // `pin_inferred_type_to_annotation`.
+            self.pin_inferred_type_to_annotation(arg, &expected);
         }
         for (name, expr) in &call.named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name) {
@@ -860,6 +888,12 @@ impl Checker {
                         expr.span(),
                     );
                 }
+                // Pin a phantom-param constructor passed as a *named* argument
+                // to a generic function — the named-arg analogue of the
+                // positional pin just above (the non-generic call path pins
+                // both arms; this one must too). See
+                // `pin_inferred_type_to_annotation`.
+                self.pin_inferred_type_to_annotation(expr, &expected);
             }
         }
 

@@ -1,0 +1,89 @@
+// Generic functions whose body annotates a collection literal with a
+// *type parameter* (`let xs: List<T> = []`, `let m: Map<K, V> = {}`).
+//
+// The leaf-refinement guard in `pin_inferred_type_to_annotation`
+// (§Phase 2.4 K.12) deliberately does *not* pin these: the annotation
+// still carries a type var, so there is nothing concrete to refine
+// toward and resolution is left to monomorphization. An empty (or
+// all-phantom) container records `List<?>` / `Map<?, ?>` and lowers to a
+// `__generic` element, which the IR verifier tolerates as inert (it is
+// not an enum type argument) and every backend allocates identically. A
+// non-empty `[a, b]` keeps the recorded `List<T>` and is resolved by
+// monomorphization per instantiation.
+//
+// This pins the cross-backend behavior of the type-var-annotation branch
+// of the guard — the path the old, unconditional pin used to rewrite to
+// `List<T>` and the new guard now leaves for mono. It deliberately
+// instantiates each generic at *two* concrete types so a stray
+// `__generic` that escaped mono would diverge on wasm32-gc.
+
+// Empty list, generic annotation: the guard skips the pin, mono resolves
+// the element from the call's `T`. The `seed` only makes `T` inferable
+// from the argument (so this doesn't depend on return-type inference).
+function emptyList<T>(seed: T) -> List<T> {
+  let xs: List<T> = []
+  xs
+}
+
+// Non-empty list, generic annotation: stays `List<T>`, resolved by mono.
+function pairList<T>(a: T, b: T) -> List<T> {
+  let xs: List<T> = [a, b]
+  xs
+}
+
+// Empty map, generic annotation: same guard path through `Map<K, V>`.
+function emptyMap<K, V>(k: K, v: V) -> Map<K, V> {
+  let m: Map<K, V> = {}
+  m
+}
+
+// Sorting a generic-annotated empty list. Because the element stays
+// `__generic` (the guard leaves the type-var annotation for mono, and the
+// empty literal gives mono no element source), this is the one path that
+// reaches the `__generic` ref branch in `List.sortBy`'s wasm32-linear
+// lowering. It is safe by construction — lists are immutable, so a
+// `__generic`-element list is always empty and the sort's inner loop
+// never runs — and this pins that, including at a ref element type
+// (`String`) where the linear backend's shadow-frame GC-root branch is
+// exercised. See the comment in
+// `phoenix-cranelift/src/wasm/builtins.rs::translate_list_sortby`. (The
+// wasm32-gc lowering in `wasm_gc/lists.rs::translate_list_sort_by` needs
+// no rooting — the host VM traces the in-flight key — so the placeholder
+// branch is specific to the linear backend.)
+function emptySortedLen<T>(seed: T) -> Int {
+  let xs: List<T> = []
+  let sorted: List<T> = xs.sortBy(function(a: T, b: T) -> Int { 0 })
+  sorted.length()
+}
+
+function main() {
+  // emptyList at Int and String — two instantiations.
+  let ints: List<Int> = emptyList(0)
+  print(ints.length())
+  let strs: List<String> = emptyList("x")
+  print(strs.length())
+
+  // pairList at Int and String, with the elements observed so the
+  // resolved element type actually matters.
+  let nums: List<Int> = pairList(3, 4)
+  print(nums.length())
+  for n in nums {
+    print(n)
+  }
+  let words: List<String> = pairList("a", "b")
+  print(words.length())
+  for w in words {
+    print(w)
+  }
+
+  // emptyMap at two key/value instantiations.
+  let mi: Map<Int, String> = emptyMap(0, "x")
+  print(mi.length())
+  let ms: Map<String, Int> = emptyMap("k", 1)
+  print(ms.length())
+
+  // sortBy over a generic-annotated empty list, at a ref (String) and a
+  // value (Int) element type — the `__generic` ref-branch safety case.
+  print(emptySortedLen("x"))
+  print(emptySortedLen(0))
+}

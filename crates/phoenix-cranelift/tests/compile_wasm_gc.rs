@@ -3308,13 +3308,29 @@ fn enum_nested_generic_variant_field_reports_known_limitation() {
         "  }\n",
         "}\n",
     );
-    let ir_module = lower_to_ir(source);
-    let err = compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("a user-defined generic enum variant field is the K.4 known limitation");
-    let msg = err.to_string();
+    // The IR verifier now catches this *before* codegen, so it can't go
+    // through `lower_to_ir` (which asserts a clean verify). The
+    // `W(Option<T>)` variant field stays `Option<__generic>` in the
+    // `Wrapper<Int>` layout (the K.4 nested-generic-variant limitation),
+    // which the partial-generic-types invariant rejects as a value that
+    // would diverge across backends. See §Phase 2.4 K.12.
+    let tokens = phoenix_lexer::tokenize(source, SourceId(0));
+    let (program, parse_errors) = phoenix_parser::parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parser errors: {parse_errors:?}");
+    let analysis = phoenix_sema::checker::check(&program);
     assert!(
-        msg.contains("unresolved generic type") && msg.contains("Known limitation"),
-        "expected the generic known-limitation diagnostic, got: {msg}"
+        analysis.diagnostics.is_empty(),
+        "sema errors: {:?}",
+        analysis.diagnostics
+    );
+    let ir_module = phoenix_ir::lower(&program, &analysis.module);
+    let verify_errors = phoenix_ir::verify::verify(&ir_module);
+    assert!(
+        verify_errors
+            .iter()
+            .any(|e| e.message.contains("partially-generic type")
+                && e.message.contains("known limitation")),
+        "expected the partial-generic verifier diagnostic, got: {verify_errors:?}"
     );
 }
 

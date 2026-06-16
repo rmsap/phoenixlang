@@ -2535,18 +2535,25 @@ fn translate_list_sortby(
     let elem_size = phx_field_size_bytes(&elem_ty)?;
     // `is_ref_type()` returns true for the `__generic` placeholder
     // (`StructRef("__generic", [])`), so a sortBy over a placeholder-typed
-    // empty list would take the ref branch. Sema closes off that path in
-    // practice today — `let xs = []` is rejected as ambiguous
-    // (`phoenix-sema/src/check_stmt.rs::check_let`'s "cannot infer type"
-    // diagnostic) and `let xs: List<T> = []` is pinned to the annotation
-    // by `pin_inferred_type_to_annotation` — so every sortBy reachable
-    // from user code carries a concrete element type. The placeholder
-    // branch is therefore unreachable today; it is kept defensively (and
-    // is safe by construction: `len == 0` on the only path that could
-    // reach it, so the inner loop never executes and the rooted slot
-    // never participates in a collection). The GC-root emitter paired
-    // with `gc_roots::is_tracked_ref`'s placeholder skip makes this
-    // safe; see that file's docstring for the joint contract.
+    // list would take the ref branch. A placeholder element reaches here in
+    // exactly one shape: a *generic-annotated empty* literal, `let xs:
+    // List<T> = []` inside a generic function. Sema's
+    // `pin_inferred_type_to_annotation` (§Phase 2.4 K.12) only refines
+    // *toward a concrete* annotation, so a concrete `let xs: List<Int> =
+    // []` is pinned to `List<Int>`, but a type-var annotation `List<T>` is
+    // left for monomorphization — which, finding no source for the empty
+    // literal's element, lowers it to `List<__generic>`. (An un-annotated
+    // `let xs = []` is still rejected outright as ambiguous by
+    // `check_stmt.rs::check_let`'s "cannot infer type" diagnostic.)
+    //
+    // Sorting such a list is therefore *reachable* but safe by
+    // construction: lists are immutable (growth goes through `ListBuilder`,
+    // whose `freeze()` produces a list with a concrete element type), so a
+    // `__generic`-element list is *always empty*. `len == 0` on the only
+    // path that reaches the ref branch, so the inner loop never executes
+    // and the rooted slot never participates in a collection. The GC-root
+    // emitter paired with `gc_roots::is_tracked_ref`'s placeholder skip
+    // makes this safe; see that file's docstring for the joint contract.
     let elem_is_ref = elem_ty.is_ref_type();
 
     let list_ptr_local = ctx.binding_of(list_vid)?.single_local();

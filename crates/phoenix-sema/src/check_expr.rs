@@ -386,6 +386,14 @@ impl Checker {
                 lambda.span,
             );
         }
+        // Pin a tail constructor whose phantom type params are unbound
+        // (`function(e) -> Result<Int, String> { Ok(99) }`) to the
+        // lambda's declared return type — the implicit-return analogue of
+        // the `let`-annotation pinning, so the unconstrained slot doesn't
+        // lower to `__generic` and break wasm32-gc's nominal enums.
+        if let Some(Statement::Expression(es)) = lambda.body.statements.last() {
+            self.pin_inferred_type_to_annotation(&es.expr, &return_type);
+        }
         // Each lambda has its own outermost level (and its own defer
         // frame on both interpreters), so its body gets its own
         // placement check — defers nested deeper than the lambda body's

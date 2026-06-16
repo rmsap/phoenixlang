@@ -20,6 +20,7 @@ use crate::block::BlockId;
 use crate::instruction::{Op, VOID_SENTINEL, ValueId};
 use crate::module::{IrFunction, IrModule};
 use crate::terminator::Terminator;
+use crate::types::IrType;
 use std::collections::{HashMap, HashSet};
 
 /// Errors found during verification.
@@ -48,10 +49,78 @@ pub fn verify(module: &IrModule) -> Vec<VerifyError> {
     for func in module.concrete_functions() {
         verify_function(func, &mut errors);
         verify_no_unresolved_placeholder_ops(func, &mut errors);
+        verify_no_partial_generic_types(func, &mut errors);
         dyn_ops::verify_dyn_ops(module, func, &mut errors);
         dyn_ops::verify_dyn_def_sites(func, &mut errors);
     }
     errors
+}
+
+/// A concrete function whose inference left a *partially-generic* type —
+/// a `__generic` placeholder nested in a type argument, e.g.
+/// `Result<Int, __generic>` from a phantom-parameter constructor like
+/// `Ok(99)`, or `Option<__generic>` from a `None` whose context didn't
+/// pin it — must not reach a backend. The native and linear backends
+/// tolerate it (their enums are structural) but wasm32-gc can't pin the
+/// placeholder to a unique nominal instantiation when siblings exist, so
+/// the *same program* would produce output on some backends and a
+/// compile error on others — violating the cross-backend determinism the
+/// matrix guarantees.
+///
+/// This is the postcondition of complete (bidirectional) inference:
+/// every type in a concrete function is fully pinned from context. Sema's
+/// expected-type pinning (`pin_inferred_type_to_annotation`, applied at
+/// the `let` / return / lambda / call-arg / constructor-arg /
+/// collection-element / `if`-`match`-branch boundaries) enforces it at
+/// the source; a residual placeholder is an inference gap, caught here as
+/// a hard, backend-agnostic error rather than a divergence. See §Phase
+/// 2.4 K.12.
+///
+/// A *bare* placeholder (a dead generic closure's erased capture, an
+/// unconstrained empty literal no nominal codegen consumes) is inert and
+/// intentionally not flagged — see [`IrType::contains_placeholder_in_enum_arg`].
+///
+/// Coverage is by *value type*, not an exhaustive type walk: we check each
+/// block parameter and each instruction `result_type`. A partially-generic
+/// type produced anywhere materializes as some value (a constructor's
+/// result, a collection alloc, a phi/merge block parameter), so a residual
+/// placeholder surfaces on one of these. Operand types are not re-checked
+/// (they are some other instruction's already-checked result), and the
+/// function signature is covered transitively — its parameters are the
+/// entry block's parameters and its return value is a checked instruction
+/// result. If a future op carries a type that is neither a block param nor
+/// a `result_type`, extend the walk to cover it.
+fn verify_no_partial_generic_types(func: &IrFunction, errors: &mut Vec<VerifyError>) {
+    // `what` is built lazily (a closure rather than a `&str`) so the
+    // block-param label's `format!` only allocates on an actual violation —
+    // this walk visits every block param of every concrete function, but
+    // almost never flags one.
+    let mut flag = |ty: &IrType, what: &dyn Fn() -> String| {
+        if ty.contains_placeholder_in_enum_arg() {
+            let what = what();
+            errors.push(VerifyError {
+                function: func.name.clone(),
+                message: format!(
+                    "{what} has partially-generic type `{ty:?}`: a `__generic` \
+                     placeholder survived in a type argument — a generic type \
+                     parameter was left unresolved. Usually a phantom-parameter \
+                     constructor needs a type annotation at its binding or \
+                     boundary; it can also be the known limitation on nested \
+                     generic variant fields of user-defined enums (§Phase 2.4 \
+                     K.4 / K.12). Reaching a backend with this would diverge \
+                     across targets."
+                ),
+            });
+        }
+    };
+    for block in &func.blocks {
+        for (val, ty) in &block.params {
+            flag(ty, &|| format!("block param {val:?}"));
+        }
+        for inst in &block.instructions {
+            flag(&inst.result_type, &|| "instruction result".to_string());
+        }
+    }
 }
 
 /// Trait-bounded method calls on type-variable receivers are emitted
@@ -426,6 +495,209 @@ mod unresolved_placeholder_op_tests {
                 .iter()
                 .any(|e| e.message.contains("UnresolvedDynAlloc")),
             "placeholder in a template must not be flagged, got: {errors:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_generic_type_tests {
+    //! Tests for [`super::verify_no_partial_generic_types`]: a `__generic`
+    //! placeholder surviving as an *enum type argument* in a concrete
+    //! function must be rejected, whether it surfaces on a block parameter
+    //! or an instruction result. A bare placeholder, or one in a list
+    //! *element*, is inert and must pass, and a template (skipped by
+    //! [`crate::module::IrModule::concrete_functions`]) is never flagged.
+    //!
+    //! The underlying type predicate
+    //! ([`crate::types::IrType::contains_placeholder_in_enum_arg`]) is
+    //! exhaustively unit-tested in [`crate::types`]; these lock the verifier
+    //! *walk* — which value types it inspects (block params + instruction
+    //! `result_type`s) and its template skip — so a future change to the IR
+    //! shape can't silently narrow coverage.
+
+    use crate::instruction::{FuncId, Op};
+    use crate::module::{FunctionSlot, IrFunction, IrModule};
+    use crate::terminator::Terminator;
+    use crate::types::{GENERIC_PLACEHOLDER, IrType};
+    use crate::verify::{VerifyError, verify};
+
+    /// The `__generic` sentinel as a value type.
+    fn placeholder() -> IrType {
+        IrType::StructRef(GENERIC_PLACEHOLDER.to_string(), Vec::new())
+    }
+
+    fn has_partial_generic_error(errors: &[VerifyError]) -> bool {
+        errors
+            .iter()
+            .any(|e| e.message.contains("partially-generic type"))
+    }
+
+    fn concrete_func(name: &str) -> IrFunction {
+        IrFunction::new(
+            FuncId(0),
+            name.into(),
+            Vec::new(),
+            Vec::new(),
+            IrType::Void,
+            None,
+        )
+    }
+
+    #[test]
+    fn partial_generic_on_block_param_is_flagged() {
+        // `Result<Int, __generic>` on a block parameter — the shape a
+        // phantom-error `Ok(_)` produces at a merge/phi join.
+        let mut module = IrModule::new();
+        let mut func = concrete_func("concrete");
+        let entry = func.create_block();
+        func.add_block_param(
+            entry,
+            IrType::EnumRef("Result".into(), vec![IrType::I64, placeholder()]),
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        assert!(
+            has_partial_generic_error(&verify(&module)),
+            "a partially-generic block param must be flagged"
+        );
+    }
+
+    #[test]
+    fn partial_generic_on_instruction_result_is_flagged() {
+        // `Option<__generic>` as an instruction result — the value a `None`
+        // whose context never pinned it materializes as. Operands need no
+        // separate check: every operand is some other instruction's result,
+        // so a placeholder used downstream is already caught at the
+        // instruction that defines it (covered by this `result_type` walk).
+        let mut module = IrModule::new();
+        let mut func = concrete_func("concrete");
+        let entry = func.create_block();
+        func.emit(
+            entry,
+            Op::EnumAlloc("Option".into(), 1, Vec::new()),
+            IrType::EnumRef("Option".into(), vec![placeholder()]),
+            None,
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        assert!(
+            has_partial_generic_error(&verify(&module)),
+            "a partially-generic instruction result must be flagged"
+        );
+    }
+
+    #[test]
+    fn inert_placeholder_in_list_element_is_not_flagged() {
+        // `List<__generic>` (an unconstrained empty literal's element) is
+        // inert — it runs identically on every backend — so the verifier
+        // must accept it. Guards against the over-broad invariant that
+        // rejected working programs (`list_of_options`, et al.).
+        let mut module = IrModule::new();
+        let mut func = concrete_func("concrete");
+        let entry = func.create_block();
+        func.emit(
+            entry,
+            Op::ListAlloc(Vec::new()),
+            IrType::ListRef(Box::new(placeholder())),
+            None,
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        assert!(
+            !has_partial_generic_error(&verify(&module)),
+            "an inert placeholder (list element) must not be flagged"
+        );
+    }
+
+    #[test]
+    fn partial_generic_in_template_is_not_flagged() {
+        // Templates carry unresolved types by design and are skipped by
+        // `concrete_functions()`, so the same enum-arg placeholder rejected
+        // in a concrete function is allowed here.
+        let mut module = IrModule::new();
+        let mut func = concrete_func("tmpl");
+        let entry = func.create_block();
+        func.add_block_param(
+            entry,
+            IrType::EnumRef("Result".into(), vec![IrType::I64, placeholder()]),
+        );
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Template(func));
+
+        assert!(
+            !has_partial_generic_error(&verify(&module)),
+            "a placeholder in a template must not be flagged"
+        );
+    }
+
+    #[test]
+    fn partial_generic_in_signature_only_is_covered_transitively_not_directly() {
+        // Documents the walk's scope: it inspects *materialized value types*
+        // (block params + instruction `result_type`s), not the function's
+        // declared `return_type`/`params` fields directly. A function whose
+        // declared `return_type` carries a placeholder but whose body never
+        // materializes it (no block param, no instruction result of that
+        // type) is therefore *not* flagged here. That is sound because a
+        // value of the return type can't arise without surfacing as a checked
+        // instruction result — and source can't spell `__generic`, so a
+        // signature can't independently carry one. This test pins that
+        // contract: if a future IR shape lets a partially-generic signature
+        // exist without a corresponding materialized value, extend the walk.
+        let mut module = IrModule::new();
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "concrete".into(),
+            Vec::new(),
+            Vec::new(),
+            IrType::EnumRef("Result".into(), vec![IrType::I64, placeholder()]),
+            None,
+        );
+        let entry = func.create_block();
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        assert!(
+            !has_partial_generic_error(&verify(&module)),
+            "the declared return_type is not walked directly — only \
+             materialized values are"
+        );
+    }
+
+    #[test]
+    fn partial_generic_function_param_is_flagged_via_entry_block() {
+        // The companion to the `signature_only` test above: a partially-
+        // generic *parameter* type IS caught, because IR lowering binds each
+        // declared parameter as a parameter of the entry block (see
+        // `IrFunction::entry_block`'s invariant: "Function parameters are
+        // bound as the parameters of this block"). The walk's coverage of
+        // function parameters rests entirely on that binding — so this pins
+        // it: a function whose declared `param_types` carry `Result<Int,
+        // __generic>`, materialized as the entry block's param the way
+        // lowering does, must be flagged. If a future lowering change stopped
+        // binding params as entry-block params, the walk would silently miss
+        // them; this test fails loudly instead.
+        let mut module = IrModule::new();
+        let param_ty = IrType::EnumRef("Result".into(), vec![IrType::I64, placeholder()]);
+        let mut func = IrFunction::new(
+            FuncId(0),
+            "concrete".into(),
+            vec![param_ty.clone()],
+            vec!["p".into()],
+            IrType::Void,
+            None,
+        );
+        let entry = func.create_block();
+        func.add_block_param(entry, param_ty);
+        func.set_terminator(entry, Terminator::Return(None));
+        module.functions.push(FunctionSlot::Concrete(func));
+
+        assert!(
+            has_partial_generic_error(&verify(&module)),
+            "a partially-generic function parameter (bound as an entry-block \
+             param) must be flagged"
         );
     }
 }

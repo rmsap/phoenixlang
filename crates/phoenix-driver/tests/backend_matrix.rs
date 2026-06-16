@@ -163,6 +163,27 @@ backend_matrix_test!(
     matrix_option_result_combinators,
     "option_result_combinators.phx"
 );
+// Expected-type inference for phantom-parameter enum constructors
+// (§Phase 2.4 K.12): `Ok(x)` / `None` pinned from context at the implicit
+// return / call-arg + nested-constructor / list-element / if-match-arm
+// boundaries. Deliberately *two* `Result` instantiations, so an unpinned
+// `Result<Int, __generic>` would be ambiguous on wasm32-gc — exactly the
+// divergence the inference fix and the IR verifier invariant prevent.
+backend_matrix_test!(
+    matrix_partial_generic_enum_inference,
+    "partial_generic_enum_inference.phx"
+);
+// The companion to the case above: collection literals annotated with a
+// *type parameter* (`let xs: List<T> = []`) inside a generic function.
+// The leaf-refinement guard leaves these unpinned (the annotation still
+// carries a type var), deferring resolution to monomorphization — the
+// empty container lowers to an inert `List<__generic>` the verifier
+// tolerates. Each generic is instantiated at two concrete types, so a
+// `__generic` that escaped mono would diverge on wasm32-gc. See K.12.
+backend_matrix_test!(
+    matrix_generic_annotated_empty_collections,
+    "generic_annotated_empty_collections.phx"
+);
 backend_matrix_test!(matrix_defaults, "defaults.phx");
 // The four stdlib-enum discriminant predicates (`Result.isOk`/`isErr`,
 // `Option.isSome`/`isNone`) on both variants of each enum. Lowered on
