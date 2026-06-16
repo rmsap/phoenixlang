@@ -275,6 +275,105 @@ endpoint upsertThing: PUT "/api/things/{id}" {
 }
 "#;
 
+/// Exercises the `DateTime` scalar across every position and target-specific
+/// path it touches: a struct field (`publishedAt`), an `Option<DateTime>` field
+/// (`editedAt`), a `List<DateTime>` (`timeline`), a `Map<String, DateTime>`
+/// (`milestones` — exercises the TS Map-revival codegen, the one revival shape
+/// the round-trip schema can't easily assert), an `Option<Map<String, DateTime>>`
+/// field (`archivedPhases` — exercises the TS `revive*` path where an optional
+/// guard wraps a `Map` value-revival `for…of` loop, the only revival-layout
+/// branch the required-collection fields don't reach), a nested Date-bearing
+/// struct (`comments: List<Comment>`), a `DateTime` query param (`since`), a
+/// request header (`requestedAt`), a response header (`servedAt`), a plain
+/// response, a paginated response (items revival), and a body+response-headers
+/// envelope. `replacePost` adds a MULTI-STATUS (`response { 200: Post … }`)
+/// endpoint with a Date-bearing body, exercising the client's multi-status decode
+/// branch (the `responseBody = revive…(JSON.parse(...))` path in TS, the parsed
+/// `<Endpoint>Response` envelope in Python) — the one DateTime-touching client
+/// branch the bare/paginated/header endpoints don't reach. It
+/// also covers BARE scalar/collection `DateTime` responses (`response DateTime`,
+/// `response List<DateTime>`, `response Map<String, DateTime>`) — the positions
+/// that render a bare `datetime`/`time.Time`/`Date` as the return type, exercising
+/// the per-file import detection AND the Python client's by-type body decode
+/// (`datetime.fromisoformat(...)` rather than the object-only `Type(**...)` form).
+/// `getPublishedAtMetered` pins a bare `DateTime` body on a response-header
+/// endpoint with a NON-`DateTime` header (`etag: String`): the Python client still
+/// decodes the body via `datetime.fromisoformat(...)` into the envelope's `body=`,
+/// so it must import `datetime` even though no response header is a `DateTime` —
+/// the case the import walker missed when it excluded response-header endpoints.
+/// `Post.title`'s `where` constraint makes `createPost`'s body BOTH constrained and
+/// Date-bearing, exercising the TS server's combined
+/// `reviveCreatePostBody(validateCreatePostBody(...))` path and the single merged
+/// value-import (`ValidationError`/`validate*`/`revive*` from `./types`).
+/// This is the lint proof that all four generators emit valid output for
+/// `DateTime`: Go `time.Time` (+`time` import, `time.Parse`/`.Format(time.RFC3339)`),
+/// Python `datetime` (+import, `.isoformat()`/`fromisoformat`), TypeScript `Date`
+/// (+the `revive*` pass and `.toISOString()`), and OpenAPI `format: date-time`. See
+/// `docs/design-decisions.md` (DateTime & UUID scalar types).
+const DATETIME_SCHEMA: &str = r#"
+struct Comment {
+    id: Int
+    createdAt: DateTime
+}
+
+struct Post {
+    id: Int
+    title: String where self.length > 0
+    publishedAt: DateTime
+    editedAt: Option<DateTime>
+    timeline: List<DateTime>
+    milestones: Map<String, DateTime>
+    archivedPhases: Option<Map<String, DateTime>>
+    comments: List<Comment>
+}
+
+endpoint getPost: GET "/api/posts/{id}" {
+    response Post
+}
+
+endpoint listPosts: GET "/api/posts" {
+    query {
+        since: Option<DateTime>
+        limit: Int = 20
+    }
+    response List<Post>
+    pagination { cursor }
+}
+
+endpoint createPost: POST "/api/posts" {
+    body Post
+    headers {
+        requestedAt: Option<DateTime>
+    }
+    response Post headers {
+        servedAt: Option<DateTime>
+    }
+}
+
+endpoint getPublishedAt: GET "/api/posts/{id}/published" {
+    response DateTime
+}
+
+endpoint listPublishDates: GET "/api/publish-dates" {
+    response List<DateTime>
+}
+
+endpoint getMilestoneMap: GET "/api/milestones" {
+    response Map<String, DateTime>
+}
+
+endpoint getPublishedAtMetered: GET "/api/posts/{id}/published-metered" {
+    response DateTime headers {
+        etag: String
+    }
+}
+
+endpoint replacePost: PUT "/api/posts/{id}" {
+    body Post
+    response { 200: Post  201: Post  204 }
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -486,6 +585,9 @@ fn go_output_compiles_and_lints() {
     // All-optional request + response headers (the `*T` param / nil-guarded
     // send / nil-able envelope-field paths).
     check_go_output(&generate_go_files(HEADER_SCHEMA));
+    // `DateTime` across fields/list/nested/query/headers — `time.Time`, the
+    // `time` import, and `time.Parse`/`.Format(time.RFC3339)` (de)serialization.
+    check_go_output(&generate_go_files(DATETIME_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -514,6 +616,7 @@ fn go_output_compiles_and_lints() {
     eprintln!("chi: gen_api full surface");
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(HEADER_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(DATETIME_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -568,6 +671,7 @@ fn openapi_output_lints() {
     check_openapi_output("WRAP_SCHEMA", WRAP_SCHEMA);
     check_openapi_output("FEATURE_SCHEMA", FEATURE_SCHEMA);
     check_openapi_output("HEADER_SCHEMA", HEADER_SCHEMA);
+    check_openapi_output("DATETIME_SCHEMA", DATETIME_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -684,6 +788,10 @@ fn typescript_output_compiles_and_lints() {
     // optional-chain send guard — the `emit_header_set` path the mixed-header
     // `getPostMetered` in SCHEMA never reaches.
     check_typescript_output(&scaffold, &generate_typescript_files(HEADER_SCHEMA));
+    // `DateTime` → `Date` plus the generated `revive*` pass: struct/list/nested
+    // revival, paginated-items revival, body+response-header envelope revival, and
+    // `.toISOString()` query/header encoding. Compiles + lints (tsc/eslint/prettier).
+    check_typescript_output(&scaffold, &generate_typescript_files(DATETIME_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -812,6 +920,13 @@ fn python_output_compiles_and_lints() {
     // All-optional request + response headers (all-`| None` kwargs, guarded
     // sends, and an all-optional envelope).
     check_python_output(&scaffold, &venv_bin, &generate_python_files(HEADER_SCHEMA));
+    // `DateTime` → `datetime` (+ import) across fields/list/nested/query/headers,
+    // with `.isoformat()`/`fromisoformat` encoding. Checks black/ruff/mypy.
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(DATETIME_SCHEMA),
+    );
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {

@@ -138,6 +138,7 @@ pub(crate) fn format_type(ty: &Type) -> String {
         Type::String => "String".to_string(),
         Type::Bool => "Bool".to_string(),
         Type::File => "File".to_string(),
+        Type::DateTime => "DateTime".to_string(),
         Type::Void => "Void".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) => {

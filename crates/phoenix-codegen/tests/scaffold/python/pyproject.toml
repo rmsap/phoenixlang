@@ -35,6 +35,27 @@ select = [
     "RUF", # ruff-specific rules
 ]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are *meant* to be called in argument defaults
+# (`x: T = Query(...)` / `Header(...)` / `Depends(...)`) — that is the framework's
+# documented DI form, and the values are immutable. ruff's built-in B008 FastAPI
+# heuristic recognizes this only for a fixed set of param types (str/int/bool/…),
+# so a `datetime` (or other non-built-in) `Header`/`Query` param trips B008 even
+# though the code is correct. Listing the markers here is the standard FastAPI +
+# ruff configuration and exempts every dependency-marker default regardless of the
+# parameter's type. See docs/phoenix-gen.md (Python target → ruff).
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Cookie",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+    "fastapi.Security",
+]
+
 [tool.mypy]
 # Strict mode: every real type bug (undefined names, missing imports, wrong
 # types, untyped defs) must be fixed in the generator, not silenced here.

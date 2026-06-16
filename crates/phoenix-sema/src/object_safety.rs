@@ -56,6 +56,7 @@ fn contains_self(ty: &Type) -> bool {
         | Type::String
         | Type::Bool
         | Type::File
+        | Type::DateTime
         | Type::Void
         | Type::TypeVar(_)
         | Type::Error => false,

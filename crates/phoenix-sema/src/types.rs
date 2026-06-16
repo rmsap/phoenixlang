@@ -26,6 +26,14 @@ pub enum Type {
     /// `unreachable!` arm. The restriction is liftable when the language later
     /// gains real file-handle semantics (a non-breaking relaxation).
     File,
+    /// An instant in time, serialized on the wire as an RFC 3339 / ISO 8601
+    /// string (e.g. `2026-06-16T12:00:00Z`). A Phoenix Gen scalar usable
+    /// wherever `String` is (struct fields, query/header params, scalar
+    /// responses, multipart form fields) — unlike `File`, it is NOT
+    /// position-restricted. Lowers to `IrType::StringRef` (see `lower_type`);
+    /// it has no literals or operations in the language yet. See
+    /// `docs/design-decisions.md` (DateTime & UUID scalar types).
+    DateTime,
     /// The unit type, used for functions that do not return a value.
     Void,
     /// A named type that hasn't been resolved yet or is user-defined.
@@ -67,11 +75,12 @@ pub enum Type {
 impl Type {
     /// Resolve a type-name string to a [`Type`].
     ///
-    /// The six built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
-    /// `"File"`, `"Void"`) are matched **case-sensitively** and mapped to the
-    /// corresponding variant.  Any other name is wrapped in
+    /// The built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
+    /// `"File"`, `"DateTime"`, `"Void"`) are matched **case-sensitively** and
+    /// mapped to the corresponding variant.  Any other name is wrapped in
     /// [`Type::Named`].  (`File` is only *legal* in endpoint-body position —
-    /// that restriction is enforced in sema, not here.)
+    /// that restriction is enforced in sema, not here.  `DateTime` is a plain
+    /// scalar with no such restriction.)
     pub fn from_name(name: &str) -> Type {
         match name {
             "Int" => Type::Int,
@@ -79,6 +88,7 @@ impl Type {
             "String" => Type::String,
             "Bool" => Type::Bool,
             "File" => Type::File,
+            "DateTime" => Type::DateTime,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
         }
@@ -188,6 +198,7 @@ impl std::fmt::Display for Type {
             Type::String => write!(f, "String"),
             Type::Bool => write!(f, "Bool"),
             Type::File => write!(f, "File"),
+            Type::DateTime => write!(f, "DateTime"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {

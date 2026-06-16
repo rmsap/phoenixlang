@@ -54,6 +54,36 @@ pub(crate) fn emit_call_stmt(
     out.push_str(&format!("{indent}){suffix}\n"));
 }
 
+/// Emits `return <value>;` at `indent`, wrapping a single-call value across lines
+/// the way Prettier does when the one-line form overflows the print width. The
+/// only over-width value the client return produces today is a `Map` revival
+/// (`Object.fromEntries(Object.entries(x).map(([k, v]) => [k, …]))`), which is a
+/// `callee(arg)` shape — `split_breakable_call` keeps `return callee(` on the
+/// first line, the single argument on its own indented line, and `);`/`) as T;` on
+/// the close line (matching `emit_object_property`'s call-break branch). A value
+/// that isn't a breakable call, or whose broken-out argument still overflows,
+/// falls back to the one-line form (over width, so the e2e `prettier --check`
+/// would catch it) rather than mis-wrapping.
+pub(crate) fn emit_return(out: &mut String, indent: &str, value: &str) {
+    let one_line = format!("{indent}return {value};");
+    if one_line.len() <= PRINT_WIDTH {
+        out.push_str(&one_line);
+        out.push('\n');
+        return;
+    }
+    if let Some((callee, args, tail)) = split_breakable_call(value) {
+        let args_line = format!("{indent}  {args},");
+        if args_line.len() <= PRINT_WIDTH {
+            out.push_str(&format!("{indent}return {callee}(\n"));
+            out.push_str(&format!("{args_line}\n"));
+            out.push_str(&format!("{indent}){tail};\n"));
+            return;
+        }
+    }
+    out.push_str(&one_line);
+    out.push('\n');
+}
+
 /// Emits an Express route's `async (req: T, res: Response) => {` arrow header at
 /// `indent`, breaking the parameter list across lines (Prettier style) when the
 /// single-line form overflows — e.g. when `T` is a wide multi-param
@@ -272,9 +302,22 @@ pub(crate) fn emit_if_stmt(out: &mut String, indent: &str, cond: &str, stmt: &st
 /// `params.set(...)` call dropped onto the next line; then the call broken one
 /// argument per line with a magic trailing comma. (The condition is short for
 /// any realistic field name, so its own overflow layout is not emulated.)
-pub(crate) fn emit_param_set(out: &mut String, indent: &str, name: &str, optional: bool) {
+pub(crate) fn emit_param_set(
+    out: &mut String,
+    indent: &str,
+    name: &str,
+    optional: bool,
+    is_datetime: bool,
+) {
     let arg0 = format!("\"{name}\"");
-    let arg1 = format!("String(opts.{name})");
+    // A `DateTime` (`Date`) goes on the wire as RFC 3339; `String(date)` would
+    // emit the human-readable locale form, so use `.toISOString()`. An optional
+    // param is only read inside its `!== undefined` guard, so the access is safe.
+    let arg1 = if is_datetime {
+        format!("opts.{name}.toISOString()")
+    } else {
+        format!("String(opts.{name})")
+    };
 
     if !optional {
         // Required: opts is non-nullable and the field is always present.
@@ -334,9 +377,16 @@ pub(crate) fn emit_header_set(
     local: &str,
     wire: &str,
     optional: bool,
+    is_datetime: bool,
 ) {
     let arg0 = format!("\"{wire}\"");
-    let arg1 = format!("String(headers.{local})");
+    // A `DateTime` (`Date`) header goes on the wire as RFC 3339 via
+    // `.toISOString()`; `String(date)` would emit the locale form.
+    let arg1 = if is_datetime {
+        format!("headers.{local}.toISOString()")
+    } else {
+        format!("String(headers.{local})")
+    };
 
     if !optional {
         let one_line = format!("{indent}{target}.set({arg0}, {arg1});");
@@ -848,7 +898,7 @@ mod tests {
     #[test]
     fn emit_param_set_required_is_unconditional() {
         let mut out = String::new();
-        emit_param_set(&mut out, "    ", "term", false);
+        emit_param_set(&mut out, "    ", "term", false, false);
         assert_eq!(out, "    params.set(\"term\", String(opts.term));\n");
     }
 
@@ -860,7 +910,7 @@ mod tests {
     fn emit_param_set_required_breaks_when_overflowing() {
         let mut out = String::new();
         let name = "aReallyExtremelyLongRequiredQueryParameterNameThatOverflows";
-        emit_param_set(&mut out, "    ", name, false);
+        emit_param_set(&mut out, "    ", name, false, false);
         assert_eq!(
             out,
             format!("    params.set(\n      \"{name}\",\n      String(opts.{name}),\n    );\n")
@@ -875,10 +925,22 @@ mod tests {
     #[test]
     fn emit_param_set_optional_uses_plain_non_null_access() {
         let mut out = String::new();
-        emit_param_set(&mut out, "    ", "page", true);
+        emit_param_set(&mut out, "    ", "page", true, false);
         assert_eq!(
             out,
             "    if (opts.page !== undefined) params.set(\"page\", String(opts.page));\n"
+        );
+    }
+
+    /// A `DateTime` query param stringifies via `.toISOString()` (RFC 3339), not
+    /// `String(...)` (which would emit the locale form).
+    #[test]
+    fn emit_param_set_datetime_uses_to_iso_string() {
+        let mut out = String::new();
+        emit_param_set(&mut out, "    ", "since", false, true);
+        assert_eq!(
+            out,
+            "    params.set(\"since\", opts.since.toISOString());\n"
         );
     }
 

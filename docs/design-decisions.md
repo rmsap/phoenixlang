@@ -2583,3 +2583,114 @@ the stub, point at a test" discipline the language phases use):
   `python_tests.rs::multi_status_long_response_name_wraps_client_return`.
 - **Python case-sensitive import sort (`ruff` I001)** —
   `python/format.rs::format_from_import_orders_names_case_insensitively`.
+
+## Phoenix Gen — DateTime & UUID scalar types (2026-06-16)
+
+The first cut at closing the "missing primitive types" gap above. Of the three
+top-ranked primitives (DateTime, UUID, Money), **this slice ships `DateTime`
+only**; **UUID is the next slice** (same loop, not yet implemented — there is no
+`Type::Uuid` in the codebase yet); and **Money/Decimal is deferred** — it carries
+currency-awareness and fixed-precision-arithmetic questions (rounding mode, scale,
+ISO-4217 coupling) that DateTime/UUID don't, so it's a design discussion of its
+own rather than a mechanical "add a scalar" pass. Doing DateTime first, then UUID,
+each through the full add→4-generators→compile-lint→round-trip loop, keeps the
+diff reviewable and proves the loop before the harder type lands. The UUID design
+below is recorded here as the agreed plan for that next slice; everything marked
+*(planned)* is design intent, not shipped behavior.
+
+**These are first-class scalar types, NOT position-restricted like `File`.** A
+`File` is a body-transport sentinel that sema forbids outside endpoint
+body/response position; DateTime (and UUID, when it lands) are ordinary values,
+legal in struct fields, query params, request/response headers, and scalar
+response bodies. They flow through `resolve_type_expr` as plain builtins (added to
+`Type::from_name`); no scope gate is needed or wanted.
+
+**Deferred: DateTime/UUID as a multipart form field.** The one position they do
+*not* cover is a non-file field of a `File`-bearing (multipart) body, whose
+scalars are still restricted to `Int`/`Float`/`Bool`/`String` (sema's
+`is_multipart_field_type`). A `DateTime` (or, once it lands, `Uuid`) there is
+rejected with the existing clean diagnostic rather than silently mis-encoded.
+Timestamps/ids in a multipart upload are the rarest position; lifting the
+whitelist (plus the per-target form encode/parse) is a small, additive follow-up.
+Not a silent gap — it errors at check time with a precise message.
+
+**Wire format is always a string.** DateTime serializes as an RFC 3339 / ISO 8601
+instant string (`2026-06-16T12:00:00Z`); UUID *(planned)* as the canonical
+hyphenated uuid string. Every target encodes/decodes them through its existing
+string path for query/header/path/multipart positions — the only target-specific
+work is the in-memory body representation and (for TS DateTime) JSON revival.
+
+**Per-target representation** (`Uuid` row is *planned* — the next slice, not in
+this diff):
+
+| | Phoenix | Wire (JSON) | TypeScript | Python | Go | OpenAPI |
+|---|---|---|---|---|---|---|
+| `DateTime` | `Type::DateTime` | RFC 3339 string | `Date` (+ generated revival) | `datetime.datetime` | `time.Time` | `{type: string, format: date-time}` |
+| `Uuid` *(planned)* | `Type::Uuid` | uuid string | branded `string` (`type Uuid = string & {…}`) | `uuid.UUID` | `string` | `{type: string, format: uuid}` |
+
+**Why TS DateTime = `Date` with generated revival, not `string`.** JS *has* a
+`Date`, but `JSON.parse` never revives it — a parsed date field is a string at
+runtime. Typing the field `Date` is therefore a lie unless codegen emits a
+recursive revival pass that walks the decoded body and reconstructs `Date`s at the
+DateTime field paths (`JSON.stringify` handles the reverse for free — it emits ISO
+strings). We pay that generation cost because a `Date`-typed API is what TS users
+expect and it's the whole point of a *typed* client. The revival runs on **both
+sides**: the client revives the decoded response, and the server revives the
+decoded *request body* (`express.json()` / Fastify's parser also yields strings)
+before handing it to the handler — otherwise the handler's `Date`-typed body field
+would be a raw string at runtime, the same lie on the inbound path. So a
+Date-bearing request body emits a `revive<Endpoint>Body` (keyed on the derived
+body fields) that the route calls on the cast/validated body. Query params and
+request/response headers are coerced inline (`new Date(...)`), so the body is the
+only position needing a generated reviver. **Why TS UUID = branded
+`string`, not a class (planned).** JS has no UUID type (only `crypto.randomUUID()`
+returning a `string`); a branded alias gives nominal typing with zero runtime cost
+and no revival pass (a uuid IS its string).
+
+**Verification (DateTime).** Two harnesses, both green. (1) Compile-lint: a
+comprehensive `DATETIME_SCHEMA` (field/`Option`/`List`/`Map`/nested/query/req+resp
+header/pagination-items, plus BARE scalar/`List`/`Map` responses) runs through all
+four targets — Go `go build`/`gofmt`/`golangci-lint`, TS `tsc`/`eslint`/`prettier`
+(incl. the `revive*` pass), Python `black`/`ruff`/`mypy`, OpenAPI `redocly lint`.
+(2) Bespoke wire round-trips (`tests/roundtrip/datetime/*`, separate from the
+contract-driven `gen_api` suite) for Go/TS/Python assert body
+(required/`Option`/`List`/`Map`)/query/response-header (required *and* optional)
+AND bare scalar/`List`/`Map` response instants survive RFC 3339 in both directions.
+The round-trip caught three bugs the lint pass could not (all
+produce *valid* code that serializes *wrong* or crashes at runtime): the TS server
+set response headers via `String(date)` (locale form, not ISO) — now
+`.toISOString()`; the Python client sent bodies via `model_dump()` (leaves
+`datetime` objects httpx's `json.dumps` rejects) — now `model_dump(mode="json")`
+when the body carries a `DateTime`; and the Python client decoded EVERY bare
+response with the object-only `Type(**response.json())` form, which crashes on a
+scalar/scalar-collection response (`datetime(**"…")`) — now decoded by type
+(`datetime.fromisoformat(...)` for a scalar, comprehensions for `List`/`Map`,
+`Model(**…)` only for structs; see `py_decode_expr`). That last fix was a
+pre-existing, type-agnostic gap (`response String` → `str(**…)` was equally
+broken) that the missing-`datetime`-import diagnostic surfaced. Two ruff/eslint
+wrinkles also surfaced: ruff's B008 FastAPI exemption is type-aware (recognizes
+`str`/`int` `Header()`/`Query()` defaults but not `datetime`), fixed by adding the
+standard FastAPI `extend-immutable-calls` to the Python scaffold; and Go
+optional-deref `*x.Format(...)` needed parenthesizing. One TS layout wrinkle: a
+bare `Map` response revival (`Object.fromEntries(…)`) overflows the 80-col print
+width, so the client return is emitted through `emit_return`'s Prettier-style call
+wrapping.
+
+Per-file `datetime` import detection in Python is split across position-specific
+walkers (`request_input_uses_datetime`, `response_header_uses_datetime`,
+`bare_response_uses_datetime`, plus the envelope/page coverage in
+`models_use_datetime`): an unused import trips ruff F401 and a missing one trips
+F821/mypy, so each file imports `datetime` iff some position it actually renders
+names it. The bare-response walker is parameterized by whether to exclude
+response-header endpoints — the client/handler render the named `<Endpoint>Result`
+envelope there, while the server still returns the bare `result.body`.
+
+**Language-runtime semantics (`lower_type`).** `DateTime` lowers to
+`IrType::StringRef` — a branded-string runtime representation (UUID will lower the
+same way when it lands). The Gen path (`cmd_gen`) never lowers to IR, so this only
+matters if a DateTime-bearing struct is used in actual Phoenix *language* code
+(`run`/`build`). It has no literals or operations in the language yet (an opaque
+scalar), so a string-backed runtime identity is sufficient and correct, and —
+unlike `File`'s `unreachable!` arm — it can't panic if such a struct is ever
+lowered. Liftable to a richer representation if the language later gains temporal
+(or uuid) semantics.

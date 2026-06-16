@@ -46,6 +46,94 @@ const SCHEMA: &str = include_str!("../../../tests/fixtures/gen_api.phx");
 /// The shared, language-agnostic contract every target driver consumes.
 const CONTRACT_JSON: &str = include_str!("roundtrip/contract.json");
 
+/// Small schema for the dedicated `DateTime` wire round-trip (separate from the
+/// contract-driven `gen_api` round-trip above). It exercises `DateTime` in a body
+/// (required / `Option` / `List` / `Map`), as a query param, and as both a
+/// required and an optional response header — the positions whose cross-language
+/// wire format (RFC 3339) the bespoke `datetime/*` drivers assert actually
+/// round-trips. The `Map<String, DateTime>` (`phases`) covers the value-revival
+/// shape (TS `Object.entries(...)` rebuild) end-to-end, not just compile-lint.
+/// `Task`/`echoTask` adds a body whose only `DateTime` is reached *through* a
+/// nested struct (`Reminder`), with no direct/generic `DateTime` field of its own
+/// — the case that regressed when the Python client's `model_dump(mode="json")`
+/// gate was non-transitive (it left a raw nested `datetime` that httpx's
+/// `json.dumps` rejects). `getEvent`'s optional `expiresAt` response header guards
+/// the optional response-header read paths (`time.Parse` into `&t` / `fromisoformat
+/// if raw else None` / `!== null ? new Date(...) : undefined`), which the required
+/// `servedAt` doesn't reach. `echoInstant`/`echoInstants`/`echoInstantMap` cover
+/// BARE scalar/`List`/`Map` `DateTime` responses (not wrapped in a struct) — the
+/// case the Python client decoded with the object-only `Type(**response.json())`
+/// form, which crashed at runtime on a scalar (`datetime(**"…")`); now decoded
+/// by type (`datetime.fromisoformat(...)` / comprehensions). Kept inline (not a
+/// fixture) because only these drivers consume it. See
+/// `docs/design-decisions.md` (DateTime & UUID scalar types).
+const DATETIME_RT_SCHEMA: &str = r#"
+struct Event {
+    id: Int
+    name: String
+    startsAt: DateTime
+    endsAt: Option<DateTime>
+    checkpoints: List<DateTime>
+    phases: Map<String, DateTime>
+}
+
+struct Reminder {
+    note: String
+    remindAt: DateTime
+}
+
+struct Task {
+    id: Int
+    reminder: Reminder
+}
+
+endpoint echoEvent: POST "/events" {
+    body Event
+    response Event
+}
+
+endpoint echoTask: POST "/tasks" {
+    body Task
+    response Task
+}
+
+endpoint getEvent: GET "/events/{id}" {
+    query {
+        since: DateTime
+    }
+    response Event headers {
+        servedAt: DateTime
+        expiresAt: Option<DateTime>
+    }
+}
+
+endpoint echoInstant: GET "/instant" {
+    query {
+        at: DateTime
+    }
+    response DateTime
+}
+
+endpoint echoInstants: GET "/instants" {
+    query {
+        at: DateTime
+    }
+    response List<DateTime>
+}
+
+endpoint echoInstantMap: GET "/instant-map" {
+    query {
+        at: DateTime
+    }
+    response Map<String, DateTime>
+}
+"#;
+
+/// Absolute path to `tests/roundtrip/datetime/` (the dedicated DateTime drivers).
+fn datetime_dir() -> PathBuf {
+    roundtrip_dir().join("datetime")
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    compiles_and_lints.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -236,6 +324,42 @@ fn go_chi_roundtrip() {
     assert!(ok, "go chi round-trip test failed:\n{out}");
 }
 
+/// Dedicated `DateTime` wire round-trip for Go: generates the `api` package from
+/// [`DATETIME_RT_SCHEMA`], assembles a tempdir module with the bespoke
+/// `datetime/go` driver (which reuses the main driver's `go.mod.template`), and
+/// runs `go test`. Asserts body/query/response-header `DateTime`s survive the
+/// RFC 3339 wire trip in both directions.
+#[test]
+fn datetime_go_roundtrip() {
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    let files = generate_go_files(DATETIME_RT_SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    // The module template is shared with the main Go driver (module `roundtrip`).
+    let go_mod = std::fs::read_to_string(roundtrip_dir().join("go").join("go.mod.template"))
+        .expect("read go.mod.template");
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+
+    let driver = datetime_dir().join("go").join("datetime_roundtrip_test.go");
+    let contents = std::fs::read_to_string(&driver)
+        .unwrap_or_else(|e| panic!("read {}: {e}", driver.display()));
+    std::fs::write(root.join("datetime_roundtrip_test.go"), contents).expect("write driver");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go DateTime round-trip test failed:\n{out}");
+}
+
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 /// Generates both the Express and Fastify variants from a single parse/check.
@@ -347,6 +471,53 @@ fn typescript_roundtrip() {
     assert!(ok, "typescript fastify round-trip test failed:\n{out}");
 }
 
+/// Dedicated `DateTime` wire round-trip for TypeScript (Express). Reuses the main
+/// TS driver's committed npm project (`node_modules` with express + tsx) but
+/// writes the generated files into a SEPARATE `generated-datetime/` dir and runs
+/// the bespoke `datetime-driver.ts`, so it never races `typescript_roundtrip`'s
+/// `generated/`. Proves the generated `Date` revival pass and `.toISOString()`
+/// (de)serialization round-trip RFC 3339 in both directions.
+///
+/// Express only: the body-revival path lives in `emit_route_prelude`, which is
+/// shared verbatim by both dialects (only the request accessor vocabulary
+/// differs), so the Fastify `DateTime` server output is deliberately covered by
+/// compile-lint (`compiles_and_lints.rs` generates BOTH frameworks) rather than a
+/// second behavioral round-trip here.
+#[test]
+fn datetime_typescript_roundtrip() {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("typescript");
+    let node_modules = driver_dir.join("node_modules");
+    if !node_modules.is_dir() {
+        let msg = format!(
+            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let (program, result) = parse_and_check(DATETIME_RT_SCHEMA);
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+
+    let generated = driver_dir.join("generated-datetime");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated-datetime dir");
+    std::fs::write(generated.join("types.ts"), &files.types).expect("write types.ts");
+    std::fs::write(generated.join("client.ts"), &files.client).expect("write client.ts");
+    std::fs::write(generated.join("handlers.ts"), &files.handlers).expect("write handlers.ts");
+    std::fs::write(generated.join("server.ts"), &files.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "datetime-driver.ts"]);
+    assert!(ok, "typescript DateTime round-trip test failed:\n{out}");
+}
+
 // ── Python target ──────────────────────────────────────────────────────────
 
 fn generate_python_files(schema: &str) -> phoenix_codegen::PythonFiles {
@@ -414,4 +585,47 @@ fn python_roundtrip() {
     let python = venv_python.to_string_lossy().into_owned();
     let (ok, out) = run(&driver_dir, &python, &["driver.py"]);
     assert!(ok, "python round-trip test failed:\n{out}");
+}
+
+/// Dedicated `DateTime` wire round-trip for Python. Reuses the main Python
+/// driver's committed `.venv` but writes the generated package into a SEPARATE
+/// `generated_dt/` dir and runs the bespoke `datetime_driver.py`, so it never
+/// races `python_roundtrip`'s `generated/`. Proves body/query/response-header
+/// `DateTime`s round-trip RFC 3339 (incl. the client's `model_dump(mode="json")`
+/// body serialization and `.isoformat()`/`fromisoformat` header handling).
+#[test]
+fn datetime_python_roundtrip() {
+    if gate(&missing_tools(&["python3"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("python");
+    let venv_python = driver_dir.join(".venv").join("bin").join("python");
+    if !venv_python.is_file() {
+        let msg = format!(
+            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
+             .venv/bin/pip install -r requirements.txt` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let files = generate_python_files(DATETIME_RT_SCHEMA);
+
+    let generated = driver_dir.join("generated_dt");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated_dt dir");
+    std::fs::write(generated.join("__init__.py"), &files.init).expect("write __init__.py");
+    std::fs::write(generated.join("models.py"), &files.models).expect("write models.py");
+    std::fs::write(generated.join("client.py"), &files.client).expect("write client.py");
+    std::fs::write(generated.join("handlers.py"), &files.handlers).expect("write handlers.py");
+    std::fs::write(generated.join("server.py"), &files.server).expect("write server.py");
+
+    let python = venv_python.to_string_lossy().into_owned();
+    let (ok, out) = run(&driver_dir, &python, &["datetime_driver.py"]);
+    assert!(ok, "python DateTime round-trip test failed:\n{out}");
 }

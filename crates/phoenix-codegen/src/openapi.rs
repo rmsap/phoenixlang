@@ -413,6 +413,9 @@ fn type_to_json_schema(ty: &Type) -> Value {
         // string with `format: binary` (used inside `multipart/form-data` request
         // bodies and binary responses, wired up in the body-codegen path).
         Type::File => json!({ "type": "string", "format": "binary" }),
+        // A `DateTime` is an RFC 3339 instant: an OpenAPI string with the
+        // standard `date-time` format. See `docs/design-decisions.md`.
+        Type::DateTime => json!({ "type": "string", "format": "date-time" }),
         Type::Void => json!({}),
         Type::Named(name) => json!({ "$ref": format!("#/components/schemas/{}", name) }),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {

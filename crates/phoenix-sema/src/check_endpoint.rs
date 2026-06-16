@@ -2681,6 +2681,35 @@ mod tests {
         );
     }
 
+    // REJECT: a multipart body with a `DateTime` field (and `Option<DateTime>`).
+    // `DateTime` is a first-class scalar everywhere *except* a multipart form
+    // field: `is_multipart_field_type`'s whitelist is `Int`/`Float`/`Bool`/
+    // `String`/`File` only, so a timestamp in a file-upload body must error at
+    // check time rather than mis-generate the per-target form encode/parse. This
+    // is the documented "deferred: DateTime as a multipart form field" contract;
+    // see `docs/design-decisions.md` (DateTime & UUID scalar types).
+    #[test]
+    fn file_reject_multipart_datetime_field() {
+        assert_has_error(
+            r#"
+            struct Upload { avatar: File  capturedAt: DateTime }
+            endpoint upload: POST "/api/upload" {
+                body Upload
+            }
+            "#,
+            "cannot be sent as a form field",
+        );
+        assert_has_error(
+            r#"
+            struct Upload { avatar: File  capturedAt: Option<DateTime> }
+            endpoint upload: POST "/api/upload" {
+                body Upload
+            }
+            "#,
+            "cannot be sent as a form field",
+        );
+    }
+
     // ── Pagination ──────────────────────────────────────────────────
 
     #[test]
@@ -3098,6 +3127,26 @@ mod tests {
             r#"
             endpoint getStatus: GET "/status" {
                 response { 200: String  204 }
+            }
+            "#,
+            "must be a named struct",
+        );
+    }
+
+    #[test]
+    fn multi_status_datetime_body_rejected() {
+        // `DateTime` is a first-class scalar, but a multi-status `response { }`
+        // body is still struct-only: the envelope's `body` slot serializes
+        // through the pydantic struct machinery (`T.model_validate(...)`), which
+        // a bare `datetime` has no method for. So a bare `DateTime` status body
+        // is impossible input — it errors here rather than reaching codegen — and
+        // a `DateTime` instant must use the bare `response DateTime` form (which
+        // IS supported and round-trip-tested). This pins the new scalar to the
+        // same contract the `String` case above asserts.
+        assert_has_error(
+            r#"
+            endpoint getPublishedAt: GET "/published" {
+                response { 200: DateTime  204 }
             }
             "#,
             "must be a named struct",
