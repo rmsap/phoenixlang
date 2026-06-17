@@ -141,6 +141,7 @@ pub(crate) fn format_type(ty: &Type) -> String {
         Type::DateTime => "DateTime".to_string(),
         Type::Uuid => "Uuid".to_string(),
         Type::Decimal => "Decimal".to_string(),
+        Type::Money => "Money".to_string(),
         Type::Void => "Void".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) => {

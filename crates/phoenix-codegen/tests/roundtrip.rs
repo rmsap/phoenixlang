@@ -211,6 +211,44 @@ fn decimal_dir() -> PathBuf {
     roundtrip_dir().join("decimal")
 }
 
+/// Small schema for the dedicated `Money` wire round-trip. Exercises the composite
+/// `Money` in a body (required / `Option` / nested in a `List` element / as a
+/// direct `List<Money>` element / as a `Map<String, Money>` value) and as a bare
+/// response. The validating decode paths (Python pydantic model + currency
+/// validator, TS `reviveMoney`, Go `Invoice.Validate()` recursing into
+/// `Money.Validate()`) accept valid values; the drivers also assert a bad amount
+/// and an unknown currency are rejected. `Money` is composite, so it never appears
+/// in query/header position. See `docs/design-decisions.md` (Money type).
+const MONEY_RT_SCHEMA: &str = r#"
+struct LineItem {
+    label: String
+    price: Money
+}
+
+struct Invoice {
+    id: Int
+    total: Money
+    tip: Option<Money>
+    items: List<LineItem>
+    charges: List<Money>
+    byCategory: Map<String, Money>
+}
+
+endpoint echoInvoice: POST "/invoices" {
+    body Invoice
+    response Invoice
+}
+
+endpoint getBalance: GET "/balance" {
+    response Money
+}
+"#;
+
+/// Absolute path to `tests/roundtrip/money/` (the dedicated Money drivers).
+fn money_dir() -> PathBuf {
+    roundtrip_dir().join("money")
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    compiles_and_lints.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -506,6 +544,41 @@ fn decimal_go_roundtrip() {
     assert!(ok, "go Decimal round-trip test failed:\n{out}");
 }
 
+/// Dedicated `Money` wire round-trip for Go: generates the `api` package from
+/// [`MONEY_RT_SCHEMA`], assembles a tempdir module with the bespoke `money/go`
+/// driver, and runs `go test`. Asserts the composite `Money` survives the wire in
+/// body/bare-response positions and that the recursive `Validate()` accepts valid
+/// input and rejects a bad amount and an unknown currency.
+#[test]
+fn money_go_roundtrip() {
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    let files = generate_go_files(MONEY_RT_SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    let go_mod = std::fs::read_to_string(roundtrip_dir().join("go").join("go.mod.template"))
+        .expect("read go.mod.template");
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+
+    let driver = money_dir().join("go").join("money_roundtrip_test.go");
+    let contents = std::fs::read_to_string(&driver)
+        .unwrap_or_else(|e| panic!("read {}: {e}", driver.display()));
+    std::fs::write(root.join("money_roundtrip_test.go"), contents).expect("write driver");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go Money round-trip test failed:\n{out}");
+}
+
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 /// Generates both the Express and Fastify variants from a single parse/check.
@@ -745,6 +818,46 @@ fn decimal_typescript_roundtrip() {
     assert!(ok, "typescript Decimal round-trip test failed:\n{out}");
 }
 
+/// Dedicated `Money` wire round-trip for TypeScript (Express). Reuses the main TS
+/// driver's npm project but writes to a SEPARATE `generated-money/` dir and runs
+/// `money-driver.ts`. Proves the composite `Money` interface + `reviveMoney`
+/// round-trip a `Money` (body / nested list element / bare response) and that the
+/// server body reviver rejects a bad amount and an unknown currency.
+#[test]
+fn money_typescript_roundtrip() {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("typescript");
+    let node_modules = driver_dir.join("node_modules");
+    if !node_modules.is_dir() {
+        let msg = format!(
+            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let (program, result) = parse_and_check(MONEY_RT_SCHEMA);
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+
+    let generated = driver_dir.join("generated-money");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated-money dir");
+    std::fs::write(generated.join("types.ts"), &files.types).expect("write types.ts");
+    std::fs::write(generated.join("client.ts"), &files.client).expect("write client.ts");
+    std::fs::write(generated.join("handlers.ts"), &files.handlers).expect("write handlers.ts");
+    std::fs::write(generated.join("server.ts"), &files.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "money-driver.ts"]);
+    assert!(ok, "typescript Money round-trip test failed:\n{out}");
+}
+
 // ── Python target ──────────────────────────────────────────────────────────
 
 fn generate_python_files(schema: &str) -> phoenix_codegen::PythonFiles {
@@ -942,4 +1055,46 @@ fn decimal_python_roundtrip() {
     let python = venv_python.to_string_lossy().into_owned();
     let (ok, out) = run(&driver_dir, &python, &["decimal_driver.py"]);
     assert!(ok, "python Decimal round-trip test failed:\n{out}");
+}
+
+/// Dedicated `Money` wire round-trip for Python. Reuses the main Python driver's
+/// `.venv` but writes the generated package into a SEPARATE `generated_money/` dir
+/// and runs `money_driver.py`. Proves the composite `Money` pydantic model
+/// round-trips (body / nested list element / bare response) and that the server
+/// rejects a malformed amount and an unknown currency.
+#[test]
+fn money_python_roundtrip() {
+    if gate(&missing_tools(&["python3"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("python");
+    let venv_python = driver_dir.join(".venv").join("bin").join("python");
+    if !venv_python.is_file() {
+        let msg = format!(
+            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
+             .venv/bin/pip install -r requirements.txt` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let files = generate_python_files(MONEY_RT_SCHEMA);
+
+    let generated = driver_dir.join("generated_money");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated_money dir");
+    std::fs::write(generated.join("__init__.py"), &files.init).expect("write __init__.py");
+    std::fs::write(generated.join("models.py"), &files.models).expect("write models.py");
+    std::fs::write(generated.join("client.py"), &files.client).expect("write client.py");
+    std::fs::write(generated.join("handlers.py"), &files.handlers).expect("write handlers.py");
+    std::fs::write(generated.join("server.py"), &files.server).expect("write server.py");
+
+    let python = venv_python.to_string_lossy().into_owned();
+    let (ok, out) = run(&driver_dir, &python, &["money_driver.py"]);
+    assert!(ok, "python Money round-trip test failed:\n{out}");
 }

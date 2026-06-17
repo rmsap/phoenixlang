@@ -257,6 +257,20 @@ impl Checker {
                 let ty = self.resolve_type_expr(&qp.type_annotation);
                 let default_value = qp.default_value.as_ref().and_then(extract_default_value);
 
+                // `Money` is a composite (`{ amount, currency }`) with no scalar
+                // URL encoding, so it cannot ride in the query string — reject it
+                // here rather than emit a dangling type reference (the per-target
+                // `Money` definition is gated on body/field/response use only).
+                if ty.mentions_money() {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: query param `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not URL-encodable) — carry it in the request body, or pass the amount and currency as separate scalar params",
+                            ep.name, qp.name
+                        ),
+                        qp.span,
+                    );
+                }
+
                 // Validate default value type matches declared type
                 if let Some(ref default) = default_value {
                     let default_matches = matches!(
@@ -714,6 +728,21 @@ impl Checker {
         is_response: bool,
     ) -> HeaderParamInfo {
         let ty = self.resolve_type_expr(&h.type_annotation);
+
+        // `Money` is a composite (`{ amount, currency }`) with no scalar header
+        // encoding, so it cannot ride in an HTTP header — reject it here (request
+        // or response) rather than emit a dangling type reference (the per-target
+        // `Money` definition is gated on body/field/response use only).
+        if ty.mentions_money() {
+            let direction = if is_response { "response " } else { "" };
+            self.error(
+                format!(
+                    "endpoint `{}`: {direction}header `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not header-encodable) — carry it in the body, or use separate scalar headers for the amount and currency",
+                    ep.name, h.name
+                ),
+                h.span,
+            );
+        }
 
         let wire_name = h
             .wire_name
@@ -2707,6 +2736,88 @@ mod tests {
             }
             "#,
             "cannot be sent as a form field",
+        );
+    }
+
+    // ── `Money` position restriction ─────────────────────────────────
+    // `Money` is a composite `{ amount, currency }` with no scalar URL/header
+    // encoding, so it is legal only in struct/body fields and responses — never a
+    // query param or header. Each target gates its one-time `Money` definition on
+    // body/field/response use, so an un-rejected query/header `Money` would emit a
+    // dangling type reference (non-compiling Go/Python, dangling OpenAPI `$ref`).
+    // See `docs/design-decisions.md` (Money type).
+
+    // REJECT: a bare `Money` query param.
+    #[test]
+    fn money_reject_query_param() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { price: Money }
+                response String
+            }
+            "#,
+            "cannot be a `Money`",
+        );
+    }
+
+    // REJECT: a `Money` reached through a generic (`Option`/`List`) query param.
+    #[test]
+    fn money_reject_query_param_nested() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { price: Option<Money> }
+                response String
+            }
+            "#,
+            "cannot be a `Money`",
+        );
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { prices: List<Money> }
+                response String
+            }
+            "#,
+            "cannot be a `Money`",
+        );
+    }
+
+    // REJECT: a `Money` request header and a `Money` response header.
+    #[test]
+    fn money_reject_headers() {
+        assert_has_error(
+            r#"
+            endpoint pay: POST "/pay" {
+                headers { amount: Money }
+                response String
+            }
+            "#,
+            "header `amount` cannot be a `Money`",
+        );
+        assert_has_error(
+            r#"
+            endpoint pay: POST "/pay" {
+                response String headers { balance: Money }
+            }
+            "#,
+            "response header `balance` cannot be a `Money`",
+        );
+    }
+
+    // ACCEPT: `Money` in struct/body fields and as a response is fine (the legal
+    // positions) — the restriction is query/header-only.
+    #[test]
+    fn money_accept_body_field_and_response() {
+        assert_no_errors(
+            r#"
+            struct Invoice { total: Money }
+            endpoint create: POST "/invoices" {
+                body Invoice
+                response Money
+            }
+            "#,
         );
     }
 

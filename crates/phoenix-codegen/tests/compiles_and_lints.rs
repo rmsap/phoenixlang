@@ -485,6 +485,91 @@ endpoint rateMap: GET "/rate-map" {
 }
 "#;
 
+/// Exercises the composite `Money` built-in across every position + target path:
+/// struct fields (`total`), `Option<Money>` (`tip`), `List<Money>` (`charges`),
+/// `Map<String, Money>` (`byCategory`), a nested Money-bearing struct
+/// (`items: List<LineItem>`), a body, BARE scalar / `List` / `Map` `Money`
+/// responses, and a PAGINATED `List<Money>` (item type `Money`, exercising the
+/// `pagination.item_type` arm of `schema_uses_money`). The lint proof that all four generators emit valid output for the
+/// composite: Go `Money` struct + `Validate()` (decimal + ISO-4217 set, recursed
+/// into by containing `Validate()`s), Python `Money` pydantic model + currency
+/// `field_validator`, TypeScript the `Money` interface + `reviveMoney`, OpenAPI a
+/// shared `Money` component with the currency `enum`. (No query/header `Money` —
+/// a composite isn't URL/header-encodable.)
+///
+/// Also covers a MULTI-STATUS response carrying a Money-bearing struct
+/// (`settleInvoice` → `Invoice`): a multi-status `response { }` block must carry a
+/// named struct (sema rejects a bare `Money`/list/scalar there), so the
+/// `<Endpoint>Response` envelope wraps an `Invoice` whose fields include `Money` —
+/// exercising the multi-status envelope generation crossed with the `Money`
+/// composite (Money emission stays gated on the struct-field scan).
+///
+/// NOTE: the `List<Money>`/`Map<String, Money>` *element* values here are validated
+/// on decode by Python (pydantic) and TypeScript (`reviveMoney` runs through
+/// list/map elements) but NOT by Go — Go's `Validate()` only recurses into direct
+/// `Money`/`Option<Money>` fields (the documented "weak link" parallel to the
+/// regex-scalar one; see `money_field_shape` in `go.rs` and `docs/known-issues.md`).
+/// This fixture only proves the output lints; the divergence itself is NOT
+/// behaviorally tested — the Money round-trip drivers place only valid currencies
+/// in `List`/`Map` position, so no test asserts Go-accepts / Python+TS-reject.
+const MONEY_SCHEMA: &str = r#"
+struct LineItem {
+    label: String
+    price: Money
+}
+
+struct Invoice {
+    id: Int
+    total: Money
+    tip: Option<Money>
+    charges: List<Money>
+    byCategory: Map<String, Money>
+    items: List<LineItem>
+}
+
+endpoint getInvoice: GET "/invoices/{id}" {
+    response Invoice
+}
+
+endpoint createInvoice: POST "/invoices" {
+    body Invoice
+    response Invoice
+}
+
+endpoint getBalance: GET "/balance" {
+    response Money
+}
+
+endpoint listCharges: GET "/charges" {
+    response List<Money>
+}
+
+endpoint chargeMap: GET "/charge-map" {
+    response Map<String, Money>
+}
+
+endpoint pageCharges: GET "/charge-page" {
+    response List<Money>
+    pagination { cursor }
+}
+
+endpoint settleInvoice: POST "/invoices/{id}/settle" {
+    response { 200: Invoice  201: Invoice }
+}
+"#;
+
+/// A schema whose ONLY `Money` use is a bare response, with NO user structs. The
+/// generated `Money` type definition is then the last thing in the file (Python's
+/// `models.py` ends just after `class Money` — there is no user model after it),
+/// which exercises the blank-line / trailing-newline tail of `emit_money_model`
+/// (and the parallel Go/TS/OpenAPI emit) that `MONEY_SCHEMA` — always followed by
+/// user structs — does not. Lint-only; behavior is covered by the round-trips.
+const MONEY_ONLY_SCHEMA: &str = r#"
+endpoint getBalance: GET "/balance" {
+    response Money
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -705,6 +790,10 @@ fn go_output_compiles_and_lints() {
     // `Decimal` across fields/list/map/nested/query/headers + bare responses; the
     // `decimalRe` `Validate()` check.
     check_go_output(&generate_go_files(DECIMAL_SCHEMA));
+    // Composite `Money`: struct + `Validate()` (decimal + ISO-4217), recursed into.
+    check_go_output(&generate_go_files(MONEY_SCHEMA));
+    // `Money` as the file's last definition (no trailing user struct).
+    check_go_output(&generate_go_files(MONEY_ONLY_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -736,6 +825,8 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(DATETIME_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(UUID_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(DECIMAL_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_ONLY_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -793,6 +884,8 @@ fn openapi_output_lints() {
     check_openapi_output("DATETIME_SCHEMA", DATETIME_SCHEMA);
     check_openapi_output("UUID_SCHEMA", UUID_SCHEMA);
     check_openapi_output("DECIMAL_SCHEMA", DECIMAL_SCHEMA);
+    check_openapi_output("MONEY_SCHEMA", MONEY_SCHEMA);
+    check_openapi_output("MONEY_ONLY_SCHEMA", MONEY_ONLY_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -917,6 +1010,10 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(UUID_SCHEMA));
     // `Decimal` branded alias + `parseDecimal` validate-on-decode across all positions.
     check_typescript_output(&scaffold, &generate_typescript_files(DECIMAL_SCHEMA));
+    // Composite `Money`: interface + `reviveMoney` + ISO-4217 `CURRENCY_CODES`.
+    check_typescript_output(&scaffold, &generate_typescript_files(MONEY_SCHEMA));
+    // `Money` as the file's last definition (no trailing user struct).
+    check_typescript_output(&scaffold, &generate_typescript_files(MONEY_ONLY_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1058,6 +1155,15 @@ fn python_output_compiles_and_lints() {
     // `Decimal` -> `decimal.Decimal` (+import) across fields/list/map/nested/
     // query/headers and bare responses, with `str()`/`Decimal(...)` encoding.
     check_python_output(&scaffold, &venv_bin, &generate_python_files(DECIMAL_SCHEMA));
+    // Composite `Money`: pydantic model + currency `field_validator`.
+    check_python_output(&scaffold, &venv_bin, &generate_python_files(MONEY_SCHEMA));
+    // `Money` as models.py's last definition (no trailing user model) — exercises
+    // the blank-line/trailing-newline tail of `emit_money_model`.
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(MONEY_ONLY_SCHEMA),
+    );
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {

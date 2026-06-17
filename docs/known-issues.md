@@ -79,6 +79,43 @@ working safety check.
 (multipart server routes). **Workaround:** validate the constrained field inside
 the handler. **Target phase:** demand-triggered. Surfaced 2026-06-05.
 
+### `Money` element validation inside `List`/`Map` is skipped in the Go target
+
+A `Money`-typed **direct** field (`total: Money`) or `Option<Money>` field is
+validated server-side on every target: Go's containing `Validate()` recurses into
+the field's own `Money.Validate()` (decimal amount + ISO-4217 currency), Python's
+pydantic model runs its currency `field_validator` on parse, and TypeScript's
+`reviveMoney` runs on decode. But for a `Money` nested inside a **`List<Money>`**
+or **`Map<String, Money>`**, only **Python and TypeScript** validate the elements
+(pydantic recurses into list/map items; `reviveMoney` runs through the revival
+pipeline's list/map walk). **Go does not** — `money_field_shape`
+(`phoenix-codegen/src/go.rs`) matches only `Money` / `Option<Money>`, so the
+generated `Validate()` never iterates a `List<Money>` / `Map<String, Money>` to
+call each element's `Validate()`.
+
+So a malformed amount or unknown currency carried inside a `List<Money>` / `Map`
+value is a 400 from the Python/TS servers but is accepted by the Go server. (A
+`Money` reached through a `List<UserStruct>` element is unvalidated in Go too —
+Go's generated `Validate()` does not recurse into `List`/`Map`-of-struct elements
+at all; the same weak link, one level out.) This is the exact parallel of the
+regex-scalar weak link: Go validates a regex scalar in a direct field but not
+inside a `List`/`Map`.
+
+**Why not fixed now:** closing it means emitting element-iteration loops in the Go
+`Validate()` generator (`render_validate_fn`) for `List`/`Map` of any validatable
+element — `Money`, regex scalars, and nested structs alike — which is a general
+nested-validation feature, larger than the `Money` slice and orthogonal to it.
+Doing it for `Money` alone would leave the regex-scalar and nested-struct cases
+inconsistently half-covered. The round-trip suite sends only valid currencies in
+`List`/`Map` position, so the divergence is not exercised.
+
+**File:** `phoenix-codegen/src/go.rs` (`money_field_shape`, `render_validate_fn`).
+**Workaround:** model the value as a direct `Money` field rather than a `List`/`Map`
+element where server-side currency validation must hold on the Go target, or
+validate inside the handler. **Target phase:** demand-triggered — pairs naturally
+with general Go nested/element `Validate()` recursion. Surfaced 2026-06-16 in the
+Money composite review.
+
 ### Multi-status responses cannot be combined with response headers or pagination (v1)
 
 An endpoint that declares a multi-status `response { 200: User  201: User }` block

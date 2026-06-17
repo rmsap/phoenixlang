@@ -3,4 +3,5 @@ generated/
 generated-datetime/
 generated-uuid/
 generated-decimal/
+generated-money/
 contract.json

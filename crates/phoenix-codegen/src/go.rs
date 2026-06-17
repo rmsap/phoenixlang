@@ -282,6 +282,11 @@ impl<'a> GoGenerator<'a> {
     /// from the program AST.
     fn generate(mut self, program: &Program) -> GoFiles {
         // ── types.go (body — header/imports composed at end) ────
+        // The composite `Money` built-in (struct + `Validate()` + the ISO-4217
+        // `currencyCodes` set), once, before the user structs that may embed it.
+        if crate::schema_uses_money(program, self.check_result) {
+            self.emit_money_type();
+        }
         for decl in &program.declarations {
             match decl {
                 Declaration::Struct(s) => {
@@ -917,7 +922,13 @@ impl<'a> GoGenerator<'a> {
                     .map(|(var, label)| (f.name.as_str(), derived_field_go_type(f).1, var, label))
             })
             .collect();
-        if fields.is_empty() && regex_fields.is_empty() {
+        // A `Money`/`Option<Money>` body field's own `Validate()` is called.
+        let money_fields: Vec<(&str, bool)> = body
+            .fields
+            .iter()
+            .filter_map(|f| money_field_shape(&f.ty).map(|is_ptr| (f.name.as_str(), is_ptr)))
+            .collect();
+        if fields.is_empty() && regex_fields.is_empty() && money_fields.is_empty() {
             return;
         }
         render_validate_fn(
@@ -930,6 +941,55 @@ impl<'a> GoGenerator<'a> {
             type_name,
             &fields,
             &regex_fields,
+            &money_fields,
+        );
+    }
+
+    /// Emits the composite `Money` built-in into types.go: the `currencyCodes`
+    /// ISO-4217 set, the `Money` struct (`{Amount, Currency}` as strings), and its
+    /// `Validate()` (amount via `decimalRe`, currency via the set). Containing
+    /// structs/bodies call `m.<Field>.Validate()` (see the validators' money_fields).
+    fn emit_money_type(&mut self) {
+        self.types_needs_fmt = true;
+        self.types_regex_vars.insert("decimalRe");
+
+        self.types_out.push_str(
+            "// currencyCodes is the set of active ISO-4217 currency codes a Money may carry.\n\
+             var currencyCodes = map[string]struct{}{\n",
+        );
+        for code in crate::iso4217::ISO_4217_CODES {
+            self.types_out.push_str(&format!("\t\"{code}\": {{}},\n"));
+        }
+        self.types_out.push_str("}\n\n");
+
+        self.types_out.push_str(
+            "// Money is a monetary amount: an exact decimal plus an ISO-4217 currency code.\n",
+        );
+        self.types_out.push_str(&render_struct(
+            "Money",
+            &[
+                (
+                    "Amount".to_string(),
+                    "string".to_string(),
+                    "`json:\"amount\"`".to_string(),
+                ),
+                (
+                    "Currency".to_string(),
+                    "string".to_string(),
+                    "`json:\"currency\"`".to_string(),
+                ),
+            ],
+        ));
+        self.types_out.push_str(
+            "// Validate checks Money's decimal amount and ISO-4217 currency code.\n\
+             func (m Money) Validate() error {\n\
+             \tif !decimalRe.MatchString(m.Amount) {\n\
+             \t\treturn fmt.Errorf(\"amount: invalid decimal\")\n\
+             \t}\n\
+             \tif _, ok := currencyCodes[m.Currency]; !ok {\n\
+             \t\treturn fmt.Errorf(\"currency: invalid ISO 4217 code\")\n\
+             \t}\n\
+             \treturn nil\n}\n\n",
         );
     }
 
@@ -964,7 +1024,13 @@ impl<'a> GoGenerator<'a> {
                 regex_scalar(&f.ty).map(|(var, label)| (f.name.as_str(), is_ptr, var, label))
             })
             .collect();
-        if fields.is_empty() && regex_fields.is_empty() {
+        // A `Money`/`Option<Money>` field's own `Validate()` is called.
+        let money_fields: Vec<(&str, bool)> = info
+            .fields
+            .iter()
+            .filter_map(|f| money_field_shape(&f.ty).map(|is_ptr| (f.name.as_str(), is_ptr)))
+            .collect();
+        if fields.is_empty() && regex_fields.is_empty() && money_fields.is_empty() {
             return;
         }
         render_validate_fn(
@@ -977,6 +1043,7 @@ impl<'a> GoGenerator<'a> {
             &s.name,
             &fields,
             &regex_fields,
+            &money_fields,
         );
     }
 
@@ -1640,7 +1707,14 @@ impl<'a> GoGenerator<'a> {
             // condition must track `emit_body_validate_method`'s emit gate so we
             // never call a method that wasn't generated, nor skip one that was.
             let has_regex_field = body.fields.iter().any(|f| regex_scalar(&f.ty).is_some());
-            if body.fields.iter().any(|f| f.constraint.is_some()) || has_regex_field {
+            let has_money_field = body
+                .fields
+                .iter()
+                .any(|f| money_field_shape(&f.ty).is_some());
+            if body.fields.iter().any(|f| f.constraint.is_some())
+                || has_regex_field
+                || has_money_field
+            {
                 let (name, code) = ep
                     .errors
                     .iter()
@@ -2336,16 +2410,20 @@ struct ValidateSink<'a> {
 /// plain field is checked directly. `regex_fields` lists each format-checked
 /// field as `(name, is_ptr, regex_var, label)` — a `Uuid` (`uuidRe`/"invalid
 /// uuid") or `Decimal` (`decimalRe`/"invalid decimal"), nil-guarded when `is_ptr`.
+/// `money_fields` lists each composite `Money` field as `(name, is_ptr)` — its
+/// own `Money.Validate()` is called (the field name wrapping the inner error via
+/// `%w`), nil-guarded when `is_ptr` (an `Option<Money>`).
 /// Shared by the source-struct validator
 /// ([`GoGenerator::emit_validate_method`]) and the derived-body validator
 /// ([`GoGenerator::emit_body_validate_method`]) so the two can never drift.
-/// Callers must invoke this only when `fields` OR `regex_fields` is non-empty — an
-/// empty `Validate()` would needlessly pull in the `fmt` import.
+/// Callers must invoke this only when `fields`, `regex_fields`, OR `money_fields`
+/// is non-empty — an empty `Validate()` would needlessly pull in the `fmt` import.
 fn render_validate_fn(
     sink: ValidateSink<'_>,
     type_name: &str,
     fields: &[(&str, &Expr, bool)],
     regex_fields: &[(&str, bool, &'static str, &'static str)],
+    money_fields: &[(&str, bool)],
 ) {
     let ValidateSink {
         out,
@@ -2394,6 +2472,22 @@ fn render_validate_fn(
         }
     }
 
+    for (name, is_ptr) in money_fields {
+        let field = to_pascal_case(name);
+        // Wrap with the field name (`%w` preserves the inner `Money.Validate()`
+        // error) so a bad nested `Money` names the offending field, matching the
+        // constraint/regex validators above which prefix `name:`.
+        if *is_ptr {
+            out.push_str(&format!(
+                "\tif s.{field} != nil {{\n\t\tif err := s.{field}.Validate(); err != nil {{\n\t\t\treturn fmt.Errorf(\"{name}: %w\", err)\n\t\t}}\n\t}}\n",
+            ));
+        } else {
+            out.push_str(&format!(
+                "\tif err := s.{field}.Validate(); err != nil {{\n\t\treturn fmt.Errorf(\"{name}: %w\", err)\n\t}}\n",
+            ));
+        }
+    }
+
     out.push_str("\treturn nil\n}\n\n");
 }
 
@@ -2422,6 +2516,23 @@ fn regex_scalar(ty: &Type) -> Option<(&'static str, &'static str)> {
     match inner {
         Type::Uuid => Some(("uuidRe", "invalid uuid")),
         Type::Decimal => Some(("decimalRe", "invalid decimal")),
+        _ => None,
+    }
+}
+
+/// If `ty` is a `Money` (or `Option<Money>`) field — whose generated `Validate()`
+/// the containing struct calls — returns its `is_ptr` flag. `List`/`Map` of
+/// `Money` element validation is NOT emitted (parallel to the regex-scalar weak
+/// link); see `docs/known-issues.md` ("`Money` element validation inside
+/// `List`/`Map` is skipped in the Go target").
+fn money_field_shape(ty: &Type) -> Option<bool> {
+    match ty {
+        Type::Money => Some(false),
+        Type::Generic(name, args)
+            if name == "Option" && args.len() == 1 && matches!(args[0], Type::Money) =>
+        {
+            Some(true)
+        }
         _ => None,
     }
 }
@@ -2464,6 +2575,9 @@ fn type_to_go(ty: &Type) -> String {
         // decimal, and we add no dependency). Format is checked in the generated
         // `Validate()` (see `emit_validate_method`); transport-only, no arithmetic.
         Type::Decimal => "string".to_string(),
+        // A composite built-in: the generated `Money` struct (`{Amount, Currency}`)
+        // with its own `Validate()`. See `docs/design-decisions.md` (Money type).
+        Type::Money => "Money".to_string(),
         Type::Void => "".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {

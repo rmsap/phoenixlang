@@ -2743,8 +2743,8 @@ asked for "currency-aware money," but `Money` is just `Decimal` + a currency, an
 a general `Decimal` also covers rates/percentages/quantities/tax. So we ship the
 `Decimal` primitive; a money amount is modeled as a user-defined struct
 (`struct Money { amount: Decimal  currency: String }`) until there's demand for a
-first-class type. **Deferred to a future slice (documented commitment): a built-in
-`Money`** — a composite `{ amount, currency }` with ISO-4217 currency validation.
+first-class type. **(Built-in `Money` shipped next — see the Money section below;
+this Decimal-only framing was the initial cut.)**
 
 **Wire format: JSON string** (`"19.99"`). The only representation that is exact in
 all three targets: a JSON *number* is parsed to an IEEE-754 double in nearly every
@@ -2825,3 +2825,80 @@ TS-validates-query / Go-accepts-query divergence (each driver asserts its side).
 All 13 round-trips (4 base + 3 DateTime + 3 UUID + 3 Decimal) and all four
 compile-lint targets are green; 238 codegen lib tests show no snapshot drift from
 the UUID→branded-scalar generalization.
+
+## Phoenix Gen — Money composite type (2026-06-16)
+
+The first *composite* built-in, and the "currency-aware money" the fixture audit
+wanted — shipped right after `Decimal` (its `amount` is a `Decimal`). Currency
+validation level: **full ISO-4217 code list** (chosen over a 3-letter regex), so a
+non-conforming currency is rejected, not just a malformed shape.
+
+**Wire format:** the object `{ "amount": "19.99", "currency": "USD" }` — `amount`
+is exactly a `Decimal` (string, exact; inherits all Decimal handling), `currency`
+an ISO-4217 alphabetic code.
+
+**Modeling:** a `Type::Money` builtin treated as a composite — each generator
+emits a `Money` type definition *once* (gated on `schema_uses_money`) and maps the
+type to it. A composite isn't URL/header encodable, so `Money` is
+**position-restricted to struct/body fields and responses**: sema rejects a
+`Money` (or `Option`/`List`/`Map` of it) in query-param or header position
+(`check_endpoint`, mirroring the multipart-field restriction). This keeps the
+`schema_uses_money` emit-gate — which scans only those legal positions — from ever
+having to face a `Money` it can't account for, so no target emits a dangling
+reference. `lower_type` → `StringRef` (a never-hit placeholder; Gen never lowers
+and the language has no `Money` literal).
+
+| Target | `Money` representation | Currency validation |
+|---|---|---|
+| TypeScript | `interface Money { amount: Decimal; currency: string }` + `reviveMoney` (revives amount via `parseDecimal`, checks currency) — slots into the revival pipeline like a struct reviver | `CURRENCY_CODES` `Set`, checked in `reviveMoney` on decode (client response, server request body, nested list/map elements) |
+| Python | `class Money(BaseModel) { amount: Decimal; currency: str }` + a `field_validator` | `_CURRENCY_CODES` `set`, checked by the validator on parse (server + client, free via pydantic) |
+| Go | `type Money struct { Amount string; Currency string }` + `Validate()` | `currencyCodes` `map`, checked in `Validate()` (`decimalRe` for amount); **containing structs' `Validate()` recurse into `Money` fields** (new nested-validation) |
+| OpenAPI | a shared `Money` component (`$ref`'d), `amount` `format: decimal` | `currency` `enum` of the full code list |
+
+**The ISO-4217 list & MIT policy.** The active codes are factual data (an ISO
+standard's alphabetic codes — not copyrightable), so they are **hand-authored** as
+a single shared `crate::iso4217::ISO_4217_CODES` const (the "compute constants from
+definitions" path of the MIT-only policy, not a vendored list). Each target emits
+its own membership structure from it (TS `Set`, Python `set`, Go `map`, OpenAPI
+`enum`). `iso4217::tests::iso_4217_codes_are_well_formed` guards authoring
+mistakes (all `^[A-Z]{3}$`, unique, ascending, plausible count); a differential
+test against an MIT reference set is a possible future hardening. Scope: active
+national/supranational transaction currencies (incl. `EUR`/`XOF`/`XAF`/`XPF`/
+`XCD`/`XDR`); precious-metal/fund/test/no-currency `X` codes are excluded.
+
+**Implementation note: generalized, not duplicated.** `Money` reused the
+scalar machinery wherever it fit — the TS revival pipeline (`ts_revive_expr`/
+`ts_type_needs_revival`/`leaf_struct_reviver` gained `Money` arms; a `Money`-using
+schema also forces the `Decimal` helpers since `reviveMoney` calls `parseDecimal`),
+the Go `Validate()` emitter (a new `money_fields` list calling each field's own
+`Validate()`), and Python's `py_decode_expr` / model_dump gate (`Money` ⟹ JSON
+mode, since it carries a `Decimal`). Per-file `Money` import detection mirrors the
+scalars (a bare-`Money` response imports the `Money` type + its reviver; a
+struct-field `Money` rides the containing struct's import).
+
+**Deferred (documented).** Money *arithmetic* (add/multiply across currencies)
+stays out — transport-only, like `Decimal`; it arrives with the Go/TS decimal-lib
+opt-in. Currency-aware rounding/scale per ISO-4217 minor units is future. A
+`Money` field in a multipart body is rejected (same `is_multipart_field_type`
+deferral as the scalars). Go's `Validate()` recurses into direct
+`Money`/`Option<Money>` fields but NOT into `List<Money>`/`Map<String, Money>`
+elements (Python/TS do validate those) — the documented weak link parallel to the
+regex scalars; see [known-issues.md](known-issues.md).
+
+**Verification.** Both harnesses green. (1) Compile-lint: a `MONEY_SCHEMA`
+(field/`Option`/`List`/`Map`/nested-struct + bare scalar/`List`/`Map` responses)
+through all four targets — incl. gofmt/golangci on the `currencyCodes` map, black/
+ruff/mypy on the model + `_CURRENCY_CODES` set (the after-imports blank-line and
+the `field_validator` import were the calibration points), tsc/eslint/prettier on
+the interface + `CURRENCY_CODES` set, and redocly on the `Money` component +
+currency `enum`. A `MONEY_ONLY_SCHEMA` (bare-`Money` response, no user structs)
+covers the case where the generated `Money` definition is the file's last thing —
+which surfaced and pinned a trailing-blank-line fix in Python's `models.py` tail
+(the "emit once" spacer blanks leaked with no following user model). (2) Bespoke
+round-trips (`tests/roundtrip/money/*`) for Go/TS/Python assert a `Money` survives
+body/nested/bare-response positions and that the recursive/validator decode
+accepts valid input and rejects both a bad amount and an unknown currency. (3)
+Sema position-restriction tests (`check_endpoint`): a `Money` (or `Option`/`List`
+of it) in query-param or header position is rejected; struct/body/response use is
+accepted. All 16 round-trips (4 base + 3 DateTime + 3 UUID + 3 Decimal + 3 Money)
+and all four compile-lint targets are green; 239 codegen lib tests show no drift.

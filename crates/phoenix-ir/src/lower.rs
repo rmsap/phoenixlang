@@ -166,6 +166,15 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
         // with no language-level literals/operations yet; same branded-string
         // runtime representation as `DateTime`/`Uuid`. See `docs/design-decisions.md`.
         Type::Decimal => IrType::StringRef,
+        // `Money` is a Phoenix Gen composite (`{amount, currency}` on the wire)
+        // with no language-level literal or operations. It is only consumed by Gen
+        // (which never lowers to IR), but — unlike `File` — nothing in sema forbids
+        // a `Money`-typed field in a regular program, so a `Money`-bearing struct
+        // *could* reach this arm. `StringRef` is a safe non-crashing fallback (same
+        // choice as `DateTime`/`Uuid`/`Decimal`): `Money` has no constructible value
+        // or operations, so the placeholder representation is never materialized.
+        // See `docs/design-decisions.md` (Money type).
+        Type::Money => IrType::StringRef,
         Type::Void => IrType::Void,
         Type::File => {
             // `File` is a Phoenix Gen endpoint-transport type only. Endpoints are

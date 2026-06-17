@@ -15,6 +15,8 @@
 
 /// Go code generation backend (structs, net/http client/server).
 pub mod go;
+/// The active ISO-4217 currency codes (shared `Money` currency validation).
+mod iso4217;
 /// OpenAPI 3.1 JSON specification generation.
 pub mod openapi;
 /// Python code generation backend (Pydantic, FastAPI, httpx).
@@ -49,6 +51,47 @@ pub enum GenMode {
 // so sema's envelope-collision check uses the exact same function — see
 // `phoenix_common::idents::capitalize`.
 pub(crate) use phoenix_common::capitalize;
+
+use phoenix_parser::ast::{Declaration, Program};
+use phoenix_sema::Analysis;
+use phoenix_sema::types::Type;
+
+/// Whether the schema references `Money` anywhere a generated artifact would name
+/// the `Money` type: a struct/body field, a response, or a pagination item type.
+/// Gates the one-time `Money` type/component emission (Go struct, OpenAPI
+/// component, etc.). Shared by the Go and OpenAPI backends; the TypeScript backend
+/// uses its generic `schema_uses_scalar` and Python a shallow per-file scan.
+///
+/// Recursion into types uses [`Type::mentions_money`] — the same predicate sema's
+/// `check_endpoint` uses for the query/header restriction, so both agree on what
+/// counts as a `Money` use.
+///
+/// This deliberately omits query-param/header positions: sema rejects a `Money`
+/// there (it isn't URL/header encodable — see `phoenix-sema`'s `check_endpoint`),
+/// so a `Money` can only reach codegen through the positions scanned here. Were
+/// that restriction lifted, this gate would have to grow those positions too, or
+/// the gated targets (Go/Python/OpenAPI) would emit a dangling `Money` reference.
+pub(crate) fn schema_uses_money(program: &Program, check_result: &Analysis) -> bool {
+    let in_struct = program.declarations.iter().any(|d| {
+        matches!(d, Declaration::Struct(s)
+            if check_result
+                .module
+                .struct_info_by_name(&s.name)
+                .is_some_and(|si| si.fields.iter().any(|f| f.ty.mentions_money())))
+    });
+    let in_ep = check_result.endpoints.iter().any(|ep| {
+        ep.response.as_ref().is_some_and(Type::mentions_money)
+            || ep
+                .body
+                .as_ref()
+                .is_some_and(|b| b.fields.iter().any(|f| f.ty.mentions_money()))
+            || ep
+                .pagination
+                .as_ref()
+                .is_some_and(|p| p.item_type.mentions_money())
+    });
+    in_struct || in_ep
+}
 
 /// A sort key ordering endpoint paths most-specific (most-static) first.
 ///

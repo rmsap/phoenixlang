@@ -59,6 +59,7 @@ fn contains_self(ty: &Type) -> bool {
         | Type::DateTime
         | Type::Uuid
         | Type::Decimal
+        | Type::Money
         | Type::Void
         | Type::TypeVar(_)
         | Type::Error => false,

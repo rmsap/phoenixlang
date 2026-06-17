@@ -23,6 +23,13 @@ use crate::capitalize;
 pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
     let mut schemas = Map::new();
 
+    // The shared `Money` component (composite built-in), only when the schema uses
+    // it — a types-only spec (no operations) skips pruning, so an unconditional
+    // insert would leak `Money` into every spec.
+    if crate::schema_uses_money(program, check_result) {
+        schemas.insert("Money".to_string(), money_schema());
+    }
+
     // Emit component schemas for structs and enums
     for decl in &program.declarations {
         match decl {
@@ -421,6 +428,9 @@ fn type_to_json_schema(ty: &Type) -> Value {
         // No standard JSON-Schema decimal; the `string` + `format: decimal`
         // convention (exact, vs a lossy JSON number). See `docs/design-decisions.md`.
         Type::Decimal => json!({ "type": "string", "format": "decimal" }),
+        // A composite built-in: `$ref` the shared `Money` component (registered in
+        // `generate_openapi`). See `docs/design-decisions.md` (Money type).
+        Type::Money => json!({ "$ref": "#/components/schemas/Money" }),
         Type::Void => json!({}),
         Type::Named(name) => json!({ "$ref": format!("#/components/schemas/{}", name) }),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
@@ -436,6 +446,26 @@ fn type_to_json_schema(ty: &Type) -> Value {
         }
         _ => json!({}),
     }
+}
+
+/// The shared `Money` component schema: an object with an exact-decimal `amount`
+/// and an ISO-4217 `currency` (constrained to the active codes via `enum`), both
+/// required. The `enum` bakes the full code list into the spec so a non-conforming
+/// currency is a validation error.
+fn money_schema() -> Value {
+    let currencies: Vec<Value> = crate::iso4217::ISO_4217_CODES
+        .iter()
+        .map(|c| json!(c))
+        .collect();
+    json!({
+        "type": "object",
+        "description": "A monetary amount: an exact decimal plus an ISO-4217 currency code.",
+        "properties": {
+            "amount": { "type": "string", "format": "decimal" },
+            "currency": { "type": "string", "enum": currencies }
+        },
+        "required": ["amount", "currency"]
+    })
 }
 
 /// Converts a struct declaration to a JSON Schema `object`.

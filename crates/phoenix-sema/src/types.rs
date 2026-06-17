@@ -52,6 +52,16 @@ pub enum Type {
     /// arithmetic via MIT libs are deferred. See `docs/design-decisions.md`
     /// (Decimal scalar type).
     Decimal,
+    /// A monetary amount: an exact `Decimal` amount plus an ISO-4217 currency
+    /// code, serialized on the wire as the object `{ "amount": "19.99",
+    /// "currency": "USD" }`. A Phoenix Gen *composite* built-in (each target emits
+    /// a `Money` type definition) with the same legal positions as a struct —
+    /// struct/body fields and responses; `check_endpoint` rejects it in query-param
+    /// or header position (a composite isn't URL/header-encodable). Lowers to
+    /// `IrType::StringRef` only as a never-hit placeholder (Gen never lowers to IR,
+    /// and the language has no `Money` literal). See `docs/design-decisions.md`
+    /// (Money type).
+    Money,
     /// The unit type, used for functions that do not return a value.
     Void,
     /// A named type that hasn't been resolved yet or is user-defined.
@@ -94,11 +104,12 @@ impl Type {
     /// Resolve a type-name string to a [`Type`].
     ///
     /// The built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
-    /// `"File"`, `"DateTime"`, `"Uuid"`, `"Decimal"`, `"Void"`) are matched
-    /// **case-sensitively** and mapped to the corresponding variant.  Any other
-    /// name is wrapped in [`Type::Named`].  (`File` is only *legal* in
+    /// `"File"`, `"DateTime"`, `"Uuid"`, `"Decimal"`, `"Money"`, `"Void"`) are
+    /// matched **case-sensitively** and mapped to the corresponding variant.  Any
+    /// other name is wrapped in [`Type::Named`].  (`File` is only *legal* in
     /// endpoint-body position — that restriction is enforced in sema, not here.
-    /// `DateTime`/`Uuid`/`Decimal` are plain scalars with no such restriction.)
+    /// `DateTime`/`Uuid`/`Decimal` are plain scalars and `Money` a composite, all
+    /// with no such restriction.)
     pub fn from_name(name: &str) -> Type {
         match name {
             "Int" => Type::Int,
@@ -109,6 +120,7 @@ impl Type {
             "DateTime" => Type::DateTime,
             "Uuid" => Type::Uuid,
             "Decimal" => Type::Decimal,
+            "Money" => Type::Money,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
         }
@@ -152,6 +164,23 @@ impl Type {
     #[must_use]
     pub fn is_type_var(&self) -> bool {
         matches!(self, Type::TypeVar(_))
+    }
+
+    /// Returns `true` if this type is — or has a generic argument that is —
+    /// [`Type::Money`]. Recurses through generics so `Option<Money>`/`List<Money>`/
+    /// `Map<_, Money>` are caught, but does NOT recurse into [`Type::Named`]
+    /// structs (a struct *field* `Money` is a separate, legal case).
+    ///
+    /// Shared by sema (`check_endpoint`'s query/header position restriction) and
+    /// codegen (`schema_uses_money`'s emit gate) so both agree on what "mentions
+    /// `Money`" means.
+    #[must_use]
+    pub fn mentions_money(&self) -> bool {
+        match self {
+            Type::Money => true,
+            Type::Generic(_, args) => args.iter().any(Type::mentions_money),
+            _ => false,
+        }
     }
 }
 
@@ -221,6 +250,7 @@ impl std::fmt::Display for Type {
             Type::DateTime => write!(f, "DateTime"),
             Type::Uuid => write!(f, "Uuid"),
             Type::Decimal => write!(f, "Decimal"),
+            Type::Money => write!(f, "Money"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {
