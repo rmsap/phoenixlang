@@ -215,31 +215,106 @@ Leak-cleanness at exit is gated wasm-side by a bounded-memory trap (the valgrind
 
 ## 2.5 JavaScript Interop
 
-- Import and call JavaScript/npm packages from Phoenix frontend code compiled to WASM
-- `extern js` declarations for typing JS functions and objects without Phoenix implementations
-- Automatic marshalling of Phoenix types to/from JS values across the WASM boundary
-- Access to the full npm ecosystem: UI libraries, utility packages, browser APIs
-- `phoenix.toml` supports `[js-dependencies]` for declaring npm packages
+**Status: active (planning) — phase plan drafted 2026-06-17.** Scope, PR sequence, and exit criteria below; subordinate design decisions are pinned in [design-decisions.md §Phase 2.5 JavaScript interop](../design-decisions.md#phase-25-javascript-interop). No PRs have landed yet.
+
+Build the JavaScript-host bridge on top of the Phase 2.4 WASM backends: let Phoenix call hand-declared JavaScript / browser APIs from code compiled to WASM, marshal values across the boundary, and pass Phoenix closures as JS callbacks. This is the language-level interop layer; the npm-ecosystem layer (package resolution + bundling) rides a later phase.
+
+- `extern js` declarations for typing JS functions and objects that have no Phoenix implementation (bodyless signatures).
+- Automatic marshalling of Phoenix scalar/string/`JsValue` values to/from JS across the WASM boundary, on **both** WASM backends.
+- Phoenix closures pass to JS as callbacks (no `async`/`await` — see below); JS async APIs (`fetch`, `setTimeout`) are modeled callback-style.
+- A generated JS **glue layer** emitted alongside the `.wasm` (Node + browser entry variants) that instantiates the module and satisfies the declared imports.
+- Tested under both **Node.js** (always-on gate) and a **headless browser** (DOM-verification tier), against both `wasm32-linear` and `wasm32-gc`.
 
 ```phoenix
-// Declare external JS functions available at runtime
+// Declare external JS functions available at runtime (hand-declared host API).
 extern js {
   function alert(message: String)
   function setTimeout(callback: (Void) -> Void, ms: Int)
 }
 
-// Import an npm module (resolved at build time)
-import js "lodash" { function debounce(f: (Void) -> Void, ms: Int) -> (Void) -> Void }
-
-async function main() {
-  let greet: (Void) -> Void = debounce(function() { alert("Hello from Phoenix!") }, 300)
-  greet()
+function main() {
+  // Phoenix closures cross the boundary as JS callbacks — no async/await needed.
+  setTimeout(function() { alert("Hello from Phoenix!") }, 300)
 }
 ```
 
-- **Why:** Phoenix targets full-stack web development. The frontend ecosystem is dominated by JavaScript — ignoring npm would force developers to rewrite existing solutions. Interop lets Phoenix leverage the JS ecosystem while providing a better authoring experience.
-- **Complexity:** High — requires a JS glue code generator, type marshalling layer, and integration with a JS bundler (e.g. esbuild or Vite) for npm resolution. The WASM component model (or wasm-bindgen-style approach) provides a proven foundation.
-- **Depends on:** WebAssembly target (2.4), Package manager (3.1)
+### Scope boundaries (carved out, with forward pointers)
+
+- **npm package resolution is deferred to Phase 3.1.** `import js "pkg" { ... }` string-source imports, `[js-dependencies]` in `phoenix.toml`, and bundler/npm integration depend on a package manager that does not exist yet (today `phoenix.toml` carries only `[gen]`, and the module resolver is filesystem-only). 2.5 ships **hand-declared** `extern js` host/browser APIs only; the npm slice rides with / after the package manager. See [design-decisions.md §Phase 2.5 decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31).
+- **async / await / `Promise` are deferred to Phase 4.3** (the async runtime). The language has no async support today; modeling it here would commit an async-shaped surface ahead of the runtime it must reconcile with. JS async APIs are callback-style in 2.5. The roadmap's earlier `async function main()` interop sketch is revised to the callbacks-only form above.
+- **Aggregate marshalling (struct / enum / `List` / `Map`) across the boundary is future work.** Only `Int` / `Float` / `Bool` / `String` / `JsValue` / `Void` and marshallable-closure types cross in 2.5.
+
+### PR sequence
+
+The phase ships in 18 PRs. The user-facing surface — `extern js` grammar, the `JsValue` type, marshallability rules, and the `Op::ExternCall` IR node — is **backend-neutral and designed once** (PRs 1–3); only the per-backend codegen / marshalling / glue differs. The linear backend ships fully and reaches its gated harness before the WASM-GC half starts (mirroring §2.4's "linear backend reaches the matrix gate before WASM GC starts" coherence discipline); the WASM-GC half is then a purely additive `externref` layer on the shared front-end, glue core, and harness.
+
+**Shared front-end (backend-neutral):**
+
+1. **`extern js` grammar.** `extern` keyword (lexer) + `Declaration::ExternJs` carrying bodyless function signatures (AST) + parser, with `synchronize_stmt()` on the failure path (the §2.4 struct-field anti-hang discipline). A body on an extern signature is a targeted parse error. Front-end plumbing only. *Crates:* `phoenix-lexer`, `phoenix-parser`.
+2. **Sema: `JsValue` + extern registration + marshalling rules.** Add an opaque `Type::JsValue`, pre-registered as a synthetic type the way `Option` / `Result` are in `resolved.rs::build_from_checker`. Register each extern signature as a `FunctionInfo` flagged extern with `(module, name)` linkage. Type-check rule: every extern param and return type must be *marshallable* (`Int`/`Float`/`Bool`/`String`/`JsValue`/`Void`, or a `Function(...)` whose parts are marshallable) — non-marshallable boundary types produce a diagnostic, not a silent pass. *Crate:* `phoenix-sema`.
+3. **IR: `Op::ExternCall`.** New op carrying `(module, name)` + arg value ids; `IrType::JsValue` mirrors the sema type. Lowering rewrites extern calls into it. Both interpreters (`phoenix run` / `run-ir`) error clearly — interop is a WASM-only feature, which the backend-matrix exclusion (PR 9) encodes. *Crates:* `phoenix-ir`, `phoenix-ir-interp`, `phoenix-interp`.
+
+**Linear backend half (ships + gates first):**
+
+4. **wasm32-linear custom-import emission.** Declare one WASM function import per distinct extern `(module, name)` via the documented `ModuleBuilder::merge_func_import` extension point, with index fix-up through the runtime merge; lower `Op::ExternCall` to `call $import`. The `only_wasi_imports_*` structural test relaxes to "imports outside WASI are exactly the declared externs."
+5. **Generated JS glue + paired `.wasm` + `.js` artifact.** `phoenix build --target wasm32-linear` emits a sidecar `.js` glue module (Node + browser entry variants over a shared marshalling core) that instantiates the module, wires WASI + the declared externs as JS thunks. The glue is driven by the same extern table the import section was built from, so names/signatures cannot drift. **Starts after PR 4 closes** so the import section and the glue that fills it stay coherent at every commit.
+6. **Linear value-marshalling helpers.** Encode/decode for each scalar + `String` + `JsValue` across linear memory, wasm-side staging + JS-side helpers, ownership/lifetime pinned. Strings are **copied** at the boundary (out via `TextDecoder` over `(ptr, len)` — the `phx_print_str` scratch-copy pattern; in via `phx_string_alloc` into a GC-owned Phoenix string). `JsValue` is an opaque `i32` handle into a JS-owned handle table. Co-lands with PR 5 as the glue's core, split as its own review unit.
+7. **Linear closures-as-callbacks.** A closure crosses as its `(fn_idx, env_ptr)` env-pointer pair; the module exports a `__phoenix_invoke_closure` trampoline doing `call_indirect`; the glue wraps the pair in a JS callable and registers it in a retention table; the Phoenix side roots the retained closure (`gc_roots`). Freeing is **explicit** (a drop extern / `FinalizationRegistry` tie-in) — callbacks-only async has no `Promise` to anchor lifetime. The host-never-released path is the linear-only known issue.
+8. **Node test harness (always-on gate).** Per fixture: build → load the glue under Node → assert captured output against a baseline. Mirrors the `run_with_wasmtime` soft-skip shape: skip with a visible warning when `node` is absent, hard-fail under a new **`PHOENIX_REQUIRE_NODE=1`** gate. Node provides deterministic synchronous host stubs (e.g. a drained `setTimeout`) so output is byte-stable. Built generic over the WASM target so PR 15 extends it to WASM-GC without restructuring.
+9. **Fixtures + matrix-exclusion encoding.** The canonical interop fixture family (string out, scalar round-trip, `JsValue` pass-through, closure-as-callback, string in). These cannot run native / under wasmtime / through the interpreters, so they are **excluded** from `backend_matrix.rs` / `multi_module_matrix.rs` and that exclusion is *asserted* via `fixture_inventory.rs` (claimant = the interop harness), keeping the "every fixture is claimed by some harness" invariant green. Because that claimant is the Node harness from PR 8, this PR is sequenced after PR 8 — the new fixtures land already claimed, so the invariant never goes red.
+10. **Browser / DOM verification tier (gated soft-skip).** A headless-browser tier (Playwright / headless Chrome) loads the *browser* glue variant in a real page and verifies DOM-mutating externs actually mutate the DOM and a closure-registered event handler fires. Gated by **`PHOENIX_REQUIRE_BROWSER=1`**; soft-skip otherwise (the wasmtime-gate shape). DOM coverage is a curated hand-declared subset.
+
+**WASM-GC backend half (additive — introduces `externref`):**
+
+11. **wasm32-gc `externref` + custom-import emission.** Introduce `externref` into the WASM-GC backend (it uses only `HeapType::Concrete` today): `IrType::JsValue` → `(ref null extern)`; declare custom imports in the WASM-GC `ModuleBuilder` (which hardcodes only `fd_write`); lower `Op::ExternCall` to `call $import`. Relax `only_wasi_imports_on_wasm32_gc` as PR 4 did for linear.
+12. **WASM-GC value-marshalling helpers.** `JsValue` is an `externref` passed **directly** — no handle table, the host VM owns and traces it. Scalars as before; strings copied out/in via the GC backend's small linear-memory scratch region (the WASI iovec staging area) or per-byte `$bytes` accessors.
+13. **WASM-GC closures-as-callbacks.** The closure crosses as a managed ref; export the WASM-GC trampoline; the glue holds the closure ref via `externref` / `funcref` so the **host VM GC traces a host-retained callback automatically — no manual rooting, no explicit-free leak** (the WASM-GC win over the linear backend).
+14. **WASM-GC glue variant.** The externref-aware GC entry variant over the PR-5 shared core; `phoenix build --target wasm32-gc` emits its paired `.js`.
+
+**Both-backend integration + close:**
+
+15. **Both-backend harness coverage + inventory.** Extend the Node (PR 8) and browser (PR 10) tiers to run every interop fixture under **both** WASM targets, asserting byte-identical output; update `fixture_inventory.rs` to claim the family for both.
+16. **CI wiring.** Promote Node from the `gen-checks`-only install to the always-on job under `PHOENIX_REQUIRE_NODE=1`, exercising both WASM targets (WASM-GC via the `function-references=y,gc=y` instantiation) with no silent skips; the browser tier runs as a gated job. The existing wasm-runtime build + `PHOENIX_REQUIRE_WASMTIME=1` steps remain green.
+17. **Interop boundary-cost bench.** A micro-bench of per-call marshalling overhead (a string round-trip vs. a pure-wasm call) for both backends under Node, regenerated by `bench-corpus/run-interop.sh`; published to `docs/perf/`.
+18. **Phase close.** Write the §2.5 closeout + "Bugs closed in this phase," tick every exit-criteria box, record the design decisions, open the deferred-item known-issues, and confirm the `async` example revision.
+
+**Sequencing constraint:** PR 1 unblocks everything; 1 → 2 → 3 is the backend-neutral front-end → IR spine. The linear half runs 4 (import declaration) → **4 closes before 5 starts** → 5/6 (glue + marshalling co-land) → 7 (callbacks) → 8 (Node harness) → 9 (fixtures + matrix exclusion; **inventory invariant not green until 8 lands**) → 10 (browser tier), at which point linear interop is fully gated. The WASM-GC half (11–14) is additive on the shared front-end + glue core + harness, sequenced 11 (externref + imports) → 12 (marshalling) → 13 (host-traced callbacks) → 14 (GC glue). Then 15 extends both harness tiers across both targets, 16 wires CI, 17 benches the boundary, 18 closes.
+
+### Design decisions locked in this phase
+
+Full rationale and rejected alternatives in [design-decisions.md §Phase 2.5 JavaScript interop](../design-decisions.md#phase-25-javascript-interop):
+
+- **[A. Host set & gating](../design-decisions.md#a-host-set--gating-node-always-on-browser-gated)** — Node is the always-on CI gate (`PHOENIX_REQUIRE_NODE=1`, mirroring `PHOENIX_REQUIRE_WASMTIME`); headless browser is a gated DOM-verification tier (`PHOENIX_REQUIRE_BROWSER=1`).
+- **[B. Backend scope: BOTH `wasm32-linear` and `wasm32-gc`](../design-decisions.md#b-backend-scope-both-wasm32-linear-and-wasm32-gc)** — front-end shared and designed once; linear uses copy-marshalling, WASM-GC introduces `externref`. Linear ships and gates first; WASM-GC is additive.
+- **[C. Glue-artifact shape](../design-decisions.md#c-glue-artifact-shape-paired-sidecar-js)** — paired sidecar `.js` (Node + browser variants) over a shared marshalling core with per-backend encode/decode plugins, driven by the extern table.
+- **[D. `JsValue` representation](../design-decisions.md#d-jsvalue-representation-per-backend-same-user-facing-type)** — per-backend (same user-facing type): an `i32` handle into a JS-owned table on linear; an `externref` passed directly on WASM-GC.
+- **[E. Extern-call ABI](../design-decisions.md#e-extern-call-abi-per-backend-marshalled-signatures)** — per-backend marshalled signatures; one custom import per distinct `(module, name)`.
+- **[F. String ownership across the boundary](../design-decisions.md#f-string-ownership-across-the-boundary-copied-never-shared)** — copied on both backends, never shared/borrowed.
+- **[G. Closures-as-callbacks lifetime](../design-decisions.md#g-closures-as-callbacks-lifetime-per-backend)** — linear: trampoline + retention table + GC root + explicit free; WASM-GC: host-VM-traced, no manual lifetime.
+- **[H. Async = callbacks-only](../design-decisions.md#h-async-model-callbacks-only)** · **[I. DOM coverage = curated hand-declared subset](../design-decisions.md#i-dom-type-coverage-curated-hand-declared-subset)** · **[J. npm slice deferred to Phase 3.1](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)**.
+
+### Exit criteria for declaring Phase 2.5 complete
+
+Mirror of [§2.4's exit criteria](#exit-criteria-for-declaring-phase-24-complete) — minimum gates, not aspirational targets.
+
+- [ ] **All Phase-2.5 design decisions implemented.** The codegen decisions **C–G** (glue-artifact shape, `JsValue` representation, extern-call ABI, string ownership, closures-as-callbacks lifetime) each carry an `✅ Implemented YYYY-MM-DD` marker; the scope/process decisions **A, B, H, I, J** (host set & gating, backend scope, async = callbacks-only, DOM coverage, deferred npm slice) carry `**Decided:**` markers — their realization is evidenced by the other boxes below, not a single code artifact (mirroring §2.4's A–D split above).
+- [ ] **`extern js` parses, type-checks, and lowers.** A bodyless `extern js { ... }` block registers marshallable signatures; a non-marshallable boundary type produces a diagnostic. Pinned by parser unit tests + a sema negative test.
+- [ ] **Paired `.wasm` + `.js` glue on both WASM targets.** `phoenix build --target wasm32-linear` and `--target wasm32-gc` each emit a glue sidecar whose import section declares exactly the WASI imports plus the program's declared externs (no stray imports), enforced by an extended structural test per backend.
+- [ ] **Node interop tier byte-identical to baselines across both WASM targets**, under the always-on `PHOENIX_REQUIRE_NODE=1` gate: string out, scalar round-trip, `JsValue` handle/externref pass-through, closure-as-callback (`setTimeout`), string in-from-host.
+- [ ] **Browser/DOM tier verifies real DOM mutation** for the curated DOM subset and a closure-registered event handler, on both targets, gated by `PHOENIX_REQUIRE_BROWSER=1`; soft-skips with a visible warning where no browser is provisioned.
+- [ ] **Marshalling round-trips leak-clean.** Linear: retained callbacks are rooted while held and freed on explicit drop (the host-never-released path documented as a known issue). WASM-GC: callbacks are host-VM-traced with no manual lifetime.
+- [ ] **Fixture-inventory invariant green with the interop family present.** Interop fixtures are excluded from `backend_matrix.rs` / `multi_module_matrix.rs` and that exclusion is asserted; the family is claimed by the interop harness for both targets.
+- [ ] **All Phase-2.5 bug-closure entries have regression tests.** Each "Bugs closed in this phase" entry maps to a test that fails when the fix is reverted.
+- [ ] **No `known-issues.md` entry targeted at / blocking Phase 2.5.** The new deferred-item entries (npm, async/await, DOM-coverage scope, the linear-only retained-callback leak) are *forward* deferrals, not open 2.5 blockers.
+- [ ] **Workspace test/clippy/fmt clean.** `cargo test --workspace` green under `PHOENIX_REQUIRE_RUNTIME_LIB=1 PHOENIX_REQUIRE_RUNTIME_WASM=1 PHOENIX_REQUIRE_WASMTIME=1 PHOENIX_REQUIRE_NODE=1`; `cargo clippy --workspace --all-targets -- -D warnings` zero warnings; `cargo fmt --all -- --check` clean.
+- [ ] **CI integration matches the gating shape.** Node runs in the always-on job under `PHOENIX_REQUIRE_NODE=1` exercising both WASM targets with no silent skips; the browser tier runs gated where a browser is provisioned; the existing wasmtime steps stay green.
+- [ ] **Phase-close bench refresh.** The interop boundary-crossing cost (string round-trip vs. pure-wasm call) is published for both backends and regenerated by `bench-corpus/run-interop.sh`.
+
+When every box above is ticked, Phase 2.5 closes and Phase 3.1 (package manager — which carries the deferred `import js "pkg"` / `[js-dependencies]` / npm-resolution slice) becomes the natural next active phase.
+
+- **Why:** Phoenix targets full-stack web development. The frontend ecosystem is dominated by JavaScript — the interop bridge lets Phoenix code in the browser reach hand-declared host and DOM APIs (and, once Phase 3.1 lands the package manager, the npm ecosystem) instead of reimplementing them. It is the prerequisite for the Phase 5 reactivity / frontend-framework work.
+- **Complexity:** High — a JS glue-code generator, a value-marshalling layer across two WASM ABIs (copy-marshalling on linear, `externref` on WASM-GC), and dual Node + browser test harnesses. The wasm-bindgen-style approach is the proven foundation on the linear side; `externref` is the native model on the WASM-GC side.
+- **Depends on:** WebAssembly target (2.4, complete). The npm-package slice additionally depends on the Package manager (3.1) and is deferred to ride with it.
 
 ## 2.6 Module System and Visibility
 
