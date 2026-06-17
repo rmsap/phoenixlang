@@ -67,6 +67,7 @@ mod dyn_trait;
 mod enums;
 mod float_helpers;
 mod lists;
+mod map_hash_index;
 mod maps;
 mod module_builder;
 mod option_result;

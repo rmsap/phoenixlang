@@ -66,6 +66,15 @@ use super::translate;
 ///   synthesized. See [`super::ryu_tables`] and §Phase 2.4 K.6.
 pub(super) const IOVEC_OFFSET: u32 = 8;
 pub(super) const NWRITTEN_OFFSET: u32 = 16;
+
+/// `$string` struct field indices (the K.2 layout
+/// `(struct (ref $bytes) (i32 $offset) (i32 $len))`). Shared by
+/// [`ModuleBuilder::declare_string_types`], the `string_helpers`
+/// synthesizers, and the map hash index's `emit_str_hash` so the field
+/// order lives in exactly one place — a future reorder is one edit here.
+pub(super) const STR_DATA: u32 = 0;
+pub(super) const STR_OFFSET: u32 = 1;
+pub(super) const STR_LEN: u32 = 2;
 /// Scratch buffer for `phx_print_i64`'s digit conversion. 32 bytes
 /// holds the worst case i64 string representation (sign byte, 19
 /// digits, trailing newline — 21 chars total) with comfortable
@@ -422,6 +431,13 @@ pub(super) struct ModuleBuilder {
     /// such collisions can't occur.
     phx_map_kv_by_struct: HashMap<u32, (IrType, IrType)>,
 
+    /// Type-section index of the single shared `$arr_idx = (array (mut
+    /// i32))` that backs every `$map_KV.$idx` open-addressing hash index
+    /// (§Phase 2.4 close). Declared once by [`maps::declare`] before any
+    /// `$map_KV`, then read back via [`Self::require_map_idx_array`].
+    /// `None` until a module that uses maps declares it.
+    map_idx_array: Option<u32>,
+
     /// Concrete map `(K, V)` → `$mapbuilder_KV` struct index. Only
     /// populated for `(K, V)` pairs the module actually builds with
     /// `MapBuilder<K, V>`. Mirrors [`Self::phx_list_builders`].
@@ -544,6 +560,7 @@ impl ModuleBuilder {
             phx_lists: HashMap::new(),
             phx_maps: HashMap::new(),
             phx_map_kv_by_struct: HashMap::new(),
+            map_idx_array: None,
             phx_map_builders: HashMap::new(),
             phx_map_builder_kv_by_struct: HashMap::new(),
             phx_dyn_traits: HashMap::new(),
@@ -619,8 +636,13 @@ impl ModuleBuilder {
     /// Declare the two nominal WASM-GC types that back Phoenix's
     /// `String`: `(array (mut i8))` for byte storage and
     /// `(struct (ref $bytes) (field $offset i32) (field $len i32))` for
-    /// the three-field wrapper.  See §Phase 2.4 decision K.2 for the
-    /// shape rationale (substring views + StringBuilder.finalize() as
+    /// the three-field wrapper.  Field order is pinned by the
+    /// [`STR_DATA`] / [`STR_OFFSET`] / [`STR_LEN`] constants — every
+    /// `struct.get`/`struct.set` against `$string` (here, in
+    /// `string_helpers`, and in the map hash index) reads those rather
+    /// than a bare literal, so a future field reorder is a one-line
+    /// change.  See §Phase 2.4 decision K.2 for the shape rationale
+    /// (substring views + StringBuilder.finalize() as
     /// O(1) struct.new operations).
     ///
     /// Must run *before* any function signature is interned, because
@@ -1329,6 +1351,27 @@ impl ModuleBuilder {
         self.phx_map_kv_by_struct
             .insert(map_idx, (key.clone(), val.clone()));
         self.phx_maps.insert((key, val), map_idx);
+    }
+
+    /// Record the shared `$arr_idx = (array (mut i32))` hash-index backing
+    /// array's type index. Called once by [`maps::declare`] before any
+    /// `$map_KV` struct (whose `$idx` field references it).
+    pub(super) fn record_map_idx_array(&mut self, arr_idx: u32) {
+        self.map_idx_array = Some(arr_idx);
+    }
+
+    /// Type-section index of the shared `$arr_idx` hash-index backing
+    /// array (recorded by [`Self::record_map_idx_array`]). Every
+    /// `$map_KV.$idx` field and index-buffer local is typed
+    /// `(ref null $arr_idx)`. Errors if the module declared no maps.
+    pub(super) fn require_map_idx_array(&self) -> Result<u32, CompileError> {
+        self.map_idx_array.ok_or_else(|| {
+            CompileError::new(
+                "wasm32-gc: the shared `$arr_idx` hash-index array was not \
+                 declared by `declare_phoenix_maps` — the module uses maps but \
+                 the index-array type is missing (internal compiler bug)",
+            )
+        })
     }
 
     /// `$map_KV` struct index for the map instantiation `(K, V)`. Used

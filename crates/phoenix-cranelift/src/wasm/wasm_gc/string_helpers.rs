@@ -25,7 +25,8 @@ use wasm_encoder::{BlockType, HeapType, Instruction, RefType, ValType};
 use crate::error::CompileError;
 
 use super::module_builder::{
-    IOVEC_OFFSET, ModuleBuilder, PRINT_STR_BUF_START, PRINT_STR_MAX_LEN, emit_fd_write_call,
+    IOVEC_OFFSET, ModuleBuilder, PRINT_STR_BUF_START, PRINT_STR_MAX_LEN, STR_DATA, STR_LEN,
+    STR_OFFSET, emit_fd_write_call,
 };
 
 /// `phx_print_str(s: (ref null $string))` — copy `s.$data[s.$offset
@@ -82,7 +83,7 @@ pub(super) fn synthesize_print_str(
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_local));
     // Reject oversized strings up front — the scratch buffer is
@@ -100,14 +101,14 @@ pub(super) fn synthesize_print_str(
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(offset_local));
     // data = struct.get $string $data(0)
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_local));
     // i = 0
@@ -208,14 +209,14 @@ pub(super) fn synthesize_str_concat(b: &mut ModuleBuilder) -> Result<u32, Compil
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_a_local));
     // len_b = b.$len
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_b_local));
     // total = len_a + len_b
@@ -233,12 +234,12 @@ pub(super) fn synthesize_str_concat(b: &mut ModuleBuilder) -> Result<u32, Compil
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalGet(len_a_local));
     func.instruction(&Instruction::ArrayCopy {
@@ -251,12 +252,12 @@ pub(super) fn synthesize_str_concat(b: &mut ModuleBuilder) -> Result<u32, Compil
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalGet(len_b_local));
     func.instruction(&Instruction::ArrayCopy {
@@ -318,13 +319,13 @@ pub(super) fn synthesize_str_eq(b: &mut ModuleBuilder) -> Result<u32, CompileErr
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalTee(len_local));
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::I32Ne);
     func.instruction(&Instruction::If(BlockType::Empty));
@@ -335,25 +336,25 @@ pub(super) fn synthesize_str_eq(b: &mut ModuleBuilder) -> Result<u32, CompileErr
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(off_a_local));
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(off_b_local));
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_a_local));
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_b_local));
     // i = 0
@@ -455,13 +456,13 @@ pub(super) fn synthesize_str_cmp(b: &mut ModuleBuilder) -> Result<u32, CompileEr
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_a_local));
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_b_local));
     // min_len = min(len_a, len_b) — emit the branchless `if a < b { a } else { b }`
@@ -477,25 +478,25 @@ pub(super) fn synthesize_str_cmp(b: &mut ModuleBuilder) -> Result<u32, CompileEr
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(off_a_local));
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(off_b_local));
     func.instruction(&Instruction::LocalGet(a_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_a_local));
     func.instruction(&Instruction::LocalGet(b_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_b_local));
     // i = 0
@@ -636,19 +637,19 @@ pub(super) fn synthesize_str_substring(b: &mut ModuleBuilder) -> Result<u32, Com
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(off_local));
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_local));
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_local));
     // Walk 1: find byte_start = byte index of start_i-th code-point
@@ -845,19 +846,19 @@ pub(super) fn synthesize_str_length(b: &mut ModuleBuilder) -> Result<u32, Compil
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 1,
+        field_index: STR_OFFSET,
     });
     func.instruction(&Instruction::LocalSet(off_local));
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 2,
+        field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_local));
     func.instruction(&Instruction::LocalGet(s_local));
     func.instruction(&Instruction::StructGet {
         struct_type_index: string_idx,
-        field_index: 0,
+        field_index: STR_DATA,
     });
     func.instruction(&Instruction::LocalSet(data_local));
     // count = 0; i = 0;

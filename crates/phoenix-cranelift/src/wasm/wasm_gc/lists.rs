@@ -1414,9 +1414,12 @@ pub(super) fn translate_list_flat_map(
 }
 
 /// `List.sortBy(list, cmp: (T, T) -> Int) -> List<T>` — stable
-/// insertion sort (matching wasm32-linear and the interpreters; `cmp
-/// <= 0` keeps ties in input order) over a fresh copy of the input
-/// array. No GC rooting — the host VM traces the in-flight `key`.
+/// bottom-up iterative merge sort (**O(n log n)**, matching native and
+/// the interpreters; `cmp <= 0` keeps ties in input order). Two buffers
+/// `src`/`dst` ping-pong each width pass (no per-pass copyback); after
+/// the loop the sorted data is in whichever `src` holds — odd pass
+/// counts leave it in `aux` rather than `copy`. No GC rooting: the host
+/// VM traces the array-ref locals (`src`, `dst`) automatically.
 pub(super) fn translate_list_sort_by(
     ctx: &mut FuncCtx,
     b: &mut ModuleBuilder,
@@ -1431,19 +1434,29 @@ pub(super) fn translate_list_sort_by(
     let (out_arr, out_list) = b.require_list_types(out_elem)?;
 
     let len = ctx.scratch_local(ValType::I32);
-    let i = ctx.scratch_local(ValType::I32);
-    let j = ctx.scratch_local(ValType::I32);
-    let key = ctx.scratch_local(elem_vt);
-    let cmp_a = ctx.scratch_local(elem_vt);
+    let width = ctx.scratch_local(ValType::I32);
+    let i = ctx.scratch_local(ValType::I32); // run-pair start
+    let lo = ctx.scratch_local(ValType::I32);
+    let mid = ctx.scratch_local(ValType::I32);
+    let hi = ctx.scratch_local(ValType::I32);
+    let a = ctx.scratch_local(ValType::I32); // left cursor
+    let bb = ctx.scratch_local(ValType::I32); // right cursor
+    let k = ctx.scratch_local(ValType::I32); // merge write cursor
+    let a_elem = ctx.scratch_local(elem_vt);
+    let b_elem = ctx.scratch_local(elem_vt);
     let cmp_res = ctx.scratch_local(ValType::I64);
-    let copy = ctx.scratch_local(arr_ref(out_arr));
+    // `src`/`dst` are array-ref locals swapped each width pass; the host
+    // VM auto-roots them across the comparator call.
+    let src = ctx.scratch_local(arr_ref(out_arr));
+    let dst = ctx.scratch_local(arr_ref(out_arr));
+    let tmp = ctx.scratch_local(arr_ref(out_arr)); // swap scratch
 
     emit_len_i32(ctx, list_local, list_idx, len);
-    // copy = array.new_default(len); array.copy copy[0..len] <- data[0..len]
+    // copy (src) = array.new_default(len); array.copy src[0..len] <- data[0..len]
     ctx.emit(Instruction::LocalGet(len));
     ctx.emit(Instruction::ArrayNewDefault(out_arr));
-    ctx.emit(Instruction::LocalSet(copy));
-    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::LocalSet(src));
+    ctx.emit(Instruction::LocalGet(src));
     ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::LocalGet(list_local));
     ctx.emit(Instruction::StructGet {
@@ -1457,79 +1470,194 @@ pub(super) fn translate_list_sort_by(
         array_type_index_src: in_arr,
     });
 
-    // i = 1
+    // Trivial path: len <= 1 → wrap src as-is (no aux, no passes).
+    ctx.emit(Instruction::LocalGet(len));
     ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32GtS);
+    ctx.emit(Instruction::If(BlockType::Empty));
+
+    // aux (dst) = array.new_default(len).
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::ArrayNewDefault(out_arr));
+    ctx.emit(Instruction::LocalSet(dst));
+
+    // width = 1
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::LocalSet(width));
+    // outer: while width < len
+    ctx.emit(Instruction::Block(BlockType::Empty));
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    ctx.emit(Instruction::LocalGet(width));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::BrIf(1)); // break outer
+    // i = 0
+    ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::LocalSet(i));
-    // outer: while i < len
+    // middle: while i < len
     ctx.emit(Instruction::Block(BlockType::Empty));
     ctx.emit(Instruction::Loop(BlockType::Empty));
     ctx.emit(Instruction::LocalGet(i));
     ctx.emit(Instruction::LocalGet(len));
     ctx.emit(Instruction::I32GeS);
-    ctx.emit(Instruction::BrIf(1)); // break outer
-    // key = copy[i]
-    ctx.emit(Instruction::LocalGet(copy));
+    ctx.emit(Instruction::BrIf(1)); // break middle
+    // lo = i
     ctx.emit(Instruction::LocalGet(i));
-    ctx.emit(Instruction::ArrayGet(out_arr));
-    ctx.emit(Instruction::LocalSet(key));
-    // j = i - 1
+    ctx.emit(Instruction::LocalSet(lo));
+    // mid = min(i + width, len)
     ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::LocalGet(width));
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalSet(mid));
+    ctx.emit(Instruction::LocalGet(mid));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::LocalGet(mid));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::I32LtS);
+    ctx.emit(Instruction::Select);
+    ctx.emit(Instruction::LocalSet(mid));
+    // hi = min(i + 2*width, len)
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::LocalGet(width));
     ctx.emit(Instruction::I32Const(1));
-    ctx.emit(Instruction::I32Sub);
-    ctx.emit(Instruction::LocalSet(j));
-    // inner: while j >= 0 && cmp(copy[j], key) > 0: copy[j+1]=copy[j]; j--
+    ctx.emit(Instruction::I32Shl);
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalSet(hi));
+    ctx.emit(Instruction::LocalGet(hi));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::LocalGet(hi));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::I32LtS);
+    ctx.emit(Instruction::Select);
+    ctx.emit(Instruction::LocalSet(hi));
+    // a = lo; bb = mid; k = lo
+    ctx.emit(Instruction::LocalGet(lo));
+    ctx.emit(Instruction::LocalSet(a));
+    ctx.emit(Instruction::LocalGet(mid));
+    ctx.emit(Instruction::LocalSet(bb));
+    ctx.emit(Instruction::LocalGet(lo));
+    ctx.emit(Instruction::LocalSet(k));
+    // merge: while k < hi
     ctx.emit(Instruction::Block(BlockType::Empty));
     ctx.emit(Instruction::Loop(BlockType::Empty));
-    // j < 0 → break inner
-    ctx.emit(Instruction::LocalGet(j));
-    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalGet(k));
+    ctx.emit(Instruction::LocalGet(hi));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::BrIf(1)); // break merge
+    // Load each side's current element into its local *at most once* per
+    // iteration, gated on the run still having elements, then reuse that
+    // load for both the comparison and the store. `a < mid` ⇒ `src[a]`
+    // valid; `bb < hi` ⇒ `src[bb]` valid. The winning side is always one
+    // that was loaded (take_left ⇒ a<mid; !take_left ⇒ bb<hi), so the
+    // store reuses its local with no reload. (The host VM auto-roots the
+    // ref-typed `a_elem`/`b_elem` across the comparator call.)
+    ctx.emit(Instruction::LocalGet(a));
+    ctx.emit(Instruction::LocalGet(mid));
     ctx.emit(Instruction::I32LtS);
-    ctx.emit(Instruction::BrIf(1));
-    // cmp_a = copy[j]
-    ctx.emit(Instruction::LocalGet(copy));
-    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::If(BlockType::Empty));
+    ctx.emit(Instruction::LocalGet(src));
+    ctx.emit(Instruction::LocalGet(a));
     ctx.emit(Instruction::ArrayGet(out_arr));
-    ctx.emit(Instruction::LocalSet(cmp_a));
-    // cmp_res = cmp(cmp_a, key)
-    emit_closure_call(ctx, b, args[1], &[cmp_a, key])?;
+    ctx.emit(Instruction::LocalSet(a_elem));
+    ctx.emit(Instruction::End);
+    ctx.emit(Instruction::LocalGet(bb));
+    ctx.emit(Instruction::LocalGet(hi));
+    ctx.emit(Instruction::I32LtS);
+    ctx.emit(Instruction::If(BlockType::Empty));
+    ctx.emit(Instruction::LocalGet(src));
+    ctx.emit(Instruction::LocalGet(bb));
+    ctx.emit(Instruction::ArrayGet(out_arr));
+    ctx.emit(Instruction::LocalSet(b_elem));
+    ctx.emit(Instruction::End);
+    // take_left = (a < mid) && (bb >= hi || cmp(a_elem, b_elem) <= 0)
+    // Compute take_left into an i32 via control flow: default false, set
+    // true when the left run wins.
+    // First: a < mid ?
+    ctx.emit(Instruction::LocalGet(a));
+    ctx.emit(Instruction::LocalGet(mid));
+    ctx.emit(Instruction::I32LtS);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    // left has elements — does it win? bb >= hi → yes outright.
+    ctx.emit(Instruction::LocalGet(bb));
+    ctx.emit(Instruction::LocalGet(hi));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+    ctx.emit(Instruction::I32Const(1)); // right exhausted → take left
+    ctx.emit(Instruction::Else);
+    // both runs live: cmp(a_elem, b_elem) <= 0 → take left (stable).
+    emit_closure_call(ctx, b, args[1], &[a_elem, b_elem])?;
     ctx.emit(Instruction::LocalSet(cmp_res));
-    // cmp_res <= 0 → break inner (stable)
     ctx.emit(Instruction::LocalGet(cmp_res));
     ctx.emit(Instruction::I64Const(0));
     ctx.emit(Instruction::I64LeS);
-    ctx.emit(Instruction::BrIf(1));
-    // copy[j+1] = copy[j]  (cmp_a holds copy[j])
-    ctx.emit(Instruction::LocalGet(copy));
-    ctx.emit(Instruction::LocalGet(j));
+    ctx.emit(Instruction::End); // if (bb >= hi)
+    ctx.emit(Instruction::Else);
+    ctx.emit(Instruction::I32Const(0)); // left exhausted → take right
+    ctx.emit(Instruction::End); // if (a < mid)
+    // if take_left { dst[k] = a_elem; a += 1 } else { dst[k] = b_elem; bb += 1 }
+    // The winning side's element is already in its local (loaded above),
+    // so the store reuses it with no reload.
+    ctx.emit(Instruction::If(BlockType::Empty));
+    // dst[k] = a_elem
+    ctx.emit(Instruction::LocalGet(dst));
+    ctx.emit(Instruction::LocalGet(k));
+    ctx.emit(Instruction::LocalGet(a_elem));
+    ctx.emit(Instruction::ArraySet(out_arr));
+    // a += 1
+    ctx.emit(Instruction::LocalGet(a));
     ctx.emit(Instruction::I32Const(1));
     ctx.emit(Instruction::I32Add);
-    ctx.emit(Instruction::LocalGet(cmp_a));
+    ctx.emit(Instruction::LocalSet(a));
+    ctx.emit(Instruction::Else);
+    // dst[k] = b_elem
+    ctx.emit(Instruction::LocalGet(dst));
+    ctx.emit(Instruction::LocalGet(k));
+    ctx.emit(Instruction::LocalGet(b_elem));
     ctx.emit(Instruction::ArraySet(out_arr));
-    // j -= 1
-    ctx.emit(Instruction::LocalGet(j));
-    ctx.emit(Instruction::I32Const(1));
-    ctx.emit(Instruction::I32Sub);
-    ctx.emit(Instruction::LocalSet(j));
-    ctx.emit(Instruction::Br(0)); // continue inner
-    ctx.emit(Instruction::End); // loop inner
-    ctx.emit(Instruction::End); // block inner
-    // copy[j+1] = key
-    ctx.emit(Instruction::LocalGet(copy));
-    ctx.emit(Instruction::LocalGet(j));
+    // bb += 1
+    ctx.emit(Instruction::LocalGet(bb));
     ctx.emit(Instruction::I32Const(1));
     ctx.emit(Instruction::I32Add);
-    ctx.emit(Instruction::LocalGet(key));
-    ctx.emit(Instruction::ArraySet(out_arr));
-    // i += 1
+    ctx.emit(Instruction::LocalSet(bb));
+    ctx.emit(Instruction::End); // if take_left
+    // k += 1
+    ctx.emit(Instruction::LocalGet(k));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Add);
+    ctx.emit(Instruction::LocalSet(k));
+    ctx.emit(Instruction::Br(0)); // continue merge
+    ctx.emit(Instruction::End); // loop merge
+    ctx.emit(Instruction::End); // block merge
+    // i += 2*width
     ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::LocalGet(width));
     ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Shl);
     ctx.emit(Instruction::I32Add);
     ctx.emit(Instruction::LocalSet(i));
+    ctx.emit(Instruction::Br(0)); // continue middle
+    ctx.emit(Instruction::End); // loop middle
+    ctx.emit(Instruction::End); // block middle
+    // swap src and dst
+    ctx.emit(Instruction::LocalGet(src));
+    ctx.emit(Instruction::LocalSet(tmp));
+    ctx.emit(Instruction::LocalGet(dst));
+    ctx.emit(Instruction::LocalSet(src));
+    ctx.emit(Instruction::LocalGet(tmp));
+    ctx.emit(Instruction::LocalSet(dst));
+    // width *= 2
+    ctx.emit(Instruction::LocalGet(width));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::I32Shl);
+    ctx.emit(Instruction::LocalSet(width));
     ctx.emit(Instruction::Br(0)); // continue outer
     ctx.emit(Instruction::End); // loop outer
     ctx.emit(Instruction::End); // block outer
 
-    emit_wrap_list(ctx, len, copy, out_list, vid);
+    ctx.emit(Instruction::End); // if len > 1
+
+    // Sorted data is in `src` (the swap leaves the final merged buffer there).
+    emit_wrap_list(ctx, len, src, out_list, vid);
     Ok(())
 }
 

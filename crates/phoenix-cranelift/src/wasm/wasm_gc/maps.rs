@@ -1,15 +1,18 @@
 //! wasm32-gc `Map<K,V>` type declaration and op lowering (§Phase 2.4
 //! decision K.9).
 //!
-//! Per K.9, a map is an **ordered association over parallel arrays** —
-//! *not* a hash table. Nothing about native's FNV-1a open-addressing
-//! table is observable; only key-equality lookup and **insertion-order**
+//! Per K.9, a map is an **insertion-ordered association over parallel
+//! arrays** carrying an **open-addressing hash *index*** that
+//! accelerates lookup and construction-dedup. Nothing about the hash is
+//! observable; only key-equality lookup and **insertion-order**
 //! `keys()`/`values()` are contract. So a map is:
 //!
 //! ```text
-//! $map_KV = (struct (field $len  i64)
-//!                   (field $keys (ref null $arr_K))
-//!                   (field $vals (ref null $arr_V)))
+//! $arr_idx = (array (mut i32))   // shared; declared once
+//! $map_KV  = (struct (field $len  i64)
+//!                    (field $keys (ref null $arr_K))
+//!                    (field $vals (ref null $arr_V))
+//!                    (field $idx  (ref null $arr_idx)))
 //! ```
 //!
 //! where `$arr_K` / `$arr_V` are exactly the K.7 `List<K>` / `List<V>`
@@ -17,11 +20,18 @@
 //! map's K and V). `keys()` / `values()` therefore just wrap `$keys` /
 //! `$vals` as a `$list_K` / `$list_V` (O(1) view; the arrays are
 //! immutable). Entries sit in the arrays in insertion order, so order
-//! preservation is structural. `get` / `contains` / `set` / `remove`
-//! are linear scans with per-`K` key-equality dispatch; `set` / `remove`
-//! are copy-on-write (the immutable Map API). O(n) where native is
-//! O(1) — accepted, consistent with K.7's O(n) lists; fixture maps are
-//! tiny. The output is byte-identical to every other backend.
+//! preservation is structural — **unchanged** by the index.
+//!
+//! `$idx` (§Phase-2.4 close, driven by the `hash_map_churn` bench) is a
+//! power-of-two open-addressing table whose slots hold a *slot index*
+//! into `$keys`/`$vals` (or `-1` for empty), sized to ≤50% load. It
+//! makes `get` / `contains` O(1) (vs the prior O(n) linear scan) and
+//! literal / `set` / `remove` / `MapBuilder.freeze` construction-dedup
+//! O(n) (vs O(n²)). The hash is *not* matched to native's FNV-1a — it
+//! need only be self-consistent, since equality (not hash) is the
+//! contract. `set` / `remove` stay copy-on-write (the immutable Map
+//! API) and rebuild the index from the result arrays. The output is
+//! byte-identical to every other backend.
 //!
 //! Key types: Int / Bool / Float / String (scalars + String). `Float`
 //! keys compare **byte-wise** (`i64.reinterpret_f64` + `i64.eq`,
@@ -39,6 +49,10 @@ use wasm_encoder::{BlockType, HeapType, Instruction, RefType, ValType};
 use crate::error::CompileError;
 
 use super::enums::contains_generic_placeholder;
+use super::map_hash_index::{
+    emit_build_idx, emit_idx_len_for, emit_index_lookup, emit_index_store_at, emit_new_idx,
+    idx_len_for,
+};
 use super::module_builder::ModuleBuilder;
 use super::translate::{FuncCtx, expect_result, single_slot};
 
@@ -48,6 +62,13 @@ const MAP_LEN: u32 = 0;
 const MAP_KEYS: u32 = 1;
 /// `$map_KV` field index of `$vals`.
 const MAP_VALS: u32 = 2;
+/// `$map_KV` field index of `$idx` — the open-addressing hash index
+/// (§Phase 2.4 close; see [`declare`]). Holds `(ref null $arr_idx)`
+/// where `$arr_idx = (array (mut i32))`. Each slot is a slot-index into
+/// `$keys`/`$vals`, or `-1` for empty. Length is a power of two
+/// ≥ `max(8, 2 * len)` (≤50% load). The index is *not* observable —
+/// only key-equality is — so any consistent hash is fine.
+const MAP_IDX: u32 = 3;
 
 /// `$mapbuilder_KV` field index of `$len`.
 const MB_LEN: u32 = 0;
@@ -85,6 +106,19 @@ pub(super) fn declare(
     let mut ordered: Vec<(IrType, IrType)> = kvs.into_iter().collect();
     ordered.sort_by_cached_key(|kv| format!("{kv:?}"));
 
+    // Declare the single shared `$arr_idx = (array (mut i32))` open-
+    // addressing hash-index backing array, *once*, before any `$map_KV`
+    // (whose `$idx` field references it), and record its type-section
+    // index on the builder for the lowering paths to read back.
+    if !ordered.is_empty() {
+        let idx_elem = wasm_encoder::FieldType {
+            element_type: wasm_encoder::StorageType::Val(ValType::I32),
+            mutable: true,
+        };
+        let arr_idx = builder.declare_list_array(idx_elem);
+        builder.record_map_idx_array(arr_idx);
+    }
+
     for (k, v) in &ordered {
         let (arr_k, _) = builder.require_list_types(k)?;
         let (arr_v, _) = builder.require_list_types(v)?;
@@ -100,8 +134,14 @@ pub(super) fn declare(
             element_type: wasm_encoder::StorageType::Val(concrete_ref(arr_v)),
             mutable: false,
         };
-        // A map is just a 3-field immutable struct (no subtyping).
-        let map_idx = builder.declare_struct(&[len_field, keys_field, vals_field]);
+        let arr_idx = builder.require_map_idx_array()?;
+        let idx_field = wasm_encoder::FieldType {
+            element_type: wasm_encoder::StorageType::Val(concrete_ref(arr_idx)),
+            mutable: false,
+        };
+        // A map is a 4-field immutable struct (no subtyping): the K.9
+        // ordered $keys / $vals plus the §Phase-2.4-close $idx hash index.
+        let map_idx = builder.declare_struct(&[len_field, keys_field, vals_field, idx_field]);
         builder.record_map(k.clone(), v.clone(), map_idx);
 
         if builder_kvs.contains(&(k.clone(), v.clone())) {
@@ -224,6 +264,7 @@ struct MapInfo {
     key_vt: ValType,
     arr_k: u32,
     arr_v: u32,
+    arr_idx: u32,
 }
 
 fn map_info(ctx: &FuncCtx, b: &ModuleBuilder, recv: ValueId) -> Result<MapInfo, CompileError> {
@@ -240,6 +281,7 @@ fn map_info(ctx: &FuncCtx, b: &ModuleBuilder, recv: ValueId) -> Result<MapInfo, 
         .clone();
     let (arr_k, _) = b.require_list_types(&k)?;
     let (arr_v, _) = b.require_list_types(&v)?;
+    let arr_idx = b.require_map_idx_array()?;
     Ok(MapInfo {
         map_idx,
         key_vt: single_slot(&k, b, "map key")?,
@@ -247,6 +289,7 @@ fn map_info(ctx: &FuncCtx, b: &ModuleBuilder, recv: ValueId) -> Result<MapInfo, 
         val_ir: v,
         arr_k,
         arr_v,
+        arr_idx,
     })
 }
 
@@ -274,28 +317,40 @@ pub(super) fn translate_map_alloc(
     let map_idx = b.require_map_idx(&k_ir, &v_ir)?;
     let (arr_k, _) = b.require_list_types(&k_ir)?;
     let (arr_v, _) = b.require_list_types(&v_ir)?;
+    let arr_idx = b.require_map_idx_array()?;
     let key_vt = single_slot(&k_ir, b, "map key")?;
     let val_vt = single_slot(&v_ir, b, "map value")?;
     let cap = pairs.len() as i32;
+    // `$idx` sized for the *literal* length (an upper bound on the final
+    // entry count after dedup), kept ≤50% load and a power of two.
+    let idxlen_const = idx_len_for(cap);
 
     let keys_arr = ctx.scratch_local(concrete_ref(arr_k));
     let vals_arr = ctx.scratch_local(concrete_ref(arr_v));
     let len = ctx.scratch_local(ValType::I32);
+    let idxlen = ctx.scratch_local(ValType::I32);
     let k_scratch = ctx.scratch_local(key_vt);
     let v_scratch = ctx.scratch_local(val_vt);
     let found = ctx.scratch_local(ValType::I32);
-    let scan_i = ctx.scratch_local(ValType::I32);
-    // Scan scratch hoisted out of the per-pair loop below so the literal
-    // builder reuses one `cur` local rather than minting one per pair.
-    let scan_cur = ctx.scratch_local(key_vt);
+    // Probe index/slot scratch hoisted out of the per-pair loop so the
+    // literal builder reuses one pair across all pairs. (The `mask` and
+    // `cur` scratch that `emit_index_lookup` mints internally are *not*
+    // hoisted — they add a few locals per unrolled pair, negligible since
+    // map literals are small. The append path reuses the lookup's `h` via
+    // `emit_index_store_at`, so it mints nothing.)
+    let probe_h = ctx.scratch_local(ValType::I32);
+    let probe_slot = ctx.scratch_local(ValType::I32);
 
-    // keys/vals = array.new_default(cap); len = 0
+    // keys/vals = array.new_default(cap); idx = array.new(-1, idxlen); len = 0
     ctx.emit(Instruction::I32Const(cap));
     ctx.emit(Instruction::ArrayNewDefault(arr_k));
     ctx.emit(Instruction::LocalSet(keys_arr));
     ctx.emit(Instruction::I32Const(cap));
     ctx.emit(Instruction::ArrayNewDefault(arr_v));
     ctx.emit(Instruction::LocalSet(vals_arr));
+    ctx.emit(Instruction::I32Const(idxlen_const));
+    ctx.emit(Instruction::LocalSet(idxlen));
+    let idx_arr = emit_new_idx(ctx, arr_idx, idxlen);
     ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::LocalSet(len));
 
@@ -307,11 +362,12 @@ pub(super) fn translate_map_alloc(
         ctx.emit(Instruction::LocalSet(k_scratch));
         ctx.emit(Instruction::LocalGet(vl));
         ctx.emit(Instruction::LocalSet(v_scratch));
-        // found = index of existing key, or -1
-        emit_scan_for_key(
-            ctx, b, keys_arr, arr_k, len, k_scratch, &k_ir, found, scan_i, scan_cur,
+        // found = existing slot of this key in the entries so far, or -1
+        emit_index_lookup(
+            ctx, b, keys_arr, arr_k, idx_arr, arr_idx, idxlen, k_scratch, &k_ir, found, probe_h,
+            probe_slot,
         )?;
-        // if found >= 0 { vals[found] = v } else { keys[len]=k; vals[len]=v; len++ }
+        // if found >= 0 { vals[found] = v } else { append + index it }
         ctx.emit(Instruction::LocalGet(found));
         ctx.emit(Instruction::I32Const(0));
         ctx.emit(Instruction::I32GeS);
@@ -321,14 +377,17 @@ pub(super) fn translate_map_alloc(
         ctx.emit(Instruction::LocalGet(v_scratch));
         ctx.emit(Instruction::ArraySet(arr_v));
         ctx.emit(Instruction::Else);
-        // keys[len]=k; vals[len]=v (both at `len`); then bump once.
+        // keys[len]=k; vals[len]=v; idx[probe_h] = len; len++. The lookup
+        // miss above already left `probe_h` at this key's empty home slot,
+        // so store there directly — no re-hash, no re-probe.
         emit_append(ctx, keys_arr, arr_k, len, k_scratch);
         emit_append(ctx, vals_arr, arr_v, len, v_scratch);
+        emit_index_store_at(ctx, idx_arr, arr_idx, probe_h, len);
         bump(ctx, len);
         ctx.emit(Instruction::End);
     }
 
-    emit_wrap_map(ctx, len, keys_arr, vals_arr, map_idx, vid);
+    emit_wrap_map(ctx, len, keys_arr, vals_arr, idx_arr, map_idx, vid);
     Ok(())
 }
 
@@ -365,21 +424,24 @@ pub(super) fn translate_map_contains(
     let info = map_info(ctx, b, args[0])?;
     let recv = ctx.binding_of(args[0])?;
     let probe = ctx.binding_of(args[1])?;
-    let (len, keys) = emit_load_len_keys(ctx, recv, &info);
+    let keys = load_field_arr(ctx, recv, &info, MAP_KEYS, info.arr_k);
+    let (idx_arr, idxlen) = emit_load_idx(ctx, recv, &info);
     let found = ctx.scratch_local(ValType::I32);
-    let scan_i = ctx.scratch_local(ValType::I32);
-    let cur = ctx.scratch_local(info.key_vt);
-    emit_scan_for_key(
+    let h = ctx.scratch_local(ValType::I32);
+    let slot = ctx.scratch_local(ValType::I32);
+    emit_index_lookup(
         ctx,
         b,
         keys,
         info.arr_k,
-        len,
+        idx_arr,
+        info.arr_idx,
+        idxlen,
         probe,
         &info.key_ir,
         found,
-        scan_i,
-        cur,
+        h,
+        slot,
     )?;
     // found >= 0 → 1
     ctx.emit(Instruction::LocalGet(found));
@@ -408,28 +470,25 @@ pub(super) fn translate_map_get(
 
     let recv = ctx.binding_of(args[0])?;
     let probe = ctx.binding_of(args[1])?;
-    let (len, keys) = emit_load_len_keys(ctx, recv, &info);
-    let vals = ctx.scratch_local(concrete_ref(info.arr_v));
-    ctx.emit(Instruction::LocalGet(recv));
-    ctx.emit(Instruction::StructGet {
-        struct_type_index: info.map_idx,
-        field_index: MAP_VALS,
-    });
-    ctx.emit(Instruction::LocalSet(vals));
+    let keys = load_field_arr(ctx, recv, &info, MAP_KEYS, info.arr_k);
+    let vals = load_field_arr(ctx, recv, &info, MAP_VALS, info.arr_v);
+    let (idx_arr, idxlen) = emit_load_idx(ctx, recv, &info);
     let found = ctx.scratch_local(ValType::I32);
-    let scan_i = ctx.scratch_local(ValType::I32);
-    let cur = ctx.scratch_local(info.key_vt);
-    emit_scan_for_key(
+    let h = ctx.scratch_local(ValType::I32);
+    let slot = ctx.scratch_local(ValType::I32);
+    emit_index_lookup(
         ctx,
         b,
         keys,
         info.arr_k,
-        len,
+        idx_arr,
+        info.arr_idx,
+        idxlen,
         probe,
         &info.key_ir,
         found,
-        scan_i,
-        cur,
+        h,
+        slot,
     )?;
 
     let opt_ref = concrete_ref(opt_parent);
@@ -481,23 +540,38 @@ pub(super) fn translate_map_set(
     let nlen = ctx.scratch_local(ValType::I32);
     ctx.emit(Instruction::LocalGet(len));
     ctx.emit(Instruction::LocalSet(nlen));
-
-    let found = ctx.scratch_local(ValType::I32);
-    let scan_i = ctx.scratch_local(ValType::I32);
-    let cur = ctx.scratch_local(info.key_vt);
-    emit_scan_for_key(
+    // Fresh `$idx` sized for len + 1 (the max post-set entry count),
+    // populated from the existing (already-deduped) entries.
+    let idxlen = emit_idx_len_for(ctx, cap);
+    let idx_arr = emit_build_idx(
         ctx,
         b,
         nkeys,
         info.arr_k,
+        info.arr_idx,
         nlen,
+        idxlen,
+        &info.key_ir,
+    )?;
+
+    let found = ctx.scratch_local(ValType::I32);
+    let h = ctx.scratch_local(ValType::I32);
+    let slot = ctx.scratch_local(ValType::I32);
+    emit_index_lookup(
+        ctx,
+        b,
+        nkeys,
+        info.arr_k,
+        idx_arr,
+        info.arr_idx,
+        idxlen,
         new_k,
         &info.key_ir,
         found,
-        scan_i,
-        cur,
+        h,
+        slot,
     )?;
-    // if found >= 0 { nvals[found] = v } else { nkeys[nlen]=k; nvals[nlen]=v; nlen++ }
+    // if found >= 0 { nvals[found] = v } else { append + index; nlen++ }
     ctx.emit(Instruction::LocalGet(found));
     ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::I32GeS);
@@ -507,13 +581,16 @@ pub(super) fn translate_map_set(
     ctx.emit(Instruction::LocalGet(new_v));
     ctx.emit(Instruction::ArraySet(info.arr_v));
     ctx.emit(Instruction::Else);
-    // nkeys[nlen]=k; nvals[nlen]=v (both at `nlen`); then bump once.
+    // nkeys[nlen]=k; nvals[nlen]=v; idx[h] = nlen; nlen++. The lookup miss
+    // above already left `h` at this key's empty home slot, so store there
+    // directly — no re-hash, no re-probe.
     emit_append(ctx, nkeys, info.arr_k, nlen, new_k);
     emit_append(ctx, nvals, info.arr_v, nlen, new_v);
+    emit_index_store_at(ctx, idx_arr, info.arr_idx, h, nlen);
     bump(ctx, nlen);
     ctx.emit(Instruction::End);
 
-    emit_wrap_map(ctx, nlen, nkeys, nvals, info.map_idx, vid);
+    emit_wrap_map(ctx, nlen, nkeys, nvals, idx_arr, info.map_idx, vid);
     Ok(())
 }
 
@@ -585,7 +662,23 @@ pub(super) fn translate_map_remove(
     ctx.emit(Instruction::End);
     ctx.emit(Instruction::End);
 
-    emit_wrap_map(ctx, nlen, nkeys, nvals, info.map_idx, vid);
+    // Build a fresh `$idx` over the surviving (already-deduped) entries.
+    // Sized from `nlen` — the *exact* survivor count, since `remove` only
+    // shrinks (no append follows). (Contrast `set`, which sizes from
+    // `len + 1` to leave room for the one entry its append may add.)
+    let idxlen = emit_idx_len_for(ctx, nlen);
+    let idx_arr = emit_build_idx(
+        ctx,
+        b,
+        nkeys,
+        info.arr_k,
+        info.arr_idx,
+        nlen,
+        idxlen,
+        &info.key_ir,
+    )?;
+
+    emit_wrap_map(ctx, nlen, nkeys, nvals, idx_arr, info.map_idx, vid);
     Ok(())
 }
 
@@ -968,17 +1061,24 @@ pub(super) fn translate_map_builder_freeze(
     ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::LocalSet(nlen));
 
+    // Fresh `$idx` sized for src_len (the max post-dedup entry count),
+    // built up incrementally as the replay appends unique keys. This is
+    // the O(n) hash-insert dedup that replaces the prior O(n²) scan.
+    let arr_idx = b.require_map_idx_array()?;
+    let idxlen = emit_idx_len_for(ctx, src_len);
+    let idx_arr = emit_new_idx(ctx, arr_idx, idxlen);
+
     // Replay loop: for i in 0..src_len { k = src_keys[i]; v = src_vals[i];
-    //   found = scan nkeys[0..nlen] for k;
-    //   if found >= 0 { nvals[found] = v } else { append (k,v); nlen++ } }
+    //   found = idx-lookup k in nkeys[0..nlen];
+    //   if found >= 0 { nvals[found] = v } else { append (k,v); index; nlen++ } }
     let i = ctx.scratch_local(ValType::I32);
     ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::LocalSet(i));
     let cur_k = ctx.scratch_local(info.key_vt);
     let cur_v = ctx.scratch_local(info.val_vt);
     let found = ctx.scratch_local(ValType::I32);
-    let scan_i = ctx.scratch_local(ValType::I32);
-    let scan_cur = ctx.scratch_local(info.key_vt);
+    let probe_h = ctx.scratch_local(ValType::I32);
+    let probe_slot = ctx.scratch_local(ValType::I32);
 
     ctx.emit(Instruction::Block(BlockType::Empty));
     ctx.emit(Instruction::Loop(BlockType::Empty));
@@ -997,19 +1097,21 @@ pub(super) fn translate_map_builder_freeze(
     ctx.emit(Instruction::ArrayGet(info.arr_v));
     ctx.emit(Instruction::LocalSet(cur_v));
     // found = index of cur_k in nkeys[0..nlen], or -1
-    emit_scan_for_key(
+    emit_index_lookup(
         ctx,
         b,
         nkeys,
         info.arr_k,
-        nlen,
+        idx_arr,
+        arr_idx,
+        idxlen,
         cur_k,
         &info.key_ir,
         found,
-        scan_i,
-        scan_cur,
+        probe_h,
+        probe_slot,
     )?;
-    // if found >= 0 { nvals[found] = cur_v } else { append; nlen++ }
+    // if found >= 0 { nvals[found] = cur_v } else { append + index; nlen++ }
     ctx.emit(Instruction::LocalGet(found));
     ctx.emit(Instruction::I32Const(0));
     ctx.emit(Instruction::I32GeS);
@@ -1019,8 +1121,11 @@ pub(super) fn translate_map_builder_freeze(
     ctx.emit(Instruction::LocalGet(cur_v));
     ctx.emit(Instruction::ArraySet(info.arr_v));
     ctx.emit(Instruction::Else);
+    // The lookup miss above already left `probe_h` at cur_k's empty home
+    // slot, so store there directly — no re-hash, no re-probe.
     emit_append(ctx, nkeys, info.arr_k, nlen, cur_k);
     emit_append(ctx, nvals, info.arr_v, nlen, cur_v);
+    emit_index_store_at(ctx, idx_arr, arr_idx, probe_h, nlen);
     bump(ctx, nlen);
     ctx.emit(Instruction::End);
     // i += 1
@@ -1029,7 +1134,7 @@ pub(super) fn translate_map_builder_freeze(
     ctx.emit(Instruction::End);
     ctx.emit(Instruction::End);
 
-    emit_wrap_map(ctx, nlen, nkeys, nvals, map_idx, vid);
+    emit_wrap_map(ctx, nlen, nkeys, nvals, idx_arr, map_idx, vid);
     Ok(())
 }
 
@@ -1054,6 +1159,24 @@ fn emit_load_len_keys(ctx: &mut FuncCtx, recv: u32, info: &MapInfo) -> (u32, u32
     });
     ctx.emit(Instruction::LocalSet(keys));
     (len, keys)
+}
+
+/// Load `$idx` and its length (`array.len`) into fresh scratch locals,
+/// returning `(idx_local, idxlen_local)`. The table length is a power of
+/// two by construction, so callers use `idxlen - 1` as the probe mask.
+fn emit_load_idx(ctx: &mut FuncCtx, recv: u32, info: &MapInfo) -> (u32, u32) {
+    let idx = ctx.scratch_local(concrete_ref(info.arr_idx));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: info.map_idx,
+        field_index: MAP_IDX,
+    });
+    ctx.emit(Instruction::LocalSet(idx));
+    let idxlen = ctx.scratch_local(ValType::I32);
+    ctx.emit(Instruction::LocalGet(idx));
+    ctx.emit(Instruction::ArrayLen);
+    ctx.emit(Instruction::LocalSet(idxlen));
+    (idx, idxlen)
 }
 
 /// Load a map array field into a fresh scratch local.
@@ -1098,67 +1221,18 @@ fn emit_append(ctx: &mut FuncCtx, arr_local: u32, arr: u32, pos: u32, val: u32) 
 }
 
 /// `pos += 1`.
-fn bump(ctx: &mut FuncCtx, pos: u32) {
+pub(super) fn bump(ctx: &mut FuncCtx, pos: u32) {
     ctx.emit(Instruction::LocalGet(pos));
     ctx.emit(Instruction::I32Const(1));
     ctx.emit(Instruction::I32Add);
     ctx.emit(Instruction::LocalSet(pos));
 }
 
-/// Scan `keys_arr[0..len]` for the first element key-equal to the value
-/// in `probe`, storing its index in `found` (or -1). `scan_i` and `cur`
-/// are caller-owned scratch (i32 index, key-typed current element) —
-/// passed in rather than allocated here so a caller that scans in a loop
-/// (the literal builder) reuses one set instead of minting locals per
-/// iteration.
-#[allow(clippy::too_many_arguments)]
-fn emit_scan_for_key(
-    ctx: &mut FuncCtx,
-    b: &ModuleBuilder,
-    keys_arr: u32,
-    arr_k: u32,
-    len: u32,
-    probe: u32,
-    key_ir: &IrType,
-    found: u32,
-    scan_i: u32,
-    cur: u32,
-) -> Result<(), CompileError> {
-    ctx.emit(Instruction::I32Const(-1));
-    ctx.emit(Instruction::LocalSet(found));
-    ctx.emit(Instruction::I32Const(0));
-    ctx.emit(Instruction::LocalSet(scan_i));
-    ctx.emit(Instruction::Block(BlockType::Empty));
-    ctx.emit(Instruction::Loop(BlockType::Empty));
-    // scan_i >= len → done
-    ctx.emit(Instruction::LocalGet(scan_i));
-    ctx.emit(Instruction::LocalGet(len));
-    ctx.emit(Instruction::I32GeS);
-    ctx.emit(Instruction::BrIf(1));
-    // cur = keys[scan_i]
-    ctx.emit(Instruction::LocalGet(keys_arr));
-    ctx.emit(Instruction::LocalGet(scan_i));
-    ctx.emit(Instruction::ArrayGet(arr_k));
-    ctx.emit(Instruction::LocalSet(cur));
-    // if key_eq(cur, probe) { found = scan_i; break }
-    emit_key_eq(ctx, b, key_ir, cur, probe)?;
-    ctx.emit(Instruction::If(BlockType::Empty));
-    ctx.emit(Instruction::LocalGet(scan_i));
-    ctx.emit(Instruction::LocalSet(found));
-    ctx.emit(Instruction::Br(2)); // break the outer block
-    ctx.emit(Instruction::End);
-    bump(ctx, scan_i);
-    ctx.emit(Instruction::Br(0));
-    ctx.emit(Instruction::End);
-    ctx.emit(Instruction::End);
-    Ok(())
-}
-
 /// Push `a`, push `b`, emit the key-equality op for `key_ir`, leaving
 /// an i32 0/1 on the stack. Matches native's `keys_equal`: value
 /// compare for Int/Bool, byte-wise (`reinterpret` + `i64.eq`) for
 /// Float, `phx_str_eq` content compare for String.
-fn emit_key_eq(
+pub(super) fn emit_key_eq(
     ctx: &mut FuncCtx,
     b: &ModuleBuilder,
     key_ir: &IrType,
@@ -1202,12 +1276,13 @@ fn emit_key_eq(
     Ok(())
 }
 
-/// `result = struct.new $map_KV(extend_i64_u(len_i32), keys, vals)`.
+/// `result = struct.new $map_KV(extend_i64_u(len_i32), keys, vals, idx)`.
 fn emit_wrap_map(
     ctx: &mut FuncCtx,
     len_i32: u32,
     keys_arr: u32,
     vals_arr: u32,
+    idx_arr: u32,
     map_idx: u32,
     vid: ValueId,
 ) {
@@ -1215,6 +1290,7 @@ fn emit_wrap_map(
     ctx.emit(Instruction::I64ExtendI32U);
     ctx.emit(Instruction::LocalGet(keys_arr));
     ctx.emit(Instruction::LocalGet(vals_arr));
+    ctx.emit(Instruction::LocalGet(idx_arr));
     ctx.emit(Instruction::StructNew(map_idx));
     let local = ctx.allocate_local(vid, concrete_ref(map_idx));
     ctx.emit(Instruction::LocalSet(local));
@@ -1225,7 +1301,7 @@ fn emit_wrap_map(
 /// A nullable ref to the concrete type at `idx` — the WASM binding type
 /// for every map field/value here (the `$arr_K`/`$arr_V` arrays, the
 /// `$list_K` view, the `$map_KV` wrapper, an `Option` parent).
-fn concrete_ref(idx: u32) -> ValType {
+pub(super) fn concrete_ref(idx: u32) -> ValType {
     ValType::Ref(RefType {
         nullable: true,
         heap_type: HeapType::Concrete(idx),

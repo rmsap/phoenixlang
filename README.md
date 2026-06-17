@@ -315,7 +315,7 @@ Phoenix is implemented in Rust as a Cargo workspace of 15 crates, each represent
 
 ## Roadmap & Vision
 
-Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), Phase 2.6 (module system and visibility), Phase 2.3 (tracing GC, runtime, and `defer` syntax), and Phase 2.7 (benchmark suite + `ListBuilder` / `MapBuilder` transient-mutable accumulators) are complete. Phase 2.4 (WebAssembly target) is the active work — the typed-allocator threading from 2.7 sets up a second `GcHeap` impl to plug in behind the existing trait. JavaScript interop, async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
+Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), Phase 2.6 (module system and visibility), Phase 2.3 (tracing GC, runtime, and `defer` syntax), Phase 2.7 (benchmark suite + `ListBuilder` / `MapBuilder` transient-mutable accumulators), and Phase 2.4 (WebAssembly target — `wasm32-linear` embed-and-merge plus inline `wasm32-gc`, both byte-identical to native across the full fixture matrix) are complete. Phase 2.5 (JavaScript interop) is the active work. Async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
 
 See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features.
 

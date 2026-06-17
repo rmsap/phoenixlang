@@ -2646,39 +2646,34 @@ fn translate_list_flatmap(
 /// `List.sortBy(list, comparator)`: return a new list sorted by the
 /// comparator closure `(a, b) -> Int` (negative = `a` before `b`).
 ///
-/// Uses **stable insertion sort** rather than native's bottom-up merge
-/// sort. The output is byte-identical for any total-order comparator:
-/// insertion sort is stable (ties keep input order via the `cmp <= 0`
-/// stop condition), matching the interpreter and native backends. It
-/// trades native's O(n log n) for O(n²), acceptable for the
-/// small-list use the method sees today; the WASM port favors a
-/// structured-control-flow shape that maps cleanly to nested
-/// `block`/`loop`s over replicating merge sort's many-edged CFG.
+/// Uses **bottom-up iterative merge sort** (O(n log n)), the same
+/// algorithm native and the two interpreters use — an earlier port
+/// shipped a stable O(n²) insertion sort here, replaced in the Phase 2.4
+/// close (2026-06-17) after the bench corpus exercised `sort_ints` at
+/// 100k elements. The output is byte-identical for any total-order
+/// comparator: the merge is stable (ties keep input order via the
+/// `cmp <= 0` rule favoring the left run), matching every other backend.
 ///
-/// The sort runs in place on a fresh copy of the input
-/// (`phx_list_take(list, len)` — Phoenix lists are immutable, so the
-/// input is never mutated). The copy is bound to the result vid and
-/// rooted via its slot.
+/// The sort never mutates the input (Phoenix lists are immutable). It
+/// works over two scratch buffers — `copy = phx_list_take(list, len)`
+/// (a fresh clone of the elements) and `aux = phx_list_alloc(es, len)`
+/// (the merge destination) — which ping-pong as `src`/`dst` each width
+/// pass. The sorted data ends up in whichever buffer is `src` after the
+/// final pass; the result wraps that buffer.
 ///
-/// GC: when the element type is a ref, the `key` being inserted is
-/// held in locals across the comparator call (which may allocate) —
-/// and after the first shift `copy[i]` is overwritten, so `key` is no
-/// longer reachable through the rooted copy. A dedicated 1-slot ad-hoc
-/// shadow frame roots `key` for the outer loop's duration. Value-typed
-/// elements (the common case) skip the frame entirely. Shifted
-/// elements (`copy[j] → copy[j+1]`) stay reachable through the rooted
-/// copy throughout.
-///
-/// The 1-slot frame is sufficient because today every Phoenix ref type
-/// occupies at most one *pointer* slot: single-slot refs (`List`, `Map`,
-/// `Closure`, `Struct`, `Enum`) are a bare GC pointer in `key_locals[0]`,
-/// and the two 2-slot refs — `StringRef` (`ptr`, `len`) and `DynRef`
-/// (`data_ptr`, `vtable_ptr`) — both keep their only GC pointer in
-/// `key_locals[0]`; slot 1 is a non-pointer (`len` / data-section vtable
-/// offset). Rooting slot 0 keeps the underlying object live in every
-/// current case. A future 2-*pointer* ref type (whose second slot is
-/// itself a GC pointer) would need this frame widened to 2 slots — that
-/// type, not merely any 2-slot ref, is the tripwire for the rewrite.
+/// GC: the phx mark-sweep GC roots through an explicit shadow stack, not
+/// wasm locals, and the comparator can allocate and trigger a collection
+/// mid-sort. Both buffers live in a dedicated **2-slot** ad-hoc shadow
+/// frame for the whole sort (slot 0 = `copy`, slot 1 = `aux`); the
+/// `src`/`dst` swap only renames which local points at each buffer, so
+/// the two pointers stay rooted in their original slots throughout. No
+/// per-element rooting is needed (unlike the historical insertion sort,
+/// which rooted the in-flight `key`): a width pass only *reads* `src` and
+/// *writes* `dst`, never mutating `src`, so a ref-typed element handed to
+/// the comparator stays reachable through the rooted `src` buffer even if
+/// the comparator collects. This invariant breaks if a future change
+/// merges in place or scribbles scratch into `src` — restore per-element
+/// rooting (or keep `src` read-only) if you do.
 fn translate_list_sortby(
     ctx: &mut FuncTranslateCtx,
     b: &mut ModuleBuilder,
@@ -2697,162 +2692,291 @@ fn translate_list_sortby(
     let closure_vid = args[1];
     let elem_ty = list_elem_type(ctx, list_vid)?;
     let elem_size = phx_field_size_bytes(&elem_ty)?;
-    // `is_ref_type()` returns true for the `__generic` placeholder
-    // (`StructRef("__generic", [])`), so a sortBy over a placeholder-typed
-    // list would take the ref branch. A placeholder element reaches here in
-    // exactly one shape: a *generic-annotated empty* literal, `let xs:
-    // List<T> = []` inside a generic function. Sema's
-    // `pin_inferred_type_to_annotation` (§Phase 2.4 K.12) only refines
-    // *toward a concrete* annotation, so a concrete `let xs: List<Int> =
-    // []` is pinned to `List<Int>`, but a type-var annotation `List<T>` is
-    // left for monomorphization — which, finding no source for the empty
-    // literal's element, lowers it to `List<__generic>`. (An un-annotated
-    // `let xs = []` is still rejected outright as ambiguous by
-    // `check_stmt.rs::check_let`'s "cannot infer type" diagnostic.)
-    //
-    // Sorting such a list is therefore *reachable* but safe by
-    // construction: lists are immutable (growth goes through `ListBuilder`,
-    // whose `freeze()` produces a list with a concrete element type), so a
-    // `__generic`-element list is *always empty*. `len == 0` on the only
-    // path that reaches the ref branch, so the inner loop never executes
-    // and the rooted slot never participates in a collection. The GC-root
-    // emitter paired with `gc_roots::is_tracked_ref`'s placeholder skip
-    // makes this safe; see that file's docstring for the joint contract.
-    let elem_is_ref = elem_ty.is_ref_type();
 
     let list_ptr_local = ctx.binding_of(list_vid)?.single_local();
     let closure_ptr_local = ctx.binding_of(closure_vid)?.single_local();
     let closure_ir_ty = ctx.binding_of(closure_vid)?.ir_type.clone();
 
-    // len = phx_list_length(list); copy = phx_list_take(list, len).
+    // ── Buffers ──────────────────────────────────────────────────────
+    // `copy` = phx_list_take(list, len) clones the input's elements;
+    // `aux` = phx_list_alloc(es, len) is the scratch destination. The
+    // two ping-pong each width pass (`src`/`dst` swap), so the sorted
+    // data ends up in whichever `src` holds — `copy` on an even pass
+    // count, `aux` on an odd one. Both are i32 linear-memory list
+    // pointers.
+    //
+    // GC: the phx mark-sweep GC roots through an explicit shadow stack,
+    // not wasm locals. The comparator can allocate and trigger a
+    // collection mid-sort, so both buffers live in a dedicated 2-slot
+    // ad-hoc frame for the whole sort (slot 0 = copy, slot 1 = aux).
+    // The swap only renames which local points at each buffer; the two
+    // pointers stay rooted in their original slots throughout. `aux` is
+    // allocated only on the sorting path (`len > 1`) below, so slot 1
+    // stays null (zero-initialized, harmlessly skipped by the tracer)
+    // for a trivial sort, which does no scratch allocation.
+    //
+    // Why no per-element root (unlike the historical insertion sort,
+    // which rooted the in-flight `key`): a width pass only ever *reads*
+    // `src` and *writes* `dst` — it never mutates `src` — and every
+    // element of the half-open range it processes lives in `src` for the
+    // whole pass. So a ref-typed element handed to the comparator (in
+    // `a_elem_locals`/`b_elem_locals`) stays reachable through the rooted
+    // `src` buffer even if the comparator collects; rooting the buffers
+    // transitively roots their elements. This invariant breaks if a
+    // future change merges in place or scribbles scratch into `src` —
+    // restore per-element rooting (or keep src read-only) if you do.
     let length_idx = b.require_phx_func("phx_list_length")?;
     let take_idx = b.require_phx_func("phx_list_take")?;
+    let list_alloc_idx = b.require_phx_func("phx_list_alloc")?;
+
     let len_local = ctx.allocate_temp_local(ValType::I64);
     ctx.emit(Instruction::LocalGet(list_ptr_local));
     ctx.emit(Instruction::Call(length_idx));
     ctx.emit(Instruction::LocalSet(len_local));
+
+    // The result vid binding — its local must hold the final `src`
+    // pointer at exit so the blanket post-instruction `emit_gc_set_root`
+    // roots the returned list.
+    let result_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
+
+    // copy = phx_list_take(list, len).
+    let copy_local = ctx.allocate_temp_local(ValType::I32);
     ctx.emit(Instruction::LocalGet(list_ptr_local));
     ctx.emit(Instruction::LocalGet(len_local));
     ctx.emit(Instruction::Call(take_idx));
-    let copy_local = ctx.allocate_local(vid, ValType::I32, instr.result_type.clone());
     ctx.emit(Instruction::LocalSet(copy_local));
-    emit_gc_set_root(ctx, b, vid)?; // root the copy
 
-    // Optional ad-hoc frame rooting the `key` element (ref types only).
-    let key_frame_local = if elem_is_ref {
-        Some(emit_gc_push_frame_at(ctx, b, 1)?)
-    } else {
-        None
-    };
+    // 2-slot GC frame; root `copy` in slot 0 before any allocation that
+    // could collect (the `phx_list_alloc` for `aux` allocates).
+    let frame = emit_gc_push_frame_at(ctx, b, 2)?;
+    emit_gc_set_root_at(ctx, b, frame, 0, copy_local)?;
 
-    let key_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    let cmp_a_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
-    // Executable tripwire for the docstring's single-pointer-slot
-    // assumption. Today every ref type either occupies one slot (a bare
-    // GC pointer in slot 0) or is one of the two 2-slot fat pointers
-    // whose slot 1 is a non-pointer: `StringRef` (slot 1 = `len`) and
-    // `DynRef` (slot 1 = data-section vtable offset). A future ref type
-    // whose second slot is also a GC pointer would need this frame
-    // widened to 2 slots; this assert fires before that case silently
-    // miscompiles.
-    debug_assert!(
-        !elem_is_ref
-            || matches!(&elem_ty, IrType::StringRef | IrType::DynRef(_))
-            || key_locals.len() == 1,
-        "sortBy: ref element type {:?} occupies {} slots — the ad-hoc \
-         key frame only roots slot 0, but this type may have a pointer \
-         in another slot. Widen the frame to match (see the docstring's \
-         tripwire note).",
-        elem_ty,
-        key_locals.len(),
-    );
-    let i_local = ctx.allocate_temp_local(ValType::I64);
-    let j_local = ctx.allocate_temp_local(ValType::I64);
-    let jp1_local = ctx.allocate_temp_local(ValType::I64);
+    // src starts as `copy`; on the trivial path it stays there and
+    // becomes the result. `aux` (the scratch dst) and `dst` are wired up
+    // inside the `len > 1` guard below, so a trivial sort allocates no
+    // scratch buffer.
+    let aux_local = ctx.allocate_temp_local(ValType::I32);
+    let src_local = ctx.allocate_temp_local(ValType::I32);
+    let dst_local = ctx.allocate_temp_local(ValType::I32);
+    let swap_tmp_local = ctx.allocate_temp_local(ValType::I32);
+    ctx.emit(Instruction::LocalGet(copy_local));
+    ctx.emit(Instruction::LocalSet(src_local));
+
+    let width_local = ctx.allocate_temp_local(ValType::I64);
+    let i_local = ctx.allocate_temp_local(ValType::I64); // run-pair start
+    let lo_local = ctx.allocate_temp_local(ValType::I64);
+    let mid_local = ctx.allocate_temp_local(ValType::I64);
+    let hi_local = ctx.allocate_temp_local(ValType::I64);
+    let a_local = ctx.allocate_temp_local(ValType::I64); // left cursor
+    let b_cursor_local = ctx.allocate_temp_local(ValType::I64); // right cursor
+    let k_local = ctx.allocate_temp_local(ValType::I64); // merge write cursor
+    let twow_local = ctx.allocate_temp_local(ValType::I64);
     let cmp_result_local = ctx.allocate_temp_local(ValType::I64);
+    let a_elem_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
+    let b_elem_locals = ctx.allocate_locals_for_ir_type_anon(&elem_ty)?;
 
-    // i = 1 (element 0 is trivially sorted).
+    // Trivial path: len <= 1 → result is `src` (== copy) as-is. The
+    // width loop is skipped, leaving `src` == copy throughout, and no
+    // `aux` scratch buffer is ever allocated.
+    ctx.emit(Instruction::LocalGet(len_local));
     ctx.emit(Instruction::I64Const(1));
-    ctx.emit(Instruction::LocalSet(i_local));
+    ctx.emit(Instruction::I64GtS);
+    ctx.emit(Instruction::If(BlockType::Empty));
 
-    // Outer loop: for i in 1..len.
+    // aux = phx_list_alloc(es, len); root in slot 1. Allocated inside the
+    // `len > 1` guard so a trivial sort never allocates a scratch buffer
+    // (slot 1 stays null, which the tracer skips). dst starts as aux.
+    ctx.emit(Instruction::I64Const(elem_size as i64));
+    ctx.emit(Instruction::LocalGet(len_local));
+    ctx.emit(Instruction::Call(list_alloc_idx));
+    ctx.emit(Instruction::LocalSet(aux_local));
+    emit_gc_set_root_at(ctx, b, frame, 1, aux_local)?;
+    ctx.emit(Instruction::LocalGet(aux_local));
+    ctx.emit(Instruction::LocalSet(dst_local));
+
+    // width = 1.
+    ctx.emit(Instruction::I64Const(1));
+    ctx.emit(Instruction::LocalSet(width_local));
+
+    // Outer loop: while width < len.
     emit_breakable_loop(ctx, |ctx| {
-        // i >= len → break outer.
-        ctx.emit(Instruction::LocalGet(i_local));
+        ctx.emit(Instruction::LocalGet(width_local));
         ctx.emit(Instruction::LocalGet(len_local));
         ctx.emit(Instruction::I64GeS);
         ctx.emit(Instruction::BrIf(LOOP_BREAK));
-        // key = copy[i].
-        let key_addr = emit_list_elem_addr(ctx, copy_local, i_local, elem_size);
-        emit_field_load(ctx, key_addr, 0, &elem_ty)?;
-        store_stack_into_locals(ctx, &key_locals);
-        if let Some(frame) = key_frame_local {
-            emit_gc_set_root_at(ctx, b, frame, 0, key_locals[0])?;
-        }
-        // j = i - 1.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Sub);
-        ctx.emit(Instruction::LocalSet(j_local));
 
-        // Inner loop: while j >= 0 && cmp(copy[j], key) > 0:
-        //                  copy[j+1] = copy[j]; j -= 1.
-        // Inner LOOP_BREAK / LOOP_CONTINUE refer to the inner loop —
-        // emit_breakable_loop's nesting shifts the outer depths by 2.
+        // twow = 2 * width.
+        ctx.emit(Instruction::LocalGet(width_local));
+        ctx.emit(Instruction::I64Const(1));
+        ctx.emit(Instruction::I64Shl);
+        ctx.emit(Instruction::LocalSet(twow_local));
+        // i = 0.
+        ctx.emit(Instruction::I64Const(0));
+        ctx.emit(Instruction::LocalSet(i_local));
+
+        // Middle loop: while i < len.
         emit_breakable_loop(ctx, |ctx| {
-            // j < 0 → break inner.
-            ctx.emit(Instruction::LocalGet(j_local));
-            ctx.emit(Instruction::I64Const(0));
-            ctx.emit(Instruction::I64LtS);
+            ctx.emit(Instruction::LocalGet(i_local));
+            ctx.emit(Instruction::LocalGet(len_local));
+            ctx.emit(Instruction::I64GeS);
             ctx.emit(Instruction::BrIf(LOOP_BREAK));
-            // cmp_a = copy[j].
-            let cj_addr = emit_list_elem_addr(ctx, copy_local, j_local, elem_size);
-            emit_field_load(ctx, cj_addr, 0, &elem_ty)?;
-            store_stack_into_locals(ctx, &cmp_a_locals);
-            // c = comparator(copy[j], key) → i64 on stack.
-            let cmp_args = vec![cmp_a_locals.clone(), key_locals.clone()];
-            emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &cmp_args)?;
-            ctx.emit(Instruction::LocalSet(cmp_result_local));
-            // c <= 0 → stop shifting (stable: ties keep left/original order).
-            ctx.emit(Instruction::LocalGet(cmp_result_local));
-            ctx.emit(Instruction::I64Const(0));
-            ctx.emit(Instruction::I64LeS);
-            ctx.emit(Instruction::BrIf(LOOP_BREAK));
-            // copy[j+1] = copy[j] (cmp_a_locals still holds copy[j]).
-            ctx.emit(Instruction::LocalGet(j_local));
-            ctx.emit(Instruction::I64Const(1));
+
+            // lo = i.
+            ctx.emit(Instruction::LocalGet(i_local));
+            ctx.emit(Instruction::LocalSet(lo_local));
+            // mid = min(i + width, len).
+            ctx.emit(Instruction::LocalGet(i_local));
+            ctx.emit(Instruction::LocalGet(width_local));
             ctx.emit(Instruction::I64Add);
-            ctx.emit(Instruction::LocalSet(jp1_local));
-            let shift_dst = emit_list_elem_addr(ctx, copy_local, jp1_local, elem_size);
-            emit_field_store(ctx, shift_dst, 0, &elem_ty, &cmp_a_locals)?;
-            // j -= 1.
-            ctx.emit(Instruction::LocalGet(j_local));
-            ctx.emit(Instruction::I64Const(1));
-            ctx.emit(Instruction::I64Sub);
-            ctx.emit(Instruction::LocalSet(j_local));
+            ctx.emit(Instruction::LocalSet(mid_local));
+            ctx.emit(Instruction::LocalGet(mid_local));
+            ctx.emit(Instruction::LocalGet(len_local));
+            ctx.emit(Instruction::LocalGet(mid_local));
+            ctx.emit(Instruction::LocalGet(len_local));
+            ctx.emit(Instruction::I64LtS);
+            ctx.emit(Instruction::Select);
+            ctx.emit(Instruction::LocalSet(mid_local));
+            // hi = min(i + 2*width, len).
+            ctx.emit(Instruction::LocalGet(i_local));
+            ctx.emit(Instruction::LocalGet(twow_local));
+            ctx.emit(Instruction::I64Add);
+            ctx.emit(Instruction::LocalSet(hi_local));
+            ctx.emit(Instruction::LocalGet(hi_local));
+            ctx.emit(Instruction::LocalGet(len_local));
+            ctx.emit(Instruction::LocalGet(hi_local));
+            ctx.emit(Instruction::LocalGet(len_local));
+            ctx.emit(Instruction::I64LtS);
+            ctx.emit(Instruction::Select);
+            ctx.emit(Instruction::LocalSet(hi_local));
+            // a = lo; b = mid; k = lo.
+            ctx.emit(Instruction::LocalGet(lo_local));
+            ctx.emit(Instruction::LocalSet(a_local));
+            ctx.emit(Instruction::LocalGet(mid_local));
+            ctx.emit(Instruction::LocalSet(b_cursor_local));
+            ctx.emit(Instruction::LocalGet(lo_local));
+            ctx.emit(Instruction::LocalSet(k_local));
+
+            // Merge loop: while k < hi.
+            emit_breakable_loop(ctx, |ctx| {
+                ctx.emit(Instruction::LocalGet(k_local));
+                ctx.emit(Instruction::LocalGet(hi_local));
+                ctx.emit(Instruction::I64GeS);
+                ctx.emit(Instruction::BrIf(LOOP_BREAK));
+
+                // Load each side's current element into its locals *at most
+                // once* per iteration, gated on the run still having
+                // elements, then reuse that load for both the comparison and
+                // the store. `a < mid` ⇒ `src[a]` valid; `b < hi` ⇒ `src[b]`
+                // valid. (The earlier shape reloaded `src[a]`/`src[b]` in the
+                // store branch because that branch is also reached from the
+                // run-exhausted case — gating the loads here removes the
+                // double-load without that hazard, matching the wasm32-gc
+                // backend's single-read merge.)
+                ctx.emit(Instruction::LocalGet(a_local));
+                ctx.emit(Instruction::LocalGet(mid_local));
+                ctx.emit(Instruction::I64LtS);
+                ctx.emit(Instruction::If(BlockType::Empty));
+                let a_addr = emit_list_elem_addr(ctx, src_local, a_local, elem_size);
+                emit_field_load(ctx, a_addr, 0, &elem_ty)?;
+                store_stack_into_locals(ctx, &a_elem_locals);
+                ctx.emit(Instruction::End);
+                ctx.emit(Instruction::LocalGet(b_cursor_local));
+                ctx.emit(Instruction::LocalGet(hi_local));
+                ctx.emit(Instruction::I64LtS);
+                ctx.emit(Instruction::If(BlockType::Empty));
+                let b_addr = emit_list_elem_addr(ctx, src_local, b_cursor_local, elem_size);
+                emit_field_load(ctx, b_addr, 0, &elem_ty)?;
+                store_stack_into_locals(ctx, &b_elem_locals);
+                ctx.emit(Instruction::End);
+
+                // take_left = (a < mid) && (b >= hi || cmp(src[a], src[b]) <= 0).
+                // a < mid ?
+                ctx.emit(Instruction::LocalGet(a_local));
+                ctx.emit(Instruction::LocalGet(mid_local));
+                ctx.emit(Instruction::I64LtS);
+                ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+                // left has elements — b >= hi → take left outright.
+                ctx.emit(Instruction::LocalGet(b_cursor_local));
+                ctx.emit(Instruction::LocalGet(hi_local));
+                ctx.emit(Instruction::I64GeS);
+                ctx.emit(Instruction::If(BlockType::Result(ValType::I32)));
+                ctx.emit(Instruction::I32Const(1)); // right exhausted → left
+                ctx.emit(Instruction::Else);
+                // both runs live: cmp(src[a], src[b]) <= 0 → take left (stable).
+                let cmp_args = vec![a_elem_locals.clone(), b_elem_locals.clone()];
+                emit_closure_call_raw(ctx, b, closure_ptr_local, &closure_ir_ty, &cmp_args)?;
+                ctx.emit(Instruction::LocalSet(cmp_result_local));
+                ctx.emit(Instruction::LocalGet(cmp_result_local));
+                ctx.emit(Instruction::I64Const(0));
+                ctx.emit(Instruction::I64LeS);
+                ctx.emit(Instruction::End); // if (b >= hi)
+                ctx.emit(Instruction::Else);
+                ctx.emit(Instruction::I32Const(0)); // left exhausted → right
+                ctx.emit(Instruction::End); // if (a < mid)
+
+                // if take_left { dst[k]=src[a]; a+=1 } else { dst[k]=src[b]; b+=1 }.
+                // The winning side's element is already in its locals (loaded
+                // above; `take_left` ⇒ a<mid, `!take_left` ⇒ b<hi), so the
+                // store reuses it with no reload.
+                ctx.emit(Instruction::If(BlockType::Empty));
+                let da = emit_list_elem_addr(ctx, dst_local, k_local, elem_size);
+                emit_field_store(ctx, da, 0, &elem_ty, &a_elem_locals)?;
+                // a += 1.
+                ctx.emit(Instruction::LocalGet(a_local));
+                ctx.emit(Instruction::I64Const(1));
+                ctx.emit(Instruction::I64Add);
+                ctx.emit(Instruction::LocalSet(a_local));
+                ctx.emit(Instruction::Else);
+                let db = emit_list_elem_addr(ctx, dst_local, k_local, elem_size);
+                emit_field_store(ctx, db, 0, &elem_ty, &b_elem_locals)?;
+                // b += 1.
+                ctx.emit(Instruction::LocalGet(b_cursor_local));
+                ctx.emit(Instruction::I64Const(1));
+                ctx.emit(Instruction::I64Add);
+                ctx.emit(Instruction::LocalSet(b_cursor_local));
+                ctx.emit(Instruction::End); // if take_left
+
+                // k += 1.
+                ctx.emit(Instruction::LocalGet(k_local));
+                ctx.emit(Instruction::I64Const(1));
+                ctx.emit(Instruction::I64Add);
+                ctx.emit(Instruction::LocalSet(k_local));
+                ctx.emit(Instruction::Br(LOOP_CONTINUE));
+                Ok(())
+            })?;
+
+            // i += 2*width.
+            ctx.emit(Instruction::LocalGet(i_local));
+            ctx.emit(Instruction::LocalGet(twow_local));
+            ctx.emit(Instruction::I64Add);
+            ctx.emit(Instruction::LocalSet(i_local));
             ctx.emit(Instruction::Br(LOOP_CONTINUE));
             Ok(())
         })?;
 
-        // copy[j+1] = key.
-        ctx.emit(Instruction::LocalGet(j_local));
+        // swap src and dst (the two pointers stay rooted in their frame
+        // slots; only the names change).
+        ctx.emit(Instruction::LocalGet(src_local));
+        ctx.emit(Instruction::LocalSet(swap_tmp_local));
+        ctx.emit(Instruction::LocalGet(dst_local));
+        ctx.emit(Instruction::LocalSet(src_local));
+        ctx.emit(Instruction::LocalGet(swap_tmp_local));
+        ctx.emit(Instruction::LocalSet(dst_local));
+        // width *= 2.
+        ctx.emit(Instruction::LocalGet(width_local));
         ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Add);
-        ctx.emit(Instruction::LocalSet(jp1_local));
-        let insert_dst = emit_list_elem_addr(ctx, copy_local, jp1_local, elem_size);
-        emit_field_store(ctx, insert_dst, 0, &elem_ty, &key_locals)?;
-        // i += 1.
-        ctx.emit(Instruction::LocalGet(i_local));
-        ctx.emit(Instruction::I64Const(1));
-        ctx.emit(Instruction::I64Add);
-        ctx.emit(Instruction::LocalSet(i_local));
+        ctx.emit(Instruction::I64Shl);
+        ctx.emit(Instruction::LocalSet(width_local));
         ctx.emit(Instruction::Br(LOOP_CONTINUE));
         Ok(())
     })?;
 
-    if let Some(frame) = key_frame_local {
-        emit_gc_pop_frame_at(ctx, b, frame)?;
-    }
+    ctx.emit(Instruction::End); // if len > 1
+
+    // Result = whichever buffer `src` holds; pop the GC frame.
+    ctx.emit(Instruction::LocalGet(src_local));
+    ctx.emit(Instruction::LocalSet(result_local));
+    emit_gc_pop_frame_at(ctx, b, frame)?;
     Ok(())
 }
 

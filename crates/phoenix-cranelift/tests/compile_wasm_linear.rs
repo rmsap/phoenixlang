@@ -240,6 +240,46 @@ fn call_targets_in_export(bytes: &[u8], export_name: &str) -> Result<Vec<u32>, S
     Ok(targets)
 }
 
+/// Collect every import's `(module, name)` pair, in section order.
+/// Used by the host-surface gate ([`only_wasi_imports_*`]) to assert
+/// the emitted module reaches the outside world *only* through WASI —
+/// no Phoenix-defined custom imports (those are Phase 2.5). Returns a
+/// specific `Err` if any wasmparser step fails so a helper regression
+/// reads as "couldn't parse imports" rather than an empty set silently
+/// passing the "only WASI" check.
+fn import_modules(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    use wasmparser::{Parser, Payload};
+
+    let mut imports = Vec::new();
+    let push = |imports: &mut Vec<(String, String)>, imp: &wasmparser::Import<'_>| {
+        imports.push((imp.module.to_string(), imp.name.to_string()));
+    };
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::ImportSection(rdr) = payload {
+            for group in rdr {
+                let group = group.map_err(|e| format!("reading import section: {e}"))?;
+                match group {
+                    wasmparser::Imports::Single(_, imp) => push(&mut imports, &imp),
+                    wasmparser::Imports::Compact1 { module, items } => {
+                        for item in items {
+                            let item = item.map_err(|e| format!("reading import items: {e}"))?;
+                            imports.push((module.to_string(), item.name.to_string()));
+                        }
+                    }
+                    wasmparser::Imports::Compact2 { module, names, .. } => {
+                        for name in names {
+                            let name = name.map_err(|e| format!("reading import names: {e}"))?;
+                            imports.push((module.to_string(), name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(imports)
+}
+
 /// Single-pass walk of the wasm bytes collecting the bookkeeping
 /// every phx_main / shadow-stack assertion needs:
 /// * `import_func_count` so absolute function indices can be biased
@@ -719,6 +759,77 @@ fn run_with_wasmtime(wasm_path: &std::path::Path, label: &str) -> Option<String>
         String::from_utf8_lossy(&output.stderr),
     );
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Per-linear-memory byte cap for the bounded-memory GC gate
+/// ([`alloc_loop_stays_under_bounded_wasm_memory`]). This is the
+/// wasm32-linear analog of the native gate's `RLIMIT_AS` cap in
+/// `phoenix-driver/tests/gc_bounded_memory.rs`: wasmtime's pooling
+/// allocator hard-caps each linear memory at this size, so a regressed
+/// GC that retained every allocation would fail `memory.grow` and trap,
+/// while a working GC stays comfortably under the cap and completes.
+///
+/// **Calibration.** The `alloc_loop` module declares a ~1.06 MB static
+/// data minimum. On top of that the working GC's high-water (static +
+/// the adaptive auto-collect arena) measures ~3.9 MB; the cap sits at
+/// 6 MB, ~1.5× above that. The leak-everything path would need the
+/// 1.06 MB static plus the fixture's ~8.7 MB cumulative allocation
+/// (~80 bytes/iter × 100k iters) ≈ 9.8 MB — well above 6 MB — so a
+/// dropped `phx_gc_enable`, an infinity'd threshold, or a missed
+/// shadow-stack root traps instead of silently leaking. If a future
+/// allocator/threshold change drifts the working high-water and flakes
+/// this test, raise the fixture's iteration count (widening the leak
+/// signal) rather than the cap. Local override:
+/// `PHOENIX_WASM_GC_MEMCAP_BYTES=8388608 cargo test ...`.
+const WASM_GC_MEMCAP_BYTES: u64 = 6 * 1024 * 1024;
+
+fn wasm_gc_memcap_bytes() -> u64 {
+    match std::env::var("PHOENIX_WASM_GC_MEMCAP_BYTES") {
+        Ok(s) => s.parse().unwrap_or_else(|e| {
+            panic!(
+                "PHOENIX_WASM_GC_MEMCAP_BYTES must be a u64 byte count (no \
+                 suffix); got {s:?}: {e}"
+            )
+        }),
+        Err(_) => WASM_GC_MEMCAP_BYTES,
+    }
+}
+
+/// Run `wasmtime` on `wasm_path` with the pooling allocator capping
+/// each linear memory at `cap_bytes`, returning captured stdout. Unlike
+/// [`run_with_wasmtime`] this does *not* assert exit success — the
+/// caller decides what a non-zero exit means (here: a GC leak that blew
+/// the cap). Returns `None` (with a visible warning) when wasmtime is
+/// absent, honoring the [`require_wasmtime`] gate by panicking instead.
+fn run_with_wasmtime_capped(
+    wasm_path: &std::path::Path,
+    cap_bytes: u64,
+    label: &str,
+) -> Option<std::process::Output> {
+    let spawn_result = Command::new("wasmtime")
+        .arg("run")
+        .arg("-O")
+        .arg("pooling-allocator=y")
+        .arg("-O")
+        .arg(format!("pooling-max-memory-size={cap_bytes}"))
+        .arg(wasm_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match spawn_result {
+        Ok(o) => Some(o),
+        Err(_) => {
+            eprintln!(
+                "warning: skipping {label} — `wasmtime` not available on PATH \
+                 (set PHOENIX_REQUIRE_WASMTIME=1 to fail instead; \
+                 see docs/design-decisions.md §Phase 2.4 decision B)"
+            );
+            if require_wasmtime() {
+                panic!("PHOENIX_REQUIRE_WASMTIME=1 set but `wasmtime` is not available on PATH");
+            }
+            None
+        }
+    }
 }
 
 /// Compile `source`, validate it structurally, then (if wasmtime is
@@ -1694,6 +1805,56 @@ fn alloc_loop_runs_under_wasmtime() {
     assert_wasm_matches_interp(ALLOC_LOOP_SOURCE, "alloc_loop");
 }
 
+/// Leak-clean-at-load gate for wasm32-linear — the wasmtime-side
+/// replacement for the §2.3 native valgrind gate
+/// (`phoenix-driver/tests/gc_valgrind.rs`). There is no valgrind under
+/// wasmtime, so we borrow the native bounded-memory gate's strategy
+/// (`gc_bounded_memory.rs`): run the same 100k-iteration `alloc_loop`
+/// fixture, but cap the wasm linear memory below the leak-everything
+/// footprint. A working GC reclaims each iteration's allocations and
+/// stays under the cap (~3.9 MB high-water vs the 6 MB cap); a
+/// regression that stopped collecting — `phx_gc_enable` dropped from
+/// `_start`, the auto-collect threshold infinity'd, or a shadow-stack
+/// root missed — would retain all ~9.8 MB, fail `memory.grow` against
+/// the pooling allocator's cap, and trap. Either way the process exits
+/// non-zero and this test reports informatively.
+///
+/// `phx_gc_shutdown` runs on `_start` exit (it replaces the heap and
+/// drops the old one, freeing the whole registry), so a clean run here
+/// also exercises the teardown path end-to-end under wasm. Skipped when
+/// wasmtime is absent unless `PHOENIX_REQUIRE_WASMTIME=1`.
+#[test]
+fn alloc_loop_stays_under_bounded_wasm_memory() {
+    let label = "alloc_loop_bounded_mem";
+    compile_or_skip(ALLOC_LOOP_SOURCE, label, |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the module for {label}: {e}"));
+
+        with_temp_wasm(label, bytes, |path| {
+            let cap = wasm_gc_memcap_bytes();
+            let Some(output) = run_with_wasmtime_capped(path, cap, label) else {
+                return; // skipped — warning already printed
+            };
+            assert!(
+                output.status.success(),
+                "alloc_loop trapped under the {cap}-byte linear-memory cap — \
+                 the GC likely stopped reclaiming (leak-everything footprint \
+                 ~9.8 MB exceeds the cap). status={:?}\nstdout={}\nstderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.trim(),
+                "300000",
+                "alloc_loop output drifted under the bounded-memory cap; \
+                 stdout = {stdout:?}"
+            );
+        });
+    });
+}
+
 /// `closures.phx` — gate for `Op::ClosureAlloc`, `Op::CallIndirect`,
 /// `Op::ClosureLoadCapture`. Exercises:
 ///
@@ -1837,8 +1998,8 @@ fn list_sortby_runs_under_wasmtime() {
 /// list) and the sequence is deterministic across runs.
 ///
 /// The byte-identical match against the interpreter is the assertion:
-/// wasm32's insertion sort and the interpreter's merge sort are both
-/// stable, so they must agree on the full sorted output (including
+/// wasm32-linear and the interpreter both run a stable bottom-up merge
+/// sort, so they must agree on the full sorted output (including
 /// duplicates, which the LCG produces).
 #[test]
 fn list_sortby_n50_runs_under_wasmtime() {
@@ -1859,11 +2020,58 @@ fn list_sortby_n50_runs_under_wasmtime() {
     assert_wasm_matches_interp(src, "list_sortby_n50");
 }
 
-/// Structural gate for sortBy's ref-element ad-hoc `key` frame:
-/// `phx_main` must emit exactly two `phx_gc_push_frame` calls (the
-/// function-level frame + sortBy's `key` frame). Push/pop indices come
-/// from `calls.first()` / `calls.last()` (`setup_gc_frame` invariant);
-/// the `key` frame is the unique `push_idx` preceded by `I32Const(1)`.
+/// `List.sortBy` over **ref-typed elements with an allocating
+/// comparator** — the one merge-sort invariant the structural
+/// `list_sortby_ref_elem_emits_adhoc_shadow_frame` gate and the Int-only
+/// `list_sortby_n50` don't exercise *functionally* on wasm32-linear: that
+/// the `copy`/`aux` buffers (and, through them, their ref elements) stay
+/// reachable when a comparator allocates and triggers a collection
+/// mid-sort. The elements are inner `List<Int>`s (ref-typed); the
+/// comparator allocates a fresh 2-element list on *every* call, so the
+/// ~300-element input drives thousands of small allocations across the
+/// merge's multiple width passes — comfortably past the GC's
+/// auto-collect threshold, so collections do fire while the half-merged
+/// buffers are live. A dropped buffer root (or a regression that let the
+/// merge scribble `src` and break the "elements stay rooted via `src`"
+/// argument) would surface as freed/corrupted inner lists and a diverged
+/// sort order. The byte-identical match against the AST interpreter
+/// (which runs the same stable merge over a real heap) is the assertion;
+/// the LCG seed keeps the input self-contained and deterministic.
+#[test]
+fn list_sortby_ref_elem_allocating_cmp_runs_under_wasmtime() {
+    let src = "function main() {\n  \
+                 let mut xs: List<List<Int>> = []\n  \
+                 let mut seed: Int = 42\n  \
+                 let mut i: Int = 0\n  \
+                 while i < 300 {\n    \
+                   seed = (1103515245 * seed + 12345) % 32768\n    \
+                   xs = xs.push([seed])\n    \
+                   i = i + 1\n  \
+                 }\n  \
+                 let sorted = xs.sortBy(function(a: List<Int>, b: List<Int>) -> Int {\n    \
+                   let pad = [a.get(0), b.get(0)]\n    \
+                   pad.get(0) - pad.get(1)\n  \
+                 })\n  \
+                 for row in sorted {\n    \
+                   print(row.get(0))\n  \
+                 }\n\
+               }\n";
+    assert_wasm_matches_interp(src, "list_sortby_ref_elem_allocating_cmp");
+}
+
+/// Structural gate for sortBy's merge-sort buffer frame: `phx_main`
+/// must emit exactly two `phx_gc_push_frame` calls (the function-level
+/// frame + sortBy's 2-slot ad-hoc frame rooting the `copy`/`aux`
+/// buffers across the comparator call). Push/pop indices come from
+/// `calls.first()` / `calls.last()` (`setup_gc_frame` invariant); the
+/// buffer frame is the unique `push_idx` preceded by `I32Const(2)`.
+///
+/// The bottom-up merge sort allocates two linear-memory buffers (`copy`
+/// = the input clone, `aux` = scratch) that ping-pong each width pass.
+/// Both must stay rooted while a (possibly allocating) comparator runs,
+/// so they share a dedicated 2-slot shadow-stack frame — unlike the
+/// historical insertion sort's size-1 frame that rooted only the
+/// in-flight `key` element.
 #[test]
 fn list_sortby_ref_elem_emits_adhoc_shadow_frame() {
     let src = "function main() {\n  \
@@ -1871,7 +2079,7 @@ fn list_sortby_ref_elem_emits_adhoc_shadow_frame() {
                  let sorted = nested.sortBy(function(a: List<Int>, b: List<Int>) -> Int { a.get(0) - b.get(0) })\n  \
                  print(sorted.length())\n\
                }\n";
-    compile_or_skip(src, "list_sortby_ref_adhoc_frame", |bytes| {
+    compile_or_skip(src, "list_sortby_buffer_frame", |bytes| {
         let calls_with_const = call_targets_with_const_in_phx_main(bytes)
             .unwrap_or_else(|e| panic!("locating phx_main and decoding its calls failed: {e}"));
         let calls: Vec<u32> = calls_with_const.iter().map(|(t, _)| *t).collect();
@@ -1881,10 +2089,10 @@ fn list_sortby_ref_elem_emits_adhoc_shadow_frame() {
         // the prologue / epilogue bracket every other runtime call, but
         // a future codegen change that inserted a different Call ahead
         // of the prologue push would mis-identify `push_idx` here. The
-        // `pushes_with_size_1 == 1` follow-up assertion below is what
+        // `pushes_with_size_2 == 1` follow-up assertion below is what
         // would catch such a mis-identification — the wrong index
-        // wouldn't be preceded by an `I32Const(1)` in this fixture,
-        // since sortBy's ad-hoc push is the only size-1 push.
+        // wouldn't be preceded by an `I32Const(2)` in this fixture,
+        // since sortBy's ad-hoc buffer push is the only size-2 push.
         let push_idx = *calls
             .first()
             .expect("sortBy `main` should emit at least one Call (phx_gc_push_frame)");
@@ -1902,37 +2110,37 @@ fn list_sortby_ref_elem_emits_adhoc_shadow_frame() {
             push_count, pop_count,
             "phx_gc_push_frame (idx {push_idx}) and phx_gc_pop_frame (idx {pop_idx}) must \
              appear an equal number of times in `phx_main` — got push={push_count}, \
-             pop={pop_count}. A mismatch means sortBy's ad-hoc key frame push/pop pair is \
+             pop={pop_count}. A mismatch means sortBy's ad-hoc buffer frame push/pop pair is \
              unbalanced (the runtime's frame counter would drift). calls={calls:?}",
         );
         assert_eq!(
             push_count, 2,
-            "sortBy `main` with a ref-typed element should emit exactly two \
-             phx_gc_push_frame calls — the function-level frame plus sortBy's ad-hoc \
-             `key` frame. Got {push_count}: a count of 1 means the frame that roots the \
-             `key` element across the comparator call was dropped (a latent \
-             use-after-free under GC pressure). calls={calls:?}",
+            "sortBy `main` should emit exactly two phx_gc_push_frame calls — the \
+             function-level frame plus sortBy's ad-hoc 2-slot buffer frame. Got \
+             {push_count}: a count of 1 means the frame that roots the `copy`/`aux` \
+             buffers across the comparator call was dropped (a latent use-after-free \
+             under GC pressure). calls={calls:?}",
         );
 
         // Confirm we really identified `phx_gc_push_frame` (not some
         // unrelated `Call` that happened to be the first opcode): the
-        // ad-hoc `key` frame uses `frame_size = 1`, so exactly one of
-        // the two `push_idx` calls must be preceded by `I32Const(1)`.
+        // ad-hoc buffer frame uses `frame_size = 2`, so exactly one of
+        // the two `push_idx` calls must be preceded by `I32Const(2)`.
         // A future codegen change that put a different `Call` first
         // (mis-identifying push_idx) would fail this — the wrong index
-        // wouldn't have a matching `I32Const(1)` predecessor at all,
-        // since sortBy's ad-hoc push is the *only* size-1 push in this
+        // wouldn't have a matching `I32Const(2)` predecessor at all,
+        // since sortBy's ad-hoc push is the *only* size-2 push in this
         // fixture.
-        let pushes_with_size_1 = calls_with_const
+        let pushes_with_size_2 = calls_with_const
             .iter()
-            .filter(|(t, c)| *t == push_idx && *c == Some(1))
+            .filter(|(t, c)| *t == push_idx && *c == Some(2))
             .count();
         assert_eq!(
-            pushes_with_size_1, 1,
-            "expected exactly one `phx_gc_push_frame(1)` site (sortBy's ad-hoc `key` frame); \
-             got {pushes_with_size_1}. Either push_idx is not actually phx_gc_push_frame \
+            pushes_with_size_2, 1,
+            "expected exactly one `phx_gc_push_frame(2)` site (sortBy's ad-hoc buffer frame); \
+             got {pushes_with_size_2}. Either push_idx is not actually phx_gc_push_frame \
              (a different `Call` is now the first in the body), or sortBy stopped emitting \
-             the size-1 ad-hoc frame. calls_with_const={calls_with_const:?}",
+             the size-2 ad-hoc frame. calls_with_const={calls_with_const:?}",
         );
     });
 }
@@ -2000,6 +2208,45 @@ const COLLECTIONS_SOURCE: &str = include_str!(concat!(
 #[test]
 fn collections_runs_under_wasmtime() {
     assert_wasm_matches_interp(COLLECTIONS_SOURCE, "collections");
+}
+
+/// Host-surface gate (Phase 2.4 exit criterion: "WASI imports are the
+/// only host surface — no Phoenix-defined custom imports yet; that's
+/// Phase 2.5"). The merged `phoenix-runtime` pulls a handful of WASI
+/// preview1 functions (`fd_write` / `proc_exit` plus `environ_get` /
+/// `environ_sizes_get` / `random_get` that Rust's wasip1 std startup
+/// references), but every import must live in the
+/// `wasi_snapshot_preview1` module — a stray import from any other
+/// namespace would mean a custom host dependency leaked into the
+/// compiled output ahead of the Phase 2.5 JS-interop work. `collections`
+/// is the densest runtime-surface fixture (lists + maps + closures +
+/// strings), so it exercises the widest swath of `phx_*` helpers and
+/// thus the widest set of imports the merge could drag in.
+///
+/// This is a structural-tier assertion (no wasmtime needed), so it runs
+/// on every host once the wasm runtime artifact is built — it does not
+/// gate on `PHOENIX_REQUIRE_WASMTIME`.
+#[test]
+fn only_wasi_imports_on_wasm32_linear() {
+    compile_or_skip(COLLECTIONS_SOURCE, "collections_host_surface", |bytes| {
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        assert!(
+            !imports.is_empty(),
+            "expected the merged runtime to import at least WASI fd_write; \
+             found no imports at all (did the merge run?)"
+        );
+        let non_wasi: Vec<&(String, String)> = imports
+            .iter()
+            .filter(|(module, _)| module != "wasi_snapshot_preview1")
+            .collect();
+        assert!(
+            non_wasi.is_empty(),
+            "wasm32-linear module imports from non-WASI namespaces — a custom \
+             host dependency leaked in ahead of Phase 2.5: {non_wasi:?}\n\
+             full import list: {imports:?}"
+        );
+    });
 }
 
 /// Deterministic gate for `flatMap`'s inner-list rooting — the part the

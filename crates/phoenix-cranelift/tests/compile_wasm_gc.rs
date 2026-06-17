@@ -214,6 +214,81 @@ fn count_ref_cast_ops(bytes: &[u8]) -> usize {
     casts
 }
 
+/// Collect every import's module namespace across the module. The
+/// wasm32-gc backend emits no Rust-runtime merge — it synthesizes its
+/// helpers inline — so the only host import it ever needs is WASI
+/// `fd_write` (stdio). Used by [`only_wasi_imports_on_wasm32_gc`] to
+/// enforce the Phase 2.4 "WASI is the only host surface" exit criterion.
+/// Returns a specific `Err` if any wasmparser step fails (mirroring the
+/// linear backend's `import_modules`) so a helper regression reads as
+/// "couldn't parse imports" rather than an empty set silently passing
+/// the "only WASI" check.
+fn import_module_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    use wasmparser::{Parser, Payload};
+    let mut modules = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::ImportSection(rdr) = payload {
+            for group in rdr {
+                match group.map_err(|e| format!("reading import section: {e}"))? {
+                    wasmparser::Imports::Single(_, imp) => modules.push(imp.module.to_string()),
+                    wasmparser::Imports::Compact1 { module, items } => {
+                        for item in items {
+                            item.map_err(|e| format!("reading import items: {e}"))?;
+                            modules.push(module.to_string());
+                        }
+                    }
+                    wasmparser::Imports::Compact2 { module, names, .. } => {
+                        for name in names {
+                            name.map_err(|e| format!("reading import names: {e}"))?;
+                            modules.push(module.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(modules)
+}
+
+/// Host-surface gate (Phase 2.4 exit criterion: "WASI imports are the
+/// only host surface — no Phoenix-defined custom imports yet"). Unlike
+/// wasm32-linear, the GC backend embeds no Rust runtime, so its import
+/// set is just WASI `fd_write`; any import from another namespace would
+/// mean a custom host dependency leaked in ahead of Phase 2.5.
+/// `collections` is the densest runtime-surface fixture (lists + maps +
+/// closures + strings). Structural-tier (no wasmtime needed).
+#[test]
+fn only_wasi_imports_on_wasm32_gc() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/collections.phx"
+    ));
+    let bytes = compile_to_wasm_gc(source);
+    let modules =
+        import_module_names(&bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+    // Guard against a vacuous pass: `collections` prints, so it must
+    // import at least WASI `fd_write`. An empty import set would mean
+    // the GC backend stopped importing stdio (or the parse helper
+    // regressed) — either way the "only WASI" filter below would pass
+    // for the wrong reason.
+    assert!(
+        !modules.is_empty(),
+        "expected the wasm32-gc module to import at least WASI fd_write; \
+         found no imports at all (did the parse helper regress?)"
+    );
+    let non_wasi: Vec<&String> = modules
+        .iter()
+        .filter(|m| *m != "wasi_snapshot_preview1")
+        .collect();
+    assert!(
+        non_wasi.is_empty(),
+        "wasm32-gc module imports from non-WASI namespaces — a custom host \
+         dependency leaked in ahead of Phase 2.5: {non_wasi:?}\n\
+         full import-module list: {modules:?}"
+    );
+}
+
 /// Compile `source`, structurally validate it, and — when wasmtime is
 /// available — assert its stdout equals `expected`. Shared by the
 /// `print(Int)` digit-conversion cases.
@@ -2614,10 +2689,13 @@ fn list_closure_methods_run_under_wasmtime_gc() {
     );
 }
 
-/// `List.sortBy` — stable insertion sort matching the interpreters.
-/// This pins the core shape directly under wasmtime: ascending and
-/// descending comparators, and a duplicate key (`1` twice) the sort
-/// must not drop or duplicate. Stability is *not* observable here —
+/// `List.sortBy` — stable bottom-up merge sort matching native and the
+/// interpreters. This pins the core shape directly under wasmtime:
+/// ascending and descending comparators, and a duplicate key (`1` twice)
+/// the sort must not drop or duplicate. The 8-element input drives three
+/// width passes (1 → 2 → 4), an *odd* count, so the sorted data ends in
+/// the `aux` buffer — exercising the `src`/`dst` ping-pong's final-buffer
+/// tracking, not just a single pass. Stability is *not* observable here —
 /// equal `Int`s are indistinguishable — so it isn't claimed; the
 /// `list_sortby_stable.phx` matrix fixture (now five-backend) verifies
 /// stability properly via struct-tagged paired keys.
@@ -2838,6 +2916,146 @@ fn map_remove_edges_run_under_wasmtime_gc() {
         source,
         "map_remove_edges_wasm_gc",
         b"2\n10\n20\n0\nfalse\n-1\n",
+    );
+}
+
+/// Open-addressing index at a scale the tiny (≤4-key) map tests don't
+/// reach: 30 Int entries land in a 64-slot table (~47% load), so home
+/// slots collide frequently and lookups must walk probe chains — some
+/// wrapping past the end of the table back to slot 0. This is the
+/// regression guard for the `map_hash_index` probe loop, its `& mask`
+/// wraparound, and the `emit_index_store_at` "reuse the miss `h`"
+/// contract; a broken mask, an off-by-one probe, or a false-positive
+/// equality check would diverge the byte-identical output. Phases:
+/// (1) `MapBuilder` populates 30 keys plus one **duplicate** (key 13) —
+/// the dup must be found through its probe chain and last-wins; (2)
+/// every present key resolves (summed), every absent key misses to an
+/// empty slot; (3) `set` overwrites an existing key (re-probe after the
+/// COW index rebuild) and appends a new one; (4) `remove` drops an
+/// interior key and a former chain-neighbor still resolves against the
+/// rebuilt index.
+#[test]
+fn map_hash_index_probe_chains_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let mb: MapBuilder<Int, Int> = Map.builder()\n",
+        "  let mut i: Int = 0\n",
+        "  while (i < 30) {\n",
+        "    mb.set(i, i * 7)\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  mb.set(13, 1300)\n", // duplicate: probe to slot 13, last-wins
+        "  let m = mb.freeze()\n",
+        "  print(m.length())\n", // 30
+        "  let mut sum: Int = 0\n",
+        "  let mut j: Int = 0\n",
+        "  while (j < 30) {\n",
+        "    sum = sum + m.get(j).unwrapOr(-1)\n",
+        "    j = j + 1\n",
+        "  }\n",
+        // 7*(0+..+29)=3045, minus 7*13=91, plus 1300 (last-wins) = 4254.
+        "  print(sum)\n",                            // 4254
+        "  print(m.get(13).unwrapOr(-1))\n",         // 1300 (last-wins through probe)
+        "  print(m.get(30).unwrapOr(-1))\n",         // -1 (miss → empty slot)
+        "  print(m.get(5000).unwrapOr(-1))\n",       // -1
+        "  print(m.contains(29))\n",                 // true
+        "  print(m.contains(30))\n",                 // false
+        "  let m2 = m.set(7, 777).set(200, 2000)\n", // overwrite + append
+        "  print(m2.get(7).unwrapOr(-1))\n",         // 777
+        "  print(m2.get(200).unwrapOr(-1))\n",       // 2000
+        "  print(m2.length())\n",                    // 31
+        "  let m3 = m2.remove(7)\n",
+        "  print(m3.contains(7))\n",         // false
+        "  print(m3.get(8).unwrapOr(-1))\n", // 56 (neighbor intact after rebuild)
+        "  print(m3.length())\n",            // 30
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_hash_index_probe_chains_wasm_gc",
+        b"30\n4254\n1300\n-1\n-1\ntrue\nfalse\n777\n2000\n31\nfalse\n56\n30\n",
+    );
+}
+
+/// String-key probe chains: exercises `emit_str_hash` (FNV-1a over the
+/// `$bytes` window) feeding the same open-addressing index. Nine string
+/// keys in a 32-slot table force at least a few FNV collisions, so `get`
+/// / `contains` / construction-dedup walk probe chains keyed on string
+/// *content* equality (`phx_str_eq`), not the hash. Pins literal-build
+/// dedup, hit/miss lookups, and `set` overwrite + append on String keys
+/// past the trivial 3-key `map_core` coverage.
+#[test]
+fn map_string_hash_index_probe_chains_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let m: Map<String, Int> = {\"alpha\": 1, \"beta\": 2, \"gamma\": 3, \
+         \"delta\": 4, \"epsilon\": 5, \"zeta\": 6, \"eta\": 7, \"theta\": 8, \
+         \"iota\": 9}\n",
+        "  print(m.length())\n",                               // 9
+        "  print(m.get(\"alpha\").unwrapOr(-1))\n",            // 1
+        "  print(m.get(\"iota\").unwrapOr(-1))\n",             // 9
+        "  print(m.get(\"theta\").unwrapOr(-1))\n",            // 8
+        "  print(m.get(\"omega\").unwrapOr(-1))\n",            // -1 (miss)
+        "  print(m.contains(\"zeta\"))\n",                     // true
+        "  print(m.contains(\"kappa\"))\n",                    // false
+        "  let m2 = m.set(\"beta\", 20).set(\"kappa\", 11)\n", // overwrite + append
+        "  print(m2.get(\"beta\").unwrapOr(-1))\n",            // 20
+        "  print(m2.get(\"kappa\").unwrapOr(-1))\n",           // 11
+        "  print(m2.length())\n",                              // 10
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_string_hash_index_probe_chains_wasm_gc",
+        b"9\n1\n9\n8\n-1\ntrue\nfalse\n20\n11\n10\n",
+    );
+}
+
+/// Float-key probe chains: exercises the `emit_map_hash` Float arm
+/// (`i64.reinterpret_f64` → the multiply-shift mix) feeding the same
+/// open-addressing index. The Int/String probe-chain tests above cover
+/// the other two hash arms; this is the one that wasn't reached at scale
+/// — `map_core`'s Float coverage is too small to force a probe chain. 30
+/// integer-valued Float keys land in a 64-slot table (~47% load), so home
+/// slots collide and lookups walk probe chains. The fractional `7.5`
+/// (distinct bits from every integer key) pins that the index keys on
+/// **byte-wise** Float equality, not the hash — a `7.5` whose hash happened
+/// to collide with `7.0`'s home must still *miss*. Phases mirror the Int
+/// test: (1) build 30 keys plus a **duplicate** (`13.0`, last-wins through
+/// its probe chain); (2) present keys resolve, absent ones miss; (3) `set`
+/// overwrites an existing key (re-probe after the COW index rebuild) and
+/// appends a new one.
+#[test]
+fn map_float_hash_index_probe_chains_run_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let mb: MapBuilder<Float, Int> = Map.builder()\n",
+        "  let mut x: Float = 0.0\n",
+        "  let mut i: Int = 0\n",
+        "  while (i < 30) {\n",
+        "    mb.set(x, i * 3)\n",
+        "    x = x + 1.0\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  mb.set(13.0, 1300)\n", // duplicate: probe to 13.0's slot, last-wins
+        "  let m = mb.freeze()\n",
+        "  print(m.length())\n",                        // 30
+        "  print(m.get(0.0).unwrapOr(-1))\n",           // 0
+        "  print(m.get(13.0).unwrapOr(-1))\n",          // 1300 (last-wins through probe)
+        "  print(m.get(29.0).unwrapOr(-1))\n",          // 87 (29 * 3)
+        "  print(m.get(30.0).unwrapOr(-1))\n",          // -1 (miss → empty slot)
+        "  print(m.contains(7.0))\n",                   // true
+        "  print(m.contains(7.5))\n",                   // false (distinct bits → byte-wise miss)
+        "  let m2 = m.set(7.0, 777).set(50.0, 5000)\n", // overwrite + append
+        "  print(m2.get(7.0).unwrapOr(-1))\n",          // 777
+        "  print(m2.get(50.0).unwrapOr(-1))\n",         // 5000
+        "  print(m2.length())\n",                       // 31
+        "}\n",
+    );
+    assert_prints(
+        source,
+        "map_float_hash_index_probe_chains_wasm_gc",
+        b"30\n0\n1300\n87\n-1\ntrue\nfalse\n777\n5000\n31\n",
     );
 }
 
