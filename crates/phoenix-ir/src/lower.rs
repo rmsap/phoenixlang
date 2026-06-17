@@ -158,6 +158,10 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
         // this can't panic if a DateTime-bearing struct is ever lowered. See
         // `docs/design-decisions.md` (DateTime & UUID scalar types).
         Type::DateTime => IrType::StringRef,
+        // `Uuid` is a Phoenix Gen scalar (RFC 4122 string on the wire) with no
+        // language-level literals/operations yet; same branded-string runtime
+        // representation as `DateTime`/`String`. See `docs/design-decisions.md`.
+        Type::Uuid => IrType::StringRef,
         Type::Void => IrType::Void,
         Type::File => {
             // `File` is a Phoenix Gen endpoint-transport type only. Endpoints are

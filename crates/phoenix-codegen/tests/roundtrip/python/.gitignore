@@ -4,6 +4,7 @@
 # Generated package + contract copy, dropped in fresh by the Rust harness.
 generated/
 generated_dt/
+generated_uuid/
 contract.json
 
 # Python bytecode caches.

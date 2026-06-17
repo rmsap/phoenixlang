@@ -374,6 +374,61 @@ endpoint replacePost: PUT "/api/posts/{id}" {
 }
 "#;
 
+/// Exercises the `Uuid` scalar across every position and target path it touches:
+/// struct fields (`id`), `Option<Uuid>` (`ownerId`), `List<Uuid>` (`members`),
+/// `Map<String, Uuid>` (`index`), a nested Uuid-bearing struct (`owner: Profile`),
+/// a `Uuid` query param (`ref`), request header (`idempotencyKey`), required +
+/// optional response headers (`requestId`/`traceId`), a body, and BARE scalar /
+/// `List` / `Map` `Uuid` responses. The lint proof that all four generators emit
+/// valid output: Go `string` + the `uuidRe` `Validate()` check (+`regexp`),
+/// Python `uuid.UUID` (+import, `str()`/`UUID(...)`), TypeScript the branded
+/// `Uuid` alias + `parseUuid` validate-on-decode pass, OpenAPI `format: uuid`.
+const UUID_SCHEMA: &str = r#"
+struct Profile {
+    handle: String
+    avatarId: Uuid
+}
+
+struct Account {
+    id: Uuid
+    ownerId: Option<Uuid>
+    name: String
+    members: List<Uuid>
+    index: Map<String, Uuid>
+    owner: Profile
+}
+
+endpoint getAccount: GET "/accounts/{id}" {
+    query {
+        ref: Uuid
+    }
+    response Account headers {
+        requestId: Uuid
+        traceId: Option<Uuid>
+    }
+}
+
+endpoint createAccount: POST "/accounts" {
+    body Account
+    headers {
+        idempotencyKey: Uuid
+    }
+    response Account
+}
+
+endpoint newId: GET "/id" {
+    response Uuid
+}
+
+endpoint listIds: GET "/ids" {
+    response List<Uuid>
+}
+
+endpoint idMap: GET "/id-map" {
+    response Map<String, Uuid>
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -588,6 +643,9 @@ fn go_output_compiles_and_lints() {
     // `DateTime` across fields/list/nested/query/headers — `time.Time`, the
     // `time` import, and `time.Parse`/`.Format(time.RFC3339)` (de)serialization.
     check_go_output(&generate_go_files(DATETIME_SCHEMA));
+    // `Uuid` across fields/list/map/nested/query/headers + bare responses; the
+    // `uuidRe` `Validate()` check and `regexp` import.
+    check_go_output(&generate_go_files(UUID_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -617,6 +675,7 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(HEADER_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(DATETIME_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(UUID_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -672,6 +731,7 @@ fn openapi_output_lints() {
     check_openapi_output("FEATURE_SCHEMA", FEATURE_SCHEMA);
     check_openapi_output("HEADER_SCHEMA", HEADER_SCHEMA);
     check_openapi_output("DATETIME_SCHEMA", DATETIME_SCHEMA);
+    check_openapi_output("UUID_SCHEMA", UUID_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -792,6 +852,8 @@ fn typescript_output_compiles_and_lints() {
     // revival, paginated-items revival, body+response-header envelope revival, and
     // `.toISOString()` query/header encoding. Compiles + lints (tsc/eslint/prettier).
     check_typescript_output(&scaffold, &generate_typescript_files(DATETIME_SCHEMA));
+    // `Uuid` branded alias + `parseUuid` validate-on-decode pass across all positions.
+    check_typescript_output(&scaffold, &generate_typescript_files(UUID_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -927,6 +989,9 @@ fn python_output_compiles_and_lints() {
         &venv_bin,
         &generate_python_files(DATETIME_SCHEMA),
     );
+    // `Uuid` → `uuid.UUID` (+ import) across fields/list/map/nested/query/headers
+    // and bare responses, with `str()`/`UUID(...)` encoding. Checks black/ruff/mypy.
+    check_python_output(&scaffold, &venv_bin, &generate_python_files(UUID_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {

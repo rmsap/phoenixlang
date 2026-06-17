@@ -2587,46 +2587,41 @@ the stub, point at a test" discipline the language phases use):
 ## Phoenix Gen — DateTime & UUID scalar types (2026-06-16)
 
 The first cut at closing the "missing primitive types" gap above. Of the three
-top-ranked primitives (DateTime, UUID, Money), **this slice ships `DateTime`
-only**; **UUID is the next slice** (same loop, not yet implemented — there is no
-`Type::Uuid` in the codebase yet); and **Money/Decimal is deferred** — it carries
-currency-awareness and fixed-precision-arithmetic questions (rounding mode, scale,
-ISO-4217 coupling) that DateTime/UUID don't, so it's a design discussion of its
-own rather than a mechanical "add a scalar" pass. Doing DateTime first, then UUID,
-each through the full add→4-generators→compile-lint→round-trip loop, keeps the
-diff reviewable and proves the loop before the harder type lands. The UUID design
-below is recorded here as the agreed plan for that next slice; everything marked
-*(planned)* is design intent, not shipped behavior.
+top-ranked primitives (DateTime, UUID, Money), **this work ships both `DateTime`
+and `Uuid`** (DateTime first, then UUID, each through the full
+add→4-generators→compile-lint→round-trip loop); **Money/Decimal is deferred** — it
+carries currency-awareness and fixed-precision-arithmetic questions (rounding
+mode, scale, ISO-4217 coupling) that DateTime/UUID don't, so it's a design
+discussion of its own rather than a mechanical "add a scalar" pass.
 
 **These are first-class scalar types, NOT position-restricted like `File`.** A
 `File` is a body-transport sentinel that sema forbids outside endpoint
-body/response position; DateTime (and UUID, when it lands) are ordinary values,
-legal in struct fields, query params, request/response headers, and scalar
-response bodies. They flow through `resolve_type_expr` as plain builtins (added to
-`Type::from_name`); no scope gate is needed or wanted.
+body/response position; DateTime and UUID are ordinary values, legal in struct
+fields, query params, request/response headers, and scalar response bodies. They
+flow through `resolve_type_expr` as plain builtins (added to `Type::from_name`);
+no scope gate is needed or wanted.
 
 **Deferred: DateTime/UUID as a multipart form field.** The one position they do
 *not* cover is a non-file field of a `File`-bearing (multipart) body, whose
 scalars are still restricted to `Int`/`Float`/`Bool`/`String` (sema's
-`is_multipart_field_type`). A `DateTime` (or, once it lands, `Uuid`) there is
+`is_multipart_field_type`). A `DateTime`/`Uuid` there is
 rejected with the existing clean diagnostic rather than silently mis-encoded.
 Timestamps/ids in a multipart upload are the rarest position; lifting the
 whitelist (plus the per-target form encode/parse) is a small, additive follow-up.
 Not a silent gap — it errors at check time with a precise message.
 
 **Wire format is always a string.** DateTime serializes as an RFC 3339 / ISO 8601
-instant string (`2026-06-16T12:00:00Z`); UUID *(planned)* as the canonical
-hyphenated uuid string. Every target encodes/decodes them through its existing
-string path for query/header/path/multipart positions — the only target-specific
-work is the in-memory body representation and (for TS DateTime) JSON revival.
+instant string (`2026-06-16T12:00:00Z`); UUID as the canonical hyphenated uuid
+string. Every target encodes/decodes them through its existing string path for
+query/header/path positions — the only target-specific work is the in-memory body
+representation, JSON revival (TS DateTime), and validation (see below).
 
-**Per-target representation** (`Uuid` row is *planned* — the next slice, not in
-this diff):
+**Per-target representation:**
 
 | | Phoenix | Wire (JSON) | TypeScript | Python | Go | OpenAPI |
 |---|---|---|---|---|---|---|
 | `DateTime` | `Type::DateTime` | RFC 3339 string | `Date` (+ generated revival) | `datetime.datetime` | `time.Time` | `{type: string, format: date-time}` |
-| `Uuid` *(planned)* | `Type::Uuid` | uuid string | branded `string` (`type Uuid = string & {…}`) | `uuid.UUID` | `string` | `{type: string, format: uuid}` |
+| `Uuid` | `Type::Uuid` | uuid string | branded `string` (`type Uuid = string & {…}`) + `parseUuid` validate-on-decode | `uuid.UUID` | `string` (regex-checked in `Validate()`) | `{type: string, format: uuid}` |
 
 **Why TS DateTime = `Date` with generated revival, not `string`.** JS *has* a
 `Date`, but `JSON.parse` never revives it — a parsed date field is a string at
@@ -2642,10 +2637,32 @@ would be a raw string at runtime, the same lie on the inbound path. So a
 Date-bearing request body emits a `revive<Endpoint>Body` (keyed on the derived
 body fields) that the route calls on the cast/validated body. Query params and
 request/response headers are coerced inline (`new Date(...)`), so the body is the
-only position needing a generated reviver. **Why TS UUID = branded
-`string`, not a class (planned).** JS has no UUID type (only `crypto.randomUUID()`
-returning a `string`); a branded alias gives nominal typing with zero runtime cost
-and no revival pass (a uuid IS its string).
+only position needing a generated reviver.
+
+**UUID validation level: validated, no Go dependency** (chosen 2026-06-16). The
+targets diverge on how much they validate a `Uuid`, and we did NOT add a UUID
+library to any of them:
+- **Python** — `uuid.UUID`; pydantic parses the wire string into a `UUID` on
+  both server (request) and client (response), rejecting malformed input for free.
+- **TypeScript** — a branded alias `type Uuid = string & { … }` (JS has no UUID
+  type) PLUS a generated `parseUuid` that regex-checks the RFC 4122 format and
+  brands the value. It reuses the same recursive decode pass as DateTime revival
+  (`Uuid` → `parseUuid` where `DateTime` → `new Date`), so it validates on the
+  client response decode AND the server request-body decode; query/request-header
+  and response-header `Uuid`s are validated inline (`parseUuid`). The brand gives
+  nominal distinctness (a bare `string` can't be passed as a `Uuid` without a
+  cast); the regex gives a runtime guarantee.
+- **Go** — `string` (no stdlib UUID type, and we add no dependency like
+  `google/uuid` to keep the policy simple), format-checked by the generated
+  `Validate()` via a package-level `uuidRe` (`regexp`). The check covers direct
+  `Uuid` / `Option<Uuid>` struct & body fields; `List`/`Map` elements and
+  query/header `Uuid`s are NOT checked — Go is the documented weak link, accepted
+  for this slice. The server already calls `body.Validate()`, now also for
+  uuid-bearing (not just constrained) bodies.
+
+This deliberately leaves query/header `Uuid` validation as the per-target weak
+spot (TS validates them, Go does not), mirroring how DateTime's server-side
+handling is the weak spot there — bodies are where ids overwhelmingly live.
 
 **Verification (DateTime).** Two harnesses, both green. (1) Compile-lint: a
 comprehensive `DATETIME_SCHEMA` (field/`Option`/`List`/`Map`/nested/query/req+resp
@@ -2676,21 +2693,101 @@ bare `Map` response revival (`Object.fromEntries(…)`) overflows the 80-col pri
 width, so the client return is emitted through `emit_return`'s Prettier-style call
 wrapping.
 
-Per-file `datetime` import detection in Python is split across position-specific
-walkers (`request_input_uses_datetime`, `response_header_uses_datetime`,
-`bare_response_uses_datetime`, plus the envelope/page coverage in
-`models_use_datetime`): an unused import trips ruff F401 and a missing one trips
-F821/mypy, so each file imports `datetime` iff some position it actually renders
-names it. The bare-response walker is parameterized by whether to exclude
-response-header endpoints — the client/handler render the named `<Endpoint>Result`
-envelope there, while the server still returns the bare `result.body`.
+Per-file special-scalar import detection in Python is split across
+position-specific walkers (`request_input_uses`, `response_header_uses`,
+`bare_response_uses`, plus the envelope/page coverage in `models_use`), each
+generic over a `fn(&Type) -> bool` type test so the SAME position logic serves
+both `datetime` (`from datetime import datetime`) and `Uuid`
+(`from uuid import UUID`) — evaluated once per scalar. An unused import trips ruff
+F401 and a missing one trips F821/mypy, so each file imports a scalar iff some
+position it actually renders names it. The bare-response walker is parameterized
+by whether to exclude response-header endpoints — the client/handler render the
+named `<Endpoint>Result` envelope there, while the server still returns the bare
+`result.body`. The same generalization is true in TS: `Uuid` reuses DateTime's
+revival machinery (`ts_type_needs_revival`/`ts_revive_expr`/`revive<Struct>`) —
+`Uuid` → `parseUuid` slots in exactly where `DateTime` → `new Date` does.
 
-**Language-runtime semantics (`lower_type`).** `DateTime` lowers to
-`IrType::StringRef` — a branded-string runtime representation (UUID will lower the
-same way when it lands). The Gen path (`cmd_gen`) never lowers to IR, so this only
-matters if a DateTime-bearing struct is used in actual Phoenix *language* code
-(`run`/`build`). It has no literals or operations in the language yet (an opaque
-scalar), so a string-backed runtime identity is sufficient and correct, and —
+**Verification (UUID).** Same two harnesses, both green. (1) Compile-lint: a
+comprehensive `UUID_SCHEMA` (field/`Option`/`List`/`Map`/nested/query/req+resp
+header + bare scalar/`List`/`Map` responses) through all four targets. (2) Bespoke
+round-trips (`tests/roundtrip/uuid/*`) for Go/TS/Python assert body/query/
+response-header/bare-response uuids survive the wire AND that the validating
+decode paths (Python `UUID(...)`, TS `parseUuid`, Go `Validate()`'s `uuidRe`)
+accept valid input. Two import gaps surfaced (both fixed): TS `handlers.ts` named
+`Uuid` (query/header params, bare response) without importing it; and the TS
+reviver-function signature overflowed 80 cols for a long body type
+(`reviveCreateAccountBody`) — now wrapped Prettier-style via
+`push_reviver_signature` (a latent DateTime bug too, just not triggered by shorter
+names). All 10 round-trips (4 base + 3 DateTime + 3 UUID) and all four compile-lint
+targets are green.
+
+**Language-runtime semantics (`lower_type`).** Both `DateTime` and `Uuid` lower to
+`IrType::StringRef` — a branded-string runtime representation. The Gen path
+(`cmd_gen`) never lowers to IR, so this only
+matters if a DateTime/Uuid-bearing struct is used in actual Phoenix *language*
+code (`run`/`build`). Neither has literals or operations in the language yet
+(opaque scalars), so a string-backed runtime identity is sufficient and correct,
+and —
 unlike `File`'s `unreachable!` arm — it can't panic if such a struct is ever
 lowered. Liftable to a richer representation if the language later gains temporal
 (or uuid) semantics.
+
+## Phoenix Gen — Decimal scalar type (DESIGN — not yet implemented, 2026-06-16)
+
+The third of the top-ranked "missing primitive types," closing the
+`Int`-cents / `Float`-amount workaround the fixtures used. **This section is the
+agreed design only — implementation is held pending explicit go-ahead.** It
+follows the same add→4-generators→compile-lint→round-trip loop as DateTime/UUID.
+
+**Scope: `Decimal` only; `Money` is compose-your-own for now.** The fixture audit
+asked for "currency-aware money," but `Money` is just `Decimal` + a currency, and
+a general `Decimal` also covers rates/percentages/quantities/tax. So we ship the
+`Decimal` primitive; a money amount is modeled as a user-defined struct
+(`struct Money { amount: Decimal  currency: String }`) until there's demand for a
+first-class type. **Deferred to a future slice (documented commitment): a built-in
+`Money`** — a composite `{ amount, currency }` with ISO-4217 currency validation.
+
+**Wire format: JSON string** (`"19.99"`). The only representation that is exact in
+all three targets: a JSON *number* is parsed to an IEEE-754 double in nearly every
+parser, and in JS precision is unrecoverable (`JSON.parse` yields the double before
+any hook runs). String is also what Stripe and most money APIs use, and JSON
+Schema has no decimal type. Integer-minor-units was rejected (couples to currency
+scale — JPY 0 / USD 2 / KWD 3 — and is exactly the workaround being replaced).
+
+**Representation: transport-only, dependency-free (Decision 3 = option A).** Phoenix
+Gen's job here is exact, typed *transport* — not arithmetic. No decimal library is
+added to any generated target.
+
+| | Phoenix | Wire (JSON) | TypeScript | Python | Go | OpenAPI |
+|---|---|---|---|---|---|---|
+| `Decimal` | `Type::Decimal` | decimal string | branded `string` (`type Decimal = string & {…}`) + `parseDecimal` validate-on-decode | `decimal.Decimal` (stdlib — exact arithmetic for free) | `string` (regex-checked in `Validate()`) | `{type: string, format: decimal}` |
+
+This mirrors the UUID approach exactly (reuse the TS revival/`parse*` pipeline, Go
+`Validate()` regex, Python's native type). It is deliberately **asymmetric**:
+Python gets real `decimal.Decimal` arithmetic for free; Go/TS get an exact,
+validated, distinctly-typed string with NO arithmetic — the user reaches for their
+own decimal lib for math. This matches the established "Gen is a transport layer"
+philosophy and the dependency-aversion of the UUID decision.
+
+**Deferred to a future slice (documented commitment): real decimal arithmetic in
+Go and TS** via MIT-licensed libraries — `shopspring/decimal` (Go) and
+`decimal.js` / `big.js` (TS) — as an opt-in, so Go/TS users get ergonomic
+add/multiply instead of string-only transport. (Confirm each library's license is
+MIT at adoption per the MIT-only policy; the candidates are believed MIT, unlike
+`google/uuid`'s BSD-3.) This is the natural companion to a built-in `Money`.
+
+**Precision: arbitrary for now; fixed scale is the long-term goal.** v1 carries
+whatever precision the wire string holds; validation only checks the value is a
+well-formed decimal. **Deferred (documented goal): a fixed-scale annotation**
+(`Decimal(2)` — a parameterized type, new parser/type-system surface) so a schema
+can pin scale and the generators can round/validate against it.
+
+**The smaller pieces (fall out of the above, same patterns as UUID):**
+- Validation: a decimal-format regex (optional leading `-`, digits, optional
+  `.` + fraction) reused through the TS `parseDecimal` and Go `Validate()` paths;
+  Python's `Decimal(str)` raises on malformed input (free, both sides via pydantic).
+- `lower_type` → `IrType::StringRef`, same as DateTime/UUID.
+- OpenAPI: `{type: string, format: decimal}` (no standard JSON-Schema decimal; the
+  string + `format: decimal` convention; an optional `pattern` could pin the regex).
+- Multipart form-field `Decimal`: same deferral as DateTime/UUID (sema's
+  `is_multipart_field_type` whitelist), rejected cleanly until lifted.

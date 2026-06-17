@@ -34,6 +34,15 @@ pub enum Type {
     /// it has no literals or operations in the language yet. See
     /// `docs/design-decisions.md` (DateTime & UUID scalar types).
     DateTime,
+    /// A UUID, serialized on the wire as the canonical hyphenated string (e.g.
+    /// `550e8400-e29b-41d4-a716-446655440000`). A Phoenix Gen scalar usable
+    /// wherever `String` is — like `DateTime`, NOT position-restricted. Lowers to
+    /// `IrType::StringRef` (see `lower_type`); it has no literals or operations in
+    /// the language yet. The targets validate it to differing degrees (Python
+    /// `uuid.UUID` and the TS `parseUuid` decode pass check the format; Go keeps
+    /// it a `string` checked only in `Validate()`). See `docs/design-decisions.md`
+    /// (DateTime & UUID scalar types).
+    Uuid,
     /// The unit type, used for functions that do not return a value.
     Void,
     /// A named type that hasn't been resolved yet or is user-defined.
@@ -76,11 +85,11 @@ impl Type {
     /// Resolve a type-name string to a [`Type`].
     ///
     /// The built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
-    /// `"File"`, `"DateTime"`, `"Void"`) are matched **case-sensitively** and
-    /// mapped to the corresponding variant.  Any other name is wrapped in
+    /// `"File"`, `"DateTime"`, `"Uuid"`, `"Void"`) are matched **case-sensitively**
+    /// and mapped to the corresponding variant.  Any other name is wrapped in
     /// [`Type::Named`].  (`File` is only *legal* in endpoint-body position —
-    /// that restriction is enforced in sema, not here.  `DateTime` is a plain
-    /// scalar with no such restriction.)
+    /// that restriction is enforced in sema, not here.  `DateTime`/`Uuid` are
+    /// plain scalars with no such restriction.)
     pub fn from_name(name: &str) -> Type {
         match name {
             "Int" => Type::Int,
@@ -89,6 +98,7 @@ impl Type {
             "Bool" => Type::Bool,
             "File" => Type::File,
             "DateTime" => Type::DateTime,
+            "Uuid" => Type::Uuid,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
         }
@@ -199,6 +209,7 @@ impl std::fmt::Display for Type {
             Type::Bool => write!(f, "Bool"),
             Type::File => write!(f, "File"),
             Type::DateTime => write!(f, "DateTime"),
+            Type::Uuid => write!(f, "Uuid"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {
