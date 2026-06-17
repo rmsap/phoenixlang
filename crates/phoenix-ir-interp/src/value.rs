@@ -16,6 +16,30 @@ pub struct StructData {
     pub fields: Vec<IrValue>,
 }
 
+/// Backing state for an [`IrValue::ListBuilder`]: the accumulated items
+/// and a one-shot `frozen` flag. `.freeze()` sets `frozen`; any later
+/// `.push()`/`.freeze()` is a runtime error, mirroring native's
+/// `assert_unfrozen` and wasm-gc's frozen trap so use-after-freeze
+/// behaves identically across all five backends.
+#[derive(Debug, Clone)]
+pub struct ListBuilderState {
+    /// Elements pushed so far, in push order.
+    pub items: Vec<IrValue>,
+    /// Set by `.freeze()`; once true the builder rejects further use.
+    pub frozen: bool,
+}
+
+/// Backing state for an [`IrValue::MapBuilder`]: appended `(key, value)`
+/// pairs (no dedup until freeze) and the same one-shot `frozen` flag as
+/// [`ListBuilderState`].
+#[derive(Debug, Clone)]
+pub struct MapBuilderState {
+    /// Pairs appended so far, verbatim and undeduped.
+    pub pairs: Vec<(IrValue, IrValue)>,
+    /// Set by `.freeze()`; once true the builder rejects further use.
+    pub frozen: bool,
+}
+
 /// Data for an enum variant instance.
 #[derive(Debug, Clone)]
 pub struct EnumData {
@@ -48,6 +72,24 @@ pub enum IrValue {
     List(Rc<RefCell<Vec<IrValue>>>),
     /// A map of key-value pairs (shared reference).
     Map(Rc<RefCell<Vec<(IrValue, IrValue)>>>),
+    /// A transient mutable `ListBuilder<T>` accumulator (Phase 2.7).
+    ///
+    /// Distinct from [`IrValue::List`] at the type level: `.push()`
+    /// mutates the shared buffer in place and `.freeze()` produces a
+    /// fresh independent [`IrValue::List`] by cloning the buffer, then
+    /// marks the builder frozen. The native backend uses a dedicated
+    /// handle/buffer pair (`list_builder_methods.rs`); the interpreter
+    /// mirrors the observable semantics, including use-after-freeze
+    /// rejection (see [`ListBuilderState`]).
+    ListBuilder(Rc<RefCell<ListBuilderState>>),
+    /// A transient mutable `MapBuilder<K, V>` accumulator (Phase 2.7).
+    ///
+    /// `.set()` appends a `(key, value)` pair verbatim (no dedup, no
+    /// result); `.freeze()` produces a fresh [`IrValue::Map`] applying
+    /// last-wins dedup with first-insertion key position, matching
+    /// `phx_map_builder_freeze` → `phx_map_from_pairs`, and marks the
+    /// builder frozen (use-after-freeze is a runtime error).
+    MapBuilder(Rc<RefCell<MapBuilderState>>),
     /// A closure: target function ID and captured values.
     Closure(FuncId, Vec<IrValue>),
     /// A `dyn Trait` fat-pointer value, parallel to the Cranelift
@@ -74,6 +116,22 @@ impl IrValue {
     /// Construct a new `IrValue::Map` from key-value pairs.
     pub fn new_map(entries: Vec<(IrValue, IrValue)>) -> Self {
         IrValue::Map(Rc::new(RefCell::new(entries)))
+    }
+
+    /// Construct a fresh empty `IrValue::ListBuilder`.
+    pub fn new_list_builder() -> Self {
+        IrValue::ListBuilder(Rc::new(RefCell::new(ListBuilderState {
+            items: Vec::new(),
+            frozen: false,
+        })))
+    }
+
+    /// Construct a fresh empty `IrValue::MapBuilder`.
+    pub fn new_map_builder() -> Self {
+        IrValue::MapBuilder(Rc::new(RefCell::new(MapBuilderState {
+            pairs: Vec::new(),
+            frozen: false,
+        })))
     }
 
     /// Format this value for user-facing output, matching the AST interpreter's
@@ -142,6 +200,11 @@ impl IrValue {
             }
             IrValue::Closure(_, _) => "<function>".to_string(),
             IrValue::Dyn { concrete, .. } => concrete.format(module),
+            // Builders are opaque transient values; they are never
+            // user-printed (the type system only exposes `.push`/`.set`
+            // and `.freeze`). Render an opaque tag for diagnostics.
+            IrValue::ListBuilder(_) => "<ListBuilder>".to_string(),
+            IrValue::MapBuilder(_) => "<MapBuilder>".to_string(),
         }
     }
 
@@ -187,6 +250,10 @@ impl PartialEq for IrValue {
             }
             (IrValue::List(a), IrValue::List(b)) => *a.borrow() == *b.borrow(),
             (IrValue::Map(a), IrValue::Map(b)) => *a.borrow() == *b.borrow(),
+            // Builders are opaque transient values with no value
+            // equality; like closures they never compare equal.
+            (IrValue::ListBuilder(_), IrValue::ListBuilder(_)) => false,
+            (IrValue::MapBuilder(_), IrValue::MapBuilder(_)) => false,
             (IrValue::Closure(_, _), IrValue::Closure(_, _)) => false,
             // Trait-object equality: two `dyn` values are equal iff they
             // carry the same trait *and* the same concrete type *and*
@@ -282,6 +349,8 @@ impl fmt::Display for IrValue {
             }
             IrValue::Closure(_, _) => write!(f, "<function>"),
             IrValue::Dyn { concrete, .. } => write!(f, "{concrete}"),
+            IrValue::ListBuilder(_) => write!(f, "<ListBuilder>"),
+            IrValue::MapBuilder(_) => write!(f, "<MapBuilder>"),
         }
     }
 }

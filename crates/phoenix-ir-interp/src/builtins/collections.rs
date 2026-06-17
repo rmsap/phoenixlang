@@ -3,8 +3,9 @@
 use crate::error::{IrRuntimeError, Result, error};
 use crate::interpreter::IrInterpreter;
 use crate::value::{IrValue, map_key_eq, none_val, some_val};
+use phoenix_common::map_key::{CanonicalMapKey, dedup_last_wins};
 
-use super::{expect_bool, expect_int_arg, expect_one_arg, expect_string_arg};
+use super::{expect_bool, expect_int_arg, expect_one_arg, expect_string_arg, expect_two_args};
 
 /// Dispatch a `String.*` method call (`length`, `contains`, `split`, etc.).
 pub(super) fn builtin_string(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
@@ -297,6 +298,121 @@ pub(super) fn builtin_map(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
     }
 }
 
+/// Dispatch a `ListBuilder.*` builtin (`alloc`, `push`, `freeze`).
+///
+/// Transient-mutable accumulators. The IR lowering
+/// emits them as `BuiltinCall("ListBuilder.alloc" | ".push" | ".freeze", …)`.
+/// Semantics mirror the native `list_builder_methods.rs` byte-for-byte:
+/// `alloc` makes a fresh empty builder, `push` appends in place and
+/// returns nothing, `freeze` produces a fresh independent `List<T>` in
+/// push order and marks the builder frozen. Use-after-freeze (`push` or
+/// a second `freeze`) is a runtime error, matching native's
+/// `assert_unfrozen` and the wasm-gc frozen trap.
+pub(super) fn builtin_list_builder(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
+    match method {
+        "alloc" => Ok(IrValue::new_list_builder()),
+        "push" => {
+            let buf = match args.first() {
+                Some(IrValue::ListBuilder(buf)) => buf.clone(),
+                _ => return error("ListBuilder.push called on non-builder"),
+            };
+            let val = expect_one_arg(&args[1..], "push")?;
+            let mut state = buf.borrow_mut();
+            if state.frozen {
+                return already_frozen("ListBuilder", "push");
+            }
+            state.items.push(val);
+            Ok(IrValue::Void)
+        }
+        "freeze" => {
+            let buf = match args.first() {
+                Some(IrValue::ListBuilder(buf)) => buf.clone(),
+                _ => return error("ListBuilder.freeze called on non-builder"),
+            };
+            let mut state = buf.borrow_mut();
+            if state.frozen {
+                return already_frozen("ListBuilder", "freeze");
+            }
+            state.frozen = true;
+            // Clone the buffer so the frozen list is independent of the
+            // builder handle.
+            Ok(IrValue::new_list(state.items.clone()))
+        }
+        _ => error(format!("no method `{method}` on type `ListBuilder`")),
+    }
+}
+
+/// Dispatch a `MapBuilder.*` builtin (`alloc`, `set`, `freeze`).
+///
+/// Transient-mutable accumulator. `set` appends a `(k, v)`
+/// pair verbatim (no dedup, no result); `freeze` produces a fresh
+/// independent `Map<K, V>` applying **last-wins** dedup while keeping
+/// each key's **first-insertion** position — matching
+/// `phx_map_builder_freeze` → `phx_map_from_pairs` and the immutable
+/// `Map.set` / map-literal dedup elsewhere in this crate — then marks
+/// the builder frozen. Use-after-freeze is a runtime error.
+pub(super) fn builtin_map_builder(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
+    match method {
+        "alloc" => Ok(IrValue::new_map_builder()),
+        "set" => {
+            let buf = match args.first() {
+                Some(IrValue::MapBuilder(buf)) => buf.clone(),
+                _ => return error("MapBuilder.set called on non-builder"),
+            };
+            let (key, val) = expect_two_args(&args[1..], "set")?;
+            let mut state = buf.borrow_mut();
+            if state.frozen {
+                return already_frozen("MapBuilder", "set");
+            }
+            // Append verbatim — dedup is deferred to `freeze`, mirroring
+            // the native builder's append-only buffer.
+            state.pairs.push((key, val));
+            Ok(IrValue::Void)
+        }
+        "freeze" => {
+            let buf = match args.first() {
+                Some(IrValue::MapBuilder(buf)) => buf.clone(),
+                _ => return error("MapBuilder.freeze called on non-builder"),
+            };
+            let mut state = buf.borrow_mut();
+            if state.frozen {
+                return already_frozen("MapBuilder", "freeze");
+            }
+            state.frozen = true;
+            // Last-wins / first-insertion-position dedup via the shared
+            // `dedup_last_wins` helper (O(n), byte-wise float keys).
+            let out = dedup_last_wins(state.pairs.iter().cloned(), canonical_key);
+            Ok(IrValue::new_map(out))
+        }
+        _ => error(format!("no method `{method}` on type `MapBuilder`")),
+    }
+}
+
+/// Projects a key [`IrValue`] to its hashable [`CanonicalMapKey`], whose
+/// `Hash`/`Eq` agree with [`map_key_eq`] (floats compared **byte-wise**:
+/// `-0.0 != 0.0`, equal-bit `NaN`s collide). Phoenix map keys are always
+/// scalar or string (sema rejects non-hashable keys); the `_` arm is a
+/// defensive fallthrough that renders to a stable string.
+fn canonical_key(v: &IrValue) -> CanonicalMapKey {
+    match v {
+        IrValue::Int(n) => CanonicalMapKey::Int(*n),
+        IrValue::Float(f) => CanonicalMapKey::FloatBits(f.to_bits()),
+        IrValue::Bool(b) => CanonicalMapKey::Bool(*b),
+        IrValue::String(s) => CanonicalMapKey::String(s.clone()),
+        other => CanonicalMapKey::Other(other.to_string()),
+    }
+}
+
+/// Error returned when a `ListBuilder`/`MapBuilder` op runs on a builder
+/// that `.freeze()` already consumed. Mirrors native's `assert_unfrozen`
+/// message so use-after-freeze is rejected identically across backends.
+fn already_frozen(ty: &str, method: &str) -> Result<IrValue> {
+    error(format!(
+        "{ty}.{method}: builder was already frozen (Phase 2.7 decision F: \
+         runtime-checked use-after-freeze; static check is a future linearity story)"
+    ))
+}
+
 /// Sort via bottom-up iterative merge sort using a closure comparator.
 /// The algorithm itself lives in
 /// [`phoenix_common::algorithms::merge_sort_by`]; this function
@@ -316,4 +432,115 @@ fn sort_by_closure(
         }
     })?;
     Ok(IrValue::new_list(sorted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn as_int(v: &IrValue) -> i64 {
+        match v {
+            IrValue::Int(n) => *n,
+            other => panic!("expected Int, got {other:?}"),
+        }
+    }
+
+    /// `push` after `freeze` is a runtime error — use-after-freeze must be
+    /// rejected here as it is on native (abort) and wasm-gc (trap), or the
+    /// IR interpreter would silently diverge from the compiled backends.
+    #[test]
+    fn list_builder_push_after_freeze_errors() {
+        let b = builtin_list_builder("alloc", vec![]).unwrap();
+        builtin_list_builder("push", vec![b.clone(), IrValue::Int(1)]).unwrap();
+        builtin_list_builder("freeze", vec![b.clone()]).unwrap();
+        let err = builtin_list_builder("push", vec![b, IrValue::Int(2)]).unwrap_err();
+        assert!(err.message.contains("frozen"), "got: {}", err.message);
+    }
+
+    /// Happy path: `push` accumulates on the shared buffer and `freeze`
+    /// snapshots it into a `List` in push order. Localizes a regression to
+    /// this crate (the `builders.phx` matrix fixture covers it end-to-end,
+    /// but only when wasmtime/native are provisioned).
+    #[test]
+    fn list_builder_push_freeze_in_order() {
+        let b = builtin_list_builder("alloc", vec![]).unwrap();
+        for n in [3, 1, 2] {
+            builtin_list_builder("push", vec![b.clone(), IrValue::Int(n)]).unwrap();
+        }
+        let frozen = builtin_list_builder("freeze", vec![b]).unwrap();
+        let items = match frozen {
+            IrValue::List(items) => items,
+            other => panic!("expected List, got {other:?}"),
+        };
+        let got: Vec<i64> = items.borrow().iter().map(as_int).collect();
+        assert_eq!(got, vec![3, 1, 2]);
+    }
+
+    /// A second `freeze` on a `MapBuilder` is a runtime error.
+    #[test]
+    fn map_builder_double_freeze_errors() {
+        let b = builtin_map_builder("alloc", vec![]).unwrap();
+        builtin_map_builder("set", vec![b.clone(), IrValue::Int(1), IrValue::Int(10)]).unwrap();
+        builtin_map_builder("freeze", vec![b.clone()]).unwrap();
+        let err = builtin_map_builder("freeze", vec![b]).unwrap_err();
+        assert!(err.message.contains("frozen"), "got: {}", err.message);
+    }
+
+    /// `freeze` dedups last-wins while keeping each key's first-insertion
+    /// position — key 3 keeps slot 0 but takes the later value 99.
+    #[test]
+    fn map_builder_freeze_dedups_last_wins_first_position() {
+        let b = builtin_map_builder("alloc", vec![]).unwrap();
+        for (k, v) in [(3, 1), (1, 2), (3, 99), (2, 5)] {
+            builtin_map_builder("set", vec![b.clone(), IrValue::Int(k), IrValue::Int(v)]).unwrap();
+        }
+        let frozen = builtin_map_builder("freeze", vec![b]).unwrap();
+        let entries = match frozen {
+            IrValue::Map(entries) => entries,
+            other => panic!("expected Map, got {other:?}"),
+        };
+        let got: Vec<(i64, i64)> = entries
+            .borrow()
+            .iter()
+            .map(|(k, v)| (as_int(k), as_int(v)))
+            .collect();
+        assert_eq!(got, vec![(3, 99), (1, 2), (2, 5)]);
+    }
+
+    /// `freeze`'s dedup is **byte-wise** on float keys (§Phase 2.4 K.9):
+    /// `-0.0` and `0.0` stay distinct entries, while equal-bit `NaN`s
+    /// collapse (last value wins). These are the ±0.0 / NaN edges
+    /// `builders.phx` can't express in source, driven end-to-end through
+    /// an actual builder `freeze` rather than only the `map_key` helper.
+    #[test]
+    fn map_builder_freeze_float_keys_are_byte_wise() {
+        let b = builtin_map_builder("alloc", vec![]).unwrap();
+        for (k, v) in [(-0.0_f64, 1), (0.0, 2), (f64::NAN, 3), (f64::NAN, 4)] {
+            builtin_map_builder("set", vec![b.clone(), IrValue::Float(k), IrValue::Int(v)])
+                .unwrap();
+        }
+        let frozen = builtin_map_builder("freeze", vec![b]).unwrap();
+        let entries = match frozen {
+            IrValue::Map(entries) => entries,
+            other => panic!("expected Map, got {other:?}"),
+        };
+        let got: Vec<(u64, i64)> = entries
+            .borrow()
+            .iter()
+            .map(|(k, v)| match k {
+                IrValue::Float(f) => (f.to_bits(), as_int(v)),
+                other => panic!("expected Float key, got {other:?}"),
+            })
+            .collect();
+        // ±0.0 survive as two entries (first-insertion order), the two
+        // NaNs collapse to one with the last value.
+        assert_eq!(
+            got,
+            vec![
+                ((-0.0_f64).to_bits(), 1),
+                (0.0_f64.to_bits(), 2),
+                (f64::NAN.to_bits(), 4),
+            ]
+        );
+    }
 }

@@ -1,8 +1,36 @@
 use crate::interpreter::{
     Interpreter, Result, RuntimeError, err_val, error, none_val, ok_val, some_val,
 };
-use crate::value::{Value, map_key_eq};
+use crate::value::{ListBuilderState, MapBuilderState, Value, map_key_eq};
+use phoenix_common::map_key::{CanonicalMapKey, dedup_last_wins};
 use phoenix_parser::ast::MethodCallExpr;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// Projects a key [`Value`] to its hashable [`CanonicalMapKey`], whose
+/// `Hash`/`Eq` agree with `value::map_key_eq` (floats compared
+/// **byte-wise**). Map keys are always scalar or string (sema rejects
+/// non-hashable key types); the `_` arm is a defensive fallthrough.
+fn canonical_key(v: &Value) -> CanonicalMapKey {
+    match v {
+        Value::Int(n) => CanonicalMapKey::Int(*n),
+        Value::Float(f) => CanonicalMapKey::FloatBits(f.to_bits()),
+        Value::Bool(b) => CanonicalMapKey::Bool(*b),
+        Value::String(s) => CanonicalMapKey::String(s.clone()),
+        other => CanonicalMapKey::Other(other.to_string()),
+    }
+}
+
+/// Error returned when a `ListBuilder`/`MapBuilder` op runs on a builder
+/// that `.freeze()` already consumed. Mirrors native's `assert_unfrozen`
+/// message (and wasm-gc's frozen trap) so use-after-freeze is rejected
+/// identically across all five backends.
+fn already_frozen<T>(ty: &str, method: &str) -> Result<T> {
+    error(format!(
+        "{ty}.{method}: builder was already frozen (Phase 2.7 decision F: \
+         runtime-checked use-after-freeze; static check is a future linearity story)"
+    ))
+}
 
 impl Interpreter {
     /// Evaluates a built-in String method call.
@@ -145,6 +173,130 @@ impl Interpreter {
                 Ok(Value::List(vals))
             }
             _ => error(format!("no method `{}` on type `Map`", mc.method)),
+        }
+    }
+
+    /// Evaluates a builtin static method on a builtin type name
+    /// (e.g. `List.builder()` / `Map.builder()`).
+    ///
+    /// Returns `Ok(None)` when `recv` is not a recognized builtin static
+    /// receiver or the method is not a known static constructor, so the
+    /// caller can fall through to the normal value-receiver path. Mirrors
+    /// sema's `check_builtin_static_method`; today only the Phase 2.7
+    /// builder constructors fire here.
+    pub(crate) fn eval_builtin_static_method(
+        &mut self,
+        recv: &str,
+        mc: &MethodCallExpr,
+    ) -> Result<Option<Value>> {
+        match (recv, mc.method.as_str()) {
+            ("List", "builder") => {
+                self.expect_args("builder", mc, 0)?;
+                Ok(Some(Value::ListBuilder(Rc::new(RefCell::new(
+                    ListBuilderState {
+                        items: Vec::new(),
+                        frozen: false,
+                    },
+                )))))
+            }
+            ("Map", "builder") => {
+                self.expect_args("builder", mc, 0)?;
+                Ok(Some(Value::MapBuilder(Rc::new(RefCell::new(
+                    MapBuilderState {
+                        pairs: Vec::new(),
+                        frozen: false,
+                    },
+                )))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Evaluates a `ListBuilder<T>` method call (Phase 2.7).
+    ///
+    /// `push` mutates the shared buffer in place (returns `Void`);
+    /// `freeze` snapshots it into an immutable [`Value::List`] in push
+    /// order and marks the builder frozen. After `freeze`, both `push`
+    /// and a second `freeze` are runtime errors — matching the native
+    /// runtime's `list_builder_methods` (`assert_unfrozen`) and the
+    /// wasm-gc frozen trap.
+    pub(crate) fn eval_list_builder_method(
+        &mut self,
+        buf: Rc<RefCell<ListBuilderState>>,
+        mc: &MethodCallExpr,
+    ) -> Result<Value> {
+        match mc.method.as_str() {
+            "push" => {
+                let args = self.expect_args("push", mc, 1)?;
+                let new_val = args
+                    .into_iter()
+                    .next()
+                    .expect("expect_args validated arg count");
+                let mut state = buf.borrow_mut();
+                if state.frozen {
+                    return already_frozen("ListBuilder", "push");
+                }
+                state.items.push(new_val);
+                Ok(Value::Void)
+            }
+            "freeze" => {
+                self.expect_args("freeze", mc, 0)?;
+                let mut state = buf.borrow_mut();
+                if state.frozen {
+                    return already_frozen("ListBuilder", "freeze");
+                }
+                state.frozen = true;
+                Ok(Value::List(state.items.clone()))
+            }
+            _ => error(format!("no method `{}` on type `ListBuilder`", mc.method)),
+        }
+    }
+
+    /// Evaluates a `MapBuilder<K, V>` method call (Phase 2.7).
+    ///
+    /// `set` appends a `(key, value)` pair to the shared buffer in place
+    /// with NO dedup (returns `Void`); `freeze` dedups last-wins while
+    /// keeping each key's first-insertion position, then returns an
+    /// immutable [`Value::Map`] and marks the builder frozen. This
+    /// matches the native runtime's `phx_map_builder_freeze` →
+    /// `phx_map_from_pairs` and the interpreter's own `Map.set` /
+    /// map-literal dedup rule. Use-after-freeze is a runtime error.
+    pub(crate) fn eval_map_builder_method(
+        &mut self,
+        buf: Rc<RefCell<MapBuilderState>>,
+        mc: &MethodCallExpr,
+    ) -> Result<Value> {
+        match mc.method.as_str() {
+            "set" => {
+                let args = self.expect_args("set", mc, 2)?;
+                let mut args = args.into_iter();
+                let key = args.next().expect("expect_args validated 2 args");
+                let val = args.next().expect("expect_args validated 2 args");
+                let mut state = buf.borrow_mut();
+                if state.frozen {
+                    return already_frozen("MapBuilder", "set");
+                }
+                state.pairs.push((key, val));
+                Ok(Value::Void)
+            }
+            "freeze" => {
+                self.expect_args("freeze", mc, 0)?;
+                let mut state = buf.borrow_mut();
+                if state.frozen {
+                    return already_frozen("MapBuilder", "freeze");
+                }
+                state.frozen = true;
+                // Dedup last-wins, first-insertion position kept — the
+                // same rule as `eval_map_method`'s `set` and the
+                // map-literal path, byte-for-byte with native's
+                // `phx_map_from_pairs`. The shared `dedup_last_wins`
+                // helper is O(n) via a hashed `CanonicalMapKey` side
+                // index (byte-wise on floats to honor `map_key_eq`); a
+                // naive per-pair linear scan would be O(n²).
+                let entries = dedup_last_wins(state.pairs.iter().cloned(), canonical_key);
+                Ok(Value::Map(entries))
+            }
+            _ => error(format!("no method `{}` on type `MapBuilder`", mc.method)),
         }
     }
 
@@ -2035,5 +2187,30 @@ function main() {
 "#,
         );
         assert_eq!(out, vec!["true", "3"]);
+    }
+
+    /// The `Value` → `CanonicalMapKey` projection that drives
+    /// `MapBuilder.freeze`'s dedup is **byte-wise** on floats: `-0.0` and
+    /// `0.0` project to distinct keys, equal-bit `NaN`s to the same key —
+    /// agreeing with `value::map_key_eq`. Tested directly because the
+    /// ±0.0 / NaN edges aren't expressible in Phoenix source, so the
+    /// `builders.phx` fixture can't reach them. (The dedup algorithm
+    /// itself is covered in `phoenix-common::map_key`; the IR interpreter
+    /// drives the equivalent edges through a full `freeze`.)
+    #[test]
+    fn canonical_key_floats_are_byte_wise() {
+        use super::canonical_key;
+        use crate::value::Value;
+
+        assert_ne!(
+            canonical_key(&Value::Float(0.0)),
+            canonical_key(&Value::Float(-0.0)),
+            "±0.0 must project to distinct keys"
+        );
+        assert_eq!(
+            canonical_key(&Value::Float(f64::NAN)),
+            canonical_key(&Value::Float(f64::NAN)),
+            "equal-bit NaNs must project to the same key"
+        );
     }
 }

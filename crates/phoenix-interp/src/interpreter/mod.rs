@@ -1273,12 +1273,35 @@ impl Interpreter {
     /// Evaluates a method call, dispatching to built-in type methods or
     /// user-defined methods.
     fn eval_method_call(&mut self, mc: &MethodCallExpr) -> Result<Value> {
+        // Recognize the builtin static constructors `List.builder()` and
+        // `Map.builder()` before evaluating the object. The parser models
+        // `Type.method(...)` as a method call with `object: Ident("Type")`;
+        // evaluating the object first would hit the "undefined variable
+        // `List`" path. Mirrors sema's `check_builtin_static_method`. The
+        // carve-out skips when the receiver name shadows a local binding,
+        // so a user `let List = some_value` then `List.builder()` falls
+        // through to the normal value-receiver path.
+        if let Expr::Ident(ident) = &mc.object
+            && self.env.get(&ident.name).is_none()
+            && let Some(result) = self.eval_builtin_static_method(&ident.name, mc)?
+        {
+            return Ok(result);
+        }
+
         let obj = self.eval_expr(&mc.object)?;
         // Built-in type methods — match to move data instead of cloning
         match obj {
             Value::String(s) => return self.eval_string_method(s, mc),
             Value::Map(entries) => return self.eval_map_method(entries, mc),
             Value::List(elements) => return self.eval_list_method(elements, mc),
+            Value::ListBuilder(ref buf) => {
+                let buf = Rc::clone(buf);
+                return self.eval_list_builder_method(buf, mc);
+            }
+            Value::MapBuilder(ref buf) => {
+                let buf = Rc::clone(buf);
+                return self.eval_map_builder_method(buf, mc);
+            }
             Value::EnumVariant(ref enum_name, ref variant, ref fields) => {
                 match enum_name.as_str() {
                     "Option" => {
@@ -3238,5 +3261,135 @@ function main() {
 }"#,
         );
         assert_eq!(output, vec!["11", "22"]);
+    }
+
+    // ---- ListBuilder / MapBuilder ----
+
+    /// `List.builder()` + `push` across a binding, then `freeze()`
+    /// yields a `List` in push order. The shared-mutable buffer must
+    /// persist across separate `push` statements on the same binding.
+    #[test]
+    fn run_list_builder_push_freeze_in_order() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let b: ListBuilder<Int> = List.builder()
+  b.push(3)
+  b.push(1)
+  b.push(2)
+  let xs: List<Int> = b.freeze()
+  print(xs)
+  print(xs.length())
+}"#,
+        );
+        assert_eq!(output, vec!["[3, 1, 2]", "3"]);
+    }
+
+    /// `push` inside a loop accumulates on the same shared buffer — the
+    /// load-bearing case for `Rc<RefCell<…>>` (a cloned `Vec` would lose
+    /// each iteration's push).
+    #[test]
+    fn run_list_builder_push_in_loop() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let b: ListBuilder<Int> = List.builder()
+  let mut i: Int = 0
+  while i < 5 {
+    b.push(i * 10)
+    i = i + 1
+  }
+  let xs: List<Int> = b.freeze()
+  print(xs)
+}"#,
+        );
+        assert_eq!(output, vec!["[0, 10, 20, 30, 40]"]);
+    }
+
+    /// `MapBuilder.freeze` dedups last-wins while keeping each key's
+    /// first-insertion position — byte-for-byte with native's
+    /// `phx_map_builder_freeze` → `phx_map_from_pairs`. Key 3 keeps its
+    /// first slot but takes the later value 99.
+    #[test]
+    fn run_map_builder_freeze_dedups_last_wins_first_position() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let mb: MapBuilder<Int, Int> = Map.builder()
+  mb.set(3, 1)
+  mb.set(1, 2)
+  mb.set(3, 99)
+  mb.set(2, 5)
+  let m: Map<Int, Int> = mb.freeze()
+  let ks: List<Int> = m.keys()
+  print(ks)
+  print(m.get(3).unwrapOr(-1))
+  print(m.length())
+}"#,
+        );
+        assert_eq!(output, vec!["[3, 1, 2]", "99", "3"]);
+    }
+
+    /// `Map.builder()` + `set` in a loop, then `freeze`/`get`. Exercises
+    /// the shared-mutable buffer and the O(n) dedup index together.
+    #[test]
+    fn run_map_builder_set_in_loop() {
+        let output = run_capturing_source(
+            r#"
+function main() {
+  let mb: MapBuilder<Int, Int> = Map.builder()
+  let mut i: Int = 0
+  while i < 4 {
+    mb.set(i, i * 7)
+    i = i + 1
+  }
+  let m: Map<Int, Int> = mb.freeze()
+  print(m.length())
+  print(m.get(2).unwrapOr(-1))
+}"#,
+        );
+        assert_eq!(output, vec!["4", "14"]);
+    }
+
+    /// `push` after `freeze` is a runtime error — use-after-freeze is
+    /// rejected on every backend (native aborts, wasm-gc traps), so the
+    /// interpreter must too. Without this the interpreters would silently
+    /// diverge from the compiled backends.
+    #[test]
+    fn list_builder_push_after_freeze_errors() {
+        let err = run_source(
+            r#"
+function main() {
+  let b: ListBuilder<Int> = List.builder()
+  b.push(1)
+  let xs: List<Int> = b.freeze()
+  b.push(2)
+}"#,
+        )
+        .expect_err("push after freeze should error");
+        assert!(
+            err.to_string().contains("frozen"),
+            "expected a use-after-freeze error, got: {err}"
+        );
+    }
+
+    /// A second `freeze` on a `MapBuilder` is a runtime error, matching
+    /// native's single-use builder contract.
+    #[test]
+    fn map_builder_double_freeze_errors() {
+        let err = run_source(
+            r#"
+function main() {
+  let mb: MapBuilder<Int, Int> = Map.builder()
+  mb.set(1, 10)
+  let m1: Map<Int, Int> = mb.freeze()
+  let m2: Map<Int, Int> = mb.freeze()
+}"#,
+        )
+        .expect_err("double freeze should error");
+        assert!(
+            err.to_string().contains("frozen"),
+            "expected a use-after-freeze error, got: {err}"
+        );
     }
 }

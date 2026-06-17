@@ -4,6 +4,30 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::rc::Rc;
 
+/// Backing state for a [`Value::ListBuilder`]: the accumulated items and
+/// a one-shot `frozen` flag. `.freeze()` sets `frozen`; any subsequent
+/// `.push()`/`.freeze()` errors, mirroring native's `assert_unfrozen`
+/// and wasm-gc's frozen trap so use-after-freeze behaves identically
+/// across all five backends.
+#[derive(Debug, Clone)]
+pub struct ListBuilderState {
+    /// Elements pushed so far, in push order.
+    pub items: Vec<Value>,
+    /// Set by `.freeze()`; once true the builder rejects further use.
+    pub frozen: bool,
+}
+
+/// Backing state for a [`Value::MapBuilder`]: appended `(key, value)`
+/// pairs (no dedup until freeze) and the same one-shot `frozen` flag as
+/// [`ListBuilderState`].
+#[derive(Debug, Clone)]
+pub struct MapBuilderState {
+    /// Pairs appended so far, verbatim and undeduped.
+    pub pairs: Vec<(Value, Value)>,
+    /// Set by `.freeze()`; once true the builder rejects further use.
+    pub frozen: bool,
+}
+
 /// A runtime value in the Phoenix interpreter.
 ///
 /// Every expression in Phoenix evaluates to a `Value`. The interpreter uses
@@ -32,6 +56,24 @@ pub enum Value {
     /// A map of key-value pairs, representing the built-in `Map<K, V>` type.
     /// Uses `Vec<(Value, Value)>` because `Value` does not implement `Hash`.
     Map(Vec<(Value, Value)>),
+    /// A transient mutable `ListBuilder<T>` accumulator (Phase 2.7).
+    ///
+    /// Wraps its [`ListBuilderState`] in `Rc<RefCell<...>>` so `.push(v)`
+    /// mutates a single shared buffer in place — the binding persists
+    /// across a loop, matching the native runtime's
+    /// `list_builder_methods` handle. `.freeze()` snapshots the buffer
+    /// into an immutable [`Value::List`] in push order and marks the
+    /// builder frozen; any later `.push()`/`.freeze()` is a runtime
+    /// error, identical to native and wasm-gc.
+    ListBuilder(Rc<RefCell<ListBuilderState>>),
+    /// A transient mutable `MapBuilder<K, V>` accumulator (Phase 2.7).
+    ///
+    /// Stores `(key, value)` pairs in append order with no dedup during
+    /// the build phase — duplicates collapse at `.freeze()` (last-wins,
+    /// first-insertion position kept), matching the native runtime's
+    /// `phx_map_builder_freeze` / `phx_map_from_pairs`. `.freeze()` marks
+    /// the builder frozen; use-after-freeze is a runtime error.
+    MapBuilder(Rc<RefCell<MapBuilderState>>),
     /// A closure (first-class function value).
     ///
     /// Carries the parameter names, the AST body to execute, and a map of
@@ -66,6 +108,8 @@ impl Value {
             Value::EnumVariant(enum_name, _, _) => bare_name(enum_name),
             Value::List(_) => "List",
             Value::Map(_) => "Map",
+            Value::ListBuilder(_) => "ListBuilder",
+            Value::MapBuilder(_) => "MapBuilder",
             Value::Closure { .. } => "<function>",
         }
     }
@@ -158,6 +202,12 @@ impl fmt::Display for Value {
                 write_comma_separated(f, entries.iter().map(|(k, v)| format!("{}: {}", k, v)))?;
                 write!(f, "}}")
             }
+            // Builders are opaque transient accumulators — they are not
+            // values a program prints in normal use (sema only types them
+            // through `.freeze()`). Render an opaque tag rather than the
+            // internal buffer.
+            Value::ListBuilder(_) => write!(f, "<ListBuilder>"),
+            Value::MapBuilder(_) => write!(f, "<MapBuilder>"),
             Value::Closure { .. } => write!(f, "<function>"),
         }
     }
@@ -181,6 +231,11 @@ impl PartialEq for Value {
             }
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Map(a), Value::Map(b)) => a == b,
+            // Builders are opaque transient values with no value equality;
+            // like closures they never compare equal (mirrors the IR
+            // interpreter's `IrValue` PartialEq).
+            (Value::ListBuilder(_), Value::ListBuilder(_)) => false,
+            (Value::MapBuilder(_), Value::MapBuilder(_)) => false,
             (Value::Closure { .. }, Value::Closure { .. }) => false, // closures are never equal
             _ => false,
         }

@@ -232,6 +232,26 @@ pub(super) fn translate_builtin_call(
             args,
             instr,
         ),
+        // `ListBuilder.<method>` / `MapBuilder.<method>` — the Phase 2.7
+        // transient-mutable accumulators. Both route to the merged
+        // runtime's `phx_{list,map}_builder_*` functions, the same shape
+        // native uses. Placed after the `List.`/`Map.` arms above;
+        // ordering is harmless because the `.` guards collision —
+        // `"ListBuilder.alloc"` does not start with `"List."`.
+        lb if lb.starts_with("ListBuilder.") => translate_list_builder_method_builtin(
+            ctx,
+            b,
+            lb.strip_prefix("ListBuilder.").unwrap(),
+            args,
+            instr,
+        ),
+        mb if mb.starts_with("MapBuilder.") => translate_map_builder_method_builtin(
+            ctx,
+            b,
+            mb.strip_prefix("MapBuilder.").unwrap(),
+            args,
+            instr,
+        ),
         string_method if string_method.starts_with("String.") => translate_string_method_builtin(
             ctx,
             b,
@@ -1866,6 +1886,150 @@ fn translate_list_push(
     ctx.emit_store_result(vid, instr.result_type.clone())?;
     emit_restore_stack_frame(ctx, b, saved_sp)?;
     Ok(())
+}
+
+/// `ListBuilder.<method>` → the merged runtime's `phx_list_builder_*`
+/// (§Phase 2.7 decision F). `alloc` derives the element size from the
+/// result `ListBuilderRef(T)`; `push` stages the element on the shadow
+/// stack and passes its address (the runtime copies by value, so no
+/// rooting); `freeze` hands the handle back for a one-shot memcpy into a
+/// fresh `List<T>`. Use-after-freeze is enforced in the runtime.
+fn translate_list_builder_method_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    match method {
+        "alloc" => {
+            let vid = expect_result(instr, "BuiltinCall(\"ListBuilder.alloc\")")?;
+            let elem_ty = match &instr.result_type {
+                IrType::ListBuilderRef(t) => (**t).clone(),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `ListBuilder.alloc` result type is `{other:?}`, \
+                         expected `ListBuilderRef` (internal compiler bug)"
+                    )));
+                }
+            };
+            let es = phx_field_size_bytes(&elem_ty)?;
+            let idx = b.require_phx_func("phx_list_builder_alloc")?;
+            ctx.emit(Instruction::I64Const(es as i64));
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, instr.result_type.clone())?;
+            Ok(())
+        }
+        "push" => {
+            // args[0] = handle, args[1] = element. No result (in-place).
+            let handle = ctx.binding_of(args[0])?.single_local();
+            let elem_binding = ctx.binding_of(args[1])?;
+            let elem_locals = elem_binding.locals.clone();
+            let elem_ty = elem_binding.ir_type.clone();
+            let es = phx_field_size_bytes(&elem_ty)?;
+            let (saved_sp, frame_local) = emit_alloc_stack_frame(ctx, b, es)?;
+            emit_field_store(ctx, frame_local, 0, &elem_ty, &elem_locals)?;
+            let idx = b.require_phx_func("phx_list_builder_push")?;
+            ctx.emit(Instruction::LocalGet(handle));
+            ctx.emit(Instruction::LocalGet(frame_local));
+            ctx.emit(Instruction::I64Const(es as i64));
+            ctx.emit(Instruction::Call(idx));
+            emit_restore_stack_frame(ctx, b, saved_sp)?;
+            Ok(())
+        }
+        "freeze" => {
+            let vid = expect_result(instr, "BuiltinCall(\"ListBuilder.freeze\")")?;
+            let handle = ctx.binding_of(args[0])?.single_local();
+            let idx = b.require_phx_func("phx_list_builder_freeze")?;
+            ctx.emit(Instruction::LocalGet(handle));
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, instr.result_type.clone())?;
+            Ok(())
+        }
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"ListBuilder.{other}\")` not yet supported"
+        ))),
+    }
+}
+
+/// `MapBuilder.<method>` → the merged runtime's `phx_map_builder_*`
+/// (§Phase 2.7 decision F). `alloc` derives key/value sizes (and the
+/// key-is-string flag) from the result `MapBuilderRef(K, V)`; `set`
+/// stages the key and value into one shadow-stack frame (key at offset
+/// 0, value at `key_size`) and passes both addresses; `freeze` builds
+/// the hash table in one pass via `phx_map_builder_freeze`.
+fn translate_map_builder_method_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    match method {
+        "alloc" => {
+            let vid = expect_result(instr, "BuiltinCall(\"MapBuilder.alloc\")")?;
+            let (k_ty, v_ty) = match &instr.result_type {
+                IrType::MapBuilderRef(k, v) => ((**k).clone(), (**v).clone()),
+                other => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `MapBuilder.alloc` result type is `{other:?}`, \
+                         expected `MapBuilderRef` (internal compiler bug)"
+                    )));
+                }
+            };
+            let ks = phx_field_size_bytes(&k_ty)?;
+            let vs = phx_field_size_bytes(&v_ty)?;
+            let idx = b.require_phx_func("phx_map_builder_alloc")?;
+            ctx.emit(Instruction::I64Const(ks as i64));
+            ctx.emit(Instruction::I64Const(vs as i64));
+            ctx.emit(Instruction::I64Const(k_ty.string_flag() as i64));
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, instr.result_type.clone())?;
+            Ok(())
+        }
+        "set" => {
+            // args[0] = handle, args[1] = key, args[2] = value. No result.
+            let handle = ctx.binding_of(args[0])?.single_local();
+            let k_binding = ctx.binding_of(args[1])?;
+            let v_binding = ctx.binding_of(args[2])?;
+            let (k_locals, k_ty) = (k_binding.locals.clone(), k_binding.ir_type.clone());
+            let (v_locals, v_ty) = (v_binding.locals.clone(), v_binding.ir_type.clone());
+            let ks = phx_field_size_bytes(&k_ty)?;
+            let vs = phx_field_size_bytes(&v_ty)?;
+            // One combined frame: key at offset 0, value packed directly
+            // at offset `ks` with no alignment padding. The value may land
+            // unaligned (e.g. a 1-byte key before an 8-byte value), which
+            // is fine — linear-memory wasm permits unaligned stores and the
+            // runtime `memcpy`s `key_size`/`val_size` bytes back out, so the
+            // frame is just a byte buffer (same idiom as `List.contains`).
+            let (saved_sp, frame_local) = emit_alloc_stack_frame(ctx, b, ks + vs)?;
+            emit_field_store(ctx, frame_local, 0, &k_ty, &k_locals)?;
+            emit_field_store(ctx, frame_local, ks, &v_ty, &v_locals)?;
+            let idx = b.require_phx_func("phx_map_builder_set")?;
+            ctx.emit(Instruction::LocalGet(handle)); // handle
+            ctx.emit(Instruction::LocalGet(frame_local)); // key_ptr
+            ctx.emit(Instruction::LocalGet(frame_local)); // value_ptr = frame + ks
+            ctx.emit(Instruction::I32Const(ks as i32));
+            ctx.emit(Instruction::I32Add);
+            ctx.emit(Instruction::I64Const(ks as i64));
+            ctx.emit(Instruction::I64Const(vs as i64));
+            ctx.emit(Instruction::Call(idx));
+            emit_restore_stack_frame(ctx, b, saved_sp)?;
+            Ok(())
+        }
+        "freeze" => {
+            let vid = expect_result(instr, "BuiltinCall(\"MapBuilder.freeze\")")?;
+            let handle = ctx.binding_of(args[0])?.single_local();
+            let idx = b.require_phx_func("phx_map_builder_freeze")?;
+            ctx.emit(Instruction::LocalGet(handle));
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, instr.result_type.clone())?;
+            Ok(())
+        }
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"MapBuilder.{other}\")` not yet supported"
+        ))),
+    }
 }
 
 /// `List.contains(elem)`: `phx_list_contains(list, &elem, es, is_float,

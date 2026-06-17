@@ -48,10 +48,13 @@ pub(super) const LIST_HEADER: u32 = 24;
 
 /// `true` for IR types that flatten to a single `i32` GC pointer on
 /// wasm32 — `StructRef` / `EnumRef` / `ListRef` / `MapRef` /
-/// `ClosureRef`. Centralizing the list keeps [`super::translate::wasm_valtypes_for`],
+/// `ListBuilderRef` / `MapBuilderRef` / `ClosureRef`. Centralizing the
+/// list keeps [`super::translate::wasm_valtypes_for`],
 /// [`phx_field_size_bytes`], [`phx_field_align_bytes`], and the
 /// field-load / field-store match arms updated in lockstep when a
-/// new GC-pointer variant lands.
+/// new GC-pointer variant lands. The builder handles
+/// (`phx_{list,map}_builder_alloc`) are single heap pointers, same as
+/// their frozen `List`/`Map` counterparts.
 pub(super) fn is_gc_pointer_type(ty: &IrType) -> bool {
     matches!(
         ty,
@@ -59,6 +62,8 @@ pub(super) fn is_gc_pointer_type(ty: &IrType) -> bool {
             | IrType::EnumRef(_, _)
             | IrType::ListRef(_)
             | IrType::MapRef(_, _)
+            | IrType::ListBuilderRef(_)
+            | IrType::MapBuilderRef(_, _)
             | IrType::ClosureRef { .. }
     )
 }

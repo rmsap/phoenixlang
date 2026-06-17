@@ -49,6 +49,19 @@ const MAP_KEYS: u32 = 1;
 /// `$map_KV` field index of `$vals`.
 const MAP_VALS: u32 = 2;
 
+/// `$mapbuilder_KV` field index of `$len`.
+const MB_LEN: u32 = 0;
+/// `$mapbuilder_KV` field index of `$frozen`.
+const MB_FROZEN: u32 = 1;
+/// `$mapbuilder_KV` field index of `$keys`.
+const MB_KEYS: u32 = 2;
+/// `$mapbuilder_KV` field index of `$vals`.
+const MB_VALS: u32 = 3;
+
+/// Initial pair-slot capacity for a fresh `MapBuilder` — matches
+/// native's `INITIAL_CAPACITY` (`phx_map_builder_alloc`).
+const MB_INITIAL_CAPACITY: i32 = 8;
+
 /// Declare a `$map_KV` struct per distinct concrete `(K, V)` per
 /// §Phase 2.4 decision K.9. Reuses the K.7 `$arr_K` / `$arr_V` arrays
 /// (declared by the list pass, which now treats every map's K and V as
@@ -61,7 +74,14 @@ pub(super) fn declare(
     ir_module: &IrModule,
 ) -> Result<(), CompileError> {
     let mut kvs: HashSet<(IrType, IrType)> = HashSet::new();
-    collect_map_kvs(ir_module, &mut kvs);
+    let mut builder_kvs: HashSet<(IrType, IrType)> = HashSet::new();
+    collect_map_kvs(ir_module, &mut kvs, &mut builder_kvs);
+    // Every builder `(K, V)` also needs the `$map_KV` pair — `freeze()`
+    // returns `Map<K, V>`. (The freeze site's `MapRef` result type makes
+    // the walk catch this in practice; the union keeps it explicit.)
+    for kv in &builder_kvs {
+        kvs.insert(kv.clone());
+    }
     let mut ordered: Vec<(IrType, IrType)> = kvs.into_iter().collect();
     ordered.sort_by_cached_key(|kv| format!("{kv:?}"));
 
@@ -83,14 +103,44 @@ pub(super) fn declare(
         // A map is just a 3-field immutable struct (no subtyping).
         let map_idx = builder.declare_struct(&[len_field, keys_field, vals_field]);
         builder.record_map(k.clone(), v.clone(), map_idx);
+
+        if builder_kvs.contains(&(k.clone(), v.clone())) {
+            // `$mapbuilder_KV`: everything mutable — `set` bumps $len,
+            // growth swaps $keys / $vals, freeze sets $frozen. Mirrors
+            // the K.7 `$builder_T` shape with two arrays instead of one.
+            let blen_field = wasm_encoder::FieldType {
+                element_type: wasm_encoder::StorageType::Val(ValType::I64),
+                mutable: true,
+            };
+            let frozen_field = wasm_encoder::FieldType {
+                element_type: wasm_encoder::StorageType::Val(ValType::I32),
+                mutable: true,
+            };
+            let bkeys_field = wasm_encoder::FieldType {
+                element_type: wasm_encoder::StorageType::Val(concrete_ref(arr_k)),
+                mutable: true,
+            };
+            let bvals_field = wasm_encoder::FieldType {
+                element_type: wasm_encoder::StorageType::Val(concrete_ref(arr_v)),
+                mutable: true,
+            };
+            let builder_idx =
+                builder.declare_struct(&[blen_field, frozen_field, bkeys_field, bvals_field]);
+            builder.record_map_builder(k.clone(), v.clone(), builder_idx);
+        }
     }
     Ok(())
 }
 
-/// Walk every IR type, collecting each `MapRef` / `MapBuilderRef`'s
-/// `(K, V)`. Mirrors the K.4 / K.7 collection sources.
-fn collect_map_kvs(ir_module: &IrModule, kvs: &mut HashSet<(IrType, IrType)>) {
-    let mut walk = |ty: &IrType| walk_type(ty, kvs);
+/// Walk every IR type, collecting each `MapRef`'s `(K, V)` into `kvs`
+/// and each `MapBuilderRef`'s `(K, V)` into `builder_kvs`. Mirrors the
+/// K.4 / K.7 collection sources.
+fn collect_map_kvs(
+    ir_module: &IrModule,
+    kvs: &mut HashSet<(IrType, IrType)>,
+    builder_kvs: &mut HashSet<(IrType, IrType)>,
+) {
+    let mut walk = |ty: &IrType| walk_type(ty, kvs, builder_kvs);
     for func in ir_module.concrete_functions() {
         walk(&func.return_type);
         for ty in &func.param_types {
@@ -119,35 +169,45 @@ fn collect_map_kvs(ir_module: &IrModule, kvs: &mut HashSet<(IrType, IrType)>) {
     }
 }
 
-fn walk_type(ty: &IrType, kvs: &mut HashSet<(IrType, IrType)>) {
+fn walk_type(
+    ty: &IrType,
+    kvs: &mut HashSet<(IrType, IrType)>,
+    builder_kvs: &mut HashSet<(IrType, IrType)>,
+) {
     match ty {
-        // `MapBuilderRef`'s `(K, V)` is collected here alongside `MapRef`
-        // (mirroring `lists.rs`) so its `$map_KV` struct exists, even
-        // though `MapBuilder` op lowering is still deferred — the struct
-        // is harmless if unused, and a freeze's result `MapRef` would
-        // declare it anyway. Recurse into K/V regardless, to reach any
-        // nested concrete `MapRef`.
-        IrType::MapRef(k, v) | IrType::MapBuilderRef(k, v) => {
+        // A `MapRef` declares the `$map_KV` struct; a `MapBuilderRef`
+        // additionally declares the `$mapbuilder_KV` (the `declare`
+        // union ensures the `$map_KV` it freezes into exists too).
+        IrType::MapRef(k, v) => {
             if !contains_generic_placeholder(k) && !contains_generic_placeholder(v) {
                 kvs.insert(((**k).clone(), (**v).clone()));
             }
-            walk_type(k, kvs);
-            walk_type(v, kvs);
+            walk_type(k, kvs, builder_kvs);
+            walk_type(v, kvs, builder_kvs);
+        }
+        IrType::MapBuilderRef(k, v) => {
+            if !contains_generic_placeholder(k) && !contains_generic_placeholder(v) {
+                builder_kvs.insert(((**k).clone(), (**v).clone()));
+            }
+            walk_type(k, kvs, builder_kvs);
+            walk_type(v, kvs, builder_kvs);
         }
         IrType::StructRef(_, args) | IrType::EnumRef(_, args) => {
             for arg in args {
-                walk_type(arg, kvs);
+                walk_type(arg, kvs, builder_kvs);
             }
         }
-        IrType::ListRef(inner) | IrType::ListBuilderRef(inner) => walk_type(inner, kvs),
+        IrType::ListRef(inner) | IrType::ListBuilderRef(inner) => {
+            walk_type(inner, kvs, builder_kvs)
+        }
         IrType::ClosureRef {
             param_types,
             return_type,
         } => {
             for p in param_types {
-                walk_type(p, kvs);
+                walk_type(p, kvs, builder_kvs);
             }
-            walk_type(return_type, kvs);
+            walk_type(return_type, kvs, builder_kvs);
         }
         _ => {}
     }
@@ -569,6 +629,407 @@ pub(super) fn translate_map_keys_or_values(
     ctx.emit(Instruction::StructNew(out_list));
     let local = ctx.allocate_local(vid, concrete_ref(out_list));
     ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+// ─────────────── MapBuilder lowerings ───────────────
+//
+// `MapBuilder<K,V>` is the two-array analogue of the K.7
+// `ListBuilder<T>`: an *append-only* accumulator of `(k, v)` pairs with
+// no dedup during the build phase (duplicates are stored verbatim), and
+// a `freeze()` that replays the pairs through the same
+// scan-and-overwrite-or-append dedup `translate_map_set` uses to
+// produce a K.9 `$map_KV`. Last value wins; the key keeps its
+// first-insertion position. This matches native `phx_map_builder_*`
+// byte-for-byte (the runtime defers dedup to `phx_map_from_pairs`).
+//
+// `$mapbuilder_KV = (struct (mut $len i64) (mut $frozen i32)
+//                          (mut $keys (ref null $arr_K))
+//                          (mut $vals (ref null $arr_V)))`.
+//
+// Everything is synthesized inline (decision I) — no runtime merge,
+// unlike wasm32-linear's `phx_map_builder_*` calls. GC rooting follows
+// the host VM's tracing (the same discipline as the wasm-gc
+// `ListBuilder` / `Map` ops): builder fields stay reachable through the
+// builder handle for the duration of each op.
+
+/// `MapBuilder.alloc() -> MapBuilder<K,V>` — a fresh builder: length 0,
+/// unfrozen, capacity-8 key and value arrays (native parity). Mirrors
+/// `ListBuilder.alloc`.
+pub(super) fn translate_map_builder_alloc(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    let vid = expect_result(instr, "BuiltinCall(\"MapBuilder.alloc\")")?;
+    let (k_ir, v_ir) = match &instr.result_type {
+        IrType::MapBuilderRef(k, v) => ((**k).clone(), (**v).clone()),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc: `MapBuilder.alloc` result type is `{other:?}`, \
+                 expected `MapBuilderRef` (internal compiler bug)"
+            )));
+        }
+    };
+    let builder_idx = b.require_map_builder_idx(&k_ir, &v_ir)?;
+    let (arr_k, _) = b.require_list_types(&k_ir)?;
+    let (arr_v, _) = b.require_list_types(&v_ir)?;
+    // struct.new $mapbuilder_KV(0, 0, new_default $arr_K(8), new_default $arr_V(8))
+    ctx.emit(Instruction::I64Const(0)); // $len
+    ctx.emit(Instruction::I32Const(0)); // $frozen
+    ctx.emit(Instruction::I32Const(MB_INITIAL_CAPACITY));
+    ctx.emit(Instruction::ArrayNewDefault(arr_k));
+    ctx.emit(Instruction::I32Const(MB_INITIAL_CAPACITY));
+    ctx.emit(Instruction::ArrayNewDefault(arr_v));
+    ctx.emit(Instruction::StructNew(builder_idx));
+    let local = ctx.allocate_local(vid, concrete_ref(builder_idx));
+    ctx.emit(Instruction::LocalSet(local));
+    Ok(())
+}
+
+/// Receiver facts for a `MapBuilder` op: the `$mapbuilder_KV` struct
+/// index, `(K, V)` IrTypes, the key ValType, and the `$arr_K` / `$arr_V`
+/// indices. The two-array analogue of `MapInfo`.
+struct MapBuilderInfo {
+    builder_idx: u32,
+    key_ir: IrType,
+    key_vt: ValType,
+    val_vt: ValType,
+    arr_k: u32,
+    arr_v: u32,
+}
+
+fn map_builder_info(
+    ctx: &FuncCtx,
+    b: &ModuleBuilder,
+    recv: ValueId,
+) -> Result<MapBuilderInfo, CompileError> {
+    let builder_idx = concrete_ref_idx(ctx, recv, "`MapBuilder` builtin receiver")?;
+    let (k, v) = b
+        .map_builder_kv_by_struct_idx(builder_idx)
+        .ok_or_else(|| {
+            CompileError::new(format!(
+                "wasm32-gc: `MapBuilder` receiver `{recv:?}` is bound to type \
+                 index {builder_idx}, which is not a recorded map-builder \
+                 instantiation (internal compiler bug)"
+            ))
+        })?
+        .clone();
+    let (arr_k, _) = b.require_list_types(&k)?;
+    let (arr_v, _) = b.require_list_types(&v)?;
+    Ok(MapBuilderInfo {
+        builder_idx,
+        key_vt: single_slot(&k, b, "map-builder key")?,
+        val_vt: single_slot(&v, b, "map-builder value")?,
+        key_ir: k,
+        arr_k,
+        arr_v,
+    })
+}
+
+/// `MapBuilder.set(builder, k, v)` (Void) — in-place **append** with no
+/// dedup (dedup happens at freeze), 2× growth at capacity. Mirrors
+/// `ListBuilder.push` over two parallel arrays. Set on a frozen builder
+/// traps (native aborts with `builder was already frozen`).
+pub(super) fn translate_map_builder_set(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+) -> Result<(), CompileError> {
+    expect_args("MapBuilder.set", args, 3)?;
+    let info = map_builder_info(ctx, b, args[0])?;
+    let bi = info.builder_idx;
+    let recv = ctx.binding_of(args[0])?;
+    let new_k = ctx.binding_of(args[1])?;
+    let new_v = ctx.binding_of(args[2])?;
+
+    // if builder.$frozen { trap }
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_FROZEN,
+    });
+    ctx.emit(Instruction::If(BlockType::Empty));
+    ctx.emit(Instruction::Unreachable);
+    ctx.emit(Instruction::End);
+
+    // grow 2× if $len == capacity (== array.len($keys)). The key and
+    // value arrays grow in lockstep, so testing one capacity suffices.
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_LEN,
+    });
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_KEYS,
+    });
+    ctx.emit(Instruction::ArrayLen);
+    ctx.emit(Instruction::I64ExtendI32U);
+    ctx.emit(Instruction::I64Eq);
+    ctx.emit(Instruction::If(BlockType::Empty));
+    {
+        // new_cap = capacity * 2 (capacity starts at 8, only doubles —
+        // never 0, so native's saturating min-1 guard is unneeded here).
+        let new_cap = ctx.scratch_local(ValType::I32);
+        ctx.emit(Instruction::LocalGet(recv));
+        ctx.emit(Instruction::StructGet {
+            struct_type_index: bi,
+            field_index: MB_KEYS,
+        });
+        ctx.emit(Instruction::ArrayLen);
+        ctx.emit(Instruction::I32Const(1));
+        ctx.emit(Instruction::I32Shl);
+        ctx.emit(Instruction::LocalSet(new_cap));
+        // len (i32) for the copy length, read once.
+        let len_i32 = ctx.scratch_local(ValType::I32);
+        ctx.emit(Instruction::LocalGet(recv));
+        ctx.emit(Instruction::StructGet {
+            struct_type_index: bi,
+            field_index: MB_LEN,
+        });
+        ctx.emit(Instruction::I32WrapI64);
+        ctx.emit(Instruction::LocalSet(len_i32));
+        emit_grow_field(ctx, recv, bi, MB_KEYS, info.arr_k, new_cap, len_i32);
+        emit_grow_field(ctx, recv, bi, MB_VALS, info.arr_v, new_cap, len_i32);
+    }
+    ctx.emit(Instruction::End);
+
+    // builder.$keys[$len] = k ; builder.$vals[$len] = v
+    let pos = ctx.scratch_local(ValType::I32);
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_LEN,
+    });
+    ctx.emit(Instruction::I32WrapI64);
+    ctx.emit(Instruction::LocalSet(pos));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_KEYS,
+    });
+    ctx.emit(Instruction::LocalGet(pos));
+    ctx.emit(Instruction::LocalGet(new_k));
+    ctx.emit(Instruction::ArraySet(info.arr_k));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_VALS,
+    });
+    ctx.emit(Instruction::LocalGet(pos));
+    ctx.emit(Instruction::LocalGet(new_v));
+    ctx.emit(Instruction::ArraySet(info.arr_v));
+
+    // builder.$len += 1
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_LEN,
+    });
+    ctx.emit(Instruction::I64Const(1));
+    ctx.emit(Instruction::I64Add);
+    ctx.emit(Instruction::StructSet {
+        struct_type_index: bi,
+        field_index: MB_LEN,
+    });
+    Ok(())
+}
+
+/// Grow one builder array field in place: allocate a fresh
+/// `array.new_default(new_cap)`, `array.copy` the first `len` elements
+/// over, and `struct.set` it back. `new_cap` / `len` are i32 scratch
+/// locals the caller owns (shared across the key/value field grow).
+fn emit_grow_field(
+    ctx: &mut FuncCtx,
+    recv: u32,
+    builder_idx: u32,
+    field: u32,
+    arr: u32,
+    new_cap: u32,
+    len: u32,
+) {
+    let grown = ctx.scratch_local(concrete_ref(arr));
+    ctx.emit(Instruction::LocalGet(new_cap));
+    ctx.emit(Instruction::ArrayNewDefault(arr));
+    ctx.emit(Instruction::LocalSet(grown));
+    // array.copy grown[0..len] <- builder.$field[0..len]
+    ctx.emit(Instruction::LocalGet(grown));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: builder_idx,
+        field_index: field,
+    });
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalGet(len));
+    ctx.emit(Instruction::ArrayCopy {
+        array_type_index_dst: arr,
+        array_type_index_src: arr,
+    });
+    // builder.$field = grown
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::LocalGet(grown));
+    ctx.emit(Instruction::StructSet {
+        struct_type_index: builder_idx,
+        field_index: field,
+    });
+}
+
+/// `MapBuilder.freeze(builder) -> Map<K,V>` — build the K.9 `$map_KV`
+/// with last-wins dedup. Replays the builder's appended `(k, v)` pairs
+/// through the same scan-and-overwrite-or-append logic as
+/// `translate_map_set`: for each appended pair, scan the result keys
+/// built so far; if the key is already present overwrite its value
+/// (keeping its first-insertion position), else append. Matches native
+/// `phx_map_builder_freeze` byte-for-byte. Double-freeze traps.
+///
+/// This linear-scan dedup is **O(n²)** in the pair count — same as the
+/// incremental `translate_map_set` it mirrors, and unlike the AST/IR
+/// interpreters' hashed O(n) `freeze`. Cheap for the small maps wasm-gc
+/// fixtures build; revisit with a hashed table if a large-map wasm
+/// fixture ever lands.
+pub(super) fn translate_map_builder_freeze(
+    ctx: &mut FuncCtx,
+    b: &mut ModuleBuilder,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    expect_args("MapBuilder.freeze", args, 1)?;
+    let vid = expect_result(instr, "MapBuilder.freeze")?;
+    let info = map_builder_info(ctx, b, args[0])?;
+    let bi = info.builder_idx;
+    // Result type is Map<K,V>; resolve its $map_KV struct.
+    let map_idx = match &instr.result_type {
+        IrType::MapRef(k, v) => b.require_map_idx(k, v)?,
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-gc: `MapBuilder.freeze` result type is `{other:?}`, \
+                 expected `MapRef` (internal compiler bug)"
+            )));
+        }
+    };
+    let recv = ctx.binding_of(args[0])?;
+
+    // if builder.$frozen { trap }
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_FROZEN,
+    });
+    ctx.emit(Instruction::If(BlockType::Empty));
+    ctx.emit(Instruction::Unreachable);
+    ctx.emit(Instruction::End);
+    // builder.$frozen = 1
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::I32Const(1));
+    ctx.emit(Instruction::StructSet {
+        struct_type_index: bi,
+        field_index: MB_FROZEN,
+    });
+
+    // src_len = builder.$len (i32); src_keys / src_vals = the buffers.
+    let src_len = ctx.scratch_local(ValType::I32);
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_LEN,
+    });
+    ctx.emit(Instruction::I32WrapI64);
+    ctx.emit(Instruction::LocalSet(src_len));
+    let src_keys = ctx.scratch_local(concrete_ref(info.arr_k));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_KEYS,
+    });
+    ctx.emit(Instruction::LocalSet(src_keys));
+    let src_vals = ctx.scratch_local(concrete_ref(info.arr_v));
+    ctx.emit(Instruction::LocalGet(recv));
+    ctx.emit(Instruction::StructGet {
+        struct_type_index: bi,
+        field_index: MB_VALS,
+    });
+    ctx.emit(Instruction::LocalSet(src_vals));
+
+    // Fresh result arrays of capacity src_len (the deduped result is at
+    // most src_len entries). nlen = 0.
+    let nkeys = ctx.scratch_local(concrete_ref(info.arr_k));
+    let nvals = ctx.scratch_local(concrete_ref(info.arr_v));
+    ctx.emit(Instruction::LocalGet(src_len));
+    ctx.emit(Instruction::ArrayNewDefault(info.arr_k));
+    ctx.emit(Instruction::LocalSet(nkeys));
+    ctx.emit(Instruction::LocalGet(src_len));
+    ctx.emit(Instruction::ArrayNewDefault(info.arr_v));
+    ctx.emit(Instruction::LocalSet(nvals));
+    let nlen = ctx.scratch_local(ValType::I32);
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(nlen));
+
+    // Replay loop: for i in 0..src_len { k = src_keys[i]; v = src_vals[i];
+    //   found = scan nkeys[0..nlen] for k;
+    //   if found >= 0 { nvals[found] = v } else { append (k,v); nlen++ } }
+    let i = ctx.scratch_local(ValType::I32);
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::LocalSet(i));
+    let cur_k = ctx.scratch_local(info.key_vt);
+    let cur_v = ctx.scratch_local(info.val_vt);
+    let found = ctx.scratch_local(ValType::I32);
+    let scan_i = ctx.scratch_local(ValType::I32);
+    let scan_cur = ctx.scratch_local(info.key_vt);
+
+    ctx.emit(Instruction::Block(BlockType::Empty));
+    ctx.emit(Instruction::Loop(BlockType::Empty));
+    // i >= src_len → done
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::LocalGet(src_len));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::BrIf(1));
+    // cur_k = src_keys[i]; cur_v = src_vals[i]
+    ctx.emit(Instruction::LocalGet(src_keys));
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::ArrayGet(info.arr_k));
+    ctx.emit(Instruction::LocalSet(cur_k));
+    ctx.emit(Instruction::LocalGet(src_vals));
+    ctx.emit(Instruction::LocalGet(i));
+    ctx.emit(Instruction::ArrayGet(info.arr_v));
+    ctx.emit(Instruction::LocalSet(cur_v));
+    // found = index of cur_k in nkeys[0..nlen], or -1
+    emit_scan_for_key(
+        ctx,
+        b,
+        nkeys,
+        info.arr_k,
+        nlen,
+        cur_k,
+        &info.key_ir,
+        found,
+        scan_i,
+        scan_cur,
+    )?;
+    // if found >= 0 { nvals[found] = cur_v } else { append; nlen++ }
+    ctx.emit(Instruction::LocalGet(found));
+    ctx.emit(Instruction::I32Const(0));
+    ctx.emit(Instruction::I32GeS);
+    ctx.emit(Instruction::If(BlockType::Empty));
+    ctx.emit(Instruction::LocalGet(nvals));
+    ctx.emit(Instruction::LocalGet(found));
+    ctx.emit(Instruction::LocalGet(cur_v));
+    ctx.emit(Instruction::ArraySet(info.arr_v));
+    ctx.emit(Instruction::Else);
+    emit_append(ctx, nkeys, info.arr_k, nlen, cur_k);
+    emit_append(ctx, nvals, info.arr_v, nlen, cur_v);
+    bump(ctx, nlen);
+    ctx.emit(Instruction::End);
+    // i += 1
+    bump(ctx, i);
+    ctx.emit(Instruction::Br(0));
+    ctx.emit(Instruction::End);
+    ctx.emit(Instruction::End);
+
+    emit_wrap_map(ctx, nlen, nkeys, nvals, map_idx, vid);
     Ok(())
 }
 

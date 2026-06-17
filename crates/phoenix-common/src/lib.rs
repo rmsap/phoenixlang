@@ -17,6 +17,9 @@ pub mod idents;
 /// Stable post-sema identifiers (`FuncId`, `StructId`, `EnumId`,
 /// `TraitId`) shared across sema, IR, and the backends.
 pub mod ids;
+/// Canonical map-key projection and last-wins dedup shared by the AST
+/// and IR interpreters' `MapBuilder.freeze` / map-literal lowering.
+pub mod map_key;
 /// Module-path identity (`ModulePath`) shared across sema, IR, the resolver,
 /// and backends, plus the `module_qualify` mangling helper.
 pub mod module_path;

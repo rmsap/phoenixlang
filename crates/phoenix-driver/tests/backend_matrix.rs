@@ -145,6 +145,13 @@ backend_matrix_test!(matrix_struct_closure_field, "struct_closure_field.phx");
 // struct itself, a forward reference legal only inside the rec group.
 backend_matrix_test!(matrix_struct_recursive_field, "struct_recursive_field.phx");
 backend_matrix_test!(matrix_collections, "collections.phx");
+// `ListBuilder<T>` / `MapBuilder<K,V>` (Phase 2.7 decision F) across all
+// five backends — the gap the Phase 2.4 close-out bench refresh exposed
+// (builders were compiled-backend-only; both interpreters and wasm32-gc
+// `MapBuilder` were added here). Pins push/set loops, freeze, and the
+// last-wins / first-position dedup. Small by design (interpreter
+// `Map.get` is O(n)).
+backend_matrix_test!(matrix_builders, "builders.phx");
 // List query methods: `first`/`last`/`find` (→ `Option<T>`) and
 // `any`/`all` (short-circuiting → `Bool`), with empty-list cases and
 // printing predicates on `find`/`any`/`all` that pin identical

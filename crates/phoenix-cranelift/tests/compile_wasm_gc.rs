@@ -1565,6 +1565,140 @@ fn list_builder_double_freeze_traps_under_wasmtime_gc() {
     );
 }
 
+/// `MapBuilder<Int, Int>` end-to-end: alloc → 12
+/// `set`s (the buffer starts at capacity 8, so this crosses one 2×
+/// growth) plus one duplicate key → freeze with last-wins dedup → read
+/// the frozen map. The duplicate makes the deduped `$len` (12) smaller
+/// than the freeze's `src_len`-sized result buffer (13 slots) — the
+/// `MapBuilder` analogue of the `ListBuilder` capacity-slack case.
+/// `length`, `get`, and `keys` iteration must read `$len`, not the array
+/// size: `get(99)` (absent) must not scan into the slack slot, and the
+/// expected output pins both the slack-safe miss and the last-wins value
+/// for the duplicated key 3 (keeping its first-insertion position).
+#[test]
+fn map_builder_set_freeze_runs_under_wasmtime_gc() {
+    let source = concat!(
+        "function main() {\n",
+        "  let mb: MapBuilder<Int, Int> = Map.builder()\n",
+        "  let mut i: Int = 0\n",
+        "  while (i < 12) {\n",
+        "    mb.set(i, i * i)\n",
+        "    i = i + 1\n",
+        "  }\n",
+        "  mb.set(3, 999)\n", // duplicate: key 3 keeps slot 3, takes value 999
+        "  let m = mb.freeze()\n",
+        "  print(m.length())\n", // 12 — deduped $len, not the 13-slot buffer
+        "  print(m.get(3).unwrapOr(-1))\n", // 999 — last-wins
+        "  print(m.get(11).unwrapOr(-1))\n", // 121
+        "  print(m.get(99).unwrapOr(-1))\n", // -1 — absent, must not scan slack
+        "  for k in m.keys() {\n",
+        "    print(k)\n",
+        "  }\n",
+        "}\n",
+    );
+    let mut expected = b"12\n999\n121\n-1\n".to_vec();
+    for k in 0..12i64 {
+        expected.extend_from_slice(format!("{k}\n").as_bytes());
+    }
+    assert_prints(source, "map_builder_wasm_gc", &expected);
+}
+
+/// Empty-builder freeze (`alloc` → `freeze`, no `set`): `src_len == 0`,
+/// so `translate_map_builder_freeze` emits zero-length result arrays and
+/// the replay loop never runs. The boundary the populated test can't
+/// reach — `length` is 0 and every `get` misses without scanning. Pins
+/// that the `ArrayNewDefault(0)` / skipped-loop path produces a valid,
+/// empty frozen `Map`.
+#[test]
+fn map_builder_empty_freeze_runs_under_wasmtime_gc() {
+    assert_prints(
+        concat!(
+            "function main() {\n",
+            "  let mb: MapBuilder<Int, Int> = Map.builder()\n",
+            "  let m = mb.freeze()\n",
+            "  print(m.length())\n",            // 0
+            "  print(m.get(0).unwrapOr(-1))\n", // -1 — empty, no scan
+            "  for k in m.keys() {\n",
+            "    print(k)\n", // never reached
+            "  }\n",
+            "  print(42)\n", // sentinel: keys loop produced nothing
+            "}\n",
+        ),
+        "map_builder_empty_freeze_wasm_gc",
+        b"0\n-1\n42\n",
+    );
+}
+
+/// `MapBuilder.set` after `freeze` traps — the `$frozen` guard
+/// (`translate_map_builder_set`) is what keeps the freeze sound, exactly
+/// as for `ListBuilder.push`. Native aborts with `builder was already
+/// frozen`; wasm-gc emits an `unreachable`.
+#[test]
+fn map_builder_set_after_freeze_traps_under_wasmtime_gc() {
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let mb: MapBuilder<Int, Int> = Map.builder()\n",
+            "  mb.set(1, 10)\n",
+            "  let m = mb.freeze()\n",
+            "  mb.set(2, 20)\n",
+            "  print(m.length())\n",
+            "}\n",
+        ),
+        "map_builder_set_after_freeze_wasm_gc",
+    );
+}
+
+/// Double-`freeze()` on a `MapBuilder` traps. Distinct from the
+/// set-after-freeze test: `translate_map_builder_freeze` carries its own
+/// `$frozen` guard (separate emission from `set`'s), so this pins the
+/// second guard independently — the `MapBuilder` analogue of
+/// [`list_builder_double_freeze_traps_under_wasmtime_gc`].
+#[test]
+fn map_builder_double_freeze_traps_under_wasmtime_gc() {
+    assert_traps(
+        concat!(
+            "function main() {\n",
+            "  let mb: MapBuilder<Int, Int> = Map.builder()\n",
+            "  mb.set(1, 10)\n",
+            "  let m = mb.freeze()\n",
+            "  print(mb.freeze().length())\n",
+            "  print(m.length())\n",
+            "}\n",
+        ),
+        "map_builder_double_freeze_wasm_gc",
+    );
+}
+
+/// `MapBuilder<Float, Int>` freeze — pins the **float** branch of the
+/// freeze replay scan (`emit_key_eq`: `I64ReinterpretF64` + `I64Eq`),
+/// which the `Int`-keyed tests above never reach. A duplicate key `1.5`
+/// must be recognized as equal during dedup (last value wins, first slot
+/// kept), and an absent key `9.5` must miss. The ±0.0 / NaN bit-edge
+/// cases live in the `phoenix-common::map_key` and IR-interp unit tests
+/// (the IR interpreter drives them through a full `freeze`); this test
+/// covers the wasm-gc emission of the float comparison itself.
+#[test]
+fn map_builder_float_keys_freeze_runs_under_wasmtime_gc() {
+    assert_prints(
+        concat!(
+            "function main() {\n",
+            "  let mb: MapBuilder<Float, Int> = Map.builder()\n",
+            "  mb.set(1.5, 10)\n",
+            "  mb.set(2.5, 20)\n",
+            "  mb.set(1.5, 99)\n", // duplicate: key 1.5 keeps slot 0, takes value 99
+            "  let m = mb.freeze()\n",
+            "  print(m.length())\n",              // 2 — 1.5 deduped
+            "  print(m.get(1.5).unwrapOr(-1))\n", // 99 — last-wins via the float compare
+            "  print(m.get(2.5).unwrapOr(-1))\n", // 20
+            "  print(m.get(9.5).unwrapOr(-1))\n", // -1 — absent
+            "}\n",
+        ),
+        "map_builder_float_keys_wasm_gc",
+        b"2\n99\n20\n-1\n",
+    );
+}
+
 /// `List.contains` over struct elements uses `ref.eq` *identity* —
 /// the exact analogue of native's bytewise compare of the stored
 /// 8-byte pointer (`elements_equal` with `is_string = false`): the

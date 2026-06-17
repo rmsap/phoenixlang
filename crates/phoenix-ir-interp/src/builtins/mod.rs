@@ -44,6 +44,8 @@ pub(crate) fn dispatch(
                     "Map" => collections::builtin_map(method, args),
                     "Option" => option_result::builtin_option(interp, method, args),
                     "Result" => option_result::builtin_result(interp, method, args),
+                    "ListBuilder" => collections::builtin_list_builder(method, args),
+                    "MapBuilder" => collections::builtin_map_builder(method, args),
                     _ => error(format!("unknown builtin type: {type_name}")),
                 }
             } else {
@@ -60,6 +62,18 @@ fn expect_one_arg(args: &[IrValue], method: &str) -> Result<IrValue> {
     args.first().cloned().ok_or_else(|| IrRuntimeError {
         message: format!("{method}() requires 1 argument"),
     })
+}
+
+/// Extract exactly two arguments as `(a, b)`, erroring with a message
+/// naming `method`. The two-arg analogue of [`expect_one_arg`]; rejects
+/// extra arguments rather than silently ignoring them.
+fn expect_two_args(args: &[IrValue], method: &str) -> Result<(IrValue, IrValue)> {
+    match args {
+        [a, b] => Ok((a.clone(), b.clone())),
+        _ => Err(IrRuntimeError {
+            message: format!("{method}() requires 2 arguments"),
+        }),
+    }
 }
 
 /// Extract a `String` argument at `idx`, erroring with a message naming `method`.

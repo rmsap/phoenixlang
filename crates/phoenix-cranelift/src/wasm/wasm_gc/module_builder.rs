@@ -422,6 +422,16 @@ pub(super) struct ModuleBuilder {
     /// such collisions can't occur.
     phx_map_kv_by_struct: HashMap<u32, (IrType, IrType)>,
 
+    /// Concrete map `(K, V)` → `$mapbuilder_KV` struct index. Only
+    /// populated for `(K, V)` pairs the module actually builds with
+    /// `MapBuilder<K, V>`. Mirrors [`Self::phx_list_builders`].
+    phx_map_builders: HashMap<(IrType, IrType), u32>,
+
+    /// Reverse index `$mapbuilder_KV` struct idx → `(K, V)`, for
+    /// `MapBuilder.set` (Void result) which keys off the receiver's WASM
+    /// binding type. Lockstep with [`Self::phx_map_builders`].
+    phx_map_builder_kv_by_struct: HashMap<u32, (IrType, IrType)>,
+
     /// Per trait coerced to `dyn`: `(dyn_struct_idx, vtable_struct_idx,
     /// per-method `$dynfn` func-type indices)` per §Phase 2.4 decision
     /// K.10. Populated by [`Self::declare_phoenix_dyn`].
@@ -534,6 +544,8 @@ impl ModuleBuilder {
             phx_lists: HashMap::new(),
             phx_maps: HashMap::new(),
             phx_map_kv_by_struct: HashMap::new(),
+            phx_map_builders: HashMap::new(),
+            phx_map_builder_kv_by_struct: HashMap::new(),
             phx_dyn_traits: HashMap::new(),
             phx_dyn_trampolines: HashMap::new(),
             phx_dyn_vtable_globals: HashMap::new(),
@@ -1340,6 +1352,59 @@ impl ModuleBuilder {
     /// (`Map.contains` → Bool, `Map.length` → Int, `Map.get` → Option<V>).
     pub(super) fn map_kv_by_struct_idx(&self, map_idx: u32) -> Option<&(IrType, IrType)> {
         self.phx_map_kv_by_struct.get(&map_idx)
+    }
+
+    /// Record one declared map-builder instantiation: `(K, V)` →
+    /// `$mapbuilder_KV` struct index, plus the reverse index. Mirrors
+    /// [`Self::record_list_builder`].
+    pub(super) fn record_map_builder(&mut self, key: IrType, val: IrType, builder_idx: u32) {
+        self.phx_map_builder_kv_by_struct
+            .insert(builder_idx, (key.clone(), val.clone()));
+        self.phx_map_builders.insert((key, val), builder_idx);
+    }
+
+    /// `$mapbuilder_KV` struct index for the `MapBuilder<K, V>`
+    /// instantiation `(K, V)`. Used by `MapBuilder.alloc`. Placeholder
+    /// types get the annotate diagnostic — same rationale as
+    /// [`Self::require_list_builder_idx`].
+    pub(super) fn require_map_builder_idx(
+        &self,
+        key: &IrType,
+        val: &IrType,
+    ) -> Result<u32, CompileError> {
+        self.phx_map_builders
+            .get(&(key.clone(), val.clone()))
+            .copied()
+            .ok_or_else(|| {
+                if super::enums::contains_generic_placeholder(key)
+                    || super::enums::contains_generic_placeholder(val)
+                {
+                    CompileError::new(
+                        "wasm32-gc: a map builder's key/value type was never \
+                         constrained to a concrete type, so no WASM-GC builder \
+                         type exists for it. Annotate the builder (e.g. \
+                         `let b: MapBuilder<Int, Int> = Map.builder()`)."
+                            .to_string(),
+                    )
+                } else {
+                    CompileError::new(format!(
+                        "wasm32-gc: map-builder instantiation \
+                         `MapBuilder<{key:?}, {val:?}>` was not declared by \
+                         `declare_phoenix_maps` (internal compiler bug — the \
+                         collection pass should have seen its `MapBuilderRef`)"
+                    ))
+                }
+            })
+    }
+
+    /// Reverse-lookup a map builder's `(K, V)` from its
+    /// `$mapbuilder_KV` struct index (recovered from a receiver's WASM
+    /// binding type). Used by `MapBuilder.set` (Void result).
+    pub(super) fn map_builder_kv_by_struct_idx(
+        &self,
+        builder_idx: u32,
+    ) -> Option<&(IrType, IrType)> {
+        self.phx_map_builder_kv_by_struct.get(&builder_idx)
     }
 
     // ── dyn Trait (§Phase 2.4 decision K.10) ──

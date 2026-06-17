@@ -167,6 +167,15 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(map_idx),
             })])
         }
+        IrType::MapBuilderRef(k, v) => {
+            // Nullable ref to the `$mapbuilder_KV` struct (Phase 2.7
+            // decision F) — the two-array analogue of `ListBuilderRef`.
+            let builder_idx = b.require_map_builder_idx(k, v)?;
+            Ok(vec![ValType::Ref(RefType {
+                nullable: true,
+                heap_type: HeapType::Concrete(builder_idx),
+            })])
+        }
         IrType::DynRef(trait_name) => {
             // Nullable ref to the K.10 `$dyn_T` fat-pointer struct.
             Ok(vec![dyn_trait::dyn_valtype(b, trait_name)?])
@@ -1384,6 +1393,10 @@ fn translate_builtin_call(
         "ListBuilder.alloc" => lists::translate_list_builder_alloc(ctx, b, instr),
         "ListBuilder.push" => lists::translate_list_builder_push(ctx, b, args),
         "ListBuilder.freeze" => lists::translate_list_builder_freeze(ctx, b, args, instr),
+        // MapBuilder: append-only, dedup at freeze.
+        "MapBuilder.alloc" => maps::translate_map_builder_alloc(ctx, b, instr),
+        "MapBuilder.set" => maps::translate_map_builder_set(ctx, b, args),
+        "MapBuilder.freeze" => maps::translate_map_builder_freeze(ctx, b, args, instr),
         other => Err(CompileError::new(format!(
             "wasm32-gc: builtin `{other}` not yet supported. Covered: \
              `print` / `toString` / the `String.*` surface; the full \

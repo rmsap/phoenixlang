@@ -1,0 +1,54 @@
+// ListBuilder<T> / MapBuilder<K,V> — the Phase 2.7 transient-mutable
+// accumulators — exercised across all five backends. Pins: push/set in
+// a loop (shared-mutable accumulator), freeze producing an immutable
+// List/Map, MapBuilder.freeze's last-value-wins dedup keeping each key
+// at its FIRST-insertion position, and float-keyed dedup. Kept small —
+// the wasm-gc freeze dedup is O(n²) (a per-key linear scan) and the
+// interpreters' Map.get is O(n) per lookup. (Native freeze and both
+// interpreters' freeze are hashed O(n); only wasm-gc is quadratic.)
+// (Use-after-freeze, which traps/aborts on
+// every backend, is covered by per-interpreter unit tests, not here —
+// the matrix harness compares success output.)
+
+function main() {
+  // ListBuilder: build [0,2,4,6,8] via a loop, freeze, sum + length.
+  let lb: ListBuilder<Int> = List.builder()
+  let mut i: Int = 0
+  while i < 5 {
+    lb.push(i * 2)
+    i = i + 1
+  }
+  let xs: List<Int> = lb.freeze()
+  print(xs.length())
+  print(xs.reduce(0, function(a: Int, v: Int) -> Int { a + v }))
+
+  // MapBuilder with a duplicate key: first-position kept, last value wins.
+  let mb: MapBuilder<String, Int> = Map.builder()
+  mb.set("a", 1)
+  mb.set("b", 2)
+  mb.set("c", 3)
+  mb.set("a", 99)
+  let m: Map<String, Int> = mb.freeze()
+  print(m.length())
+  print(m.get("a").unwrapOr(-1))
+  print(m.get("b").unwrapOr(-1))
+  print(m.get("z").unwrapOr(-1))
+  // keys() preserves first-insertion order — print them.
+  for k in m.keys() {
+    print(k)
+  }
+
+  // MapBuilder with Float keys: last-wins dedup is byte-wise on floats
+  // (§Phase 2.4 K.9), so it must apply to float keys too. Key 1.5 keeps
+  // its first slot but takes the later value 99. (±0.0 / NaN bit-edge
+  // cases live in phoenix-common's `map_key` unit tests — not expressible
+  // / portable to print from source.)
+  let fb: MapBuilder<Float, Int> = Map.builder()
+  fb.set(1.5, 10)
+  fb.set(2.5, 20)
+  fb.set(1.5, 99)
+  let fm: Map<Float, Int> = fb.freeze()
+  print(fm.length())
+  print(fm.get(1.5).unwrapOr(-1))
+  print(fm.get(2.5).unwrapOr(-1))
+}
