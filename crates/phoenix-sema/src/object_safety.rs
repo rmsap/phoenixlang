@@ -58,6 +58,7 @@ fn contains_self(ty: &Type) -> bool {
         | Type::File
         | Type::DateTime
         | Type::Uuid
+        | Type::Decimal
         | Type::Void
         | Type::TypeVar(_)
         | Type::Error => false,

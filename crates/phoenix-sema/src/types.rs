@@ -43,6 +43,15 @@ pub enum Type {
     /// it a `string` checked only in `Validate()`). See `docs/design-decisions.md`
     /// (DateTime & UUID scalar types).
     Uuid,
+    /// An exact base-10 decimal, serialized on the wire as a string (e.g.
+    /// `"19.99"`) to avoid the precision loss of a JSON float. A Phoenix Gen
+    /// scalar usable wherever `String` is — like `DateTime`/`Uuid`, NOT
+    /// position-restricted. Lowers to `IrType::StringRef`. Transport-only for now:
+    /// Python gets real `decimal.Decimal` arithmetic (free, stdlib); TS/Go carry
+    /// it as a validated string (no arithmetic). `Money` (Decimal + currency) and
+    /// arithmetic via MIT libs are deferred. See `docs/design-decisions.md`
+    /// (Decimal scalar type).
+    Decimal,
     /// The unit type, used for functions that do not return a value.
     Void,
     /// A named type that hasn't been resolved yet or is user-defined.
@@ -85,11 +94,11 @@ impl Type {
     /// Resolve a type-name string to a [`Type`].
     ///
     /// The built-in type names (`"Int"`, `"Float"`, `"String"`, `"Bool"`,
-    /// `"File"`, `"DateTime"`, `"Uuid"`, `"Void"`) are matched **case-sensitively**
-    /// and mapped to the corresponding variant.  Any other name is wrapped in
-    /// [`Type::Named`].  (`File` is only *legal* in endpoint-body position —
-    /// that restriction is enforced in sema, not here.  `DateTime`/`Uuid` are
-    /// plain scalars with no such restriction.)
+    /// `"File"`, `"DateTime"`, `"Uuid"`, `"Decimal"`, `"Void"`) are matched
+    /// **case-sensitively** and mapped to the corresponding variant.  Any other
+    /// name is wrapped in [`Type::Named`].  (`File` is only *legal* in
+    /// endpoint-body position — that restriction is enforced in sema, not here.
+    /// `DateTime`/`Uuid`/`Decimal` are plain scalars with no such restriction.)
     pub fn from_name(name: &str) -> Type {
         match name {
             "Int" => Type::Int,
@@ -99,6 +108,7 @@ impl Type {
             "File" => Type::File,
             "DateTime" => Type::DateTime,
             "Uuid" => Type::Uuid,
+            "Decimal" => Type::Decimal,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
         }
@@ -210,6 +220,7 @@ impl std::fmt::Display for Type {
             Type::File => write!(f, "File"),
             Type::DateTime => write!(f, "DateTime"),
             Type::Uuid => write!(f, "Uuid"),
+            Type::Decimal => write!(f, "Decimal"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {

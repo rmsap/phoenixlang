@@ -162,6 +162,10 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
         // language-level literals/operations yet; same branded-string runtime
         // representation as `DateTime`/`String`. See `docs/design-decisions.md`.
         Type::Uuid => IrType::StringRef,
+        // `Decimal` is a Phoenix Gen scalar (exact base-10, string on the wire)
+        // with no language-level literals/operations yet; same branded-string
+        // runtime representation as `DateTime`/`Uuid`. See `docs/design-decisions.md`.
+        Type::Decimal => IrType::StringRef,
         Type::Void => IrType::Void,
         Type::File => {
             // `File` is a Phoenix Gen endpoint-transport type only. Endpoints are

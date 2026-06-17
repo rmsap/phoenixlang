@@ -2732,12 +2732,11 @@ unlike `File`'s `unreachable!` arm — it can't panic if such a struct is ever
 lowered. Liftable to a richer representation if the language later gains temporal
 (or uuid) semantics.
 
-## Phoenix Gen — Decimal scalar type (DESIGN — not yet implemented, 2026-06-16)
+## Phoenix Gen — Decimal scalar type (2026-06-16)
 
 The third of the top-ranked "missing primitive types," closing the
-`Int`-cents / `Float`-amount workaround the fixtures used. **This section is the
-agreed design only — implementation is held pending explicit go-ahead.** It
-follows the same add→4-generators→compile-lint→round-trip loop as DateTime/UUID.
+`Int`-cents / `Float`-amount workaround the fixtures used. Shipped via the same
+add→4-generators→compile-lint→round-trip loop as DateTime/UUID.
 
 **Scope: `Decimal` only; `Money` is compose-your-own for now.** The fixture audit
 asked for "currency-aware money," but `Money` is just `Decimal` + a currency, and
@@ -2784,10 +2783,45 @@ can pin scale and the generators can round/validate against it.
 
 **The smaller pieces (fall out of the above, same patterns as UUID):**
 - Validation: a decimal-format regex (optional leading `-`, digits, optional
-  `.` + fraction) reused through the TS `parseDecimal` and Go `Validate()` paths;
-  Python's `Decimal(str)` raises on malformed input (free, both sides via pydantic).
+  `.` + fraction, optional `eE` exponent) reused through the TS `parseDecimal` and
+  Go `Validate()` paths; Python's `Decimal(str)` raises on malformed input (free,
+  both sides via pydantic). **Strictness diverges across targets:** Go/TS accept
+  only finite base-10 numbers (the regex), while Python's `Decimal` also admits
+  `NaN`/`Infinity` and bare-exponent forms. So a `Decimal("NaN")` produced by a
+  Python client round-trips in Python but is rejected by a Go or TS server. This is
+  intentional — those are not canonical decimal values — and is the Decimal analogue
+  of the query-validation divergence below; a fixed-scale `Decimal(N)` would tighten
+  all three to one grammar.
 - `lower_type` → `IrType::StringRef`, same as DateTime/UUID.
 - OpenAPI: `{type: string, format: decimal}` (no standard JSON-Schema decimal; the
   string + `format: decimal` convention; an optional `pattern` could pin the regex).
 - Multipart form-field `Decimal`: same deferral as DateTime/UUID (sema's
   `is_multipart_field_type` whitelist), rejected cleanly until lifted.
+
+**Implementation note: generalized from UUID, not duplicated.** `Decimal` and
+`Uuid` are the same shape (branded validated string), so the UUID-specific
+machinery was generalized to serve both rather than copied: TS has
+`ts_branded_scalars()` / `branded_scalar()` (a small `[(Type, alias, parse fn)]`
+table) driving `type_to_ts`, `ts_revive_expr`, the coercions, the one-time
+alias/`parse*` emission, and the per-file import collection; the pure helpers
+became `type_mentions(ty, target)` / `leaf_is(ty, target)`. Go's `Validate()`
+machinery moved from a single `uuidRe` bool to a `types_regex_vars:
+BTreeSet<&str>` with a `regex_scalar(ty) -> (var, label)` lookup (`uuidRe` /
+`decimalRe`), each var emitted with its pattern from `go_regex_pattern`. Python's
+per-file detection was already predicate-generic (`*_uses(fn)`); `Decimal` just
+adds `type_uses_decimal[_deep]` and a `needs_decimal` import flag. Adding a fourth
+branded scalar later is now a table entry plus a regex, not a fresh copy.
+
+**Verification.** Two harnesses, both green. (1) Compile-lint: a comprehensive
+`DECIMAL_SCHEMA` (field/`Option`/`List`/`Map`/nested/query/req+resp header + bare
+scalar/`List`/`Map` responses) through all four targets — Go
+`build`/`gofmt`/`golangci-lint`, TS `tsc`/`eslint`/`prettier`, Python
+`black`/`ruff`/`mypy`, OpenAPI `redocly lint`. (2) Bespoke round-trips
+(`tests/roundtrip/decimal/*`) for Go/TS/Python assert body/query/response-header/
+bare-response decimals survive the wire AND that the validating decode paths
+(Python `Decimal(...)`, TS `parseDecimal`, Go `Validate()`'s `decimalRe`) accept
+valid input and reject a malformed body decimal — plus the documented
+TS-validates-query / Go-accepts-query divergence (each driver asserts its side).
+All 13 round-trips (4 base + 3 DateTime + 3 UUID + 3 Decimal) and all four
+compile-lint targets are green; 238 codegen lib tests show no snapshot drift from
+the UUID→branded-scalar generalization.

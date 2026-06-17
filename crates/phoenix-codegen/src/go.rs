@@ -196,9 +196,10 @@ struct GoGenerator<'a> {
     types_needs_fmt: bool,
     /// Whether types.go needs a `"strings"` import (for contains constraints).
     types_needs_strings: bool,
-    /// Whether types.go needs a `"regexp"` import + the package-level `uuidRe`
-    /// var (a `Uuid` field's `Validate()` checks its RFC 4122 format with it).
-    types_needs_regexp: bool,
+    /// The package-level format-check regex vars types.go must emit (e.g.
+    /// `"uuidRe"`, `"decimalRe"`) — a `Uuid`/`Decimal` field's `Validate()` checks
+    /// its format against one. Non-empty ⇒ also import `"regexp"`.
+    types_regex_vars: BTreeSet<&'static str>,
     /// Whether client.go needs a `"fmt"` import. Every client method formats its
     /// URL with `fmt.Sprintf` and wraps HTTP errors with `fmt.Errorf`, so this is
     /// true iff at least one endpoint exists — a schema with types but no
@@ -258,7 +259,7 @@ impl<'a> GoGenerator<'a> {
             emitted_derived_types: BTreeSet::new(),
             types_needs_fmt: false,
             types_needs_strings: false,
-            types_needs_regexp: false,
+            types_regex_vars: BTreeSet::new(),
             client_needs_fmt: false,
             client_needs_url: false,
             client_needs_strconv: false,
@@ -339,9 +340,9 @@ impl<'a> GoGenerator<'a> {
             if go_body_uses_time(&types_body) {
                 imports.push("\"time\"");
             }
-            // `regexp` is needed only by the `uuidRe` var a `Uuid` field's
-            // `Validate()` uses.
-            if self.types_needs_regexp {
+            // `regexp` is needed only by the format-check var(s) a `Uuid`/`Decimal`
+            // field's `Validate()` uses.
+            if !self.types_regex_vars.is_empty() {
                 imports.push("\"regexp\"");
             }
             imports.sort_unstable();
@@ -356,12 +357,14 @@ impl<'a> GoGenerator<'a> {
                 ));
             }
         }
-        // The shared RFC 4122 matcher, compiled once, used by every `Uuid`
-        // field's `Validate()` check. Emitted only when some struct/body has one.
-        if self.types_needs_regexp {
-            self.types_out.push_str(
-                "var uuidRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)\n\n",
-            );
+        // The shared format-check matchers, compiled once, used by every
+        // `Uuid`/`Decimal` field's `Validate()` check. Emitted (sorted, for stable
+        // output) only for the vars some struct/body actually references.
+        for var in &self.types_regex_vars {
+            self.types_out.push_str(&format!(
+                "var {var} = regexp.MustCompile(`{}`)\n\n",
+                go_regex_pattern(var)
+            ));
         }
         // Each emitted type ends with `}\n\n`, leaving a trailing blank line at
         // EOF. gofmt requires exactly one trailing newline, so trim and re-add.
@@ -903,16 +906,18 @@ impl<'a> GoGenerator<'a> {
                     .map(|c| (f.name.as_str(), c, derived_field_go_type(f).1))
             })
             .collect();
-        // A `Uuid`/`Option<Uuid>` body field gets a format check. Pointer-ness
-        // comes from `derived_field_go_type` (a `partial`-applied `Uuid` is `*string`),
-        // so the nil-guard can't disagree with the rendered field type.
-        let uuid_fields: Vec<(&str, bool)> = body
+        // A `Uuid`/`Decimal` (or `Option` thereof) body field gets a format check.
+        // Pointer-ness comes from `derived_field_go_type` (a `partial`-applied
+        // scalar is `*string`), so the nil-guard can't disagree with the field type.
+        let regex_fields: Vec<(&str, bool, &'static str, &'static str)> = body
             .fields
             .iter()
-            .filter(|f| is_uuid_field(&f.ty))
-            .map(|f| (f.name.as_str(), derived_field_go_type(f).1))
+            .filter_map(|f| {
+                regex_scalar(&f.ty)
+                    .map(|(var, label)| (f.name.as_str(), derived_field_go_type(f).1, var, label))
+            })
             .collect();
-        if fields.is_empty() && uuid_fields.is_empty() {
+        if fields.is_empty() && regex_fields.is_empty() {
             return;
         }
         render_validate_fn(
@@ -920,11 +925,11 @@ impl<'a> GoGenerator<'a> {
                 out: &mut self.types_out,
                 needs_fmt: &mut self.types_needs_fmt,
                 needs_strings: &mut self.types_needs_strings,
-                needs_regexp: &mut self.types_needs_regexp,
+                regex_vars: &mut self.types_regex_vars,
             },
             type_name,
             &fields,
-            &uuid_fields,
+            &regex_fields,
         );
     }
 
@@ -948,12 +953,18 @@ impl<'a> GoGenerator<'a> {
                     .map(|c| (f.name.as_str(), c, is_option))
             })
             .collect();
-        let uuid_fields: Vec<(&str, bool)> = info
+        // `Uuid`/`Decimal` (or `Option` thereof) fields get a format check; the
+        // pointer shape is whether the field is `Option` (a struct has no
+        // `partial`, so `Option` ⇒ `*string`).
+        let regex_fields: Vec<(&str, bool, &'static str, &'static str)> = info
             .fields
             .iter()
-            .filter_map(|f| uuid_field_shape(&f.ty).map(|is_ptr| (f.name.as_str(), is_ptr)))
+            .filter_map(|f| {
+                let is_ptr = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                regex_scalar(&f.ty).map(|(var, label)| (f.name.as_str(), is_ptr, var, label))
+            })
             .collect();
-        if fields.is_empty() && uuid_fields.is_empty() {
+        if fields.is_empty() && regex_fields.is_empty() {
             return;
         }
         render_validate_fn(
@@ -961,11 +972,11 @@ impl<'a> GoGenerator<'a> {
                 out: &mut self.types_out,
                 needs_fmt: &mut self.types_needs_fmt,
                 needs_strings: &mut self.types_needs_strings,
-                needs_regexp: &mut self.types_needs_regexp,
+                regex_vars: &mut self.types_regex_vars,
             },
             &s.name,
             &fields,
-            &uuid_fields,
+            &regex_fields,
         );
     }
 
@@ -1628,8 +1639,8 @@ impl<'a> GoGenerator<'a> {
             // constrained field OR a `Uuid` field (whose format it checks). This
             // condition must track `emit_body_validate_method`'s emit gate so we
             // never call a method that wasn't generated, nor skip one that was.
-            let has_uuid_field = body.fields.iter().any(|f| is_uuid_field(&f.ty));
-            if body.fields.iter().any(|f| f.constraint.is_some()) || has_uuid_field {
+            let has_regex_field = body.fields.iter().any(|f| regex_scalar(&f.ty).is_some());
+            if body.fields.iter().any(|f| f.constraint.is_some()) || has_regex_field {
                 let (name, code) = ep
                     .errors
                     .iter()
@@ -2310,7 +2321,10 @@ struct ValidateSink<'a> {
     out: &'a mut String,
     needs_fmt: &'a mut bool,
     needs_strings: &'a mut bool,
-    needs_regexp: &'a mut bool,
+    /// The format-check regex vars this `Validate()` references; the composer
+    /// emits a `var <name> = regexp.MustCompile(...)` (and the `regexp` import)
+    /// for each.
+    regex_vars: &'a mut BTreeSet<&'static str>,
 }
 
 /// Renders a `func (s {type_name}) Validate() error` whose body checks every
@@ -2319,24 +2333,25 @@ struct ValidateSink<'a> {
 /// `(name, constraint, is_ptr)`: an `is_ptr` field is rendered as a Go pointer
 /// (either `partial`-applied or already `Option<T>`, both `*T`), so its check is
 /// nil-guarded and `self` is dereferenced inside the constraint expression; a
-/// plain field is checked directly. `uuid_fields` lists each `(name, is_ptr)`
-/// uuid field, format-checked against `uuidRe` (nil-guarded when `is_ptr`).
+/// plain field is checked directly. `regex_fields` lists each format-checked
+/// field as `(name, is_ptr, regex_var, label)` — a `Uuid` (`uuidRe`/"invalid
+/// uuid") or `Decimal` (`decimalRe`/"invalid decimal"), nil-guarded when `is_ptr`.
 /// Shared by the source-struct validator
 /// ([`GoGenerator::emit_validate_method`]) and the derived-body validator
 /// ([`GoGenerator::emit_body_validate_method`]) so the two can never drift.
-/// Callers must invoke this only when `fields` OR `uuid_fields` is non-empty — an
+/// Callers must invoke this only when `fields` OR `regex_fields` is non-empty — an
 /// empty `Validate()` would needlessly pull in the `fmt` import.
 fn render_validate_fn(
     sink: ValidateSink<'_>,
     type_name: &str,
     fields: &[(&str, &Expr, bool)],
-    uuid_fields: &[(&str, bool)],
+    regex_fields: &[(&str, bool, &'static str, &'static str)],
 ) {
     let ValidateSink {
         out,
         needs_fmt,
         needs_strings,
-        needs_regexp,
+        regex_vars,
     } = sink;
     *needs_fmt = true;
     out.push_str(&format!(
@@ -2365,16 +2380,16 @@ fn render_validate_fn(
         }
     }
 
-    for (name, is_ptr) in uuid_fields {
-        *needs_regexp = true;
+    for (name, is_ptr, var, label) in regex_fields {
+        regex_vars.insert(*var);
         let field = to_pascal_case(name);
         if *is_ptr {
             out.push_str(&format!(
-                "\tif s.{field} != nil && !uuidRe.MatchString(*s.{field}) {{\n\t\treturn fmt.Errorf(\"{name}: invalid uuid\")\n\t}}\n",
+                "\tif s.{field} != nil && !{var}.MatchString(*s.{field}) {{\n\t\treturn fmt.Errorf(\"{name}: {label}\")\n\t}}\n",
             ));
         } else {
             out.push_str(&format!(
-                "\tif !uuidRe.MatchString(s.{field}) {{\n\t\treturn fmt.Errorf(\"{name}: invalid uuid\")\n\t}}\n",
+                "\tif !{var}.MatchString(s.{field}) {{\n\t\treturn fmt.Errorf(\"{name}: {label}\")\n\t}}\n",
             ));
         }
     }
@@ -2382,30 +2397,33 @@ fn render_validate_fn(
     out.push_str("\treturn nil\n}\n\n");
 }
 
-/// Whether `ty` is a directly-validatable `Uuid` field for Go's `Validate()`: a
-/// bare `Uuid` (`string`) or an `Option<Uuid>` (`*string`), returning the
-/// `is_ptr` flag. `List<Uuid>`/`Map<_, Uuid>` element validation is not emitted
-/// (Go is the documented weak link for uuid validation).
-fn uuid_field_shape(ty: &Type) -> Option<bool> {
-    match ty {
-        Type::Uuid => Some(false),
-        Type::Generic(name, args)
-            if name == "Option" && args.len() == 1 && matches!(args[0], Type::Uuid) =>
-        {
-            Some(true)
-        }
-        _ => None,
+/// The package-level regex pattern (raw-string body, no backticks) for a
+/// format-check var. `uuidRe` matches RFC 4122; `decimalRe` matches an exact
+/// base-10 number (optional sign, digits, optional fraction, optional exponent —
+/// covering the canonical strings every target emits, incl. Python `Decimal`'s
+/// occasional `1E+2` form).
+fn go_regex_pattern(var: &str) -> &'static str {
+    match var {
+        "uuidRe" => "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        "decimalRe" => r"^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$",
+        other => unreachable!("no regex pattern for var `{other}`"),
     }
 }
 
-/// Whether `ty` is a `Uuid`/`Option<Uuid>` field that the generated `Validate()`
-/// format-checks — the single source of truth for that rule (derived from
-/// [`uuid_field_shape`]). Used where only the presence matters, not the pointer
-/// shape: the body validator's field filter (whose pointer-ness comes from
-/// `derived_field_go_type` instead) and the server's "should I call `Validate()`"
-/// gate, which must agree with the body validator's emit gate.
-fn is_uuid_field(ty: &Type) -> bool {
-    uuid_field_shape(ty).is_some()
+/// If `ty` is a regex-format-checked scalar (`Uuid`/`Decimal`), unwrapping a
+/// single `Option`, returns its `(regex_var, error_label)`. `List`/`Map` element
+/// validation is not emitted (Go is the documented weak link). The pointer shape
+/// is decided by the caller (struct vs `partial`-derived body field).
+fn regex_scalar(ty: &Type) -> Option<(&'static str, &'static str)> {
+    let inner = match ty {
+        Type::Generic(name, args) if name == "Option" && args.len() == 1 => &args[0],
+        other => other,
+    };
+    match inner {
+        Type::Uuid => Some(("uuidRe", "invalid uuid")),
+        Type::Decimal => Some(("decimalRe", "invalid decimal")),
+        _ => None,
+    }
 }
 
 /// Reports whether `ty` is `File` or `Option<File>` — the two field shapes that
@@ -2442,6 +2460,10 @@ fn type_to_go(ty: &Type) -> String {
         // generated `Validate()` (see `emit_validate_method`). It needs no special
         // (de)serialization — it IS a string on the wire and in memory.
         Type::Uuid => "string".to_string(),
+        // A `Decimal` is an exact base-10 number carried as a string (no Go stdlib
+        // decimal, and we add no dependency). Format is checked in the generated
+        // `Validate()` (see `emit_validate_method`); transport-only, no arithmetic.
+        Type::Decimal => "string".to_string(),
         Type::Void => "".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {

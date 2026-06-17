@@ -418,6 +418,9 @@ fn type_to_json_schema(ty: &Type) -> Value {
         Type::DateTime => json!({ "type": "string", "format": "date-time" }),
         // A `Uuid` is an RFC 4122 string with the standard `uuid` format.
         Type::Uuid => json!({ "type": "string", "format": "uuid" }),
+        // No standard JSON-Schema decimal; the `string` + `format: decimal`
+        // convention (exact, vs a lossy JSON number). See `docs/design-decisions.md`.
+        Type::Decimal => json!({ "type": "string", "format": "decimal" }),
         Type::Void => json!({}),
         Type::Named(name) => json!({ "$ref": format!("#/components/schemas/{}", name) }),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {

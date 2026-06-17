@@ -74,7 +74,13 @@ impl<'a> PyGenerator<'a> {
             .push_str("from __future__ import annotations\n\n");
         let models_needs_datetime = self.models_use(type_uses_datetime);
         let models_needs_uuid = self.models_use(type_uses_uuid);
-        self.emit_models_imports(program, models_needs_datetime, models_needs_uuid);
+        let models_needs_decimal = self.models_use(type_uses_decimal);
+        self.emit_models_imports(
+            program,
+            models_needs_datetime,
+            models_needs_uuid,
+            models_needs_decimal,
+        );
 
         // The client-side `FileUpload` helper (filename + content bytes) is shared
         // by every multipart endpoint, so emit it once up front when any exists.
@@ -116,7 +122,14 @@ impl<'a> PyGenerator<'a> {
         let client_needs_uuid = self.request_input_uses(type_uses_uuid)
             || self.response_header_uses(type_uses_uuid)
             || self.bare_response_uses(false, type_uses_uuid);
-        self.emit_client_imports(client_needs_datetime, client_needs_uuid);
+        let client_needs_decimal = self.request_input_uses(type_uses_decimal)
+            || self.response_header_uses(type_uses_decimal)
+            || self.bare_response_uses(false, type_uses_decimal);
+        self.emit_client_imports(
+            client_needs_datetime,
+            client_needs_uuid,
+            client_needs_decimal,
+        );
         self.client_out.push_str("\n\nclass ApiClient:\n");
         self.client_out.push_str(
             "    def __init__(self, base_url: str) -> None:\n        self.base_url = base_url\n        self.client = httpx.AsyncClient()\n",
@@ -133,7 +146,13 @@ impl<'a> PyGenerator<'a> {
             || self.bare_response_uses(true, type_uses_datetime);
         let handlers_needs_uuid = self.request_input_uses(type_uses_uuid)
             || self.bare_response_uses(true, type_uses_uuid);
-        self.emit_handler_imports(handlers_needs_datetime, handlers_needs_uuid);
+        let handlers_needs_decimal = self.request_input_uses(type_uses_decimal)
+            || self.bare_response_uses(true, type_uses_decimal);
+        self.emit_handler_imports(
+            handlers_needs_datetime,
+            handlers_needs_uuid,
+            handlers_needs_decimal,
+        );
         self.handlers_out
             .push_str("\n\nclass Handlers(Protocol):\n");
 
@@ -148,7 +167,13 @@ impl<'a> PyGenerator<'a> {
             || self.bare_response_uses(false, type_uses_datetime);
         let server_needs_uuid = self.request_input_uses(type_uses_uuid)
             || self.bare_response_uses(false, type_uses_uuid);
-        self.emit_server_imports(server_needs_datetime, server_needs_uuid);
+        let server_needs_decimal = self.request_input_uses(type_uses_decimal)
+            || self.bare_response_uses(false, type_uses_decimal);
+        self.emit_server_imports(
+            server_needs_datetime,
+            server_needs_uuid,
+            server_needs_decimal,
+        );
         self.server_out
             .push_str("\n\ndef create_router(handlers: Handlers) -> APIRouter:\n");
         self.server_out.push_str("    router = APIRouter()\n");
@@ -263,7 +288,13 @@ impl<'a> PyGenerator<'a> {
     // ── models.py emission ──────────────────────────────────────────
 
     /// Emits imports needed by models.py based on what types are used.
-    fn emit_models_imports(&mut self, program: &Program, needs_datetime: bool, needs_uuid: bool) {
+    fn emit_models_imports(
+        &mut self,
+        program: &Program,
+        needs_datetime: bool,
+        needs_uuid: bool,
+        needs_decimal: bool,
+    ) {
         let mut needs_field = false;
         let mut needs_enum = false;
 
@@ -348,9 +379,13 @@ impl<'a> PyGenerator<'a> {
         if needs_dataclass {
             stdlib.push("from dataclasses import dataclass");
         }
-        // isort order within the stdlib group: dataclasses < datetime < enum < uuid.
+        // isort order within the stdlib group:
+        // dataclasses < datetime < decimal < enum < uuid.
         if needs_datetime {
             stdlib.push("from datetime import datetime");
+        }
+        if needs_decimal {
+            stdlib.push("from decimal import Decimal");
         }
         if needs_enum {
             stdlib.push("from enum import Enum");
@@ -661,7 +696,7 @@ impl<'a> PyGenerator<'a> {
     // ── client.py emission ──────────────────────────────────────────
 
     /// Emits imports for the client file.
-    fn emit_client_imports(&mut self, needs_datetime: bool, needs_uuid: bool) {
+    fn emit_client_imports(&mut self, needs_datetime: bool, needs_uuid: bool, needs_decimal: bool) {
         // `Any` is referenced by the `params: dict[str, Any]` dict that
         // query-bearing endpoints emit, and by the `data: dict[str, Any]` form
         // dict that multipart endpoints emit; importing it otherwise trips ruff
@@ -671,11 +706,14 @@ impl<'a> PyGenerator<'a> {
             .endpoints
             .iter()
             .any(|ep| !ep.query_params.is_empty() || ep.body_is_multipart);
-        // stdlib group (isort order: datetime < typing < uuid), then a blank line,
-        // then the third-party `httpx`.
+        // stdlib group (isort order: datetime < decimal < typing < uuid), then a
+        // blank line, then the third-party `httpx`.
         let mut stdlib: Vec<&str> = Vec::new();
         if needs_datetime {
             stdlib.push("from datetime import datetime");
+        }
+        if needs_decimal {
+            stdlib.push("from decimal import Decimal");
         }
         if needs_any {
             stdlib.push("from typing import Any");
@@ -891,9 +929,9 @@ impl<'a> PyGenerator<'a> {
                 // server's ISO parse rejects. `.isoformat()` emits the `T`-form.
                 let value = match unwrap_option(&qp.ty) {
                     Type::DateTime => format!("{snake}.isoformat()"),
-                    // httpx would stringify a `UUID` to its canonical form anyway,
-                    // but make it explicit so the wire value is unambiguous.
-                    Type::Uuid => format!("str({snake})"),
+                    // httpx would stringify a `UUID`/`Decimal` to its canonical form
+                    // anyway, but make it explicit so the wire value is unambiguous.
+                    Type::Uuid | Type::Decimal => format!("str({snake})"),
                     _ => snake.clone(),
                 };
                 self.client_out.push_str(&format!(
@@ -1029,6 +1067,7 @@ impl<'a> PyGenerator<'a> {
             let needs_json_dump = body.fields.iter().any(|f| {
                 type_uses_datetime_deep(&f.ty, self.check_result, &mut BTreeSet::new())
                     || type_uses_uuid_deep(&f.ty, self.check_result, &mut BTreeSet::new())
+                    || type_uses_decimal_deep(&f.ty, self.check_result, &mut BTreeSet::new())
             });
             let dump = if needs_json_dump {
                 "body.model_dump(mode=\"json\")"
@@ -1171,11 +1210,19 @@ impl<'a> PyGenerator<'a> {
     // ── handlers.py emission ────────────────────────────────────────
 
     /// Emits imports for the handlers file.
-    fn emit_handler_imports(&mut self, needs_datetime: bool, needs_uuid: bool) {
-        // isort order within the stdlib group: datetime < typing < uuid.
+    fn emit_handler_imports(
+        &mut self,
+        needs_datetime: bool,
+        needs_uuid: bool,
+        needs_decimal: bool,
+    ) {
+        // isort order within the stdlib group: datetime < decimal < typing < uuid.
         if needs_datetime {
             self.handlers_out
                 .push_str("from datetime import datetime\n");
+        }
+        if needs_decimal {
+            self.handlers_out.push_str("from decimal import Decimal\n");
         }
         self.handlers_out.push_str("from typing import Protocol\n");
         if needs_uuid {
@@ -1340,7 +1387,7 @@ impl<'a> PyGenerator<'a> {
     // ── server.py emission ──────────────────────────────────────────
 
     /// Emits imports for the server file.
-    fn emit_server_imports(&mut self, needs_datetime: bool, needs_uuid: bool) {
+    fn emit_server_imports(&mut self, needs_datetime: bool, needs_uuid: bool, needs_decimal: bool) {
         // Build the `fastapi` import list from what the routes actually use, so
         // ruff F401 never fires on an unused name. `APIRouter` is always needed;
         // `HTTPException` only when some endpoint maps errors; `Query` only when
@@ -1417,10 +1464,13 @@ impl<'a> PyGenerator<'a> {
                 || !ep.response_statuses.is_empty()
         });
         // Standard-library imports form the first group (isort order:
-        // datetime < typing < uuid), emitted before the third-party fastapi group.
-        // The `Annotated[...]` file-alias form lives in the typing import.
+        // datetime < decimal < typing < uuid), emitted before the third-party
+        // fastapi group. The `Annotated[...]` file-alias form lives in typing.
         if needs_datetime {
             self.server_out.push_str("from datetime import datetime\n");
+        }
+        if needs_decimal {
+            self.server_out.push_str("from decimal import Decimal\n");
         }
         if needs_annotated {
             self.server_out.push_str("from typing import Annotated\n");
@@ -1428,7 +1478,7 @@ impl<'a> PyGenerator<'a> {
         if needs_uuid {
             self.server_out.push_str("from uuid import UUID\n");
         }
-        if needs_datetime || needs_annotated || needs_uuid {
+        if needs_datetime || needs_decimal || needs_annotated || needs_uuid {
             self.server_out.push('\n');
         }
         // Keep this list alphabetical so it satisfies ruff's isort (I) ordering.
@@ -1969,6 +2019,8 @@ fn py_decode_expr(ty: &Type, src: &str) -> String {
         Type::DateTime => format!("datetime.fromisoformat({src})"),
         // `UUID(str)` parses and validates the RFC 4122 string (raises on bad).
         Type::Uuid => format!("UUID({src})"),
+        // `Decimal(str)` parses exactly and raises on a malformed number.
+        Type::Decimal => format!("Decimal({src})"),
         Type::Named(name) => format!("{name}(**{src})"),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
             format!("[{} for item in {src}]", py_decode_expr(&args[0], "item"))
@@ -2077,6 +2129,46 @@ fn type_uses_uuid_deep(ty: &Type, check_result: &Analysis, visited: &mut BTreeSe
     }
 }
 
+/// Per-file `Decimal` detection (shallow); the analogue of [`type_uses_uuid`] for
+/// the `from decimal import Decimal` import. NOT transitive — see [`type_uses_datetime`].
+fn type_uses_decimal(ty: &Type) -> bool {
+    match ty {
+        Type::Decimal => true,
+        Type::Generic(_, args) => args.iter().any(type_uses_decimal),
+        _ => false,
+    }
+}
+
+/// Transitive `Decimal` reachability (through `Named` struct fields). Used by the
+/// `model_dump(mode="json")` gate: pydantic's default dump leaves `Decimal`
+/// objects that httpx's `json.dumps` rejects, exactly like `datetime`/`UUID`.
+fn type_uses_decimal_deep(
+    ty: &Type,
+    check_result: &Analysis,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    match ty {
+        Type::Decimal => true,
+        Type::Generic(_, args) => args
+            .iter()
+            .any(|a| type_uses_decimal_deep(a, check_result, visited)),
+        Type::Named(name) => {
+            if !visited.insert(name.clone()) {
+                return false;
+            }
+            check_result
+                .module
+                .struct_info_by_name(name)
+                .is_some_and(|info| {
+                    info.fields
+                        .iter()
+                        .any(|f| type_uses_decimal_deep(&f.ty, check_result, visited))
+                })
+        }
+        _ => false,
+    }
+}
+
 /// The Python name of the pagination envelope model for an endpoint
 /// (e.g. `listPosts` → `ListPostsPage`). Only emitted/used when the endpoint
 /// declares a `pagination { }` block. Distinct from the `<Endpoint>Result`
@@ -2133,6 +2225,7 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
             Type::Bool => format!("({raw} == \"true\") if {raw} else None"),
             Type::DateTime => format!("datetime.fromisoformat({raw}) if {raw} else None"),
             Type::Uuid => format!("UUID({raw}) if {raw} else None"),
+            Type::Decimal => format!("Decimal({raw}) if {raw} else None"),
             // `str` (and any unmodeled scalar) passes through untouched.
             _ => raw.clone(),
         }
@@ -2154,6 +2247,9 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
             Type::Uuid => {
                 format!("UUID({raw} or \"00000000-0000-0000-0000-000000000000\")")
             }
+            // The `0` fallback only narrows the `str | None` read; a required
+            // header is contractually present on the wire.
+            Type::Decimal => format!("Decimal({raw} or \"0\")"),
             _ => format!("{raw} or \"\""),
         }
     };
@@ -2210,6 +2306,10 @@ fn type_to_python(ty: &Type) -> String {
         // serializes it back under `mode="json"`. The import is added wherever a
         // `Uuid` appears. See `docs/design-decisions.md`.
         Type::Uuid => "UUID".to_string(),
+        // A `Decimal` maps to `decimal.Decimal` (stdlib, exact arithmetic). pydantic
+        // parses the wire string into a `Decimal` (rejecting malformed input —
+        // free validation) and serializes it back as a string under `mode="json"`.
+        Type::Decimal => "Decimal".to_string(),
         Type::Void => "None".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
