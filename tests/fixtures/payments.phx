@@ -1,10 +1,9 @@
 // Phoenix Gen — a realistic Payments API
 //
-// MONEY MODELING NOTE: Phoenix Gen has no native Money/Decimal type, so all
-// monetary amounts are modeled as `Int` minor units (e.g. cents for USD).
-// Every amount field below is documented as "minor units". There is also no
-// native DateTime/timestamp, UUID, or bytes type, so timestamps are Unix epoch
-// seconds (`Int`) and IDs are opaque `String`s.
+// Monetary amounts use the built-in `Money` (an exact `Decimal` amount + an
+// ISO-4217 currency); timestamps use `DateTime` (RFC 3339); opaque ids/tokens use
+// `Uuid`. A capture amount that travels as a query param uses `Decimal` (a `Money`
+// composite isn't URL-encodable; the currency is the charge's).
 
 // ── Domain types ──────────────────────────────────────────────
 
@@ -14,14 +13,11 @@ enum PaymentStatus { Pending  Succeeded  Failed  Refunded }
 /** Supported card networks (simple unit enum so it codegens on all targets) */
 enum CardBrand { Visa  Mastercard  Amex  Discover }
 
-/** Currency, as ISO-4217 alpha codes. No native currency type exists */
-enum Currency { USD  EUR  GBP  JPY }
-
 /** A tokenized payment card. PANs are never modeled here — only the last four
  *  and brand, as returned by the vault */
 struct Card {
-    /** Opaque card token id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque card token id */
+    id: Uuid
     brand: CardBrand
     last4: String where self.length == 4
     /** Expiry month, 1..12 */
@@ -32,23 +28,20 @@ struct Card {
 
 /** A customer record */
 struct Customer {
-    /** Opaque customer id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     name: String where self.length > 0 && self.length <= 200
     email: String where self.contains("@") && self.length > 3
     /** Default card token, if the customer has one on file */
-    defaultCardId: Option<String>
+    defaultCardId: Option<Uuid>
 }
 
 /** A charge against a customer's payment method */
 struct Charge {
-    /** Opaque charge id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     /** Customer the charge belongs to */
-    customerId: String where self.length > 0
-    /** Amount in MINOR UNITS (e.g. cents). No native Money/Decimal type */
-    amount: Int where self >= 0
-    currency: Currency
+    customerId: Uuid
+    /** Currency-aware amount (exact decimal + ISO-4217 currency) */
+    amount: Money
     status: PaymentStatus
     /** Free-form, human-readable description */
     description: String where self.length <= 500
@@ -56,33 +49,31 @@ struct Charge {
     card: Card
     /** Whether funds have been captured (vs. auth-only) */
     captured: Bool
-    /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    createdAt: Int where self >= 0
+    /** Creation time */
+    createdAt: DateTime
     /** Arbitrary key/value metadata attached at creation */
     metadata: Map<String, String>
 }
 
 /** A refund issued against a prior charge */
 struct Refund {
-    /** Opaque refund id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     /** The charge being refunded */
-    chargeId: String where self.length > 0
-    /** Amount refunded in MINOR UNITS. No native Money/Decimal type */
-    amount: Int where self >= 0
-    currency: Currency
+    chargeId: Uuid
+    /** Currency-aware amount refunded */
+    amount: Money
     status: PaymentStatus
     /** Optional reason code/string */
     reason: Option<String> where self.length > 0
-    /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    createdAt: Int where self >= 0
+    /** Creation time */
+    createdAt: DateTime
 }
 
 /** A line-item breakdown used when quoting an itemized charge */
 struct LineItem {
     label: String where self.length > 0 && self.length <= 200
-    /** Unit price in MINOR UNITS. No native Money/Decimal type */
-    unitAmount: Int where self >= 0
+    /** Currency-aware unit price */
+    unitAmount: Money
     quantity: Int where self >= 1
 }
 
@@ -90,8 +81,7 @@ struct LineItem {
  *  the charge context the preview is computed against. The `List<LineItem>`
  *  field exercises list-of-struct fields in a body position */
 struct QuoteRequest {
-    customerId: String where self.length > 0
-    currency: Currency
+    customerId: Uuid
     /** The items to total */
     items: List<LineItem>
     /** Optional free-form note carried onto the quoted charge preview */
@@ -203,7 +193,7 @@ endpoint listCharges: GET "/charges" {
     query {
         page: Int = 1
         limit: Int = 20
-        customerId: Option<String>
+        customerId: Option<Uuid>
         capturedOnly: Bool = false
     }
     response List<Charge>
@@ -219,7 +209,9 @@ endpoint captureCharge: POST "/charges/{id}/capture" {
         idemKey: String as "Idempotency-Key"
     }
     query {
-        amount: Option<Int>
+        // Amount to capture as an exact decimal; currency is the charge's.
+        // (`Money` is a composite, so it can't ride a query param.)
+        amount: Option<Decimal>
     }
     response Charge headers {
         ratelimitRemaining: Int as "X-RateLimit-Remaining"

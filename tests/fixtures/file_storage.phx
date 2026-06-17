@@ -1,12 +1,15 @@
 // Phoenix Gen — a realistic File Storage / Object Store API
 //
-// MODELING NOTES (Phoenix Gen has no native DateTime/UUID/bytes types):
-//   * All ids are opaque `String`s (no native UUID type)
-//   * All timestamps are Unix epoch SECONDS as `Int` (no native DateTime type)
-//   * Object/file sizes are non-negative `Int` byte counts (no native bytes type)
-//   * Checksums (MD5/SHA-256 hex) are modeled as `String` (no native bytes/hash type)
+// MODELING NOTES:
+//   * Ids in JSON structs use the built-in `Uuid`; timestamps use `DateTime`.
+//   * Object/file sizes are non-negative `Int` byte counts (no native bytes type).
+//   * Checksums (MD5/SHA-256 hex), etags, and opaque version ids are `String`s —
+//     they are not UUIDs, so a validated String is the honest model.
 //   * Binary object payloads are carried via the `File` type, valid only as a
-//     struct field used in an endpoint body (upload) or response (download)
+//     struct field used in an endpoint body (upload) or response (download).
+//   * The multipart UPLOAD body (`ObjectUpload`) can carry only File/scalar
+//     (String/Int/Bool/Option-of-scalar) form fields — so its ids and keys stay
+//     `String`, NOT `Uuid` (the composite scalars are rejected in multipart).
 //   * HTTP Range requests (partial/byte-range downloads) have NO native
 //     representation here — a full-object binary download is the only shape
 //     expressible. See the type-system gaps entry in docs/design-decisions.md.
@@ -33,8 +36,8 @@ enum ChecksumAlgorithm { Md5  Sha1  Sha256  Crc32c }
 
 /** A top-level storage bucket (namespace for objects) */
 struct Bucket {
-    /** Opaque bucket id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque bucket id */
+    id: Uuid
     /** Globally unique bucket name, DNS-ish, 3..63 chars */
     name: String where self.length >= 3 && self.length <= 63
     /** Geographic region the bucket lives in, e.g. "us-east-1" */
@@ -49,32 +52,32 @@ struct Bucket {
     objectCount: Int where self >= 0
     /** Total bytes stored across all objects (non-negative) */
     totalBytes: Int where self >= 0
-    /** Bucket creation time, Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
+    /** Bucket creation time */
+    createdAt: DateTime
 }
 
 /** A logical folder/prefix inside a bucket */
 struct Folder {
-    /** Opaque folder id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque folder id */
+    id: Uuid
     /** Bucket this folder belongs to */
-    bucketId: String where self.length > 0
+    bucketId: Uuid
     /** Full key prefix, e.g. "photos/2024/" — must contain a separator */
     prefix: String where self.contains("/")
     /** Human-friendly folder name (last path segment) */
     name: String where self.length > 0
     /** Parent folder prefix; absent for a top-level folder */
     parentPrefix: Option<String> where self.length > 0
-    /** Folder creation time, Unix epoch SECONDS */
-    createdAt: Int where self >= 0
+    /** Folder creation time */
+    createdAt: DateTime
 }
 
 /** Metadata describing a stored object (no payload bytes — see download endpoint) */
 struct StoredObject {
-    /** Opaque object id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque object id */
+    id: Uuid
     /** Bucket the object lives in */
-    bucketId: String where self.length > 0
+    bucketId: Uuid
     /** Full object key/path within the bucket, e.g. "photos/cat.jpg" */
     objectKey: String where self.length > 0
     /** Original client filename */
@@ -83,7 +86,7 @@ struct StoredObject {
     mimeType: String where self.contains("/")
     /** Object size in bytes (non-negative) */
     sizeBytes: Int where self >= 0
-    /** Integrity checksum as a hex digest string (no native bytes/hash type) */
+    /** Integrity checksum as a hex digest string (not a UUID — validated String) */
     checksum: String where self.length > 0
     /** Algorithm used to compute the checksum above */
     checksumAlgorithm: ChecksumAlgorithm
@@ -94,24 +97,24 @@ struct StoredObject {
     encryption: EncryptionMode
     /** Optional opaque version id when bucket versioning is enabled */
     versionId: Option<String> where self.length > 0
-    /** Upload (creation) time, Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
-    /** Last modification time, Unix epoch SECONDS */
-    updatedAt: Int where self >= 0
+    /** Upload (creation) time */
+    createdAt: DateTime
+    /** Last modification time */
+    updatedAt: DateTime
     /** Arbitrary user-supplied key/value tags attached to the object */
     userMetadata: Map<String, String>
 }
 
 /** Aggregate usage stats for a bucket, surfaced on a stats endpoint */
 struct BucketUsage {
-    bucketId: String where self.length > 0
+    bucketId: Uuid
     objectCount: Int where self >= 0
     totalBytes: Int where self >= 0
     folderCount: Int where self >= 0
     /** Bytes counted under the Archive + Cold tiers combined */
     archivedBytes: Int where self >= 0
-    /** Time the usage snapshot was computed, Unix epoch SECONDS */
-    computedAt: Int where self >= 0
+    /** Time the usage snapshot was computed */
+    computedAt: DateTime
 }
 
 /** A multipart upload body: the binary payload plus scalar metadata and an

@@ -20,6 +20,66 @@ fn render_hash_comment_blanks_out_empty_lines() {
     );
 }
 
+/// `single_outer_call` distinguishes black's "explode the call" layout from its
+/// "paren-wrap" layout. The integration `black --check` gate only guards this
+/// when black is installed (it soft-skips otherwise), so pin the branch
+/// boundaries directly. Covers every over-long RHS shape `header_read_coercion`
+/// can emit: a call with a fallback arg, a required-Int call, a truthiness
+/// ternary, a bare-binary expression, and a parenthesized ternary.
+#[test]
+fn single_outer_call_matches_black_layout_choice() {
+    // A single call whose matching close paren is the final char → explode.
+    assert_eq!(
+        single_outer_call("datetime.fromisoformat(raw or \"1970\")"),
+        Some(("datetime.fromisoformat", "raw or \"1970\""))
+    );
+    assert_eq!(
+        single_outer_call("int(raw or 0)"),
+        Some(("int", "raw or 0"))
+    );
+
+    // Ternaries, binary expressions, and bare names → paren-wrap (None).
+    assert_eq!(single_outer_call("int(raw) if raw else None"), None);
+    assert_eq!(single_outer_call("raw or \"\""), None);
+    // Leading `(` gives an empty prefix; a parenthesized ternary is not a call.
+    assert_eq!(
+        single_outer_call("(raw == \"true\") if raw else None"),
+        None
+    );
+    // Two adjacent calls: the first close paren is not the final char.
+    assert_eq!(single_outer_call("foo(a)(b)"), None);
+}
+
+/// `emit_py_assignment` keeps the one-line form under 88 cols, explodes a single
+/// over-long call's own parens, and paren-wraps an over-long non-call RHS — the
+/// three layouts black produces.
+#[test]
+fn emit_py_assignment_reflows_like_black() {
+    // Short assignments stay on one line.
+    assert_eq!(
+        emit_py_assignment("    ", "x", "int(y)"),
+        "    x = int(y)\n"
+    );
+
+    // An over-long single call explodes the call's parens (no trailing comma,
+    // matching black's single-argument right-hand split).
+    let long_call =
+        "datetime.fromisoformat(some_very_long_header_raw or \"1970-01-01T00:00:00+00:00\")";
+    assert_eq!(
+        emit_py_assignment("        ", "some_very_long_header", long_call),
+        "        some_very_long_header = datetime.fromisoformat(\n            \
+         some_very_long_header_raw or \"1970-01-01T00:00:00+00:00\"\n        )\n"
+    );
+
+    // An over-long non-call RHS (binary expression) gets invisible parens.
+    let long_binary =
+        "some_very_long_header_raw or some_other_very_long_fallback_value_goes_here_now";
+    assert_eq!(
+        emit_py_assignment("        ", "some_very_long_header", long_binary),
+        format!("        some_very_long_header = (\n            {long_binary}\n        )\n")
+    );
+}
+
 fn generate_from_source(source: &str) -> PythonFiles {
     let tokens = tokenize(source, SourceId(0));
     let (program, parse_errors) = parser::parse(&tokens);

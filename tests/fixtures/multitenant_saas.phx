@@ -1,12 +1,11 @@
 // Phoenix Gen — a realistic multi-tenant SaaS control-plane API
 //
-// TYPE-MODELING NOTES: Phoenix Gen has no native UUID, DateTime, Decimal/Money,
-// or bytes types. Conventions used throughout:
-//   - IDs are opaque `String`s (no native UUID type).
-//   - Timestamps are Unix epoch SECONDS as `Int` (no native DateTime type) and
-//     are documented as such at each field.
-//   - Soft-delete is modeled as `Bool deleted` plus `Option<Int> deletedAt`
-//     (epoch seconds when the row was tombstoned; absent while live).
+// TYPE-MODELING NOTES. Conventions used throughout:
+//   - Ids use the built-in `Uuid`; timestamps use `DateTime`.
+//   - Opaque single-use tokens and the API-key display prefix stay `String`s —
+//     they are not UUIDs, so a validated String is the honest model.
+//   - Soft-delete is modeled as `Bool deleted` plus `Option<DateTime> deletedAt`
+//     (the tombstone time; absent while live).
 //   - Tenant scoping appears in two styles across the API: a request header
 //     `X-Tenant-Id` (via `as`) on most endpoints, and an explicit `{tenantId}`
 //     PATH PARAM on the tenant-rooted resource tree — both are exercised.
@@ -30,8 +29,8 @@ enum Permission { ReadOnly  Write  Manage  Billing }
 /** A tenant organization — the top-level multi-tenancy boundary. Wide struct
  *  carrying identity, plan, audit, and soft-delete fields */
 struct Organization {
-    /** Opaque org id, also the tenant id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque org id, also the tenant id */
+    id: Uuid
     /** Human-readable display name */
     name: String where self.length > 0 && self.length <= 200
     /** URL-safe slug used in vanity URLs */
@@ -47,49 +46,49 @@ struct Organization {
     suspended: Bool
     /** Soft-delete tombstone flag */
     deleted: Bool
-    /** Epoch SECONDS when soft-deleted; absent while the org is live */
-    deletedAt: Option<Int>
-    /** Creation time as Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
-    /** Last-modified time as Unix epoch SECONDS */
-    updatedAt: Int where self >= 0
-    /** Opaque user id of the creator (no native UUID type — using String) */
-    createdBy: String where self.length > 0
+    /** Tombstone time when soft-deleted; absent while the org is live */
+    deletedAt: Option<DateTime>
+    /** Creation time */
+    createdAt: DateTime
+    /** Last-modified time */
+    updatedAt: DateTime
+    /** Opaque user id of the creator */
+    createdBy: Uuid
     /** Arbitrary tenant-level settings as string key/value pairs */
     settings: Map<String, String>
 }
 
 /** A workspace (project) nested inside an organization */
 struct Workspace {
-    /** Opaque workspace id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque workspace id */
+    id: Uuid
     /** Owning tenant/org id */
-    orgId: String where self.length > 0
+    orgId: Uuid
     name: String where self.length > 0 && self.length <= 120
     /** Optional free-form description */
     description: Option<String> where self.length <= 1000
     /** Whether non-members of the workspace can view it */
     isPublic: Bool
     deleted: Bool
-    /** Epoch SECONDS when soft-deleted; absent while live */
-    deletedAt: Option<Int>
-    /** Creation time as Unix epoch SECONDS */
-    createdAt: Int where self >= 0
-    /** Last-modified time as Unix epoch SECONDS */
-    updatedAt: Int where self >= 0
+    /** Tombstone time when soft-deleted; absent while live */
+    deletedAt: Option<DateTime>
+    /** Creation time */
+    createdAt: DateTime
+    /** Last-modified time */
+    updatedAt: DateTime
     /** Opaque user id of the creator */
-    createdBy: String where self.length > 0
+    createdBy: Uuid
 }
 
 /** A member of an organization — a user bound to a tenant with a role.
  *  Wide struct combining identity, role/permission, audit, and soft-delete */
 struct Member {
-    /** Opaque membership id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque membership id */
+    id: Uuid
     /** Owning tenant/org id */
-    orgId: String where self.length > 0
+    orgId: Uuid
     /** Opaque user id behind this membership */
-    userId: String where self.length > 0
+    userId: Uuid
     displayName: String where self.length > 0 && self.length <= 200
     email: String where self.contains("@") && self.length > 3
     role: Role
@@ -98,61 +97,61 @@ struct Member {
     /** Whether the member's email/seat has been confirmed */
     active: Bool
     deleted: Bool
-    /** Epoch SECONDS when soft-deleted; absent while live */
-    deletedAt: Option<Int>
-    /** Epoch SECONDS of last successful sign-in; absent if never signed in */
-    lastSeenAt: Option<Int>
-    /** Creation time as Unix epoch SECONDS */
-    createdAt: Int where self >= 0
-    /** Last-modified time as Unix epoch SECONDS */
-    updatedAt: Int where self >= 0
+    /** Tombstone time when soft-deleted; absent while live */
+    deletedAt: Option<DateTime>
+    /** Time of last successful sign-in; absent if never signed in */
+    lastSeenAt: Option<DateTime>
+    /** Creation time */
+    createdAt: DateTime
+    /** Last-modified time */
+    updatedAt: DateTime
     /** Opaque user id of whoever provisioned this member */
-    createdBy: String where self.length > 0
+    createdBy: Uuid
 }
 
 /** A seat invitation extended to a prospective member */
 struct Invite {
-    /** Opaque invite id (no native UUID type — using String) */
-    id: String where self.length > 0
-    orgId: String where self.length > 0
+    /** Opaque invite id */
+    id: Uuid
+    orgId: Uuid
     email: String where self.contains("@") && self.length > 3
     /** Role the invitee will receive on acceptance */
     role: Role
     status: InviteStatus
-    /** Opaque single-use acceptance token (no native bytes/UUID type) */
+    /** Opaque single-use acceptance token (not a UUID — validated String) */
     token: String where self.length > 0
-    /** Epoch SECONDS after which the invite is no longer valid */
-    expiresAt: Int where self >= 0
-    /** Creation time as Unix epoch SECONDS */
-    createdAt: Int where self >= 0
+    /** Time after which the invite is no longer valid */
+    expiresAt: DateTime
+    /** Creation time */
+    createdAt: DateTime
     /** Opaque user id of the inviter */
-    createdBy: String where self.length > 0
+    createdBy: Uuid
 }
 
 /** An immutable audit-log entry recording a tenant-scoped action */
 struct AuditEvent {
-    /** Opaque event id (no native UUID type — using String) */
-    id: String where self.length > 0
-    orgId: String where self.length > 0
+    /** Opaque event id */
+    id: Uuid
+    orgId: Uuid
     /** Opaque user id of the actor who performed the action */
-    actorId: String where self.length > 0
+    actorId: Uuid
     /** Action verb, e.g. "member.invited" */
     action: String where self.length > 0 && self.length <= 120
     /** Type of the affected resource, e.g. "workspace" */
     targetType: String where self.length > 0
     /** Opaque id of the affected resource */
-    targetId: String where self.length > 0
-    /** Occurrence time as Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
+    targetId: Uuid
+    /** Occurrence time */
+    createdAt: DateTime
     /** Arbitrary structured context as string key/value pairs */
     metadata: Map<String, String>
 }
 
 /** An API key issued to a tenant for programmatic access */
 struct ApiKey {
-    /** Opaque key id (no native UUID type — using String) */
-    id: String where self.length > 0
-    orgId: String where self.length > 0
+    /** Opaque key id */
+    id: Uuid
+    orgId: Uuid
     /** Human label for the key */
     name: String where self.length > 0 && self.length <= 120
     /** Non-secret display prefix, e.g. "pk_live_" */
@@ -160,12 +159,12 @@ struct ApiKey {
     /** Scopes this key is allowed to exercise */
     scopes: List<Permission>
     revoked: Bool
-    /** Epoch SECONDS of last use; absent if never used */
-    lastUsedAt: Option<Int>
-    /** Creation time as Unix epoch SECONDS */
-    createdAt: Int where self >= 0
+    /** Time of last use; absent if never used */
+    lastUsedAt: Option<DateTime>
+    /** Creation time */
+    createdAt: DateTime
     /** Opaque user id of the issuer */
-    createdBy: String where self.length > 0
+    createdBy: Uuid
 }
 
 // ── Organization endpoints (tenant created/listed at the platform root) ──

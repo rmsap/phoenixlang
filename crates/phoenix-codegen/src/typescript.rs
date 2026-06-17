@@ -2708,6 +2708,25 @@ const FASTIFY_DIALECT: Dialect = Dialect {
     emit_500: emit_fastify_500,
 };
 
+/// Emits a `const body = {reviver}({decode});` body-revival assignment at indent
+/// `si`. When the one-liner exceeds [`PRINT_WIDTH`] the single call argument breaks
+/// onto its own line at `si + 2` with a trailing comma, the way prettier does under
+/// the pinned `trailingComma: "all"`. One split is assumed to suffice: the only
+/// over-width driver here is a long endpoint name in `reviver`, not the (short)
+/// `decode` argument (a single call/cast); a `decode` long enough to need a second
+/// split would drift — the e2e `prettier --check` gate would catch it.
+fn emit_body_revival(body: &mut String, si: &str, reviver: &str, decode: &str) {
+    let one_line = format!("{si}const body = {reviver}({decode});");
+    if one_line.len() <= PRINT_WIDTH {
+        body.push_str(&one_line);
+        body.push('\n');
+    } else {
+        body.push_str(&format!(
+            "{si}const body = {reviver}(\n{si}  {decode},\n{si});\n"
+        ));
+    }
+}
+
 /// Emits the request-decode prelude of a route body — path-param, body, query,
 /// and header locals — into `body`, returning the handler argument list in
 /// declaration order. Shared by the Express and Fastify route emitters, which
@@ -2777,13 +2796,11 @@ fn emit_route_prelude(
             } else {
                 format!("{req}.body as {type_name}")
             };
-            // A `JSON.parse`d body decodes `DateTime` fields to strings; revive
-            // them in place before the handler sees its `Date`-typed fields.
+            // A `JSON.parse`d body decodes `DateTime`/`Uuid`/`Decimal`/`Money`
+            // fields to strings/plain objects; revive them in place before the
+            // handler sees its branded/`Date`-typed fields.
             if body_needs_revival(ep, revivable) {
-                body.push_str(&format!(
-                    "{si}const body = {}({decode});\n",
-                    reviver_name(&type_name)
-                ));
+                emit_body_revival(body, si, &reviver_name(&type_name), &decode);
             } else {
                 body.push_str(&format!("{si}const body = {decode};\n"));
             }

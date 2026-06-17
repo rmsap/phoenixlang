@@ -1,10 +1,8 @@
 // Phoenix Gen — a realistic Social Network API
 //
-// MODELING NOTES (Phoenix Gen has no native DateTime/UUID/bytes types):
-//   * All ids are opaque `String`s (no native UUID type)
-//   * All timestamps are Unix epoch SECONDS as `Int` (no native DateTime type)
-//   * Counts (followers, likes, comments) are non-negative `Int`s
-//   * No native Money/Decimal/bytes types are needed by this domain
+// Ids/tokens use the built-in `Uuid`; timestamps use `DateTime` (RFC 3339).
+// Counts (followers, likes, comments) are non-negative `Int`s. Avatar/media URLs
+// stay `String` (a native URL type is a future slice). No monetary values here.
 //
 // Resource shape: users -> posts -> comments, plus follow graph and an
 // aggregated home feed. Heavy use of omit/pick/partial derivations, both
@@ -30,8 +28,7 @@ enum FollowState { Pending  Accepted  Blocked }
 
 /** A user account and public-ish profile */
 struct User {
-    /** Opaque user id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     /** Unique handle, e.g. "ada" — no leading @, 1..30 chars */
     username: String where self.length > 0 && self.length <= 30
     /** Human display name */
@@ -40,7 +37,7 @@ struct User {
     email: String where self.contains("@") && self.length > 3
     /** Free-form bio/about text */
     bio: String where self.length <= 280
-    /** Avatar image URL, if one has been set */
+    /** Avatar image URL, if one has been set (a native URL type is a future slice) */
     avatarUrl: Option<String> where self.length > 0
     /** Default visibility applied to this user's new posts */
     defaultVisibility: Visibility
@@ -50,16 +47,15 @@ struct User {
     followerCount: Int where self >= 0
     /** Number of accounts this user follows */
     followingCount: Int where self >= 0
-    /** Account creation time, Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
+    /** Account creation time */
+    createdAt: DateTime
 }
 
 /** A post authored by a user */
 struct Post {
-    /** Opaque post id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     /** Id of the authoring user */
-    authorId: String where self.length > 0
+    authorId: Uuid
     /** Post text content */
     content: String where self.length > 0 && self.length <= 5000
     /** Hashtags extracted from the content (without the leading #) */
@@ -76,56 +72,54 @@ struct Post {
     /** Number of times reshared */
     repostCount: Int where self >= 0
     /** Id of the post this one reshares, if it is a repost */
-    repostOfId: Option<String> where self.length > 0
-    /** Creation time, Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
-    /** Last edit time, Unix epoch SECONDS; absent if never edited */
-    editedAt: Option<Int>
+    repostOfId: Option<Uuid>
+    /** Creation time */
+    createdAt: DateTime
+    /** Last edit time; absent if never edited */
+    editedAt: Option<DateTime>
     /** Arbitrary key/value annotations attached by the client */
     annotations: Map<String, String>
 }
 
 /** A comment on a post; threaded via an optional parent comment id */
 struct Comment {
-    /** Opaque comment id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     /** Post this comment belongs to */
-    postId: String where self.length > 0
+    postId: Uuid
     /** Author of the comment */
-    authorId: String where self.length > 0
+    authorId: Uuid
     /** Comment text */
     content: String where self.length > 0 && self.length <= 2000
     /** Parent comment id for threaded replies; absent for top-level comments */
-    parentId: Option<String> where self.length > 0
+    parentId: Option<Uuid>
     /** Number of reactions on this comment */
     reactionCount: Int where self >= 0
-    /** Creation time, Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
+    /** Creation time */
+    createdAt: DateTime
 }
 
 /** A directed follow relationship between two users */
 struct Follow {
     /** The user who initiated the follow */
-    followerId: String where self.length > 0
+    followerId: Uuid
     /** The user being followed */
-    followeeId: String where self.length > 0
+    followeeId: Uuid
     state: FollowState
-    /** When the follow was created, Unix epoch SECONDS */
-    createdAt: Int where self >= 0
+    /** When the follow was created */
+    createdAt: DateTime
 }
 
 /** A reaction placed by a user on a post */
 struct Reaction {
-    /** Opaque reaction id (no native UUID type — using String) */
-    id: String where self.length > 0
+    id: Uuid
     /** Post the reaction is on */
-    postId: String where self.length > 0
+    postId: Uuid
     /** User who reacted */
-    userId: String where self.length > 0
+    userId: Uuid
     /** `kind` is not a reserved word, so it's used directly as the field name */
     kind: ReactionKind
-    /** When the reaction was placed, Unix epoch SECONDS */
-    createdAt: Int where self >= 0
+    /** When the reaction was placed */
+    createdAt: DateTime
 }
 
 /** A single entry in an aggregated home feed: a post plus a denormalized
@@ -144,7 +138,7 @@ struct FeedItem {
  *  default-visibility setting. (Phoenix Gen has no `response ... pick`, so a
  *  read-only projection like this is modeled as its own struct) */
 struct PublicProfile {
-    id: String where self.length > 0
+    id: Uuid
     username: String where self.length > 0 && self.length <= 30
     displayName: String where self.length > 0 && self.length <= 80
     bio: String where self.length <= 280
@@ -156,7 +150,7 @@ struct PublicProfile {
 
 /** Engagement totals for a user's account, surfaced on a stats endpoint */
 struct UserStats {
-    userId: String where self.length > 0
+    userId: Uuid
     totalPosts: Int where self >= 0
     totalReactionsReceived: Int where self >= 0
     totalCommentsReceived: Int where self >= 0
@@ -394,7 +388,7 @@ endpoint listComments: GET "/posts/{postId}/comments" {
         cursor: Option<String>
         limit: Int = 50
         // When set, return only replies under this parent comment
-        parentId: Option<String>
+        parentId: Option<Uuid>
     }
     response List<Comment>
     pagination { cursor }

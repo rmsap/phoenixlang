@@ -4,10 +4,12 @@
 // enum-driven state machines + many admin/back-office endpoints. It is the
 // "wide types + constraints" stress fixture.
 //
-// MODELING NOTES (Phoenix Gen has no native DateTime/UUID/bytes/Money types):
-//   * All ids are opaque `String`s (no native UUID type), doc-commented as such
-//   * All timestamps are Unix epoch SECONDS as `Int` (no native DateTime type)
-//   * Monetary figures (e.g. account credit) are `Int` minor units (cents)
+// MODELING NOTES:
+//   * Ids use the built-in `Uuid`; timestamps use `DateTime`.
+//   * Monetary figures (e.g. account credit) use the built-in `Money`.
+//   * Source IPs have no native type — modeled as a validated `String`.
+//   * Admin/auth tokens (`X-Admin-Token`, the impersonation token) and the
+//     stable feature-flag key are opaque `String`s, NOT `Uuid`s.
 //   * All admin-only endpoints authenticate via the `X-Admin-Token` header
 //
 // Field-naming note: reserved keywords (type/headers/query/where/...) are
@@ -75,8 +77,8 @@ enum NotifyChannel { Email  Sms  Push  Webhook }
  *  exercising the constraint-heavy generation path: nearly every scalar field
  *  carries a `where` clause. */
 struct AdminUser {
-    /** Opaque account id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque account id */
+    id: Uuid
     /** Login handle, 3..32 chars */
     username: String where self.length >= 3 && self.length <= 32
     /** Primary email; must look email-ish */
@@ -92,16 +94,16 @@ struct AdminUser {
     countryCode: String where self.length == 2
     /** IETF locale tag, e.g. "en-US" */
     locale: String where self.length >= 2 && self.length <= 12
-    /** Account credit balance in MINOR UNITS (cents). No native Money type */
-    creditBalance: Int where self >= 0
+    /** Account credit balance (currency-aware: exact decimal + ISO-4217) */
+    creditBalance: Money
     /** Lifetime support tickets opened (non-negative) */
     ticketCount: Int where self >= 0
     /** Failed login attempts since last success (0..100) */
     failedLoginCount: Int where self >= 0 && self <= 100
-    /** Account creation time, Unix epoch SECONDS (no native DateTime type) */
-    createdAt: Int where self >= 0
-    /** Last successful login time, Unix epoch SECONDS; absent if never */
-    lastLoginAt: Option<Int>
+    /** Account creation time */
+    createdAt: DateTime
+    /** Last successful login time; absent if never */
+    lastLoginAt: Option<DateTime>
     /** Internal moderator note; absent when none */
     note: Option<String> where self.length > 0
     /** Arbitrary key/value admin tags attached to the account */
@@ -112,10 +114,10 @@ struct AdminUser {
 
 /** A support ticket in the back-office queue (constraint-dense, 14 fields) */
 struct Ticket {
-    /** Opaque ticket id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque ticket id */
+    id: Uuid
     /** Account that opened the ticket */
-    accountId: String where self.length > 0
+    accountId: Uuid
     /** Short subject line */
     subject: String where self.length > 0 && self.length <= 200
     /** Full ticket body text */
@@ -125,15 +127,15 @@ struct Ticket {
     /** Bucketing category, e.g. "billing" */
     category: String where self.length > 0
     /** Assigned agent account id; absent when unassigned */
-    assigneeId: Option<String> where self.length > 0
+    assigneeId: Option<Uuid>
     /** Number of back-and-forth messages so far (non-negative) */
     messageCount: Int where self >= 0
-    /** Open time, Unix epoch SECONDS */
-    createdAt: Int where self >= 0
-    /** Last-updated time, Unix epoch SECONDS */
-    updatedAt: Int where self >= 0
-    /** Resolution time, Unix epoch SECONDS; absent until resolved */
-    resolvedAt: Option<Int>
+    /** Open time */
+    createdAt: DateTime
+    /** Last-updated time */
+    updatedAt: DateTime
+    /** Resolution time; absent until resolved */
+    resolvedAt: Option<DateTime>
     /** Searchable free-form tags */
     tags: List<String>
     /** Whether the reporter has been notified of the latest update */
@@ -142,8 +144,8 @@ struct Ticket {
 
 /** A background/admin job record (state machine + retry metadata, 12 fields) */
 struct AdminJob {
-    /** Opaque job id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque job id */
+    id: Uuid
     /** Job kind discriminator, e.g. "reindex-search" */
     jobKind: String where self.length > 0
     state: JobState
@@ -153,40 +155,40 @@ struct AdminJob {
     attempts: Int where self >= 0 && self <= 10
     /** Max retry attempts allowed (1..10) */
     maxAttempts: Int where self >= 1 && self <= 10
-    /** Enqueue time, Unix epoch SECONDS */
-    queuedAt: Int where self >= 0
-    /** Start time, Unix epoch SECONDS; absent until started */
-    startedAt: Option<Int>
-    /** Finish time, Unix epoch SECONDS; absent until finished */
-    finishedAt: Option<Int>
+    /** Enqueue time */
+    queuedAt: DateTime
+    /** Start time; absent until started */
+    startedAt: Option<DateTime>
+    /** Finish time; absent until finished */
+    finishedAt: Option<DateTime>
     /** Last error message if the job failed; absent otherwise */
     lastError: Option<String> where self.length > 0
     /** Opaque parameters bag for the job */
     params: Map<String, String>
     /** Account that triggered the job */
-    triggeredBy: String where self.length > 0
+    triggeredBy: Uuid
 }
 
 /** An item sitting in a moderation review queue (review-decision machine) */
 struct ReviewItem {
-    /** Opaque review-item id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque review-item id */
+    id: Uuid
     kind: ReviewKind
     decision: ReviewDecision
     /** Id of the entity under review (account/post/comment/etc.) */
-    subjectId: String where self.length > 0
+    subjectId: Uuid
     /** Account that submitted/flagged the item */
-    reportedBy: String where self.length > 0
+    reportedBy: Uuid
     /** Moderator who rendered the decision; absent while Pending */
-    moderatorId: Option<String> where self.length > 0
+    moderatorId: Option<Uuid>
     /** Computed risk score, 0..100 */
     riskScore: Int where self >= 0 && self <= 100
     /** Reason/notes supplied with the report */
     reason: String where self.length > 0 && self.length <= 1000
-    /** Submission time, Unix epoch SECONDS */
-    createdAt: Int where self >= 0
-    /** Decision time, Unix epoch SECONDS; absent while Pending */
-    decidedAt: Option<Int>
+    /** Submission time */
+    createdAt: DateTime
+    /** Decision time; absent while Pending */
+    decidedAt: Option<DateTime>
 }
 
 /** A feature flag and its rollout configuration (rollout state machine) */
@@ -204,33 +206,33 @@ struct FeatureFlag {
     permanent: Bool
     /** Owning team name */
     owningTeam: String where self.length > 0
-    /** Last toggle time, Unix epoch SECONDS */
-    updatedAt: Int where self >= 0
+    /** Last toggle time */
+    updatedAt: DateTime
     /** Explicit allow-list of account ids forced ON */
-    forcedOnAccounts: List<String>
+    forcedOnAccounts: List<Uuid>
 }
 
 /** An immutable audit-log entry recording an admin action */
 struct AuditEntry {
-    /** Opaque audit-entry id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque audit-entry id */
+    id: Uuid
     actionKind: AuditActionKind
     outcome: AuditOutcome
     /** Admin account that performed the action */
-    actorId: String where self.length > 0
+    actorId: Uuid
     /** Target entity the action was performed on; absent for global actions */
-    targetId: Option<String> where self.length > 0
+    targetId: Option<Uuid>
     /** Source IP the action came from, as a String (no native IP type) */
     sourceIp: String where self.length > 0
-    /** Action time, Unix epoch SECONDS */
-    occurredAt: Int where self >= 0
+    /** Action time */
+    occurredAt: DateTime
     /** Structured key/value detail bag for the action */
     details: Map<String, String>
 }
 
 /** Per-account notification preference row (small struct for pick/partial) */
 struct NotifyPreference {
-    accountId: String where self.length > 0
+    accountId: Uuid
     channel: NotifyChannel
     enabled: Bool
     /** Quiet-hours start, 0..23 (hour of day) */
@@ -246,8 +248,8 @@ struct AdminDashboard {
     openTickets: Int where self >= 0
     pendingReviews: Int where self >= 0
     runningJobs: Int where self >= 0
-    /** Snapshot time, Unix epoch SECONDS */
-    computedAt: Int where self >= 0
+    /** Snapshot time */
+    computedAt: DateTime
 }
 
 /** A pure binary download body: EXACTLY one File field, generating a binary
@@ -260,8 +262,8 @@ struct DataExport {
  *  an optional shared reason. Exercises a list-bearing request body inside a
  *  versioned slice. */
 struct BulkSuspendRequest {
-    /** Account ids to suspend (opaque ids — no native UUID type) */
-    accountIds: List<String>
+    /** Account ids to suspend */
+    accountIds: List<Uuid>
     /** Optional reason recorded on every resulting suspension */
     reason: Option<String> where self.length > 0
 }
@@ -431,7 +433,7 @@ endpoint impersonateUser: POST "/admin/users/{id}/impersonate" {
     }
     response AdminUser headers {
         impersonationToken: String as "X-Impersonation-Token"
-        expiresAt: Int as "X-Expires-At"
+        expiresAt: DateTime as "X-Expires-At"
     }
     error {
         Unauthorized(401)

@@ -5,10 +5,10 @@
 // header to bound replay windows); and (2) OUTBOUND subscription management —
 // CRUD over the subscriptions we deliver to, plus the delivery/attempt records.
 //
-// TYPE-MODELING NOTES: Phoenix Gen has no native DateTime/UUID/bytes/Decimal
-// type, so timestamps are Unix epoch SECONDS (`Int`), all ids are opaque
-// `String`s, the raw signature/secret are `String`s, and there is no first-class
-// "URL" type so destination URLs are validated `String`s.
+// TYPE-MODELING NOTES: ids use the built-in `Uuid`; timestamps use `DateTime`.
+// The signature-replay `X-Webhook-Timestamp` header stays an `Int` (unix seconds,
+// the convention for signature schemes). Destination URLs and signing secrets stay
+// validated `String`s (a native URL/bytes type is a future slice).
 
 // ── Domain enums (simple unit-variant only — codegens on all 4 targets) ──
 
@@ -39,13 +39,13 @@ enum AckOutcome { Accepted  Duplicate  Ignored }
 /** A signed event as RECEIVED from the upstream provider. The provider signs
  *  the raw body; we re-expose the parsed envelope here */
 struct InboundEvent {
-    /** Opaque provider event id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque provider event id */
+    id: Uuid
     eventType: EventType
     /** Provider account/tenant this event belongs to */
-    accountId: String where self.length > 0
-    /** Event creation time as Unix epoch SECONDS. No native DateTime type */
-    createdAt: Int where self >= 0
+    accountId: Uuid
+    /** Event creation time */
+    createdAt: DateTime
     /** Monotonic schema version of the event payload */
     apiVersion: Int where self >= 1
     /** Flattened, stringified payload (no native JSON/Any type — Map of
@@ -57,8 +57,8 @@ struct InboundEvent {
 
 /** A destination we deliver outbound events to */
 struct Subscription {
-    /** Opaque subscription id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque subscription id */
+    id: Uuid
     /** Human-readable label for dashboards */
     description: String where self.length <= 200
     /** HTTPS destination URL (no native URL type — validated String) */
@@ -70,18 +70,18 @@ struct Subscription {
     secret: String where self.length >= 16
     /** Custom headers injected on every delivery to this destination */
     customHeaders: Map<String, String>
-    /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    createdAt: Int where self >= 0
+    /** Creation time */
+    createdAt: DateTime
 }
 
 /** One delivery attempt of one event to one subscription */
 struct Delivery {
-    /** Opaque delivery id (no native UUID type — using String) */
-    id: String where self.length > 0
+    /** Opaque delivery id */
+    id: Uuid
     /** The subscription this delivery targets */
-    subscriptionId: String where self.length > 0
+    subscriptionId: Uuid
     /** The source event being delivered */
-    eventId: String where self.length > 0
+    eventId: Uuid
     eventType: EventType
     status: DeliveryStatus
     /** Number of attempts made so far */
@@ -92,21 +92,21 @@ struct Delivery {
     responseCode: Option<Int>
     /** Truncated response body captured from the destination, if any */
     responseBody: Option<String> where self.length > 0
-    /** Unix epoch SECONDS of the next scheduled retry, if still retrying */
-    nextRetryAt: Option<Int>
-    /** Creation time as Unix epoch SECONDS. No native DateTime type */
-    createdAt: Int where self >= 0
+    /** Time of the next scheduled retry, if still retrying */
+    nextRetryAt: Option<DateTime>
+    /** Creation time */
+    createdAt: DateTime
 }
 
 /** The acknowledgement a receiver returns after validating an inbound event */
 struct AckReceipt {
     /** Echoes the provider event id we accepted */
-    eventId: String where self.length > 0
+    eventId: Uuid
     outcome: AckOutcome
     /** Our internal ingestion id assigned to the accepted event, if stored */
-    ingestId: Option<String> where self.length > 0
-    /** Receipt time as Unix epoch SECONDS. No native DateTime type */
-    receivedAt: Int where self >= 0
+    ingestId: Option<Uuid>
+    /** Receipt time */
+    receivedAt: DateTime
 }
 
 // ── Inbound receiver endpoints (signature + timestamp headers) ──

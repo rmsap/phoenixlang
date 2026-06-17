@@ -2902,3 +2902,36 @@ Sema position-restriction tests (`check_endpoint`): a `Money` (or `Option`/`List
 of it) in query-param or header position is rejected; struct/body/response use is
 accepted. All 16 round-trips (4 base + 3 DateTime + 3 UUID + 3 Decimal + 3 Money)
 and all four compile-lint targets are green; 239 codegen lib tests show no drift.
+
+### Fixture library adopts the new types (2026-06-17)
+
+The realistic fixture library (`payments`, `social`, `webhooks`, `file_storage`,
+`internal_admin`, `multitenant_saas` under `tests/fixtures/*.phx` — all in
+`FILE_FIXTURES`, so each runs through the compile-lint harness on all four targets
+and both server frameworks) was migrated off the old placeholder modeling — opaque-`String` ids,
+`Int` epoch-seconds timestamps, `Int` minor-unit amounts — to the built-in types
+that motivated the slices: ids → `Uuid`, timestamps → `DateTime`, currency amounts
+→ `Money` (`payments`' charge/refund/line-item amounts, `internal_admin`'s account
+credit), and the capture-amount query param → `Decimal` (a `Money` composite isn't
+URL-encodable). The honest exclusions are kept and re-commented: the `file_storage`
+**multipart** upload body (`ObjectUpload`) stays all-`String`/`Int` — its object
+key stays a validated `String`, not a `Uuid` (the composite scalars are rejected
+in multipart); checksums/etags/opaque tokens/IPs/the feature-flag key stay
+validated `String`s (they are not UUIDs); webhook signature-replay header timestamps
+stay `Int` epoch (the convention for signature schemes); and the `internal_admin`
+deliberate trailing-period doc-comment repro is preserved verbatim.
+
+**Two formatter fixes surfaced by the new code paths** (both were dead branches
+until a real fixture exercised them, both are width-conditional so no snapshot
+drifted):
+- **Python `emit_py_assignment`** (response-header decode): an over-88-col
+  assignment whose RHS is a single call (`expires_at =
+  datetime.fromisoformat(raw or "…")`, from `internal_admin`'s now-`DateTime`
+  `X-Expires-At` header) must explode the *call's* parens, not wrap the RHS in
+  extra invisible parens — black does the former for a call, the latter only for
+  ternaries/binary expressions. Added `single_outer_call` to distinguish them.
+- **TypeScript server body revival**: `const body =
+  reviveXBody(validateXBody(req.body));` overflows 80 cols once a body needs
+  revival (Money/Uuid in `payments`' Customer/Charge create bodies) and the
+  endpoint name is long; made it break one-arg-per-line with a trailing comma, the
+  way prettier does.

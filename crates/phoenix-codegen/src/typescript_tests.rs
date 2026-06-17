@@ -33,6 +33,33 @@ fn render_jsdoc_trims_whitespace_only_lines() {
     );
 }
 
+/// `emit_body_revival` keeps the one-line form under [`PRINT_WIDTH`] and otherwise
+/// breaks the single call argument onto its own line at `si + 2` with a trailing
+/// comma — the two layouts prettier produces under the pinned `trailingComma:
+/// "all"`. The integration `prettier --check` gate only guards this when prettier
+/// is installed (it soft-skips otherwise), so pin the branch boundary directly.
+#[test]
+fn emit_body_revival_reflows_like_prettier() {
+    // A short revival stays on one line.
+    let mut short = String::new();
+    emit_body_revival(&mut short, "    ", "reviveXBody", "validateXBody(req.body)");
+    assert_eq!(
+        short,
+        "    const body = reviveXBody(validateXBody(req.body));\n"
+    );
+
+    // An over-80-col revival breaks the argument onto its own line at `si + 2`
+    // with a trailing comma (prettier's single-argument call split).
+    let mut long = String::new();
+    let reviver = "reviveCreateOrganizationMemberBody";
+    let decode = "validateCreateOrganizationMemberBody(request.body)";
+    emit_body_revival(&mut long, "      ", reviver, decode);
+    assert_eq!(
+        long,
+        format!("      const body = {reviver}(\n        {decode},\n      );\n")
+    );
+}
+
 /// Parses, type-checks, and generates TypeScript from a Phoenix source string.
 fn generate_from_source(source: &str) -> GeneratedFiles {
     let tokens = tokenize(source, SourceId(0));

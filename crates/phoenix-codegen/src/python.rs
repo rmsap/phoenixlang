@@ -2324,18 +2324,78 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
     emit_py_assignment("        ", snake, &rhs)
 }
 
-/// Renders a single `lhs = rhs` assignment, wrapping the RHS in parentheses one
-/// indent level deeper when the one-line form would exceed [`LINE_LENGTH`] — the
-/// layout black produces for an over-long assignment. Keeps generated coercions
-/// (whose `lhs`/`rhs` both embed the header's snake_case name, so a long name can
-/// push past 88 columns) formatter-clean. Returns the line(s) with a trailing
-/// newline.
+/// Renders a single `lhs = rhs` assignment, reflowing the RHS when the one-line
+/// form would exceed [`LINE_LENGTH`] exactly as black would. Keeps generated
+/// coercions (whose `lhs`/`rhs` both embed the header's snake_case name, so a long
+/// name — or a `datetime.fromisoformat(...)` parse — can push past 88 columns)
+/// formatter-clean. Returns the line(s) with a trailing newline.
+///
+/// Black has two layouts for an over-long assignment: when the RHS is a single
+/// call wrapping the whole expression (`name(...)` with the outer `)` as the final
+/// char), it explodes that call's parens; otherwise (ternaries, bare names, binary
+/// expressions) it wraps the RHS in invisible parens one indent deeper.
+///
+/// Both layouts emit the wrapped fragment (`inner` / `rhs`) on a SINGLE line at
+/// `indent + 4` — i.e. they assume one level of splitting suffices. That holds for
+/// the generated coercion RHSs (bounded header names + a fixed-width zero-value
+/// fallback never overflow 88 cols once indented one level deeper); if a future
+/// caller passes a fragment long enough to need a second split, black would
+/// recurse and this output would drift (the e2e `black --check` gate would catch
+/// it).
 fn emit_py_assignment(indent: &str, lhs: &str, rhs: &str) -> String {
     let one_line = format!("{indent}{lhs} = {rhs}");
     if one_line.len() <= LINE_LENGTH {
         return format!("{one_line}\n");
     }
+    if let Some((prefix, inner)) = single_outer_call(rhs) {
+        return format!("{indent}{lhs} = {prefix}(\n{indent}    {inner}\n{indent})\n");
+    }
     format!("{indent}{lhs} = (\n{indent}    {rhs}\n{indent})\n")
+}
+
+/// If `rhs` is a single call expression — a dotted-identifier prefix followed by a
+/// paren group whose matching close paren is the final char (`int(x)`,
+/// `datetime.fromisoformat(x or "…")`) — returns `(prefix, inner)` where both the
+/// `prefix` and the `inner` argument text are trimmed. Used to mirror black's
+/// "explode the call" layout for an over-long assignment; returns `None` for
+/// ternaries, bare names, and binary expressions (which black paren-wraps instead).
+///
+/// Paren depth is counted naively (it does not skip parens inside string
+/// literals), which is sufficient for the generated coercion RHSs — their only
+/// string literals are paren-free zero-value fallbacks.
+///
+/// The caller's explode layout (`emit_py_assignment`) emits `inner` on a single
+/// line with no trailing comma, so it is only faithful to black for a
+/// *comma-free* (single-argument) call — black delimiter-splits a multi-argument
+/// call one-per-line with a trailing comma. Every generated coercion RHS is
+/// single-argument (`int(…)`, `datetime.fromisoformat(…)`, `UUID(…)`,
+/// `Decimal(…)`), so this holds; a future multi-argument caller would need the
+/// delimiter-split layout instead.
+fn single_outer_call(rhs: &str) -> Option<(&str, &str)> {
+    let open = rhs.find('(')?;
+    let prefix = rhs[..open].trim();
+    if prefix.is_empty()
+        || !prefix
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let bytes = rhs.as_bytes();
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (i == bytes.len() - 1).then(|| (prefix, rhs[open + 1..i].trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Renders `text` as one or more Python `#` comments, each prefixed with
