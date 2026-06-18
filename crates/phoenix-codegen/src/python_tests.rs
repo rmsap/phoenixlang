@@ -1116,6 +1116,19 @@ fn default_value_conversions() {
     assert_eq!(default_value_to_python(&DefaultValue::Bool(false)), "False");
 }
 
+/// `py_default_for` resolves an enum default to its SCREAMING_SNAKE member, and
+/// must reach the bare enum class even when the param is `Option<Enum>` (whose
+/// `py_type` renders as `"<Class> | None"`) — otherwise it would emit the
+/// syntactically invalid `Color | None.RED`.
+#[test]
+fn enum_default_strips_optional_suffix() {
+    let d = DefaultValue::Enum("Red".into());
+    assert_eq!(py_default_for(&d, "Color"), "Color.RED");
+    assert_eq!(py_default_for(&d, "Color | None"), "Color.RED");
+    // Non-enum defaults are unaffected by the `py_type`.
+    assert_eq!(py_default_for(&DefaultValue::Int(7), "int | None"), "7");
+}
+
 /// `dyn Trait` erases to the trait name — callers are expected to have
 /// a matching Protocol / ABC defined in hand-written Python.
 #[test]

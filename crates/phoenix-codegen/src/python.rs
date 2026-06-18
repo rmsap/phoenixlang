@@ -833,6 +833,15 @@ impl<'a> PyGenerator<'a> {
             if !ep.response_headers.is_empty() {
                 imports.insert(format!("{}Result", capitalize(&ep.name)));
             }
+            // Enum query/request-header param types are named in the method
+            // signature; enum response-header types are constructed on read
+            // (`Color(raw)`). `collect_python_imports` adds only user models.
+            for q in &ep.query_params {
+                collect_python_imports(&q.ty, &mut imports);
+            }
+            for h in ep.headers.iter().chain(ep.response_headers.iter()) {
+                collect_python_imports(&h.ty, &mut imports);
+            }
         }
         if !imports.is_empty() {
             let joined: Vec<_> = imports.into_iter().collect();
@@ -927,7 +936,7 @@ impl<'a> PyGenerator<'a> {
                     let default = qp
                         .default_value
                         .as_ref()
-                        .map(default_value_to_python)
+                        .map(|d| py_default_for(d, &py_type))
                         .unwrap_or_else(|| "None".to_string());
                     params.push(format!(
                         "{}: {} = {}",
@@ -947,7 +956,7 @@ impl<'a> PyGenerator<'a> {
                     let default = hp
                         .default_value
                         .as_ref()
-                        .map(default_value_to_python)
+                        .map(|d| py_default_for(d, &py_type))
                         .unwrap_or_else(|| "None".to_string());
                     params.push(format!(
                         "{}: {} = {}",
@@ -994,6 +1003,10 @@ impl<'a> PyGenerator<'a> {
                     // httpx would stringify a `UUID`/`Decimal` to its canonical form
                     // anyway, but make it explicit so the wire value is unambiguous.
                     Type::Uuid | Type::Decimal => format!("str({snake})"),
+                    // An enum is a `(str, Enum)` — send its `.value` so the wire
+                    // string is the bare variant (`str(enum)` would emit
+                    // `Color.Red`).
+                    Type::Named(_) => format!("{snake}.value"),
                     _ => snake.clone(),
                 };
                 self.client_out.push_str(&format!(
@@ -1030,6 +1043,9 @@ impl<'a> PyGenerator<'a> {
                     // RFC 3339 on the wire; `str(datetime)` would use Python's
                     // space-separated layout, which the peer's ISO parse rejects.
                     Type::DateTime => format!("{snake}.isoformat()"),
+                    // An enum is a `(str, Enum)` — send its `.value` (the bare
+                    // variant), not `str(enum)` which emits `Color.Red`.
+                    Type::Named(_) => format!("{snake}.value"),
                     _ => format!("str({snake})"),
                 };
                 if is_nullable {
@@ -1328,6 +1344,14 @@ impl<'a> PyGenerator<'a> {
             if !ep.response_headers.is_empty() {
                 imports.insert(format!("{}Result", capitalize(&ep.name)));
             }
+            // Enum query/request-header param types are named in the handler
+            // signature (response-header enums travel inside the imported envelope).
+            for q in &ep.query_params {
+                collect_python_imports(&q.ty, &mut imports);
+            }
+            for h in &ep.headers {
+                collect_python_imports(&h.ty, &mut imports);
+            }
         }
         if !imports.is_empty() {
             let joined: Vec<_> = imports.into_iter().collect();
@@ -1598,6 +1622,14 @@ impl<'a> PyGenerator<'a> {
             }
             // The route returns `result.body`, so the envelope type itself is not
             // imported; only the body's component types (above) are referenced.
+            // Enum query/request-header param types ARE named in the route
+            // signature (FastAPI validates them), so import those.
+            for q in &ep.query_params {
+                collect_python_imports(&q.ty, &mut model_imports);
+            }
+            for h in &ep.headers {
+                collect_python_imports(&h.ty, &mut model_imports);
+            }
         }
         self.server_out.push_str("from .handlers import Handlers\n");
         if !model_imports.is_empty() {
@@ -1752,7 +1784,7 @@ impl<'a> PyGenerator<'a> {
                 let default = qp
                     .default_value
                     .as_ref()
-                    .map(default_value_to_python)
+                    .map(|d| py_default_for(d, &py_type))
                     .unwrap_or_else(|| "None".to_string());
                 if needs_alias {
                     defaulted.push(format!(
@@ -1787,7 +1819,7 @@ impl<'a> PyGenerator<'a> {
                 let default = hp
                     .default_value
                     .as_ref()
-                    .map(default_value_to_python)
+                    .map(|d| py_default_for(d, &py_type))
                     .unwrap_or_else(|| "None".to_string());
                 defaulted.push(format!(
                     "{snake}: {py_type} = Header({default}, alias=\"{}\")",
@@ -1982,6 +2014,9 @@ impl<'a> PyGenerator<'a> {
                     Type::Bool => format!("\"true\" if result.{snake} else \"false\""),
                     // RFC 3339 on the wire (guarded by `is not None` when optional).
                     Type::DateTime => format!("result.{snake}.isoformat()"),
+                    // An enum is a `(str, Enum)` — write its `.value` (the bare
+                    // variant), not `str(enum)` which emits `Color.Red`.
+                    Type::Named(_) => format!("result.{snake}.value"),
                     _ => format!("str(result.{snake})"),
                 };
                 if is_optional {
@@ -2294,6 +2329,8 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
             Type::DateTime => format!("datetime.fromisoformat({raw}) if {raw} else None"),
             Type::Uuid => format!("UUID({raw}) if {raw} else None"),
             Type::Decimal => format!("Decimal({raw}) if {raw} else None"),
+            // An enum is constructed from its wire value (`Color(raw)`).
+            Type::Named(n) => format!("{n}({raw}) if {raw} else None"),
             // `str` (and any unmodeled scalar) passes through untouched.
             _ => raw.clone(),
         }
@@ -2318,6 +2355,9 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
             // The `0` fallback only narrows the `str | None` read; a required
             // header is contractually present on the wire.
             Type::Decimal => format!("Decimal({raw} or \"0\")"),
+            // An enum is constructed from its wire value; the `or ""` only narrows
+            // the `str | None` read (a required header is contractually present).
+            Type::Named(n) => format!("{n}({raw} or \"\")"),
             _ => format!("{raw} or \"\""),
         }
     };
@@ -2480,19 +2520,7 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
-/// Converts a PascalCase name to SCREAMING_SNAKE_CASE for Python enum values.
-fn to_screaming_snake(s: &str) -> String {
-    let mut result = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            result.push('_');
-        }
-        result.push(c.to_uppercase().next().unwrap_or(c));
-    }
-    result
-}
-
-use crate::capitalize;
+use crate::{capitalize, to_screaming_snake};
 
 /// Builds a Python f-string URL expression from a Phoenix path pattern.
 ///
@@ -2530,6 +2558,23 @@ fn format_python_float(v: f64) -> String {
     if s.contains('.') { s } else { format!("{s}.0") }
 }
 
+/// Renders a query/header param's default value, resolving an enum default to
+/// `<EnumClass>.<Variant>`. The enum class is `py_type` with any `Option`
+/// rendering (`"<Class> | None"`, from `Option<Enum> = Variant`) stripped — the
+/// member reference must name the bare class. Other defaults delegate to
+/// [`default_value_to_python`].
+fn py_default_for(val: &DefaultValue, py_type: &str) -> String {
+    match val {
+        // The generated enum member is the SCREAMING_SNAKE form of the variant
+        // (`Color.RED`, not `Color.Red`); the value stays the bare variant string.
+        DefaultValue::Enum(v) => {
+            let class = py_type.strip_suffix(" | None").unwrap_or(py_type);
+            format!("{class}.{}", to_screaming_snake(v))
+        }
+        other => default_value_to_python(other),
+    }
+}
+
 /// Converts a `DefaultValue` to a Python literal.
 fn default_value_to_python(val: &DefaultValue) -> String {
     match val {
@@ -2538,6 +2583,14 @@ fn default_value_to_python(val: &DefaultValue) -> String {
         DefaultValue::String(v) => format!("\"{}\"", v),
         DefaultValue::Bool(true) => "True".to_string(),
         DefaultValue::Bool(false) => "False".to_string(),
+        // An enum default needs its `<EnumName>.<Variant>` reference, which
+        // requires the param's enum type name not available here. Every enum param
+        // is in `param_enums` (see `param_enum_names`), so `py_default_for` renders
+        // it before reaching this helper — no fallback can be correct here (a bare
+        // variant would not be a valid member reference).
+        DefaultValue::Enum(_) => {
+            unreachable!("enum query/header default is rendered by py_default_for at the call site")
+        }
     }
 }
 

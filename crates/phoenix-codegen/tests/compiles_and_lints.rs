@@ -570,6 +570,58 @@ endpoint getBalance: GET "/balance" {
 }
 "#;
 
+/// Exercises simple enums in query/header param positions across every
+/// target-specific path: an `Option<enum>` query param (`color`), an enum query
+/// param WITH a default (`size = Medium` — the `is_optional`-with-default branch,
+/// and the enum-default rendering: TS `"Medium"`, Go `SizeMedium`, Python
+/// `Size.MEDIUM`, OpenAPI `default`), a required enum REQUEST header
+/// (`preferredColor`) and an `Option<enum>` header (`fallbackColor`), plus a
+/// required and `Option<enum>` RESPONSE header (`chosen`/`alt`). `listItems` has
+/// an `error { }` block (so the catch maps both `ValidationError`→400 and the
+/// declared error); `pickColor` has NONE (exercising the catch-binding path when
+/// only the enum 400 guard is present). The server validates the wire string into
+/// the typed enum on every target (TS `parse<Enum>`→`ValidationError`, Go
+/// `Valid()`→400, Python FastAPI enum coercion→422), the headline soundness win
+/// of the slice. `Tier` is used ONLY as a response header (`pickColor`'s `tier`)
+/// and nowhere in a query/request header, so it is NOT a param-enum: it pins the
+/// response-header-only path — the type is still imported and the client casts it
+/// on read, but no `parse<Enum>`/`Valid()` is emitted for it.
+const ENUM_PARAM_SCHEMA: &str = r#"
+enum Color { Red  Green  Blue }
+enum Size { Small  Medium  Large }
+enum Tier { Free  Pro }
+
+struct Item {
+    id: Uuid
+    color: Color
+    size: Size
+}
+
+endpoint listItems: GET "/items" {
+    headers {
+        preferredColor: Color as "X-Preferred-Color"
+        fallbackColor: Option<Color> as "X-Fallback-Color"
+    }
+    query {
+        color: Option<Color>
+        size: Size = Medium
+    }
+    response List<Item>
+    error { Unauthorized(401) }
+}
+
+endpoint pickColor: GET "/pick" {
+    query {
+        color: Color = Red
+    }
+    response Item headers {
+        chosen: Color as "X-Chosen-Color"
+        alt: Option<Color> as "X-Alt-Color"
+        tier: Tier as "X-Tier"
+    }
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -794,6 +846,8 @@ fn go_output_compiles_and_lints() {
     check_go_output(&generate_go_files(MONEY_SCHEMA));
     // `Money` as the file's last definition (no trailing user struct).
     check_go_output(&generate_go_files(MONEY_ONLY_SCHEMA));
+    // Enum query/header params (server `Valid()` validation + 400).
+    check_go_output(&generate_go_files(ENUM_PARAM_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -827,6 +881,7 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(DECIMAL_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_ONLY_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(ENUM_PARAM_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -886,6 +941,7 @@ fn openapi_output_lints() {
     check_openapi_output("DECIMAL_SCHEMA", DECIMAL_SCHEMA);
     check_openapi_output("MONEY_SCHEMA", MONEY_SCHEMA);
     check_openapi_output("MONEY_ONLY_SCHEMA", MONEY_ONLY_SCHEMA);
+    check_openapi_output("ENUM_PARAM_SCHEMA", ENUM_PARAM_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -1014,6 +1070,8 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(MONEY_SCHEMA));
     // `Money` as the file's last definition (no trailing user struct).
     check_typescript_output(&scaffold, &generate_typescript_files(MONEY_ONLY_SCHEMA));
+    // Enum query/header params: `parse<Enum>` validator + ValidationError → 400.
+    check_typescript_output(&scaffold, &generate_typescript_files(ENUM_PARAM_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1163,6 +1221,12 @@ fn python_output_compiles_and_lints() {
         &scaffold,
         &venv_bin,
         &generate_python_files(MONEY_ONLY_SCHEMA),
+    );
+    // Enum query/header params: FastAPI enum coercion (422) + enum defaults.
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(ENUM_PARAM_SCHEMA),
     );
 
     // Realistic schema fixture library (see FILE_FIXTURES).

@@ -329,6 +329,11 @@ pub enum DefaultValue {
     String(String),
     /// A boolean default: `true` or `false`.
     Bool(bool),
+    /// A simple (unit-variant) enum default, carrying the variant name, e.g.
+    /// `Normal` for a `priority: TicketStatus = Normal` query/header param. The
+    /// variant is validated against the declared enum type during endpoint
+    /// checking; generators emit the target-specific variant reference.
+    Enum(String),
 }
 
 /// Information about a resolved query parameter in an endpoint.

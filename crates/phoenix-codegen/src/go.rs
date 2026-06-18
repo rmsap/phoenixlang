@@ -242,6 +242,10 @@ struct GoGenerator<'a> {
     /// Whether handlers.go needs an `"io"` import (a binary-download handler
     /// returns `io.Reader`).
     handlers_needs_io: bool,
+    /// Names of simple enums used in a query/request-header param, so the enum
+    /// type gets a `Valid()` method the server decode path checks (rejecting an
+    /// unknown variant with 400). Computed once in [`Self::generate`].
+    param_enums: BTreeSet<String>,
     /// The server framework `server.go` targets.
     framework: GoServerFramework,
 }
@@ -275,12 +279,14 @@ impl<'a> GoGenerator<'a> {
             server_needs_io: false,
             file_upload_emitted: false,
             handlers_needs_io: false,
+            param_enums: BTreeSet::new(),
         }
     }
 
     /// Generates `types.go`, `client.go`, `handlers.go`, and `server.go`
     /// from the program AST.
     fn generate(mut self, program: &Program) -> GoFiles {
+        self.param_enums = crate::param_enum_names(program, self.check_result);
         // ── types.go (body — header/imports composed at end) ────
         // The composite `Money` built-in (struct + `Validate()` + the ISO-4217
         // `currencyCodes` set), once, before the user structs that may embed it.
@@ -659,6 +665,17 @@ impl<'a> GoGenerator<'a> {
             ));
         }
         self.types_out.push_str(")\n\n");
+
+        // A `Valid()` method for enums used in a query/request-header param: the
+        // server decode path calls it to reject an unknown variant with 400.
+        if self.param_enums.contains(&e.name) {
+            self.types_out.push_str(&format!(
+                "// Valid reports whether {name} is a defined variant.\nfunc ({recv} {name}) Valid() bool {{\n\tswitch {recv} {{\n\tcase {cases}:\n\t\treturn true\n\tdefault:\n\t\treturn false\n\t}}\n}}\n\n",
+                name = e.name,
+                recv = "v",
+                cases = names.join(", "),
+            ));
+        }
     }
 
     /// Emits a derived Go struct for an endpoint body type.
@@ -2082,10 +2099,12 @@ impl<'a> GoGenerator<'a> {
     /// Required params parse into a value (using the declared default, else the
     /// Go zero value); optional `Option<T>` params parse into a `*T` that stays
     /// nil when the parameter is absent or malformed. Numeric/bool parsing pulls
-    /// in `strconv`; enum (named) params are produced via a direct `T(v)` string
-    /// conversion, since Phoenix enums lower to `type T string`. That conversion
-    /// is unchecked — an out-of-range value reaches the handler as-is, matching
-    /// how Gen represents enums everywhere else (no runtime validation).
+    /// in `strconv`. Named string-backed params (Phoenix enums lower to
+    /// `type T string`) are produced via a direct `T(v)` conversion. A param-enum
+    /// (in [`Self::param_enums`]) is additionally validated against the generated
+    /// `Valid()` method, rejecting an unknown variant — or a missing required
+    /// value — with 400; the other named types (`Uuid`/`Decimal`) stay unchecked,
+    /// reaching the handler as-is (an out-of-range value 500s rather than 400s).
     fn emit_query_param_parse(&mut self, qp: &QueryParamInfo) {
         let camel = to_camel(&qp.name);
         let name = &qp.name;
@@ -2125,8 +2144,17 @@ impl<'a> GoGenerator<'a> {
                         "var {camel} *time.Time\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tif t, err := time.Parse(time.RFC3339, v); err == nil {{\n\t\t\t\t{camel} = &t\n\t\t\t}}\n\t\t}}\n"
                     )
                 }
+                Type::Named(n) if self.param_enums.contains(n) => {
+                    // Enum: convert the raw value and validate it against the
+                    // defined variants, rejecting an unknown one with 400.
+                    let go_type = type_to_go(inner);
+                    format!(
+                        "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\tif !cv.Valid() {{\n\t\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &cv\n\t\t}}\n"
+                    )
+                }
                 other => {
-                    // Enum / named string-backed type: convert the raw value.
+                    // Other named string-backed types (`Uuid`/`Decimal`): convert
+                    // the raw value unchecked, matching their body/field handling.
                     let go_type = type_to_go(other);
                     format!(
                         "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\t{camel} = &cv\n\t\t}}\n"
@@ -2178,8 +2206,23 @@ impl<'a> GoGenerator<'a> {
                         "{camel} := time.Time{{}}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\t{camel}, _ = time.Parse(time.RFC3339, v)\n\t\t}}\n"
                     )
                 }
+                Type::Named(n) if self.param_enums.contains(n) => {
+                    // Enum: seed from the default variant (or the empty string when
+                    // none), overwrite from the query, then validate the final value
+                    // — rejecting an unknown variant (or a missing required param)
+                    // with 400.
+                    let go_type = type_to_go(inner);
+                    let seed = match &qp.default_value {
+                        Some(DefaultValue::Enum(v)) => format!("{go_type}{v}"),
+                        _ => format!("{go_type}(\"\")"),
+                    };
+                    format!(
+                        "{camel} := {seed}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\t{camel} = {go_type}(v)\n\t\t}}\n\t\tif !{camel}.Valid() {{\n\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
+                    )
+                }
                 other => {
-                    // Enum / named string-backed type: convert the raw value.
+                    // Other named string-backed types (`Uuid`/`Decimal`): unchecked
+                    // string conversion, matching their body/field handling.
                     let go_type = type_to_go(other);
                     format!("{camel} := {go_type}(r.URL.Query().Get(\"{name}\"))\n")
                 }
@@ -2231,7 +2274,16 @@ impl<'a> GoGenerator<'a> {
                         "var {camel} *time.Time\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tif t, err := time.Parse(time.RFC3339, v); err == nil {{\n\t\t\t\t{camel} = &t\n\t\t\t}}\n\t\t}}\n"
                     )
                 }
+                Type::Named(n) if self.param_enums.contains(n) => {
+                    // Enum header: convert + validate, rejecting an unknown variant
+                    // with 400.
+                    let go_type = type_to_go(inner);
+                    format!(
+                        "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\tif !cv.Valid() {{\n\t\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &cv\n\t\t}}\n"
+                    )
+                }
                 other => {
+                    // Other named string-backed types (`Uuid`/`Decimal`): unchecked.
                     let go_type = type_to_go(other);
                     format!(
                         "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\t{camel} = &cv\n\t\t}}\n"
@@ -2282,7 +2334,20 @@ impl<'a> GoGenerator<'a> {
                         "{camel} := time.Time{{}}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel}, _ = time.Parse(time.RFC3339, v)\n\t\t}}\n"
                     )
                 }
+                Type::Named(n) if self.param_enums.contains(n) => {
+                    // Enum required header: seed from the default variant (or
+                    // empty), overwrite when present, validate.
+                    let go_type = type_to_go(inner);
+                    let seed = match &h.default_value {
+                        Some(DefaultValue::Enum(v)) => format!("{go_type}{v}"),
+                        _ => format!("{go_type}(\"\")"),
+                    };
+                    format!(
+                        "{camel} := {seed}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel} = {go_type}(v)\n\t\t}}\n\t\tif !{camel}.Valid() {{\n\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
+                    )
+                }
                 other => {
+                    // Other named string-backed types (`Uuid`/`Decimal`): unchecked.
                     let go_type = type_to_go(other);
                     format!("{camel} := {go_type}(r.Header.Get(\"{wire}\"))\n")
                 }
@@ -2842,6 +2907,16 @@ fn default_value_to_go(val: &DefaultValue) -> String {
         DefaultValue::String(v) => format!("\"{}\"", v),
         DefaultValue::Bool(true) => "true".to_string(),
         DefaultValue::Bool(false) => "false".to_string(),
+        // An enum default needs its `<EnumName><Variant>` constant, which requires
+        // the param's enum type name not available here. Every enum param is in
+        // `param_enums` (see `param_enum_names`), so `emit_query_param_parse` /
+        // `emit_header_param_parse` render the seed before reaching this helper —
+        // no fallback can be correct here (a bare variant would not compile).
+        DefaultValue::Enum(_) => {
+            unreachable!(
+                "enum query/header default is rendered at the call site (param_enums branch)"
+            )
+        }
     }
 }
 

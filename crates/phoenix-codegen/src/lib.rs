@@ -49,12 +49,53 @@ pub enum GenMode {
 
 // The capitalization rule for generated type names lives in `phoenix-common`
 // so sema's envelope-collision check uses the exact same function — see
-// `phoenix_common::idents::capitalize`.
-pub(crate) use phoenix_common::capitalize;
+// `phoenix_common::idents::capitalize`. `to_screaming_snake` is shared by the
+// Python and TypeScript backends so the enum-value/const casing cannot drift.
+pub(crate) use phoenix_common::{capitalize, to_screaming_snake};
 
 use phoenix_parser::ast::{Declaration, Program};
 use phoenix_sema::Analysis;
 use phoenix_sema::types::Type;
+use std::collections::BTreeSet;
+
+/// The set of simple (unit-variant) enum names used in any query param or request
+/// header (a single `Option<…>` layer unwrapped). Shared by the Go and TypeScript
+/// backends, which both gate inbound enum validation on it: Go emits a `Valid()`
+/// method, TS a `parse<Enum>` validator + `ValidationError → 400` mapping.
+/// Response headers are excluded: the server *writes* them, so there is no inbound
+/// value to validate — the client casts on read.
+pub(crate) fn param_enum_names(program: &Program, check_result: &Analysis) -> BTreeSet<String> {
+    let simple_enums: BTreeSet<&str> = program
+        .declarations
+        .iter()
+        .filter_map(|d| match d {
+            Declaration::Enum(e) if e.variants.iter().all(|v| v.fields.is_empty()) => {
+                Some(e.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut used = BTreeSet::new();
+    for ep in &check_result.endpoints {
+        let types = ep
+            .query_params
+            .iter()
+            .map(|q| &q.ty)
+            .chain(ep.headers.iter().map(|h| &h.ty));
+        for ty in types {
+            let inner = match ty {
+                Type::Generic(name, args) if name == "Option" && args.len() == 1 => &args[0],
+                other => other,
+            };
+            if let Type::Named(n) = inner
+                && simple_enums.contains(n.as_str())
+            {
+                used.insert(n.clone());
+            }
+        }
+    }
+    used
+}
 
 /// Whether the schema references `Money` anywhere a generated artifact would name
 /// the `Money` type: a struct/body field, a response, or a pagination item type.

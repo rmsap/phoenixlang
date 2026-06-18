@@ -682,8 +682,11 @@ endpoint listItems: GET "/api/items" {
 
 /// Required `Float` and enum query params, plus an optional enum. Exercises
 /// the server-parse paths whose local type must match the handler signature:
-/// `float64` via `strconv.ParseFloat`, and a `T(v)` / `*T` conversion for the
-/// string-backed enum. Also pins the conditional server import set.
+/// `float64` via `strconv.ParseFloat`, and a validated `T(v)` / `*T` conversion
+/// for the string-backed enum. The `types` snapshot pins the generated `Valid()`
+/// method (emitted only for param-enums, the server's 400 guard); the `server`
+/// snapshot pins the seed-overwrite-validate decode. Also pins the conditional
+/// server import set.
 #[test]
 fn float_and_enum_query_params() {
     let files = generate_from_source(
@@ -700,6 +703,7 @@ endpoint listItems: GET "/api/items" {
 }
 "#,
     );
+    insta::assert_snapshot!("go_float_enum_query_types", files.types);
     insta::assert_snapshot!("go_float_enum_query_client", files.client);
     insta::assert_snapshot!("go_float_enum_query_server", files.server);
     insta::assert_snapshot!("go_float_enum_query_handlers", files.handlers);

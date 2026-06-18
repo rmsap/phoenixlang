@@ -2966,3 +2966,104 @@ drifted):
   revival (Money/Uuid in `payments`' Customer/Charge create bodies) and the
   endpoint name is long; made it break one-arg-per-line with a trailing comma, the
   way prettier does.
+
+## Phoenix Gen — enum query/header params (2026-06-17)
+
+The next schema slice after the type-fidelity work: allow **simple (unit-variant)
+enums in query params and request headers**, instead of degrading them to
+`Option<String>` the handler re-parses (the most-requested gap from the fixture
+audit — three fixtures hit it). Scope is **query + request headers** (response-header enums are also handled — client casts on read);
+**enum-variant defaults are supported** (`priority: TicketStatus = Normal`).
+
+**Locked behavior.** On the wire an enum is the bare variant string (identical to
+its JSON-body encoding — TS string unions, Go typed-string consts, Python
+`(str, Enum)`), so `?status=Pending`. The server **validates** the inbound string
+into the typed enum, rejecting an unknown variant — the headline soundness win:
+- **TypeScript**: a generated `parse<Enum>` (a `<ENUM>_VALUES` membership check)
+  throws `ValidationError`; the route catch maps it to **400**. The catch's
+  `ValidationError → 400` guard, previously gated on body constraints, now also
+  fires when the endpoint has an enum param.
+- **Go**: a `Valid()` method on the enum type (emitted only for param-enums); the
+  server seeds the default (or empty), overwrites from the wire, and rejects an
+  invalid/missing-required value with **400** (`http.Error`).
+- **Python**: the FastAPI route types the param as the `Enum` class, so FastAPI
+  coerces + rejects natively with **422**.
+- **OpenAPI**: the param schema `$ref`s the enum component (with `default`) — no
+  generator change needed; redocly-clean.
+
+Only **simple** enums are allowed in these positions — a tagged/payload-carrying
+enum serializes to an object, not a URL/header string, so sema rejects it (along
+with an enum-variant default that names an unknown variant, and a literal default
+on an enum type). An enum default on an **optional** param (`Option<Enum> =
+Variant`) is also rejected — `Option` already encodes "may be absent", so a
+default is contradictory; this mirrors the pre-existing literal check on
+`Option<Int> = 5` and keeps the backends consistent (Go's optional decode never
+seeds a default, so allowing it would silently drop the value there while
+Python/TS rendered it). A **struct** in a query/header position is rejected for the same
+reason (it also serializes to an object — carry it in the body); without this the
+backends would emit broken code (Go `Item(v)`, Python `item.value`, a TS struct
+cast). The restriction applies to response headers too.
+
+**Sema.** A new `DefaultValue::Enum(String)`; `extract_default_value` maps a bare
+identifier default to it; a shared `check_enum_param_default` (used by query +
+request/response header resolution) enforces the simple-enum / no-struct
+restriction on the (option-unwrapped) named type and validates the enum-variant
+default against the declared enum.
+
+**Cross-target client encoding.** TS sends `String(enumValue)` (the union value);
+Go `string(v)` / `fmt.Sprint`; Python sends `.value` (NOT `str(enum)`, which would
+emit `Color.Red`). The Python enum **member** is the SCREAMING_SNAKE form
+(`Color.RED`), but its **value** is the bare variant (`"Red"`), so defaults render
+`Color.RED` while the wire stays `Red`. The SCREAMING_SNAKE conversion now lives
+in the shared `phoenix_common::idents::to_screaming_snake` (so the Python member
+name and the TS `<ENUM>_VALUES` const name cannot drift). It is acronym-aware
+(`HTTPError` → `HTTP_ERROR`, `RED` → `RED`), unlike the prior Python-local helper
+which split before every uppercase char (`RED` → `R_E_D`). This only changes the
+Python enum **member identifier** for acronym/all-caps variants — the `.value`
+and wire string are unaffected, so it is a self-consistent improvement, not a
+wire-format change.
+
+**Response-header read validation (deliberate asymmetry).** The *inbound* server
+validation above is uniform (TS 400 / Go 400 / Python 422). The *client read* of a
+**response-header** enum is not, and this is intentional: a response-header-only
+enum (one never used in a query/request header, e.g. `Tier`) has no generated
+validator, so there is nothing to call. TS casts the wire string straight into the
+union (`raw as Color`); Go casts into its typed-string (`Color(raw)`); only Python
+reconstructs through the enum constructor (`Color(raw)`), which happens to raise on
+an unknown value. So a misbehaving server's bad response-header enum surfaces as a
+runtime error on the Python client but is silently accepted (as an out-of-union
+value) by the TS and Go clients. This matches how branded-scalar *response* headers
+are the only read-side values TS/Go validate, and the contract treats the server as
+trusted for what it writes; tightening response-header reads to validate uniformly
+(emit a `parse<Enum>`/`Valid()` for response-header-only enums too) is a possible
+future cleanup, tracked alongside the Go `Uuid`/`Decimal` 500-vs-400 divergence
+below.
+
+**Import wiring.** Enum param types are named in client/handler/server signatures
+(and the client casts response-header enums on read), so all three generators'
+import collectors now walk query/request-header (and, for the client,
+response-header) param types — `collect_import_names` / `collect_python_imports`
+already add user `Named` types, so this is just extending which positions are
+scanned.
+
+**Out of scope (deferred).** `List<Enum>` in query (part of the separate
+list-valued-query-param slice). The pre-existing `Uuid`/`Decimal` query params
+remain unchecked on the Go server (they 500 rather than 400 on a malformed value —
+a divergence from enums, which validate); unifying param-validation→400 across all
+branded types is a possible future cleanup.
+
+**Verification.** `ENUM_PARAM_SCHEMA` (Option/defaulted enum query params, required
++ Option enum request headers, required + Option enum response headers, an
+endpoint with an `error {}` block and one without) is wired into the compile-lint
+harness on all four targets and both server frameworks — green (`tsc`/`eslint`/
+`prettier`, `go build`/`gofmt`/`golangci-lint`, `black`/`ruff`/`mypy`, `redocly`).
+Sema rejection tests cover the tagged-enum, struct (query/request/response
+header), and bad-default cases; 244 codegen lib (incl. `float_and_enum_query_params`,
+now with a Go `types` snapshot pinning the emitted `Valid()` method), 469 sema, and
+the integration suites are green; clippy clean. Runtime interop round-trips
+(`ENUM_RT_SCHEMA` + bespoke `enum/go`, `typescript/enum-driver.ts`,
+`python/enum_driver.py`) drive the generated client against the generated server
+and assert enum query/header values survive the wire (required + Option + a
+server-applied default) AND that an unknown query/header variant is rejected (Go
+`Valid()`→400, TS `parse<Enum>`→400, Python FastAPI→422) — 19 round-trips total
+(the prior 16 + 3 enum) green across go/ts/python.

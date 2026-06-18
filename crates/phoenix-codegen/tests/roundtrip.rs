@@ -249,6 +249,47 @@ fn money_dir() -> PathBuf {
     roundtrip_dir().join("money")
 }
 
+/// Small schema for the dedicated enum query/header round-trip. `pickItem`
+/// exercises a required enum query param (`color`), a defaulted enum query param
+/// (`size = Medium`), a required enum request header (`preferred`) and an
+/// `Option<enum>` header (`fallback`), plus a required (`chosen`) and
+/// `Option<enum>` (`alt`) response header — the handler echoes the inputs so each
+/// path can be asserted to survive the wire (the bare variant string), AND so the
+/// drivers can drive an UNKNOWN variant through the query/header to prove the
+/// server rejects it (TS `parse<Enum>`→400, Go `Valid()`→400, Python FastAPI→422).
+/// Kept inline (not a fixture) because only these drivers consume it. See
+/// `docs/design-decisions.md` (enum query/header params).
+const ENUM_RT_SCHEMA: &str = r#"
+enum Color { Red  Green  Blue }
+enum Size { Small  Medium  Large }
+
+struct Item {
+    name: String
+    color: Color
+    size: Size
+}
+
+endpoint pickItem: GET "/pick" {
+    headers {
+        preferred: Color as "X-Preferred"
+        fallback: Option<Color> as "X-Fallback"
+    }
+    query {
+        color: Color
+        size: Size = Medium
+    }
+    response Item headers {
+        chosen: Color as "X-Chosen"
+        alt: Option<Color> as "X-Alt"
+    }
+}
+"#;
+
+/// Absolute path to `tests/roundtrip/enum/` (the dedicated enum drivers).
+fn enum_dir() -> PathBuf {
+    roundtrip_dir().join("enum")
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    compiles_and_lints.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -579,6 +620,42 @@ fn money_go_roundtrip() {
     assert!(ok, "go Money round-trip test failed:\n{out}");
 }
 
+/// Dedicated enum query/header wire round-trip for Go: generates the `api` package
+/// from [`ENUM_RT_SCHEMA`], assembles a tempdir module with the bespoke `enum/go`
+/// driver, and runs `go test`. Asserts enum query/header values survive the wire
+/// as the bare variant string and that the server's generated `Valid()` check
+/// rejects an unknown query/header variant (a Go `Color` is a plain string, so the
+/// driver can hand the client an out-of-range value to drive the reject path).
+#[test]
+fn enum_go_roundtrip() {
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    let files = generate_go_files(ENUM_RT_SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    let go_mod = std::fs::read_to_string(roundtrip_dir().join("go").join("go.mod.template"))
+        .expect("read go.mod.template");
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+
+    let driver = enum_dir().join("go").join("enum_roundtrip_test.go");
+    let contents = std::fs::read_to_string(&driver)
+        .unwrap_or_else(|e| panic!("read {}: {e}", driver.display()));
+    std::fs::write(root.join("enum_roundtrip_test.go"), contents).expect("write driver");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go enum round-trip test failed:\n{out}");
+}
+
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 /// Generates both the Express and Fastify variants from a single parse/check.
@@ -858,6 +935,47 @@ fn money_typescript_roundtrip() {
     assert!(ok, "typescript Money round-trip test failed:\n{out}");
 }
 
+/// Dedicated enum query/header wire round-trip for TypeScript (Express). Reuses
+/// the main TS driver's npm project but writes to a SEPARATE `generated-enum/` dir
+/// and runs `enum-driver.ts`. Proves enum query/header values round-trip as the
+/// bare variant string (required + defaulted query, required + Option request and
+/// response headers) and that the server's `parse<Enum>` rejects an unknown
+/// query/header variant (→ ValidationError → 400 → client throws).
+#[test]
+fn enum_typescript_roundtrip() {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("typescript");
+    let node_modules = driver_dir.join("node_modules");
+    if !node_modules.is_dir() {
+        let msg = format!(
+            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let (program, result) = parse_and_check(ENUM_RT_SCHEMA);
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+
+    let generated = driver_dir.join("generated-enum");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated-enum dir");
+    std::fs::write(generated.join("types.ts"), &files.types).expect("write types.ts");
+    std::fs::write(generated.join("client.ts"), &files.client).expect("write client.ts");
+    std::fs::write(generated.join("handlers.ts"), &files.handlers).expect("write handlers.ts");
+    std::fs::write(generated.join("server.ts"), &files.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "enum-driver.ts"]);
+    assert!(ok, "typescript enum round-trip test failed:\n{out}");
+}
+
 // ── Python target ──────────────────────────────────────────────────────────
 
 fn generate_python_files(schema: &str) -> phoenix_codegen::PythonFiles {
@@ -1097,4 +1215,48 @@ fn money_python_roundtrip() {
     let python = venv_python.to_string_lossy().into_owned();
     let (ok, out) = run(&driver_dir, &python, &["money_driver.py"]);
     assert!(ok, "python Money round-trip test failed:\n{out}");
+}
+
+/// Dedicated enum query/header wire round-trip for Python. Reuses the main Python
+/// driver's `.venv` but writes the generated package into a SEPARATE
+/// `generated_enum/` dir and runs `enum_driver.py`. Proves enum query/header
+/// values round-trip as the bare variant string (FastAPI coerces the wire string
+/// into the enum on receive; the client sends `.value` and reconstructs on read),
+/// that the server applies a defaulted query enum, and that FastAPI rejects an
+/// unknown query/header variant (422).
+#[test]
+fn enum_python_roundtrip() {
+    if gate(&missing_tools(&["python3"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("python");
+    let venv_python = driver_dir.join(".venv").join("bin").join("python");
+    if !venv_python.is_file() {
+        let msg = format!(
+            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
+             .venv/bin/pip install -r requirements.txt` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let files = generate_python_files(ENUM_RT_SCHEMA);
+
+    let generated = driver_dir.join("generated_enum");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated_enum dir");
+    std::fs::write(generated.join("__init__.py"), &files.init).expect("write __init__.py");
+    std::fs::write(generated.join("models.py"), &files.models).expect("write models.py");
+    std::fs::write(generated.join("client.py"), &files.client).expect("write client.py");
+    std::fs::write(generated.join("handlers.py"), &files.handlers).expect("write handlers.py");
+    std::fs::write(generated.join("server.py"), &files.server).expect("write server.py");
+
+    let python = venv_python.to_string_lossy().into_owned();
+    let (ok, out) = run(&driver_dir, &python, &["enum_driver.py"]);
+    assert!(ok, "python enum round-trip test failed:\n{out}");
 }

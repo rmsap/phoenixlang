@@ -271,8 +271,22 @@ impl Checker {
                     );
                 }
 
-                // Validate default value type matches declared type
-                if let Some(ref default) = default_value {
+                // Enum query params: restrict to simple enums and validate an
+                // enum-variant default (`= Normal`). Returns true when it handled
+                // an enum default, so the literal match below is skipped.
+                let enum_default_handled = self.check_enum_param_default(
+                    &ep.name,
+                    "query param",
+                    &qp.name,
+                    qp.span,
+                    &ty,
+                    default_value.as_ref(),
+                );
+
+                // Validate default value type matches declared type (literals).
+                if let Some(ref default) = default_value
+                    && !enum_default_handled
+                {
                     let default_matches = matches!(
                         (default, &ty),
                         (DefaultValue::Int(_), Type::Int)
@@ -721,6 +735,112 @@ impl Checker {
     /// **response** header is *set by the handler*, never received, so a default
     /// is meaningless — it is rejected with a diagnostic and dropped, rather than
     /// silently ignored.
+    /// Validates a query/request-header param whose type may be (an `Option` of)
+    /// a named type. Four rules: (1) only a **simple** unit-variant enum is
+    /// URL/header-encodable — a tagged/payload-carrying enum serializes to an
+    /// object, so it is rejected here; (2) a **struct** is likewise rejected (it
+    /// also serializes to an object, not a scalar); (3) a bare-identifier default
+    /// (`= Normal`) must name an existing variant of that enum; (4) an enum
+    /// default on an **optional** param (`Option<Enum> = Normal`) is rejected, the
+    /// same way the literal check rejects `Option<Int> = 5` — `Option` already
+    /// encodes "may be absent", so a default is contradictory. `kind` is
+    /// `"query param"`, `"header"`, or `"response header"` for diagnostics.
+    /// Returns `true` when `default` was an enum default this handled, so the
+    /// caller skips the literal default-type match.
+    fn check_enum_param_default(
+        &mut self,
+        ep_name: &str,
+        kind: &str,
+        name: &str,
+        span: phoenix_common::span::Span,
+        ty: &Type,
+        default: Option<&DefaultValue>,
+    ) -> bool {
+        // Strip a single `Option<…>` to find the (possibly enum/struct) inner type.
+        // `was_option` is tracked so an enum default on an *optional* param is
+        // rejected the same way the literal default-type check rejects one on a
+        // primitive `Option<Int>` — an optional param already means "may be
+        // absent", so pairing it with a default is contradictory.
+        let (was_option, inner) = match ty {
+            Type::Generic(n, args) if n == "Option" && args.len() == 1 => (true, &args[0]),
+            other => (false, other),
+        };
+        // Capture the named type's shape before any `&mut self` diagnostic call.
+        let enum_data = match inner {
+            Type::Named(n) => self.lookup_enum(n).map(|info| {
+                let is_simple = info.variants.iter().all(|(_, fields)| fields.is_empty());
+                let variants: Vec<String> = info.variants.iter().map(|(v, _)| v.clone()).collect();
+                (is_simple, variants)
+            }),
+            _ => None,
+        };
+        // A `Named` type that isn't an enum is a struct (an undefined type is
+        // reported elsewhere); a struct has no scalar URL/header encoding.
+        let is_struct = enum_data.is_none()
+            && matches!(inner, Type::Named(n) if self.lookup_struct(n).is_some());
+
+        if let Some((is_simple, variants)) = enum_data {
+            if !is_simple {
+                self.error(
+                    format!(
+                        "endpoint `{ep_name}`: {kind} `{name}` cannot be the enum `{inner}` — only simple unit-variant enums are URL/header-encodable; a payload-carrying enum serializes to an object (carry it in the request body)"
+                    ),
+                    span,
+                );
+                // The tagged-enum diagnostic already covers this param; mark any
+                // default handled so neither the optional-default branch below nor
+                // the literal default-type check piles on a second, misleading
+                // message (mirrors the struct branch).
+                return default.is_some();
+            }
+            if let Some(DefaultValue::Enum(v)) = default {
+                if was_option {
+                    self.error(
+                        format!(
+                            "endpoint `{ep_name}`: default value `{v}` for {kind} `{name}` does not match type `{ty}` — an optional param cannot have a default"
+                        ),
+                        span,
+                    );
+                } else if !variants.contains(v) {
+                    self.error(
+                        format!(
+                            "endpoint `{ep_name}`: default value `{v}` for {kind} `{name}` is not a variant of enum `{inner}`"
+                        ),
+                        span,
+                    );
+                }
+                return true;
+            }
+            return false;
+        }
+
+        if is_struct {
+            self.error(
+                format!(
+                    "endpoint `{ep_name}`: {kind} `{name}` cannot be the struct `{inner}` — a struct serializes to an object, not a URL/header-encodable scalar (carry it in the request body)"
+                ),
+                span,
+            );
+            // Any default on a struct param is already covered by this
+            // diagnostic; mark it handled so the literal default-type check below
+            // does not pile on a second, misleading message (a bare-identifier
+            // `= Foo` *or* a literal `= 5` would otherwise each add one).
+            return default.is_some();
+        }
+
+        // A bare-identifier default on a non-enum type is a type mismatch.
+        if let Some(DefaultValue::Enum(v)) = default {
+            self.error(
+                format!(
+                    "endpoint `{ep_name}`: default value `{v}` for {kind} `{name}` does not match type `{ty}`"
+                ),
+                span,
+            );
+            return true;
+        }
+        false
+    }
+
     fn resolve_header(
         &mut self,
         ep: &EndpointDecl,
@@ -759,6 +879,9 @@ impl Checker {
                     h.span,
                 );
             }
+            // Enforce the simple-enum restriction on response headers too (they
+            // are still header-encoded); response headers carry no default.
+            self.check_enum_param_default(&ep.name, "response header", &h.name, h.span, &ty, None);
             return HeaderParamInfo {
                 name: h.name.clone(),
                 wire_name,
@@ -770,7 +893,20 @@ impl Checker {
 
         let default_value = h.default_value.as_ref().and_then(extract_default_value);
 
-        if let Some(ref default) = default_value {
+        // Enum request headers: restrict to simple enums and validate an
+        // enum-variant default; returns true when an enum default was handled.
+        let enum_default_handled = self.check_enum_param_default(
+            &ep.name,
+            "header",
+            &h.name,
+            h.span,
+            &ty,
+            default_value.as_ref(),
+        );
+
+        if let Some(ref default) = default_value
+            && !enum_default_handled
+        {
             let default_matches = matches!(
                 (default, &ty),
                 (DefaultValue::Int(_), Type::Int)
@@ -1258,6 +1394,9 @@ fn extract_default_value(expr: &Expr) -> Option<DefaultValue> {
             kind: LiteralKind::Bool(v),
             ..
         }) => Some(DefaultValue::Bool(*v)),
+        // A bare identifier default (`= Normal`) is a unit enum variant; the
+        // declared type and variant existence are validated by the caller.
+        Expr::Ident(id) => Some(DefaultValue::Enum(id.name.clone())),
         _ => None,
     }
 }
@@ -3945,6 +4084,233 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("helper type `FileUpload`")),
             "the duplicate's FileUpload clash should cascade, not report: {errors:?}"
+        );
+    }
+
+    // ── Enum query/header params ────────────────────────────────────────
+
+    #[test]
+    fn simple_enum_query_and_header_params_ok() {
+        // A simple unit-variant enum is URL/header-encodable in a query param, a
+        // request header, and a response header, and accepts an enum-variant
+        // default — all four positions check clean.
+        assert_no_errors(
+            r#"
+            enum Color { Red  Green  Blue }
+            struct Item { color: Color }
+            endpoint pickItem: GET "/pick" {
+                headers {
+                    preferred: Color as "X-Preferred"
+                    fallback: Option<Color> as "X-Fallback"
+                }
+                query {
+                    color: Option<Color>
+                    size: Color = Green
+                }
+                response Item headers {
+                    chosen: Color as "X-Chosen"
+                }
+            }
+            "#,
+        );
+    }
+
+    #[test]
+    fn tagged_enum_query_param_rejected() {
+        // A payload-carrying enum serializes to an object, so it is not a legal
+        // query-param type.
+        assert_has_error(
+            r#"
+            enum Shape { Circle(Float)  Square(Float) }
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                query { shape: Shape }
+                response Item
+            }
+            "#,
+            "only simple unit-variant enums are URL/header-encodable",
+        );
+    }
+
+    #[test]
+    fn tagged_enum_response_header_rejected() {
+        // The simple-enum restriction applies to response headers too.
+        assert_has_error(
+            r#"
+            enum Shape { Circle(Float)  Square(Float) }
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                response Item headers {
+                    shape: Shape as "X-Shape"
+                }
+            }
+            "#,
+            "only simple unit-variant enums are URL/header-encodable",
+        );
+    }
+
+    #[test]
+    fn enum_query_param_unknown_default_variant_rejected() {
+        // A bare-identifier default must name an existing variant of the enum.
+        assert_has_error(
+            r#"
+            enum Color { Red  Green  Blue }
+            struct Item { color: Color }
+            endpoint pickItem: GET "/pick" {
+                query { color: Color = Purple }
+                response Item
+            }
+            "#,
+            "default value `Purple` for query param `color` is not a variant of enum `Color`",
+        );
+    }
+
+    #[test]
+    fn enum_request_header_unknown_default_variant_rejected() {
+        assert_has_error(
+            r#"
+            enum Color { Red  Green  Blue }
+            struct Item { color: Color }
+            endpoint pickItem: GET "/pick" {
+                headers { preferred: Color as "X-Preferred" = Purple }
+                response Item
+            }
+            "#,
+            "default value `Purple` for header `preferred` is not a variant of enum `Color`",
+        );
+    }
+
+    #[test]
+    fn literal_default_on_enum_query_param_rejected() {
+        // A literal default on an enum-typed param is a type mismatch (handled by
+        // the existing literal default-type check, not the enum path).
+        assert_has_error(
+            r#"
+            enum Color { Red  Green  Blue }
+            struct Item { color: Color }
+            endpoint pickItem: GET "/pick" {
+                query { color: Color = 5 }
+                response Item
+            }
+            "#,
+            "default value for query param `color` does not match type `Color`",
+        );
+    }
+
+    #[test]
+    fn bare_identifier_default_on_non_enum_query_param_rejected() {
+        // A bare-identifier default (`= Foo`) on a non-enum type is a mismatch.
+        assert_has_error(
+            r#"
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                query { page: Int = Foo }
+                response Item
+            }
+            "#,
+            "default value `Foo` for query param `page` does not match type `Int`",
+        );
+    }
+
+    #[test]
+    fn struct_query_param_rejected() {
+        // A struct serializes to an object, not a URL-encodable scalar, so it is
+        // not a legal query-param type (it must ride in the body).
+        assert_has_error(
+            r#"
+            struct Filter { term: String }
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                query { filter: Filter }
+                response Item
+            }
+            "#,
+            "query param `filter` cannot be the struct `Filter`",
+        );
+    }
+
+    #[test]
+    fn struct_request_header_rejected() {
+        assert_has_error(
+            r#"
+            struct Filter { term: String }
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                headers { filter: Filter as "X-Filter" }
+                response Item
+            }
+            "#,
+            "header `filter` cannot be the struct `Filter`",
+        );
+    }
+
+    #[test]
+    fn struct_response_header_rejected() {
+        // The struct restriction applies to response headers too.
+        assert_has_error(
+            r#"
+            struct Filter { term: String }
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                response Item headers {
+                    filter: Filter as "X-Filter"
+                }
+            }
+            "#,
+            "response header `filter` cannot be the struct `Filter`",
+        );
+    }
+
+    #[test]
+    fn optional_struct_query_param_rejected() {
+        // `Option<Struct>` is rejected on the unwrapped inner type, just like a
+        // bare struct.
+        assert_has_error(
+            r#"
+            struct Filter { term: String }
+            struct Item { x: Int }
+            endpoint pickItem: GET "/pick" {
+                query { filter: Option<Filter> }
+                response Item
+            }
+            "#,
+            "query param `filter` cannot be the struct `Filter`",
+        );
+    }
+
+    #[test]
+    fn enum_default_on_optional_query_param_rejected() {
+        // An enum default on an `Option<Enum>` param is rejected, mirroring the
+        // literal check on `Option<Int> = 5`: `Option` already means "may be
+        // absent", so a default is contradictory. This keeps the backends
+        // consistent (Go's optional decode never seeds a default, so allowing it
+        // would silently drop the value there while Python/TS rendered it).
+        assert_has_error(
+            r#"
+            enum Color { Red  Green  Blue }
+            struct Item { color: Color }
+            endpoint pickItem: GET "/pick" {
+                query { color: Option<Color> = Red }
+                response Item
+            }
+            "#,
+            "default value `Red` for query param `color` does not match type `Option<Color>` — an optional param cannot have a default",
+        );
+    }
+
+    #[test]
+    fn enum_default_on_optional_header_rejected() {
+        // The optional-default rejection applies to request headers too.
+        assert_has_error(
+            r#"
+            enum Color { Red  Green  Blue }
+            struct Item { color: Color }
+            endpoint pickItem: GET "/pick" {
+                headers { preferred: Option<Color> as "X-Preferred" = Red }
+                response Item
+            }
+            "#,
+            "default value `Red` for header `preferred` does not match type `Option<Color>` — an optional param cannot have a default",
         );
     }
 }

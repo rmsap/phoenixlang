@@ -15,7 +15,8 @@ pub mod diagnostics;
 /// by the interpreters for `extern js` host calls.
 pub mod host;
 /// Identifier-casing helpers shared between sema and the codegen backends
-/// (currently `capitalize`, the rule generated type names are built with).
+/// (`capitalize`, the rule generated type names are built with, and
+/// `to_screaming_snake`, the enum-value/const casing).
 pub mod idents;
 /// Stable post-sema identifiers (`FuncId`, `StructId`, `EnumId`,
 /// `TraitId`) shared across sema, IR, and the backends.
@@ -32,7 +33,7 @@ pub mod source;
 pub mod span;
 
 pub use diagnostics::Diagnostic;
-pub use idents::capitalize;
+pub use idents::{capitalize, to_screaming_snake};
 pub use ids::{EnumId, FuncId, StructId, TraitId};
 pub use module_path::{ModulePath, module_qualify};
 pub use source::SourceMap;

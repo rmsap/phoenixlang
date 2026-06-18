@@ -722,6 +722,9 @@ fn default_to_json(val: &DefaultValue) -> Value {
         DefaultValue::Float(v) => json!(v),
         DefaultValue::String(v) => json!(v),
         DefaultValue::Bool(v) => json!(v),
+        // An enum default is the variant string (the enum schema's `enum` list
+        // carries the allowed values).
+        DefaultValue::Enum(v) => json!(v),
     }
 }
 

@@ -20,10 +20,21 @@ func NewRouter(h Handlers) *http.ServeMux {
 		if v := r.URL.Query().Get("minScore"); v != "" {
 			minScore, _ = strconv.ParseFloat(v, 64)
 		}
-		sort := Sort(r.URL.Query().Get("sort"))
+		sort := Sort("")
+		if v := r.URL.Query().Get("sort"); v != "" {
+			sort = Sort(v)
+		}
+		if !sort.Valid() {
+			http.Error(w, "invalid query param: sort", http.StatusBadRequest)
+			return
+		}
 		var fallback *Sort
 		if v := r.URL.Query().Get("fallback"); v != "" {
 			cv := Sort(v)
+			if !cv.Valid() {
+				http.Error(w, "invalid query param: fallback", http.StatusBadRequest)
+				return
+			}
 			fallback = &cv
 		}
 		result, err := h.ListItems(minScore, sort, fallback)

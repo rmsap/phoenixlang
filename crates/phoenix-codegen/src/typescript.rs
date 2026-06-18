@@ -90,6 +90,11 @@ struct TsGenerator<'a> {
     /// `Date`s. Computed once at the top of [`Self::generate`]. See
     /// `docs/design-decisions.md` (DateTime & UUID scalar types).
     revivable_structs: BTreeSet<String>,
+    /// Names of simple (unit-variant) enums used in a query param or request
+    /// header, so the server decode path validates the wire string into the
+    /// branded union via a generated `parse<Enum>`. Computed once in
+    /// [`Self::generate`].
+    param_enums: BTreeSet<String>,
     /// The server framework `server.ts` targets.
     framework: TsServerFramework,
 }
@@ -106,6 +111,7 @@ impl<'a> TsGenerator<'a> {
             emitted_derived_types: BTreeSet::new(),
             emitted_validation_error: false,
             revivable_structs: BTreeSet::new(),
+            param_enums: BTreeSet::new(),
             framework,
         }
     }
@@ -114,6 +120,7 @@ impl<'a> TsGenerator<'a> {
     /// program AST.
     fn generate(mut self, program: &Program) -> GeneratedFiles {
         self.revivable_structs = compute_revivable_structs(self.check_result, program);
+        self.param_enums = crate::param_enum_names(program, self.check_result);
 
         // Generate types.ts
         self.types_out
@@ -163,6 +170,10 @@ impl<'a> TsGenerator<'a> {
                 self.emit_struct_validation(s);
             }
         }
+
+        // Emit a `parse<Enum>` validator for each simple enum used in a query/
+        // request-header param (the server decode path validates the wire string).
+        self.emit_enum_param_helpers(program);
 
         // Emit derived types and error types for endpoints
         for ep in &self.check_result.endpoints {
@@ -290,18 +301,7 @@ impl<'a> TsGenerator<'a> {
         }
 
         // Emit ValidationError class once
-        if !self.emitted_validation_error {
-            self.types_out
-                .push_str("export class ValidationError extends Error {\n");
-            self.types_out
-                .push_str("  constructor(message: string) {\n");
-            self.types_out.push_str("    super(message);\n");
-            self.types_out
-                .push_str("    this.name = \"ValidationError\";\n");
-            self.types_out.push_str("  }\n");
-            self.types_out.push_str("}\n\n");
-            self.emitted_validation_error = true;
-        }
+        self.ensure_validation_error();
 
         emit_validate_signature(&mut self.types_out, &s.name);
         let vfields: Vec<ValidationField> = info
@@ -350,6 +350,71 @@ impl<'a> TsGenerator<'a> {
                     .is_some_and(|p| type_mentions(&p.item_type, target))
         });
         in_struct || in_ep
+    }
+
+    /// Emits, into `types.ts`, a `<ENUM>_VALUES` array and a `parse<Enum>`
+    /// validator for each simple enum used in a query/request-header param. The
+    /// server decode path calls `parse<Enum>` to turn the wire string into the
+    /// branded union, throwing `ValidationError` (→ 400) on an unknown variant.
+    fn emit_enum_param_helpers(&mut self, program: &Program) {
+        if self.param_enums.is_empty() {
+            return;
+        }
+        self.ensure_validation_error();
+        for decl in &program.declarations {
+            let Declaration::Enum(e) = decl else { continue };
+            if !self.param_enums.contains(&e.name) {
+                continue;
+            }
+            let name = &e.name;
+            let const_name = format!("{}_VALUES", to_screaming_snake(name));
+            // The values array: one line if it fits ≤ 80 cols, else one variant
+            // per line with a trailing comma (matching Prettier).
+            let inline = e
+                .variants
+                .iter()
+                .map(|v| format!("\"{}\"", v.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let one_line = format!("const {const_name}: readonly {name}[] = [{inline}];");
+            if one_line.len() <= PRINT_WIDTH {
+                self.types_out.push_str(&one_line);
+                self.types_out.push_str("\n\n");
+            } else {
+                self.types_out
+                    .push_str(&format!("const {const_name}: readonly {name}[] = [\n"));
+                for v in &e.variants {
+                    self.types_out.push_str(&format!("  \"{}\",\n", v.name));
+                }
+                self.types_out.push_str("];\n\n");
+            }
+            self.types_out.push_str(&format!(
+                "/** Validates that `value` is a `{name}`, throwing otherwise. Run by\n \
+                 * the server query/header decode path. */\n\
+                 export function parse{name}(value: string): {name} {{\n  \
+                 if (({const_name} as readonly string[]).includes(value)) {{\n    \
+                 return value as {name};\n  \
+                 }}\n  \
+                 throw new ValidationError(`invalid {name}: ${{value}}`);\n}}\n\n"
+            ));
+        }
+    }
+
+    /// Emits the `ValidationError` class into `types.ts` exactly once.
+    fn ensure_validation_error(&mut self) {
+        if self.emitted_validation_error {
+            return;
+        }
+        self.types_out
+            .push_str("export class ValidationError extends Error {\n");
+        self.types_out
+            .push_str("  constructor(message: string) {\n");
+        self.types_out.push_str("    super(message);\n");
+        self.types_out
+            .push_str("    this.name = \"ValidationError\";\n");
+        self.types_out.push_str("  }\n");
+        self.types_out.push_str("}\n\n");
+        self.emitted_validation_error = true;
     }
 
     /// Emits a branded-scalar alias + its `parse*` validator into types.ts (once,
@@ -681,18 +746,7 @@ impl<'a> TsGenerator<'a> {
         }
 
         // Emit ValidationError class once
-        if !self.emitted_validation_error {
-            self.types_out
-                .push_str("export class ValidationError extends Error {\n");
-            self.types_out
-                .push_str("  constructor(message: string) {\n");
-            self.types_out.push_str("    super(message);\n");
-            self.types_out
-                .push_str("    this.name = \"ValidationError\";\n");
-            self.types_out.push_str("  }\n");
-            self.types_out.push_str("}\n\n");
-            self.emitted_validation_error = true;
-        }
+        self.ensure_validation_error();
 
         let type_name = format!("{}Body", capitalize(&ep.name));
         emit_validate_signature(&mut self.types_out, &type_name);
@@ -752,6 +806,17 @@ impl<'a> TsGenerator<'a> {
                 && let Some(ref resp) = ep.response
             {
                 collect_import_names(resp, &mut type_imports);
+            }
+            // Query/request-header param types name enums used in the method
+            // signature; response-header types name enums the client casts on read
+            // (and that appear in the result envelope). `collect_import_names` only
+            // adds user `Named` types (enums/structs), skipping builtins — branded
+            // scalars are imported by the dedicated loop below.
+            for q in &ep.query_params {
+                collect_import_names(&q.ty, &mut type_imports);
+            }
+            for h in ep.headers.iter().chain(ep.response_headers.iter()) {
+                collect_import_names(&h.ty, &mut type_imports);
             }
         }
 
@@ -1258,6 +1323,15 @@ impl<'a> TsGenerator<'a> {
                     collect_import_names(resp, &mut imports);
                 }
             }
+            // Query/request-header param types name enums the handler signature
+            // receives (response-header enums travel inside the imported result
+            // envelope, so they need no separate import).
+            for q in &ep.query_params {
+                collect_import_names(&q.ty, &mut imports);
+            }
+            for h in &ep.headers {
+                collect_import_names(&h.ty, &mut imports);
+            }
             // A branded scalar (`Uuid`/`Decimal`) is a builtin the handler
             // signature still names (query/header params, or a bare non-envelope
             // response) — collect its alias like a type import, since
@@ -1429,7 +1503,10 @@ impl<'a> TsGenerator<'a> {
                 value_imports.push(format!("validate{type_name}"));
             }
         }
-        if !value_imports.is_empty() {
+        // `ValidationError` is referenced by the 400 guard whenever the server
+        // validates inbound data: a constrained body, or an enum query/header
+        // param whose `parse<Enum>` throws it.
+        if !value_imports.is_empty() || !self.param_enums.is_empty() {
             value_imports.insert(0, "ValidationError".to_string());
         }
         for ep in &self.check_result.endpoints {
@@ -1450,6 +1527,11 @@ impl<'a> TsGenerator<'a> {
             }) {
                 value_imports.push(parse.to_string());
             }
+        }
+        // Each simple enum used in a query/request-header param: its `parse<Enum>`
+        // validator (BTreeSet → sorted, stable output).
+        for name in &self.param_enums {
+            value_imports.push(format!("parse{name}"));
         }
         if !value_imports.is_empty() {
             emit_import(&mut self.server_out, "import", &value_imports, "./types");
@@ -1598,12 +1680,21 @@ impl<'a> TsGenerator<'a> {
             si,
             ni,
             &self.revivable_structs,
+            &self.param_enums,
         );
 
         // Response + error mapping are framework-independent (only the response
         // verbs differ) — see [`emit_route_response`] / [`emit_route_error_catch`].
         emit_route_response(&mut body, ep, &args, FASTIFY_DIALECT, si, ni);
-        emit_route_error_catch(&mut body, ep, FASTIFY_DIALECT, ti, si, ni);
+        emit_route_error_catch(
+            &mut body,
+            ep,
+            FASTIFY_DIALECT,
+            ti,
+            si,
+            ni,
+            &self.param_enums,
+        );
 
         // Emit the route. When the inline opener fits, the whole `app.X(...)` call
         // stays on one line above the body; otherwise the call breaks one argument
@@ -1698,12 +1789,21 @@ impl<'a> TsGenerator<'a> {
             si,
             ni,
             &self.revivable_structs,
+            &self.param_enums,
         );
 
         // Response + error mapping are framework-independent (only the response
         // verbs differ) — see [`emit_route_response`] / [`emit_route_error_catch`].
         emit_route_response(&mut body, ep, &args, EXPRESS_DIALECT, si, ni);
-        emit_route_error_catch(&mut body, ep, EXPRESS_DIALECT, ti, si, ni);
+        emit_route_error_catch(
+            &mut body,
+            ep,
+            EXPRESS_DIALECT,
+            ti,
+            si,
+            ni,
+            &self.param_enums,
+        );
 
         // Emit the route. When the inline opener fits, the whole `router.X(...)`
         // call stays on one line above the body; otherwise the call breaks one
@@ -1804,6 +1904,7 @@ fn query_param_coercion_with(
     qp: &phoenix_sema::checker::QueryParamInfo,
     base: &str,
     raw_is_str_opt: bool,
+    param_enums: &BTreeSet<String>,
 ) -> String {
     let raw = format!("{base}.{}", qp.name);
     let is_option = matches!(&qp.ty, Type::Generic(name, _) if name == "Option");
@@ -1824,6 +1925,10 @@ fn query_param_coercion_with(
             let parse = branded_scalar(&qp.ty).expect("branded scalar").1;
             format!("{parse}({raw} as string)")
         }
+        // A simple enum: validate the wire string into the branded union via the
+        // generated `parse<Enum>` (throws ValidationError → 400 on an unknown
+        // variant). Like the branded scalars, `raw` is `string | undefined` here.
+        Type::Named(n) if param_enums.contains(n) => format!("parse{n}({raw} as string)"),
         Type::Generic(name, args) if name == "Option" && !args.is_empty() => {
             // For Option<T>, coerce the inner type if present
             match &args[0] {
@@ -1848,6 +1953,13 @@ fn query_param_coercion_with(
                         format!("{raw} !== undefined ? {parse}({raw}) : undefined")
                     } else {
                         format!("{raw} !== undefined ? {parse}({raw} as string) : undefined")
+                    }
+                }
+                Type::Named(n) if param_enums.contains(n) => {
+                    if raw_is_str_opt {
+                        format!("{raw} !== undefined ? parse{n}({raw}) : undefined")
+                    } else {
+                        format!("{raw} !== undefined ? parse{n}({raw} as string) : undefined")
                     }
                 }
                 _ if raw_is_str_opt => raw.clone(),
@@ -1881,6 +1993,9 @@ fn default_value_to_ts(val: &DefaultValue) -> String {
         DefaultValue::Float(v) => v.to_string(),
         DefaultValue::String(v) => format!("\"{}\"", v),
         DefaultValue::Bool(v) => v.to_string(),
+        // An enum value is a member of the string-union type, so the default is
+        // just the variant string literal — no enum-name qualifier needed.
+        DefaultValue::Enum(v) => format!("\"{}\"", v),
     }
 }
 
@@ -2750,6 +2865,7 @@ fn emit_route_prelude(
     si: &str,
     ni: &str,
     revivable: &BTreeSet<String>,
+    param_enums: &BTreeSet<String>,
 ) -> Vec<String> {
     let req = d.request;
     let mut args = Vec::new();
@@ -2833,7 +2949,7 @@ fn emit_route_prelude(
                 body,
                 &format!("{si}  "),
                 &qp.name,
-                &query_param_coercion_with(qp, &query_base, d.cast_record),
+                &query_param_coercion_with(qp, &query_base, d.cast_record, param_enums),
             );
         }
         body.push_str(&format!("{si}}};\n"));
@@ -2860,7 +2976,7 @@ fn emit_route_prelude(
                 body,
                 &format!("{si}  "),
                 &h.name,
-                &request_header_coercion_raw(h, &raw),
+                &request_header_coercion_raw(h, &raw, param_enums),
             );
         }
         body.push_str(&format!("{si}}};\n"));
@@ -3041,6 +3157,7 @@ fn emit_route_error_catch(
     ti: &str,
     si: &str,
     ni: &str,
+    param_enums: &BTreeSet<String>,
 ) {
     let recv = d.receiver;
     let verb = d.json_verb;
@@ -3048,16 +3165,25 @@ fn emit_route_error_catch(
         .body
         .as_ref()
         .is_some_and(|b| b.fields.iter().any(|f| f.constraint.is_some()));
+    // An enum query/request-header param's `parse<Enum>` throws `ValidationError`
+    // on an unknown variant, so the same 400 guard applies.
+    let has_enum_param = ep
+        .query_params
+        .iter()
+        .map(|q| &q.ty)
+        .chain(ep.headers.iter().map(|h| &h.ty))
+        .any(|ty| matches!(unwrap_option_ts(ty), Type::Named(n) if param_enums.contains(n)));
+    let validates = has_body_constraints || has_enum_param;
 
-    // The caught binding is only referenced when there are body constraints or
-    // declared errors; otherwise use an optional catch binding (`catch {`) so
-    // no-unused-vars has nothing to flag.
-    if has_body_constraints || !ep.errors.is_empty() {
+    // The caught binding is only referenced when there is a ValidationError → 400
+    // guard or declared errors; otherwise use an optional catch binding
+    // (`catch {`) so no-unused-vars has nothing to flag.
+    if validates || !ep.errors.is_empty() {
         body.push_str(&format!("{ti}}} catch (error: unknown) {{\n"));
     } else {
         body.push_str(&format!("{ti}}} catch {{\n"));
     }
-    if has_body_constraints {
+    if validates {
         emit_guarded_block(
             body,
             si,
@@ -3100,7 +3226,11 @@ fn emit_route_error_catch(
 /// while Fastify reads `rawHeaders["wire-name"]` off a `Record<string, string |
 /// undefined>` cast of `request.headers`. The body is identical because both
 /// accessors are typed `string | undefined`. Mirrors [`query_param_coercion_with`].
-fn request_header_coercion_raw(h: &phoenix_sema::checker::HeaderParamInfo, raw: &str) -> String {
+fn request_header_coercion_raw(
+    h: &phoenix_sema::checker::HeaderParamInfo,
+    raw: &str,
+    param_enums: &BTreeSet<String>,
+) -> String {
     let raw = raw.to_string();
     let is_option = is_header_option(h);
 
@@ -3116,6 +3246,10 @@ fn request_header_coercion_raw(h: &phoenix_sema::checker::HeaderParamInfo, raw: 
             let parse = branded_scalar(&h.ty).expect("branded scalar").1;
             format!("{parse}({raw} as string)")
         }
+        // A simple enum header: validate the wire string into the branded union
+        // via `parse<Enum>` (the `as string` removes `undefined`, like the
+        // branded scalars above).
+        Type::Named(n) if param_enums.contains(n) => format!("parse{n}({raw} as string)"),
         Type::Generic(name, args) if name == "Option" && !args.is_empty() => match &args[0] {
             Type::Int | Type::Float => {
                 format!("{raw} !== undefined ? Number({raw}) : undefined")
@@ -3127,6 +3261,9 @@ fn request_header_coercion_raw(h: &phoenix_sema::checker::HeaderParamInfo, raw: 
             inner @ (Type::Uuid | Type::Decimal) => {
                 let parse = branded_scalar(inner).expect("branded scalar").1;
                 format!("{raw} !== undefined ? {parse}({raw} as string) : undefined")
+            }
+            Type::Named(n) if param_enums.contains(n) => {
+                format!("{raw} !== undefined ? parse{n}({raw} as string) : undefined")
             }
             // `req.header(...)` is already typed `string | undefined`, so an
             // `as string | undefined` cast would be flagged by eslint's
@@ -3179,6 +3316,10 @@ fn response_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> Strin
                 let parse = branded_scalar(inner).expect("branded scalar").1;
                 format!("{raw} !== null ? {parse}({raw} as string) : undefined")
             }
+            // A simple-enum response header (sema guarantees unit variants): the
+            // server writes a valid variant, so the client narrows + casts the
+            // `string | null` read down to the branded union.
+            Type::Named(n) => format!("{raw} !== null ? ({raw} as {n}) : undefined"),
             // `response.headers.get(...)` is already typed `string | null`, so a
             // cast would be an unnecessary-type-assertion; `?? undefined` maps the
             // missing case (null) to undefined for the optional field.
@@ -3202,6 +3343,9 @@ fn response_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> Strin
                 let parse = branded_scalar(inner).expect("branded scalar").1;
                 format!("{parse}({raw} as string)")
             }
+            // A simple-enum response header: cast the (contractually present)
+            // `string | null` read down to the branded union.
+            Type::Named(n) => format!("{raw} as {n}"),
             _ => format!("{raw} as string"),
         }
     }
@@ -3214,7 +3358,7 @@ fn build_url_expr(path: &str, _params: &[String]) -> String {
     path.replace('{', "${")
 }
 
-use crate::capitalize;
+use crate::{capitalize, to_screaming_snake};
 
 #[cfg(test)]
 #[path = "typescript_tests.rs"]
