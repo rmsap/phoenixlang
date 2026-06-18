@@ -204,7 +204,8 @@ impl Interpreter {
             | Declaration::TypeAlias(_)
             | Declaration::Endpoint(_)
             | Declaration::Schema(_)
-            | Declaration::Import(_) => {}
+            | Declaration::Import(_)
+            | Declaration::ExternJs(_) => {}
         }
     }
 }

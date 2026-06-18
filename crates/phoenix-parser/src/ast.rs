@@ -50,6 +50,9 @@ pub enum Declaration {
     Schema(SchemaDecl),
     /// An `import` declaration that brings names from another module into scope.
     Import(ImportDecl),
+    /// An `extern js { ... }` block declaring JavaScript host functions that
+    /// have no Phoenix body.
+    ExternJs(ExternJsBlock),
 }
 
 /// An `import` declaration that brings names from another module into scope.
@@ -86,6 +89,49 @@ pub struct ImportItem {
     /// An optional local alias (`Foo as Bar` → `Some("Bar")`).
     pub alias: Option<String>,
     /// Source span covering this item.
+    pub span: Span,
+}
+
+/// An `extern js { ... }` block declaring JavaScript host functions that have
+/// no Phoenix implementation. Phase 2.5 JavaScript interop.
+///
+/// ```text
+/// extern js {
+///   function alert(message: String)
+///   function setTimeout(callback: (Void) -> Void, ms: Int)
+/// }
+/// ```
+///
+/// The `js` language tag is matched contextually by the parser (it stays a
+/// plain identifier so it remains usable as a variable name). Each signature
+/// is typed so calls can be type-checked and marshalled across the WASM
+/// boundary, but carries no `body` — the implementation lives in the JS host.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternJsBlock {
+    /// The declared external function signatures, in source order.
+    pub items: Vec<ExternFnSig>,
+    /// Source span covering the entire `extern js { ... }` block.
+    pub span: Span,
+}
+
+/// A single bodyless function signature inside an [`ExternJsBlock`]:
+/// `function setTimeout(callback: (Void) -> Void, ms: Int)`.
+///
+/// Mirrors the head of a [`FunctionDecl`] (name + params + optional return
+/// type) but has no `body`. Generic type parameters are not permitted on
+/// extern signatures.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternFnSig {
+    /// The function name, as exposed by the JavaScript host.
+    pub name: String,
+    /// Source span covering just the function name identifier.
+    pub name_span: Span,
+    /// The formal parameters (typed; default values are not permitted on
+    /// extern signatures — the JS host cannot evaluate a Phoenix default).
+    pub params: Vec<Param>,
+    /// The declared return type, or `None` for a `Void` return.
+    pub return_type: Option<TypeExpr>,
+    /// Source span covering the entire signature.
     pub span: Span,
 }
 

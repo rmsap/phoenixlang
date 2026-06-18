@@ -84,6 +84,12 @@ pub enum TokenKind {
     /// Phase 2.3 cleanup-syntax decision G; see
     /// `docs/design-decisions.md#g-scope-bound-cleanup-syntax-go-style-statement-level-defer`.
     Defer,
+    /// The `extern` keyword, introducing an external (JavaScript) interop block.
+    ///
+    /// Syntax: `extern js { function alert(message: String) ... }`. The `js`
+    /// language tag is a contextual identifier, not a keyword. Phase 2.5; see
+    /// `docs/design-decisions.md#phase-25-javascript-interop`.
+    Extern,
 
     // ── Gen keywords ────────────────────────────────────────
     /// The `endpoint` keyword, introducing an endpoint declaration.

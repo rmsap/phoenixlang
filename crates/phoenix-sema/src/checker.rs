@@ -1071,7 +1071,22 @@ impl Checker {
                 // docs/design-decisions.md for the rationale. Schemas
                 // are parse-only; imports were already processed by
                 // `build_module_scopes_phase_b` before this pass.
-                Declaration::Endpoint(_) | Declaration::Schema(_) | Declaration::Import(_) => {}
+                //
+                // TODO(phase-2.5-pr2): register `extern js` signatures and
+                // check their marshallability here. Per decision A0, `extern
+                // js` is a uniform host-FFI boundary supported on every
+                // executable backend (interpreters, native, both WASM targets),
+                // so this is NOT gated to WASM — the gate is that Gen rejects it
+                // (an executable-language feature, not a schema feature). The
+                // Gen codegen backends (typescript/go/python/openapi) match
+                // `Declaration` with a trailing `_ => {}`, so an `extern js`
+                // block reaching a Gen-consumed schema is currently dropped
+                // silently with no diagnostic; sema must reject it here, before
+                // codegen ever sees it.
+                Declaration::Endpoint(_)
+                | Declaration::Schema(_)
+                | Declaration::Import(_)
+                | Declaration::ExternJs(_) => {}
             }
         }
     }
@@ -1123,7 +1138,10 @@ impl Checker {
                 Declaration::Trait(_)
                 | Declaration::TypeAlias(_)
                 | Declaration::Schema(_)
-                | Declaration::Import(_) => {}
+                | Declaration::Import(_)
+                // `extern js` registration + WASM-target gating is deferred;
+                // see the `TODO(phase-2.5-pr2)` on the skip arm above.
+                | Declaration::ExternJs(_) => {}
             }
         }
     }

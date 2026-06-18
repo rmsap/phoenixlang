@@ -1,10 +1,10 @@
 use crate::api_version::validate_api_version;
 use crate::ast::{
     Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
-    FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock, ImportDecl, ImportItem,
-    ImportItems, InlineTraitImpl, NamedType, PaginationMode, Param, Program, QueryParam,
-    ResponseStatus, SchemaDecl, SchemaTable, StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl,
-    TypeExpr, TypeModifier, Visibility,
+    ExternFnSig, ExternJsBlock, FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock,
+    ImportDecl, ImportItem, ImportItems, InlineTraitImpl, NamedType, PaginationMode, Param,
+    Program, QueryParam, ResponseStatus, SchemaDecl, SchemaTable, StructDecl, TraitDecl,
+    TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
 };
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::{SourceId, Span};
@@ -118,6 +118,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Public => "'public'",
         TokenKind::As => "'as'",
         TokenKind::Defer => "'defer'",
+        TokenKind::Extern => "'extern'",
     }
 }
 
@@ -433,8 +434,15 @@ impl<'src> Parser<'src> {
                 );
                 self.parse_import_decl().map(Declaration::Import)
             }
+            TokenKind::Extern => {
+                self.reject_public_modifier(
+                    public_span,
+                    "`extern js` blocks cannot be marked `public` — the declared functions are external, not Phoenix declarations",
+                );
+                self.parse_extern_js_block().map(Declaration::ExternJs)
+            }
             _ => {
-                self.error_at_current("expected a declaration (e.g. `function`, `struct`, `enum`, `impl`, `trait`, `type`, `endpoint`, `schema`, `import`)");
+                self.error_at_current("expected a declaration (e.g. `function`, `struct`, `enum`, `impl`, `trait`, `type`, `endpoint`, `schema`, `import`, `extern js`)");
                 None
             }
         }
@@ -518,6 +526,177 @@ impl<'src> Parser<'src> {
         Some(ImportDecl {
             path,
             items,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parses an `extern js { ... }` block of bodyless JavaScript function
+    /// signatures.
+    ///
+    /// ```text
+    /// extern js {
+    ///   function alert(message: String)
+    ///   function setTimeout(callback: (Void) -> Void, ms: Int)
+    /// }
+    /// ```
+    ///
+    /// The `js` language tag is matched as a contextual identifier (not a
+    /// reserved keyword) so `js` stays usable as a variable name; only
+    /// `extern js` is recognized today. A signature that fails to parse is
+    /// recovered via [`synchronize_stmt`](Self::synchronize_stmt); the loop
+    /// makes guaranteed progress every iteration (same anti-hang discipline as
+    /// [`parse_block`](Self::parse_block) — see that loop and `synchronize_stmt`).
+    ///
+    /// A doc comment preceding a signature is consumed and discarded, matching
+    /// how [`parse_declaration`](Self::parse_declaration) treats a leading doc
+    /// comment on a top-level function (functions don't yet carry doc text), so
+    /// a documented extern signature doesn't draw a spurious "expected
+    /// `function`" error.
+    fn parse_extern_js_block(&mut self) -> Option<ExternJsBlock> {
+        let start = self.expect(TokenKind::Extern)?.span;
+
+        // Contextual `js` language tag — a plain identifier, not a keyword.
+        // Use a lookahead rather than `expect(Ident)` so that an omitted tag
+        // (`extern { ... }`) gets the tailored "expected `js`" message rather
+        // than a generic "expected identifier", and so the block is still
+        // parsed best-effort instead of aborting on the missing tag.
+        if self.peek().kind == TokenKind::Ident {
+            let lang_tok = self.advance();
+            if lang_tok.text != "js" {
+                self.diagnostics.push(Diagnostic::error(
+                    "expected `js` after `extern` — only `extern js` interop blocks are supported",
+                    lang_tok.span,
+                ));
+                // Continue best-effort: still parse the block below so a typo
+                // in the language tag doesn't cascade into a stream of errors.
+            }
+        } else {
+            self.diagnostics.push(Diagnostic::error(
+                "expected `js` after `extern` — only `extern js` interop blocks are supported",
+                self.peek().span,
+            ));
+            // Continue best-effort into the block below (the `{` expectation
+            // follows), so a missing tag doesn't cascade into further errors.
+        }
+
+        self.expect(TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let mut items = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            // A doc comment before a signature is consumed and discarded,
+            // mirroring top-level declarations (`parse_declaration` swallows a
+            // leading doc comment for every decl, and functions don't yet carry
+            // doc text). The `continue` makes progress — the doc-comment token
+            // is consumed — so it can't stall the anti-hang loop.
+            if self.try_consume_doc_comment().is_some() {
+                continue;
+            }
+            if let Some(sig) = self.parse_extern_fn_sig() {
+                items.push(sig);
+            } else {
+                self.synchronize_stmt();
+            }
+            self.skip_newlines();
+        }
+
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Some(ExternJsBlock {
+            items,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parses one bodyless function signature inside an `extern js` block:
+    /// `function setTimeout(callback: (Void) -> Void, ms: Int)`.
+    ///
+    /// Reuses [`parse_params`](Self::parse_params) and
+    /// [`parse_type_expr`](Self::parse_type_expr) so extern parameters and
+    /// return types accept exactly the same grammar as ordinary functions.
+    /// Three constructs that ordinary functions allow are rejected here with
+    /// targeted diagnostics, because the JavaScript host cannot honor them:
+    /// generic type parameters (`function f<T>(...)`), parameter default
+    /// values (`function f(x: Int = 5)`), and a `self` receiver
+    /// (`function f(self)`) — extern signatures declare free functions, not
+    /// methods. A `{ ... }` body following the signature is likewise a
+    /// targeted error — extern signatures declare a JavaScript function with
+    /// no Phoenix implementation — but the stray block is still consumed so
+    /// parsing continues cleanly.
+    fn parse_extern_fn_sig(&mut self) -> Option<ExternFnSig> {
+        let start = self.expect(TokenKind::Function)?.span;
+        let name_token = self.expect(TokenKind::Ident)?;
+        let name = name_token.text.clone();
+        let name_span = name_token.span;
+
+        // Generic type parameters are not permitted: the JS host has no
+        // monomorphization. Diagnose `<...>` explicitly (rather than letting
+        // the `(` expectation below fire a confusing "expected `(`") and
+        // consume the list — bounds included (`<T: Trait>`) — via the
+        // bounds-aware parser so a bounded generic doesn't trip a second
+        // spurious "expected `>`" diagnostic. The result is discarded.
+        if self.peek().kind == TokenKind::Lt {
+            self.diagnostics.push(Diagnostic::error(
+                "`extern js` function signatures cannot have generic type parameters — the JavaScript host has no type information to monomorphize against",
+                self.peek().span,
+            ));
+            self.parse_type_params_with_bounds();
+        }
+
+        self.expect(TokenKind::LParen)?;
+        let params = self.parse_params();
+        let mut end = self.expect(TokenKind::RParen)?.span;
+
+        // Validate each parameter against the extern-js restrictions:
+        //   * No default values — the JS host cannot evaluate a Phoenix
+        //     default expression.
+        //   * No `self` receiver — extern signatures declare free JavaScript
+        //     functions, not methods, so `self` is meaningless here.
+        for param in &params {
+            if let Some(default) = &param.default_value {
+                self.diagnostics.push(Diagnostic::error(
+                    "`extern js` function parameters cannot have default values — the JavaScript host cannot evaluate a Phoenix default expression",
+                    default.span(),
+                ));
+            }
+            // `param.name == "self"` is reliable because `self` lexes as
+            // `SelfKw`, never `Ident`: only the `SelfKw` branch in
+            // `parse_params` produces a param named "self", so an ordinary
+            // parameter can never collide with this check.
+            if param.name == "self" {
+                self.diagnostics.push(Diagnostic::error(
+                    "`extern js` function signatures cannot take `self` — they declare free JavaScript functions, not methods",
+                    param.span,
+                ));
+            }
+        }
+
+        let return_type = if self.eat(TokenKind::Arrow) {
+            let rt = self.parse_type_expr();
+            if let Some(t) = &rt {
+                end = t.span();
+            }
+            rt
+        } else {
+            None
+        };
+
+        // A body is not allowed on an extern signature. Diagnose it, then
+        // consume the stray block so the surrounding block loop continues.
+        if self.peek().kind == TokenKind::LBrace {
+            self.diagnostics.push(Diagnostic::error(
+                "`extern js` function signatures cannot have a body — they declare a JavaScript function with no Phoenix implementation",
+                self.peek().span,
+            ));
+            if let Some(body) = self.parse_block() {
+                end = body.span;
+            }
+        }
+
+        Some(ExternFnSig {
+            name,
+            name_span,
+            params,
+            return_type,
             span: start.merge(end),
         })
     }
@@ -6295,6 +6474,405 @@ public type UserId = Int";
             "expected at least one Import decl from recovery; got {} decls: {:?}",
             program.declarations.len(),
             program.declarations
+        );
+    }
+
+    // ── extern js interop tests ──────────────────
+
+    #[test]
+    fn parse_extern_js_basic() {
+        let (program, diagnostics) =
+            parse_source("extern js {\n  function alert(message: String)\n}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                let sig = &block.items[0];
+                assert_eq!(sig.name, "alert");
+                assert_eq!(sig.params.len(), 1);
+                assert_eq!(sig.params[0].name, "message");
+                assert!(sig.return_type.is_none());
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_multiple_sigs_closure_param_and_return() {
+        // Exercises a closure-typed param `(Void) -> Void`, a second param,
+        // and a separate signature with a return type.
+        let src = "extern js {\n  \
+                   function setTimeout(callback: (Void) -> Void, ms: Int)\n  \
+                   function now() -> Int\n}";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 2);
+                assert_eq!(block.items[0].name, "setTimeout");
+                assert_eq!(block.items[0].params.len(), 2);
+                assert_eq!(block.items[0].params[0].name, "callback");
+                assert_eq!(block.items[0].params[1].name, "ms");
+                assert!(block.items[0].return_type.is_none());
+                assert_eq!(block.items[1].name, "now");
+                assert!(block.items[1].params.is_empty());
+                assert!(block.items[1].return_type.is_some());
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_closure_return_type() {
+        // A closure-typed *return* position (`-> (Int) -> Bool`) must parse
+        // through the same `parse_type_expr` reuse as params — locks in that
+        // `end`-span tracking and the arrow handling hold for return types,
+        // not just for parameters.
+        let (program, diagnostics) =
+            parse_source("extern js {\n  function make() -> (Int) -> Bool\n}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                let sig = &block.items[0];
+                assert_eq!(sig.name, "make");
+                assert!(
+                    matches!(sig.return_type, Some(TypeExpr::Function(_))),
+                    "expected a function-typed return, got {:?}",
+                    sig.return_type
+                );
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_multiple_sigs_no_newline_separator() {
+        // The block loop must not depend on a newline between signatures: two
+        // `function`s on one line still parse as two distinct items, since each
+        // `parse_extern_fn_sig` stops at the next `function` token.
+        let (program, diagnostics) = parse_source("extern js { function f() function g() }");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 2);
+                assert_eq!(block.items[0].name, "f");
+                assert_eq!(block.items[1].name, "g");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_signature_body_is_rejected() {
+        // A `{ ... }` body on an extern signature is a targeted error, but the
+        // stray block is consumed and the signature is still recorded.
+        let (program, diagnostics) =
+            parse_source("extern js {\n  function alert(message: String) { }\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot have a body")),
+            "expected a body-rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "alert");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_return_type_and_body_both_present() {
+        // A signature with both a return type *and* a (rejected) body exercises
+        // the `end`-span ordering: `parse_type_expr` first sets `end` to the
+        // return type, then the rejected body overwrites it with the block
+        // span. The body is still a targeted error, and the signature — return
+        // type included — is recorded for recovery.
+        let (program, diagnostics) = parse_source("extern js {\n  function f() -> Int { }\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot have a body")),
+            "expected a body-rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+                assert!(
+                    block.items[0].return_type.is_some(),
+                    "return type should be recorded despite the rejected body"
+                );
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_malformed_body_after_valid_header_recovers() {
+        // A valid signature header followed by a *malformed* `{ ... }` body
+        // exercises the body-rejection path where `parse_block` recovers
+        // mid-block rather than returning a clean span: the "cannot have a
+        // body" diagnostic still fires, `parse_block` consumes through the
+        // closing brace, and the signature is recorded. Distinct from
+        // `extern_js_return_type_and_body_both_present`, which uses a
+        // well-formed empty body. The test completing at all also proves the
+        // block loop makes progress through the recovered body.
+        let (program, diagnostics) = parse_source("extern js {\n  function f() { let }\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot have a body")),
+            "expected a body-rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_omitted_tag_is_rejected() {
+        // An omitted language tag (`extern { ... }`) gets the tailored
+        // "expected `js`" diagnostic — not a generic "expected identifier" —
+        // and the block is still parsed best-effort.
+        let (program, diagnostics) = parse_source("extern {\n  function f()\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("only `extern js`")),
+            "expected an `extern js`-only diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_omitted_braces_is_rejected() {
+        // The `js` tag is present but the `{` is omitted (`extern js function
+        // f()`). `expect(LBrace)` emits a diagnostic and the block is dropped —
+        // distinct from the omitted-tag and unclosed-block recovery paths.
+        let (_, diagnostics) = parse_source("extern js function f()");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected '{'")),
+            "expected a missing-brace diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn extern_js_non_js_tag_is_rejected() {
+        let (_, diagnostics) = parse_source("extern wasm {\n  function f()\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("only `extern js`")),
+            "expected an `extern js`-only diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn public_on_extern_js_rejected() {
+        let (_, diagnostics) = parse_source("public extern js {\n  function f()\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot be marked `public`")),
+            "expected diagnostic about `public extern`, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_extern_js_empty_block() {
+        // An empty `extern js { }` is valid: no signatures, no diagnostics.
+        let (program, diagnostics) = parse_source("extern js {\n}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => assert!(block.items.is_empty()),
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_doc_comment_on_sig_is_discarded() {
+        // A doc comment before a signature is consumed and discarded (matching
+        // how top-level functions treat a leading doc comment), not flagged as a
+        // spurious "expected `function`" error. A trailing doc comment with no
+        // following signature is likewise swallowed cleanly before the `}`.
+        let src = "extern js {\n  \
+                   /** Pop a dialog. */\n  function alert(message: String)\n  \
+                   /** trailing, no sig */\n}";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "alert");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_param_default_value_is_rejected() {
+        // The JS host cannot evaluate a Phoenix default; the parser rejects it
+        // but still records the signature (with the parsed param) for recovery.
+        let (program, diagnostics) = parse_source("extern js {\n  function f(x: Int = 5)\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot have default values")),
+            "expected a default-value rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+                assert_eq!(block.items[0].params.len(), 1);
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_generic_type_params_are_rejected() {
+        // Generic type parameters get a targeted diagnostic (not a confusing
+        // "expected `(`"), and the rest of the signature still parses.
+        let (program, diagnostics) = parse_source("extern js {\n  function f<T>(x: T)\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot have generic type parameters")),
+            "expected a generics rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+                assert_eq!(block.items[0].params.len(), 1);
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_body_garbage_terminates_with_diagnostics() {
+        // Anti-hang: a malformed extern-block body must produce a diagnostic
+        // and terminate. The test completing at all is the anti-hang proof;
+        // see `parse_extern_js_block`'s doc comment for why every loop
+        // iteration is guaranteed to make progress.
+        for source in [
+            "extern js { 42 }",
+            "extern js { let x }",
+            "extern js { function }",
+            "extern js { function f( }",
+            "extern js {",
+        ] {
+            let (_, diagnostics) = parse_source(source);
+            assert!(
+                !diagnostics.is_empty(),
+                "expected diagnostics for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extern_js_self_param_is_rejected() {
+        // Extern signatures declare free functions, not methods; a `self`
+        // receiver is rejected but the signature is still recorded.
+        let (program, diagnostics) = parse_source("extern js {\n  function f(self)\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("cannot take `self`")),
+            "expected a `self`-rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_js_bounded_generics_single_diagnostic() {
+        // A bounded generic (`<T: Trait>`) is consumed cleanly via the
+        // bounds-aware parser, so it produces exactly the one targeted
+        // generics-rejection diagnostic — no spurious secondary "expected `>`".
+        let (program, diagnostics) = parse_source("extern js {\n  function f<T: Display>(x: T)\n}");
+        let generics_errors = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("cannot have generic type parameters"))
+            .count();
+        assert_eq!(
+            generics_errors, 1,
+            "expected exactly one generics diagnostic, got: {:?}",
+            diagnostics
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected no other diagnostics, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "f");
+                assert_eq!(block.items[0].params.len(), 1);
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn js_remains_usable_as_identifier() {
+        // The `js` language tag is contextual: outside `extern js`, `js` is an
+        // ordinary identifier and stays usable as a variable name.
+        let (program, diagnostics) = parse_source("function main() {\n  let js = 5\n}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => assert_eq!(f.name, "main"),
+            other => panic!("expected Function decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extern_is_reserved_as_identifier() {
+        // Counterpart to `js_remains_usable_as_identifier`: `extern` is now a
+        // full keyword (unlike the contextual `js` tag), so it can no longer be
+        // used as an ordinary identifier. `let extern = 5` must diagnose rather
+        // than bind a variable named `extern`.
+        let (_, diagnostics) = parse_source("function main() {\n  let extern = 5\n}");
+        assert!(
+            !diagnostics.is_empty(),
+            "expected `extern` to be rejected as an identifier"
         );
     }
 

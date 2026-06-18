@@ -1708,7 +1708,32 @@ To promote the verifier invariant from *enum arguments* to *all* `__generic` (a 
 
 Subordinate decisions for the Phase 2.5 JS-interop layer. Each pins a scope or ABI contract before any code lands so the marshalling model, the glue-artifact shape, and the test-host surface don't drift mid-phase. Decisions confirmed with the user 2026-06-17 during plan mode; phase-level scope summary and exit criteria live in [phase-2.md §2.5](phases/phase-2.md#25-javascript-interop) (matching the location pattern used by §2.3 / §2.4 / §2.6 / §2.7).
 
-The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)](#b-exit-criteria-runtime-wasmtime-cli) and [decision C (WASI-only host surface)](#c-host-import-surface-wasi-preview1-only) both explicitly named Phase 2.5 as the slot where browser/Node execution and Phoenix-defined custom imports arrive. 2.5 cashes that in. Two assumptions baked into the original [phase-2.md §2.5](phases/phase-2.md#25-javascript-interop) stub turned out not to hold: the stub depended on a package manager (Phase 3.1) that does not exist, and its example used `async`/`await` that the language does not have until Phase 4.3.
+The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)](#b-exit-criteria-runtime-wasmtime-cli) and [decision C (WASI-only host surface)](#c-host-import-surface-wasi-preview1-only) both explicitly named Phase 2.5 as the slot where browser/Node execution and Phoenix-defined custom imports arrive. 2.5 cashes that in. Three assumptions baked into the original [phase-2.md §2.5](phases/phase-2.md#25-javascript-interop) stub turned out not to hold: it depended on a package manager (Phase 3.1) that does not exist; its example used `async`/`await` that the language does not have until Phase 4.3; and an early draft scoped `extern js` as WASM-only, which has been revised.
+
+#### A0. Parity model: extern functions are a uniform host-FFI boundary
+
+**Decided:** 2026-06-17 (revises an early WASM-only scoping).
+
+**Context.** Every prior Phase 2 feature is pure computation, so byte-identical stdout across all backends falls out for free — that is what made the §2.4 five-backend matrix possible. `extern js` is the first feature whose *purpose* is to reach outside the program into a host environment, and a native binary / pure-Rust interpreter has no JavaScript engine. "Parity" therefore has to be defined; two readings:
+
+- *Mechanism parity* — every backend uniformly declares / type-checks / lowers / **calls** extern functions through a host-binding layer; only the binding differs per environment.
+- *Effect parity* — `alert` literally pops a dialog on every backend. Only achievable by embedding a JS engine (V8 / QuickJS) into native binaries *and* both interpreters — abandons Phoenix's pure-Rust posture, bloats every binary, and runs browser APIs where no browser exists.
+
+**Decision: mechanism parity via a uniform host-FFI boundary.** `Op::ExternCall` is a generic host-call op (not WASM-tagged). Each backend binds it differently:
+
+- **wasm32-linear / wasm32-gc** — the generated JS glue is the host (real JS). See decisions B–G.
+- **AST + IR interpreters** — a registerable Rust host-function table keyed by `(module, name)`; the embedder / test harness registers Rust closures (e.g. `alert` → append to a buffer).
+- **native (Cranelift)** — each distinct extern lowers to a call of a C-ABI symbol (`phx_extern_<module>__<name>`); the standalone binary resolves it from a linked host shim.
+
+**Default when an extern is unbound at runtime** (no host closure registered / no shim symbol linked): a clear runtime error naming the missing `(module, name)` — never a silent no-op.
+
+**Consequence for the matrix.** Interop fixtures whose host functions are stubbable (log-append, scalar transforms) register identical stubs on every backend and **rejoin the five-backend byte-identical matrix** — the §2.4 parity discipline is preserved, not excepted. Genuinely DOM-only fixtures stay in the browser tier (decision I) because the effect they assert only exists in a browser.
+
+**Residual (stated honestly).** Mechanism parity is not effect parity: a DOM-mutating extern called from a native binary hits its host-shim binding, which on a non-browser host can only stub or error — it cannot mutate a DOM that does not exist. That is a property of the deployment target, not a backend gap.
+
+**Alternatives considered:**
+- *WASM-only with clean rejection* (the early draft). Honest about the host dependency and simplest, but native + both interpreters would reject interop programs at compile time and interop fixtures would live outside the five-backend matrix.
+- *Embed a JS engine on every backend* (effect parity). Rejected: abandons the pure-Rust posture, bloats every native binary, and the payoff — browser APIs running where there is no browser — is illusory.
 
 #### A. Host set & gating: Node always-on, browser gated
 
@@ -1724,9 +1749,11 @@ The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)
 - *Browser only.* Rejected: makes every interop test depend on a headless-browser rig; too heavy for the always-on gate and overkill for non-DOM marshalling fixtures.
 - *Deno.* Rejected: less ubiquitous than Node as the ecosystem default; npm compat is good but not the assumption Phoenix users start from.
 
-#### B. Backend scope: BOTH wasm32-linear and wasm32-gc
+#### B. WASM host bindings: BOTH wasm32-linear and wasm32-gc ship
 
 **Decided:** 2026-06-17
+
+Scopes the two **WASM** host bindings of [decision A0](#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary) (the interpreter and native bindings are covered by A0 + decisions E/G). Both WASM backends ship interop in 2.5.
 
 **Rationale:** WASM-GC is the strategic browser backend (§2.4 [decision A](#a-dual-backends-in-this-phase-wasm-gc-primary-linear-memory-fallback) frames it as primary, linear as the fallback), and the Phase 5 reactivity/frontend endgame lives in the browser. The decisive technical point: `externref` is the *native* model for holding a JS value, so on WASM-GC `JsValue` is a host-VM-traced managed reference — which means a host-retained Phoenix **callback is traced automatically**, dissolving the retained-callback leak that the linear backend has to manage with manual rooting + explicit free. Shipping both now avoids designing two marshalling models at different times. The cost is bounded because the **user-facing surface is backend-neutral and designed once** — `extern js` grammar, `Type::JsValue`, marshallability rules, and `Op::ExternCall` are shared (PRs 1–3); only the per-backend lowering / marshalling / glue differs. A `.phx` program written against linear interop keeps compiling unchanged on WASM-GC, so this is not a user-visible ABI fork.
 
@@ -1734,7 +1761,7 @@ The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)
 - WASM-GC: additive `externref` layer on the shared front-end + glue core + harness. Introduces `externref` into a backend that today uses only `HeapType::Concrete`.
 
 **Alternatives considered:**
-- *Linear only, defer WASM-GC (the original recommendation).* Defensible — the front-end is shared so WASM-GC stays a pure-additive follow-on, and linear-memory WASM runs in browsers fine — but it ships interop on the "fallback" backend first and leaves the externref-based callback-lifetime win on the table. Declined by the design director in favor of landing the strategic model in-phase.
+- *Linear only, defer WASM-GC (the original recommendation).* Defensible — the front-end is shared so WASM-GC stays a pure-additive follow-on, and linear-memory WASM runs in browsers fine — but it ships interop on the "fallback" backend first and leaves the externref-based callback-lifetime win on the table.
 - *WASM-GC only.* Rejected: linear is the proven marshalling path and de-risks the language-level design; dropping it also strands runtimes without WASM-GC.
 
 #### C. Glue-artifact shape: paired sidecar `.js`
@@ -1766,12 +1793,14 @@ The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)
 
 **Decided:** 2026-06-17
 
-Each distinct extern `(module, name)` becomes one custom WASM function import (declared via the documented `merge_func_import` extension on linear; via the GC `ModuleBuilder` on WASM-GC). The marshalled signature:
+Per the [A0 host-FFI model](#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary), each backend binds `Op::ExternCall` differently. The marshalled signature per binding:
 
-- **Linear:** `Int`→`i64`, `Float`→`f64`, `Bool`→`i32`, `String`→ the existing 2-slot `(i32 ptr, i32 len)` fat pointer, `JsValue`→`i32` handle, closure→`(i32 fn_idx, i32 env_ptr)` env-pointer pair.
-- **WASM-GC:** scalars as above; `String` copied across the GC backend's small linear-memory scratch region; `JsValue`→`externref`; closure→ a managed ref.
+- **WASM (linear):** each distinct extern `(module, name)` becomes one custom WASM function import (declared via the documented `merge_func_import` extension). `Int`→`i64`, `Float`→`f64`, `Bool`→`i32`, `String`→ the existing 2-slot `(i32 ptr, i32 len)` fat pointer, `JsValue`→`i32` handle, closure→`(i32 fn_idx, i32 env_ptr)` env-pointer pair.
+- **WASM (gc):** one import per extern (declared via the GC `ModuleBuilder`); scalars as above; `String` copied across the GC backend's small linear-memory scratch region; `JsValue`→`externref`; closure→ a managed ref.
+- **Interpreters (AST + IR):** no marshalling — extern calls dispatch on `(module, name)` to the registered Rust host closure with `Value` arguments directly; `JsValue` is an opaque interpreter-side handle the host table owns.
+- **Native (Cranelift):** each distinct extern lowers to a call of a C-ABI symbol `phx_extern_<module>__<name>` with the native value ABI (`i64`/`f64`/`i32`/string-fat-pointer); `JsValue`→ an opaque `i64`/pointer handle owned by the linked host shim. The compiler emits the call and the symbol reference; the host shim provides the body.
 
-This is an internal compiler↔glue contract, not a user-visible ABI — which is what lets the two backends differ without forking the language surface.
+This is an internal compiler↔host contract, not a user-visible ABI — which is what lets the bindings differ without forking the language surface.
 
 #### F. String ownership across the boundary: copied, never shared
 
@@ -1783,10 +1812,12 @@ This is an internal compiler↔glue contract, not a user-visible ABI — which i
 
 **Decided:** 2026-06-17
 
-A Phoenix closure passed to JS crosses as its env-pointer representation; the module exports a `__phoenix_invoke_closure` trampoline (a `call_indirect` over the existing function table) that the glue wraps in a JS callable. Lifetime management differs:
+A Phoenix closure passed to a host crosses through each backend's binding (per [A0](#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary)). On WASM the module exports a `__phoenix_invoke_closure` trampoline (a `call_indirect` over the existing function table) that the glue wraps in a JS callable. Lifetime management differs per binding:
 
-- **Linear:** the glue registers the wrapped callable in a retention table and the Phoenix side roots the closure (`gc_roots`) so the GC can't collect a host-retained callback. Freeing is **explicit** (a drop extern / `FinalizationRegistry` tie-in) — callbacks-only async has no `Promise` to anchor lifetime. The host-never-released path is a linear-only leak to be filed in `known-issues.md` (by PR 7 / closed-out at PR 18) as a *forward* deferral, not a 2.5 blocker.
-- **WASM-GC:** the glue holds the closure ref via `externref`/`funcref`, so the host VM GC traces a host-retained callback automatically — **no manual rooting, no explicit-free leak.**
+- **WASM (linear):** the glue registers the wrapped callable in a retention table and the Phoenix side roots the closure (`gc_roots`) so the GC can't collect a host-retained callback. Freeing is **explicit** (a drop extern / `FinalizationRegistry` tie-in) — callbacks-only async has no `Promise` to anchor lifetime. The host-never-released path is a linear-only leak to be filed in `known-issues.md` (by PR 7 / closed-out at PR 18) as a *forward* deferral, not a 2.5 blocker.
+- **WASM (gc):** the glue holds the closure ref via `externref`/`funcref`, so the host VM GC traces a host-retained callback automatically — **no manual rooting, no explicit-free leak.**
+- **Interpreters:** the host table receives the Phoenix `Value::Closure` directly and invokes it via the interpreter's normal call path; the interpreter's own GC/ownership keeps it alive for as long as the host table holds it.
+- **Native:** the closure crosses to the host shim as its `(fn_ptr, env_ptr)` pair plus an exported `phx_invoke_closure` entry point the shim calls back through; retention/rooting mirrors the linear contract (the shim must hold the env pointer rooted while retained).
 
 #### H. Async model: callbacks-only
 

@@ -469,7 +469,8 @@ impl Interpreter {
                 | Declaration::TypeAlias(_)
                 | Declaration::Endpoint(_)
                 | Declaration::Schema(_)
-                | Declaration::Import(_) => {} // Compile-time only
+                | Declaration::Import(_)
+                | Declaration::ExternJs(_) => {} // No Phoenix body to register; extern js calls bind to the interpreter's host-function table at call time (Phase 2.5 PR 2+)
             }
         }
 
