@@ -98,6 +98,16 @@ pub struct FunctionInfo {
     pub visibility: Visibility,
     /// Module path of the file declaring this function.
     pub def_module: ModulePath,
+    /// JavaScript-host linkage when this is an `extern js` signature
+    /// (JavaScript interop). `Some((js_module, js_name))` for extern functions —
+    /// they have no Phoenix body and their [`func_id`](Self::func_id) is a
+    /// never-used sentinel: extern `FunctionInfo`s live in a dedicated
+    /// `Checker::extern_functions` / `ResolvedModule::extern_functions` map,
+    /// never the `FuncId`-indexed function table, so they do not flow through
+    /// `build_functions`. `None` for ordinary functions. The linkage is the
+    /// `(module, name)` host-call target IR lowering emits as `Op::ExternCall`
+    /// (PR 3). See `docs/design-decisions.md` §Phase 2.5 (decisions A0, E).
+    pub extern_js: Option<(String, String)>,
 }
 
 /// Information about a registered trait.
@@ -583,6 +593,12 @@ pub struct TypeAliasInfo {
 pub struct Checker {
     pub(crate) scopes: ScopeStack,
     pub(crate) functions: HashMap<String, FunctionInfo>,
+    /// `extern js` host functions (Phase 2.5), keyed by module-qualified name.
+    /// Kept **separate** from `functions` so bodyless extern signatures never
+    /// reach `build_functions` / the `FuncId`-indexed `ResolvedModule.functions`
+    /// Vec — they carry a sentinel `func_id` and resolve via `lookup_extern`,
+    /// not the FuncId table. Each entry's `FunctionInfo.extern_js` is `Some`.
+    pub(crate) extern_functions: HashMap<String, FunctionInfo>,
     pub(crate) structs: HashMap<String, StructInfo>,
     pub(crate) enums: HashMap<String, EnumInfo>,
     pub(crate) methods: HashMap<String, HashMap<String, MethodInfo>>, // type_name -> method_name -> info
@@ -755,6 +771,7 @@ impl Checker {
         Self {
             scopes: ScopeStack::new(),
             functions: HashMap::new(),
+            extern_functions: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             methods: HashMap::new(),
@@ -1066,27 +1083,20 @@ impl Checker {
                 Declaration::Impl(imp) => self.register_impl(imp),
                 Declaration::Trait(t) => self.register_trait(t),
                 Declaration::TypeAlias(ta) => self.register_type_alias(ta),
+                // `extern js` signatures are registered (and marshallability-
+                // checked) here. Per decision A0, `extern js` is a uniform
+                // host-FFI boundary supported on every executable backend, so
+                // sema does NOT reject it — it is valid for `run` / `build`. The
+                // Gen-schema rejection (it is an executable-language feature, not
+                // a schema feature) lives in the codegen entry, which is the only
+                // place that knows it is generating a schema.
+                Declaration::ExternJs(block) => self.register_extern_js(block),
                 // Endpoints are checked in the body-check pass — see
                 // "Endpoints are checked in the body-check pass" in
                 // docs/design-decisions.md for the rationale. Schemas
                 // are parse-only; imports were already processed by
                 // `build_module_scopes_phase_b` before this pass.
-                //
-                // TODO(phase-2.5-pr2): register `extern js` signatures and
-                // check their marshallability here. Per decision A0, `extern
-                // js` is a uniform host-FFI boundary supported on every
-                // executable backend (interpreters, native, both WASM targets),
-                // so this is NOT gated to WASM — the gate is that Gen rejects it
-                // (an executable-language feature, not a schema feature). The
-                // Gen codegen backends (typescript/go/python/openapi) match
-                // `Declaration` with a trailing `_ => {}`, so an `extern js`
-                // block reaching a Gen-consumed schema is currently dropped
-                // silently with no diagnostic; sema must reject it here, before
-                // codegen ever sees it.
-                Declaration::Endpoint(_)
-                | Declaration::Schema(_)
-                | Declaration::Import(_)
-                | Declaration::ExternJs(_) => {}
+                Declaration::Endpoint(_) | Declaration::Schema(_) | Declaration::Import(_) => {}
             }
         }
     }

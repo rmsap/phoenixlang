@@ -93,6 +93,59 @@ pub(crate) fn schema_uses_money(program: &Program, check_result: &Analysis) -> b
     in_struct || in_ep
 }
 
+/// `true` if the schema mentions [`Type::JsValue`] anywhere a Gen backend would
+/// emit it: a struct field, an enum-variant payload, an endpoint
+/// query/header/body/response/pagination type, or a type alias.
+///
+/// `JsValue` is an executable-language host-FFI handle (Phase 2.5) with no wire
+/// representation, so it has no place in a Gen schema. The driver's `emit_target`
+/// uses this to reject such a schema uniformly across all four targets — without
+/// it, each backend's type-mapper would silently guess a *different* fallback
+/// (`unknown` / `interface{}` / `object`). Recursion uses
+/// [`Type::mentions_jsvalue`]. `extern js` signatures (which legitimately carry
+/// `JsValue`) are not scanned here — they live in `extern_functions`, not these
+/// emittable tables, and are rejected separately by `emit_target`.
+///
+/// Unlike the sibling [`schema_uses_money`], this takes only the [`Analysis`]
+/// (no `program`): it scans the *resolved* `module.structs`/`enums` rather than
+/// walking `program.declarations`, so it also catches `JsValue` in imported
+/// structs/enums. The two gates should eventually converge on this form.
+pub fn schema_mentions_jsvalue(check_result: &Analysis) -> bool {
+    let m = &check_result.module;
+    let in_struct = m
+        .structs
+        .iter()
+        .any(|s| s.fields.iter().any(|f| f.ty.mentions_jsvalue()));
+    let in_enum = m.enums.iter().any(|e| {
+        e.variants
+            .iter()
+            .any(|(_, tys)| tys.iter().any(Type::mentions_jsvalue))
+    });
+    let in_alias = check_result
+        .type_aliases
+        .values()
+        .any(|a| a.target.mentions_jsvalue());
+    let in_ep = check_result.endpoints.iter().any(|ep| {
+        ep.query_params.iter().any(|q| q.ty.mentions_jsvalue())
+            || ep.headers.iter().any(|h| h.ty.mentions_jsvalue())
+            || ep.response_headers.iter().any(|h| h.ty.mentions_jsvalue())
+            || ep.response.as_ref().is_some_and(Type::mentions_jsvalue)
+            || ep
+                .body
+                .as_ref()
+                .is_some_and(|b| b.fields.iter().any(|f| f.ty.mentions_jsvalue()))
+            || ep
+                .response_statuses
+                .iter()
+                .any(|rs| rs.ty.as_ref().is_some_and(Type::mentions_jsvalue))
+            || ep
+                .pagination
+                .as_ref()
+                .is_some_and(|p| p.item_type.mentions_jsvalue())
+    });
+    in_struct || in_enum || in_alias || in_ep
+}
+
 /// A sort key ordering endpoint paths most-specific (most-static) first.
 ///
 /// The generated Express (TypeScript) and FastAPI (Python) routers both match

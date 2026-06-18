@@ -64,6 +64,22 @@ pub enum Type {
     Money,
     /// The unit type, used for functions that do not return a value.
     Void,
+    /// An opaque JavaScript-host value handle.
+    ///
+    /// Produced and consumed only at the `extern js` boundary: Phoenix never
+    /// inspects a `JsValue`, it only holds one and passes it back to a host
+    /// function. The runtime representation is per-backend (an `i32` handle
+    /// table index on `wasm32-linear`, an `externref` on `wasm32-gc`, an opaque
+    /// host handle in the interpreters / native) — see `docs/design-decisions.md`
+    /// §Phase 2.5 (decision D). There is no `JsValue` literal in the language;
+    /// the only way to obtain one is an extern call's return value. Until the
+    /// per-backend lowering lands (PR 3+), `lower_type` maps it to a placeholder
+    /// `IrType`. That arm is unreachable today not because `JsValue` is
+    /// unspellable (it *is* spellable, unlike `Money`) but because a program
+    /// using `extern js` is rejected on every execution path before lowering —
+    /// see `reject_extern_js_for_execution` in `phoenix-driver` and the note on
+    /// the `JsValue` arm of `lower_type`.
+    JsValue,
     /// A named type that hasn't been resolved yet or is user-defined.
     ///
     /// Post-Phase 2.6 the payload is the canonical *qualified* key
@@ -121,6 +137,7 @@ impl Type {
             "Uuid" => Type::Uuid,
             "Decimal" => Type::Decimal,
             "Money" => Type::Money,
+            "JsValue" => Type::JsValue,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
         }
@@ -166,6 +183,32 @@ impl Type {
         matches!(self, Type::TypeVar(_))
     }
 
+    /// Returns `true` if this type may cross the `extern js` host-FFI boundary.
+    /// The marshallable set is the scalars `Int` / `Float` / `Bool`
+    /// / `String`, the opaque `JsValue` handle, `Void`, and a
+    /// `Function(...)` whose parameter and return types are themselves
+    /// marshallable (closures-as-callbacks). `Void` is meaningful chiefly in
+    /// return position; this predicate is position-agnostic and accepts it
+    /// uniformly (a `Void` parameter is nonsensical but harmless — there is no
+    /// value to marshal). Aggregates (`Named` structs/enums,
+    /// `Generic` `List`/`Map`/`Option`/…, `Dyn`), type variables, the Gen-only
+    /// scalars (`File`/`DateTime`/`Uuid`/`Decimal`/`Money`), and the `Error`
+    /// sentinel are NOT marshallable — aggregate marshalling is deferred (see
+    /// `docs/design-decisions.md` §Phase 2.5). Used by extern-signature
+    /// registration to reject non-marshallable boundary types.
+    #[must_use]
+    pub fn is_js_marshallable(&self) -> bool {
+        match self {
+            Type::Int | Type::Float | Type::Bool | Type::String | Type::JsValue | Type::Void => {
+                true
+            }
+            Type::Function(params, ret) => {
+                params.iter().all(Type::is_js_marshallable) && ret.is_js_marshallable()
+            }
+            _ => false,
+        }
+    }
+
     /// Returns `true` if this type is — or has a generic argument that is —
     /// [`Type::Money`]. Recurses through generics so `Option<Money>`/`List<Money>`/
     /// `Map<_, Money>` are caught, but does NOT recurse into [`Type::Named`]
@@ -179,6 +222,30 @@ impl Type {
         match self {
             Type::Money => true,
             Type::Generic(_, args) => args.iter().any(Type::mentions_money),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this type is — or recursively contains —
+    /// [`Type::JsValue`]. Recurses through `Generic` arguments and `Function`
+    /// parameter/return types so `List<JsValue>` / `Option<JsValue>` /
+    /// `(JsValue) -> Void` are caught; does NOT recurse into [`Type::Named`]
+    /// (a struct that *has* a `JsValue` field is caught by scanning that
+    /// struct's own fields).
+    ///
+    /// `JsValue` is an executable-language host-FFI handle (Phase 2.5) with no
+    /// wire representation, so it has no place in a Phoenix Gen schema. Used by
+    /// codegen's `schema_mentions_jsvalue` to reject such a schema uniformly
+    /// across all targets (instead of each backend's type-mapper guessing a
+    /// different fallback).
+    #[must_use]
+    pub fn mentions_jsvalue(&self) -> bool {
+        match self {
+            Type::JsValue => true,
+            Type::Generic(_, args) => args.iter().any(Type::mentions_jsvalue),
+            Type::Function(params, ret) => {
+                params.iter().any(Type::mentions_jsvalue) || ret.mentions_jsvalue()
+            }
             _ => false,
         }
     }
@@ -251,6 +318,7 @@ impl std::fmt::Display for Type {
             Type::Uuid => write!(f, "Uuid"),
             Type::Decimal => write!(f, "Decimal"),
             Type::Money => write!(f, "Money"),
+            Type::JsValue => write!(f, "JsValue"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),
             Type::Function(params, ret) => {
@@ -342,5 +410,37 @@ mod tests {
         assert_eq!(Type::Void.to_string(), "Void");
         assert_eq!(Type::Named("Foo".to_string()).to_string(), "Foo");
         assert_eq!(Type::Error.to_string(), "<error>");
+    }
+
+    #[test]
+    fn mentions_jsvalue_recurses_through_generics_and_functions() {
+        assert!(Type::JsValue.mentions_jsvalue());
+        assert!(list_of(Type::JsValue).mentions_jsvalue());
+        assert!(map_of(Type::String, Type::JsValue).mentions_jsvalue());
+        assert!(Type::Function(vec![Type::JsValue], Box::new(Type::Void)).mentions_jsvalue());
+        assert!(Type::Function(vec![Type::Int], Box::new(Type::JsValue)).mentions_jsvalue());
+        // Does not recurse into Named (a struct that *has* a JsValue field is
+        // caught by scanning that struct's own fields, not by this predicate).
+        assert!(!Type::Named("Element".to_string()).mentions_jsvalue());
+        assert!(!list_of(Type::Int).mentions_jsvalue());
+    }
+
+    #[test]
+    fn is_js_marshallable_accepts_scalars_jsvalue_and_marshallable_closures() {
+        assert!(Type::Int.is_js_marshallable());
+        assert!(Type::String.is_js_marshallable());
+        assert!(Type::JsValue.is_js_marshallable());
+        assert!(Type::Void.is_js_marshallable());
+        assert!(
+            Type::Function(vec![Type::Int, Type::String], Box::new(Type::Bool))
+                .is_js_marshallable()
+        );
+        // Aggregates / Gen scalars / closures-of-aggregates are not marshallable.
+        assert!(!list_of(Type::Int).is_js_marshallable());
+        assert!(!Type::Money.is_js_marshallable());
+        assert!(!Type::Named("Foo".to_string()).is_js_marshallable());
+        assert!(
+            !Type::Function(vec![list_of(Type::Int)], Box::new(Type::Void)).is_js_marshallable()
+        );
     }
 }

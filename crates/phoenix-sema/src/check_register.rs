@@ -9,11 +9,12 @@ use crate::checker::{
 };
 use crate::impl_classify::ImplTarget;
 use crate::types::Type;
+use phoenix_common::ids::FuncId;
 use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
-    EnumDecl, Expr, FunctionDecl, ImplBlock, InlineTraitImpl, LiteralKind, Param, StructDecl,
-    TraitDecl, TypeAliasDecl, TypeExpr, UnaryOp, Visibility,
+    EnumDecl, Expr, ExternJsBlock, FunctionDecl, ImplBlock, InlineTraitImpl, LiteralKind, Param,
+    StructDecl, TraitDecl, TypeAliasDecl, TypeExpr, UnaryOp, Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -202,11 +203,30 @@ impl Checker {
         // registration.
         let qualified = module_qualify(&self.current_module, &func.name);
         if self.functions.contains_key(&qualified) {
+            // A prior function already consumed this name's pre-allocated
+            // `FuncId`, so bailing leaves no unfilled slot (see
+            // `build_functions`'s every-id-filled invariant).
             self.error(
                 format!("function `{}` is already defined", func.name),
                 func.span,
             );
             return;
+        }
+        if self.extern_functions.contains_key(&qualified) {
+            // A prior `extern js` signature claimed this name. Declarations
+            // register in source order, so an extern-then-function ordering
+            // reaches here; without this the function would register and
+            // silently shadow the extern (call resolution consults
+            // `lookup_function` first). Report the collision — but unlike the
+            // function-vs-function case we must NOT bail: the extern lives in a
+            // separate table and did not consume this function's pre-allocated
+            // `FuncId`, so the function must still register to fill that slot.
+            // The duplicate entry is harmless post-error recovery state.
+            //
+            // Wording matches `register_extern_js`'s collision message (not the
+            // function-vs-function message above) so a function↔extern clash
+            // reads identically whichever declaration comes first.
+            self.error(format!("`{}` is already defined", func.name), func.span);
         }
         let (params, param_names, default_param_exprs, return_type) =
             self.with_type_params(&func.type_params, None, |this| {
@@ -274,8 +294,137 @@ impl Checker {
                 return_type,
                 visibility: func.visibility,
                 def_module: self.current_module.clone(),
+                extern_js: None,
             },
         );
+    }
+
+    /// Register an `extern js { ... }` block (Phase 2.5 JavaScript interop).
+    ///
+    /// Each bodyless signature becomes a [`FunctionInfo`] flagged
+    /// [`extern_js`](FunctionInfo::extern_js) and stored in the dedicated
+    /// `extern_functions` map (never the `FuncId`-indexed function table, so it
+    /// carries a sentinel `func_id`). Validates that every parameter and the
+    /// return type is marshallable across the JS boundary
+    /// ([`Type::is_js_marshallable`]) and that no parameter carries a default
+    /// value (the JavaScript host cannot evaluate a Phoenix default).
+    pub(crate) fn register_extern_js(&mut self, block: &ExternJsBlock) {
+        for item in &block.items {
+            // Builtin names (`Option`, `Result`, …) are reserved in every module.
+            // `build_one_module_scope_phase_a` skips inserting a builtin-shadowing
+            // extern into the module scope using this same `is_builtin_name` predicate,
+            // so without this guard the entry would land in `extern_functions` yet be
+            // unreachable — silently dropped with no diagnostic. Reject it here, matching
+            // how ordinary decls that shadow a builtin are rejected.
+            if self.is_builtin_name(&item.name) {
+                self.error(
+                    format!("`{}` is already defined", item.name),
+                    item.name_span,
+                );
+                continue;
+            }
+
+            let qualified = module_qualify(&self.current_module, &item.name);
+            // Collide against both ordinary functions and prior externs.
+            if self.functions.contains_key(&qualified)
+                || self.extern_functions.contains_key(&qualified)
+            {
+                self.error(
+                    format!("`{}` is already defined", item.name),
+                    item.name_span,
+                );
+                continue;
+            }
+
+            // Extern signatures have no generic type parameters and no `self`.
+            let params: Vec<Type> = item
+                .params
+                .iter()
+                .map(|p| self.resolve_type_expr(&p.type_annotation))
+                .collect();
+            let param_names: Vec<String> = item.params.iter().map(|p| p.name.clone()).collect();
+            let return_type = item
+                .return_type
+                .as_ref()
+                .map(|t| self.resolve_type_expr(t))
+                .unwrap_or(Type::Void);
+
+            // Default values, `self`, and generic type parameters on extern
+            // signatures are *diagnosed* at parse time — see `parse_extern_fn_sig`
+            // in `phoenix-parser`. The parser is error-recovering, though, so the
+            // recovered constructs reach this pass and are handled benignly:
+            // generic type params are dropped by the parser (`ExternFnSig` has no
+            // type-params field, so they truly never arrive); default values stay
+            // on the `Param`s but are ignored here (extern signatures store no
+            // `default_param_exprs`); a `self` param arrives as a `Self`-typed
+            // entry and simply fails the marshallability check below, adding one
+            // redundant diagnostic atop the parse error. Compilation already fails
+            // in every case, so no special handling is needed.
+
+            // Marshallability: every parameter and the return type must be able
+            // to cross the JS boundary. Aggregates / Gen-only scalars / dyn /
+            // type vars are rejected (aggregate marshalling is deferred). An
+            // unresolved annotation already surfaced a "type not found" error
+            // and resolved to `Type::Error`; skip those so a single bad
+            // annotation does not also emit a confusing non-marshallable
+            // `<error>` diagnostic.
+            for (name, ty) in param_names.iter().zip(params.iter()) {
+                if !matches!(ty, Type::Error) && !ty.is_js_marshallable() {
+                    self.error(
+                        format!(
+                            "`extern js` function `{}` parameter `{}` has non-marshallable \
+                             type `{}` — only Int, Float, Bool, String, JsValue, Void, and \
+                             functions of those may cross the JavaScript boundary",
+                            item.name, name, ty
+                        ),
+                        item.name_span,
+                    );
+                }
+            }
+            if !matches!(return_type, Type::Error) && !return_type.is_js_marshallable() {
+                self.error(
+                    format!(
+                        "`extern js` function `{}` has non-marshallable return type `{}` — \
+                         only Int, Float, Bool, String, JsValue, Void, and functions of those \
+                         may cross the JavaScript boundary",
+                        item.name, return_type
+                    ),
+                    item.name_span,
+                );
+            }
+
+            self.record_reference(
+                item.name_span,
+                crate::checker::SymbolKind::Function,
+                item.name.clone(),
+            );
+
+            self.extern_functions.insert(
+                qualified,
+                FunctionInfo {
+                    // Sentinel: extern functions never enter the FuncId-indexed
+                    // function table (they resolve via `lookup_extern` and lower
+                    // to `Op::ExternCall`, not `Op::Call`). Documented on
+                    // `FunctionInfo::extern_js`.
+                    func_id: FuncId(u32::MAX),
+                    definition_span: item.name_span,
+                    type_params: Vec::new(),
+                    type_param_bounds: Vec::new(),
+                    params,
+                    param_names,
+                    default_param_exprs: HashMap::new(),
+                    default_needs_wrapper: HashSet::new(),
+                    return_type,
+                    // The `extern js` block cannot be marked `public` (rejected by
+                    // the parser), and cross-module import of externs is out of
+                    // PR-2 scope, so private is the consistent default. Within the
+                    // declaring module, calls resolve regardless of visibility.
+                    visibility: Visibility::Private,
+                    def_module: self.current_module.clone(),
+                    extern_js: Some(("js".to_string(), item.name.clone())),
+                },
+            );
+        }
     }
 
     /// Returns `true` if a struct-field type counts as carrying a `File`:

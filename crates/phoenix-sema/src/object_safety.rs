@@ -60,6 +60,7 @@ fn contains_self(ty: &Type) -> bool {
         | Type::Uuid
         | Type::Decimal
         | Type::Money
+        | Type::JsValue
         | Type::Void
         | Type::TypeVar(_)
         | Type::Error => false,

@@ -745,3 +745,157 @@ mode = "server"
     assert!(dir.join("go_out/handlers.go").exists());
     assert!(dir.join("go_out/server.go").exists());
 }
+
+// ── extern js is rejected in Gen schemas (Phase 2.5) ────────────────
+
+#[test]
+fn gen_rejects_extern_js_schema() {
+    // `extern js` is an executable-language interop feature, not a Phoenix Gen
+    // schema feature. `phoenix gen` must reject a schema containing it with a
+    // clear error and produce no output — written to a temp file (not a
+    // committed `gen_*.phx` fixture) so the fixture suites don't pick it up.
+    let dir = temp_dir("extern_js_reject");
+    fs::create_dir_all(&dir).unwrap();
+    let schema = dir.join("schema.phx");
+    fs::write(
+        &schema,
+        "extern js { function alert(message: String) }\nstruct User { id: Int }\n",
+    )
+    .unwrap();
+    let out = dir.join("out");
+
+    let output = phoenix_bin()
+        .arg("gen")
+        .arg(&schema)
+        .args(["--target", "typescript", "--out"])
+        .arg(&out)
+        .output()
+        .expect("failed to run phoenix");
+
+    assert!(
+        !output.status.success(),
+        "expected `phoenix gen` to fail on an extern-js schema"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("extern js") && stderr.contains("not supported in Phoenix Gen"),
+        "expected an extern-js rejection message, got stderr: {stderr}"
+    );
+    // Rejection happens before any output is written.
+    assert!(
+        !out.join("types.ts").exists(),
+        "no output should be generated when the schema is rejected"
+    );
+}
+
+#[test]
+fn gen_rejects_jsvalue_field_schema() {
+    // The `JsValue` *type* is rejected wherever it appears in a schema — here a
+    // struct field, with NO `extern js` block — so all four targets behave
+    // uniformly instead of each type-mapper guessing a different fallback
+    // (`unknown` / `interface{}` / `object`).
+    let dir = temp_dir("jsvalue_field_reject");
+    fs::create_dir_all(&dir).unwrap();
+    let schema = dir.join("schema.phx");
+    fs::write(&schema, "struct Element { handle: JsValue }\n").unwrap();
+    let out = dir.join("out");
+
+    let output = phoenix_bin()
+        .arg("gen")
+        .arg(&schema)
+        .args(["--target", "go", "--out"])
+        .arg(&out)
+        .output()
+        .expect("failed to run phoenix");
+
+    assert!(
+        !output.status.success(),
+        "expected `phoenix gen` to fail on a JsValue-typed field"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("JsValue") && stderr.contains("not supported in Phoenix Gen"),
+        "expected a JsValue rejection message, got stderr: {stderr}"
+    );
+    assert!(
+        !out.join("types.go").exists(),
+        "no output should be generated when the schema is rejected"
+    );
+}
+
+/// Run `phoenix gen` on `schema_src` and assert it is rejected with the JsValue
+/// schema diagnostic and writes no `types.<target>` artifact. Shared by the
+/// JsValue-position tests below so each exercises one arm of
+/// `schema_mentions_jsvalue` without re-spelling the subprocess plumbing.
+fn assert_gen_rejects_jsvalue(name: &str, schema_src: &str, target: &str, types_file: &str) {
+    let dir = temp_dir(name);
+    fs::create_dir_all(&dir).unwrap();
+    let schema = dir.join("schema.phx");
+    fs::write(&schema, schema_src).unwrap();
+    let out = dir.join("out");
+
+    let output = phoenix_bin()
+        .arg("gen")
+        .arg(&schema)
+        .args(["--target", target, "--out"])
+        .arg(&out)
+        .output()
+        .expect("failed to run phoenix");
+
+    assert!(
+        !output.status.success(),
+        "expected `phoenix gen` to fail on schema: {schema_src}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("JsValue") && stderr.contains("not supported in Phoenix Gen"),
+        "expected a JsValue rejection message, got stderr: {stderr}"
+    );
+    assert!(
+        !out.join(types_file).exists(),
+        "no output should be generated when the schema is rejected"
+    );
+}
+
+#[test]
+fn gen_rejects_jsvalue_type_alias_schema() {
+    // The `in_alias` arm of `schema_mentions_jsvalue`: a `JsValue`-targeting type
+    // alias is rejected even when it is otherwise unused. Aliases are recorded
+    // independently of use (for the LSP), so the gate must scan them directly —
+    // a struct field referencing the alias would already be expanded to
+    // `JsValue` and caught by the struct scan, but a bare alias would not be.
+    assert_gen_rejects_jsvalue(
+        "jsvalue_alias_reject",
+        "type Handle = JsValue\nstruct User { id: Int }\n",
+        "typescript",
+        "types.ts",
+    );
+}
+
+#[test]
+fn gen_rejects_jsvalue_endpoint_response_schema() {
+    // The endpoint arm of `schema_mentions_jsvalue`: a `JsValue` in an endpoint
+    // response position (not a struct field) is rejected too. `JsValue` is a
+    // built-in, so endpoint validation accepts it as a known response type and
+    // it reaches the Gen gate.
+    assert_gen_rejects_jsvalue(
+        "jsvalue_endpoint_reject",
+        "endpoint getHandle: GET \"/handle\" {\n  response JsValue\n}\n",
+        "go",
+        "types.go",
+    );
+}
+
+#[test]
+fn gen_rejects_jsvalue_enum_payload_schema() {
+    // The `in_enum` arm of `schema_mentions_jsvalue`: a `JsValue` carried as an
+    // enum-variant payload (not a struct field) is rejected too. The gate scans
+    // resolved enum variants directly, so a bare enum mentioning `JsValue`
+    // reaches the rejection even without any struct or endpoint use.
+    assert_gen_rejects_jsvalue(
+        "jsvalue_enum_reject",
+        "enum Wrapper { Value(JsValue)  Empty }\n",
+        "typescript",
+        "types.ts",
+    );
+}

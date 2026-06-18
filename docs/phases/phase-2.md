@@ -229,7 +229,7 @@ Build the host-FFI bridge that lets Phoenix call hand-declared JavaScript / brow
 // Declare external JS functions available at runtime (hand-declared host API).
 extern js {
   function alert(message: String)
-  function setTimeout(callback: (Void) -> Void, ms: Int)
+  function setTimeout(callback: () -> Void, ms: Int)
 }
 
 function main() {

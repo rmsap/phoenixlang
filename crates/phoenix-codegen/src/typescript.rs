@@ -2419,6 +2419,14 @@ fn type_to_ts(ty: &Type) -> String {
         // interface dispatch handles the runtime variance); sharper mappings
         // can replace this when specific traits get per-trait TS shims.
         Type::Dyn(name) => name.clone(),
+        // `JsValue` is an executable-language host-FFI type, not a Phoenix Gen
+        // schema type. The Gen entry (`emit_target`) rejects any schema that
+        // mentions `JsValue` — via `extern js` block or as a field/param type —
+        // before codegen runs (`schema_mentions_jsvalue`), so this arm is
+        // unreachable in practice. It exists only because `type_to_ts` is an
+        // exhaustive match (the Go/Python type-mappers absorb `JsValue` in their
+        // `_` arm); map to `unknown` defensively rather than panic.
+        Type::JsValue => "unknown".to_string(),
         Type::Error => "unknown".to_string(),
     }
 }

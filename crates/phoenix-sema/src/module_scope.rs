@@ -164,6 +164,19 @@ impl Checker {
         // (the bare-name builtin loop below would also see the slot
         // already filled and skip its own insert).
         for decl in &program.declarations {
+            // `extern js` blocks introduce one visible name per signature.
+            // Handle them up front since a single decl yields
+            // multiple names, then `continue` past the single-name match below.
+            if let Declaration::ExternJs(block) = decl {
+                for item in &block.items {
+                    if self.is_builtin_name(&item.name) {
+                        continue;
+                    }
+                    let qualified = module_qualify(module_path, &item.name);
+                    scope.insert(item.name.clone(), qualified);
+                }
+                continue;
+            }
             let name = match decl {
                 Declaration::Function(f) => Some(&f.name),
                 Declaration::Struct(s) => Some(&s.name),
@@ -324,6 +337,16 @@ impl Checker {
     ) -> Option<&crate::checker::FunctionInfo> {
         let qualified = self.resolve_visible(local_name)?;
         self.functions.get(qualified)
+    }
+
+    /// Look up an `extern js` host function by user-source name in the current
+    /// module's scope (Phase 2.5). Returns `None` when the name is not in scope
+    /// or is not an extern. Externs live in a table separate from `functions`
+    /// so a bodyless host signature never enters the `FuncId`-indexed function
+    /// table; call resolution consults this after [`Self::lookup_function`].
+    pub(crate) fn lookup_extern(&self, local_name: &str) -> Option<&crate::checker::FunctionInfo> {
+        let qualified = self.resolve_visible(local_name)?;
+        self.extern_functions.get(qualified)
     }
 
     /// Look up a struct by name. Accepts either a bare user-source

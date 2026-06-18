@@ -175,6 +175,20 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
         // or operations, so the placeholder representation is never materialized.
         // See `docs/design-decisions.md` (Money type).
         Type::Money => IrType::StringRef,
+        // `JsValue` is the opaque host-FFI handle. It has no
+        // constructible value or operations in the language yet — only an
+        // `extern js` call produces one, and extern-call lowering plus the real
+        // per-backend representation (an `i32` handle on `wasm32-linear`, an
+        // `externref` on `wasm32-gc`, an opaque handle in the interpreters /
+        // native) arrive in Phase 2.5 PR 3+. `JsValue` *is* a spellable type
+        // annotation (`let a: JsValue = …`), unlike `Money`, but this arm is
+        // still unreachable today: a program containing `extern js` is rejected
+        // up front on every execution path by `reject_extern_js_for_execution`
+        // in `phoenix-driver` (the only way to obtain a `JsValue` is an extern
+        // call, which has no lowering), so lowering never reaches a binding of
+        // this type. PR 3 removes that driver guard, adds extern-call lowering,
+        // and replaces this placeholder with a dedicated `IrType::JsValue`.
+        Type::JsValue => IrType::I64,
         Type::Void => IrType::Void,
         Type::File => {
             // `File` is a Phoenix Gen endpoint-transport type only. Endpoints are

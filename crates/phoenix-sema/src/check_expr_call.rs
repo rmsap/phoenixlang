@@ -616,6 +616,18 @@ impl Checker {
                 return self.check_call_with_info(&ident.name, &func_info, call);
             }
 
+            // `extern js` host function (Phase 2.5). Externs live in a separate
+            // table but share `FunctionInfo`, so call validation (arity, arg
+            // types, return type) reuses `check_call_with_info` unchanged.
+            if let Some(extern_info) = self.lookup_extern(&ident.name).cloned() {
+                self.record_reference(
+                    ident.span,
+                    crate::checker::SymbolKind::Function,
+                    ident.name.clone(),
+                );
+                return self.check_call_with_info(&ident.name, &extern_info, call);
+            }
+
             // Check if it's a variable with a function type
             if let Some(info) = self.scopes.lookup(&ident.name).cloned() {
                 return self.check_call_on_type(info.ty, call);

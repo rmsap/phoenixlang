@@ -130,6 +130,15 @@ pub struct ResolvedModule {
     /// `function_name → FuncId` for free-function name lookup.
     pub function_by_name: HashMap<String, FuncId>,
 
+    /// `extern js` host functions, keyed by
+    /// module-qualified name. Each entry's [`FunctionInfo::extern_js`] is
+    /// `Some`. These are **not** part of the [`FuncId`]-indexed
+    /// [`functions`](Self::functions) Vec — they have no Phoenix body and lower
+    /// to `Op::ExternCall` (PR 3), not `Op::Call` — so they carry a sentinel
+    /// `func_id` and sit in their own table. IR lowering consults this to route
+    /// a call to a host function instead of the function table.
+    pub extern_functions: HashMap<String, FunctionInfo>,
+
     /// User-declared methods in declaration order.  Indexed by
     /// `FuncId(user_method_offset + i) → user_methods[i]`.  Inline
     /// `methods { … }` / `impl Trait { … }` on a struct/enum are
@@ -649,6 +658,10 @@ pub(crate) fn build_from_checker(program: &Program, mut checker: Checker) -> Ana
     let mut rm = empty_resolved_module();
 
     build_functions(&mut rm, &mut checker);
+    // `extern js` host functions move across whole — they are name-keyed and
+    // carry sentinel `func_id`s, so they bypass the FuncId-indexed `functions`
+    // Vec built above (see `ResolvedModule::extern_functions`).
+    rm.extern_functions = std::mem::take(&mut checker.extern_functions);
     build_user_and_builtin_methods(&mut rm, &mut checker);
     build_enums(&mut rm, &mut checker, program);
     build_structs(&mut rm, &mut checker, program);
@@ -700,6 +713,7 @@ fn empty_resolved_module() -> ResolvedModule {
     ResolvedModule {
         functions: Vec::new(),
         function_by_name: HashMap::new(),
+        extern_functions: HashMap::new(),
         user_methods: Vec::new(),
         user_method_offset: 0,
         method_index: HashMap::new(),

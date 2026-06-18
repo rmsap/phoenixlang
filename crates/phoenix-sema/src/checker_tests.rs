@@ -4438,3 +4438,241 @@ fn outer_defer_does_not_inherit_inner_defers_try_violation() {
         0,
     );
 }
+
+// ── extern js host-FFI ──────────────
+
+#[test]
+fn extern_js_valid_block_and_call_checks_clean() {
+    assert_no_errors(
+        "extern js {\n\
+           function alert(message: String)\n\
+           function setTimeout(callback: () -> Void, ms: Int)\n\
+         }\n\
+         function main() {\n\
+           alert(\"hi\")\n\
+           setTimeout(function() { alert(\"later\") }, 300)\n\
+         }",
+    );
+}
+
+#[test]
+fn extern_js_function_registered_in_extern_table_only() {
+    let tokens = tokenize("extern js { function alert(message: String) }", SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let analysis = check(&program);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "unexpected errors: {:?}",
+        analysis.diagnostics
+    );
+    // Registered as an extern, with `(module, name)` linkage…
+    let info = analysis
+        .module
+        .extern_functions
+        .get("alert")
+        .expect("`alert` should be registered as an extern function");
+    assert_eq!(
+        info.extern_js,
+        Some(("js".to_string(), "alert".to_string()))
+    );
+    assert_eq!(info.params, vec![Type::String]);
+    // …and NOT in the FuncId-indexed function table (no Phoenix body).
+    assert!(!analysis.module.function_by_name.contains_key("alert"));
+}
+
+#[test]
+fn extern_js_return_type_flows_to_caller() {
+    // An extern returning Int is usable in arithmetic — the return type flows.
+    assert_no_errors(
+        "extern js { function getLength(s: String) -> Int }\n\
+         function main() { let n: Int = getLength(\"abc\") + 1\n print(n) }",
+    );
+}
+
+#[test]
+fn extern_js_jsvalue_round_trips_opaquely() {
+    // A JsValue produced by one extern can be passed to another; Phoenix never
+    // inspects it, only holds and forwards it.
+    assert_no_errors(
+        "extern js {\n\
+           function getElementById(id: String) -> JsValue\n\
+           function appendChild(parent: JsValue, child: JsValue)\n\
+         }\n\
+         function main() {\n\
+           let a: JsValue = getElementById(\"a\")\n\
+           let b: JsValue = getElementById(\"b\")\n\
+           appendChild(a, b)\n\
+         }",
+    );
+}
+
+#[test]
+fn extern_js_call_arg_type_mismatch_rejected() {
+    assert_has_error(
+        "extern js { function alert(message: String) }\n\
+         function main() { alert(42) }",
+        "argument 1 of `alert`: expected `String` but got `Int`",
+    );
+}
+
+#[test]
+fn extern_js_call_arity_mismatch_rejected() {
+    assert_has_error(
+        "extern js { function alert(message: String) }\n\
+         function main() { alert(\"a\", \"b\") }",
+        "takes 1 argument(s)",
+    );
+}
+
+#[test]
+fn extern_js_non_marshallable_param_rejected() {
+    assert_has_error(
+        "extern js { function f(xs: List<Int>) }",
+        "non-marshallable type `List<Int>`",
+    );
+}
+
+#[test]
+fn extern_js_non_marshallable_return_rejected() {
+    assert_has_error(
+        "extern js { function f() -> List<Int> }",
+        "non-marshallable return type `List<Int>`",
+    );
+}
+
+#[test]
+fn extern_js_gen_only_scalar_param_rejected() {
+    // The Gen-only scalars (DateTime/Uuid/Decimal/Money) are not marshallable
+    // across the executable host-FFI boundary.
+    assert_has_error(
+        "extern js { function at(t: DateTime) }",
+        "non-marshallable type `DateTime`",
+    );
+}
+
+#[test]
+fn extern_js_duplicate_name_rejected() {
+    assert_has_error(
+        "extern js {\n  function dup(a: Int)\n  function dup(b: String)\n}",
+        "`dup` is already defined",
+    );
+}
+
+#[test]
+fn extern_js_collides_with_ordinary_function() {
+    assert_has_error(
+        "function shared() {}\n\
+         extern js { function shared() }",
+        "`shared` is already defined",
+    );
+}
+
+#[test]
+fn ordinary_function_collides_with_prior_extern_js() {
+    // The reverse order of `extern_js_collides_with_ordinary_function`:
+    // declarations register in source order, so an `extern js` signature
+    // followed by an ordinary function of the same name reaches
+    // `register_function`. Without checking `extern_functions` there, the
+    // function would register under the same qualified key and silently shadow
+    // the extern (call resolution consults `lookup_function` first). Must be
+    // rejected, symmetric with the function-first case.
+    assert_has_error(
+        "extern js { function shared() }\n\
+         function shared() {}",
+        "`shared` is already defined",
+    );
+}
+
+#[test]
+fn extern_js_marshallable_closure_param_ok() {
+    // A function-typed param whose parts are all marshallable is allowed
+    // (closures-as-callbacks).
+    assert_no_errors("extern js { function onClick(handler: (Int) -> Bool) }");
+}
+
+#[test]
+fn extern_js_closure_param_with_non_marshallable_part_rejected() {
+    // The recursive arm of `is_js_marshallable`: a function-typed param is only
+    // marshallable when every parameter and its return are. A non-marshallable
+    // argument type (`List<Int>`) inside the closure must be rejected.
+    assert_has_error(
+        "extern js { function each(cb: (List<Int>) -> Void) }",
+        "non-marshallable type `(List<Int>) -> Void`",
+    );
+}
+
+#[test]
+fn extern_js_closure_return_with_non_marshallable_part_rejected() {
+    // Same recursion, return position: a closure returning a non-marshallable
+    // type (`List<Int>`) is itself non-marshallable.
+    assert_has_error(
+        "extern js { function make(seed: Int) -> () -> List<Int> }",
+        "non-marshallable return type `() -> List<Int>`",
+    );
+}
+
+#[test]
+fn extern_js_shadowing_builtin_rejected() {
+    // An extern that shadows a reserved builtin name (`Option`) must be rejected,
+    // not silently registered-but-unreachable. `build_one_module_scope_phase_a`
+    // skips inserting builtin-shadowing names into the module scope, so without an
+    // explicit rejection the extern would land in `extern_functions` yet never be
+    // resolvable — a dead, undiagnosed entry.
+    assert_has_error(
+        "extern js { function Option(x: Int) }",
+        "`Option` is already defined",
+    );
+}
+
+#[test]
+fn extern_js_non_marshallable_param_still_registered() {
+    // The marshallability check emits an error but does NOT bail on the
+    // signature — the extern is still registered so downstream call-checking can
+    // recover (resolve the name, report arg errors) instead of also reporting
+    // "undefined function".
+    let tokens = tokenize("extern js { function f(xs: List<Int>) }", SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let analysis = check(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("non-marshallable type `List<Int>`")),
+        "expected a marshallability error, got: {:?}",
+        analysis.diagnostics
+    );
+    assert!(
+        analysis.module.extern_functions.contains_key("f"),
+        "extern `f` should still be registered for call-check recovery"
+    );
+}
+
+#[test]
+fn extern_js_unresolved_param_type_reports_one_error() {
+    // An unresolved annotation resolves to `Type::Error` after `resolve_type_expr`
+    // already reported "unknown type". The marshallability check must skip
+    // `Type::Error` so a single bad annotation yields exactly that one diagnostic,
+    // not also a confusing non-marshallable `<error>` message.
+    let tokens = tokenize("extern js { function f(x: Bogus) }", SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let analysis = check(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("unknown type `Bogus`")),
+        "expected an unknown-type error, got: {:?}",
+        analysis.diagnostics
+    );
+    assert!(
+        !analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("non-marshallable")),
+        "unresolved type must not also produce a non-marshallable diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
