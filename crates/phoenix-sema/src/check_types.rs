@@ -121,6 +121,26 @@ impl Checker {
     pub(crate) fn resolve_type_expr(&mut self, type_expr: &TypeExpr) -> Type {
         match type_expr {
             TypeExpr::Named(named) => {
+                // Projection modifiers (`pick`/`omit`/`partial`) are only valid
+                // DIRECTLY on a `body` base or a `response` type (incl. as the
+                // element of a `List<…>`) — those positions strip the modifiers and
+                // resolve them via `resolve_derived_type` before reaching here. Any
+                // other position is misplaced — a struct field, a param, or even a
+                // response that nests the projection one level too deep (e.g.
+                // `response Option<User pick …>` / `Map<_, User pick …>`, neither yet
+                // wired). The message names the supported shapes rather than the
+                // position so the nested-in-a-response case isn't misdescribed as
+                // "not a response". Report and resolve the base name so downstream
+                // errors don't cascade.
+                if !named.modifiers.is_empty() {
+                    self.error(
+                        format!(
+                            "type `{}`: `pick`/`omit`/`partial` projection is only allowed directly on a `body` base type or a `response` type (optionally as the element of a `List<…>`)",
+                            named.name
+                        ),
+                        named.span,
+                    );
+                }
                 // Check if it's a type parameter currently in scope
                 if self.current_type_params.contains(&named.name) {
                     return Type::TypeVar(named.name.clone());

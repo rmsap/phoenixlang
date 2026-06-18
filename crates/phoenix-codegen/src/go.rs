@@ -320,6 +320,7 @@ impl<'a> GoGenerator<'a> {
 
         for ep in &self.check_result.endpoints {
             self.emit_derived_type(ep);
+            self.emit_response_projection_type(ep);
             self.emit_response_envelope(ep);
             self.emit_pagination_envelope(ep);
             self.emit_multi_status_envelope(ep);
@@ -715,6 +716,35 @@ impl<'a> GoGenerator<'a> {
         }
 
         self.emit_body_validate_method(ep, &type_name);
+    }
+
+    /// Emits the `<Endpoint>Response` struct for an endpoint with an inline
+    /// response projection (`response Struct pick/omit/partial`, incl. a `List<…>`
+    /// element). Mirrors [`Self::emit_derived_type`] but for the response side: a
+    /// plain struct over the projected field set, no `Validate()` (responses are
+    /// outbound — the server constructs them, the client decodes them).
+    fn emit_response_projection_type(&mut self, ep: &EndpointInfo) {
+        let Some(ref proj) = ep.response_projection else {
+            return;
+        };
+        let type_name = format!("{}Response", capitalize(&ep.name));
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+        let rows: Vec<(String, String, String)> = proj
+            .fields
+            .iter()
+            .map(|f| {
+                let (go_type, _) = derived_field_go_type(f);
+                let omitempty = if f.optional { ",omitempty" } else { "" };
+                (
+                    to_pascal_case(&f.name),
+                    go_type,
+                    format!("`json:\"{}{}\"`", f.name, omitempty),
+                )
+            })
+            .collect();
+        self.types_out.push_str(&render_struct(&type_name, &rows));
     }
 
     /// Emits the shared `FileUpload` helper struct (once) to types.go: the

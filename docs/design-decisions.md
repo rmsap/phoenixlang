@@ -3067,3 +3067,88 @@ and assert enum query/header values survive the wire (required + Option + a
 server-applied default) AND that an unknown query/header variant is rejected (Go
 `Valid()`→400, TS `parse<Enum>`→400, Python FastAPI→422) — 19 round-trips total
 (the prior 16 + 3 enum) green across go/ts/python.
+
+## Phoenix Gen — inline response projection (2026-06-17)
+
+Lets a `response` reference an existing struct narrowed by `pick`/`omit`/`partial`
+instead of declaring a dedicated read-model struct (the fixture pain points: social
+`PublicProfile`, file_storage `BucketUsage`). Language-designer decisions: support
+the **full `pick`/`omit`/`partial` chain** (same as `body`); scope includes the
+**bare response, `List<Struct pick…>`, and paginated projected items** (plus
+projection with response headers).
+
+**Grammar (least-invasive).** A `NamedType` gained an optional
+`modifiers: Vec<TypeModifier>`; `parse_type_expr` consumes a trailing
+`omit`/`pick`/`partial` chain onto a bare `Named`, so a projection is accepted
+wherever a named type appears — crucially **inside `List<…>`** (`List<User pick
+{…}>`) without any generic-grammar change. Existing `TypeExpr::Named(n)` matches
+keep compiling (they ignore `modifiers`); only the 5 `NamedType` literal sites
+needed the new field. `parse_body_type` now pulls the chain off the parsed `Named`
+into its `DerivedType` (one shared modifier parser, `parse_type_modifiers`).
+
+**Sema.** `resolve_type_expr` errors on a `Named` carrying modifiers (projection
+misplaced — only `body`/`response` handle them, via `resolve_derived_type`). A new
+`resolve_response_projection` detects the projection (bare or `List` element),
+resolves it through the generalized `resolve_derived_type_in` into a
+`ResolvedDerivedType`, points the resolved response `Type` at a reference to the
+generated `<Endpoint>Response` struct (bare → `Named`, list → `List<Named>`), and
+stores the field set in the new `EndpointInfo.response_projection`. The
+`<Endpoint>Response` name is reserved by the generated-type collision check — it
+reuses the multi-status envelope's name slot, but the two never co-occur (block
+form has no bare response to project), and it composes with a `Result`/`Page`
+envelope (which wrap the projected struct).
+
+**Codegen.** Each generator emits `<Endpoint>Response` from `response_projection`,
+mirroring `<Endpoint>Body`: Go struct (no `Validate()` — responses are outbound),
+pydantic model (shared `emit_pydantic_model` helper extracted from the body path),
+TS `type` alias, OpenAPI component schema. Everything downstream
+(response/list/pagination/response-header handling, imports) then treats it as an
+ordinary `Named` struct. The TS revival fixed-point (`compute_revivable_structs`)
+now includes projected response structs, and a new reviver block emits
+`revive<Endpoint>Response` so the client revives a projected `DateTime`/`Uuid`/
+`Decimal`/`Money` (incl. paginated items, with a width-aware `.map((x) => …)`).
+
+**Bugs surfaced.** Python: a response-header endpoint's handler imported the bare
+projected `<Endpoint>Response` (unused → ruff F401) — the handler returns the
+`<Endpoint>Result` envelope, so the bare-response import is now gated on no response
+headers. TS: the paginated-items revival line overflowed 80 cols for a long
+`revive<Endpoint>Response` — made width-aware (prettier's arrow-break).
+
+**Out of scope (deferred).** Projection on a multi-status `response { 200: Struct
+pick }` (the block form), an `Option<Struct pick>` response, and a `Map<_, Struct
+pick>` value projection — all need the projection to nest in those positions (the
+grammar already permits it syntactically, but sema/codegen don't wire those
+shapes). A projection nested in one of these unwired response shapes resolves
+through `resolve_type_expr` and hits the misplaced-projection error, whose message
+names the SUPPORTED shapes ("only allowed directly on a `body` base type or a
+`response` type, optionally as the element of a `List<…>`") rather than claiming
+the position isn't a response — so `response Option<User pick …>` isn't
+misdescribed. `partial` on a response is allowed (optional fields) per the
+modifier-parity decision.
+
+A projection that **picks a `File`-typed field** off the base struct is **rejected**
+(not deferred): because `resolve_response_projection` resolves before (and instead
+of) the normal response path, it bypasses the file/multipart response validation
+(`file_bearing_struct_allowed` + the single-`File` binary-download rule). Rather
+than silently emit a `File`-bearing `<Endpoint>Response` with no multipart handling,
+the resolver scans the projected field set (`field_carries_file`, covering `File`
+and `Option<File>`) and errors. Supporting projected file responses later would mean
+running the same file/multipart checks the bare-response path does.
+
+**Verification.** `PROJECTION_SCHEMA` (bare `pick`/`omit`, `omit … partial`, bare
+`List<pick>`, paginated `List<pick>`, projection + response headers, every
+projection carrying a `DateTime`/`Uuid`) is wired into the compile-lint harness on
+all four targets and both server frameworks — green. `PROJECTION_RT_SCHEMA` +
+bespoke `projection/go`, `typescript/projection-driver.ts`,
+`python/projection_driver.py` assert a bare projected response, a `List<…>` of them,
+a `partial` projection (every field optional), and an `omit` projection (the
+complementary selector) round-trip the wire and that the TS client revives the
+projected `createdAt` into a real `Date` (incl. through the reviver's optional-field
+wrapping path for the `partial` case) — **22 round-trips total** (the prior 19 + 3
+projection). Dedicated sema unit tests cover the new response path directly: bare-
+and `List`-projection resolution (asserting the `response_projection` field set and
+the `<Endpoint>Response` reference), the response-context `unknown struct`/bad-field
+errors, the picked-`File`-field rejection (direct and `Option<File>`), and the
+misplaced-projection error in four illegal positions (struct field, query param,
+`response Option<Struct pick …>`, and `response Map<_, Struct pick …>`). Parser,
+sema, codegen lib tests + integration suites green; clippy clean.

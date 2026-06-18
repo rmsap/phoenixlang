@@ -8,6 +8,7 @@ generated_uuid/
 generated_decimal/
 generated_money/
 generated_enum/
+generated_projection/
 contract.json
 
 # Python bytecode caches.

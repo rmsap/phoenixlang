@@ -6,7 +6,7 @@ expression: files.handlers
 
 from typing import Protocol
 
-from .models import GetPostResult, Post
+from .models import GetPostResult
 
 
 class Handlers(Protocol):

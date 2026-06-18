@@ -39,9 +39,17 @@ impl<'src> Parser<'src> {
                         span: start.merge(end),
                     }))
                 } else {
+                    // A bare named type may carry a trailing projection chain
+                    // (`User pick { id, name }`) — accepted wherever a named type
+                    // appears (so it also nests inside `List<…>`); sema restricts
+                    // it to body/response positions. `span` stays the name token
+                    // only; callers that need the full extent (e.g. a `body`'s
+                    // `DerivedType`) merge in the modifier spans themselves.
+                    let modifiers = self.parse_type_modifiers()?;
                     Some(TypeExpr::Named(NamedType {
                         name: token.text.clone(),
                         span: token.span,
+                        modifiers,
                     }))
                 }
             }

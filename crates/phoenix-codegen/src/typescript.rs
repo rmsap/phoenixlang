@@ -180,6 +180,9 @@ impl<'a> TsGenerator<'a> {
             self.emit_endpoint_derived_type(ep);
         }
         for ep in &self.check_result.endpoints {
+            self.emit_endpoint_response_projection_type(ep);
+        }
+        for ep in &self.check_result.endpoints {
             self.emit_endpoint_result_type(ep);
         }
         for ep in &self.check_result.endpoints {
@@ -548,6 +551,30 @@ impl<'a> TsGenerator<'a> {
             }
             self.types_out.push_str("  return o;\n}\n\n");
         }
+
+        // Response-projection revivers. A projected `<Endpoint>Response` is a
+        // generated type (not a struct decl), so — like the body revivers above —
+        // its reviver is keyed on the resolved projected fields. The client runs it
+        // over the decoded JSON when the projection reaches a revivable scalar.
+        for ep in &self.check_result.endpoints {
+            let Some(ref proj) = ep.response_projection else {
+                continue;
+            };
+            let name = format!("{}Response", capitalize(&ep.name));
+            if !self.revivable_structs.contains(&name) {
+                continue;
+            }
+            push_reviver_signature(&mut self.types_out, &reviver_name(&name), &name);
+            for f in &proj.fields {
+                let ty = if f.optional && !matches!(&f.ty, Type::Generic(n, _) if n == "Option") {
+                    Type::Generic("Option".to_string(), vec![f.ty.clone()])
+                } else {
+                    f.ty.clone()
+                };
+                emit_field_revival(&mut self.types_out, &f.name, &ty, &self.revivable_structs);
+            }
+            self.types_out.push_str("  return o;\n}\n\n");
+        }
     }
 
     /// Emits a TypeScript string union type for a Phoenix enum (simple variants only).
@@ -599,6 +626,24 @@ impl<'a> TsGenerator<'a> {
         }
 
         let ts_type = derived_type_to_ts(body);
+        self.types_out
+            .push_str(&format!("export type {} = {};\n\n", type_name, ts_type));
+    }
+
+    /// Emits the `<Endpoint>Response` type alias for an endpoint with an inline
+    /// response projection (`response Struct pick/omit/partial`, incl. a `List<…>`
+    /// element), mirroring [`Self::emit_endpoint_derived_type`] for the response
+    /// side. The client revives it (see [`Self::emit_reviver_functions`]) when its
+    /// fields reach a `DateTime`/`Uuid`/`Decimal`/`Money`.
+    fn emit_endpoint_response_projection_type(&mut self, ep: &EndpointInfo) {
+        let Some(ref proj) = ep.response_projection else {
+            return;
+        };
+        let type_name = format!("{}Response", capitalize(&ep.name));
+        if !self.emitted_derived_types.insert(type_name.clone()) {
+            return;
+        }
+        let ts_type = derived_type_to_ts(proj);
         self.types_out
             .push_str(&format!("export type {} = {};\n\n", type_name, ts_type));
     }
@@ -1266,9 +1311,19 @@ impl<'a> TsGenerator<'a> {
             if let Some(inner) = ts_revive_expr(&pag.item_type, "x", &self.revivable_structs) {
                 self.client_out
                     .push_str(&format!("    const pageResult = {decode};\n"));
-                self.client_out.push_str(&format!(
-                    "    pageResult.items = pageResult.items.map((x) => {inner});\n"
-                ));
+                // Prettier keeps the `.map((x) => …)` on one line when it fits, else
+                // breaks after the arrow (arg one indent deeper, trailing comma).
+                let one_line =
+                    format!("    pageResult.items = pageResult.items.map((x) => {inner});");
+                if one_line.len() <= PRINT_WIDTH {
+                    self.client_out.push_str(&one_line);
+                    self.client_out.push('\n');
+                } else {
+                    self.client_out
+                        .push_str("    pageResult.items = pageResult.items.map((x) =>\n");
+                    self.client_out
+                        .push_str(&format!("      {inner},\n    );\n"));
+                }
                 self.client_out.push_str("    return pageResult;\n");
             } else {
                 self.client_out.push_str(&format!("    return {decode};\n"));
@@ -2276,7 +2331,7 @@ fn leaf_is(ty: &Type, target: &Type) -> bool {
 /// only if its struct is already in the set). File-bearing structs are excluded
 /// (they emit no interface/value).
 fn compute_revivable_structs(check_result: &Analysis, program: &Program) -> BTreeSet<String> {
-    let structs: Vec<(String, Vec<Type>)> = program
+    let mut structs: Vec<(String, Vec<Type>)> = program
         .declarations
         .iter()
         .filter_map(|d| match d {
@@ -2293,6 +2348,17 @@ fn compute_revivable_structs(check_result: &Analysis, program: &Program) -> BTre
             _ => None,
         })
         .collect();
+    // Projected response structs (`<Endpoint>Response`) are response-side, so they
+    // participate in the same revival fixed-point: the client revives a projected
+    // response whose fields reach a `DateTime`/`Uuid`/`Decimal`/`Money`.
+    for ep in &check_result.endpoints {
+        if let Some(ref proj) = ep.response_projection {
+            structs.push((
+                format!("{}Response", capitalize(&ep.name)),
+                proj.fields.iter().map(|f| f.ty.clone()).collect(),
+            ));
+        }
+    }
 
     let mut set: BTreeSet<String> = BTreeSet::new();
     loop {

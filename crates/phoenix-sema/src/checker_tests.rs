@@ -28,6 +28,18 @@ fn assert_has_error(source: &str, expected_msg: &str) {
     );
 }
 
+/// Assert that NO diagnostic's message contains `unexpected_msg`. Used to pin
+/// that a fix removed a spurious cascade error while the primary error remains.
+fn assert_no_error_containing(source: &str, unexpected_msg: &str) {
+    let errors = check_source(source);
+    assert!(
+        !errors.iter().any(|e| e.message.contains(unexpected_msg)),
+        "expected no error containing '{}', got: {:?}",
+        unexpected_msg,
+        errors
+    );
+}
+
 /// Assert that the checker emits *exactly* `expected_count` diagnostics
 /// whose message contains `expected_msg`. Stronger than [`assert_has_error`]
 /// when the test name implies a specific count of violations — e.g.
@@ -2406,6 +2418,196 @@ body User partial { nonexistent }
 }
 "#,
         "field `nonexistent` does not exist on struct `User`",
+    );
+}
+
+// ── Inline response projection (`response Struct pick/omit/partial`) ──────────
+
+/// A bare response projection (`response User pick { … }`) resolves: the endpoint
+/// gains a `response_projection` field set and the resolved response `Type` points
+/// at the generated `<Endpoint>Response` struct. No errors.
+#[test]
+fn endpoint_response_projection_bare() {
+    let analysis = check_full(
+        r#"
+struct User { id: Int  name: String  secret: String }
+endpoint getUser: GET "/api/users/{id}" {
+response User pick { id, name }
+}
+"#,
+    );
+    let ep = analysis
+        .endpoints
+        .iter()
+        .find(|e| e.name == "getUser")
+        .expect("getUser endpoint");
+    let proj = ep
+        .response_projection
+        .as_ref()
+        .expect("response_projection should be populated");
+    let fields: Vec<&str> = proj.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(fields, vec!["id", "name"], "projected field set");
+    assert_eq!(
+        ep.response,
+        Some(Type::Named("GetUserResponse".to_string())),
+        "response type should reference the generated struct",
+    );
+}
+
+/// A `List<Struct pick { … }>` response projection resolves to a
+/// `List<GetUserResponse>` and still records the projected field set.
+#[test]
+fn endpoint_response_projection_list() {
+    let analysis = check_full(
+        r#"
+struct User { id: Int  name: String  secret: String }
+endpoint listUsers: GET "/api/users" {
+response List<User pick { id, name }>
+}
+"#,
+    );
+    let ep = analysis
+        .endpoints
+        .iter()
+        .find(|e| e.name == "listUsers")
+        .expect("listUsers endpoint");
+    assert!(
+        ep.response_projection.is_some(),
+        "response_projection should be populated for a List<…> projection"
+    );
+    assert_eq!(
+        ep.response,
+        Some(Type::Generic(
+            "List".to_string(),
+            vec![Type::Named("ListUsersResponse".to_string())]
+        )),
+        "response type should be a List of the generated struct",
+    );
+}
+
+/// A projection on a `response` whose base struct is unknown reports the error in
+/// the `response` context (not the `body` context) — and ONLY that error: the
+/// recognized-but-failed projection must not fall through to the normal response
+/// path, which would re-resolve the modifier-bearing type and emit a spurious
+/// "projection misplaced" + "unknown response type" cascade.
+#[test]
+fn endpoint_response_projection_unknown_struct() {
+    let src = r#"
+endpoint getUser: GET "/api/users/{id}" {
+response Nope pick { id }
+}
+"#;
+    assert_has_error(src, "unknown struct `Nope` in response type");
+    assert_no_error_containing(src, "projection is only allowed");
+    assert_no_error_containing(src, "unknown response type");
+}
+
+/// A projection picking a field the base struct lacks reports the field error
+/// (the resolver is shared with the `body` path; this exercises it from a
+/// `response`).
+#[test]
+fn endpoint_response_projection_nonexistent_field() {
+    assert_has_error(
+        r#"
+struct User { id: Int  name: String }
+endpoint getUser: GET "/api/users/{id}" {
+response User pick { nonexistent }
+}
+"#,
+        "field `nonexistent` does not exist on struct `User`",
+    );
+}
+
+/// A projection in a position that is neither a `body` base nor a `response`
+/// type — here a struct field — is rejected as misplaced.
+#[test]
+fn projection_misplaced_in_struct_field() {
+    assert_has_error(
+        r#"
+struct User { id: Int  name: String }
+struct Wrapper { u: User pick { id } }
+"#,
+        "projection is only allowed directly on a `body` base type or a `response` type",
+    );
+}
+
+/// A projection on a query parameter type is rejected as misplaced.
+#[test]
+fn projection_misplaced_in_query_param() {
+    assert_has_error(
+        r#"
+struct User { id: Int  name: String }
+endpoint listUsers: GET "/api/users" {
+query { u: User pick { id } }
+response User
+}
+"#,
+        "projection is only allowed directly on a `body` base type or a `response` type",
+    );
+}
+
+/// A projection nested one level too deep in a response (`Option<Struct pick …>`)
+/// is rejected: only the bare and `List<…>` shapes are wired. The diagnostic names
+/// the supported shapes rather than claiming the position isn't a response.
+#[test]
+fn projection_misplaced_nested_in_response_option() {
+    assert_has_error(
+        r#"
+struct User { id: Int  name: String }
+endpoint getUser: GET "/api/users/{id}" {
+response Option<User pick { id }>
+}
+"#,
+        "projection is only allowed directly on a `body` base type or a `response` type",
+    );
+}
+
+/// A projection nested as a `Map<_, Struct pick …>` value type is rejected for the
+/// same reason as the `Option<…>` case: only the bare and `List<…>` response shapes
+/// are wired, so the `Map` value reaches the misplaced-projection error.
+#[test]
+fn projection_misplaced_nested_in_response_map() {
+    assert_has_error(
+        r#"
+struct User { id: Int  name: String }
+endpoint getUsers: GET "/api/users" {
+response Map<String, User pick { id }>
+}
+"#,
+        "projection is only allowed directly on a `body` base type or a `response` type",
+    );
+}
+
+/// A projection that picks a `File`-typed field is rejected: the projection path
+/// bypasses the binary-download / multipart response validation, so a `File` field
+/// would silently miscompile into a `File`-bearing `<Endpoint>Response` with no
+/// multipart handling. The guard reports the field (not a cascade) and suppresses
+/// the normal-path "unknown response type" fallthrough.
+#[test]
+fn projection_rejects_picked_file_field() {
+    let src = r#"
+struct Doc { id: Int  blob: File }
+endpoint getDoc: GET "/api/docs/{id}" {
+response Doc pick { blob }
+}
+"#;
+    assert_has_error(src, "cannot pick a `File`-typed field");
+    assert_no_error_containing(src, "unknown response type");
+}
+
+/// The same guard applies when the picked field's type is `Option<File>` (an
+/// optional file field on the base struct) — exercising the recursive branch of
+/// `field_carries_file`.
+#[test]
+fn projection_rejects_picked_optional_file_field() {
+    assert_has_error(
+        r#"
+struct Doc { id: Int  blob: Option<File> }
+endpoint getDoc: GET "/api/docs/{id}" {
+response Doc pick { blob }
+}
+"#,
+        "cannot pick a `File`-typed field",
     );
 }
 

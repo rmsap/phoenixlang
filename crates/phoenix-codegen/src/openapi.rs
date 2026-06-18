@@ -62,6 +62,13 @@ pub fn generate_openapi(program: &Program, check_result: &Analysis) -> String {
             let type_name = format!("{}Page", capitalize(&ep.name));
             schemas.insert(type_name, pagination_page_schema(pagination));
         }
+        // An inline response projection generates a `<Endpoint>Response` component
+        // schema (the projected struct), `$ref`d from the response (directly, or
+        // as the `items` element of a `List`/pagination envelope).
+        if let Some(ref proj) = ep.response_projection {
+            let type_name = format!("{}Response", capitalize(&ep.name));
+            schemas.insert(type_name, derived_type_to_schema(proj));
+        }
     }
 
     let paths = build_paths(&check_result.endpoints);
@@ -832,6 +839,7 @@ mod tests {
                     fields: vec![TypeExpr::Named(NamedType {
                         name: "Float".to_string(),
                         span: Span::BUILTIN,
+                        modifiers: Vec::new(),
                     })],
                     span: Span::BUILTIN,
                 },
@@ -840,6 +848,7 @@ mod tests {
                     fields: vec![TypeExpr::Named(NamedType {
                         name: "Float".to_string(),
                         span: Span::BUILTIN,
+                        modifiers: Vec::new(),
                     })],
                     span: Span::BUILTIN,
                 },

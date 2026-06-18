@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 use phoenix_parser::ast::{Declaration, EnumDecl, PaginationMode, Program, StructDecl};
 use phoenix_sema::Analysis;
-use phoenix_sema::checker::{DefaultValue, EndpointInfo};
+use phoenix_sema::checker::{DefaultValue, DerivedField, EndpointInfo};
 use phoenix_sema::types::Type;
 
 mod format;
@@ -110,6 +110,7 @@ impl<'a> PyGenerator<'a> {
 
         for ep in &self.check_result.endpoints {
             self.emit_derived_model(ep);
+            self.emit_response_projection_model(ep);
             self.emit_result_envelope(ep);
             self.emit_page_model(ep);
             self.emit_multi_status_envelope(ep);
@@ -575,8 +576,26 @@ impl<'a> PyGenerator<'a> {
             return;
         }
         let type_name = format!("{}Body", capitalize(&ep.name));
+        self.emit_pydantic_model(&type_name, &body.fields);
+    }
 
-        if !self.emitted_derived_types.insert(type_name.clone()) {
+    /// Emits the `<Endpoint>Response` pydantic model for an endpoint with an inline
+    /// response projection (`response Struct pick/omit/partial`, incl. a `List<…>`
+    /// element), mirroring [`Self::emit_derived_model`] for the response side.
+    fn emit_response_projection_model(&mut self, ep: &EndpointInfo) {
+        let Some(ref proj) = ep.response_projection else {
+            return;
+        };
+        let type_name = format!("{}Response", capitalize(&ep.name));
+        self.emit_pydantic_model(&type_name, &proj.fields);
+    }
+
+    /// Emits a pydantic `BaseModel` named `type_name` over `fields` (the derived
+    /// field set of a request body or a response projection). Deduped via
+    /// `emitted_derived_types`. Honors per-field optionality (`Option<T>` or a
+    /// `partial` modifier) and constraint `Field(...)` kwargs.
+    fn emit_pydantic_model(&mut self, type_name: &str, fields: &[DerivedField]) {
+        if !self.emitted_derived_types.insert(type_name.to_string()) {
             return;
         }
 
@@ -584,10 +603,10 @@ impl<'a> PyGenerator<'a> {
         self.models_out
             .push_str(&format!("class {}(BaseModel):\n", type_name));
 
-        if body.fields.is_empty() {
+        if fields.is_empty() {
             self.models_out.push_str("    pass\n");
         } else {
-            for f in &body.fields {
+            for f in fields {
                 let py_type = type_to_python(&f.ty);
                 let field_str = constraint_to_field(&f.constraint);
                 // A field can be optional either because the source type is
@@ -1335,14 +1354,17 @@ impl<'a> PyGenerator<'a> {
                 imports.insert(multi_status_type_name(ep));
             } else if ep.pagination.is_some() {
                 imports.insert(page_type_name(ep));
+            } else if !ep.response_headers.is_empty() {
+                // Response-header endpoint: the handler returns the `<Endpoint>Result`
+                // envelope (which bundles the body type internally — referenced in
+                // models.py, not here), so import only the envelope. Importing the
+                // bare body type too would be unused (ruff F401) for a projected
+                // `<Endpoint>Response`, which no other endpoint shares.
+                imports.insert(format!("{}Result", capitalize(&ep.name)));
             } else if let Some(ref resp) = ep.response
                 && !ep.response_is_binary
             {
                 collect_python_imports(resp, &mut imports);
-            }
-            // Endpoints with response headers return the typed envelope.
-            if !ep.response_headers.is_empty() {
-                imports.insert(format!("{}Result", capitalize(&ep.name)));
             }
             // Enum query/request-header param types are named in the handler
             // signature (response-header enums travel inside the imported envelope).

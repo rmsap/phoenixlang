@@ -466,6 +466,14 @@ pub struct EndpointInfo {
     pub headers: Vec<HeaderParamInfo>,
     /// The resolved body type with modifiers applied, if present.
     pub body: Option<ResolvedDerivedType>,
+    /// The projected response struct's field set when the endpoint declares an
+    /// inline response projection (`response Struct pick/omit/partial`, incl. a
+    /// `List<…>` element). Codegen emits this as the `<Endpoint>Response` struct
+    /// that [`response`] references. `None` for an ordinary (un-projected)
+    /// response. See `docs/design-decisions.md` (inline response projection).
+    ///
+    /// [`response`]: EndpointInfo::response
+    pub response_projection: Option<ResolvedDerivedType>,
     /// The resolved response type — the success body type.
     ///
     /// For a **bare** `response <T>` endpoint this is the resolved `T` (or `None`

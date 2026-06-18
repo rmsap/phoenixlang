@@ -622,6 +622,80 @@ endpoint pickColor: GET "/pick" {
 }
 "#;
 
+/// Exercises inline response projection (`response Struct pick/omit/partial`)
+/// across every position + target-specific path: a bare `pick` (`getProfile`), a
+/// bare `omit` (`getUser`), `omit … partial` (`getSummary` — projected struct with
+/// all-optional fields), a BARE `List<Struct pick…>` (`searchUsers`), a PAGINATED
+/// `List<Struct pick…>` (`listUsers` — the `<Endpoint>Page` envelope over projected
+/// items), a paginated projected list whose reviver name is long enough to push the
+/// items-revival `.map((x) => …)` past the print width (`listActiveSubscribers` —
+/// locks the multi-line `prettier` break of that line, vs `listUsers`'s one-line
+/// form), and a projection WITH response headers (`getMetered` — the
+/// `<Endpoint>Result` envelope wrapping the projected `<Endpoint>Response`). Every
+/// projection includes a `DateTime`/`Uuid` field so the TS client's revival pass
+/// over the generated `<Endpoint>Response` (and the paginated-items revival) is
+/// exercised end-to-end, not just at compile-lint. The generated `<Endpoint>Response`
+/// reuses the multi-status name slot (mutually exclusive). Auth header + `error`
+/// blocks mirror the other schemas so the output is realistic.
+const PROJECTION_SCHEMA: &str = r#"
+struct User {
+    id: Uuid
+    displayName: String where self.length > 0
+    email: String where self.contains("@")
+    passwordHash: String where self.length > 0
+    loginCount: Int where self >= 0
+    createdAt: DateTime
+}
+
+endpoint getProfile: GET "/users/{id}/profile" {
+    headers { authorization: String }
+    response User pick { id, displayName, createdAt }
+    error { Unauthorized(401)  NotFound(404) }
+}
+
+endpoint getUser: GET "/users/{id}" {
+    headers { authorization: String }
+    response User omit { passwordHash }
+    error { Unauthorized(401)  NotFound(404) }
+}
+
+endpoint getSummary: GET "/users/{id}/summary" {
+    headers { authorization: String }
+    response User omit { passwordHash, email } partial
+    error { Unauthorized(401) }
+}
+
+endpoint searchUsers: GET "/users/search" {
+    headers { authorization: String }
+    query { q: String }
+    response List<User pick { id, displayName, createdAt }>
+    error { Unauthorized(401) }
+}
+
+endpoint listUsers: GET "/users" {
+    headers { authorization: String }
+    response List<User pick { id, displayName }>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+endpoint listActiveSubscribers: GET "/subscribers/active" {
+    headers { authorization: String }
+    response List<User pick { id, displayName, createdAt }>
+    pagination { offset }
+    error { Unauthorized(401) }
+}
+
+endpoint getMetered: GET "/users/{id}/metered" {
+    headers { authorization: String }
+    response User pick { id, displayName, createdAt } headers {
+        etag: String as "ETag"
+        ratelimitRemaining: Int as "X-RateLimit-Remaining"
+    }
+    error { Unauthorized(401) }
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -848,6 +922,8 @@ fn go_output_compiles_and_lints() {
     check_go_output(&generate_go_files(MONEY_ONLY_SCHEMA));
     // Enum query/header params (server `Valid()` validation + 400).
     check_go_output(&generate_go_files(ENUM_PARAM_SCHEMA));
+    // Inline response projection (`<Endpoint>Response` struct emission).
+    check_go_output(&generate_go_files(PROJECTION_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -882,6 +958,7 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_ONLY_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(ENUM_PARAM_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(PROJECTION_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -942,6 +1019,7 @@ fn openapi_output_lints() {
     check_openapi_output("MONEY_SCHEMA", MONEY_SCHEMA);
     check_openapi_output("MONEY_ONLY_SCHEMA", MONEY_ONLY_SCHEMA);
     check_openapi_output("ENUM_PARAM_SCHEMA", ENUM_PARAM_SCHEMA);
+    check_openapi_output("PROJECTION_SCHEMA", PROJECTION_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -1072,6 +1150,8 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(MONEY_ONLY_SCHEMA));
     // Enum query/header params: `parse<Enum>` validator + ValidationError → 400.
     check_typescript_output(&scaffold, &generate_typescript_files(ENUM_PARAM_SCHEMA));
+    // Inline response projection: `<Endpoint>Response` type + revival + paginated.
+    check_typescript_output(&scaffold, &generate_typescript_files(PROJECTION_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1227,6 +1307,12 @@ fn python_output_compiles_and_lints() {
         &scaffold,
         &venv_bin,
         &generate_python_files(ENUM_PARAM_SCHEMA),
+    );
+    // Inline response projection: `<Endpoint>Response` pydantic model.
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(PROJECTION_SCHEMA),
     );
 
     // Realistic schema fixture library (see FILE_FIXTURES).

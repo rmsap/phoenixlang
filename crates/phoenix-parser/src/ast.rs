@@ -726,6 +726,17 @@ pub enum TypeModifier {
     },
 }
 
+impl TypeModifier {
+    /// The source span of this modifier.
+    pub fn span(&self) -> Span {
+        match self {
+            TypeModifier::Omit { span, .. }
+            | TypeModifier::Pick { span, .. }
+            | TypeModifier::Partial { span, .. } => *span,
+        }
+    }
+}
+
 /// A derived type reference: a base type with zero or more chained modifiers.
 ///
 /// Derived types appear in endpoint `body` declarations and allow re-using an
@@ -1580,6 +1591,15 @@ pub struct GenericType {
 pub struct NamedType {
     /// The type name.
     pub name: String,
-    /// Source span covering the type name token.
+    /// Source span covering the type name token. Any trailing projection
+    /// `modifiers` carry their own spans; this span does not extend over them.
     pub span: Span,
+    /// Projection modifiers (`omit`/`pick`/`partial`) parsed immediately after the
+    /// name, e.g. `User pick { id, name }`. Empty for an ordinary named type. The
+    /// parser accepts these wherever a named type may appear; sema permits them
+    /// ONLY on a `body` base or a `response` type (incl. a `List`/pagination
+    /// element) and errors elsewhere. See `docs/design-decisions.md` (inline
+    /// response projection).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modifiers: Vec<TypeModifier>,
 }

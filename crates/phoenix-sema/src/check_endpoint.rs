@@ -11,10 +11,36 @@ use crate::types::Type;
 use phoenix_common::capitalize;
 use phoenix_parser::api_version::normalize_api_version;
 use phoenix_parser::ast::{
-    DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, TypeExpr,
-    TypeModifier,
+    DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, NamedType,
+    TypeExpr, TypeModifier,
 };
 use std::collections::HashSet;
+
+/// Outcome of looking for an inline response projection on an endpoint
+/// (`response Struct pick/omit/partial`, incl. a `List<…>` element).
+enum ResponseProjection {
+    /// No projection — the response (if any) resolves through the normal path.
+    None,
+    /// A projection that resolved: the response `Type` (referencing the generated
+    /// `<Endpoint>Response`) plus the projected field set.
+    Resolved(Type, ResolvedDerivedType),
+    /// A projection shape was recognized but its base type failed to resolve
+    /// (unknown struct / non-struct base) — the error is already reported. The
+    /// caller must NOT fall back to normal resolution: re-resolving the
+    /// modifier-bearing type would emit a spurious "projection misplaced"
+    /// cascade on top of the real diagnostic.
+    Failed,
+}
+
+/// The generated types an endpoint claims, passed to
+/// [`Checker::check_generated_type_collisions`]. Each flag maps to a generated
+/// `<Endpoint><Suffix>` name whose collision the check must report.
+struct GeneratedTypeClaims {
+    is_multi_status: bool,
+    has_body: bool,
+    body_is_multipart: bool,
+    has_response_projection: bool,
+}
 
 impl Checker {
     /// Type-checks an endpoint declaration and, if valid, adds a resolved
@@ -77,19 +103,34 @@ impl Checker {
         // requires such a response struct to hold EXACTLY one field, of type
         // `File`, and nothing else (a binary stream cannot be multiplexed with
         // JSON fields). See `docs/design-decisions.md` (multipart).
-        let mut response = ep.response.as_ref().map(|te| {
-            let prev = self.file_bearing_struct_allowed;
-            self.file_bearing_struct_allowed = true;
-            let ty = self.resolve_type_expr(te);
-            self.file_bearing_struct_allowed = prev;
-            if ty == Type::Error {
-                self.error(
-                    format!("endpoint `{}`: unknown response type", ep.name),
-                    ep.span,
-                );
+        // Inline response projection (`response Struct pick/omit/partial`, incl. a
+        // `List<…>` element): resolve to a reference to the generated
+        // `<Endpoint>Response` struct + its field set, BEFORE the normal type
+        // resolution (which would reject the projection's modifiers).
+        let (mut response, response_projection) = match self.resolve_response_projection(ep) {
+            ResponseProjection::Resolved(ty, rdt) => (Some(ty), Some(rdt)),
+            // The projection shape was recognized but failed to resolve; the
+            // real error is already reported. Claim the response slot with
+            // `Type::Error` (as the normal unknown-type path would) so we don't
+            // re-resolve the modifier-bearing type and emit a spurious cascade.
+            ResponseProjection::Failed => (Some(Type::Error), None),
+            ResponseProjection::None => {
+                let response = ep.response.as_ref().map(|te| {
+                    let prev = self.file_bearing_struct_allowed;
+                    self.file_bearing_struct_allowed = true;
+                    let ty = self.resolve_type_expr(te);
+                    self.file_bearing_struct_allowed = prev;
+                    if ty == Type::Error {
+                        self.error(
+                            format!("endpoint `{}`: unknown response type", ep.name),
+                            ep.span,
+                        );
+                    }
+                    ty
+                });
+                (response, None)
             }
-            ty
-        });
+        };
 
         // Multi-status block form: `response { 200: User  201: User  204 }`.
         // Resolve and validate the block, then mirror the shared body type `T`
@@ -401,9 +442,12 @@ impl Checker {
             ep,
             is_duplicate_name,
             exported_name_collides_with.as_deref(),
-            is_multi_status,
-            body.is_some(),
-            body_is_multipart,
+            GeneratedTypeClaims {
+                is_multi_status,
+                has_body: body.is_some(),
+                body_is_multipart,
+                has_response_projection: response_projection.is_some(),
+            },
         );
 
         // Request headers share the generated parameter scope with path and
@@ -464,6 +508,7 @@ impl Checker {
             query_params,
             headers,
             body,
+            response_projection,
             response,
             response_statuses,
             response_headers,
@@ -599,10 +644,14 @@ impl Checker {
         ep: &EndpointDecl,
         is_duplicate_name: bool,
         exported_name_collides_with: Option<&str>,
-        is_multi_status: bool,
-        has_body: bool,
-        body_is_multipart: bool,
+        claims: GeneratedTypeClaims,
     ) {
+        let GeneratedTypeClaims {
+            is_multi_status,
+            has_body,
+            body_is_multipart,
+            has_response_projection,
+        } = claims;
         // The `else if` chain claims at most one envelope: the exclusivity
         // checks in `check_endpoint` (which run before this) reject any
         // endpoint combining response headers, pagination, or multi-status,
@@ -616,6 +665,14 @@ impl Checker {
             generated_claims.push(("Page", "an envelope"));
         } else if is_multi_status {
             generated_claims.push(("Response", "an envelope"));
+        }
+        // An inline response projection generates `<Endpoint>Response` (the
+        // projected struct). This is independent of the envelope chain above —
+        // a projection can co-occur with a `Result`/`Page` envelope (which wrap
+        // the projected struct) — but never with multi-status (the block form has
+        // no bare response to project), so it never double-claims `Response`.
+        if has_response_projection {
+            generated_claims.push(("Response", "a response-body"));
         }
         if has_body {
             generated_claims.push(("Body", "a request-body"));
@@ -967,13 +1024,106 @@ impl Checker {
         endpoint_name: &str,
         dt: &DerivedType,
     ) -> Option<ResolvedDerivedType> {
+        self.resolve_derived_type_in(endpoint_name, "body", dt)
+    }
+
+    /// Detects and resolves an inline response projection — `response Struct
+    /// pick/omit/partial`, including the element of a `List<Struct pick…>` (which
+    /// also covers a paginated projected list). Returns the resolved response
+    /// `Type` with the projection replaced by a reference to the generated
+    /// `<Endpoint>Response` struct, plus the projected field set (which codegen
+    /// emits as that struct). Returns [`ResponseProjection::None`] when the
+    /// response declares no projection (the bare `response <T>` and block forms
+    /// resolve normally), and [`ResponseProjection::Failed`] when a projection
+    /// shape was recognized but its base type didn't resolve.
+    fn resolve_response_projection(&mut self, ep: &EndpointDecl) -> ResponseProjection {
+        // The projection is either the bare response type (`response User pick …`)
+        // or the element of a `List<User pick …>` (which also covers a paginated
+        // projected list). No other generic position carries a projection element.
+        let (named, in_list) = match ep.response.as_ref() {
+            Some(TypeExpr::Named(n)) if !n.modifiers.is_empty() => (n, false),
+            Some(TypeExpr::Generic(g))
+                if g.name == "List"
+                    && g.type_args.len() == 1
+                    && matches!(&g.type_args[0], TypeExpr::Named(n) if !n.modifiers.is_empty()) =>
+            {
+                let TypeExpr::Named(n) = &g.type_args[0] else {
+                    unreachable!()
+                };
+                (n, true)
+            }
+            _ => return ResponseProjection::None,
+        };
+        // Shape recognized: from here a resolution failure is reported by
+        // `resolve_named_projection`, and we must claim the response slot rather
+        // than letting the caller fall through to the normal path.
+        let Some(rdt) = self.resolve_named_projection(ep, named) else {
+            return ResponseProjection::Failed;
+        };
+        // A projection resolves *instead of* the normal response path, so it
+        // bypasses the binary-download validation (`file_bearing_struct_allowed`
+        // + the single-`File` rule). Picking a `File` field would therefore emit a
+        // `File`-bearing `<Endpoint>Response` with no multipart handling — reject it
+        // explicitly rather than silently miscompile. (Lifting this restriction
+        // requires running the same file/multipart checks the bare-response path
+        // does; see `docs/design-decisions.md` (inline response projection).)
+        if let Some(f) = rdt.fields.iter().find(|f| field_carries_file(&f.ty)) {
+            self.error(
+                format!(
+                    "endpoint `{}`: a response projection cannot pick a `File`-typed field (`{}`) — file/binary responses are not supported through projection",
+                    ep.name, f.name
+                ),
+                f.span,
+            );
+            return ResponseProjection::Failed;
+        }
+        let projected = Type::Named(format!("{}Response", capitalize(&ep.name)));
+        let response_ty = if in_list {
+            Type::Generic("List".to_string(), vec![projected])
+        } else {
+            projected
+        };
+        ResponseProjection::Resolved(response_ty, rdt)
+    }
+
+    /// Resolves a single projected `Named` (base struct + its modifier chain) into
+    /// the concrete field set, by synthesizing a [`DerivedType`] and reusing
+    /// [`Self::resolve_derived_type_in`].
+    fn resolve_named_projection(
+        &mut self,
+        ep: &EndpointDecl,
+        named: &NamedType,
+    ) -> Option<ResolvedDerivedType> {
+        let dt = DerivedType {
+            base_type: TypeExpr::Named(NamedType {
+                name: named.name.clone(),
+                span: named.span,
+                modifiers: Vec::new(),
+            }),
+            modifiers: named.modifiers.clone(),
+            span: named.span,
+        };
+        self.resolve_derived_type_in(&ep.name, "response", &dt)
+    }
+
+    /// Resolves a base-struct + `omit`/`pick`/`partial` chain into the concrete
+    /// field set. Shared by the `body` clause and `response` projection; `context`
+    /// (`"body"` / `"response"`) only shapes the diagnostics.
+    fn resolve_derived_type_in(
+        &mut self,
+        endpoint_name: &str,
+        context: &str,
+        dt: &DerivedType,
+    ) -> Option<ResolvedDerivedType> {
         // Resolve the base type — must be a struct
         let base_name = match &dt.base_type {
             TypeExpr::Named(n) => n.name.clone(),
             TypeExpr::Generic(g) => g.name.clone(),
             _ => {
                 self.error(
-                    format!("endpoint `{endpoint_name}`: body base type must be a struct name"),
+                    format!(
+                        "endpoint `{endpoint_name}`: {context} base type must be a struct name"
+                    ),
                     dt.span,
                 );
                 return None;
@@ -985,7 +1135,7 @@ impl Checker {
             None => {
                 self.error(
                     format!(
-                        "endpoint `{endpoint_name}`: unknown struct `{base_name}` in body type"
+                        "endpoint `{endpoint_name}`: unknown struct `{base_name}` in {context} type"
                     ),
                     dt.span,
                 );
@@ -1296,6 +1446,20 @@ fn extract_path_params(path: &str) -> Vec<String> {
         }
     }
     params
+}
+
+/// Whether a projected field's resolved type is `File` or `Option<File>` — the
+/// shapes a base-struct `File` field takes after projection. Used to reject
+/// `File`-typed fields picked into a response projection (see
+/// [`Checker::resolve_response_projection`]).
+fn field_carries_file(ty: &Type) -> bool {
+    match ty {
+        Type::File => true,
+        Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
+            field_carries_file(&args[0])
+        }
+        _ => false,
+    }
 }
 
 /// Produces a routing signature for collision detection: the HTTP method

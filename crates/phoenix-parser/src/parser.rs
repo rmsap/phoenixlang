@@ -805,6 +805,7 @@ impl<'src> Parser<'src> {
                     type_annotation: TypeExpr::Named(NamedType {
                         name: "Self".to_string(),
                         span: tok.span,
+                        modifiers: Vec::new(),
                     }),
                     name: "self".to_string(),
                     default_value: None,
@@ -1760,10 +1761,41 @@ impl<'src> Parser<'src> {
         let start = self.peek().span;
         self.expect(TokenKind::Body)?;
         self.skip_newlines();
-        let base_type = self.parse_type_expr()?;
-        let mut modifiers = Vec::new();
+        // `parse_type_expr` attaches any trailing `omit`/`pick`/`partial` chain to
+        // the base `Named` (the same grammar a `response` projection uses). Pull
+        // those modifiers up into the `DerivedType` so body resolution sees them
+        // exactly as before.
+        let base = self.parse_type_expr()?;
+        let (base_type, modifiers) = match base {
+            TypeExpr::Named(n) if !n.modifiers.is_empty() => {
+                let modifiers = n.modifiers.clone();
+                let bare = TypeExpr::Named(NamedType {
+                    name: n.name,
+                    span: n.span,
+                    modifiers: Vec::new(),
+                });
+                (bare, modifiers)
+            }
+            other => (other, Vec::new()),
+        };
 
-        // Parse chained modifiers: omit, pick, partial
+        let end = modifiers
+            .last()
+            .map(TypeModifier::span)
+            .unwrap_or_else(|| base_type.span());
+
+        Some(DerivedType {
+            base_type,
+            modifiers,
+            span: start.merge(end),
+        })
+    }
+
+    /// Parses a (possibly empty) chain of `omit`/`pick`/`partial` projection
+    /// modifiers. Shared by the type-expression parser (so a `Named` type may
+    /// carry projection wherever it appears) and, transitively, the `body` parser.
+    pub(crate) fn parse_type_modifiers(&mut self) -> Option<Vec<TypeModifier>> {
+        let mut modifiers = Vec::new();
         loop {
             match self.peek().kind {
                 TokenKind::Omit => {
@@ -1789,7 +1821,7 @@ impl<'src> Parser<'src> {
                 TokenKind::Partial => {
                     let mstart = self.peek().span;
                     self.advance();
-                    // Optional field list for selective partial
+                    // Optional field list for selective partial.
                     let fields = if self.peek().kind == TokenKind::LBrace {
                         Some(self.parse_field_list()?)
                     } else {
@@ -1804,21 +1836,7 @@ impl<'src> Parser<'src> {
                 _ => break,
             }
         }
-
-        let end = modifiers
-            .last()
-            .map(|m| match m {
-                TypeModifier::Omit { span, .. }
-                | TypeModifier::Pick { span, .. }
-                | TypeModifier::Partial { span, .. } => *span,
-            })
-            .unwrap_or_else(|| base_type.span());
-
-        Some(DerivedType {
-            base_type,
-            modifiers,
-            span: start.merge(end),
-        })
+        Some(modifiers)
     }
 
     /// Parses a brace-delimited, comma-or-newline-separated list of field names.

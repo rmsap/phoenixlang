@@ -5,4 +5,5 @@ generated-uuid/
 generated-decimal/
 generated-money/
 generated-enum/
+generated-projection/
 contract.json
