@@ -360,6 +360,17 @@ impl<'a> LoweringContext<'a> {
             (Type::Bool, BinaryOp::Eq) => Op::BoolEq(lhs, rhs),
             (Type::Bool, BinaryOp::NotEq) => Op::BoolNe(lhs, rhs),
 
+            // `JsValue` identity comparison. A `JsValue` is an opaque host
+            // handle whose identity *is* bit-equality of its handle, so `==`/
+            // `!=` lower to the integer-compare ops — the same `icmp` on the i64
+            // handle the native/wasm backends would emit (those backends never
+            // see a `JsValue` today, since it only flows from a rejected
+            // `ExternCall`, but the lowering is uniform). The IR interpreter's
+            // `IEq`/`INe` handlers read the handle for this case. Sema permits
+            // only `==`/`!=` on `JsValue` (no ordering), so no `Lt`/`Gt` arms.
+            (Type::JsValue, BinaryOp::Eq) => Op::IEq(lhs, rhs),
+            (Type::JsValue, BinaryOp::NotEq) => Op::INe(lhs, rhs),
+
             // Fallback: treat as int operation
             _ => match binary.op {
                 BinaryOp::Add => Op::IAdd(lhs, rhs),
@@ -1397,19 +1408,25 @@ impl<'a> LoweringContext<'a> {
         // before the lambda's `Terminator::Return`).
         let body_result = self.lower_function_body_block(&lambda.body);
         if self.block_needs_terminator() {
-            if let Some(val) = body_result {
-                // Implicit-return coercion — same contract as the
-                // top-level function-body path in
-                // `lower_stmt.rs::lower_function_body`: a concrete
-                // trailing expression flowing out of a `-> dyn Trait`
-                // lambda must be wrapped in a `(data_ptr, vtable_ptr)`
-                // pair at the function boundary.
-                let expected = self.module.functions[func_id.index()]
-                    .func()
-                    .return_type
-                    .clone();
-                let val = self.coerce_value_to_expected(val, &expected, lambda.body.span);
-                self.terminate(Terminator::Return(Some(val)));
+            let expected = self.module.functions[func_id.index()]
+                .func()
+                .return_type
+                .clone();
+            // Mirror the top-level function-body path in
+            // `lower_stmt.rs::lower_function_body`: only a non-`Void` return
+            // type coerces its trailing value (a concrete expression flowing
+            // out of a `-> dyn Trait` lambda is wrapped in a `(data_ptr,
+            // vtable_ptr)` pair at the boundary). A `Void`-returning lambda —
+            // e.g. `function() { print(x) }`, the common callback shape — has
+            // no value to return; coercing its `Void` trailing expression would
+            // look up a type the void sentinel never recorded.
+            if expected != IrType::Void {
+                if let Some(val) = body_result {
+                    let val = self.coerce_value_to_expected(val, &expected, lambda.body.span);
+                    self.terminate(Terminator::Return(Some(val)));
+                } else {
+                    self.terminate(Terminator::Return(None));
+                }
             } else {
                 self.terminate(Terminator::Return(None));
             }

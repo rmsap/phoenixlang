@@ -1,9 +1,10 @@
 mod multi_module;
 
-pub use multi_module::run_modules;
+pub use multi_module::{run_modules, run_modules_with_host};
 
 use crate::env::Environment;
 use crate::value::{Value, map_key_eq};
+use phoenix_common::host::{CallbackHandle, HostContext, HostValue};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{
     BinaryExpr, BinaryOp, Block, CallExpr, CaptureInfo, Declaration, ElseBranch, Expr, ForSource,
@@ -186,13 +187,14 @@ const MAX_CALL_DEPTH: usize = 50;
 pub struct Interpreter {
     pub(crate) env: Environment,
     pub(crate) functions: HashMap<String, FunctionEntry>,
-    /// Names of `extern js` host functions declared in the program.
-    /// The tree-walk interpreter (`phoenix run`) has no host-function binding
-    /// yet — that lands in PR 4 — so a call to one is reported as a clean "not
-    /// supported yet" error rather than a misleading "undefined function".
-    /// Tracked by bare name; cross-module extern resolution is out of scope
-    /// until the binding lands.
-    pub(crate) extern_function_names: std::collections::HashSet<String>,
+    /// `extern js` host functions declared in the program, mapped to their
+    /// declared parameter names in source order. Membership drives call
+    /// precedence (an extern shadows a same-named local closure, matching
+    /// sema's `check_call`); the parameter order lets a call's named arguments
+    /// be reordered into positional form before marshalling, exactly as the IR
+    /// backend does. Tracked by bare name; cross-module extern resolution is out
+    /// of scope until the import-js grammar lands.
+    pub(crate) extern_params: HashMap<String, Vec<String>>,
     pub(crate) structs: HashMap<String, StructDef>,
     pub(crate) enums: HashMap<String, EnumDef>, // enum name -> def
     pub(crate) variant_to_enum: HashMap<String, String>, // variant name -> enum name
@@ -236,6 +238,24 @@ pub struct Interpreter {
     /// variables are looked up at exit time (lazy semantics) — see
     /// Phase 2.3 design-decisions.md decision G for the tradeoff.
     pub(crate) defer_stack: Vec<Vec<phoenix_parser::ast::Expr>>,
+
+    /// Host-FFI bindings for `extern js` calls. Empty by default —
+    /// the bare CLI registers nothing, so an extern call reports a clean "no
+    /// host binding registered" error. The embedder / test harness populates it
+    /// (see [`Interpreter::register_host`] / [`run_modules_with_host`]).
+    ///
+    /// Held behind an `Rc` so an extern dispatch can clone a cheap handle for
+    /// the lookup while leaving the field populated for the duration of the host
+    /// call — a host callback that re-enters Phoenix and calls another extern
+    /// must still find the registry. See [`Interpreter::call_extern_host`].
+    pub(crate) host_registry: Rc<phoenix_common::host::HostRegistry>,
+    /// Phoenix closures handed to the host as callbacks, indexed by
+    /// [`phoenix_common::host::CallbackHandle`]. A closure is appended when it
+    /// is marshalled out across the `extern js` boundary; the host invokes it
+    /// back through [`phoenix_common::host::HostContext::call_callback`].
+    /// Retained for the interpreter's lifetime — the interpreter has no event
+    /// loop to release them (the callbacks-only async model).
+    pub(crate) host_callbacks: Vec<Value>,
 }
 
 /// Control flow signal that must escape from an expression context
@@ -252,6 +272,32 @@ impl Default for Interpreter {
     }
 }
 
+/// Lets a host function call back into Phoenix (Phase 2.5). A host stub
+/// modelling a callback-taking API (`setTimeout(cb, ms)`) invokes the Phoenix
+/// closure synchronously via the interpreter's normal [`Interpreter::call_closure`]
+/// path. The interpreters have no event loop — the callbacks-only async model.
+impl HostContext for Interpreter {
+    fn call_callback(
+        &mut self,
+        handle: CallbackHandle,
+        args: Vec<HostValue>,
+    ) -> std::result::Result<HostValue, String> {
+        let closure = self
+            .host_callbacks
+            .get(handle.0 as usize)
+            .cloned()
+            .ok_or_else(|| format!("invalid `extern js` callback handle {}", handle.0))?;
+        let native_args: Vec<Value> = args
+            .into_iter()
+            .map(|a| self.host_to_value(a))
+            .collect::<std::result::Result<_, String>>()?;
+        let result = self
+            .call_closure(closure, native_args)
+            .map_err(|e| e.message)?;
+        self.value_to_host(result)
+    }
+}
+
 impl Interpreter {
     /// Creates a new interpreter with an empty environment and no registered declarations.
     /// Output from `print()` is written to stdout.
@@ -264,7 +310,7 @@ impl Interpreter {
         Self {
             env: Environment::new(),
             functions: HashMap::new(),
-            extern_function_names: std::collections::HashSet::new(),
+            extern_params: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             variant_to_enum: HashMap::new(),
@@ -277,7 +323,177 @@ impl Interpreter {
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),
             defer_stack: Vec::new(),
+            host_registry: Rc::new(phoenix_common::host::HostRegistry::new()),
+            host_callbacks: Vec::new(),
         }
+    }
+
+    /// Register a host binding for an `extern js` function `(module, name)`.
+    /// Call before running a program that calls the extern. See
+    /// [`phoenix_common::host`] for the host-function contract.
+    pub fn register_host(
+        &mut self,
+        module: impl Into<String>,
+        name: impl Into<String>,
+        f: phoenix_common::host::HostFunction,
+    ) {
+        // Registration happens during setup, before any run begins, so the `Rc`
+        // is uniquely owned and `get_mut` succeeds. (It is only ever aliased
+        // transiently inside [`Self::call_extern_host`], which never registers.)
+        Rc::get_mut(&mut self.host_registry)
+            .expect("register host bindings before running the program")
+            .register(module, name, f);
+    }
+
+    /// Marshal a native [`Value`] out across the `extern js` boundary into a
+    /// [`HostValue`]. A closure registers a callback handle (so the host can
+    /// invoke it later); aggregates are an internal error, since sema rejects
+    /// non-marshallable types at the extern signature.
+    fn value_to_host(&mut self, v: Value) -> std::result::Result<HostValue, String> {
+        Ok(match v {
+            Value::Int(n) => HostValue::Int(n),
+            Value::Float(n) => HostValue::Float(n),
+            Value::Bool(b) => HostValue::Bool(b),
+            Value::String(s) => HostValue::Str(s),
+            Value::Void => HostValue::Void,
+            Value::JsValue(h) => HostValue::JsValue(h),
+            c @ Value::Closure { .. } => {
+                let handle = CallbackHandle(self.host_callbacks.len() as u64);
+                self.host_callbacks.push(c);
+                HostValue::Callback(handle)
+            }
+            other => {
+                return Err(format!(
+                    "value of type `{}` cannot cross the `extern js` boundary \
+                     (only Int / Float / Bool / String / JsValue / Void and closures \
+                     are marshallable)",
+                    other.type_name()
+                ));
+            }
+        })
+    }
+
+    /// Marshal a [`HostValue`] from the host back into a native [`Value`].
+    fn host_to_value(&self, hv: HostValue) -> std::result::Result<Value, String> {
+        Ok(match hv {
+            HostValue::Int(n) => Value::Int(n),
+            HostValue::Float(n) => Value::Float(n),
+            HostValue::Bool(b) => Value::Bool(b),
+            HostValue::Str(s) => Value::String(s),
+            HostValue::Void => Value::Void,
+            HostValue::JsValue(h) => Value::JsValue(h),
+            HostValue::Callback(_) => {
+                return Err("a host function returned a callback handle, which Phoenix \
+                            cannot receive across the `extern js` boundary"
+                    .to_string());
+            }
+        })
+    }
+
+    /// Dispatch an `extern js` call to its registered host binding (Phase 2.5).
+    /// Marshals args out, invokes the host function (which may call Phoenix
+    /// callbacks back through [`HostContext`]), and marshals the result in.
+    /// Reports a clean error if no binding is registered for `(module, name)`.
+    fn call_extern_host(&mut self, module: &str, name: &str, args: Vec<Value>) -> Result<Value> {
+        let to_err = |m: String| RuntimeError {
+            message: m,
+            try_return_value: None,
+        };
+        // Clone a cheap `Rc` handle so `self.host_registry` stays populated while
+        // the host function borrows `&mut self` (as a `HostContext`, for
+        // callbacks): a callback that re-enters Phoenix and calls another extern
+        // then still finds the registry. The clone also lets the resolved `&f`
+        // live across the marshalling `&mut self` borrows below, since it borrows
+        // the local `registry`, not `self`.
+        let registry = Rc::clone(&self.host_registry);
+        // Resolve the binding *before* marshalling. Marshalling a closure arg
+        // mints a callback handle in `host_callbacks`; doing it first on the
+        // unbound path would leave an orphan entry behind for an extern that
+        // never runs. The lookup is a cheap pair of `HashMap` probes.
+        let Some(f) = registry.get(module, name) else {
+            return Err(to_err(format!(
+                "no host binding registered for `extern js` function `{module}.{name}` \
+                 — register one before running (`phoenix run` provides none; a host \
+                 binding lands with the WASM / native backends)"
+            )));
+        };
+        // Snapshot the callback table before marshalling so a failure partway
+        // through the arg list — a non-marshallable arg *after* an earlier
+        // closure arg already minted a handle — rolls those orphan handles back
+        // rather than leaking them, matching the resolve-binding-first intent
+        // above (no handle survives for a call that never reaches the host).
+        let checkpoint = self.host_callbacks.len();
+        let host_args: Vec<HostValue> = match args
+            .into_iter()
+            .map(|a| self.value_to_host(a))
+            .collect::<std::result::Result<_, String>>()
+        {
+            Ok(host_args) => host_args,
+            Err(m) => {
+                self.host_callbacks.truncate(checkpoint);
+                return Err(to_err(m));
+            }
+        };
+        let host_result = f(self, host_args).map_err(to_err)?;
+        self.host_to_value(host_result).map_err(to_err)
+    }
+
+    /// Reorder an `extern js` call's positional + named arguments into a single
+    /// positional vector matching the extern's declared parameter order (Phase
+    /// 2.5), mirroring the IR backend's `assemble_call_args`. Extern signatures
+    /// permit no default values, so every parameter must be supplied — sema
+    /// validates arity and names, so a gap or unknown name here is an internal
+    /// error rather than a user error.
+    fn assemble_extern_args(
+        &self,
+        name: &str,
+        param_names: &[String],
+        positional: Vec<Value>,
+        named: Vec<(String, Value)>,
+    ) -> Result<Vec<Value>> {
+        // Sema validates arity, so an overflow here is an internal error (a
+        // lowering/resolution bug), never user input. Fail loudly — in release
+        // as well as debug — rather than silently dropping the extra args.
+        if positional.len() > param_names.len() {
+            return error(format!(
+                "internal error: extern js call `{name}`: {} positional args for {} parameters",
+                positional.len(),
+                param_names.len()
+            ));
+        }
+        let mut slots: Vec<Option<Value>> = vec![None; param_names.len()];
+        for (i, val) in positional.into_iter().enumerate() {
+            // `positional.len() <= param_names.len() == slots.len()` (checked
+            // above), so every index is in bounds.
+            slots[i] = Some(val);
+        }
+        for (arg_name, val) in named {
+            match param_names.iter().position(|p| *p == arg_name) {
+                Some(idx) => slots[idx] = Some(val),
+                // Sema validates argument names, so an unknown name here is an
+                // internal error. Fail loudly rather than dropping the arg
+                // silently — otherwise it would resurface below as a misleading
+                // "missing argument" for whatever slot stayed unfilled.
+                None => {
+                    return error(format!(
+                        "internal error: extern js call `{name}`: unknown argument `{arg_name}`"
+                    ));
+                }
+            }
+        }
+        let mut args = Vec::with_capacity(param_names.len());
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot {
+                Some(v) => args.push(v),
+                None => {
+                    return error(format!(
+                        "extern js call `{name}`: missing argument for parameter `{}`",
+                        param_names[i]
+                    ));
+                }
+            }
+        }
+        Ok(args)
     }
 
     /// Run every pending defer in the current function's frame in reverse
@@ -474,12 +690,14 @@ impl Interpreter {
                     self.register_methods(&imp.type_name, &imp.methods, None);
                 }
                 Declaration::ExternJs(block) => {
-                    // No Phoenix body to register, but record the names so a
-                    // call resolves to a clean "not supported yet" error
-                    // instead of "undefined function". The host-function
-                    // binding that actually invokes these lands in PR 4.
+                    // No Phoenix body to register, but record each extern's name
+                    // and parameter order. The name drives call precedence and a
+                    // clean unbound-host error (vs. "undefined function"); the
+                    // parameter order lets a call's named args be reordered into
+                    // positional form before marshalling (see `check_call`).
                     for item in &block.items {
-                        self.extern_function_names.insert(item.name.clone());
+                        let params = item.params.iter().map(|p| p.name.clone()).collect();
+                        self.extern_params.insert(item.name.clone(), params);
                     }
                 }
                 Declaration::Trait(_)
@@ -1569,30 +1787,24 @@ impl Interpreter {
                 return self.call_function_in_module(&entry.decl, args, named_args, entry.module);
             }
 
+            // `extern js` host call. Dispatch to the registered host
+            // binding; an unregistered extern is a clean error (the bare CLI
+            // registers none). Checked *before* the closure-variable arm to match
+            // sema's `check_call` precedence (function -> extern -> variable), so
+            // a name bound to both an extern and a local closure resolves to the
+            // extern in both sema and the interpreter. The host module is `js`
+            // today — npm-package modules arrive with the import-js grammar later.
+            if let Some(param_names) = self.extern_params.get(&ident.name).cloned() {
+                let positional = self.eval_args(&call.args)?;
+                let args =
+                    self.assemble_extern_args(&ident.name, &param_names, positional, named_args)?;
+                return self.call_extern_host("js", &ident.name, args);
+            }
+
             // Variable holding a closure
             if let Some(val) = self.env.get(&ident.name) {
                 let args = self.eval_args(&call.args)?;
                 return self.call_closure(val, args);
-            }
-
-            // `extern js` host call. The tree-walk interpreter has
-            // no host-function binding yet (PR 4); report it cleanly rather than
-            // as a misleading "undefined function".
-            //
-            // Precedence note: this is checked *after* the named-function and
-            // closure-variable arms above, whereas sema's `check_call` resolves
-            // a bare callee as function -> extern -> variable. So a name bound
-            // to both an extern and a local closure would resolve to the extern
-            // in sema but the closure here. This is inert today (every extern
-            // call errors regardless), but the two orders must be reconciled
-            // when the PR 4 host binding makes extern calls actually execute.
-            if self.extern_function_names.contains(&ident.name) {
-                return error(format!(
-                    "`extern js` host call `{}` is not supported by the tree-walk \
-                     interpreter (`phoenix run`) yet — the interpreter host-function \
-                     binding lands in Phase 2.5 PR 4",
-                    ident.name
-                ));
             }
 
             return error(format!("undefined function `{}`", ident.name));
@@ -3156,6 +3368,131 @@ function main() {
             .collect()
     }
 
+    /// Like [`run_modules_capturing`], but registers host-FFI bindings (built
+    /// by `register`) on the interpreter before running. Exercises the
+    /// multi-module `extern js` path — `register_module_declarations`'s
+    /// `ExternJs` branch (distinct from the single-module `run_program` loop)
+    /// plus dispatch + marshalling end to end.
+    fn run_modules_with_host_capturing(
+        source: &str,
+        register: impl FnOnce(&mut Interpreter),
+    ) -> std::result::Result<Vec<String>, RuntimeError> {
+        use phoenix_modules::{ModulePath, ResolvedSourceModule};
+        use std::path::PathBuf;
+        let tokens = tokenize(source, SourceId(0));
+        let (program, parse_errors) = parser::parse(&tokens);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let module = ResolvedSourceModule {
+            module_path: ModulePath::entry(),
+            source_id: SourceId(0),
+            program,
+            is_entry: true,
+            file_path: PathBuf::from("<test>"),
+        };
+        let modules = [module];
+        let mut analysis = phoenix_sema::checker::check_modules(&modules);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "sema diagnostics: {:?}",
+            analysis.diagnostics
+        );
+
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let writer = SharedWriter(buffer.clone());
+        let mut interpreter = Interpreter::with_output(Box::new(writer));
+        interpreter.lambda_captures = std::mem::take(&mut analysis.module.lambda_captures);
+        interpreter.module_scopes = std::mem::take(&mut analysis.module.module_scopes);
+        register(&mut interpreter);
+        interpreter.run_modules_inner(&modules)?;
+        let bytes = buffer.borrow();
+        Ok(String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(String::from)
+            .collect())
+    }
+
+    /// The multi-module path (`run_modules` / `register_module_declarations`)
+    /// has its own `extern js` registration branch, separate from the
+    /// single-module `run_program` loop the other host tests exercise. Route an
+    /// extern-calling program through it to pin that the branch records
+    /// `extern_params` and that dispatch + marshalling work end to end — a
+    /// regression dropping the multi-module registration would surface here as
+    /// "undefined function `alert`".
+    #[test]
+    fn run_modules_dispatches_extern_js_host_call() {
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let out = run_modules_with_host_capturing(
+            "extern js { function alert(message: String) }\n\
+             function main() { alert(\"hi\") }",
+            move |interp| {
+                interp.register_host(
+                    "js",
+                    "alert",
+                    Box::new(move |_ctx, args| {
+                        if let Some(HostValue::Str(s)) = args.into_iter().next() {
+                            seen2.borrow_mut().push(s);
+                        }
+                        Ok(HostValue::Void)
+                    }),
+                );
+            },
+        )
+        .expect("program should run with the host binding registered");
+        assert_eq!(out, Vec::<String>::new());
+        assert_eq!(*seen.borrow(), vec!["hi".to_string()]);
+    }
+
+    /// The public [`run_modules_with_host`] entry point threads a *pre-built*
+    /// [`HostRegistry`] (by value) onto the interpreter — the form an embedder
+    /// uses, distinct from the closure-builder `register_host` the capturing
+    /// helper above drives. Pin that the registry-by-value path actually
+    /// dispatches: a regression dropping the `host_registry` assignment in
+    /// `run_modules_with_host` would surface here as a clean "no host binding
+    /// registered" error instead of the stub firing.
+    #[test]
+    fn run_modules_with_host_threads_prebuilt_registry() {
+        use phoenix_modules::{ModulePath, ResolvedSourceModule};
+        use std::path::PathBuf;
+        let source = "extern js { function alert(message: String) }\n\
+                      function main() { alert(\"hi\") }";
+        let tokens = tokenize(source, SourceId(0));
+        let (program, parse_errors) = parser::parse(&tokens);
+        assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+        let module = ResolvedSourceModule {
+            module_path: ModulePath::entry(),
+            source_id: SourceId(0),
+            program,
+            is_entry: true,
+            file_path: PathBuf::from("<test>"),
+        };
+        let modules = [module];
+        let mut analysis = phoenix_sema::checker::check_modules(&modules);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "sema diagnostics: {:?}",
+            analysis.diagnostics
+        );
+
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let mut registry = phoenix_common::host::HostRegistry::new();
+        registry.register(
+            "js",
+            "alert",
+            Box::new(move |_ctx, args| {
+                if let Some(HostValue::Str(s)) = args.into_iter().next() {
+                    seen2.borrow_mut().push(s);
+                }
+                Ok(HostValue::Void)
+            }),
+        );
+
+        run_modules_with_host(&modules, &mut analysis, registry)
+            .expect("program should run with the pre-built host registry");
+        assert_eq!(*seen.borrow(), vec!["hi".to_string()]);
+    }
+
     /// Regression: a user enum that re-uses a builtin variant name
     /// (`enum Foo { Some }`) used to panic in debug builds when run
     /// through the multi-module path because `register_decl_in_module`
@@ -3427,6 +3764,444 @@ function main() {
         assert!(
             err.to_string().contains("frozen"),
             "expected a use-after-freeze error, got: {err}"
+        );
+    }
+
+    // ── extern js host-FFI binding ──────────────
+
+    /// Parse `source`, register declarations, register the host bindings built
+    /// by `register`, run `main`, and return captured stdout (or the error).
+    fn run_with_host(
+        source: &str,
+        register: impl FnOnce(&mut Interpreter),
+    ) -> std::result::Result<String, RuntimeError> {
+        let tokens = tokenize(source, SourceId(0));
+        let (program, errors) = parser::parse(&tokens);
+        assert!(errors.is_empty(), "parse errors: {:?}", errors);
+        let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut interp = Interpreter::with_output(Box::new(SharedWriter(buffer.clone())));
+        register(&mut interp);
+        let result = interp.run_program(&program);
+        drop(interp);
+        result.map(|()| String::from_utf8_lossy(&buffer.borrow()).into_owned())
+    }
+
+    #[test]
+    fn extern_js_call_dispatches_to_registered_host() {
+        // A host stub for `alert` records what it was passed; the program's call
+        // marshals the String argument across the boundary to it.
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let out = run_with_host(
+            "extern js { function alert(message: String) }\n\
+             function main() { alert(\"hi\") }",
+            move |interp| {
+                interp.register_host(
+                    "js",
+                    "alert",
+                    Box::new(move |_ctx, args| {
+                        if let Some(HostValue::Str(s)) = args.into_iter().next() {
+                            seen2.borrow_mut().push(s);
+                        }
+                        Ok(HostValue::Void)
+                    }),
+                );
+            },
+        )
+        .expect("program should run with the host binding registered");
+        assert_eq!(out, "");
+        assert_eq!(*seen.borrow(), vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn extern_js_return_value_marshals_back() {
+        // `getLength` returns an Int the program uses in arithmetic.
+        let out = run_with_host(
+            "extern js { function getLength(s: String) -> Int }\n\
+             function main() { print(getLength(\"abc\") + 1) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "getLength",
+                    Box::new(|_ctx, args| match args.into_iter().next() {
+                        Some(HostValue::Str(s)) => Ok(HostValue::Int(s.len() as i64)),
+                        _ => Err("expected a string".to_string()),
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "4");
+    }
+
+    #[test]
+    fn extern_js_callback_invokes_phoenix_closure() {
+        // A host stub for a callback-taking API invokes the Phoenix closure it
+        // is handed (synchronously) via the HostContext bridge.
+        let out = run_with_host(
+            "extern js { function callNow(cb: () -> Void) }\n\
+             function main() { callNow(function() { print(\"called back\") }) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "callNow",
+                    Box::new(|ctx, args| match args.into_iter().next() {
+                        Some(HostValue::Callback(h)) => {
+                            ctx.call_callback(h, vec![])?;
+                            Ok(HostValue::Void)
+                        }
+                        _ => Err("expected a callback".to_string()),
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "called back");
+    }
+
+    #[test]
+    fn extern_js_jsvalue_round_trips_through_host() {
+        // `getEl` returns an opaque JsValue handle; `tagOf` receives the same
+        // handle back — Phoenix never inspects it, it only round-trips it.
+        let out = run_with_host(
+            "extern js {\n\
+               function getEl(id: String) -> JsValue\n\
+               function tagOf(e: JsValue) -> String\n\
+             }\n\
+             function main() {\n\
+               let e: JsValue = getEl(\"root\")\n\
+               print(tagOf(e))\n\
+             }",
+            |interp| {
+                interp.register_host("js", "getEl", Box::new(|_c, _a| Ok(HostValue::JsValue(7))));
+                interp.register_host(
+                    "js",
+                    "tagOf",
+                    Box::new(|_c, args| match args.into_iter().next() {
+                        Some(HostValue::JsValue(7)) => Ok(HostValue::Str("DIV".to_string())),
+                        other => Err(format!("unexpected handle: {other:?}")),
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "DIV");
+    }
+
+    #[test]
+    fn extern_js_unbound_host_errors_cleanly() {
+        // No host registered → a clean "no host binding" error, never a panic
+        // or a silent no-op.
+        let err = run_with_host(
+            "extern js { function alert(message: String) }\n\
+             function main() { alert(\"x\") }",
+            |_interp| {},
+        )
+        .expect_err("an unbound extern call should error");
+        assert!(
+            err.message.contains("no host binding registered") && err.message.contains("js.alert"),
+            "expected a clean unbound-host error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn extern_js_callback_can_call_another_extern() {
+        // Re-entrancy: the host `run` invokes the Phoenix callback, which itself
+        // calls a *second* extern (`shout`). The registry must stay populated for
+        // the duration of the outer host call so the nested dispatch resolves —
+        // a regression guard for the registry handling in `call_extern_host`.
+        let out = run_with_host(
+            "extern js {\n\
+               function run(cb: () -> Void)\n\
+               function shout(s: String) -> String\n\
+             }\n\
+             function main() { run(function() { print(shout(\"hi\")) }) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "run",
+                    Box::new(|ctx, args| match args.into_iter().next() {
+                        Some(HostValue::Callback(h)) => {
+                            ctx.call_callback(h, vec![])?;
+                            Ok(HostValue::Void)
+                        }
+                        _ => Err("expected a callback".to_string()),
+                    }),
+                );
+                interp.register_host(
+                    "js",
+                    "shout",
+                    Box::new(|_ctx, args| match args.into_iter().next() {
+                        Some(HostValue::Str(s)) => Ok(HostValue::Str(s.to_uppercase())),
+                        _ => Err("expected a string".to_string()),
+                    }),
+                );
+            },
+        )
+        .expect("a nested extern through a callback should dispatch");
+        assert_eq!(out.trim(), "HI");
+    }
+
+    #[test]
+    fn extern_js_named_args_reorder_to_positional() {
+        // Sema accepts named args on extern calls (same validation path as
+        // regular functions), so the interpreter must reorder them into the
+        // declared parameter order before marshalling — matching the IR backend.
+        // Here `pair` is declared `(name, id)` but called `(id:, name:)`.
+        let out = run_with_host(
+            "extern js { function pair(name: String, id: Int) -> String }\n\
+             function main() { print(pair(id: 7, name: \"x\")) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "pair",
+                    Box::new(|_ctx, args| {
+                        let mut it = args.into_iter();
+                        match (it.next(), it.next()) {
+                            (Some(HostValue::Str(name)), Some(HostValue::Int(id))) => {
+                                Ok(HostValue::Str(format!("{name}={id}")))
+                            }
+                            _ => Err("expected (String, Int) in declared order".to_string()),
+                        }
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "x=7");
+    }
+
+    #[test]
+    fn extern_shadows_same_named_local_closure() {
+        // Precedence guard: a bare name bound to *both* an `extern js` function
+        // and a local closure variable must dispatch to the extern, matching
+        // sema's `check_call` resolution order (function -> extern -> variable).
+        // The extern arm is checked before the closure-variable arm in
+        // `eval_call`; this pins that the interpreter agrees with sema rather
+        // than calling the shadowing local closure.
+        let fired = Rc::new(RefCell::new(false));
+        let fired2 = fired.clone();
+        let out = run_with_host(
+            "extern js { function greet() }\n\
+             function main() {\n\
+               let greet = function() { print(\"LOCAL\") }\n\
+               greet()\n\
+             }",
+            move |interp| {
+                interp.register_host(
+                    "js",
+                    "greet",
+                    Box::new(move |_ctx, _args| {
+                        *fired2.borrow_mut() = true;
+                        Ok(HostValue::Void)
+                    }),
+                );
+            },
+        )
+        .expect("program should run with the host binding registered");
+        assert!(*fired.borrow(), "the extern binding should have fired");
+        assert_eq!(out, "", "the shadowing local closure must not be called");
+    }
+
+    #[test]
+    fn extern_js_callback_receives_marshalled_args() {
+        // The host invokes the Phoenix callback *with* a value (the
+        // `setTimeout(cb, x)` shape), exercising the inbound-arg marshalling in
+        // `call_callback` that the empty-arg callback tests never reach.
+        let out = run_with_host(
+            "extern js { function withValue(cb: (Int) -> Void) }\n\
+             function main() { withValue(function(n: Int) { print(n + 1) }) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "withValue",
+                    Box::new(|ctx, args| match args.into_iter().next() {
+                        Some(HostValue::Callback(h)) => {
+                            ctx.call_callback(h, vec![HostValue::Int(41)])?;
+                            Ok(HostValue::Void)
+                        }
+                        _ => Err("expected a callback".to_string()),
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "42");
+    }
+
+    #[test]
+    fn extern_js_host_error_surfaces_cleanly() {
+        // A host function returning `Err` must surface as a clean runtime error
+        // carrying the host's message — not a panic, not a swallowed failure.
+        let err = run_with_host(
+            "extern js { function boom() }\n\
+             function main() { boom() }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "boom",
+                    Box::new(|_ctx, _args| Err("host blew up".to_string())),
+                );
+            },
+        )
+        .expect_err("a host function returning Err should error");
+        assert!(
+            err.message.contains("host blew up"),
+            "expected the host error message to surface, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn extern_js_host_returning_callback_is_rejected() {
+        // A host that hands back a callback handle (not a receivable value) is
+        // marshalled-in as a clean error rather than silently producing a bogus
+        // value Phoenix cannot represent.
+        let err = run_with_host(
+            "extern js { function evil() }\n\
+             function main() { evil() }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "evil",
+                    Box::new(|_ctx, _args| Ok(HostValue::Callback(CallbackHandle(0)))),
+                );
+            },
+        )
+        .expect_err("a host returning a callback handle should error");
+        assert!(
+            err.message.contains("callback handle"),
+            "expected a clean rejection of the returned callback, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn jsvalue_equality_is_by_handle() {
+        // Sema permits `==` on `JsValue` (any type-compatible pair is
+        // equatable), so the interpreter must compare opaque handles by identity:
+        // the same host handle is equal to itself; distinct handles are not.
+        let out = run_with_host(
+            "extern js {\n\
+               function getEl(id: String) -> JsValue\n\
+             }\n\
+             function main() {\n\
+               let a: JsValue = getEl(\"x\")\n\
+               let b: JsValue = getEl(\"x\")\n\
+               let c: JsValue = getEl(\"y\")\n\
+               print(a == a)\n\
+               print(a == b)\n\
+               print(a == c)\n\
+             }",
+            |interp| {
+                // Same id ↔ same object; `getEl(\"y\")` is a different handle.
+                interp.register_host(
+                    "js",
+                    "getEl",
+                    Box::new(|_c, args| match args.into_iter().next() {
+                        Some(HostValue::Str(s)) if s == "y" => Ok(HostValue::JsValue(2)),
+                        Some(HostValue::Str(_)) => Ok(HostValue::JsValue(1)),
+                        _ => Err("expected a string".to_string()),
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "true\ntrue\nfalse\n");
+    }
+
+    #[test]
+    fn extern_js_float_round_trips_through_host() {
+        // A Float crosses the boundary out (as an arg) and back (as the result),
+        // exercising the `Float` marshalling arm the scalar tests otherwise skip.
+        let out = run_with_host(
+            "extern js { function twice(x: Float) -> Float }\n\
+             function main() { print(twice(1.5)) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "twice",
+                    Box::new(|_ctx, args| match args.into_iter().next() {
+                        Some(HostValue::Float(x)) => Ok(HostValue::Float(x * 2.0)),
+                        _ => Err("expected a float".to_string()),
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim(), "3.0");
+    }
+
+    #[test]
+    fn extern_js_non_marshallable_arg_is_rejected() {
+        // Marshalling-*out* a value sema would never permit at an extern
+        // signature (here a `List`) is a clean internal error, not a panic. Sema
+        // normally rejects this at the signature; `run_with_host` skips sema, so
+        // this drives the defensive `value_to_host` aggregate arm directly.
+        let err = run_with_host(
+            "extern js { function take(xs: List<Int>) }\n\
+             function main() { take([1, 2, 3]) }",
+            |interp| {
+                interp.register_host("js", "take", Box::new(|_ctx, _args| Ok(HostValue::Void)));
+            },
+        )
+        .expect_err("a non-marshallable arg should error");
+        assert!(
+            err.message
+                .contains("cannot cross the `extern js` boundary"),
+            "expected a clean non-marshallable-value error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn assemble_extern_args_reports_internal_errors() {
+        // The arity/name guards in `assemble_extern_args` back sema's validation;
+        // a sema-valid program never trips them, so exercise them directly. Each
+        // must fail loudly rather than silently drop or mis-attribute an arg.
+        let interp = Interpreter::new();
+        let params = vec!["a".to_string(), "b".to_string()];
+
+        // Too many positional args.
+        let err = interp
+            .assemble_extern_args(
+                "f",
+                &params,
+                vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+                vec![],
+            )
+            .expect_err("over-arity should error");
+        assert!(
+            err.message.contains("positional args"),
+            "got: {}",
+            err.message
+        );
+
+        // A parameter left unfilled.
+        let err = interp
+            .assemble_extern_args("f", &params, vec![Value::Int(1)], vec![])
+            .expect_err("a missing argument should error");
+        assert!(
+            err.message.contains("missing argument for parameter `b`"),
+            "got: {}",
+            err.message
+        );
+
+        // A named arg whose name matches no parameter — must fail loudly, not
+        // vanish and resurface as a misleading "missing argument".
+        let err = interp
+            .assemble_extern_args(
+                "f",
+                &params,
+                vec![Value::Int(1)],
+                vec![("zzz".to_string(), Value::Int(2))],
+            )
+            .expect_err("an unknown named arg should error");
+        assert!(
+            err.message.contains("unknown argument `zzz`"),
+            "got: {}",
+            err.message
         );
     }
 }

@@ -53,3 +53,26 @@ function main() {
 "#,
     );
 }
+
+/// A `Void`-returning closure (`function() { print(...) }`, the common callback
+/// shape) must lower and run on both interpreters. Regression for the lambda
+/// body-coercion path that unconditionally coerced the trailing value — for a
+/// `Void` body it looked up a type the void sentinel never recorded and tripped
+/// a debug-only assert in `coerce_value_to_expected`. Now guarded on
+/// `return_type != Void`, mirroring the top-level function-body path.
+#[test]
+fn void_returning_closure_called() {
+    roundtrip(
+        r#"
+function run(f: () -> Void) {
+    f()
+}
+
+function main() {
+    let greet: () -> Void = function() { print("hi") }
+    run(greet)
+    run(function() { print("bye") })
+}
+"#,
+    );
+}

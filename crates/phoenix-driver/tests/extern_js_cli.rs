@@ -1,16 +1,18 @@
-//! CLI integration tests for `extern js` across the execution subcommands
-//! (Phase 2.5 PR 3).
+//! CLI integration tests for `extern js` across the execution subcommands.
 //!
-//! After PR 3, `extern js` calls **lower** to the generic `Op::ExternCall`
-//! host-call node, so `phoenix ir` prints the lowered IR. No execution backend
-//! *binds* that op yet, though, so the run/build paths reject it with a clean,
-//! backend-specific diagnostic until their host bindings land:
+//! `extern js` calls lower to the generic `Op::ExternCall` host-call node (PR
+//! 3), so `phoenix ir` prints the lowered IR. The behavior of a *calling* program
+//! then depends on whether the backend has a host binding:
 //!
-//! - `run` (AST tree-walk interpreter) and `run-ir` (IR interpreter) — the
-//!   interpreter host-function table lands in PR 4.
-//! - `build` (native Cranelift) — the C-ABI host shim lands in PR 9. The
-//!   rejection happens during IR→Cranelift translation, before linking, so this
-//!   case needs no runtime/linker provisioning.
+//! - `run` / `run-ir` (the interpreters) gained a host-FFI table in PR 4, so they
+//!   *can* execute extern calls — but the bare CLI registers no bindings, so a
+//!   call reports a clean "no host binding registered" error (the mechanism
+//!   exists; the CLI just provides nothing). Binary-level host provisioning is
+//!   PR 16. A program that merely *declares* an extern without calling it runs
+//!   normally (no `Op::ExternCall` is lowered).
+//! - `build` (native Cranelift) has no host binding yet — it rejects during
+//!   IR→Cranelift translation, before linking (so no runtime/linker provisioning
+//!   is needed). The C-ABI host shim lands in PR 9.
 //!
 //! (`gen`'s separate, schema-specific rejection is covered by `gen_cli.rs`.)
 
@@ -98,10 +100,9 @@ fn assert_uncalled_extern_runs(subcommand: &str, name: &str) {
     );
 }
 
-/// Assert the given subcommand rejects an `extern js` program with a clean,
-/// backend-specific diagnostic that names the feature and the phase/PR where its
-/// binding lands.
-fn assert_execution_rejects(subcommand: &str, name: &str) {
+/// Assert the given subcommand fails on a calling-an-extern program with a
+/// clean diagnostic containing `expect_substr` (the per-backend reason).
+fn assert_execution_fails_with(subcommand: &str, name: &str, expect_substr: &str) {
     let src = extern_js_source(name);
     let output = phoenix_bin()
         .arg(subcommand)
@@ -112,30 +113,35 @@ fn assert_execution_rejects(subcommand: &str, name: &str) {
 
     assert!(
         !output.status.success(),
-        "`phoenix {subcommand}` should reject an extern-js program (no host binding yet)"
+        "`phoenix {subcommand}` should fail on a program that calls an unbound extern"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("extern js") && stderr.contains("Phase 2.5 PR"),
-        "expected a clean extern-js binding diagnostic from `{subcommand}`, got stderr: {stderr}"
+        stderr.contains("extern js") && stderr.contains(expect_substr),
+        "expected `{expect_substr}` in `{subcommand}` stderr, got: {stderr}"
     );
 }
 
 #[test]
-fn run_rejects_extern_js() {
-    assert_execution_rejects("run", "run");
+fn run_reports_unbound_host() {
+    // The AST interpreter has the host-FFI mechanism (PR 4) but the bare CLI
+    // registers no bindings, so a call to an extern is a clean "no host binding
+    // registered" error — not "undefined function", not a panic.
+    assert_execution_fails_with("run", "run", "no host binding registered");
 }
 
 #[test]
-fn run_ir_rejects_extern_js() {
-    assert_execution_rejects("run-ir", "run_ir");
+fn run_ir_reports_unbound_host() {
+    // Same for the IR interpreter.
+    assert_execution_fails_with("run-ir", "run_ir", "no host binding registered");
 }
 
 #[test]
 fn build_rejects_extern_js() {
-    // `build` rejects during IR→Cranelift translation, before linking, so no
-    // runtime lib is needed and no executable is produced.
-    assert_execution_rejects("build", "build");
+    // `build` (native Cranelift) has no host binding yet — it rejects during
+    // IR→Cranelift translation, before linking (so no runtime/linker needed).
+    // The native C-ABI host shim lands in PR 9.
+    assert_execution_fails_with("build", "build", "Phase 2.5 PR 9");
 }
 
 #[test]

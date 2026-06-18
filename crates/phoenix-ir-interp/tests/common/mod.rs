@@ -22,6 +22,25 @@ pub fn ast_run(source: &str) -> Vec<String> {
         .expect("AST runtime error")
 }
 
+/// Parse, type-check, lower, and verify `source` to an IR module — for host-FFI
+/// tests that register bindings on the interpreter before running. Asserts no
+/// parse / sema / verification errors.
+pub fn lower_to_ir(source: &str) -> phoenix_ir::module::IrModule {
+    let tokens = tokenize(source, SourceId(0));
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = checker::check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "type errors: {:?}",
+        result.diagnostics
+    );
+    let module = phoenix_ir::lower(&program, &result.module);
+    let errors = phoenix_ir::verify::verify(&module);
+    assert!(errors.is_empty(), "IR verification errors: {:?}", errors);
+    module
+}
+
 /// Run source through the IR interpreter and capture print() output.
 pub fn ir_run(source: &str) -> Vec<String> {
     let tokens = tokenize(source, SourceId(0));

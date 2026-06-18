@@ -38,6 +38,22 @@ pub fn run(module: &IrModule) -> Result<(), IrRuntimeError> {
     interp.run()
 }
 
+/// Like [`run_and_capture`], but registers host-FFI bindings (built by
+/// `register`) before running, so `extern js` calls dispatch to registered Rust
+/// host functions. Captures `print()` output as lines.
+pub fn run_with_host_capture(
+    module: &IrModule,
+    register: impl FnOnce(&mut IrInterpreter),
+) -> Result<Vec<String>, IrRuntimeError> {
+    let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut interp = IrInterpreter::new(module, Box::new(SharedWriter(buffer.clone())));
+    register(&mut interp);
+    interp.run()?;
+    let bytes = buffer.borrow();
+    let output = String::from_utf8_lossy(&bytes);
+    Ok(output.lines().map(|l| l.to_string()).collect())
+}
+
 /// Run the `main` function and capture all `print()` output as lines.
 pub fn run_and_capture(module: &IrModule) -> Result<Vec<String>, IrRuntimeError> {
     let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));

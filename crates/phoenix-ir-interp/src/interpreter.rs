@@ -3,6 +3,7 @@
 use crate::builtins;
 use crate::error::{IrRuntimeError, Result, error};
 use crate::value::{EnumData, IrValue, StructData, map_key_eq};
+use phoenix_common::host::{CallbackHandle, HostContext, HostValue};
 use phoenix_ir::block::BlockId;
 use phoenix_ir::instruction::{FuncId, Op, ValueId};
 use phoenix_ir::module::{IrFunction, IrModule};
@@ -79,16 +80,73 @@ pub struct IrInterpreter<'m> {
     output: Box<dyn Write>,
     /// Current call depth (for stack overflow detection).
     depth: usize,
+    /// Host-FFI bindings for `extern js` calls. Empty by default —
+    /// an unregistered extern is a clean "no host binding" error. Populated via
+    /// [`IrInterpreter::register_host`] / the `run_with_host_capture` entry point.
+    ///
+    /// Held behind an `Rc` so an extern dispatch can clone a cheap handle for
+    /// the lookup while leaving the field populated for the duration of the host
+    /// call — a host callback that re-enters Phoenix and calls another extern
+    /// must still find the registry. See [`IrInterpreter::call_extern_host`].
+    host_registry: Rc<phoenix_common::host::HostRegistry>,
+    /// Phoenix closures handed to the host as callbacks (Phase 2.5), indexed by
+    /// [`phoenix_common::host::CallbackHandle`]; invoked back through the
+    /// [`phoenix_common::host::HostContext`] bridge. Retained for the
+    /// interpreter's lifetime (no event loop releases them).
+    host_callbacks: Vec<IrValue>,
+}
+
+/// Lets a host function call back into Phoenix (Phase 2.5) via the IR
+/// interpreter's normal closure-call path. Synchronous — the interpreter has no
+/// event loop (the callbacks-only async model).
+impl HostContext for IrInterpreter<'_> {
+    fn call_callback(
+        &mut self,
+        handle: CallbackHandle,
+        args: Vec<HostValue>,
+    ) -> std::result::Result<HostValue, String> {
+        let closure = self
+            .host_callbacks
+            .get(handle.0 as usize)
+            .cloned()
+            .ok_or_else(|| format!("invalid `extern js` callback handle {}", handle.0))?;
+        let native_args: Vec<IrValue> = args
+            .into_iter()
+            .map(|a| self.host_to_ir_value(a))
+            .collect::<std::result::Result<_, String>>()?;
+        let result = self
+            .call_closure(&closure, native_args)
+            .map_err(|e| e.message)?;
+        self.ir_value_to_host(result)
+    }
 }
 
 impl<'m> IrInterpreter<'m> {
-    /// Create a new interpreter for the given module.
+    /// Create a new interpreter for the given module, with no host bindings.
     pub fn new(module: &'m IrModule, output: Box<dyn Write>) -> Self {
         Self {
             module,
             output,
             depth: 0,
+            host_registry: Rc::new(phoenix_common::host::HostRegistry::new()),
+            host_callbacks: Vec::new(),
         }
+    }
+
+    /// Register a host binding for an `extern js` function `(module, name)`.
+    /// See [`phoenix_common::host`] for the host-function contract.
+    pub fn register_host(
+        &mut self,
+        module: impl Into<String>,
+        name: impl Into<String>,
+        f: phoenix_common::host::HostFunction,
+    ) {
+        // Registration happens during setup, before any run begins, so the `Rc`
+        // is uniquely owned and `get_mut` succeeds. (It is only ever aliased
+        // transiently inside [`Self::call_extern_host`], which never registers.)
+        Rc::get_mut(&mut self.host_registry)
+            .expect("register host bindings before running the program")
+            .register(module, name, f);
     }
 
     /// Run the `main` function.
@@ -503,11 +561,15 @@ impl<'m> IrInterpreter<'m> {
                     .collect::<Result<_>>()?;
                 builtins::dispatch(self, name, args)
             }
-            Op::ExternCall(module, name, _) => error(format!(
-                "`extern js` host call `{module}.{name}` is not supported by the IR \
-                 interpreter yet — the interpreter host-function binding lands in \
-                 Phase 2.5 PR 4"
-            )),
+            Op::ExternCall(module, name, arg_vids) => {
+                // Resolve args from the frame, then dispatch to the host binding
+                // (which may invoke Phoenix callbacks back through HostContext).
+                let args: Vec<IrValue> = arg_vids
+                    .iter()
+                    .map(|vid| frame.get(*vid).cloned())
+                    .collect::<Result<_>>()?;
+                self.call_extern_host(module, name, args)
+            }
             Op::UnresolvedTraitMethod(method, _, _) => error(format!(
                 "internal error: unresolved trait-bound method call `.{method}` \
                  reached the IR interpreter — monomorphization was expected to \
@@ -636,11 +698,17 @@ impl<'m> IrInterpreter<'m> {
     fn execute_comparison(&self, op: &Op, frame: &CallFrame) -> Result<IrValue> {
         match op {
             Op::IEq(a, b) => {
-                let (a, b) = (self.get_int(frame, *a)?, self.get_int(frame, *b)?);
+                let (a, b) = (
+                    self.get_int_or_handle(frame, *a)?,
+                    self.get_int_or_handle(frame, *b)?,
+                );
                 Ok(IrValue::Bool(a == b))
             }
             Op::INe(a, b) => {
-                let (a, b) = (self.get_int(frame, *a)?, self.get_int(frame, *b)?);
+                let (a, b) = (
+                    self.get_int_or_handle(frame, *a)?,
+                    self.get_int_or_handle(frame, *b)?,
+                );
                 Ok(IrValue::Bool(a != b))
             }
             Op::ILt(a, b) => {
@@ -737,6 +805,21 @@ impl<'m> IrInterpreter<'m> {
         }
     }
 
+    /// Extract the comparable identity of an `IEq`/`INe` operand: an `Int`'s
+    /// value, or a `JsValue`'s opaque handle. `JsValue` reaches the
+    /// integer-compare ops because `==`/`!=` on it lower to `Op::IEq`/`Op::INe`
+    /// (its identity is bit-equality of its handle — see `lower_binary`). The
+    /// `u64`→`i64` cast preserves that bit identity for equality. Sema
+    /// guarantees both operands share a type, so an `Int`/`JsValue` mix never
+    /// arises.
+    fn get_int_or_handle(&self, frame: &CallFrame, vid: ValueId) -> Result<i64> {
+        match frame.get(vid)? {
+            IrValue::Int(n) => Ok(*n),
+            IrValue::JsValue(h) => Ok(*h as i64),
+            other => error(format!("expected Int or JsValue, got {other}")),
+        }
+    }
+
     fn get_float(&self, frame: &CallFrame, vid: ValueId) -> Result<f64> {
         match frame.get(vid)? {
             IrValue::Float(n) => Ok(*n),
@@ -770,6 +853,101 @@ impl<'m> IrInterpreter<'m> {
         writeln!(self.output, "{s}").map_err(|e| IrRuntimeError {
             message: format!("write error: {e}"),
         })
+    }
+
+    /// Marshal a native [`IrValue`] out across the `extern js` boundary into a
+    /// [`HostValue`]. A closure registers a callback handle so the
+    /// host can invoke it; aggregates are an internal error (sema rejects
+    /// non-marshallable extern types).
+    fn ir_value_to_host(&mut self, v: IrValue) -> std::result::Result<HostValue, String> {
+        Ok(match v {
+            IrValue::Int(n) => HostValue::Int(n),
+            IrValue::Float(n) => HostValue::Float(n),
+            IrValue::Bool(b) => HostValue::Bool(b),
+            IrValue::String(s) => HostValue::Str(s),
+            IrValue::Void => HostValue::Void,
+            IrValue::JsValue(h) => HostValue::JsValue(h),
+            c @ IrValue::Closure(_, _) => {
+                let handle = CallbackHandle(self.host_callbacks.len() as u64);
+                self.host_callbacks.push(c);
+                HostValue::Callback(handle)
+            }
+            other => {
+                return Err(format!(
+                    "value of type `{}` cannot cross the `extern js` boundary \
+                     (only Int / Float / Bool / String / JsValue / Void and closures \
+                     are marshallable)",
+                    other.type_name()
+                ));
+            }
+        })
+    }
+
+    /// Marshal a [`HostValue`] from the host back into a native [`IrValue`].
+    fn host_to_ir_value(&self, hv: HostValue) -> std::result::Result<IrValue, String> {
+        Ok(match hv {
+            HostValue::Int(n) => IrValue::Int(n),
+            HostValue::Float(n) => IrValue::Float(n),
+            HostValue::Bool(b) => IrValue::Bool(b),
+            HostValue::Str(s) => IrValue::String(s),
+            HostValue::Void => IrValue::Void,
+            HostValue::JsValue(h) => IrValue::JsValue(h),
+            HostValue::Callback(_) => {
+                return Err("a host function returned a callback handle, which Phoenix \
+                            cannot receive across the `extern js` boundary"
+                    .to_string());
+            }
+        })
+    }
+
+    /// Dispatch an `extern js` call to its registered host binding.
+    /// Marshals args out, invokes the host function (which may call Phoenix
+    /// callbacks back through [`HostContext`]), and marshals the result in.
+    /// Reports a clean error if no binding is registered for `(module, name)`.
+    fn call_extern_host(
+        &mut self,
+        module: &str,
+        name: &str,
+        args: Vec<IrValue>,
+    ) -> Result<IrValue> {
+        let to_err = |m: String| IrRuntimeError { message: m };
+        // Clone a cheap `Rc` handle so `self.host_registry` stays populated while
+        // the host function borrows `&mut self` (as a `HostContext`, for
+        // callbacks): a callback that re-enters Phoenix and calls another extern
+        // then still finds the registry. The clone also lets the resolved `&f`
+        // live across the marshalling `&mut self` borrows below, since it borrows
+        // the local `registry`, not `self`.
+        let registry = Rc::clone(&self.host_registry);
+        // Resolve the binding *before* marshalling. Marshalling a closure arg
+        // mints a callback handle in `host_callbacks`; doing it first on the
+        // unbound path would leave an orphan entry behind for an extern that
+        // never runs. The lookup is a cheap pair of `HashMap` probes.
+        let Some(f) = registry.get(module, name) else {
+            return Err(to_err(format!(
+                "no host binding registered for `extern js` function `{module}.{name}` \
+                 — register one before running (`phoenix run-ir` provides none; a host \
+                 binding lands with the WASM / native backends)"
+            )));
+        };
+        // Snapshot the callback table before marshalling so a failure partway
+        // through the arg list — a non-marshallable arg *after* an earlier
+        // closure arg already minted a handle — rolls those orphan handles back
+        // rather than leaking them, matching the resolve-binding-first intent
+        // above (no handle survives for a call that never reaches the host).
+        let checkpoint = self.host_callbacks.len();
+        let host_args: Vec<HostValue> = match args
+            .into_iter()
+            .map(|a| self.ir_value_to_host(a))
+            .collect::<std::result::Result<_, String>>()
+        {
+            Ok(host_args) => host_args,
+            Err(m) => {
+                self.host_callbacks.truncate(checkpoint);
+                return Err(to_err(m));
+            }
+        };
+        let host_result = f(self, host_args).map_err(to_err)?;
+        self.host_to_ir_value(host_result).map_err(to_err)
     }
 
     /// Call a closure value with arguments.

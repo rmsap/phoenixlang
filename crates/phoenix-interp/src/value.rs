@@ -88,6 +88,13 @@ pub enum Value {
         /// Variables captured from the enclosing scope (by shared reference).
         captures: HashMap<String, Rc<RefCell<Value>>>,
     },
+    /// An opaque JavaScript-host value handle (`JsValue`).
+    ///
+    /// Produced and consumed only at the `extern js` boundary: the handle
+    /// identifies a host-owned object the interpreter never inspects. The host
+    /// stub registry owns the real object; Phoenix only round-trips the handle.
+    /// Mirrors `phoenix_common::host::HostValue::JsValue`.
+    JsValue(u64),
 }
 
 impl Value {
@@ -111,6 +118,7 @@ impl Value {
             Value::ListBuilder(_) => "ListBuilder",
             Value::MapBuilder(_) => "MapBuilder",
             Value::Closure { .. } => "<function>",
+            Value::JsValue(_) => "JsValue",
         }
     }
 
@@ -209,6 +217,8 @@ impl fmt::Display for Value {
             Value::ListBuilder(_) => write!(f, "<ListBuilder>"),
             Value::MapBuilder(_) => write!(f, "<MapBuilder>"),
             Value::Closure { .. } => write!(f, "<function>"),
+            // Opaque host handle — not a value programs print in normal use.
+            Value::JsValue(_) => write!(f, "<JsValue>"),
         }
     }
 }
@@ -237,6 +247,11 @@ impl PartialEq for Value {
             (Value::ListBuilder(_), Value::ListBuilder(_)) => false,
             (Value::MapBuilder(_), Value::MapBuilder(_)) => false,
             (Value::Closure { .. }, Value::Closure { .. }) => false, // closures are never equal
+            // `JsValue` is an opaque host handle whose identity *is* its handle
+            // id. Sema permits `==`/`!=` on it (any type-compatible pair is
+            // equatable), so compare by handle: two handles are equal iff they
+            // name the same host object. Mirrors the IR interpreter's `IrValue`.
+            (Value::JsValue(a), Value::JsValue(b)) => a == b,
             _ => false,
         }
     }

@@ -11,6 +11,9 @@
 pub mod algorithms;
 /// Error and warning diagnostics produced by the compiler pipeline.
 pub mod diagnostics;
+/// Host-FFI exchange types (`HostValue`, `HostContext`, `HostRegistry`) shared
+/// by the interpreters for `extern js` host calls.
+pub mod host;
 /// Identifier-casing helpers shared between sema and the codegen backends
 /// (currently `capitalize`, the rule generated type names are built with).
 pub mod idents;

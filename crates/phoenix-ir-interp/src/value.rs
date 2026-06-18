@@ -105,6 +105,14 @@ pub enum IrValue {
         /// The trait name the value was object-ified under.
         trait_name: String,
     },
+    /// An opaque JavaScript-host value handle (`JsValue`).
+    ///
+    /// The IR-interpreter mirror of `IrType::JsValue`: a handle into a
+    /// host-owned object space the interpreter never inspects, produced and
+    /// consumed only at the `extern js` boundary
+    /// ([`crate::instruction::Op::ExternCall`]). Mirrors
+    /// `phoenix_common::host::HostValue::JsValue`.
+    JsValue(u64),
 }
 
 impl IrValue {
@@ -205,6 +213,30 @@ impl IrValue {
             // and `.freeze`). Render an opaque tag for diagnostics.
             IrValue::ListBuilder(_) => "<ListBuilder>".to_string(),
             IrValue::MapBuilder(_) => "<MapBuilder>".to_string(),
+            IrValue::JsValue(_) => "<JsValue>".to_string(),
+        }
+    }
+
+    /// Returns a fixed, module-free kind label for this value, for diagnostics
+    /// that can't borrow the module (e.g. the `extern js` marshalling error).
+    /// Aggregates report their kind, not their declared name — use
+    /// [`Self::format`] when the source-level name is wanted.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            IrValue::Int(_) => "Int",
+            IrValue::Float(_) => "Float",
+            IrValue::String(_) => "String",
+            IrValue::Bool(_) => "Bool",
+            IrValue::Void => "Void",
+            IrValue::Struct(_) => "Struct",
+            IrValue::EnumVariant(_) => "EnumVariant",
+            IrValue::List(_) => "List",
+            IrValue::Map(_) => "Map",
+            IrValue::Closure(_, _) => "<function>",
+            IrValue::Dyn { .. } => "Dyn",
+            IrValue::ListBuilder(_) => "ListBuilder",
+            IrValue::MapBuilder(_) => "MapBuilder",
+            IrValue::JsValue(_) => "JsValue",
         }
     }
 
@@ -255,6 +287,10 @@ impl PartialEq for IrValue {
             (IrValue::ListBuilder(_), IrValue::ListBuilder(_)) => false,
             (IrValue::MapBuilder(_), IrValue::MapBuilder(_)) => false,
             (IrValue::Closure(_, _), IrValue::Closure(_, _)) => false,
+            // `JsValue` is an opaque host handle whose identity *is* its handle
+            // id. Sema permits `==`/`!=` on it, so compare by handle: two
+            // handles are equal iff they name the same host object.
+            (IrValue::JsValue(a), IrValue::JsValue(b)) => a == b,
             // Trait-object equality: two `dyn` values are equal iff they
             // carry the same trait *and* the same concrete type *and*
             // their underlying values are equal. The trait-name check
@@ -351,6 +387,7 @@ impl fmt::Display for IrValue {
             IrValue::Dyn { concrete, .. } => write!(f, "{concrete}"),
             IrValue::ListBuilder(_) => write!(f, "<ListBuilder>"),
             IrValue::MapBuilder(_) => write!(f, "<MapBuilder>"),
+            IrValue::JsValue(_) => write!(f, "<JsValue>"),
         }
     }
 }

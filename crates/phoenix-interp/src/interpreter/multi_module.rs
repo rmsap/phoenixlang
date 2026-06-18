@@ -201,10 +201,12 @@ impl Interpreter {
                 self.register_methods(&qualified_type, &imp.methods, Some(module_path));
             }
             Declaration::ExternJs(block) => {
-                // Record names so a call resolves to a clean "not supported
-                // yet" error; the host-function binding lands in PR 4.
+                // Record each extern's name and parameter order: the name drives
+                // call precedence and a clean unbound-host error, the order lets
+                // named args be reordered into positional form (see `check_call`).
                 for item in &block.items {
-                    self.extern_function_names.insert(item.name.clone());
+                    let params = item.params.iter().map(|p| p.name.clone()).collect();
+                    self.extern_params.insert(item.name.clone(), params);
                 }
             }
             Declaration::Trait(_)
@@ -235,9 +237,32 @@ pub fn run_modules(
     modules: &[phoenix_modules::ResolvedSourceModule],
     analysis: &mut phoenix_sema::Analysis,
 ) -> std::result::Result<(), RuntimeError> {
+    run_modules_with_host(modules, analysis, phoenix_common::host::HostRegistry::new())
+}
+
+/// Like [`run_modules`], but with a pre-populated host-FFI registry so
+/// `extern js` calls dispatch to registered Rust host functions.
+///
+/// The bare CLI (`phoenix run`) uses [`run_modules`] with an empty registry —
+/// an extern call then reports a clean "no host binding registered" error. An
+/// embedder or test harness uses this entry point to register host stubs (see
+/// [`phoenix_common::host`]) before running a program that calls externs.
+///
+/// Takes the registry pre-built and by value because it owns the [`Interpreter`]
+/// it constructs — the caller never sees it, so there is nothing to register
+/// against afterwards. The single-module / IR paths instead expose the
+/// interpreter and register through [`Interpreter::register_host`] (the
+/// closure-builder form), since their callers hold the interpreter directly.
+/// Both populate the same [`phoenix_common::host::HostRegistry`].
+pub fn run_modules_with_host(
+    modules: &[phoenix_modules::ResolvedSourceModule],
+    analysis: &mut phoenix_sema::Analysis,
+    host_registry: phoenix_common::host::HostRegistry,
+) -> std::result::Result<(), RuntimeError> {
     let mut interpreter = Interpreter::new();
     interpreter.lambda_captures = std::mem::take(&mut analysis.module.lambda_captures);
     interpreter.module_scopes = std::mem::take(&mut analysis.module.module_scopes);
+    interpreter.host_registry = Rc::new(host_registry);
     interpreter.run_modules_inner(modules)
 }
 
