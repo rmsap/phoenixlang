@@ -72,13 +72,13 @@ pub enum Type {
     /// table index on `wasm32-linear`, an `externref` on `wasm32-gc`, an opaque
     /// host handle in the interpreters / native) — see `docs/design-decisions.md`
     /// §Phase 2.5 (decision D). There is no `JsValue` literal in the language;
-    /// the only way to obtain one is an extern call's return value. Until the
-    /// per-backend lowering lands (PR 3+), `lower_type` maps it to a placeholder
-    /// `IrType`. That arm is unreachable today not because `JsValue` is
-    /// unspellable (it *is* spellable, unlike `Money`) but because a program
-    /// using `extern js` is rejected on every execution path before lowering —
-    /// see `reject_extern_js_for_execution` in `phoenix-driver` and the note on
-    /// the `JsValue` arm of `lower_type`.
+    /// the only way to obtain one is an extern call's return value. It lowers to
+    /// the dedicated `IrType::JsValue` and round-trips through the IR cleanly
+    /// (Phase 2.5 PR 3). A program that actually *materializes* a `JsValue`
+    /// still can't execute end-to-end, though: the `Op::ExternCall` that
+    /// produces one has no backend binding yet, so each backend rejects it with
+    /// a clean per-backend error (the interpreters until PR 4, native until
+    /// PR 9, the WASM backends until PRs 5–8 / 12–15).
     JsValue,
     /// A named type that hasn't been resolved yet or is user-defined.
     ///

@@ -243,7 +243,8 @@ pub(crate) fn substitute(ty: &IrType, subst: &HashMap<String, IrType>) -> IrType
         | IrType::Bool
         | IrType::Void
         | IrType::StringRef
-        | IrType::DynRef(_) => ty.clone(),
+        | IrType::DynRef(_)
+        | IrType::JsValue => ty.clone(),
     }
 }
 
@@ -343,6 +344,7 @@ pub(crate) fn mangle_type(ty: &IrType) -> String {
             s.push_str("_E");
             s
         }
+        IrType::JsValue => "jsval".to_string(),
         IrType::TypeVar(name) => format!("T_{name}"),
     }
 }
@@ -508,7 +510,8 @@ pub(super) fn contains_type_var(ty: &IrType) -> bool {
         | IrType::Bool
         | IrType::Void
         | IrType::StringRef
-        | IrType::DynRef(_) => false,
+        | IrType::DynRef(_)
+        | IrType::JsValue => false,
     }
 }
 
@@ -533,6 +536,7 @@ pub(super) fn contains_dyn_ref(ty: &IrType) -> bool {
         | IrType::Bool
         | IrType::Void
         | IrType::StringRef
+        | IrType::JsValue
         | IrType::TypeVar(_) => false,
     }
 }

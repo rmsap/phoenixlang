@@ -504,6 +504,38 @@ impl<'a> LoweringContext<'a> {
                 return self.emit(Op::Call(func_id, type_args, args), result_type, span);
             }
 
+            // `extern js` host-function call. Externs are resolved
+            // by qualified name in sema's `extern_functions` table — they have
+            // no `FuncId` and no IR body — and lower to the generic
+            // `Op::ExternCall(module, name, args)`. Each backend binds that op
+            // to its host (JS glue / Rust host table / C-ABI shim); see
+            // `Op::ExternCall`. Args are merged through the shared
+            // `assemble_call_args` core with `callee_id = None` (no FuncId, so
+            // no default-wrapper probe) and no defaults (rejected at parse time).
+            if let Some((module, name, param_names)) =
+                self.check.extern_functions.get(qname.as_ref()).map(|info| {
+                    let (m, n) = info
+                        .extern_js
+                        .clone()
+                        .expect("extern_functions entry must carry extern_js linkage");
+                    (m, n, info.param_names.clone())
+                })
+            {
+                let result_type = self.expr_type(&call.span);
+                let site_desc = format!("extern js function `{name}`");
+                let args = self.assemble_call_args(
+                    None,
+                    param_names.len(),
+                    &positional,
+                    &named,
+                    |n| param_names.iter().position(|p| p == n),
+                    &HashMap::new(),
+                    &site_desc,
+                    call.span,
+                );
+                return self.emit(Op::ExternCall(module, name, args), result_type, span);
+            }
+
             // Check for an enum variant constructor (e.g. `Some(42)`).
             if let Some((enum_name, type_args)) = self.enum_type_at(&call.span)
                 && let Some(variants) = self.module.enum_layouts.get(&enum_name).cloned()

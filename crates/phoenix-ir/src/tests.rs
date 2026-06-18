@@ -2462,3 +2462,112 @@ fn closure_default_wrapper_synthesizes_and_lowers_closure() {
         "main must fill f's missing default by calling the closure-valued wrapper"
     );
 }
+
+#[test]
+fn lower_extern_js_call_emits_extern_call_op() {
+    // An `extern js` call lowers to the generic `Op::ExternCall(module, name,
+    // args)` host-call node. `lower_to_string` also runs the
+    // IR verifier, so this pins that the verifier accepts `ExternCall` (its
+    // args are checked like any other call's operands). The JsValue-returning
+    // extern exercises the `IrType::JsValue` lowering round-trip too.
+    let module = lower_source(
+        "extern js {\n\
+           function alert(message: String)\n\
+           function getEl(id: String) -> JsValue\n\
+         }\n\
+         function main() {\n\
+           alert(\"hi\")\n\
+           let e: JsValue = getEl(\"root\")\n\
+         }",
+    );
+    // Verifier accepts the new op.
+    let errors = verify::verify(&module);
+    assert!(
+        errors.is_empty(),
+        "verifier rejected extern-call IR: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+
+    // Both extern calls became `Op::ExternCall` with the `("js", name)` linkage,
+    // and neither became an `Op::Call` (externs have no FuncId).
+    let ops: Vec<&Op> = module
+        .concrete_functions()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.instructions.iter())
+        .map(|i| &i.op)
+        .collect();
+    let extern_names: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::ExternCall(module, name, _) => {
+                assert_eq!(module, "js", "extern call module should be `js`");
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        extern_names.contains(&"alert") && extern_names.contains(&"getEl"),
+        "expected ExternCall for both `alert` and `getEl`, got: {extern_names:?}"
+    );
+
+    // The textual IR shows the host-call nodes. (The `getEl` extern returns
+    // `IrType::JsValue`; that it lowered + verified without error exercises the
+    // JsValue round-trip — the Display format doesn't annotate result types
+    // inline, so there's no `jsvalue` substring to assert on here.)
+    let ir = module.to_string();
+    assert!(
+        ir.contains("extern_call js.alert") && ir.contains("extern_call js.getEl"),
+        "IR text missing extern_call nodes:\n{ir}"
+    );
+}
+
+#[test]
+fn lower_extern_js_call_with_named_args_fills_slots_in_param_order() {
+    // Externs lower through the shared `assemble_call_args` core with
+    // `callee_id = None`. The all-positional fast path is exercised by the test
+    // above; this pins the named-arg slot-placement branch — that an out-of-order
+    // named call lands each value in *declared-parameter* order in the emitted
+    // `Op::ExternCall`, not call-site order. Distinct param types (`String` then
+    // `Int`) let the IR result type of each arg disambiguate which slot it filled
+    // without tracing constant values.
+    let module = lower_source(
+        "extern js {\n\
+           function send(label: String, count: Int)\n\
+         }\n\
+         function main() {\n\
+           send(count: 7, label: \"hi\")\n\
+         }",
+    );
+    let errors = verify::verify(&module);
+    assert!(
+        errors.is_empty(),
+        "verifier rejected named-arg extern-call IR: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+
+    // Find the single `send` ExternCall and resolve each arg's IR type.
+    let (func, args) = module
+        .concrete_functions()
+        .flat_map(|f| f.blocks.iter().map(move |b| (f, b)))
+        .flat_map(|(f, b)| b.instructions.iter().map(move |i| (f, i)))
+        .find_map(|(f, i)| match &i.op {
+            Op::ExternCall(_, name, args) if name == "send" => Some((f, args.clone())),
+            _ => None,
+        })
+        .expect("expected an `Op::ExternCall` for `send`");
+
+    let arg_types: Vec<&IrType> = args
+        .iter()
+        .map(|&v| {
+            func.instruction_result_type(v)
+                .expect("every ExternCall arg ValueId must have a recorded type")
+        })
+        .collect();
+    assert_eq!(
+        arg_types,
+        vec![&IrType::StringRef, &IrType::I64],
+        "named args must fill slots in declared param order (label: String, \
+         count: Int), regardless of call-site order"
+    );
+}

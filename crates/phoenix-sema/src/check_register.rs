@@ -316,7 +316,16 @@ impl Checker {
             // so without this guard the entry would land in `extern_functions` yet be
             // unreachable — silently dropped with no diagnostic. Reject it here, matching
             // how ordinary decls that shadow a builtin are rejected.
-            if self.is_builtin_name(&item.name) {
+            //
+            // The builtin *functions* `print` / `toString` are reserved too, but live
+            // outside `is_builtin_name` (which covers builtin *types*): both `check_call`
+            // and IR `lower_call` dispatch them by bare name *before* consulting the
+            // extern table, so an `extern js { function print(...) }` would register yet
+            // never be reachable — the call would silently bind to the builtin. Reject
+            // the shadow here so the conflict is diagnosed instead of swallowed.
+            if self.is_builtin_name(&item.name)
+                || matches!(item.name.as_str(), "print" | "toString")
+            {
                 self.error(
                     format!("`{}` is already defined", item.name),
                     item.name_span,

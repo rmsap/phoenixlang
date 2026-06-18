@@ -221,6 +221,10 @@ impl fmt::Display for Op {
                 write!(f, "builtin_call @{name}")?;
                 write_value_list(f, args)
             }
+            Op::ExternCall(module, name, args) => {
+                write!(f, "extern_call {module}.{name}")?;
+                write_value_list(f, args)
+            }
             Op::UnresolvedTraitMethod(method, type_args, args) => {
                 write!(f, "unresolved_trait_method .{method}")?;
                 if !type_args.is_empty() {

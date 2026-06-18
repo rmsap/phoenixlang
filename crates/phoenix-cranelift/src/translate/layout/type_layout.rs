@@ -102,6 +102,20 @@ impl TypeLayout {
                 cl_types: CL_POINTER,
                 slots: 1,
             },
+            // `JsValue` is an opaque single-slot host handle — a
+            // plain scalar, NOT a Phoenix-heap pointer, so it is never GC-rooted
+            // (see `IrType::JsValue`). Logically it is an `i32`-width host handle
+            // (a JS-side table index), but it occupies one full machine slot
+            // (`CL_I64_SLICE`) like every other native value type — the i64 slot
+            // is the storage width, not a claim about the handle's logical size;
+            // do not narrow it to i32. The native extern-call binding (PR 9)
+            // produces/consumes these; the layout exists so a signature
+            // mentioning `JsValue` lays out, even though no native program can
+            // materialize one until that binding lands.
+            IrType::JsValue => Self {
+                cl_types: CL_I64_SLICE,
+                slots: 1,
+            },
             // TypeVar should be eliminated by monomorphization before any
             // layout query reaches the backend. Reaching here means a
             // generic template leaked past monomorphization.

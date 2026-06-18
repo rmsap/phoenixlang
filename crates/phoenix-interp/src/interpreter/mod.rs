@@ -186,6 +186,13 @@ const MAX_CALL_DEPTH: usize = 50;
 pub struct Interpreter {
     pub(crate) env: Environment,
     pub(crate) functions: HashMap<String, FunctionEntry>,
+    /// Names of `extern js` host functions declared in the program.
+    /// The tree-walk interpreter (`phoenix run`) has no host-function binding
+    /// yet — that lands in PR 4 — so a call to one is reported as a clean "not
+    /// supported yet" error rather than a misleading "undefined function".
+    /// Tracked by bare name; cross-module extern resolution is out of scope
+    /// until the binding lands.
+    pub(crate) extern_function_names: std::collections::HashSet<String>,
     pub(crate) structs: HashMap<String, StructDef>,
     pub(crate) enums: HashMap<String, EnumDef>, // enum name -> def
     pub(crate) variant_to_enum: HashMap<String, String>, // variant name -> enum name
@@ -257,6 +264,7 @@ impl Interpreter {
         Self {
             env: Environment::new(),
             functions: HashMap::new(),
+            extern_function_names: std::collections::HashSet::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             variant_to_enum: HashMap::new(),
@@ -465,12 +473,20 @@ impl Interpreter {
                 Declaration::Impl(imp) => {
                     self.register_methods(&imp.type_name, &imp.methods, None);
                 }
+                Declaration::ExternJs(block) => {
+                    // No Phoenix body to register, but record the names so a
+                    // call resolves to a clean "not supported yet" error
+                    // instead of "undefined function". The host-function
+                    // binding that actually invokes these lands in PR 4.
+                    for item in &block.items {
+                        self.extern_function_names.insert(item.name.clone());
+                    }
+                }
                 Declaration::Trait(_)
                 | Declaration::TypeAlias(_)
                 | Declaration::Endpoint(_)
                 | Declaration::Schema(_)
-                | Declaration::Import(_)
-                | Declaration::ExternJs(_) => {} // No Phoenix body to register; extern js calls bind to the interpreter's host-function table at call time (Phase 2.5 PR 2+)
+                | Declaration::Import(_) => {}
             }
         }
 
@@ -1557,6 +1573,26 @@ impl Interpreter {
             if let Some(val) = self.env.get(&ident.name) {
                 let args = self.eval_args(&call.args)?;
                 return self.call_closure(val, args);
+            }
+
+            // `extern js` host call. The tree-walk interpreter has
+            // no host-function binding yet (PR 4); report it cleanly rather than
+            // as a misleading "undefined function".
+            //
+            // Precedence note: this is checked *after* the named-function and
+            // closure-variable arms above, whereas sema's `check_call` resolves
+            // a bare callee as function -> extern -> variable. So a name bound
+            // to both an extern and a local closure would resolve to the extern
+            // in sema but the closure here. This is inert today (every extern
+            // call errors regardless), but the two orders must be reconciled
+            // when the PR 4 host binding makes extern calls actually execute.
+            if self.extern_function_names.contains(&ident.name) {
+                return error(format!(
+                    "`extern js` host call `{}` is not supported by the tree-walk \
+                     interpreter (`phoenix run`) yet — the interpreter host-function \
+                     binding lands in Phase 2.5 PR 4",
+                    ident.name
+                ));
             }
 
             return error(format!("undefined function `{}`", ident.name));

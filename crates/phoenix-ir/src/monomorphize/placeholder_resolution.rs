@@ -251,7 +251,8 @@ fn receiver_type_name(ty: &IrType) -> Option<String> {
         | IrType::ListBuilderRef(_)
         | IrType::MapBuilderRef(_, _)
         | IrType::ClosureRef { .. }
-        | IrType::DynRef(_) => None,
+        | IrType::DynRef(_)
+        | IrType::JsValue => None,
     }
 }
 

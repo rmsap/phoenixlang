@@ -44,7 +44,6 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
     };
 
     let (modules, check_result, _sm) = super::parse_resolve_check(path);
-    super::reject_extern_js_for_execution(&modules);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);

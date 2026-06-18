@@ -200,12 +200,18 @@ impl Interpreter {
                     phoenix_common::module_path::module_qualify(module_path, &imp.type_name);
                 self.register_methods(&qualified_type, &imp.methods, Some(module_path));
             }
+            Declaration::ExternJs(block) => {
+                // Record names so a call resolves to a clean "not supported
+                // yet" error; the host-function binding lands in PR 4.
+                for item in &block.items {
+                    self.extern_function_names.insert(item.name.clone());
+                }
+            }
             Declaration::Trait(_)
             | Declaration::TypeAlias(_)
             | Declaration::Endpoint(_)
             | Declaration::Schema(_)
-            | Declaration::Import(_)
-            | Declaration::ExternJs(_) => {}
+            | Declaration::Import(_) => {}
         }
     }
 }

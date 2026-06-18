@@ -112,6 +112,22 @@ pub enum IrType {
         return_type: Box<IrType>,
     },
 
+    /// An opaque JavaScript-host value handle.
+    ///
+    /// The IR mirror of `phoenix_sema::types::Type::JsValue`. It is **not** a
+    /// Phoenix-heap pointer: at runtime it is a single scalar handle the host
+    /// owns (an `i32` index into a JS-side table on `wasm32-linear`, an
+    /// `externref` on `wasm32-gc`, an opaque host handle in the interpreters /
+    /// native). Phoenix never dereferences it — it only holds one and passes it
+    /// back to an `extern js` function. Because it is not a Phoenix-managed
+    /// reference, [`is_value_type`](Self::is_value_type) classifies it as a
+    /// value type (register-resident, not shadow-stack-rooted). The only way to
+    /// obtain one is an [`crate::instruction::Op::ExternCall`] return value; the
+    /// per-backend binding of that op lands incrementally (the interpreters in
+    /// Phase 2.5 PR 4, native in PR 9, the WASM backends in PRs 5–8 / 12–15),
+    /// so until then each backend rejects `ExternCall` with a clean error.
+    JsValue,
+
     /// An unresolved generic type parameter by name (e.g., `T`, `U`).
     /// Present only in pre-monomorphization IR for generic function
     /// templates. The monomorphization pass substitutes each `TypeVar(name)`
@@ -138,7 +154,11 @@ impl IrType {
     /// the variant without triggering the panic.
     pub fn is_value_type(&self) -> bool {
         match self {
-            IrType::I64 | IrType::F64 | IrType::Bool | IrType::Void => true,
+            // `JsValue` is an opaque host handle (a single scalar — `i32`/
+            // `externref`/host pointer), NOT a Phoenix-heap pointer, so it is a
+            // value type for classification purposes: register-resident and not
+            // shadow-stack-rooted (Phase 2.5). See the `IrType::JsValue` doc.
+            IrType::I64 | IrType::F64 | IrType::Bool | IrType::Void | IrType::JsValue => true,
             IrType::StringRef
             | IrType::StructRef(_, _)
             | IrType::EnumRef(_, _)
@@ -263,6 +283,7 @@ impl IrType {
             | IrType::Void
             | IrType::StringRef
             | IrType::DynRef(_)
+            | IrType::JsValue
             | IrType::TypeVar(_) => false,
         }
     }
@@ -307,7 +328,8 @@ impl IrType {
             | IrType::Bool
             | IrType::Void
             | IrType::StringRef
-            | IrType::DynRef(_) => self.clone(),
+            | IrType::DynRef(_)
+            | IrType::JsValue => self.clone(),
         }
     }
 }
@@ -366,6 +388,7 @@ impl fmt::Display for IrType {
                 write!(f, ") -> {return_type}")
             }
             IrType::DynRef(name) => write!(f, "dyn.{name}"),
+            IrType::JsValue => write!(f, "jsvalue"),
             IrType::TypeVar(name) => write!(f, "{name}"),
         }
     }
@@ -400,6 +423,22 @@ mod tests {
             ),
             "enum.Result<string, i64>"
         );
+    }
+
+    #[test]
+    fn js_value_classifies_as_value_type() {
+        // `JsValue` is an opaque host handle, not a Phoenix-heap pointer, so it
+        // must classify as a value type (register-resident, never shadow-stack-
+        // rooted). The GC-rooting contract the backend layouts rely on hinges on
+        // this; pin it so a future reclassification can't silently start rooting
+        // host handles. See the `IrType::JsValue` doc + its `type_layout` arm.
+        assert!(IrType::JsValue.is_value_type());
+        assert!(!IrType::JsValue.is_ref_type());
+    }
+
+    #[test]
+    fn js_value_displays_as_jsvalue() {
+        assert_eq!(format!("{}", IrType::JsValue), "jsvalue");
     }
 
     #[test]

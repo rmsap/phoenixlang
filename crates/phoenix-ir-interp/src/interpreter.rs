@@ -503,6 +503,11 @@ impl<'m> IrInterpreter<'m> {
                     .collect::<Result<_>>()?;
                 builtins::dispatch(self, name, args)
             }
+            Op::ExternCall(module, name, _) => error(format!(
+                "`extern js` host call `{module}.{name}` is not supported by the IR \
+                 interpreter yet — the interpreter host-function binding lands in \
+                 Phase 2.5 PR 4"
+            )),
             Op::UnresolvedTraitMethod(method, _, _) => error(format!(
                 "internal error: unresolved trait-bound method call `.{method}` \
                  reached the IR interpreter — monomorphization was expected to \

@@ -465,6 +465,15 @@ fn translate_op(
             calls::translate_call(builder, ctx, ir_module, op, result_type, state)
         }
 
+        // `extern js` host call. The native binding — a C-ABI host
+        // shim (`phx_extern_<module>__<name>`) — lands in PR 9; until then the
+        // native backend rejects it cleanly rather than emitting a dangling
+        // call. See `Op::ExternCall`.
+        Op::ExternCall(module, name, _) => Err(CompileError::new(format!(
+            "`extern js` host call `{module}.{name}` is not supported by the native \
+             backend yet — the C-ABI host-shim binding lands in Phase 2.5 PR 9"
+        ))),
+
         Op::DynAlloc(..) | Op::UnresolvedDynAlloc(..) | Op::DynCall(..) => {
             dyn_trait::translate_dyn_op(builder, ctx, ir_module, op, state)
         }

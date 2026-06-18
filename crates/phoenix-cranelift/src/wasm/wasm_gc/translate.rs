@@ -193,6 +193,15 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(parent_idx),
             })])
         }
+        // `JsValue` is an `externref` on `wasm32-gc`, but the op that produces
+        // one (`Op::ExternCall`) has no wasm-gc binding yet (the JS-glue binding
+        // lands in Phase 2.5 PRs 12–15), so no program can materialize a
+        // `JsValue` to lay out here. Reject explicitly rather than via the
+        // generic arm so the gap names the feature and its landing PR.
+        IrType::JsValue => Err(CompileError::new(
+            "wasm32-gc: `JsValue` host handles are not supported yet — the \
+             `extern js` JS-glue binding lands in Phase 2.5 PRs 12–15",
+        )),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
              (Phase 2.4 PR 5 slices 1-3 + PR 6 slices cover Int / Bool / \

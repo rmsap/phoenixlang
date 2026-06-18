@@ -336,39 +336,6 @@ pub(crate) fn parse_resolve_check(
     (modules, analysis, source_map)
 }
 
-/// Reject `extern js` on the execution paths (`run` / `run-ir` / `ir` /
-/// `build`) until host-FFI call lowering lands (Phase 2.5 PR 3).
-///
-/// Sema deliberately accepts `extern js` as a valid executable-language
-/// construct (decision A0), but no backend can yet *lower* an extern call: the
-/// IR paths would ICE in `lower_ident` (the callee falls through every
-/// resolution branch to `unreachable!`), and the AST interpreter would
-/// mis-report it as an `undefined function` (the name resolves to an extern,
-/// not the function/closure tables it consults). Until PR 3 wires
-/// `Op::ExternCall` and the per-backend host-function tables, fail fast here
-/// with one clear, accurate diagnostic across every execution backend.
-///
-/// Phoenix Gen rejects `extern js` separately — in [`emit_target`], with a
-/// schema-specific message — because only the codegen entry knows it is
-/// generating a schema. This guard is execution-only, so it lives here rather
-/// than in the shared [`parse_resolve_check`] (which `gen` also routes
-/// through). PR 3 removes it.
-pub(crate) fn reject_extern_js_for_execution(modules: &[ResolvedSourceModule]) {
-    let has_extern_js = modules.iter().any(|m| {
-        m.program
-            .declarations
-            .iter()
-            .any(|d| matches!(d, phoenix_parser::ast::Declaration::ExternJs(_)))
-    });
-    if has_extern_js {
-        eprintln!(
-            "error: `extern js` is not yet supported by `phoenix run` / `build` \
-             (Phase 2.5 PR 3) — host-FFI call lowering is not implemented yet."
-        );
-        process::exit(1);
-    }
-}
-
 /// Type-checks a source file and reports diagnostics.
 pub fn cmd_check(path: &str) {
     parse_and_check(path);
@@ -378,7 +345,6 @@ pub fn cmd_check(path: &str) {
 /// Lower a Phoenix source file to IR and print the textual representation.
 pub fn cmd_ir(path: &str) {
     let (modules, check_result, _sm) = parse_resolve_check(path);
-    reject_extern_js_for_execution(&modules);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     // Run the IR verifier to catch structural errors.
@@ -402,7 +368,6 @@ pub fn cmd_run(path: &str) {
     // single-program path — entry module qualifies to bare, every
     // name resolves identically.
     let (modules, mut analysis, _sm) = parse_resolve_check(path);
-    reject_extern_js_for_execution(&modules);
     if let Err(err) = interpreter::run_modules(&modules, &mut analysis) {
         eprintln!("runtime error: {}", err);
         process::exit(1);
@@ -412,7 +377,6 @@ pub fn cmd_run(path: &str) {
 /// Run a Phoenix program via the IR interpreter.
 pub fn cmd_run_ir(path: &str) {
     let (modules, check_result, _sm) = parse_resolve_check(path);
-    reject_extern_js_for_execution(&modules);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);

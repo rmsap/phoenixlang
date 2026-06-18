@@ -218,6 +218,23 @@ pub enum Op {
     CallIndirect(ValueId, Vec<ValueId>),
     /// Call a built-in runtime function by name (e.g. `"print"`, `"String.length"`).
     BuiltinCall(String, Vec<ValueId>),
+    /// Call an `extern js` host function.
+    ///
+    /// Fields: `(module, name, args)` — the `(module, name)` host-call linkage
+    /// (`("js", "alert")` today) carried over from sema's
+    /// `FunctionInfo::extern_js`, plus the marshalled argument values. The
+    /// instruction's `result_type` is the extern's return type
+    /// (possibly [`crate::types::IrType::JsValue`] or `Void`).
+    ///
+    /// This is a **generic host-call** node, deliberately backend-neutral: it
+    /// names a call into the host environment, and each backend's *binding*
+    /// decides how it executes — the JS glue on `wasm32-linear` / `wasm32-gc`,
+    /// a registered Rust closure in the interpreters, a C-ABI host shim on
+    /// native. Until a backend binds it (the interpreters in PR 4, native in
+    /// PR 9, the WASM backends in PRs 5–8 / 12–15), that backend returns a
+    /// clean "not supported yet" error rather than executing it. See
+    /// `docs/design-decisions.md` §Phase 2.5 (decisions A0, E).
+    ExternCall(String, String, Vec<ValueId>),
     /// Placeholder for a trait-bounded method call whose receiver is a
     /// type variable at lowering time.
     ///
@@ -372,6 +389,7 @@ impl Op {
                 ops
             }
             Op::BuiltinCall(_, args) => args.clone(),
+            Op::ExternCall(_, _, args) => args.clone(),
             Op::UnresolvedTraitMethod(_, _, args) => args.clone(),
 
             // Trait object ops.

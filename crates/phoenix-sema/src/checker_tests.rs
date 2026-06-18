@@ -4626,6 +4626,23 @@ fn extern_js_shadowing_builtin_rejected() {
 }
 
 #[test]
+fn extern_js_shadowing_builtin_function_rejected() {
+    // The builtin *functions* `print` / `toString` are reserved like builtin
+    // types, but live outside `is_builtin_name`. Both `check_call` and IR
+    // `lower_call` dispatch them by bare name before consulting the extern
+    // table, so an extern named after one would register yet never be reachable
+    // — the call would silently bind to the builtin. Both must be rejected.
+    assert_has_error(
+        "extern js { function print(message: String) }",
+        "`print` is already defined",
+    );
+    assert_has_error(
+        "extern js { function toString(value: Int) -> String }",
+        "`toString` is already defined",
+    );
+}
+
+#[test]
 fn extern_js_non_marshallable_param_still_registered() {
     // The marshallability check emits an error but does NOT bail on the
     // signature — the extern is still registered so downstream call-checking can

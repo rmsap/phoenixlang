@@ -165,6 +165,15 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
         // identical, so the codegen treats them uniformly.
         IrType::StringRef | IrType::DynRef(_) => Ok(vec![ValType::I32, ValType::I32]),
         ty if is_gc_pointer_type(ty) => Ok(vec![ValType::I32]),
+        // `JsValue` is an `i32` JS-side table index on `wasm32-linear`, but the
+        // op that produces one (`Op::ExternCall`) has no wasm binding yet (the
+        // JS glue lands in Phase 2.5 PRs 5–8), so no program can materialize a
+        // `JsValue` to lay out here. Reject explicitly rather than via the
+        // generic wildcard so the gap names the feature and its landing PR.
+        IrType::JsValue => Err(CompileError::new(
+            "wasm32-linear: `JsValue` host handles are not supported yet — the \
+             `extern js` JS-glue binding lands in Phase 2.5 PRs 5–8",
+        )),
         _ => Err(unsupported(ty, "wasm32-linear value representation")),
     }
 }
