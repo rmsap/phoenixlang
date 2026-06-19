@@ -278,6 +278,8 @@ async function findUser(id: Int) -> Result<{ name: String, email: String }, DbEr
 - **SQL injection impossible**: `$variable` parameters are always sent as prepared statement bindings, never interpolated
 - **End-to-end type safety**: a request flows through the entire stack — `client -> endpoint -> handler -> query -> row -> response -> client` — with compile-time type checking at every boundary
 
+**Phoenix has no ORM, and that's deliberate.** You write real SQL (or use transparent CRUD and relationship-loading helpers built on it) and the compiler proves it — nothing lazy-loads, change-tracks, or hides the queries that run. The absence of an opaque mapping layer is the point: the database boundary is one the compiler checks and you can see, not one an abstraction conceals.
+
 ## Full-Stack HTTP Server
 
 ```phoenix

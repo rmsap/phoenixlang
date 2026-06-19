@@ -784,6 +784,39 @@ async function findUser(id: Int) -> Result<{ String name, String email }, DbErro
 - **Complexity:** Very high — requires a SQL parser (subset), a type inference pass from SELECT clauses to Phoenix types, schema validation, prepared statement compilation, and backend-specific SQL generation.
 - **Depends on:** Compilation (2.2), Async runtime (4.3), Built-in serialization (5.1), Annotations (4.5)
 
+### No ORM — a transparent data layer
+
+Phoenix deliberately ships **no ORM**. An ORM's defining behavior — lazy-loaded associations, identity maps, change tracking, opaque generated SQL — hides the database boundary, which is exactly the boundary Phoenix promises the compiler checks and the developer can see. The committed typed-SQL above stays the default surface. See [design-decisions.md → "No first-class ORM"](../design-decisions.md#no-first-class-orm-a-transparent-typed-data-layer-instead-phase-47) for the full rationale.
+
+To close the ergonomic gap that raw SQL leaves (trivial CRUD, relationship traversal, dynamic queries), a thin data layer is built *on top of* the typed-SQL core. Its one governing rule: **no operation may hide its database round trips.** Three pieces, each compiling to obvious, inspectable SQL — reusing the `User` / `Post` / `schema db` declaration above:
+
+**Schema-derived typed CRUD** — each call is exactly one statement:
+
+```phoenix
+let u: User = await db.users.insert(User(0, "Ada", "ada@example.com", 36))?  // INSERT ... RETURNING *
+let found: Option<User> = await db.users.find(u.id)?                          // SELECT * ... WHERE id = $1
+await db.users.update(u.id, { age: 37 })?                                     // UPDATE ... WHERE id = $1
+await db.users.delete(u.id)?                                                  // DELETE ... WHERE id = $1
+```
+
+**Explicit relationship loading — never lazy.** Foreign keys declared in the schema (`posts.authorId references users(id)`) make relationships *available* to load, but loading is always an explicit call that performs one visible round trip. There is no `post.author` accessor that silently issues a query, so N+1 is structurally impossible:
+
+```phoenix
+let posts: List<Post> = await db.posts.all()?
+let authors: Map<Int, User> = await db.load(posts, .author)?  // ONE round trip: SELECT * FROM users WHERE id IN (...)
+```
+
+**Optional typed query builder** for *dynamic* queries — the one case where building SQL as data beats a string literal (conditional `WHERE`, composed filters). It shares the §4.7 type-inference engine, so results are typed identically, and the SQL it produces is inspectable:
+
+```phoenix
+let mut q = db.from(users).select(.name, .age)
+if let Some(min) = minAge { q = q.where(.age >= min) }
+let rows = await q.run()?   // builder is sugar over the same checked SQL; raw db.query stays the default
+```
+
+- **Complexity:** Medium for CRUD + relationship loading (mechanical, schema-driven); High for the builder (dynamic SQL construction sharing the type-inference pass).
+- **Depends on:** Typed queries / schemas (4.7).
+
 ### Auto-generated migrations
 
 Because `schema` blocks are declarative and version-controlled, the compiler can diff the current schema against a migration history and generate DDL automatically. This eliminates hand-written migration files for the common case.

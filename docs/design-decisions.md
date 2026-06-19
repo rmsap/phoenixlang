@@ -141,6 +141,21 @@ The runtime exposes `phx_print_i64`, `phx_print_f64`, `phx_print_bool`, `phx_pri
 
 ## Decided
 
+### No first-class ORM; a transparent typed data layer instead (Phase 4.7)
+
+**Decided 2026-06-19.** Phoenix ships **no ORM**. The compile-time typed SQL committed in [`phase-4.md` §4.7](phases/phase-4.md#47-database-access-compile-time-typed-queries) — raw `db.query(SELECT ...)` validated against an explicit `schema` block, with row types inferred from the SELECT clause — stays the foundation. On top of it Phoenix layers a thin, *transparent* data layer for ergonomics: schema-derived typed CRUD (`db.users.insert/find/update/delete`), **explicit, never-lazy** relationship loading (`db.load(posts, .author)` — one visible round trip per call), and an optional typed query builder (Kysely/jOOQ-style, inspectable SQL) for dynamic queries only. The default surface remains string SQL.
+
+**The governing rule:** no data-layer operation may hide its database round trips — no lazy-loaded associations, no implicit identity map, no change-tracking writes, no opaque generated SQL. Every relationship traversal and every write is explicit and predictable. That rule is the line between this data layer and an ORM, and the absence of an ORM is a deliberate position, not a gap to fill later.
+
+**Rationale.**
+
+1. **An ORM contradicts the wedge.** Phoenix's promise is that the compiler checks every boundary and you can see what runs ("from database to DOM, no drift"). An ORM's defining behavior — lazy loading, identity maps, change tracking, opaque SQL — is precisely the *hiding* of the database boundary (N+1 surprises, surprise writes). Adopting it would undercut the one thing the language is selling.
+2. **It would be undifferentiated.** A dozen mature ORMs already exist; "another good ORM" is not a reason to choose Phoenix. SQL whose row types provably cannot drift from the schema and flow unbroken into the endpoint and the DOM is a claim no one else makes — that is the differentiator worth building.
+3. **The ecosystem already moved this way.** The sophisticated end of the field (sqlc, Drizzle's SQL-like API, Kysely, jOOQ, sqlx) has been migrating *away* from heavy ORMs toward typed-SQL and thin builders. The committed §4.7 design is aligned with where good teams are going.
+4. **Scope.** Item 51 (typed queries) is already "Very High" effort. A real ORM (entity lifecycle, unit-of-work, relationship DSL, cascade orchestration) would balloon scope and steal oxygen from the Phase 5 differentiators (reactivity, typed endpoints, frontend) that are the actual moat.
+
+This *reinforces* the §4.7 decision rather than overturning it. The CRUD / relationship-loading / query-builder pieces are scoped as roadmap items 51a–51c. Concrete grammar and parsing for them is detailed design work for when Phase 4.7 is built.
+
 ### Field declarations use `name: Type` colon syntax
 
 **Decided 2026-06-10.** Every named, typed field in the language declares as `name: Type`: struct fields (`x: Int`, with `public`, `where` constraints, and doc comments unchanged), endpoint `query` parameters (`page: Int = 1`), and endpoint `headers` entries (`rateLimit: String as "X-RateLimit-Limit" = default`). The previous type-first form (`Int x`) was the lone holdout against the rest of the language — function parameters, return annotations, `let` bindings, and map literals all already used colon syntax — and it actively trapped users: writing the natural `x: Int` in a struct didn't error, it **hung the parser** (see the Phase 2.4 "Bugs closed" entry). The old form is a hard parse error with a targeted migration diagnostic ("write `x: Int`, not `Int x`"); no dual-syntax transition period (pre-1.0, single-user — dual grammar would be pure debt against the consistency goal). The phase-4 `schema`/`table` DSL sketch was updated to match so the future column grammar starts consistent. Out of scope: enum variants stay positional (`Circle(Float)` — they mirror constructor calls, not field declarations).

@@ -13,7 +13,7 @@ This document outlines the path from the current implementation to a production-
 | [1](phases/phase-1.md) | Core Language | ✅ Complete | Variables, functions, control flow, structs, enums, generics, traits, closures, collections, error handling, and all ergonomic features |
 | [2](phases/phase-2.md) | Compilation | In Progress | IR (complete), Cranelift native compilation (complete), modules and visibility (complete), runtime + GC + `defer` (complete), benchmark suite + `ListBuilder` / `MapBuilder` (complete), WebAssembly target (active), JS interop |
 | [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, error message quality |
-| [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access, logging, test framework |
+| [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access (typed SQL + a transparent data layer, no ORM), logging, test framework |
 | [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability, frontend framework |
 | [6](phases/phase-6.md) | Ecosystem & Adoption | Planned | Documentation site, package registry, starter templates, community, 1.0 release |
 
@@ -48,7 +48,7 @@ CI pipeline, type registries exposed, and expression types annotated.
 
 **M4 — "Web-capable"** (Phases 4.1–4.9)
 
-> Tuples, Date/Time, Regex, iterators, type-safe config, async with background jobs, HTTP/WebSocket/SSE, struct update syntax, annotations, JSON, compile-time typed database queries (with schema-references-struct and auto-generated migrations), error context chaining, and the built-in test framework.
+> Tuples, Date/Time, Regex, iterators, type-safe config, async with background jobs, HTTP/WebSocket/SSE, struct update syntax, annotations, JSON, compile-time typed database queries (schema-references-struct, auto-generated migrations, and a transparent data layer — typed CRUD and explicit relationship loading, no ORM), error context chaining, and the built-in test framework.
 
 **M5 — "Differentiated"** (Phase 5)
 
@@ -89,6 +89,9 @@ CI pipeline, type registries exposed, and expression types annotated.
 | 49 | Annotation system | — | Small-Medium | |
 | 50 | JSON serialization | Annotations, compilation | Medium | |
 | 51 | Typed database queries (with schema-from-struct) | Async, compilation, serialization, annotations | Very High | |
+| 51a | Derived typed CRUD helpers (`db.<table>.insert/find/update/delete`) | 51 | Medium | |
+| 51b | Explicit relationship loading (`db.load`, never lazy) | 51 | Medium | |
+| 51c | Optional typed query builder (dynamic queries) | 51 | High | |
 | 52 | Auto-generated migrations | Schema declarations, compilation | High | |
 | 53 | Built-in serialization | Generics, traits, compilation, annotations | High | |
 | 54 | Refinement types | Type system | Very High | |
