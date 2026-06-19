@@ -298,11 +298,24 @@ impl Checker {
                 let ty = self.resolve_type_expr(&qp.type_annotation);
                 let default_value = qp.default_value.as_ref().and_then(extract_default_value);
 
+                // List-valued query param (`List<T>`, repeated on the wire):
+                // validate the element + reject `Option<List>`/default. When it IS
+                // a list, the scalar gatekeeper and default checks below are skipped.
+                let is_list = self.check_list_param(
+                    &ep.name,
+                    "query param",
+                    &qp.name,
+                    qp.span,
+                    &ty,
+                    qp.default_value.is_some(),
+                );
+
                 // `Money` is a composite (`{ amount, currency }`) with no scalar
                 // URL encoding, so it cannot ride in the query string — reject it
                 // here rather than emit a dangling type reference (the per-target
                 // `Money` definition is gated on body/field/response use only).
-                if ty.mentions_money() {
+                // (A `List<Money>` is reported by `check_list_param` instead.)
+                if !is_list && ty.mentions_money() {
                     self.error(
                         format!(
                             "endpoint `{}`: query param `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not URL-encodable) — carry it in the request body, or pass the amount and currency as separate scalar params",
@@ -315,17 +328,19 @@ impl Checker {
                 // Enum query params: restrict to simple enums and validate an
                 // enum-variant default (`= Normal`). Returns true when it handled
                 // an enum default, so the literal match below is skipped.
-                let enum_default_handled = self.check_enum_param_default(
-                    &ep.name,
-                    "query param",
-                    &qp.name,
-                    qp.span,
-                    &ty,
-                    default_value.as_ref(),
-                );
+                let enum_default_handled = !is_list
+                    && self.check_enum_param_default(
+                        &ep.name,
+                        "query param",
+                        &qp.name,
+                        qp.span,
+                        &ty,
+                        default_value.as_ref(),
+                    );
 
                 // Validate default value type matches declared type (literals).
                 if let Some(ref default) = default_value
+                    && !is_list
                     && !enum_default_handled
                 {
                     let default_matches = matches!(
@@ -898,6 +913,117 @@ impl Checker {
         false
     }
 
+    /// Validates a list-valued query/request-header param (`List<T>`, repeated on
+    /// the wire). Returns `true` when `ty` IS a list — so the caller skips the
+    /// scalar gatekeeper ([`Self::check_enum_param_default`]) and the literal
+    /// default check. The element `T` must be a permitted scalar
+    /// (`Int`/`Float`/`Bool`/`String`/`DateTime`/`Uuid`/`Decimal`) or a simple
+    /// unit-variant enum — never a `Money`/struct/tagged-enum (object, not a wire
+    /// scalar) nor a nested `List`/`Map`/`Option` element. `Option<List<…>>` is
+    /// rejected (an absent list is the empty list), as is a default on a list.
+    fn check_list_param(
+        &mut self,
+        ep_name: &str,
+        kind: &str,
+        name: &str,
+        span: phoenix_common::span::Span,
+        ty: &Type,
+        has_default: bool,
+    ) -> bool {
+        // `Option<List<…>>`: a list param already models absence as the empty list.
+        if let Type::Generic(opt, args) = ty
+            && opt == "Option"
+            && args.len() == 1
+            && matches!(&args[0], Type::Generic(l, _) if l == "List")
+        {
+            self.error(
+                format!(
+                    "endpoint `{ep_name}`: {kind} `{name}` cannot be an `Option<List<…>>` — a list param is absent-as-empty, so wrap it as a plain `List<…>`"
+                ),
+                span,
+            );
+            return true;
+        }
+
+        let Type::Generic(list, args) = ty else {
+            return false;
+        };
+        if list != "List" || args.len() != 1 {
+            return false;
+        }
+        let elem = &args[0];
+
+        if has_default {
+            self.error(
+                format!(
+                    "endpoint `{ep_name}`: {kind} `{name}` is a list and cannot have a default (an absent list is the empty list)"
+                ),
+                span,
+            );
+        }
+
+        // Capture the element enum's simplicity before any `&mut self` call.
+        let elem_enum_simple = match elem {
+            Type::Named(n) => self
+                .lookup_enum(n)
+                .map(|info| info.variants.iter().all(|(_, f)| f.is_empty())),
+            _ => None,
+        };
+        let elem_is_struct = elem_enum_simple.is_none()
+            && matches!(elem, Type::Named(n) if self.lookup_struct(n).is_some());
+
+        match elem {
+            Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::DateTime
+            | Type::Uuid
+            | Type::Decimal => {}
+            Type::Money => self.error(
+                format!(
+                    "endpoint `{ep_name}`: {kind} `{name}` cannot be a `List<Money>` — `Money` is a composite, not a URL/header-encodable scalar"
+                ),
+                span,
+            ),
+            Type::Named(n) => {
+                if let Some(is_simple) = elem_enum_simple {
+                    if !is_simple {
+                        self.error(
+                            format!(
+                                "endpoint `{ep_name}`: {kind} `{name}` list element enum `{n}` must be a simple unit-variant enum (a payload-carrying enum serializes to an object)"
+                            ),
+                            span,
+                        );
+                    }
+                } else if elem_is_struct {
+                    self.error(
+                        format!(
+                            "endpoint `{ep_name}`: {kind} `{name}` cannot be a `List<{n}>` — a struct serializes to an object, not a URL/header-encodable scalar"
+                        ),
+                        span,
+                    );
+                } else if !elem.is_error() {
+                    self.error(
+                        format!(
+                            "endpoint `{ep_name}`: {kind} `{name}` list element `{n}` is not a scalar or simple enum"
+                        ),
+                        span,
+                    );
+                }
+            }
+            // A nested `List`/`Map`/`Option` element has no flat repeated-key
+            // encoding.
+            _ => self.error(
+                format!(
+                    "endpoint `{ep_name}`: {kind} `{name}` list element `{elem}` must be a scalar or simple enum (nested collections are not URL/header-encodable)"
+                ),
+                span,
+            ),
+        }
+        true
+    }
+
     fn resolve_header(
         &mut self,
         ep: &EndpointDecl,
@@ -905,21 +1031,6 @@ impl Checker {
         is_response: bool,
     ) -> HeaderParamInfo {
         let ty = self.resolve_type_expr(&h.type_annotation);
-
-        // `Money` is a composite (`{ amount, currency }`) with no scalar header
-        // encoding, so it cannot ride in an HTTP header — reject it here (request
-        // or response) rather than emit a dangling type reference (the per-target
-        // `Money` definition is gated on body/field/response use only).
-        if ty.mentions_money() {
-            let direction = if is_response { "response " } else { "" };
-            self.error(
-                format!(
-                    "endpoint `{}`: {direction}header `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not header-encodable) — carry it in the body, or use separate scalar headers for the amount and currency",
-                    ep.name, h.name
-                ),
-                h.span,
-            );
-        }
 
         let wire_name = h
             .wire_name
@@ -936,9 +1047,43 @@ impl Checker {
                     h.span,
                 );
             }
-            // Enforce the simple-enum restriction on response headers too (they
-            // are still header-encoded); response headers carry no default.
-            self.check_enum_param_default(&ep.name, "response header", &h.name, h.span, &ty, None);
+            // A list RESPONSE header is out of scope (the server-write/client-read
+            // paths don't handle repeated response headers); reject it. Unwrap a
+            // single `Option<…>` first so `Option<List<…>>` is caught too (it would
+            // otherwise slip past a bare-`List` match into the scalar path below).
+            let unwrapped = match &ty {
+                Type::Generic(n, args) if n == "Option" && args.len() == 1 => &args[0],
+                other => other,
+            };
+            if matches!(unwrapped, Type::Generic(n, _) if n == "List") {
+                self.error(
+                    format!(
+                        "endpoint `{}`: response header `{}` cannot be a `List<…>` (list response headers are not supported)",
+                        ep.name, h.name
+                    ),
+                    h.span,
+                );
+            } else {
+                if ty.mentions_money() {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: response header `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not header-encodable) — carry it in the body, or use separate scalar headers for the amount and currency",
+                            ep.name, h.name
+                        ),
+                        h.span,
+                    );
+                }
+                // Enforce the simple-enum restriction on response headers too (they
+                // are still header-encoded); response headers carry no default.
+                self.check_enum_param_default(
+                    &ep.name,
+                    "response header",
+                    &h.name,
+                    h.span,
+                    &ty,
+                    None,
+                );
+            }
             return HeaderParamInfo {
                 name: h.name.clone(),
                 wire_name,
@@ -948,20 +1093,45 @@ impl Checker {
             };
         }
 
-        let default_value = h.default_value.as_ref().and_then(extract_default_value);
-
-        // Enum request headers: restrict to simple enums and validate an
-        // enum-variant default; returns true when an enum default was handled.
-        let enum_default_handled = self.check_enum_param_default(
+        // List-valued request header (`List<T>`, repeated header lines): validate
+        // the element; when it IS a list the scalar/enum/default checks are skipped.
+        let is_list = self.check_list_param(
             &ep.name,
             "header",
             &h.name,
             h.span,
             &ty,
-            default_value.as_ref(),
+            h.default_value.is_some(),
         );
 
+        // `Money` is a composite with no scalar header encoding (a `List<Money>` is
+        // reported by `check_list_param` instead).
+        if !is_list && ty.mentions_money() {
+            self.error(
+                format!(
+                    "endpoint `{}`: header `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not header-encodable) — carry it in the body, or use separate scalar headers for the amount and currency",
+                    ep.name, h.name
+                ),
+                h.span,
+            );
+        }
+
+        let default_value = h.default_value.as_ref().and_then(extract_default_value);
+
+        // Enum request headers: restrict to simple enums and validate an
+        // enum-variant default; returns true when an enum default was handled.
+        let enum_default_handled = !is_list
+            && self.check_enum_param_default(
+                &ep.name,
+                "header",
+                &h.name,
+                h.span,
+                &ty,
+                default_value.as_ref(),
+            );
+
         if let Some(ref default) = default_value
+            && !is_list
             && !enum_default_handled
         {
             let default_matches = matches!(
@@ -3083,7 +3253,7 @@ mod tests {
                 response String
             }
             "#,
-            "cannot be a `Money`",
+            "cannot be a `List<Money>`",
         );
     }
 
@@ -3106,6 +3276,147 @@ mod tests {
             }
             "#,
             "response header `balance` cannot be a `Money`",
+        );
+    }
+
+    // ACCEPT: list-valued query/request-header params over every permitted element
+    // kind — scalars (`Int`/`String`/`DateTime`/`Uuid`/`Decimal`) and a simple
+    // unit-variant enum, in both positions.
+    #[test]
+    fn list_param_accept_scalar_and_simple_enum() {
+        assert_no_errors(
+            r#"
+            enum Role { Admin Editor Viewer }
+            endpoint search: GET "/search" {
+                headers {
+                    roles: List<String> as "X-Role"
+                    tags: List<Role> as "X-Tag"
+                }
+                query {
+                    ids: List<Uuid>
+                    names: List<String>
+                    counts: List<Int>
+                    since: List<DateTime>
+                    prices: List<Decimal>
+                    perms: List<Role>
+                }
+                response String
+            }
+            "#,
+        );
+    }
+
+    // REJECT: `Option<List<…>>` — a list param is already absent-as-empty (both
+    // positions).
+    #[test]
+    fn list_param_reject_option_list() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { ids: Option<List<String>> }
+                response String
+            }
+            "#,
+            "cannot be an `Option<List",
+        );
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                headers { roles: Option<List<String>> as "X-Role" }
+                response String
+            }
+            "#,
+            "cannot be an `Option<List",
+        );
+    }
+
+    // REJECT: a default on a list param (an absent list is the empty list).
+    #[test]
+    fn list_param_reject_default() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { counts: List<Int> = 0 }
+                response String
+            }
+            "#,
+            "is a list and cannot have a default",
+        );
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                headers { roles: List<String> as "X-Role" = "x" }
+                response String
+            }
+            "#,
+            "is a list and cannot have a default",
+        );
+    }
+
+    // REJECT: `List<struct>` — a struct serializes to an object, not a wire scalar.
+    #[test]
+    fn list_param_reject_struct_element() {
+        assert_has_error(
+            r#"
+            struct Item { id: Uuid  name: String }
+            endpoint search: GET "/search" {
+                query { items: List<Item> }
+                response String
+            }
+            "#,
+            "a struct serializes to an object",
+        );
+    }
+
+    // REJECT: `List<tagged-enum>` — a payload-carrying enum serializes to an object.
+    #[test]
+    fn list_param_reject_tagged_enum_element() {
+        assert_has_error(
+            r#"
+            enum Shape { Circle(Float)  Square }
+            endpoint search: GET "/search" {
+                query { shapes: List<Shape> }
+                response String
+            }
+            "#,
+            "must be a simple unit-variant enum",
+        );
+    }
+
+    // REJECT: a nested collection element (`List<List<…>>`) has no flat encoding.
+    #[test]
+    fn list_param_reject_nested_collection_element() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { grid: List<List<Int>> }
+                response String
+            }
+            "#,
+            "nested collections are not URL/header-encodable",
+        );
+    }
+
+    // REJECT: a `List<…>` response header (list response headers are out of scope),
+    // including when wrapped in an `Option<…>` — the bare-`List` match must not let
+    // `Option<List<…>>` slip into the scalar path.
+    #[test]
+    fn list_param_reject_response_header() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                response String headers { roles: List<String> as "X-Role" }
+            }
+            "#,
+            "list response headers are not supported",
+        );
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                response String headers { roles: Option<List<String>> as "X-Role" }
+            }
+            "#,
+            "list response headers are not supported",
         );
     }
 

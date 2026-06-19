@@ -427,6 +427,9 @@ impl<'a> TsGenerator<'a> {
     /// bodies/params server-side). No native JS type exists to revive into, so the
     /// brand + runtime check is how a decoded value differs from a bare string.
     fn emit_branded_helper(&mut self, target: &Type) {
+        // `parse*` throws `ValidationError` on a malformed value, so the class must
+        // be defined wherever a branded scalar is used. Idempotent.
+        self.ensure_validation_error();
         let (alias, parse) = branded_scalar(target).expect("branded scalar");
         let (brand_field, re_const, re_literal, noun, err) = match target {
             Type::Uuid => (
@@ -462,10 +465,12 @@ impl<'a> TsGenerator<'a> {
         }
         self.types_out.push_str(&format!(
             "/** Validates the format and brands the value as `{alias}`, throwing\n \
-             * otherwise. Run by the generated decode path on each wire `{alias}`. */\n\
+             * `ValidationError` otherwise. Run by the generated decode path on each\n \
+             * wire `{alias}` (so a malformed query/header param maps to 400, like an\n \
+             * enum). */\n\
              export function {parse}(value: string): {alias} {{\n  \
              if (!{re_const}.test(value)) {{\n    \
-             throw new Error(`{err}: ${{value}}`);\n  }}\n  \
+             throw new ValidationError(`{err}: ${{value}}`);\n  }}\n  \
              return value as {alias};\n}}\n\n"
         ));
     }
@@ -1130,6 +1135,20 @@ impl<'a> TsGenerator<'a> {
             // each param's own optionality to decide whether to guard with
             // `!== undefined` — it never emits an eslint-flagged redundant chain.
             for qp in &ep.query_params {
+                // A list-valued query param (`List<T>`) is repeated on the wire:
+                // append one value per element. The bag is non-nullable and a list
+                // is required (no `Option<List>`), so no guard is needed.
+                if let Type::Generic(lname, largs) = &qp.ty
+                    && lname == "List"
+                    && largs.len() == 1
+                {
+                    let enc = ts_scalar_encode(&largs[0], "x");
+                    self.client_out.push_str(&format!(
+                        "    for (const x of opts.{}) {{\n      params.append(\"{}\", {enc});\n    }}\n",
+                        qp.name, qp.name
+                    ));
+                    continue;
+                }
                 emit_param_set(
                     &mut self.client_out,
                     "    ",
@@ -1179,6 +1198,28 @@ impl<'a> TsGenerator<'a> {
                     .push_str("    requestHeaders.set(\"Content-Type\", \"application/json\");\n");
             }
             for h in &ep.headers {
+                // A list-valued request header (`List<T>`) is sent comma-joined in
+                // a SINGLE header value (not repeated `append` — `Headers` collapses
+                // duplicates with `", "`, which the server's `","` split would
+                // mishandle). The server splits on `,`.
+                if let Type::Generic(lname, largs) = &h.ty
+                    && lname == "List"
+                    && largs.len() == 1
+                {
+                    let enc = ts_scalar_encode(&largs[0], "x");
+                    let value = format!("headers.{}.map((x) => {enc}).join(\",\")", h.name);
+                    let one_line = format!("    requestHeaders.set(\"{}\", {value});", h.wire_name);
+                    if one_line.len() <= PRINT_WIDTH {
+                        self.client_out.push_str(&one_line);
+                        self.client_out.push('\n');
+                    } else {
+                        self.client_out.push_str(&format!(
+                            "    requestHeaders.set(\n      \"{}\",\n      {value},\n    );\n",
+                            h.wire_name
+                        ));
+                    }
+                    continue;
+                }
                 emit_header_set(
                     &mut self.client_out,
                     "    ",
@@ -1558,10 +1599,19 @@ impl<'a> TsGenerator<'a> {
                 value_imports.push(format!("validate{type_name}"));
             }
         }
+        // A `Uuid`/`Decimal` query/request-header param (scalar or `List` element)
+        // is validated server-side via its `parse*`, which throws `ValidationError`.
+        let has_branded_param = ts_branded_scalars().iter().any(|(target, _, _)| {
+            self.check_result.endpoints.iter().any(|ep| {
+                ep.query_params.iter().any(|q| type_mentions(&q.ty, target))
+                    || ep.headers.iter().any(|h| type_mentions(&h.ty, target))
+            })
+        });
         // `ValidationError` is referenced by the 400 guard whenever the server
-        // validates inbound data: a constrained body, or an enum query/header
-        // param whose `parse<Enum>` throws it.
-        if !value_imports.is_empty() || !self.param_enums.is_empty() {
+        // validates inbound data: a constrained body, an enum query/header param
+        // whose `parse<Enum>` throws it, or a `Uuid`/`Decimal` query/header param
+        // whose `parse*` throws it.
+        if !value_imports.is_empty() || !self.param_enums.is_empty() || has_branded_param {
             value_imports.insert(0, "ValidationError".to_string());
         }
         for ep in &self.check_result.endpoints {
@@ -1655,6 +1705,50 @@ impl<'a> TsGenerator<'a> {
                  interface MultipartRequest {\n\
                  \x20 body: Record<string, string>;\n\
                  \x20 files: Record<string, Blob>;\n\
+                 }\n\n",
+            );
+        }
+
+        // Helpers for list-valued params (emitted once, only when used).
+        let has_list_query = self.check_result.endpoints.iter().any(|ep| {
+            ep.query_params
+                .iter()
+                .any(|q| matches!(&q.ty, Type::Generic(n, _) if n == "List"))
+        });
+        let has_list_header = self.check_result.endpoints.iter().any(|ep| {
+            ep.headers
+                .iter()
+                .any(|h| matches!(&h.ty, Type::Generic(n, _) if n == "List"))
+        });
+        if has_list_query {
+            // A repeated query key arrives as `string[]`; a single occurrence as a
+            // bare `string`; absent as `undefined`. Normalize all three to a
+            // `string[]` the per-element coercion maps over.
+            self.server_out.push_str(
+                "function toStringArray(v: unknown): string[] {\n\
+                 \x20 if (typeof v === \"string\") {\n\
+                 \x20   return [v];\n\
+                 \x20 }\n\
+                 \x20 if (Array.isArray(v)) {\n\
+                 \x20   return v.filter((x): x is string => typeof x === \"string\");\n\
+                 \x20 }\n\
+                 \x20 return [];\n\
+                 }\n\n",
+            );
+        }
+        if has_list_header {
+            // A list request header is comma-separated; trim each element and drop
+            // an empty header (→ empty list).
+            self.server_out.push_str(
+                "function splitHeaderList(v: string | undefined): string[] {\n\
+                 \x20 if (v === undefined) {\n\
+                 \x20   return [];\n\
+                 \x20 }\n\
+                 \x20 const trimmed = v.trim();\n\
+                 \x20 if (trimmed === \"\") {\n\
+                 \x20   return [];\n\
+                 \x20 }\n\
+                 \x20 return trimmed.split(\",\").map((s) => s.trim());\n\
                  }\n\n",
             );
         }
@@ -1945,6 +2039,25 @@ fn multipart_field_extraction(name: &str, ty: &Type, optional: bool) -> String {
     }
 }
 
+/// Coerces a single wire string `var` (already typed `string`) into the element
+/// type `elem`, for a list query/header param's per-element `.map`. No `Option`
+/// handling and no casts — the array helpers (`toStringArray`/`splitHeaderList`)
+/// hand each element over as a `string`.
+fn ts_elem_coerce(elem: &Type, var: &str, param_enums: &BTreeSet<String>) -> String {
+    match elem {
+        Type::Int | Type::Float => format!("Number({var})"),
+        Type::Bool => format!("{var} === \"true\""),
+        Type::DateTime => format!("new Date({var})"),
+        Type::Uuid | Type::Decimal => {
+            let parse = branded_scalar(elem).expect("branded scalar").1;
+            format!("{parse}({var})")
+        }
+        Type::Named(n) if param_enums.contains(n) => format!("parse{n}({var})"),
+        // `String` (and any unmodeled scalar) is already a `string`.
+        _ => var.to_string(),
+    }
+}
+
 /// Generates a TypeScript expression that extracts and coerces a query parameter
 /// from `{base}.{name}`, applying the default value if the parameter is absent.
 /// Each framework supplies its own `base`: Express reads `req.query` directly,
@@ -1966,6 +2079,12 @@ fn query_param_coercion_with(
 
     // Determine the coercion expression based on the resolved type
     let coerced = match &qp.ty {
+        // A list-valued query param: normalize the repeated wire values to a
+        // `string[]` and coerce each element.
+        Type::Generic(name, args) if name == "List" && args.len() == 1 => {
+            let elem = ts_elem_coerce(&args[0], "v", param_enums);
+            return format!("toStringArray({raw}).map((v) => {elem})");
+        }
         Type::Int | Type::Float => format!("Number({raw})"),
         Type::Bool => format!("{raw} === \"true\""),
         Type::String => format!("{raw} as string"),
@@ -2247,6 +2366,17 @@ fn render_jsdoc(indent: &str, text: &str) -> String {
     }
     out.push_str(&format!("{indent} */\n"));
     out
+}
+
+/// Renders a TS expression encoding a single scalar `var` to its wire string for a
+/// repeated query/header element (`List<T>`). `DateTime` (`Date`) goes RFC 3339 via
+/// `.toISOString()`; everything else (`number`/`boolean`/`string`, a branded
+/// `Uuid`/`Decimal`, or an enum string-union) stringifies via `String(...)`.
+fn ts_scalar_encode(elem: &Type, var: &str) -> String {
+    match elem {
+        Type::DateTime => format!("{var}.toISOString()"),
+        _ => format!("String({var})"),
+    }
 }
 
 /// Returns the inner type of an `Option<T>`, or the type unchanged otherwise.
@@ -3231,15 +3361,27 @@ fn emit_route_error_catch(
         .body
         .as_ref()
         .is_some_and(|b| b.fields.iter().any(|f| f.constraint.is_some()));
-    // An enum query/request-header param's `parse<Enum>` throws `ValidationError`
-    // on an unknown variant, so the same 400 guard applies.
-    let has_enum_param = ep
+    // A query/request-header param whose server-side coercion throws
+    // `ValidationError` (→ 400): an enum's `parse<Enum>` on an unknown variant, or a
+    // `Uuid`/`Decimal`'s `parseUuid`/`parseDecimal` on a malformed value. Holds for
+    // the scalar param and for each element of a `List<…>`. Without this the guard
+    // is dropped and the throw falls through to the catch-all 500 — so a batch
+    // `GET ?ids=<bad-uuid>` would 500 instead of 400, diverging from Go.
+    let has_validated_param = ep
         .query_params
         .iter()
         .map(|q| &q.ty)
         .chain(ep.headers.iter().map(|h| &h.ty))
-        .any(|ty| matches!(unwrap_option_ts(ty), Type::Named(n) if param_enums.contains(n)));
-    let validates = has_body_constraints || has_enum_param;
+        .any(|ty| {
+            let inner = unwrap_option_ts(ty);
+            let elem = match inner {
+                Type::Generic(n, args) if n == "List" && args.len() == 1 => &args[0],
+                other => other,
+            };
+            matches!(elem, Type::Uuid | Type::Decimal)
+                || matches!(elem, Type::Named(n) if param_enums.contains(n))
+        });
+    let validates = has_body_constraints || has_validated_param;
 
     // The caught binding is only referenced when there is a ValidationError → 400
     // guard or declared errors; otherwise use an optional catch binding
@@ -3301,6 +3443,12 @@ fn request_header_coercion_raw(
     let is_option = is_header_option(h);
 
     let coerced = match &h.ty {
+        // A list-valued request header: comma-separated on the wire. Split (helper
+        // trims + drops empty) and coerce each element.
+        Type::Generic(name, args) if name == "List" && args.len() == 1 => {
+            let elem = ts_elem_coerce(&args[0], "v", param_enums);
+            return format!("splitHeaderList({raw}).map((v) => {elem})");
+        }
         Type::Int | Type::Float => format!("Number({raw})"),
         Type::Bool => format!("{raw} === \"true\""),
         Type::String => format!("{raw} as string"),

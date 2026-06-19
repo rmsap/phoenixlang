@@ -100,10 +100,11 @@ async def main() -> None:
     if bad.status_code < 400:
         fail(f"server accepted malformed body uuid: HTTP {bad.status_code}")
 
-    # Reject path (query uuid): unlike Go, Python validates query uuids — FastAPI
-    # coerces the `ref: UUID` param and 422s on malformed input. Bypass the typed
-    # client (which won't construct a bad UUID locally) by issuing the raw GET, so
-    # the server-side parse is what rejects it. Pins the Go-accepts divergence.
+    # Reject path (query uuid): Python validates query uuids — FastAPI coerces the
+    # `ref: UUID` param and 422s on malformed input. Bypass the typed client (which
+    # won't construct a bad UUID locally) by issuing the raw GET, so the server-side
+    # parse is what rejects it. Go now format-checks the same params against
+    # `uuidRe` (see the Go driver's reject assertion), so all three targets agree.
     bad_q = await client.client.get("/accounts/acct-1", params={"ref": "not-a-uuid"})
     if bad_q.status_code < 400:
         fail(f"server accepted malformed query uuid: HTTP {bad_q.status_code}")

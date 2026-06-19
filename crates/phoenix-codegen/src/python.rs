@@ -1014,6 +1014,18 @@ impl<'a> PyGenerator<'a> {
                 .push_str("        params: dict[str, Any] = {}\n");
             for qp in &ep.query_params {
                 let snake = to_snake_case(&qp.name);
+                // A list-valued query param: httpx sends a list value as repeated
+                // keys. Encode each element to its wire string. The list is required
+                // (no `Option<List>`), so it is set unconditionally.
+                if let Type::Generic(lname, largs) = &qp.ty
+                    && lname == "List"
+                    && largs.len() == 1
+                {
+                    let value = py_list_query_value(&largs[0], &snake);
+                    self.client_out
+                        .push_str(&format!("        params[\"{}\"] = {value}\n", qp.name));
+                    continue;
+                }
                 // A `DateTime` goes on the wire as RFC 3339; httpx would otherwise
                 // `str()` it into Python's space-separated default layout, which the
                 // server's ISO parse rejects. `.isoformat()` emits the `T`-form.
@@ -1043,6 +1055,19 @@ impl<'a> PyGenerator<'a> {
                 .push_str("        headers: dict[str, str] = {}\n");
             for hp in &ep.headers {
                 let snake = to_snake_case(&hp.name);
+                // A list-valued request header: comma-join the encoded elements
+                // into a single header value (the server splits on `,`).
+                if let Type::Generic(lname, largs) = &hp.ty
+                    && lname == "List"
+                    && largs.len() == 1
+                {
+                    let joined = py_list_header_value(&largs[0], &snake);
+                    self.client_out.push_str(&format!(
+                        "        headers[\"{}\"] = {joined}\n",
+                        hp.wire_name
+                    ));
+                    continue;
+                }
                 // Only an `Option<T>` header can actually be `None` at runtime, so
                 // only those are guarded. A header with a literal default is a
                 // non-None value (it defaults to that literal) and is sent
@@ -1507,9 +1532,12 @@ impl<'a> PyGenerator<'a> {
             .iter()
             .any(|ep| !ep.errors.is_empty());
         let needs_query = self.check_result.endpoints.iter().any(|ep| {
-            ep.query_params
-                .iter()
-                .any(|qp| to_snake_case(&qp.name) != qp.name)
+            ep.query_params.iter().any(|qp| {
+                // An aliased param OR any list-valued param (always bound via
+                // `Query(default_factory=list)`) pulls in `Query`.
+                to_snake_case(&qp.name) != qp.name
+                    || matches!(&qp.ty, Type::Generic(n, _) if n == "List")
+            })
         });
         // Request headers always bind via `Header(alias="<wire_name>")` — the
         // exact HTTP header name (e.g. `Idempotency-Key`) is never a valid Python
@@ -1793,6 +1821,21 @@ impl<'a> PyGenerator<'a> {
         for qp in &ep.query_params {
             let py_type = type_to_python(&qp.ty);
             let snake = to_snake_case(&qp.name);
+            // A list-valued query param: FastAPI parses repeated keys into a
+            // `list[T]` only when bound via `Query(...)` (a bare `list[T]` would be
+            // read as a body), so always emit `Query`. An absent param → empty list.
+            if matches!(&qp.ty, Type::Generic(n, _) if n == "List") {
+                let needs_alias = snake != qp.name;
+                let alias = if needs_alias {
+                    format!(", alias=\"{}\"", qp.name)
+                } else {
+                    String::new()
+                };
+                defaulted.push(format!(
+                    "{snake}: {py_type} = Query(default_factory=list{alias})"
+                ));
+                continue;
+            }
             let is_optional =
                 qp.has_default || matches!(&qp.ty, Type::Generic(name, _) if name == "Option");
             // FastAPI matches query keys to the Python parameter name. The
@@ -1835,6 +1878,17 @@ impl<'a> PyGenerator<'a> {
         for hp in &ep.headers {
             let py_type = type_to_python(&hp.ty);
             let snake = to_snake_case(&hp.name);
+            // A list-valued request header is comma-separated: FastAPI can't split
+            // it, so receive the raw `str` (default "" = absent) and split it into
+            // a `list[T]` in the route body before calling the handler. The same
+            // `header_ty_is_list` predicate gates the body split + the handler arg.
+            if header_ty_is_list(&hp.ty) {
+                defaulted.push(format!(
+                    "{snake}: str = Header(default=\"\", alias=\"{}\")",
+                    hp.wire_name
+                ));
+                continue;
+            }
             let is_optional =
                 hp.has_default || matches!(&hp.ty, Type::Generic(name, _) if name == "Option");
             if is_optional {
@@ -1886,6 +1940,29 @@ impl<'a> PyGenerator<'a> {
             self.server_out.push_str("        try:\n");
         }
 
+        // A list-valued request header arrives as one comma-separated `str` param;
+        // split + trim + coerce each element into a `{snake}_items` local the handler
+        // call below consumes by that exact name (see the matching `_items` branch in
+        // the handler-arg loop) — the two stay in lockstep on the `List` predicate.
+        // Emitted at `indent`, so when the endpoint declares errors this sits inside
+        // the `try:` — a malformed element (`int(...)`/`UUID(...)`/`Enum(...)`) then
+        // raises, runs through the `except` error-name map below (matching nothing),
+        // and re-raises → 500. That's the accepted query-vs-header divergence (see
+        // design-decisions.md), not a bug: FastAPI can't split a comma header into a
+        // typed `list[T]`, so the coercion is ours and its failure is a 500.
+        for hp in &ep.headers {
+            if !header_ty_is_list(&hp.ty) {
+                continue;
+            }
+            let snake = to_snake_case(&hp.name);
+            let elem = crate::unwrap_option_or_list(&hp.ty);
+            let elem_py = type_to_python(elem);
+            let coerce = py_elem_coerce(elem, "stripped");
+            self.server_out.push_str(&format!(
+                "{indent}{snake}_items: list[{elem_py}] = []\n{indent}for part in {snake}.split(\",\"):\n{indent}    stripped = part.strip()\n{indent}    if stripped:\n{indent}        {snake}_items.append({coerce})\n"
+            ));
+        }
+
         // Call handler
         let mut handler_args = Vec::new();
         for pp in &ep.path_params {
@@ -1911,7 +1988,15 @@ impl<'a> PyGenerator<'a> {
         }
         for hp in &ep.headers {
             let snake = to_snake_case(&hp.name);
-            handler_args.push(format!("{snake}={snake}"));
+            // A list header was split into `{snake}_items` by the coercion loop
+            // above; both sites share `header_ty_is_list` so the local and its
+            // consumer can never drift apart (the `_items` local exists only when
+            // this holds).
+            if header_ty_is_list(&hp.ty) {
+                handler_args.push(format!("{snake}={snake}_items"));
+            } else {
+                handler_args.push(format!("{snake}={snake}"));
+            }
         }
 
         if is_multi_status {
@@ -2595,6 +2680,61 @@ fn py_default_for(val: &DefaultValue, py_type: &str) -> String {
         }
         other => default_value_to_python(other),
     }
+}
+
+/// Whether a request-header param type is list-valued (`List<T>`). A list header is
+/// received as one comma-separated `str` and split into a `{snake}_items` local in
+/// the route body; the coercion loop that emits that local and the handler-arg
+/// selection that consumes it MUST agree on this predicate (the `_items` local
+/// exists only when this holds), so both call this single function.
+fn header_ty_is_list(ty: &Type) -> bool {
+    matches!(ty, Type::Generic(n, _) if n == "List")
+}
+
+/// Renders the client-side value for a list-valued query param (`List<T>`): a
+/// `list[str]` httpx sends as repeated keys. `str`/`int`/`float` pass through (httpx
+/// stringifies the latter two correctly); `bool`/`DateTime`/`Uuid`/`Decimal`/enum
+/// map each element to its exact wire string.
+fn py_list_query_value(elem: &Type, snake: &str) -> String {
+    match elem {
+        Type::String | Type::Int | Type::Float => snake.to_string(),
+        Type::Bool => format!("[\"true\" if x else \"false\" for x in {snake}]"),
+        Type::DateTime => format!("[x.isoformat() for x in {snake}]"),
+        Type::Uuid | Type::Decimal => format!("[str(x) for x in {snake}]"),
+        // An enum is a `(str, Enum)` — send each `.value`.
+        _ => format!("[x.value for x in {snake}]"),
+    }
+}
+
+/// Coerces a single wire string `expr` into the element type `elem`, for the
+/// server-side split of a comma-separated list request header. (List QUERY params
+/// use FastAPI's native `list[T]` parsing and need no manual coercion.)
+fn py_elem_coerce(elem: &Type, expr: &str) -> String {
+    match elem {
+        Type::String => expr.to_string(),
+        Type::Int => format!("int({expr})"),
+        Type::Float => format!("float({expr})"),
+        Type::Bool => format!("{expr} == \"true\""),
+        Type::DateTime => format!("datetime.fromisoformat({expr})"),
+        Type::Uuid => format!("UUID({expr})"),
+        Type::Decimal => format!("Decimal({expr})"),
+        // An enum is constructed from its wire value (`Color(expr)`).
+        other => format!("{}({expr})", type_to_python(other)),
+    }
+}
+
+/// Renders the client-side value for a list-valued request header (`List<T>`):
+/// the elements encoded to strings and comma-joined into one header value.
+fn py_list_header_value(elem: &Type, snake: &str) -> String {
+    let part = match elem {
+        Type::String => "x".to_string(),
+        Type::Bool => "(\"true\" if x else \"false\")".to_string(),
+        Type::DateTime => "x.isoformat()".to_string(),
+        Type::Uuid | Type::Decimal | Type::Int | Type::Float => "str(x)".to_string(),
+        // An enum is a `(str, Enum)` — its `.value` is the bare variant.
+        _ => "x.value".to_string(),
+    };
+    format!("\",\".join({part} for x in {snake})")
 }
 
 /// Converts a `DefaultValue` to a Python literal.

@@ -103,19 +103,15 @@ async function main(): Promise<void> {
   }
   check(rejected, "server rejected malformed body uuid");
 
-  // Reject path (query param): unlike Go, TS validates query/request-header
-  // `Uuid`s inline via `parseUuid` on the server, so a malformed `ref` must be
-  // rejected (`parseUuid` throws → 500 → client throws on `!response.ok`). This
-  // pins the documented TS-validates / Go-accepts divergence (see the Go
-  // driver's accept assertion). The cast smuggles a bad value past the typed
-  // client signature so the server coercion is what rejects it.
-  let queryRejected = false;
-  try {
-    await api.getAccount("acct-1", { ref: "not-a-uuid" as unknown as Uuid });
-  } catch {
-    queryRejected = true;
-  }
-  check(queryRejected, "server rejected malformed query uuid");
+  // Reject path (query param): TS validates query/request-header `Uuid`s inline
+  // via `parseUuid` on the server, which throws `ValidationError` → 400 (like an
+  // enum param), matching Go's `uuidRe` check and Python's FastAPI coercion. Issue
+  // a raw GET (rather than the typed client, which throws a generic error that
+  // hides the status) so the assertion can pin the exact 400.
+  const badQuery = await fetch(
+    `http://127.0.0.1:${String(port)}/accounts/acct-1?ref=not-a-uuid`,
+  );
+  check(badQuery.status === 400, "malformed query uuid rejected with 400");
 
   await new Promise<void>((resolve, reject) =>
     server.close((err) => (err ? reject(err) : resolve())),

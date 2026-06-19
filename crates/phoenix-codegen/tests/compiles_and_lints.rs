@@ -377,8 +377,10 @@ endpoint replacePost: PUT "/api/posts/{id}" {
 /// Exercises the `Uuid` scalar across every position and target path it touches:
 /// struct fields (`id`), `Option<Uuid>` (`ownerId`), `List<Uuid>` (`members`),
 /// `Map<String, Uuid>` (`index`), a nested Uuid-bearing struct (`owner: Profile`),
-/// a `Uuid` query param (`ref`), request header (`idempotencyKey`), required +
-/// optional response headers (`requestId`/`traceId`), a body, and BARE scalar /
+/// a `Uuid` query param (`ref`) + `Option<Uuid>` query param (`since`), required
+/// request header (`idempotencyKey`) + `Option<Uuid>` request header (`ifMatch`),
+/// required + optional response headers (`requestId`/`traceId`), a body, and
+/// BARE scalar /
 /// `List` / `Map` `Uuid` responses. The lint proof that all four generators emit
 /// valid output: Go `string` + the `uuidRe` `Validate()` check (+`regexp`),
 /// Python `uuid.UUID` (+import, `str()`/`UUID(...)`), TypeScript the branded
@@ -401,6 +403,10 @@ struct Account {
 endpoint getAccount: GET "/accounts/{id}" {
     query {
         ref: Uuid
+        since: Option<Uuid>
+    }
+    headers {
+        ifMatch: Option<Uuid>
     }
     response Account headers {
         requestId: Uuid
@@ -432,8 +438,10 @@ endpoint idMap: GET "/id-map" {
 /// Exercises the `Decimal` scalar across every position and target path: struct
 /// fields (`subtotal`), `Option<Decimal>` (`discount`), `List<Decimal>`
 /// (`lineTotals`), `Map<String, Decimal>` (`rates`), a nested Decimal-bearing
-/// struct (`tax: TaxLine`), a `Decimal` query param (`minAmount`), request header
-/// (`budgetCap`), required + optional response headers (`computedTax`/`fxRate`), a
+/// struct (`tax: TaxLine`), a `Decimal` query param (`minAmount`) + `Option<Decimal>`
+/// query param (`maxAmount`), request header (`budgetCap`) + `Option<Decimal>`
+/// request header (`priceFloor`), required + optional response headers
+/// (`computedTax`/`fxRate`), a
 /// body, and BARE scalar / `List` / `Map` `Decimal` responses. The lint proof that
 /// all four generators emit valid output: Go `string` + the `decimalRe`
 /// `Validate()` check (+`regexp`), Python `decimal.Decimal` (+import,
@@ -457,6 +465,10 @@ struct Invoice {
 endpoint getInvoice: GET "/invoices/{id}" {
     query {
         minAmount: Decimal
+        maxAmount: Option<Decimal>
+    }
+    headers {
+        priceFloor: Option<Decimal>
     }
     response Invoice headers {
         computedTax: Decimal
@@ -696,6 +708,44 @@ endpoint getMetered: GET "/users/{id}/metered" {
 }
 "#;
 
+/// Exercises list-valued params (`List<T>`, repeated query keys / comma-separated
+/// headers) across every element type and both positions: `List<Uuid>`,
+/// `List<String>`, `List<Int>`, `List<DateTime>`, `List<Bool>`, `List<Decimal>`,
+/// and `List<enum>` query params (repeated key, FastAPI native `list[T]`; the enum
+/// element is validated), plus a `List<String>` and a `List<enum>` REQUEST header
+/// (comma-separated: client joins, server splits + trims + coerces each — the enum
+/// header exercises the split→validate path). The `List<Bool>`/`List<Decimal>`
+/// query params exist to compile-lint the query-only client encoders (the header
+/// encoders cover the other element types). Auth header + `error` block mirror the
+/// other schemas.
+const LIST_PARAM_SCHEMA: &str = r#"
+enum Tag { Red  Green  Blue }
+
+struct Item {
+    id: Uuid
+    name: String
+}
+
+endpoint search: GET "/search" {
+    headers {
+        authorization: String
+        roles: List<String> as "X-Role"
+        tagFilter: List<Tag> as "X-Tag"
+    }
+    query {
+        ids: List<Uuid>
+        names: List<String>
+        counts: List<Int>
+        since: List<DateTime>
+        flags: List<Bool>
+        prices: List<Decimal>
+        tags: List<Tag>
+    }
+    response List<Item>
+    error { Unauthorized(401) }
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -924,6 +974,8 @@ fn go_output_compiles_and_lints() {
     check_go_output(&generate_go_files(ENUM_PARAM_SCHEMA));
     // Inline response projection (`<Endpoint>Response` struct emission).
     check_go_output(&generate_go_files(PROJECTION_SCHEMA));
+    // List-valued params (repeated query keys + comma-separated headers).
+    check_go_output(&generate_go_files(LIST_PARAM_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -959,6 +1011,7 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(MONEY_ONLY_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(ENUM_PARAM_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(PROJECTION_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(LIST_PARAM_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -1020,6 +1073,7 @@ fn openapi_output_lints() {
     check_openapi_output("MONEY_ONLY_SCHEMA", MONEY_ONLY_SCHEMA);
     check_openapi_output("ENUM_PARAM_SCHEMA", ENUM_PARAM_SCHEMA);
     check_openapi_output("PROJECTION_SCHEMA", PROJECTION_SCHEMA);
+    check_openapi_output("LIST_PARAM_SCHEMA", LIST_PARAM_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -1152,6 +1206,8 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(ENUM_PARAM_SCHEMA));
     // Inline response projection: `<Endpoint>Response` type + revival + paginated.
     check_typescript_output(&scaffold, &generate_typescript_files(PROJECTION_SCHEMA));
+    // List params: repeated-key query (toStringArray) + comma-split headers.
+    check_typescript_output(&scaffold, &generate_typescript_files(LIST_PARAM_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1313,6 +1369,13 @@ fn python_output_compiles_and_lints() {
         &scaffold,
         &venv_bin,
         &generate_python_files(PROJECTION_SCHEMA),
+    );
+    // List params: FastAPI `list[T] = Query(default_factory=list)` + comma-split
+    // request headers.
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(LIST_PARAM_SCHEMA),
     );
 
     // Realistic schema fixture library (see FILE_FIXTURES).

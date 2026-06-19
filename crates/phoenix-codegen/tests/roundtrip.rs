@@ -335,6 +335,74 @@ fn projection_dir() -> PathBuf {
     roundtrip_dir().join("projection")
 }
 
+/// Small schema for the dedicated list-valued-param round-trip. `search` takes
+/// query params and request headers each covering EVERY permitted element type —
+/// `String`/`Int`/`Uuid`/`Status` (a simple enum)/`Float`/`Bool`/`DateTime`/
+/// `Decimal` — and echoes all of them into the response so the drivers can assert
+/// multiple values, and the empty list, survive the wire in both directions. The
+/// query `List<Uuid>` exercises a branded/format-checked element coercion and
+/// `List<Status>` the per-element enum validation (whose unknown variant the
+/// drivers also drive through the reject path). Both positions carry every element
+/// type because the query and header paths DIVERGE per target: Go/TS share their
+/// encode/coerce helpers across positions, but Python's query path uses FastAPI's
+/// native `list[T]` parsing plus the `py_list_query_value` client encoders, whereas
+/// its header path coerces each element manually in the route body
+/// (`int(...)`/`float(...)`/`UUID(...)`/`Decimal(...)`/`datetime.fromisoformat(...)`/
+/// `Status(...)`/`== "true"`) — so each path needs its own typed element per type
+/// or those branches go untested. Kept inline (not a fixture); only these drivers
+/// consume it. See `docs/design-decisions.md` (list-valued query/header params).
+const LIST_RT_SCHEMA: &str = r#"
+enum Status { Active  Inactive  Pending }
+
+struct Echo {
+    ids: List<String>
+    counts: List<Int>
+    uuids: List<Uuid>
+    statuses: List<Status>
+    qFloats: List<Float>
+    qFlags: List<Bool>
+    qTimes: List<DateTime>
+    qAmounts: List<Decimal>
+    roles: List<String>
+    limits: List<Int>
+    keys: List<Uuid>
+    ratios: List<Float>
+    flags: List<Bool>
+    times: List<DateTime>
+    amounts: List<Decimal>
+    tags: List<Status>
+}
+
+endpoint search: GET "/search" {
+    headers {
+        roles: List<String> as "X-Role"
+        limits: List<Int> as "X-Limit"
+        keys: List<Uuid> as "X-Key"
+        ratios: List<Float> as "X-Ratio"
+        flags: List<Bool> as "X-Flag"
+        times: List<DateTime> as "X-Time"
+        amounts: List<Decimal> as "X-Amount"
+        tags: List<Status> as "X-Tag"
+    }
+    query {
+        ids: List<String>
+        counts: List<Int>
+        uuids: List<Uuid>
+        statuses: List<Status>
+        qFloats: List<Float>
+        qFlags: List<Bool>
+        qTimes: List<DateTime>
+        qAmounts: List<Decimal>
+    }
+    response Echo
+}
+"#;
+
+/// Absolute path to `tests/roundtrip/list/` (the dedicated list-param drivers).
+fn list_dir() -> PathBuf {
+    roundtrip_dir().join("list")
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    compiles_and_lints.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -738,6 +806,42 @@ fn projection_go_roundtrip() {
     assert!(ok, "go projection round-trip test failed:\n{out}");
 }
 
+/// Dedicated list-valued-param wire round-trip for Go: generates the `api` package
+/// from [`LIST_RT_SCHEMA`], assembles a tempdir module with the bespoke `list/go`
+/// driver, and runs `go test`. Asserts query params (repeated keys) and request
+/// headers (comma-separated), both covering every element type, round-trip
+/// including the empty list, plus the per-element reject path (unknown enum /
+/// malformed `Uuid` query element → 400).
+#[test]
+fn list_go_roundtrip() {
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    let files = generate_go_files(LIST_RT_SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    let go_mod = std::fs::read_to_string(roundtrip_dir().join("go").join("go.mod.template"))
+        .expect("read go.mod.template");
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+
+    let driver = list_dir().join("go").join("list_roundtrip_test.go");
+    let contents = std::fs::read_to_string(&driver)
+        .unwrap_or_else(|e| panic!("read {}: {e}", driver.display()));
+    std::fs::write(root.join("list_roundtrip_test.go"), contents).expect("write driver");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go list round-trip test failed:\n{out}");
+}
+
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 /// Generates both the Express and Fastify variants from a single parse/check.
@@ -1099,6 +1203,67 @@ fn projection_typescript_roundtrip() {
     assert!(ok, "typescript projection round-trip test failed:\n{out}");
 }
 
+/// Dedicated list-valued-param wire round-trip for TypeScript, run against BOTH
+/// server frameworks. Reuses the main TS driver's npm project but writes to a
+/// SEPARATE `generated-list/` dir. Generates the Express server, runs
+/// `list-driver.ts`, then overwrites just `server.ts` with the Fastify variant
+/// (types/client/handlers are framework-independent — asserted by
+/// `generate_typescript_express_and_fastify`) and runs `list-driver-fastify.ts`
+/// against the SAME dir (so both must stay in this one test — a separate `#[test]`
+/// would race the shared dir). The Fastify pass is not redundant: list query params
+/// arrive as a repeated-key array via a framework-specific query parser, so both
+/// Express and Fastify must be driven to prove the array shape `toStringArray`
+/// normalizes actually arrives. Proves query params (repeated keys via
+/// `toStringArray`) and headers (comma-split), covering every element type, round-trip
+/// in both directions including the empty list.
+#[test]
+fn list_typescript_roundtrip() {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("typescript");
+    let node_modules = driver_dir.join("node_modules");
+    if !node_modules.is_dir() {
+        let msg = format!(
+            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let (express, fastify) = generate_typescript_express_and_fastify(LIST_RT_SCHEMA);
+
+    let generated = driver_dir.join("generated-list");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated-list dir");
+    std::fs::write(generated.join("types.ts"), &express.types).expect("write types.ts");
+    std::fs::write(generated.join("client.ts"), &express.client).expect("write client.ts");
+    std::fs::write(generated.join("handlers.ts"), &express.handlers).expect("write handlers.ts");
+    std::fs::write(generated.join("server.ts"), &express.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "list-driver.ts"]);
+    assert!(
+        ok,
+        "typescript list round-trip test failed (express):\n{out}"
+    );
+
+    // Fastify server variant: only `server.ts` differs (asserted framework-independent
+    // above), so overwrite just the server into the SAME `generated-list/` and drive
+    // the Fastify plugin via `list-driver-fastify.ts`.
+    std::fs::write(generated.join("server.ts"), &fastify.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "list-driver-fastify.ts"]);
+    assert!(
+        ok,
+        "typescript list round-trip test failed (fastify):\n{out}"
+    );
+}
+
 // ── Python target ──────────────────────────────────────────────────────────
 
 fn generate_python_files(schema: &str) -> phoenix_codegen::PythonFiles {
@@ -1424,4 +1589,48 @@ fn projection_python_roundtrip() {
     let python = venv_python.to_string_lossy().into_owned();
     let (ok, out) = run(&driver_dir, &python, &["projection_driver.py"]);
     assert!(ok, "python projection round-trip test failed:\n{out}");
+}
+
+/// Dedicated list-valued-param wire round-trip for Python. Reuses the main Python
+/// driver's `.venv` but writes the generated package into a SEPARATE
+/// `generated_list/` dir and runs `list_driver.py`. Proves query params (FastAPI
+/// native `list[T]` parsing + `py_list_query_value` client encoders) and request
+/// headers (route-body manual split→coerce), both covering every element type,
+/// round-trip including the empty list — the two paths diverge in Python, so each
+/// carries every type.
+#[test]
+fn list_python_roundtrip() {
+    if gate(&missing_tools(&["python3"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("python");
+    let venv_python = driver_dir.join(".venv").join("bin").join("python");
+    if !venv_python.is_file() {
+        let msg = format!(
+            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
+             .venv/bin/pip install -r requirements.txt` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let files = generate_python_files(LIST_RT_SCHEMA);
+
+    let generated = driver_dir.join("generated_list");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated_list dir");
+    std::fs::write(generated.join("__init__.py"), &files.init).expect("write __init__.py");
+    std::fs::write(generated.join("models.py"), &files.models).expect("write models.py");
+    std::fs::write(generated.join("client.py"), &files.client).expect("write client.py");
+    std::fs::write(generated.join("handlers.py"), &files.handlers).expect("write handlers.py");
+    std::fs::write(generated.join("server.py"), &files.server).expect("write server.py");
+
+    let python = venv_python.to_string_lossy().into_owned();
+    let (ok, out) = run(&driver_dir, &python, &["list_driver.py"]);
+    assert!(ok, "python list round-trip test failed:\n{out}");
 }

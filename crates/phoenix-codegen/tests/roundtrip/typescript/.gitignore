@@ -6,4 +6,5 @@ generated-decimal/
 generated-money/
 generated-enum/
 generated-projection/
+generated-list/
 contract.json

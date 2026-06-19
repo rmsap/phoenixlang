@@ -58,6 +58,21 @@ use phoenix_sema::Analysis;
 use phoenix_sema::types::Type;
 use std::collections::BTreeSet;
 
+/// Peels a single `Option<…>` or `List<…>` layer off a query/header param type to
+/// reach the scalar/enum element, returning the type unchanged otherwise. A
+/// `List<Enum>`/`List<Uuid>` element is validated exactly like the scalar form, so
+/// the per-element checks (enum-name collection here, Go regex-var registration)
+/// share this one-layer unwrap. `Option<List<…>>` cannot occur (sema rejects it),
+/// so a single layer suffices.
+pub(crate) fn unwrap_option_or_list(ty: &Type) -> &Type {
+    match ty {
+        Type::Generic(name, args) if (name == "Option" || name == "List") && args.len() == 1 => {
+            &args[0]
+        }
+        other => other,
+    }
+}
+
 /// The set of simple (unit-variant) enum names used in any query param or request
 /// header (a single `Option<…>` layer unwrapped). Shared by the Go and TypeScript
 /// backends, which both gate inbound enum validation on it: Go emits a `Valid()`
@@ -83,10 +98,10 @@ pub(crate) fn param_enum_names(program: &Program, check_result: &Analysis) -> BT
             .map(|q| &q.ty)
             .chain(ep.headers.iter().map(|h| &h.ty));
         for ty in types {
-            let inner = match ty {
-                Type::Generic(name, args) if name == "Option" && args.len() == 1 => &args[0],
-                other => other,
-            };
+            // Unwrap a single `Option<…>` or `List<…>` to reach the (possibly enum)
+            // element: a `List<Enum>` param validates each element the same way a
+            // scalar enum param does.
+            let inner = unwrap_option_or_list(ty);
             if let Type::Named(n) = inner
                 && simple_enums.contains(n.as_str())
             {

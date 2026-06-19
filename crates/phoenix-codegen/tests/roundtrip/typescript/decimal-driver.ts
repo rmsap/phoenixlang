@@ -104,19 +104,15 @@ async function main(): Promise<void> {
   }
   check(rejected, "server rejected malformed body decimal");
 
-  // Reject path (query param): unlike Go, TS validates query/request-header
-  // `Decimal`s inline via `parseDecimal` on the server, so a malformed
-  // `minAmount` must be rejected — pinning the TS-validates / Go-accepts
-  // divergence (see the Go driver's accept assertion).
-  let queryRejected = false;
-  try {
-    await api.getQuote("inv-1", {
-      minAmount: "not-a-number" as unknown as Decimal,
-    });
-  } catch {
-    queryRejected = true;
-  }
-  check(queryRejected, "server rejected malformed query decimal");
+  // Reject path (query param): TS validates query/request-header `Decimal`s
+  // inline via `parseDecimal` on the server, which throws `ValidationError` → 400
+  // (like an enum param), matching Go's `decimalRe` check and Python's FastAPI
+  // coercion. Issue a raw GET (rather than the typed client, which throws a generic
+  // error that hides the status) so the assertion can pin the exact 400.
+  const badQuery = await fetch(
+    `http://127.0.0.1:${String(port)}/quote/inv-1?minAmount=not-a-number`,
+  );
+  check(badQuery.status === 400, "malformed query decimal rejected with 400");
 
   await new Promise<void>((resolve, reject) =>
     server.close((err) => (err ? reject(err) : resolve())),

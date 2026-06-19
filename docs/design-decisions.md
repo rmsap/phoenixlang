@@ -1969,8 +1969,7 @@ not here.
 ## Phoenix Gen — multipart / file-upload (and download) design (2026-06-05)
 
 Adds a `File` primitive type so endpoints can carry binary uploads (multipart
-request bodies) and downloads (binary response bodies). Locked decisions
-(language-designer calls):
+request bodies) and downloads (binary response bodies). Locked decisions:
 
 1. **`File` is a new primitive `Type` variant** (alongside Int/Float/String/Bool/
    Void), recognized as a built-in type name via `Type::from_name`
@@ -2125,7 +2124,7 @@ registered, so only the resolver sees every `File`-bearing position.
 ## Phoenix Gen — pagination design (2026-06-06)
 
 Adds first-class cursor and offset pagination, the single most common API shape
-("every team reinvents it"). Locked decisions (language-designer calls):
+("every team reinvents it"). Locked decisions:
 
 1. **Surface — a `pagination { <mode> }` endpoint block**, a named section peer to
    `query` / `headers` / `response` / `error`, NOT a response-type modifier.
@@ -2243,7 +2242,7 @@ returning `200` when it updated or `201` when it created). Scoped deliberately t
 negotiation with union return types). We are doing (a) only. (b) — content
 negotiation — is the expensive part (runtime client dispatch on the response
 `Content-Type`, union/sum return types that have no clean Go representation) and is
-deferred; see "Deferred" below. Locked decisions (language-designer calls):
+deferred; see "Deferred" below. Locked decisions:
 
 1. **Shared body type across statuses (Option A — no unions).** All typed statuses
    in a `response { }` block must share ONE body type. `response { 200: User
@@ -2694,6 +2693,13 @@ library to any of them:
 This deliberately leaves query/header `Uuid` validation as the per-target weak
 spot (TS validates them, Go does not), mirroring how DateTime's server-side
 handling is the weak spot there — bodies are where ids overwhelmingly live.
+**Superseded 2026-06-18:** the Go query/request-header `Uuid` weak spot is closed
+— scalar query/header params and `List<Uuid>`-valued query/header param elements
+are now format-checked against `uuidRe` inline → 400, matching TS/Python. (Struct
+`List<Uuid>`/`Map<String, Uuid>` *field* elements in `Validate()` remain
+unchecked — a separate weak link, see the `Money` entry.) See *"Phoenix Gen —
+tighten scalar query/header `Uuid`/`Decimal` validation on Go (2026-06-18)"*
+below.
 
 **Verification (DateTime).** Two harnesses, both green. (1) Compile-lint: a
 comprehensive `DATETIME_SCHEMA` (field/`Option`/`List`/`Map`/nested/query/req+resp
@@ -2851,8 +2857,9 @@ scalar/`List`/`Map` responses) through all four targets — Go
 (`tests/roundtrip/decimal/*`) for Go/TS/Python assert body/query/response-header/
 bare-response decimals survive the wire AND that the validating decode paths
 (Python `Decimal(...)`, TS `parseDecimal`, Go `Validate()`'s `decimalRe`) accept
-valid input and reject a malformed body decimal — plus the documented
-TS-validates-query / Go-accepts-query divergence (each driver asserts its side).
+valid input and reject a malformed body decimal — plus the (since-closed)
+TS-validates-query / Go-accepts-query divergence (each driver's query case now
+asserts rejection on all three targets; Go updated 2026-06-18, see below).
 All 13 round-trips (4 base + 3 DateTime + 3 UUID + 3 Decimal) and all four
 compile-lint targets are green; 238 codegen lib tests show no snapshot drift from
 the UUID→branded-scalar generalization.
@@ -3048,9 +3055,13 @@ scanned.
 
 **Out of scope (deferred).** `List<Enum>` in query (part of the separate
 list-valued-query-param slice). The pre-existing `Uuid`/`Decimal` query params
-remain unchecked on the Go server (they 500 rather than 400 on a malformed value —
-a divergence from enums, which validate); unifying param-validation→400 across all
-branded types is a possible future cleanup.
+remain unchecked on the Go server (they pass the malformed value through to the
+handler rather than 400 — a divergence from enums, which validate); unifying
+param-validation→400 across all branded types is a possible future cleanup.
+**Done 2026-06-18:** that cleanup landed — Go now format-checks scalar (and
+`List`-element) query/request-header `Uuid`/`Decimal` against `uuidRe`/`decimalRe`
+→ 400, matching enums and TS/Python. See *"tighten scalar query/header
+`Uuid`/`Decimal` validation on Go (2026-06-18)"* below.
 
 **Verification.** `ENUM_PARAM_SCHEMA` (Option/defaulted enum query params, required
 + Option enum request headers, required + Option enum response headers, an
@@ -3072,7 +3083,7 @@ server-applied default) AND that an unknown query/header variant is rejected (Go
 
 Lets a `response` reference an existing struct narrowed by `pick`/`omit`/`partial`
 instead of declaring a dedicated read-model struct (the fixture pain points: social
-`PublicProfile`, file_storage `BucketUsage`). Language-designer decisions: support
+`PublicProfile`, file_storage `BucketUsage`). Decisions: support
 the **full `pick`/`omit`/`partial` chain** (same as `body`); scope includes the
 **bare response, `List<Struct pick…>`, and paginated projected items** (plus
 projection with response headers).
@@ -3152,3 +3163,137 @@ errors, the picked-`File`-field rejection (direct and `Option<File>`), and the
 misplaced-projection error in four illegal positions (struct field, query param,
 `response Option<Struct pick …>`, and `response Map<_, Struct pick …>`). Parser,
 sema, codegen lib tests + integration suites green; clippy clean.
+
+## Phoenix Gen — list-valued query/header params (2026-06-17)
+
+Allows `List<T>` in query params and request headers (the batch-endpoint gap from
+the fixture audit), where `T` is a permitted scalar (`Int`/`Float`/`Bool`/`String`/
+`DateTime`/`Uuid`/`Decimal`) or a simple enum. `List<Money>`/`List<struct>`/
+`List<tagged-enum>`/nested `List`/`List<Map>`, `Option<List<…>>`, and a default on
+a list are all rejected by sema (`check_list_param`).
+
+**Wire format** Query params
+use **repeated keys** (`?ids=a&ids=b`) — clean everywhere (nothing collapses query
+strings; FastAPI `list[T]=Query()`, Go `r.URL.Query()[k]`, Express/Fastify array
+parsing, OpenAPI `style: form, explode: true` default). Request headers use
+**comma-separated** values (`X-Role: a,b`), NOT repeated header lines: Node (both
+`fetch`'s `Headers` and the http server) collapses duplicate request headers to a
+single `", "`-joined value, and FastAPI's native `list[str]` header parsing then
+can't recover them — so repeated header lines do NOT round-trip cross-language.
+Comma-separated (join on send; on receive, join any multiple values then split on
+`,` and trim) is the only encoding that works across Go/Node/Python. Caveat: a
+comma inside a header element value mis-splits (documented; rare for header lists).
+OpenAPI gets this for free — a header array param's default `style: simple` IS
+comma-separated.
+
+**Per target.** Client: append one query value per element (Go `url.Values.Add`,
+TS `params.append`, Python list value via httpx) / comma-join the encoded header
+elements into one value. Server: query reads all values for the key and coerces
+each (Go `r.URL.Query()[k]`, TS `toStringArray(...).map`, Python FastAPI native
+`list[T] = Query(default_factory=list)`); a list request header is received as a
+raw `str`/joined value and split+trimmed+coerced (Go inline split, TS
+`splitHeaderList`, Python a `str` Header param split into `<name>_items` in the
+route body before the handler call — FastAPI can't split a comma header into
+`list[T]` natively). Enum list elements are validated per element (Go `Valid()`→400,
+TS `parse<Enum>`→400; Python query elements via FastAPI→422, header elements
+construct the enum → ValueError→500, a documented minor divergence). The shared
+`param_enum_names` now unwraps `List<…>` so a `List<Enum>` element gets its
+validator. A `Uuid`/`Decimal` element is format-checked per element on the server
+(Go against the shared `uuidRe`/`decimalRe` matcher → 400, TS `parseUuid`/
+`parseDecimal` → 400; Python *query* elements via FastAPI `list[UUID]`/`Decimal`
+coercion → 422, but a `Uuid`/`Decimal` *header* element — coerced manually with
+`UUID(...)`/`Decimal(...)` in the route body, exactly like the numeric/enum header
+elements below — raises → 500, the same documented header divergence, not 422); a
+plain `String` (Go `string`) appends unconverted to dodge `unconvert`. (The Go
+*scalar* `Uuid`/`Decimal` query/header path was format-lenient when this slice
+landed; it was tightened the next day so a list element and a scalar validate
+identically — see *"tighten scalar query/header `Uuid`/`Decimal` validation on
+Go (2026-06-18)"* below.)
+
+The same query-vs-header status divergence applies to malformed *numeric*
+elements: a bad `List<Int>`/`List<Float>` query element is dropped (Go/TS scalar
+leniency) or 422'd (Python FastAPI), whereas a bad numeric **header** element
+raises on coercion (Python `int(...)`→500; Go/TS keep the scalar-header leniency
+and skip it). This matches the existing scalar-header behavior and is accepted as
+a minor divergence, not a defect.
+
+**Out of scope (deferred).** Response-header lists (the server-write/client-read
+paths don't handle them — sema rejects `List` response headers).
+
+**Verification.** `LIST_PARAM_SCHEMA` (`List` of `Uuid`/`String`/`Int`/`DateTime`/
+enum query params + a `List<String>` and a `List<enum>` request header) is wired
+into the compile-lint harness on all four targets and both server frameworks —
+green. `LIST_RT_SCHEMA` + bespoke `list/go`, `typescript/list-run.ts` (shared by
+`list-driver.ts`/`list-driver-fastify.ts`), `python/list_driver.py` assert multiple
+elements (and the empty list) round-trip in both directions. Query params AND
+request headers each carry EVERY permitted element type
+(`String`/`Int`/`Uuid`/`Status`/`Float`/`Bool`/`DateTime`/`Decimal`), because the
+query and header paths diverge per target — most sharply in Python, where a query
+`list[T]` rides FastAPI's native parsing + the `py_list_query_value` client encoders
+while a header is split + coerced manually in the route body — so each path needs
+its own typed element per type or those branches go untested. The `List<Status>`
+(simple enum) and branded/format-checked `List<Uuid>` query elements also drive the
+per-element reject path (Go `Valid()`/`uuidRe`→400, TS `parseStatus`/`parseUuid`→400,
+Python FastAPI→422). The TS round-trip runs against BOTH Express and Fastify (list
+query params arrive as a repeated-key array via a framework-specific parser, so both
+must be driven to prove the array shape `toStringArray` normalizes arrives) — **25
+round-trips total** (the prior 22 + 3 list). Dedicated sema accept/reject
+tests cover every element-type rule (simple-enum/scalar accept; `Option<List>`,
+default-on-list, `List<struct>`, `List<tagged-enum>`, nested-collection, and
+list-response-header reject); parser 208, sema 488, codegen 244 lib tests +
+integration suites green; clippy clean.
+
+## Phoenix Gen — tighten scalar query/header `Uuid`/`Decimal` validation on Go (2026-06-18)
+
+Closes the long-documented Go "weak link": scalar `Uuid`/`Decimal` query params and
+request headers reached the handler **unvalidated** on the Go target (a malformed
+value passed straight through), whereas TS validated them inline via
+`parseUuid`/`parseDecimal` and Python via FastAPI's `UUID`/`Decimal` coercion. The
+divergence was called out across the UUID, Decimal, and enum-param slices as an
+accepted weak spot and a possible future cleanup; this slice does that cleanup —
+and, while closing it, also fixes the TS *status code* (see "TypeScript" below): TS
+rejected the malformed value but with a **500**, not the 400 an enum param already
+gave, because `parse*` threw a plain `Error` rather than `ValidationError`.
+
+**Change.** `emit_query_param_parse` / `emit_header_param_parse` now format-check a
+`Uuid`/`Decimal` param against the shared `uuidRe`/`decimalRe` matcher var,
+rejecting a malformed value with 400 — the required branch also rejects an absent
+(empty) value, matching the enum required path. Both Go `string`, so the value is
+read without a conversion (no `unconvert`). This brings the **scalar** path in line
+with the `List`-element path tightened the day before (`go_list_elem_append`), so a
+`Uuid`/`Decimal` validates identically whether it rides as a scalar param or a
+`List`-valued param element, across all three targets. The matcher var lives in
+types.go (composed before the server routes that reference it), so the pre-scan in
+`generate` that registers it now unwraps a single `Option<…>`/`List<…>` to catch
+every position.
+
+**TypeScript (same slice).** TS already ran `parseUuid`/`parseDecimal` on each
+query/header `Uuid`/`Decimal` (scalar or `List` element), but those threw a plain
+`Error`, which the route's catch never matched against the `ValidationError → 400`
+guard — so a malformed value surfaced as a catch-all **500** (e.g. a batch
+`GET ?ids=<bad-uuid>` 500'd), diverging from the 400 an enum param gave and from
+Go's new 400. Fixed by making `parse*` throw `ValidationError` (the class is now
+emitted wherever a branded scalar is used) and extending the route's guard
+predicate (`emit_route_error_catch`) + the `ValidationError` server import to fire
+for a `Uuid`/`Decimal` query/header param. So a malformed `Uuid`/`Decimal` now
+rejects with **400** on both Go and TS (Python: 422 from FastAPI), regardless of
+what else the endpoint carries. (Side effect, intended: `parse*` failures elsewhere
+— a constrained body's branded field server-side, or a malformed branded value in a
+*response* client-side — now also throw `ValidationError`, an `Error` subclass, so
+no caller breaks; a constrained body's bad branded field now 400s too, instead of
+500.)
+
+**Still a weak link (unchanged, separate code path).** Go's struct `Validate()`
+still does not recurse into `List<Uuid>`/`Map<String, Uuid>` (or `List<Money>`)
+**field** elements — see [known-issues.md](known-issues.md). That is the
+general-nested-validation feature, orthogonal to this query/header-param slice.
+
+**Verification.** Compile-lint: `UUID_SCHEMA`/`DECIMAL_SCHEMA` gained `Option<Uuid>`/
+`Option<Decimal>` query + request-header params so all four parse branches (scalar/
+`Option` × query/header) are exercised; all four targets green. The Go UUID and
+Decimal wire round-trips **flip** their former accept assertion to a reject: a
+malformed `ref`/`minAmount` query value now 400s (non-nil client error). The TS
+UUID/Decimal drivers (and the list driver's `List<Uuid>` element) now issue a raw
+`fetch` and assert the exact **400** — pinning the plain-`Error`→500 fix, not just
+"client threw" — so Go and TS agree on 400 (Python 422). Clippy clean; 244 codegen
+lib tests green; 25 round-trips green.

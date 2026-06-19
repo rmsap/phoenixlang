@@ -107,8 +107,9 @@ async def main() -> None:
     if bad.status_code < 400:
         fail(f"server accepted malformed body decimal: HTTP {bad.status_code}")
 
-    # Reject path (query decimal): unlike Go, Python validates query decimals —
-    # FastAPI coerces the `min_amount: Decimal` param and 422s on malformed input.
+    # Reject path (query decimal): Python validates query decimals — FastAPI
+    # coerces the `min_amount: Decimal` param and 422s on malformed input. Go now
+    # format-checks the same params against `decimalRe`, so all three targets agree.
     bad_q = await client.client.get("/quote/inv-1", params={"minAmount": "not-a-number"})
     if bad_q.status_code < 400:
         fail(f"server accepted malformed query decimal: HTTP {bad_q.status_code}")

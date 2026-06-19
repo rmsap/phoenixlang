@@ -110,15 +110,10 @@ func TestUuidRoundtrip(t *testing.T) {
 		t.Fatal("server accepted malformed body uuid (Validate() did not reject)")
 	}
 
-	// Accept path (query uuid): Go validates ONLY body fields (via Validate()),
-	// never query/header uuids — the documented weak link. A malformed query
-	// uuid must therefore round-trip unchanged rather than error, pinning the
-	// TS-validates / Go-accepts divergence (the TS driver asserts the opposite).
-	r3, err := client.GetAccount("acct-1", "not-a-uuid")
-	if err != nil {
-		t.Fatalf("getAccount with malformed query uuid errored (Go must not validate it): %v", err)
-	}
-	if r3.Body.Id != "not-a-uuid" {
-		t.Fatalf("malformed query uuid not echoed back: got %s", r3.Body.Id)
+	// Reject path (query uuid): Go now format-checks query/request-header `Uuid`s
+	// against `uuidRe` inline on the server (parallel to TS/Python), so a malformed
+	// `ref` must be rejected with 400, surfacing as a non-nil client error.
+	if _, err := client.GetAccount("acct-1", "not-a-uuid"); err == nil {
+		t.Fatal("server accepted malformed query uuid (uuidRe check did not reject)")
 	}
 }

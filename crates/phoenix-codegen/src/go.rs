@@ -209,6 +209,9 @@ struct GoGenerator<'a> {
     client_needs_url: bool,
     /// Whether client.go needs a `"strconv"` import (any non-String query param).
     client_needs_strconv: bool,
+    /// Whether client.go needs a `"strings"` import (a list-valued request header
+    /// is sent comma-joined via `strings.Join`).
+    client_needs_strings: bool,
     /// Whether client.go needs a `"bytes"` import (any endpoint has a request body).
     client_needs_bytes: bool,
     /// Whether client.go needs an `"encoding/json"` import (any endpoint has a
@@ -267,6 +270,7 @@ impl<'a> GoGenerator<'a> {
             client_needs_fmt: false,
             client_needs_url: false,
             client_needs_strconv: false,
+            client_needs_strings: false,
             client_needs_bytes: false,
             client_needs_json: false,
             server_needs_json: false,
@@ -287,6 +291,26 @@ impl<'a> GoGenerator<'a> {
     /// from the program AST.
     fn generate(mut self, program: &Program) -> GoFiles {
         self.param_enums = crate::param_enum_names(program, self.check_result);
+        // A `Uuid`/`Decimal` query/header param — scalar, `Option`-wrapped, or a
+        // `List` element — is format-checked server-side (`emit_query_param_parse`/
+        // `emit_header_param_parse`/`go_list_elem_append`), parallel to the TS/Python
+        // coercion. The matcher var lives in types.go, which is composed below before
+        // the server routes reference it — so register the var here, up front, rather
+        // than during server emission (too late).
+        for ep in &self.check_result.endpoints {
+            let param_types = ep
+                .query_params
+                .iter()
+                .map(|q| &q.ty)
+                .chain(ep.headers.iter().map(|h| &h.ty));
+            for ty in param_types {
+                // Unwrap a single `Option<…>`/`List<…>` to reach the scalar.
+                let scalar = crate::unwrap_option_or_list(ty);
+                if let Some((re, _)) = regex_scalar(scalar) {
+                    self.types_regex_vars.insert(re);
+                }
+            }
+        }
         // ── types.go (body — header/imports composed at end) ────
         // The composite `Money` built-in (struct + `Validate()` + the ISO-4217
         // `currencyCodes` set), once, before the user structs that may embed it.
@@ -433,6 +457,9 @@ impl<'a> GoGenerator<'a> {
             }
             if self.client_needs_strconv {
                 imports.push("\"strconv\"");
+            }
+            if self.client_needs_strings {
+                imports.push("\"strings\"");
             }
             // See the types.go note: `time.Time` in the body is the exact
             // condition for the `time` import (a `DateTime` param/field/return).
@@ -1211,6 +1238,19 @@ impl<'a> GoGenerator<'a> {
                 .push_str(&format!("\t{qv} := url.Values{{}}\n"));
             for qp in &ep.query_params {
                 let name = to_camel(&qp.name);
+                // A list-valued query param (`List<T>`) is repeated on the wire:
+                // append one `key=value` pair per element via `url.Values.Add`.
+                if let Type::Generic(lname, largs) = &qp.ty
+                    && lname == "List"
+                    && largs.len() == 1
+                {
+                    let enc = go_scalar_encode(&largs[0], "e", &mut self.client_needs_strconv);
+                    self.client_out.push_str(&format!(
+                        "\tfor _, e := range {name} {{\n\t\t{qv}.Add(\"{}\", {enc})\n\t}}\n",
+                        qp.name
+                    ));
+                    continue;
+                }
                 let (optional, inner) = query_param_shape(&qp.ty);
                 // For an optional query param the value is a pointer; only set it
                 // when non-nil, dereferencing for the formatting expression.
@@ -1323,6 +1363,22 @@ impl<'a> GoGenerator<'a> {
         // wire name from sema is the single source of truth — never recomputed.
         for h in &ep.headers {
             let name = to_camel(&h.name);
+            // A list-valued request header (`List<T>`) is sent comma-joined in a
+            // single header value (NOT repeated lines — Node collapses duplicate
+            // request headers to `", "`-joined, which would mis-split). The server
+            // splits on `,`.
+            if let Type::Generic(lname, largs) = &h.ty
+                && lname == "List"
+                && largs.len() == 1
+            {
+                self.client_needs_strings = true;
+                let enc = go_scalar_encode(&largs[0], "e", &mut self.client_needs_strconv);
+                self.client_out.push_str(&format!(
+                    "\t{{\n\t\tparts := make([]string, 0, len({name}))\n\t\tfor _, e := range {name} {{\n\t\t\tparts = append(parts, {enc})\n\t\t}}\n\t\t{}.Header.Set(\"{}\", strings.Join(parts, \",\"))\n\t}}\n",
+                    locals.req, h.wire_name
+                ));
+                continue;
+            }
             let (optional, inner) = query_param_shape(&h.ty);
             let value_expr = if optional {
                 format!("*{name}")
@@ -2133,11 +2189,24 @@ impl<'a> GoGenerator<'a> {
     /// `type T string`) are produced via a direct `T(v)` conversion. A param-enum
     /// (in [`Self::param_enums`]) is additionally validated against the generated
     /// `Valid()` method, rejecting an unknown variant — or a missing required
-    /// value — with 400; the other named types (`Uuid`/`Decimal`) stay unchecked,
-    /// reaching the handler as-is (an out-of-range value 500s rather than 400s).
+    /// value — with 400. A `Uuid`/`Decimal` is likewise format-checked against its
+    /// shared matcher var (`uuidRe`/`decimalRe`), rejecting a malformed (or absent
+    /// required) value with 400. Any other named type stays unchecked.
     fn emit_query_param_parse(&mut self, qp: &QueryParamInfo) {
         let camel = to_camel(&qp.name);
         let name = &qp.name;
+        // A list-valued query param: one slice element per repeated wire value.
+        if let Type::Generic(lname, largs) = &qp.ty
+            && lname == "List"
+            && largs.len() == 1
+        {
+            let elem_go = type_to_go(&largs[0]);
+            let append = self.go_list_elem_append(&largs[0], &camel, "query param", name, "\t\t\t");
+            self.server_out.push_str(&format!(
+                "\t\t{camel} := []{elem_go}{{}}\n\t\tfor _, v := range r.URL.Query()[\"{name}\"] {{\n{append}\t\t}}\n"
+            ));
+            return;
+        }
         let (optional, inner) = query_param_shape(&qp.ty);
 
         // Optional params deliberately ignore `qp.default_value`: `Option<T>`
@@ -2182,9 +2251,19 @@ impl<'a> GoGenerator<'a> {
                         "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\tif !cv.Valid() {{\n\t\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &cv\n\t\t}}\n"
                     )
                 }
+                Type::Uuid | Type::Decimal => {
+                    // A `Uuid`/`Decimal` (Go `string`) is format-checked against the
+                    // shared matcher var, rejecting a malformed value with 400 —
+                    // parallel to the TS/Python scalar coercion and the list path.
+                    let go_type = type_to_go(inner);
+                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    format!(
+                        "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tif !{re}.MatchString(v) {{\n\t\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &v\n\t\t}}\n"
+                    )
+                }
                 other => {
-                    // Other named string-backed types (`Uuid`/`Decimal`): convert
-                    // the raw value unchecked, matching their body/field handling.
+                    // Any other named string-backed type: convert the raw value
+                    // unchecked, matching its body/field handling.
                     let go_type = type_to_go(other);
                     format!(
                         "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\t{camel} = &cv\n\t\t}}\n"
@@ -2250,9 +2329,22 @@ impl<'a> GoGenerator<'a> {
                         "{camel} := {seed}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\t{camel} = {go_type}(v)\n\t\t}}\n\t\tif !{camel}.Valid() {{\n\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
                     )
                 }
+                Type::Uuid | Type::Decimal => {
+                    // A required `Uuid`/`Decimal` (Go `string`) is format-checked
+                    // against the shared matcher var — an absent (empty) or malformed
+                    // value is rejected with 400, parallel to the enum required path
+                    // and the TS/Python scalar coercion. Unlike the scalar arms above,
+                    // `qp.default_value` is intentionally NOT seeded: a `Uuid`/`Decimal`
+                    // has no literal-default form (sema accepts only Int/Float/Bool/
+                    // String defaults), so there is never a default to honor here.
+                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    format!(
+                        "{camel} := r.URL.Query().Get(\"{name}\")\n\t\tif !{re}.MatchString({camel}) {{\n\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
+                    )
+                }
                 other => {
-                    // Other named string-backed types (`Uuid`/`Decimal`): unchecked
-                    // string conversion, matching their body/field handling.
+                    // Any other named string-backed type: unchecked string
+                    // conversion, matching its body/field handling.
                     let go_type = type_to_go(other);
                     format!("{camel} := {go_type}(r.URL.Query().Get(\"{name}\"))\n")
                 }
@@ -2261,6 +2353,62 @@ impl<'a> GoGenerator<'a> {
 
         self.server_out.push_str("\t\t");
         self.server_out.push_str(&body);
+    }
+
+    /// Emits the loop-body statement(s) coercing one wire string `v` into an `elem`
+    /// and appending it to `slice` (the caller emits the surrounding range loop over
+    /// `r.URL.Query()["name"]` or the split header values; `indent` is that loop
+    /// body's indentation). Numerics/`DateTime` skip a malformed element (matching
+    /// the scalar leniency); an enum element is validated against its `Valid()`,
+    /// rejecting an unknown variant with 400. A `String` (Go `string`) appends
+    /// unconverted; a `Uuid`/`Decimal` (also Go `string`) is format-checked against
+    /// the shared matcher var and rejects a malformed element with 400 — parallel
+    /// to the TS/Python per-element validation. `kind`/`name` feed those 400
+    /// messages. The matcher var is registered by the pre-scan in [`Self::generate`]
+    /// (types.go is composed before the server routes that reference it).
+    fn go_list_elem_append(
+        &mut self,
+        elem: &Type,
+        slice: &str,
+        kind: &str,
+        name: &str,
+        indent: &str,
+    ) -> String {
+        let elem_go = type_to_go(elem);
+        let i2 = format!("{indent}\t");
+        match elem {
+            Type::Int => {
+                self.server_needs_strconv = true;
+                format!(
+                    "{indent}if n, err := strconv.ParseInt(v, 10, 64); err == nil {{\n{i2}{slice} = append({slice}, n)\n{indent}}}\n"
+                )
+            }
+            Type::Float => {
+                self.server_needs_strconv = true;
+                format!(
+                    "{indent}if n, err := strconv.ParseFloat(v, 64); err == nil {{\n{i2}{slice} = append({slice}, n)\n{indent}}}\n"
+                )
+            }
+            Type::Bool => {
+                self.server_needs_strconv = true;
+                format!(
+                    "{indent}if b, err := strconv.ParseBool(v); err == nil {{\n{i2}{slice} = append({slice}, b)\n{indent}}}\n"
+                )
+            }
+            Type::String => format!("{indent}{slice} = append({slice}, v)\n"),
+            Type::Uuid | Type::Decimal => {
+                let re = regex_scalar(elem).expect("uuid/decimal regex var").0;
+                format!(
+                    "{indent}if !{re}.MatchString(v) {{\n{i2}http.Error(w, \"invalid {kind}: {name}\", http.StatusBadRequest)\n{i2}return\n{indent}}}\n{indent}{slice} = append({slice}, v)\n"
+                )
+            }
+            Type::DateTime => format!(
+                "{indent}if t, err := time.Parse(time.RFC3339, v); err == nil {{\n{i2}{slice} = append({slice}, t)\n{indent}}}\n"
+            ),
+            _ => format!(
+                "{indent}cv := {elem_go}(v)\n{indent}if !cv.Valid() {{\n{i2}http.Error(w, \"invalid {kind}: {name}\", http.StatusBadRequest)\n{i2}return\n{indent}}}\n{indent}{slice} = append({slice}, cv)\n"
+            ),
+        }
     }
 
     /// Emits server-side parsing for a single REQUEST header into a local whose
@@ -2272,6 +2420,21 @@ impl<'a> GoGenerator<'a> {
     fn emit_header_param_parse(&mut self, h: &HeaderParamInfo) {
         let camel = to_camel(&h.name);
         let wire = &h.wire_name;
+        // A list-valued request header: comma-separated on the wire. Join any
+        // multiple header values (a non-conforming client may repeat the line),
+        // split on `,`, trim each element, and skip an empty header (→ empty list).
+        if let Type::Generic(lname, largs) = &h.ty
+            && lname == "List"
+            && largs.len() == 1
+        {
+            self.server_needs_strings = true;
+            let elem_go = type_to_go(&largs[0]);
+            let append = self.go_list_elem_append(&largs[0], &camel, "header", wire, "\t\t\t\t");
+            self.server_out.push_str(&format!(
+                "\t\t{camel} := []{elem_go}{{}}\n\t\tif hv := strings.TrimSpace(strings.Join(r.Header.Values(\"{wire}\"), \",\")); hv != \"\" {{\n\t\t\tfor _, v := range strings.Split(hv, \",\") {{\n\t\t\t\tv = strings.TrimSpace(v)\n{append}\t\t\t}}\n\t\t}}\n"
+            ));
+            return;
+        }
         let (optional, inner) = query_param_shape(&h.ty);
 
         let body = if optional {
@@ -2312,8 +2475,18 @@ impl<'a> GoGenerator<'a> {
                         "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\tif !cv.Valid() {{\n\t\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &cv\n\t\t}}\n"
                     )
                 }
+                Type::Uuid | Type::Decimal => {
+                    // A `Uuid`/`Decimal` (Go `string`) header is format-checked
+                    // against the shared matcher var, rejecting a malformed value
+                    // with 400 — parallel to the TS/Python scalar coercion.
+                    let go_type = type_to_go(inner);
+                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    format!(
+                        "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tif !{re}.MatchString(v) {{\n\t\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &v\n\t\t}}\n"
+                    )
+                }
                 other => {
-                    // Other named string-backed types (`Uuid`/`Decimal`): unchecked.
+                    // Any other named string-backed type: unchecked.
                     let go_type = type_to_go(other);
                     format!(
                         "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\t{camel} = &cv\n\t\t}}\n"
@@ -2376,8 +2549,18 @@ impl<'a> GoGenerator<'a> {
                         "{camel} := {seed}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel} = {go_type}(v)\n\t\t}}\n\t\tif !{camel}.Valid() {{\n\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
                     )
                 }
+                Type::Uuid | Type::Decimal => {
+                    // A required `Uuid`/`Decimal` (Go `string`) header is
+                    // format-checked against the shared matcher var — an absent
+                    // (empty) or malformed value is rejected with 400, parallel to
+                    // the enum required path and the TS/Python scalar coercion.
+                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    format!(
+                        "{camel} := r.Header.Get(\"{wire}\")\n\t\tif !{re}.MatchString({camel}) {{\n\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
+                    )
+                }
                 other => {
-                    // Other named string-backed types (`Uuid`/`Decimal`): unchecked.
+                    // Any other named string-backed type: unchecked.
                     let go_type = type_to_go(other);
                     format!("{camel} := {go_type}(r.Header.Get(\"{wire}\"))\n")
                 }
@@ -2837,6 +3020,34 @@ fn page_type_name(ep: &EndpointInfo) -> String {
 /// envelopes (all three are mutually exclusive per sema).
 fn multi_status_type_name(ep: &EndpointInfo) -> String {
     format!("{}Response", to_pascal_case(&ep.name))
+}
+
+/// Renders a Go expression encoding a single scalar `value_expr` to its wire
+/// string for a repeated query/header element (`List<T>`). Mirrors the scalar
+/// query/header encoding: `String`/`Uuid`/`Decimal` (all Go `string`) pass through
+/// unconverted (no `unconvert` lint), `DateTime` formats RFC 3339, an enum (a named
+/// `string` type) takes a `string(...)` conversion, and numerics/bool use `strconv`.
+fn go_scalar_encode(elem: &Type, value_expr: &str, needs_strconv: &mut bool) -> String {
+    match elem {
+        Type::Int => {
+            *needs_strconv = true;
+            format!("strconv.FormatInt({value_expr}, 10)")
+        }
+        Type::Float => {
+            *needs_strconv = true;
+            format!("strconv.FormatFloat({value_expr}, 'f', -1, 64)")
+        }
+        Type::Bool => {
+            *needs_strconv = true;
+            format!("strconv.FormatBool({value_expr})")
+        }
+        // `String` and the validated-string scalars (`Uuid`/`Decimal`) are already
+        // Go `string`s — a `string(...)` conversion would trip `unconvert`.
+        Type::String | Type::Uuid | Type::Decimal => value_expr.to_string(),
+        Type::DateTime => format!("{value_expr}.Format(time.RFC3339)"),
+        // An enum is a named `string` type — convert it to a plain `string`.
+        _ => format!("string({value_expr})"),
+    }
 }
 
 /// Renders a Go expression that stringifies a header value for the wire,

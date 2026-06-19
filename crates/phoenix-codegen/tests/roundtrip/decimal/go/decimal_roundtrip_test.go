@@ -106,14 +106,11 @@ func TestDecimalRoundtrip(t *testing.T) {
 		t.Fatal("server accepted malformed body decimal (Validate() did not reject)")
 	}
 
-	// Accept path (query decimal): Go validates ONLY body fields, never
-	// query/header decimals — the documented weak link. A malformed query decimal
-	// must round-trip unchanged rather than error (the TS driver asserts the opposite).
-	r3, err := client.GetQuote("inv-1", "not-a-number")
-	if err != nil {
-		t.Fatalf("getQuote with malformed query decimal errored (Go must not validate it): %v", err)
-	}
-	if r3.Body.Subtotal != "not-a-number" {
-		t.Fatalf("malformed query decimal not echoed back: got %s", r3.Body.Subtotal)
+	// Reject path (query decimal): Go now format-checks query/request-header
+	// `Decimal`s against `decimalRe` inline on the server (parallel to TS/Python),
+	// so a malformed `minAmount` must be rejected with 400, surfacing as a non-nil
+	// client error.
+	if _, err := client.GetQuote("inv-1", "not-a-number"); err == nil {
+		t.Fatal("server accepted malformed query decimal (decimalRe check did not reject)")
 	}
 }

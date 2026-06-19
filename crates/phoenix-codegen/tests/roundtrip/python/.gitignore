@@ -9,6 +9,7 @@ generated_decimal/
 generated_money/
 generated_enum/
 generated_projection/
+generated_list/
 contract.json
 
 # Python bytecode caches.
