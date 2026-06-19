@@ -98,12 +98,14 @@ pub(super) struct MergeOutcome {
 /// `phx_*` lookup table plus the memory-pages floor the runtime
 /// requires.
 ///
-/// `builder` must be in its initial state — no imports, no functions,
-/// no memory. PR 3a's pipeline runs `merge_runtime` before any other
-/// section-mutating call on `builder`. `builder.memories` must be empty
-/// in particular: the runtime's memory declaration becomes the merged
-/// module's sole memory (we don't currently support two memories in
-/// the merged module).
+/// `builder` must have no local functions and no memory yet. It MAY already
+/// carry custom `extern js` function imports declared by
+/// [`ModuleBuilder::declare_extern_import`] — the merge appends the
+/// runtime's WASI imports after them and assigns runtime-local indices via the
+/// live `import_func_count`, so a few pre-declared imports shift everything up
+/// consistently. `builder.memories` must be empty in particular: the runtime's
+/// memory declaration becomes the merged module's sole memory (we don't
+/// currently support two memories in the merged module).
 pub(super) fn merge_runtime(
     builder: &mut ModuleBuilder,
     runtime_bytes: &[u8],

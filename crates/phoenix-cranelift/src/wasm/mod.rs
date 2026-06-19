@@ -133,9 +133,18 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
 
     let mut builder = ModuleBuilder::new();
 
-    // Merge first: every `phx_*` runtime symbol must resolve to a
-    // merged-module function index before the user-side translator
-    // (which looks up names like `phx_print_i64`) runs.
+    // Declare custom `extern js` imports BEFORE the merge. Imports
+    // and local functions share one index space (imports first), so these must
+    // occupy import indices ahead of the runtime's local functions — declaring
+    // them after the merge would collide a new import index with an already-
+    // assigned runtime-local index. `add_local_function` is purely relative to
+    // the live `import_func_count`, so the merge's index bookkeeping shifts up
+    // consistently. See `translate::declare_extern_imports`.
+    translate::declare_extern_imports(&mut builder, ir_module)?;
+
+    // Merge: every `phx_*` runtime symbol must resolve to a merged-module
+    // function index before the user-side translator (which looks up names like
+    // `phx_print_i64`) runs.
     let outcome = runtime_merge::merge_runtime(&mut builder, &runtime_bytes)?;
     builder.finalize_merge(
         outcome.phx_funcs,

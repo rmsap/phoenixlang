@@ -165,17 +165,82 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
         // identical, so the codegen treats them uniformly.
         IrType::StringRef | IrType::DynRef(_) => Ok(vec![ValType::I32, ValType::I32]),
         ty if is_gc_pointer_type(ty) => Ok(vec![ValType::I32]),
-        // `JsValue` is an `i32` JS-side table index on `wasm32-linear`, but the
-        // op that produces one (`Op::ExternCall`) has no wasm binding yet (the
-        // JS glue lands in Phase 2.5 PRs 5–8), so no program can materialize a
-        // `JsValue` to lay out here. Reject explicitly rather than via the
-        // generic wildcard so the gap names the feature and its landing PR.
-        IrType::JsValue => Err(CompileError::new(
-            "wasm32-linear: `JsValue` host handles are not supported yet — the \
-             `extern js` JS-glue binding lands in Phase 2.5 PRs 5–8",
-        )),
+        // `JsValue` is a single `i32` JS-side table index on `wasm32-linear`
+        // (Phase 2.5, decision D) — a plain opaque host handle, not a
+        // Phoenix-heap pointer. It crosses the `extern js` boundary as one i32;
+        // the JS glue that owns the handle space lands in PR 6.
+        IrType::JsValue => Ok(vec![ValType::I32]),
         _ => Err(unsupported(ty, "wasm32-linear value representation")),
     }
+}
+
+/// Declare a custom WASM function import for every *called* `extern js` function.
+/// Scans every concrete function for [`Op::ExternCall`] and derives
+/// each extern's WASM signature from its call site — the flattened arg value
+/// types as params, the instruction's `result_type` as the return — declaring
+/// one import per distinct `(module, name)`.
+///
+/// Only externs actually *called* get an import: a declared-but-uncalled extern
+/// produces no `Op::ExternCall` and so no dangling import.
+///
+/// The signature is taken from the *first* call site (`declare_extern_import` is
+/// idempotent, so later sites short-circuit). This couples the import signature
+/// to call-site arg/result IR types rather than the extern's declared signature
+/// in sema's table — which is sound because sema coerces every argument to the
+/// declared parameter type and rejects non-marshallable types, so every site of
+/// a given extern agrees and matches the declaration. The body translator's
+/// `Op::ExternCall` arm reads the same per-site bindings when it emits the
+/// `call`, so the declared import signature and the emitted operands stay in
+/// lockstep by construction. (The IR carries no extern declaration table, only
+/// `Op::ExternCall` sites, so call-site derivation is also the only signal
+/// available here without re-threading sema state into the backend.)
+///
+/// This is a deliberate **separate pass**, not folded into
+/// [`ModuleBuilder::declare_phoenix_functions`]: extern imports **must run
+/// before the runtime merge** so they occupy import indices ahead of the
+/// runtime's local functions (see [`ModuleBuilder::declare_extern_import`]),
+/// whereas `declare_phoenix_functions` runs *after* the merge. The two can't
+/// share one walk. The JS glue that satisfies these imports lands in PR 6.
+pub(super) fn declare_extern_imports(
+    b: &mut ModuleBuilder,
+    ir_module: &phoenix_ir::module::IrModule,
+) -> Result<(), CompileError> {
+    for func in ir_module.concrete_functions() {
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                let Op::ExternCall(module, name, args) = &instr.op else {
+                    continue;
+                };
+                if b.get_extern_import(module, name).is_some() {
+                    continue;
+                }
+                let mut params = Vec::new();
+                for arg in args {
+                    let ty = func.instruction_result_type(*arg).ok_or_else(|| {
+                        CompileError::new(format!(
+                            "wasm32-linear: `extern js` call `{module}.{name}` argument \
+                             {arg:?} has no recorded IR type (internal compiler bug)"
+                        ))
+                    })?;
+                    params.extend(wasm_valtypes_for(ty).map_err(|e| {
+                        CompileError::new(format!(
+                            "wasm32-linear: `extern js` call `{module}.{name}` argument \
+                             {arg:?}: {}",
+                            e.message
+                        ))
+                    })?);
+                }
+                let returns = wasm_valtypes_for(&instr.result_type).map_err(|e| {
+                    CompileError::new(format!(
+                        "wasm32-linear: `extern js` call `{module}.{name}` return type: {}",
+                        e.message
+                    ))
+                })?;
+                b.declare_extern_import(module, name, &params, &returns);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject a placeholder-typed field at codegen. Used at both the
@@ -1415,6 +1480,58 @@ fn translate_instruction(
         }
         Op::BuiltinCall(name, args) => {
             translate_builtin_call(ctx, b, ir_module, name, args, instr)?
+        }
+
+        // `extern js` host call. The import was declared up front by
+        // `declare_extern_imports` (before the runtime merge); here we just push
+        // the marshalled args and `call` the import index. The value-level
+        // marshalling on the wasm side (e.g. string staging) is the same
+        // load/store the runtime ABI already uses — `StringRef` is its 2-slot
+        // `(ptr, len)`, `JsValue` its 1-slot i32 handle, etc. The JS glue that
+        // *satisfies* this import lands in PR 6.
+        Op::ExternCall(module, name, args) => {
+            let import_idx = b.get_extern_import(module, name).ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-linear: no import declared for `extern js` call \
+                     `{module}.{name}` (internal compiler bug — `declare_extern_imports` \
+                     must run before the merge)"
+                ))
+            })?;
+            // Classify the result binding *before* emitting anything so the
+            // internal-bug guards stay side-effect-free (a malformed pairing
+            // returns `Err` without leaving a dangling `call` and unconsumed
+            // return values on the operand stack).
+            let result_vid = match (instr.result, &instr.result_type) {
+                (Some(_), IrType::Void) => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `extern js` call `{module}.{name}` has a result \
+                         binding but a Void return type (internal compiler bug)"
+                    )));
+                }
+                // A non-void result is stored even when the source discards it
+                // (a bare-statement call): `lower::emit` allocates a result vid
+                // whenever the result type is non-`Void`, so this arm fires and
+                // `emit_store_result` writes into a dead local. Pinned by
+                // `discarded_value_returning_extern_result_validates`.
+                (Some(vid), ty) => Some((vid, ty.clone())),
+                (None, IrType::Void) => None,
+                // Unreachable defensive guard: because `emit` always allocates a
+                // result vid for a non-`Void` result type, an `Op::ExternCall`
+                // with a non-`Void` `result_type` always carries `Some(result)`.
+                (None, ty) => {
+                    return Err(CompileError::new(format!(
+                        "wasm32-linear: `extern js` call `{module}.{name}` returns \
+                         `{ty:?}` but has no result binding (internal compiler bug)"
+                    )));
+                }
+            };
+            for arg in args {
+                ctx.emit_load_all(*arg)?;
+            }
+            ctx.emit(Instruction::Call(import_idx));
+            if let Some((vid, ty)) = result_vid {
+                ctx.emit_store_result(vid, ty)?;
+            }
         }
 
         // --- Mutable-variable surface --------------------------------

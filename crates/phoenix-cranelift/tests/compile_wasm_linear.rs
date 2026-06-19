@@ -2226,8 +2226,14 @@ fn collections_runs_under_wasmtime() {
 /// This is a structural-tier assertion (no wasmtime needed), so it runs
 /// on every host once the wasm runtime artifact is built — it does not
 /// gate on `PHOENIX_REQUIRE_WASMTIME`.
+/// A wasm32-linear module's non-WASI imports are
+/// *exactly* the `extern js` functions the program calls. This fixture
+/// (`COLLECTIONS_SOURCE`) declares no externs, so the only imports are WASI — a
+/// custom host import leaking in for an extern-free program would be a bug. The
+/// extern-import case (non-empty externs) is pinned by
+/// `extern_js_emits_custom_imports_and_validates` below.
 #[test]
-fn only_wasi_imports_on_wasm32_linear() {
+fn extern_free_program_imports_only_wasi_on_wasm32_linear() {
     compile_or_skip(COLLECTIONS_SOURCE, "collections_host_surface", |bytes| {
         let imports =
             import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
@@ -2242,9 +2248,331 @@ fn only_wasi_imports_on_wasm32_linear() {
             .collect();
         assert!(
             non_wasi.is_empty(),
-            "wasm32-linear module imports from non-WASI namespaces — a custom \
-             host dependency leaked in ahead of Phase 2.5: {non_wasi:?}\n\
-             full import list: {imports:?}"
+            "an extern-free program imports from non-WASI namespaces — a custom \
+             host dependency leaked in: {non_wasi:?}\nfull import list: {imports:?}"
+        );
+    });
+}
+
+/// A program that calls `extern js` functions emits one custom WASM import per
+/// distinct called extern, and the module still validates. The
+/// JS glue that *satisfies* these imports lands in PR 6, so this is structural
+/// (validate + inspect the import section) — the module can't be instantiated
+/// under bare wasmtime because the `js.*` imports are unsatisfied.
+#[test]
+fn extern_js_emits_custom_imports_and_validates() {
+    let src = "extern js {\n  \
+                 function alert(message: String)\n  \
+                 function getLength(s: String) -> Int\n\
+               }\n\
+               function main() {\n  \
+                 alert(\"hi\")\n  \
+                 let n: Int = getLength(\"abc\")\n  \
+                 print(n)\n\
+               }\n";
+    compile_or_skip(src, "extern_js_custom_imports", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the extern module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        // The two *called* externs are imported from the `js` module.
+        assert!(
+            imports.contains(&("js".to_string(), "alert".to_string())),
+            "missing import js.alert: {imports:?}"
+        );
+        assert!(
+            imports.contains(&("js".to_string(), "getLength".to_string())),
+            "missing import js.getLength: {imports:?}"
+        );
+        // WASI imports are still present (the merged runtime needs fd_write).
+        assert!(
+            imports.iter().any(|(m, _)| m == "wasi_snapshot_preview1"),
+            "WASI imports vanished: {imports:?}"
+        );
+        // Non-WASI imports are EXACTLY the two declared+called externs.
+        let mut non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        non_wasi.sort_unstable();
+        assert_eq!(
+            non_wasi,
+            vec!["alert", "getLength"],
+            "non-WASI imports should be exactly the called externs: {imports:?}"
+        );
+    });
+}
+
+/// An extern that is *declared* but never *called* produces no `Op::ExternCall`,
+/// so no dangling import is emitted.
+#[test]
+fn declared_but_uncalled_extern_emits_no_import() {
+    let src = "extern js { function alert(message: String) }\n\
+               function main() { print(1) }\n";
+    compile_or_skip(src, "extern_js_uncalled_no_import", |bytes| {
+        wasmparser::validate(bytes).unwrap_or_else(|e| panic!("validation failed: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        let non_wasi: Vec<&(String, String)> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .collect();
+        assert!(
+            non_wasi.is_empty(),
+            "an uncalled extern must not be imported: {non_wasi:?}"
+        );
+    });
+}
+
+/// A `JsValue` host handle round-trips across the `extern js` boundary as a
+/// single `i32` (Phase 2.5 decision D, the type-representation change in this
+/// PR): `getEl` *returns* a `JsValue` (stored into an i32 local) and `setText`
+/// *consumes* one (loaded back as an i32 arg). This pins the new
+/// `wasm_valtypes_for(JsValue)` arm — which flipped from a hard error to
+/// `[i32]` in this PR — on both the return-store and arg-load paths, and proves
+/// the module still validates. Structural-tier: the `js.*` imports are
+/// unsatisfied until the PR 6 glue, so it can't run under bare wasmtime.
+#[test]
+fn jsvalue_handle_round_trips_as_i32_across_extern_boundary() {
+    let src = "extern js {\n  \
+                 function getEl(id: String) -> JsValue\n  \
+                 function setText(el: JsValue, text: String)\n\
+               }\n\
+               function main() {\n  \
+                 let el: JsValue = getEl(\"root\")\n  \
+                 setText(el, \"hi\")\n\
+               }\n";
+    compile_or_skip(src, "extern_js_jsvalue_roundtrip", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the JsValue module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        let mut non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        non_wasi.sort_unstable();
+        assert_eq!(
+            non_wasi,
+            vec!["getEl", "setText"],
+            "non-WASI imports should be exactly the two JsValue-typed externs: {imports:?}"
+        );
+    });
+}
+
+/// Calling the *same* extern from many sites emits exactly one import.
+//  `declare_extern_imports` declares an import per distinct `(module,
+/// name)`; `declare_extern_import` is idempotent so the second and later call
+/// sites short-circuit. This pins that idempotency: a regression that emitted
+/// one import per call site would make `js.alert` appear twice here.
+#[test]
+fn extern_called_from_many_sites_emits_one_import() {
+    let src = "extern js { function alert(message: String) }\n\
+               function main() {\n  \
+                 alert(\"a\")\n  \
+                 alert(\"b\")\n  \
+                 alert(\"c\")\n\
+               }\n";
+    compile_or_skip(src, "extern_js_dedup_imports", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the dedup module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        let alert_imports = imports
+            .iter()
+            .filter(|(m, n)| m == "js" && n == "alert")
+            .count();
+        assert_eq!(
+            alert_imports, 1,
+            "an extern called from 3 sites must be imported exactly once: {imports:?}"
+        );
+    });
+}
+
+/// An extern whose *return* type flattens to two WASM slots (`String` →
+/// `(ptr, len)`) round-trips across the boundary. The import
+/// signature's `returns` is derived independently in `declare_extern_imports`,
+/// and `emit_store_result` must pop the two slots in reverse declaration order;
+/// `print(greet(...))` then re-loads both as a `String` arg. This pins the
+/// multi-slot return path the single-slot `getLength`/`getEl` cases don't reach.
+/// Structural-tier: the `js.greet` import is unsatisfied until the PR 6 glue.
+#[test]
+fn extern_with_multi_slot_string_return_validates() {
+    let src = "extern js { function greet(name: String) -> String }\n\
+               function main() { print(greet(\"world\")) }\n";
+    compile_or_skip(src, "extern_js_string_return", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the String-return module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        assert!(
+            imports.contains(&("js".to_string(), "greet".to_string())),
+            "missing import js.greet: {imports:?}"
+        );
+        let non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        assert_eq!(
+            non_wasi,
+            vec!["greet"],
+            "non-WASI imports should be exactly the String-returning extern: {imports:?}"
+        );
+    });
+}
+
+/// The import signature is derived from the *first* `Op::ExternCall` site the
+/// scanner reaches (`declare_extern_imports`); `declare_extern_import` is
+/// idempotent, so every later site short-circuits and reuses that signature.
+/// This pins that the derivation is order-independent across *divergent argument
+/// provenance*: a multi-arg, multi-slot extern (`tag(String, Int)` → flattened
+/// `[i32, i32, i64]`) is called from three sites whose arguments are produced
+/// completely differently — function parameters (in `emit`), bare literals, and
+/// values computed into `let` bindings (string concatenation, integer
+/// arithmetic). Sema coerces every site to the declared `(String, Int)`, so each
+/// site's marshalled operands must match the single derived import signature and
+/// the module must validate, with `js.tag` imported exactly once regardless of
+/// which site fixed the signature. This is the one assumption the other extern
+/// tests leave unpinned: that a later call site's operands stay in lockstep with
+/// a signature it did not itself derive. Structural-tier: the `js.tag` import is
+/// unsatisfied until the PR 6 glue.
+#[test]
+fn extern_signature_derived_from_first_site_validates_all_call_sites() {
+    let src = "extern js { function tag(label: String, count: Int) }\n\
+               function emit(label: String, count: Int) {\n  \
+                 tag(label, count)\n\
+               }\n\
+               function main() {\n  \
+                 tag(\"lit\", 1)\n  \
+                 let v: String = \"x\" + \"y\"\n  \
+                 let n: Int = 2 + 3\n  \
+                 tag(v, n)\n  \
+                 emit(\"via-helper\", 9)\n\
+               }\n";
+    compile_or_skip(src, "extern_js_first_site_signature", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the multi-site module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        // One import despite three call sites with divergent arg provenance.
+        let tag_imports = imports
+            .iter()
+            .filter(|(m, n)| m == "js" && n == "tag")
+            .count();
+        assert_eq!(
+            tag_imports, 1,
+            "an extern called from 3 sites with divergent arg provenance must be \
+             imported exactly once: {imports:?}"
+        );
+        // Non-WASI imports are EXACTLY the single multi-site extern — proof no
+        // later site spuriously declared a second import under a different sig.
+        let non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        assert_eq!(
+            non_wasi,
+            vec!["tag"],
+            "non-WASI imports should be exactly the single multi-site extern: {imports:?}"
+        );
+    });
+}
+
+/// A value-returning `extern js` call whose result is *discarded* (called as a
+/// bare statement) still imports and validates. `lower::emit`
+/// allocates a result `ValueId` whenever the result type is non-`Void`,
+/// independent of whether the source binds it, so the IR carries `result =
+/// Some(vid)` here and the body translator's `(Some(vid), ty)` arm stores into a
+/// dead local. This pins that the discarded-result path compiles — and, by
+/// construction, that the body translator's `(None, non-Void)` arm is
+/// unreachable defensive code (an `Op::ExternCall` with a non-`Void`
+/// `result_type` always carries a result binding). Structural-tier: the
+/// `js.getLength` import is unsatisfied until the PR 6 glue.
+#[test]
+fn discarded_value_returning_extern_result_validates() {
+    let src = "extern js { function getLength(s: String) -> Int }\n\
+               function main() {\n  \
+                 getLength(\"abc\")\n  \
+                 print(1)\n\
+               }\n";
+    compile_or_skip(src, "extern_js_discarded_result", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the discarded-result module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        let non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        assert_eq!(
+            non_wasi,
+            vec!["getLength"],
+            "a discarded value-returning extern must still be imported exactly once: {imports:?}"
+        );
+    });
+}
+
+/// `Float` and `Bool` cross the `extern js` boundary as single WASM slots
+/// (`f64` and `i32`) on both the arg-load and return-store paths (Phase 2.5
+/// PR 5). The other extern tests only exercise the `String` (2-slot i32),
+/// `Int` (i64), and `JsValue` (i32) flattening arms of `wasm_valtypes_for`;
+/// this pins the `F64` and `Bool` arms. `scale`/`flip` each *return* their
+/// type (stored via `emit_store_result`) and the results are then *consumed*
+/// as args by `sink` (loaded via `emit_load_all`), so the derived import
+/// signatures and the emitted operands must stay in lockstep for both numeric
+/// and boolean slots. Routing through `sink` rather than `print` keeps the
+/// test on the extern-marshalling paths regardless of `print`'s type support.
+/// Structural-tier: the `js.*` imports are unsatisfied until the PR 6 glue.
+#[test]
+fn float_and_bool_round_trip_across_extern_boundary() {
+    let src = "extern js {\n  \
+                 function scale(x: Float) -> Float\n  \
+                 function flip(b: Bool) -> Bool\n  \
+                 function sink(f: Float, b: Bool)\n\
+               }\n\
+               function main() {\n  \
+                 let s: Float = scale(1.5)\n  \
+                 let t: Bool = flip(true)\n  \
+                 sink(s, t)\n\
+               }\n";
+    compile_or_skip(src, "extern_js_float_bool_roundtrip", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the Float/Bool module: {e}"));
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        let mut non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        non_wasi.sort_unstable();
+        assert_eq!(
+            non_wasi,
+            vec!["flip", "scale", "sink"],
+            "non-WASI imports should be exactly the three Float/Bool externs: {imports:?}"
         );
     });
 }

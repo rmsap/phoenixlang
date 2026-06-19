@@ -79,6 +79,14 @@ pub(super) const STACK_SAFETY_MARGIN: u32 = 65_536;
 /// pointing at decision H.
 pub(super) const USER_DATA_LIMIT: u32 = STACK_REGION_BASE - STACK_SAFETY_MARGIN;
 
+/// Compose the `extern_import_lookup` key for an `extern js` host function.
+/// A NUL byte (illegal in WASM import module/name UTF-8 identifiers and in
+/// Phoenix source identifiers) separates the two halves so distinct
+/// `(module, name)` pairs can never collide on a shared key.
+fn extern_import_key(module: &str, name: &str) -> String {
+    format!("{module}\0{name}")
+}
+
 pub(super) struct ModuleBuilder {
     /// Function-signature interning. Both user-emitted types and
     /// runtime types (via [`Self::intern_runtime_type`]) flow through
@@ -150,6 +158,16 @@ pub(super) struct ModuleBuilder {
     /// by the IR translator (via [`Self::get_phx_func`]) to resolve
     /// runtime calls such as `phx_print_i64`, `phx_gc_alloc`.
     phx_func_lookup: HashMap<String, u32>,
+
+    /// `extern js` host function → its custom WASM import index (Phase 2.5).
+    /// Keyed by the composed `module\0name` string (see [`extern_import_key`])
+    /// so lookups cost one allocation rather than a `(String, String)` tuple's
+    /// two. Populated by [`Self::declare_extern_import`], which must run
+    /// *before* the runtime merge so these imports occupy import indices ahead
+    /// of the runtime's local functions. Queried by the IR translator (via
+    /// [`Self::get_extern_import`]) to lower `Op::ExternCall` to a `call` of the
+    /// import. The JS glue that *satisfies* these imports lands in PR 6.
+    extern_import_lookup: HashMap<String, u32>,
 
     /// Merged-module global index of the runtime's `__stack_pointer`
     /// (mutable `i32`, initialized to `1048576` — the top of the wasm32-
@@ -233,6 +251,7 @@ impl ModuleBuilder {
             phx_main_idx: None,
             phx_user_funcs: HashMap::new(),
             phx_func_lookup: HashMap::new(),
+            extern_import_lookup: HashMap::new(),
             phx_stack_pointer_global: None,
             // 0 rather than 1: the merge always overwrites this with the
             // runtime's declared minimum (every wasm32-wasip1 cdylib has a
@@ -317,10 +336,12 @@ impl ModuleBuilder {
         }
     }
 
-    /// Append an imported function from the runtime. PR 3a does not
-    /// dedupe against pre-existing imports because we no longer
-    /// pre-declare any (the runtime's WASI imports are the merged
-    /// module's only WASI imports). Returns the merged function index.
+    /// Append an imported function (a runtime WASI import, or a custom
+    /// `extern js` import via [`Self::declare_extern_import`]). This does not
+    /// dedupe against existing imports: the only imports declared before the
+    /// merge are `extern js` functions, which live in the `js` (custom)
+    /// namespace, so a runtime WASI import in `wasi_snapshot_preview1` can
+    /// never collide with one. Returns the merged function index.
     pub(super) fn merge_func_import(
         &mut self,
         module: &str,
@@ -335,6 +356,43 @@ impl ModuleBuilder {
         );
         self.import_func_count += 1;
         idx
+    }
+
+    /// Declare a custom WASM function import for an `extern js` host function
+    /// `(module, name)` with the given flattened WASM signature (Phase 2.5).
+    ///
+    /// **Must be called before [`super::runtime_merge::merge_runtime`].** Imports
+    /// and local functions share one index space (imports first); declaring a
+    /// custom import here, before the merge assigns indices to the runtime's
+    /// local functions, keeps every later index (runtime locals, Phoenix
+    /// functions) shifted up consistently — `add_local_function` is purely
+    /// relative to the live `import_func_count`. Declaring *after* the merge
+    /// would collide a new import index with an already-assigned local index.
+    ///
+    /// Idempotent per `(module, name)`: a re-declaration is ignored (the IR may
+    /// call the same extern from many sites; only one import is emitted).
+    pub(super) fn declare_extern_import(
+        &mut self,
+        module: &str,
+        name: &str,
+        params: &[wasm_encoder::ValType],
+        returns: &[wasm_encoder::ValType],
+    ) {
+        let key = extern_import_key(module, name);
+        if self.extern_import_lookup.contains_key(&key) {
+            return;
+        }
+        let sig = self.types.intern(params, returns);
+        let idx = self.merge_func_import(module, name, sig);
+        self.extern_import_lookup.insert(key, idx);
+    }
+
+    /// Look up the custom WASM import index for an `extern js` function
+    /// `(module, name)`, or `None` if no import was declared for it.
+    pub(super) fn get_extern_import(&self, module: &str, name: &str) -> Option<u32> {
+        self.extern_import_lookup
+            .get(&extern_import_key(module, name))
+            .copied()
     }
 
     /// Append a local-function declaration with signature `sig` and
