@@ -1237,6 +1237,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+ "wasmparser 0.248.0",
 ]
 
 [[package]]

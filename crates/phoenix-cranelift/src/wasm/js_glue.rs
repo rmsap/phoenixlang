@@ -14,12 +14,16 @@
 //! `TextDecoder`, `JsValue`↔an opaque handle into a glue-owned table mapping
 //! i32 handles to real JS objects.
 //!
-//! **Deferred to PR 7:** a host function *returning* a `String` needs to
-//! allocate it in linear memory via `phx_string_alloc` (which the merged module
-//! does not yet export); such a thunk is generated as a clear runtime throw.
-//! Closure-typed extern parameters are PR 8. The generator never fails the
-//! build for these — it emits a throwing thunk so the rest of the program still
-//! links and runs.
+//! A host function *returning* a `String` builds a GC-managed Phoenix
+//! string from the returned JS string: the module exports `phx_string_alloc`
+//! (gated on having externs), and the glue allocates `byteLen` bytes, copies the
+//! UTF-8 in, and returns the `(ptr, len)` fat pointer. Strings are **copied**,
+//! never shared (decision F).
+//!
+//! **Deferred to PR 8:** closure-typed extern parameters (callbacks). The
+//! generator never fails the build for an unsupported signature — it emits a
+//! throwing thunk so the rest of the program still links and runs; only an
+//! actual call to that extern fails.
 
 use super::translate::{ExternSig, wasm_valtypes_for};
 use crate::error::CompileError;
@@ -64,6 +68,7 @@ class ExitStatus extends Error {
 }
 
 const __decoder = new TextDecoder("utf-8");
+const __encoder = new TextEncoder();
 
 /**
  * Host-owned JsValue handle table (design-decisions §Phase 2.5 decision D):
@@ -121,6 +126,33 @@ export async function instantiate({ wasm, host = {}, writeStdout } = {}) {
   const out = writeStdout || __defaultWriteStdout();
   const handles = __makeHandles();
   let memory = null;
+  // Set after instantiation (below): the exported `phx_string_alloc` the glue
+  // calls to build a GC-managed Phoenix string from host bytes when a host
+  // function returns a `String`. A module with no string-returning extern never
+  // calls it; a build that uses externs always exports it (PR 7).
+  let stringAlloc = null;
+  /**
+   * Build a Phoenix `String` (a `(ptr, len)` fat pointer) in linear memory from
+   * a JS string: allocate `phx_string_alloc(byteLen)` (returns the writable
+   * payload pointer — the GC header sits just before it) and copy the UTF-8
+   * bytes in. The bytes are *copied*, never shared (design-decisions §Phase 2.5
+   * decision F): the GC owns the Phoenix copy, the JS engine owns the original.
+   * The result is rooted by the calling Phoenix function the instant the extern
+   * call returns (the backend roots every ref-typed `Op::ExternCall` result), so
+   * a GC triggered by a later allocation can't collect it.
+   */
+  const buildString = (s) => {
+    if (typeof stringAlloc !== "function") {
+      throw new Error(
+        "phoenix glue: this module did not export `phx_string_alloc`; a host " +
+          "function returning a String needs it (rebuild with a current runtime)",
+      );
+    }
+    const bytes = __encoder.encode(s);
+    const ptr = stringAlloc(bytes.length);
+    new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+    return [ptr, bytes.length];
+  };
   const view = () => new DataView(memory.buffer);
   const u8 = () => new Uint8Array(memory.buffer);
   const readString = (ptr, len) =>
@@ -197,6 +229,7 @@ export async function instantiate({ wasm, host = {}, writeStdout } = {}) {
     imports,
   );
   memory = instance.exports.memory;
+  stringAlloc = instance.exports.phx_string_alloc || null;
   return {
     instance,
     run() {
@@ -372,13 +405,20 @@ fn outbound_return(ty: &IrType, call: &str) -> Result<String, String> {
         IrType::F64 => format!("return {call};"),
         IrType::Bool => format!("return ({call}) ? 1 : 0;"),
         IrType::JsValue => format!("return handles.put({call});"),
-        IrType::StringRef => {
-            return Err(
-                "returning a String from a host function needs phx_string_alloc \
-                 (lands in PR 7)"
-                    .to_string(),
-            );
-        }
+        // String return: the host returns a JS string; the glue
+        // builds a GC-managed Phoenix string in linear memory (UTF-8 bytes copied
+        // in) and returns its `(ptr, len)` fat pointer as a 2-value result.
+        // `String(...)` coerces a meaningfully-typed result (a number, say)
+        // rather than producing a torn value — matching the lenient `Int↔Number`
+        // coercion above. But `null`/`undefined` mean the host returned *no*
+        // value; guard those (as the `Int` arm guards non-finite) so the bug
+        // surfaces as a clear glue error instead of the literal string
+        // `"undefined"` silently flowing into the program.
+        IrType::StringRef => format!(
+            "const __r = {call}; \
+             if (__r == null) throw new Error(\"phoenix glue: a `String`-returning host function returned no value (null or undefined)\"); \
+             return buildString(String(__r));"
+        ),
         other => return Err(format!("return type `{other}` is not marshallable")),
     })
 }
@@ -454,19 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn only_real_thunks_are_required_host_bindings() {
-        // `getText` returns a String (deferred → throwing thunk), so it needs no
-        // host binding; `alert` does. The required-host list must list only
-        // `alert`, or instantiate would force a pointless `getText` stub.
-        let externs = vec![
-            sig("alert", vec![IrType::StringRef], IrType::Void),
-            sig("getText", vec![], IrType::StringRef),
-        ];
-        let glue = generate(&externs).unwrap();
-        assert!(glue.contains(r#"for (const __name of ["alert"])"#));
-    }
-
-    #[test]
     fn no_externs_yields_an_empty_required_host_list() {
         let glue = generate(&[]).unwrap();
         // The placeholder must still be substituted (to an empty list), never
@@ -534,11 +561,28 @@ mod tests {
     }
 
     #[test]
-    fn string_return_emits_throwing_thunk_deferred_to_pr7() {
-        let externs = vec![sig("getText", vec![], IrType::StringRef)];
+    fn string_return_builds_a_gc_string_via_phx_string_alloc() {
+        // A host function returning a String gets a real marshalling thunk
+        // that routes through `buildString` (which calls the exported
+        // `phx_string_alloc`), not a throwing stub.
+        let externs = vec![sig("greet", vec![IrType::StringRef], IrType::StringRef)];
         let glue = generate(&externs).unwrap();
-        assert!(glue.contains("getText(/* ...args */) { throw new Error("));
-        assert!(glue.contains("phx_string_alloc"));
+        assert!(
+            glue.contains("const __r = host.greet(readString(p0, p1));")
+                && glue.contains("return buildString(String(__r));"),
+            "string-return thunk should build a GC string from the host result, \
+             not a throwing stub"
+        );
+        // A `null`/`undefined` host return is rejected with a clear error rather
+        // than silently coerced to the literal string `\"undefined\"`.
+        assert!(
+            glue.contains("returned no value (null or undefined)"),
+            "string-return thunk should guard a missing host result"
+        );
+        // `buildString` allocates via the exported runtime function.
+        assert!(glue.contains("stringAlloc(bytes.length)"));
+        // …and it's a required host binding (it has a real thunk).
+        assert!(glue.contains(r#"for (const __name of ["greet"])"#));
     }
 
     #[test]

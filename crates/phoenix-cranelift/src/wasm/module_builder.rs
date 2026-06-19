@@ -1076,6 +1076,27 @@ impl ModuleBuilder {
             .export("_start", wasm_encoder::ExportKind::Func, start_idx);
     }
 
+    /// `true` once at least one `extern js` import has been declared via
+    /// [`Self::declare_extern_import`]. Gates the extra runtime-
+    /// function exports the JS glue needs (e.g. `phx_string_alloc`) so an
+    /// extern-free module's export surface stays just `memory` + `_start`.
+    pub(super) fn has_extern_imports(&self) -> bool {
+        !self.extern_import_lookup.is_empty()
+    }
+
+    /// Export a merged runtime function by name so the JS glue can call it.
+    /// Used for `phx_string_alloc`, which the glue invokes to
+    /// build a GC-managed Phoenix string from host-provided UTF-8 bytes (a host
+    /// function returning a `String`). No-op if the runtime did not export
+    /// `name` — a well-formed `phoenix_runtime.wasm` always does, so a miss means
+    /// the runtime is mismatched; the glue then surfaces a clear call-time error.
+    pub(super) fn export_phx_func(&mut self, name: &str) {
+        if let Some(idx) = self.get_phx_func(name) {
+            self.exports
+                .export(name, wasm_encoder::ExportKind::Func, idx);
+        }
+    }
+
     pub(super) fn emit_phoenix_bodies(&mut self, ir_module: &IrModule) -> Result<(), CompileError> {
         for func in ir_module.concrete_functions() {
             let body = translate::translate_function(self, ir_module, func)?;

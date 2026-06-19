@@ -25,6 +25,27 @@ fn phoenix_bin() -> Command {
     cmd
 }
 
+/// `true` iff `wasm` has an export-section entry that is a *function* named
+/// `name`. Parses the export section rather than scanning the raw bytes for the
+/// substring (which can't tell an export name from an incidental byte match), so
+/// the assertion can't pass on a coincidence.
+fn module_exports_func(wasm: &[u8], name: &str) -> bool {
+    use wasmparser::{ExternalKind, Parser, Payload};
+    for payload in Parser::new(0).parse_all(wasm) {
+        if let Ok(Payload::ExportSection(exports)) = payload {
+            for export in exports {
+                if let Ok(export) = export
+                    && export.kind == ExternalKind::Func
+                    && export.name == name
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// The wasm32-linear backend embeds-and-merges this artifact; without it a build
 /// can't produce a `.wasm`, so the glue tests have nothing to exercise.
 fn runtime_wasm_present() -> bool {
@@ -334,28 +355,34 @@ try {
     );
 }
 
+/// A host function *returning* a `String` builds a GC-managed Phoenix string via
+/// the exported `phx_string_alloc`. This pins the full
+/// round-trip across three shapes: a *multi-byte* host string is printed (so a
+/// byte-vs-char length mistake in the allocation would corrupt it), a host
+/// string is *passed back* into a second extern (`lengthOf`) that reads it, and
+/// an *empty* return exercises `phx_string_alloc(0)`.
 #[test]
-fn string_returning_extern_throws_a_clear_error_at_runtime() {
-    if !require_runtime_wasm_or_skip("string_returning_extern_throws_a_clear_error_at_runtime") {
+fn string_returning_extern_round_trips_through_the_glue() {
+    if !require_runtime_wasm_or_skip("string_returning_extern_round_trips_through_the_glue") {
         return;
     }
-    if !require_node_or_skip("string_returning_extern_throws_a_clear_error_at_runtime") {
+    if !require_node_or_skip("string_returning_extern_round_trips_through_the_glue") {
         return;
     }
 
-    // A host function *returning* a String needs `phx_string_alloc`, deferred to
-    // PR 7. The build must still succeed (the glue emits a throwing thunk so the
-    // import stays satisfied); only an actual *call* fails, with a message that
-    // names the missing piece. This pins that runtime behaviour end-to-end.
     let dir = TempDir::new("strret");
     let src = dir.join("app.phx");
     std::fs::write(
         &src,
         "extern js {\n  \
-           function getText() -> String\n\
+           function greet(name: String) -> String\n  \
+           function lengthOf(s: String) -> Int\n  \
+           function echo(s: String) -> String\n\
          }\n\
          function main() {\n  \
-           print(getText())\n\
+           print(greet(\"world\"))\n  \
+           print(lengthOf(greet(\"hi\")))\n  \
+           print(lengthOf(echo(\"\")))\n\
          }\n",
     )
     .unwrap();
@@ -368,11 +395,17 @@ fn string_returning_extern_throws_a_clear_error_at_runtime() {
         .arg(&wasm)
         .status()
         .expect("failed to run phoenix build");
-    assert!(
-        status.success(),
-        "the build must succeed; only the runtime call is deferred"
-    );
+    assert!(status.success(), "wasm32-linear build failed");
     assert!(dir.join("app.js").exists(), "glue sidecar should exist");
+
+    // The module exports `phx_string_alloc` as a function (the glue's string-in
+    // path calls it). Checked against the parsed export section, not a raw-byte
+    // substring scan, so the assertion is exact.
+    let wasm_bytes = std::fs::read(&wasm).expect("read built wasm");
+    assert!(
+        module_exports_func(&wasm_bytes, "phx_string_alloc"),
+        "the module must export phx_string_alloc for the glue's string-in path"
+    );
 
     let driver = dir.join("driver.mjs");
     std::fs::write(
@@ -381,13 +414,18 @@ fn string_returning_extern_throws_a_clear_error_at_runtime() {
 import { readFile } from "node:fs/promises";
 import { instantiate } from "./app.js";
 const wasm = await readFile(new URL("./app.wasm", import.meta.url));
-const { run } = await instantiate({ wasm, host: { getText: () => "nope" } });
-try {
-  run();
-  process.stdout.write("NO_THROW");
-} catch (e) {
-  process.stdout.write("THREW:" + e.message);
-}
+let out = "";
+const { run } = await instantiate({
+  wasm,
+  host: {
+    greet: (name) => "Héllo, " + name,   // multi-byte return -> GC string
+    lengthOf: (s) => s.length,           // reads a host-allocated string back
+    echo: (s) => s,                      // identity: echo("") -> empty GC string
+  },
+  writeStdout: (t) => { out += t; },
+});
+run();
+process.stdout.write(out);
 "#,
     )
     .unwrap();
@@ -400,10 +438,12 @@ try {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     assert!(output.status.success(), "node run failed: {stderr}");
-    assert!(
-        stdout.starts_with("THREW:") && stdout.contains("phx_string_alloc"),
-        "calling the deferred String-returning extern should throw a clear error \
-         naming phx_string_alloc, got: {stdout}"
+    assert_eq!(
+        stdout, "Héllo, world\n9\n0\n",
+        "string-in round-trip: greet(\"world\")=\"Héllo, world\" (multi-byte, \
+         13 UTF-8 bytes, printed back intact); lengthOf(greet(\"hi\"))=\
+         len(\"Héllo, hi\")=9; lengthOf(echo(\"\"))=0 (empty return via \
+         phx_string_alloc(0))"
     );
 }
 

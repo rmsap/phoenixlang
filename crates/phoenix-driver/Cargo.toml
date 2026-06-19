@@ -39,6 +39,9 @@ toml = { workspace = true }
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
 tempfile = { workspace = true }
+# Parse a built `.wasm`'s export section in tests (e.g. assert the glue's
+# `phx_string_alloc` export is present), rather than scanning the raw bytes.
+wasmparser = { workspace = true }
 
 # Linux-only: needed to set RLIMIT_AS in the child process before exec —
 # gc_bounded_memory.rs proves the GC actually collects (the child OOMs if it

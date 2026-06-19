@@ -173,6 +173,13 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
     builder.register_closure_table(ir_module)?;
     builder.declare_start();
     builder.emit_exports();
+    // A module with `extern js` imports also exports
+    // `phx_string_alloc` so the JS glue can build a GC-managed Phoenix string
+    // from host-provided bytes (a host function returning a `String`). Gated on
+    // having externs so an extern-free module's exports stay `memory`+`_start`.
+    if builder.has_extern_imports() {
+        builder.export_phx_func("phx_string_alloc");
+    }
     builder.emit_phoenix_bodies(ir_module)?;
     builder.emit_start_body()?;
 
