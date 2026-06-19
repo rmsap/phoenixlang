@@ -2369,10 +2369,11 @@ fn jsvalue_handle_round_trips_as_i32_across_extern_boundary() {
 }
 
 /// Calling the *same* extern from many sites emits exactly one import.
-//  `declare_extern_imports` declares an import per distinct `(module,
-/// name)`; `declare_extern_import` is idempotent so the second and later call
-/// sites short-circuit. This pins that idempotency: a regression that emitted
-/// one import per call site would make `js.alert` appear twice here.
+/// `collect_externs` dedups by distinct `(module, name)`: the first site records
+/// the signature and a `HashSet` drops every later site, and
+/// `declare_extern_imports` declares one import per surviving entry. This pins
+/// that dedup: a regression that emitted one import (or glue thunk) per call
+/// site would make `js.alert` appear twice here.
 #[test]
 fn extern_called_from_many_sites_emits_one_import() {
     let src = "extern js { function alert(message: String) }\n\
@@ -2433,9 +2434,9 @@ fn extern_with_multi_slot_string_return_validates() {
     });
 }
 
-/// The import signature is derived from the *first* `Op::ExternCall` site the
-/// scanner reaches (`declare_extern_imports`); `declare_extern_import` is
-/// idempotent, so every later site short-circuits and reuses that signature.
+/// The import signature is derived from the *first* `Op::ExternCall` site
+/// `collect_externs` reaches; its `(module, name)` `HashSet` drops every later
+/// site, so they all reuse that first signature.
 /// This pins that the derivation is order-independent across *divergent argument
 /// provenance*: a multi-arg, multi-slot extern (`tag(String, Int)` → flattened
 /// `[i32, i32, i64]`) is called from three sites whose arguments are produced

@@ -82,7 +82,7 @@
 //! into a `Function` at the end. The buffer holds `Instruction<'static>`
 //! — every op landed here owns its data, so there's no borrow churn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use phoenix_ir::block::{BasicBlock, BlockId};
 use phoenix_ir::instruction::{Op, ValueId};
@@ -175,46 +175,97 @@ pub(super) fn wasm_valtypes_for(ty: &IrType) -> Result<Vec<ValType>, CompileErro
 }
 
 /// Declare a custom WASM function import for every *called* `extern js` function.
-/// Scans every concrete function for [`Op::ExternCall`] and derives
-/// each extern's WASM signature from its call site — the flattened arg value
-/// types as params, the instruction's `result_type` as the return — declaring
-/// one import per distinct `(module, name)`.
+/// Walks the distinct extern signatures from [`collect_externs`] (which derives
+/// each one from its call site and dedups by `(module, name)`), flattens each
+/// into a WASM import signature — the per-parameter `IrType`s as flattened
+/// params, the return `IrType` as the result — and declares one import per
+/// extern.
 ///
 /// Only externs actually *called* get an import: a declared-but-uncalled extern
-/// produces no `Op::ExternCall` and so no dangling import.
+/// produces no `Op::ExternCall`, so [`collect_externs`] never sees it and no
+/// dangling import is declared.
 ///
-/// The signature is taken from the *first* call site (`declare_extern_import` is
-/// idempotent, so later sites short-circuit). This couples the import signature
-/// to call-site arg/result IR types rather than the extern's declared signature
-/// in sema's table — which is sound because sema coerces every argument to the
-/// declared parameter type and rejects non-marshallable types, so every site of
-/// a given extern agrees and matches the declaration. The body translator's
-/// `Op::ExternCall` arm reads the same per-site bindings when it emits the
-/// `call`, so the declared import signature and the emitted operands stay in
-/// lockstep by construction. (The IR carries no extern declaration table, only
-/// `Op::ExternCall` sites, so call-site derivation is also the only signal
-/// available here without re-threading sema state into the backend.)
+/// Coupling the import signature to call-site arg/result IR types (rather than
+/// the extern's declared signature in sema's table) is sound because sema
+/// coerces every argument to the declared parameter type and rejects
+/// non-marshallable types, so every site of a given extern agrees and matches
+/// the declaration. The body translator's `Op::ExternCall` arm reads the same
+/// per-site bindings when it emits the `call`, so the declared import signature
+/// and the emitted operands stay in lockstep by construction. The JS glue
+/// generator consumes the very same [`collect_externs`] table, so the imports
+/// and their glue thunks can't drift either.
 ///
 /// This is a deliberate **separate pass**, not folded into
 /// [`ModuleBuilder::declare_phoenix_functions`]: extern imports **must run
 /// before the runtime merge** so they occupy import indices ahead of the
 /// runtime's local functions (see [`ModuleBuilder::declare_extern_import`]),
 /// whereas `declare_phoenix_functions` runs *after* the merge. The two can't
-/// share one walk. The JS glue that satisfies these imports lands in PR 6.
+/// share one walk.
 pub(super) fn declare_extern_imports(
     b: &mut ModuleBuilder,
     ir_module: &phoenix_ir::module::IrModule,
 ) -> Result<(), CompileError> {
+    for sig in collect_externs(ir_module)? {
+        let mut params = Vec::new();
+        for (i, ty) in sig.params.iter().enumerate() {
+            params.extend(wasm_valtypes_for(ty).map_err(|e| {
+                CompileError::new(format!(
+                    "wasm32-linear: `extern js` call `{}.{}` parameter {i}: {}",
+                    sig.module, sig.name, e.message
+                ))
+            })?);
+        }
+        let returns = wasm_valtypes_for(&sig.return_type).map_err(|e| {
+            CompileError::new(format!(
+                "wasm32-linear: `extern js` call `{}.{}` return type: {}",
+                sig.module, sig.name, e.message
+            ))
+        })?;
+        b.declare_extern_import(&sig.module, &sig.name, &params, &returns);
+    }
+    Ok(())
+}
+
+/// The IR-level signature of a *called* `extern js` function, derived from its
+/// call site. Shared by [`declare_extern_imports`] (which flattens
+/// it into a WASM import signature) and the JS glue generator (which uses the
+/// per-parameter and return `IrType`s to emit marshalling), so the import and
+/// its glue thunk can never drift.
+pub(super) struct ExternSig {
+    /// The host module (`"js"` today).
+    pub(super) module: String,
+    /// The host function name.
+    pub(super) name: String,
+    /// Parameter IR types, in call order.
+    pub(super) params: Vec<IrType>,
+    /// Return IR type (`Void` for a no-result extern).
+    pub(super) return_type: IrType,
+}
+
+/// Collect the distinct *called* `extern js` functions from every concrete
+/// function, deriving each one's signature from its first `Op::ExternCall` site.
+///
+/// Only externs actually *called* appear: a declared-but-uncalled extern emits
+/// no `Op::ExternCall`. The signature is taken from the first call site; sema
+/// coerces every argument to the declared parameter type and rejects
+/// non-marshallable types, so every site of a given extern agrees and matches
+/// the declaration. The IR carries no extern declaration table — only
+/// `Op::ExternCall` sites — so call-site derivation is the only signal here.
+pub(super) fn collect_externs(
+    ir_module: &phoenix_ir::module::IrModule,
+) -> Result<Vec<ExternSig>, CompileError> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
     for func in ir_module.concrete_functions() {
         for block in &func.blocks {
             for instr in &block.instructions {
                 let Op::ExternCall(module, name, args) = &instr.op else {
                     continue;
                 };
-                if b.get_extern_import(module, name).is_some() {
+                if !seen.insert((module.clone(), name.clone())) {
                     continue;
                 }
-                let mut params = Vec::new();
+                let mut params = Vec::with_capacity(args.len());
                 for arg in args {
                     let ty = func.instruction_result_type(*arg).ok_or_else(|| {
                         CompileError::new(format!(
@@ -222,25 +273,18 @@ pub(super) fn declare_extern_imports(
                              {arg:?} has no recorded IR type (internal compiler bug)"
                         ))
                     })?;
-                    params.extend(wasm_valtypes_for(ty).map_err(|e| {
-                        CompileError::new(format!(
-                            "wasm32-linear: `extern js` call `{module}.{name}` argument \
-                             {arg:?}: {}",
-                            e.message
-                        ))
-                    })?);
+                    params.push(ty.clone());
                 }
-                let returns = wasm_valtypes_for(&instr.result_type).map_err(|e| {
-                    CompileError::new(format!(
-                        "wasm32-linear: `extern js` call `{module}.{name}` return type: {}",
-                        e.message
-                    ))
-                })?;
-                b.declare_extern_import(module, name, &params, &returns);
+                out.push(ExternSig {
+                    module: module.clone(),
+                    name: name.clone(),
+                    params,
+                    return_type: instr.result_type.clone(),
+                });
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Reject a placeholder-typed field at codegen. Used at both the

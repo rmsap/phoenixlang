@@ -79,6 +79,8 @@ use crate::error::CompileError;
 mod builtins;
 mod gc_root;
 mod heap_layout;
+mod js_glue;
+pub(crate) use js_glue::GENERATED_MARKER as GENERATED_GLUE_MARKER;
 mod module_builder;
 pub(crate) mod runtime_discovery;
 mod runtime_merge;
@@ -175,4 +177,17 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
     builder.emit_start_body()?;
 
     Ok(builder.finish())
+}
+
+/// Generate the paired JavaScript glue for a wasm32-linear module's `extern js`
+/// imports, or `None` if the program declares/calls no externs
+/// (in which case no `.js` sidecar is emitted — the bare `.wasm` runs under
+/// wasmtime as before). Driven by the same [`translate::collect_externs`] table
+/// the import section was built from, so imports and glue can't drift.
+pub(super) fn generate_js_glue(ir_module: &IrModule) -> Result<Option<String>, CompileError> {
+    let externs = translate::collect_externs(ir_module)?;
+    if externs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(js_glue::generate(&externs)?))
 }

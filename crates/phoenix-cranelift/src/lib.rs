@@ -106,6 +106,24 @@ pub fn compile(ir_module: &IrModule, target: Target) -> Result<Vec<u8>, CompileE
     }
 }
 
+/// Generate the paired JavaScript glue for a `wasm32-linear` build's `extern js`
+/// host imports, or `None` if the program uses no externs.
+///
+/// `phoenix build --target wasm32-linear` writes this alongside the `.wasm` as a
+/// sidecar `.js`: it provides a minimal WASI shim plus one marshalling thunk per
+/// declared extern, so the module instantiates and runs under Node / the browser
+/// with a caller-supplied `host` object. The glue is derived from the same
+/// extern table as the import section, so the two cannot drift.
+pub fn wasm_linear_js_glue(ir_module: &IrModule) -> Result<Option<String>, CompileError> {
+    wasm::generate_js_glue(ir_module)
+}
+
+/// The sentinel header every generated JS glue file begins with. The driver uses
+/// it to recognise a build-owned `.js` sidecar: when an `extern js` program is
+/// rebuilt with no externs, a now-stale sidecar is removed only if it carries
+/// this marker, so a hand-written `.js` beside the `.wasm` is never clobbered.
+pub const GENERATED_GLUE_MARKER: &str = wasm::GENERATED_GLUE_MARKER;
+
 fn compile_native(ir_module: &IrModule) -> Result<Vec<u8>, CompileError> {
     let mut ctx = CompileContext::new(ir_module)?;
 

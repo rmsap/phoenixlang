@@ -91,6 +91,27 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
     // Phase 2.4 PR 2; `Wasm32Gc` still errors at `compile` and never gets
     // here.
     if target.is_wasm() {
+        // For a `wasm32-linear` module that uses `extern js`,
+        // emit a paired `.js` glue sidecar next to the `.wasm` so the module can
+        // be instantiated under Node / the browser (the glue provides WASI + the
+        // host-import thunks). Programs without externs get no sidecar — the
+        // bare `.wasm` runs under wasmtime as before. (wasm32-gc glue is PR 14.)
+        //
+        // Generate the glue *before* writing the `.wasm`: a glue-generation
+        // failure then aborts the build without leaving a stale `.wasm` behind
+        // (an artifact whose paired sidecar never got written).
+        let js_glue = if matches!(target, Target::Wasm32Linear) {
+            match phoenix_cranelift::wasm_linear_js_glue(&ir_module) {
+                Ok(glue) => glue,
+                Err(err) => {
+                    eprintln!("error: generating JS glue: {err}");
+                    process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
+
         if let Err(err) = fs::write(&out_path, &artifact_bytes) {
             eprintln!(
                 "error: could not write WASM module to {}: {err}",
@@ -98,7 +119,95 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
             );
             process::exit(1);
         }
-        eprintln!("Compiled to {}", out_path.display());
+
+        // The paired glue sidecar's path is a pure function of the artifact
+        // path: swap a trailing `.wasm` for `.js` (the common `app.wasm` →
+        // `app.js` case), but if the artifact has any other extension — e.g. an
+        // explicit `-o app.foo` — append `.js` instead of clobbering it, so the
+        // sidecar always sits beside the artifact with its stem intact. Computed
+        // unconditionally because the no-extern branch also needs it to clean up
+        // a stale sidecar left by a previous extern-using build. The extension
+        // match is case-insensitive so a `-o app.WASM` still swaps to `app.js`
+        // rather than appending (`app.WASM.js`).
+        let js_path = if out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("wasm"))
+        {
+            out_path.with_extension("js")
+        } else {
+            let mut p = out_path.clone().into_os_string();
+            p.push(".js");
+            PathBuf::from(p)
+        };
+
+        // Write the sidecar *after* the `.wasm`, but treat the pair atomically:
+        // if the sidecar write fails, remove the `.wasm` we just wrote so we
+        // never leave an extern-using `.wasm` whose paired glue is missing.
+        // Hold the success message until both land for the same reason.
+        if let Some(glue) = js_glue {
+            // The paired sidecar lives at a fixed path beside the `.wasm`, so an
+            // extern-using build must write it there — unlike the no-extern
+            // branch below, it can't honour the generated-code marker (there's
+            // nowhere else to put the glue). Warn before clobbering a file that
+            // lacks the marker, so a user who kept a hand-written `.js` and then
+            // added an `extern` block doesn't lose it silently.
+            if let Ok(existing) = fs::read_to_string(&js_path)
+                && !existing.starts_with(phoenix_cranelift::GENERATED_GLUE_MARKER)
+            {
+                eprintln!(
+                    "warning: overwriting {} with generated JS glue \
+                     (it lacks the Phoenix generated-code marker — was it hand-written?)",
+                    js_path.display()
+                );
+            }
+            if let Err(err) = fs::write(&js_path, glue) {
+                eprintln!(
+                    "error: could not write JS glue to {}: {err}",
+                    js_path.display()
+                );
+                // Treat the pair atomically: drop the `.wasm` we just wrote so
+                // we never leave an extern-using `.wasm` whose paired glue is
+                // missing. If even the cleanup fails, say so — silently
+                // swallowing it would leave that exact broken state behind
+                // while the build still reports only the glue error.
+                if let Err(rm_err) = fs::remove_file(&out_path) {
+                    eprintln!(
+                        "warning: could not remove the orphaned WASM module {}: {rm_err}",
+                        out_path.display()
+                    );
+                }
+                process::exit(1);
+            }
+            eprintln!("Compiled to {}", out_path.display());
+            eprintln!("Wrote JS glue to {}", js_path.display());
+        } else {
+            // No glue this build. `js_glue` is only ever `Some` for
+            // `wasm32-linear` (it's `None` for any other wasm target by
+            // construction above), so in practice this branch runs for a
+            // linear build with no externs, or — once it lands — `wasm32-gc`,
+            // which today errors at `compile` and never reaches here. Either
+            // way the stale-sidecar cleanup is sound: it only removes a
+            // marker-bearing file.
+            //
+            // If a *previous* build of this artifact emitted a glue sidecar, it
+            // is now stale — leaving it would let a consumer import glue for a
+            // module that no longer declares those imports. Remove it, but only
+            // if it carries the generated-code marker, so a hand-written `.js`
+            // the user keeps beside the `.wasm` is never clobbered.
+            if let Ok(existing) = fs::read_to_string(&js_path)
+                && existing.starts_with(phoenix_cranelift::GENERATED_GLUE_MARKER)
+            {
+                match fs::remove_file(&js_path) {
+                    Ok(()) => eprintln!("Removed stale JS glue {}", js_path.display()),
+                    Err(err) => eprintln!(
+                        "warning: could not remove stale JS glue {}: {err}",
+                        js_path.display()
+                    ),
+                }
+            }
+            eprintln!("Compiled to {}", out_path.display());
+        }
     } else {
         link_object(&artifact_bytes, &out_path);
     }

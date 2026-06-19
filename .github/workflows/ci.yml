@@ -12,6 +12,14 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
+      # Node drives the wasm32-linear `extern js` glue tests
+      # (`phoenix-driver/tests/extern_js_glue.rs`): the generated `.js` is
+      # imported and run under Node. Provision it here so those tests actually
+      # execute rather than soft-skip, and so `PHOENIX_REQUIRE_NODE=1` below is
+      # satisfiable.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install wasmtime
         # The wasmtime version is the single source of truth in
         # `.wasmtime-version` at the repo root. Local dev setup reads
@@ -76,6 +84,9 @@ jobs:
           PHOENIX_REQUIRE_RUNTIME_LIB: "1"
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
+          # `node` is provisioned above, so the `extern js` glue tests must run,
+          # not soft-skip. A missing `node` is then a hard failure here.
+          PHOENIX_REQUIRE_NODE: "1"
       - run: cargo test -p phoenix-cranelift
         env:
           PHOENIX_REQUIRE_RUNTIME_LIB: "1"
