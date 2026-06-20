@@ -287,6 +287,122 @@ pub(super) fn collect_externs(
     Ok(out)
 }
 
+/// A distinct closure (callback) signature that crosses the `extern js`
+/// boundary as a parameter — i.e. a Phoenix closure handed to a host function.
+/// Collected by [`collect_callback_signatures`] and consumed by both the
+/// trampoline emitter ([`ModuleBuilder::declare_closure_trampolines`]) and the
+/// JS glue (which wraps the crossing closure pointer in a JS callable that
+/// invokes the matching trampoline). The two derive the trampoline's export
+/// name from the *same* [`closure_trampoline_name`], so they cannot drift.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CallbackSig {
+    /// The closure's own parameter types (the values the host passes when it
+    /// invokes the callback). Marshalled host→wasm by the glue.
+    pub(super) param_types: Vec<IrType>,
+    /// The closure's return type (the value the callback hands back to the
+    /// host). Marshalled wasm→host by the glue. `Void` for a no-result callback.
+    pub(super) return_type: IrType,
+}
+
+/// The single-character marshalling code for a type that can cross the `extern
+/// js` boundary, or `None` for a type the linear callback glue does not marshal
+/// (today: a *nested* closure parameter/return, or any non-marshallable type
+/// sema should already have rejected at the extern signature). The codes are
+/// stable — they appear in generated trampoline export names — so a new
+/// marshallable type must append a fresh code, never reuse one.
+fn marshall_code(ty: &IrType) -> Option<char> {
+    match ty {
+        IrType::I64 => Some('i'),
+        IrType::F64 => Some('f'),
+        IrType::Bool => Some('b'),
+        IrType::StringRef => Some('s'),
+        IrType::JsValue => Some('j'),
+        IrType::Void => Some('v'),
+        _ => None,
+    }
+}
+
+/// `true` iff the linear backend can marshal this callback signature end-to-end
+/// — every parameter and the return type has a [`marshall_code`], and no
+/// parameter is `Void` (a `Void` parameter is meaningless). A *nested* closure
+/// (a callback whose own parameter/return is itself a closure) is **not**
+/// supported in this phase: it has no code, so the predicate rejects it and the
+/// glue emits a throwing thunk for the owning extern (the deferral pattern PR 7
+/// used for string-return). Shared by the trampoline emitter and the glue so
+/// they agree on exactly which callbacks get a real trampoline.
+pub(super) fn callback_sig_is_glue_supported(sig: &CallbackSig) -> bool {
+    let param_ok = sig
+        .param_types
+        .iter()
+        .all(|t| marshall_code(t).is_some_and(|c| c != 'v'));
+    let return_ok = marshall_code(&sig.return_type).is_some();
+    param_ok && return_ok
+}
+
+/// The exported name of the `call_indirect` trampoline for a callback signature.
+/// Encodes the parameter codes followed by the return code so distinct
+/// signatures get distinct names and coincident ones share a trampoline (e.g.
+/// every `(Int) -> Void` callback in the module routes through
+/// `__phoenix_invoke_closure_i_to_v`). Derived identically by the emitter and
+/// the glue. Returns `None` for a signature [`callback_sig_is_glue_supported`]
+/// rejects (a code is missing), so callers never name a trampoline they can't
+/// also marshal.
+pub(super) fn closure_trampoline_name(sig: &CallbackSig) -> Option<String> {
+    let mut params = String::with_capacity(sig.param_types.len());
+    for ty in &sig.param_types {
+        match marshall_code(ty) {
+            Some('v') | None => return None,
+            Some(c) => params.push(c),
+        }
+    }
+    let ret = marshall_code(&sig.return_type)?;
+    Some(format!("__phoenix_invoke_closure_{params}_to_{ret}"))
+}
+
+/// Collect the distinct, glue-supported closure signatures that cross the
+/// `extern js` boundary as call arguments — every `ClosureRef`-typed parameter
+/// of a *called* extern (derived from [`collect_externs`], which already dedups
+/// by `(module, name)` and reads each parameter's call-site IR type). Dedup is
+/// by structural signature so two externs taking the same callback shape share
+/// one trampoline. A signature the linear glue cannot marshal
+/// ([`callback_sig_is_glue_supported`] is false — e.g. a nested closure) is
+/// dropped here so no trampoline is emitted for a callback the glue will reject
+/// with a throwing thunk anyway.
+pub(super) fn collect_callback_signatures(
+    ir_module: &phoenix_ir::module::IrModule,
+) -> Result<Vec<CallbackSig>, CompileError> {
+    Ok(callback_sigs_in_externs(&collect_externs(ir_module)?))
+}
+
+/// The distinct, glue-supported callback signatures among a set of already-
+/// collected externs — every `ClosureRef`-typed parameter, deduped by structural
+/// signature and filtered to [`callback_sig_is_glue_supported`]. Shared by
+/// [`collect_callback_signatures`] (which feeds the trampoline emitter) and the
+/// JS glue (which builds one factory per signature), so the two derive the same
+/// set in the same order and a factory can never lack its trampoline.
+pub(super) fn callback_sigs_in_externs(externs: &[ExternSig]) -> Vec<CallbackSig> {
+    let mut out: Vec<CallbackSig> = Vec::new();
+    for ext in externs {
+        for param in &ext.params {
+            let IrType::ClosureRef {
+                param_types,
+                return_type,
+            } = param
+            else {
+                continue;
+            };
+            let sig = CallbackSig {
+                param_types: param_types.clone(),
+                return_type: (**return_type).clone(),
+            };
+            if callback_sig_is_glue_supported(&sig) && !out.contains(&sig) {
+                out.push(sig);
+            }
+        }
+    }
+    out
+}
+
 /// Reject a placeholder-typed field at codegen. Used at both the
 /// alloc and get sites for enum-variant fields where a `result_type`
 /// (or value-vid `ir_type`) carrying the `GENERIC_PLACEHOLDER`

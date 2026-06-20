@@ -172,6 +172,13 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
     // `closure_target_slot(fid)` and `require_closure_table_idx()`).
     builder.register_closure_table(ir_module)?;
     builder.declare_start();
+    // Declare the `extern js` callback trampolines (Phase 2.5 decision G) after
+    // `_start` so their function indices follow it; their bodies are emitted
+    // after `_start`'s for the same lockstep reason. One trampoline per distinct
+    // glue-supported closure signature handed to a host; none for a program that
+    // passes no callbacks.
+    let callback_sigs = translate::collect_callback_signatures(ir_module)?;
+    builder.declare_closure_trampolines(&callback_sigs)?;
     builder.emit_exports();
     // A module with `extern js` imports also exports
     // `phx_string_alloc` so the JS glue can build a GC-managed Phoenix string
@@ -180,8 +187,17 @@ pub(super) fn compile_wasm_linear(ir_module: &IrModule) -> Result<Vec<u8>, Compi
     if builder.has_extern_imports() {
         builder.export_phx_func("phx_string_alloc");
     }
+    // A module that hands a closure to a host also exports the GC pin/unpin
+    // hooks so the glue can root a host-retained callback (and release it). Gated
+    // on having callback trampolines so a module with no callbacks doesn't widen
+    // its export surface.
+    if builder.has_closure_trampolines() {
+        builder.export_phx_func("phx_gc_pin");
+        builder.export_phx_func("phx_gc_unpin");
+    }
     builder.emit_phoenix_bodies(ir_module)?;
     builder.emit_start_body()?;
+    builder.emit_closure_trampoline_bodies()?;
 
     Ok(builder.finish())
 }

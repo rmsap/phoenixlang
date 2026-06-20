@@ -9,8 +9,8 @@ use std::sync::{Mutex, OnceLock};
 
 use phoenix_runtime::gc::{
     DEFAULT_COLLECTION_THRESHOLD, TypeTag, phx_gc_alloc, phx_gc_collect, phx_gc_disable,
-    phx_gc_enable, phx_gc_pop_frame, phx_gc_push_frame, phx_gc_set_root, phx_gc_shutdown,
-    set_collection_threshold,
+    phx_gc_enable, phx_gc_pin, phx_gc_pop_frame, phx_gc_push_frame, phx_gc_set_root,
+    phx_gc_shutdown, phx_gc_unpin, set_collection_threshold,
 };
 
 /// Process-wide lock so the integration tests in this file don't
@@ -39,6 +39,67 @@ fn unrooted_allocation_is_collected() {
         phoenix_runtime::gc::live_objects(),
         baseline,
         "unrooted allocation should be collected"
+    );
+}
+
+#[test]
+fn pinned_allocation_survives_collection_without_a_frame() {
+    // The retained-callback root path (Phase 2.5 decision G): a pin keeps an
+    // object alive across collections with *no* shadow-stack frame holding it —
+    // modelling a Phoenix closure the host retained past the extern call that
+    // handed it over (so the frame that rooted it has already popped). Balanced
+    // `phx_gc_unpin` then makes it collectable, and the never-unpinned case is
+    // the documented leak.
+    let _g = gc_test_lock().lock().unwrap();
+    phx_gc_collect();
+    let baseline = phoenix_runtime::gc::live_objects();
+
+    let ptr = alloc(64, TypeTag::Closure);
+    phx_gc_pin(ptr);
+
+    // No frame, no shadow-stack root — only the pin keeps it alive.
+    phx_gc_collect();
+    assert_eq!(
+        phoenix_runtime::gc::live_objects(),
+        baseline + 1,
+        "a pinned allocation must survive collection with no frame rooting it"
+    );
+
+    phx_gc_unpin(ptr);
+    phx_gc_collect();
+    assert_eq!(
+        phoenix_runtime::gc::live_objects(),
+        baseline,
+        "after unpin the allocation is unreachable and gets collected"
+    );
+}
+
+#[test]
+fn double_pin_needs_two_unpins_to_collect() {
+    // A closure handed to two externs is pinned twice; one release must not
+    // free it (pins are a multiset).
+    let _g = gc_test_lock().lock().unwrap();
+    phx_gc_collect();
+    let baseline = phoenix_runtime::gc::live_objects();
+
+    let ptr = alloc(48, TypeTag::Closure);
+    phx_gc_pin(ptr);
+    phx_gc_pin(ptr);
+
+    phx_gc_unpin(ptr);
+    phx_gc_collect();
+    assert_eq!(
+        phoenix_runtime::gc::live_objects(),
+        baseline + 1,
+        "one unpin of a doubly-pinned object must not collect it"
+    );
+
+    phx_gc_unpin(ptr);
+    phx_gc_collect();
+    assert_eq!(
+        phoenix_runtime::gc::live_objects(),
+        baseline,
+        "the balancing second unpin makes it collectable"
     );
 }
 

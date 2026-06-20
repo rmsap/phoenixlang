@@ -28,6 +28,7 @@ use phoenix_ir::types::IrType;
 
 use crate::error::CompileError;
 
+use super::heap_layout::i32_memarg;
 use super::translate;
 use super::type_interner::TypeInterner;
 
@@ -231,6 +232,27 @@ pub(super) struct ModuleBuilder {
     /// table is declared in that case, so the output module stays
     /// minimal).
     closure_table_idx: Option<u32>,
+    /// Exported `call_indirect` trampolines for `extern js` callbacks (Phase
+    /// 2.5 decision G), one per distinct glue-supported closure signature handed
+    /// to a host. Populated by [`Self::declare_closure_trampolines`] (which adds
+    /// the function-section entries + exports) and drained by
+    /// [`Self::emit_closure_trampoline_bodies`] (which pushes the matching code
+    /// bodies, in the same order). Empty for a program with no callback externs.
+    closure_trampolines: Vec<ClosureTrampoline>,
+}
+
+/// A recorded callback trampoline awaiting its body. The function-section entry
+/// and export are emitted at declaration time; the body (a `call_indirect`
+/// through the closure table) is emitted later so it lands in the code section
+/// after the user functions and `_start`, keeping the function- and code-section
+/// orders in lockstep (the invariant `finish` asserts).
+struct ClosureTrampoline {
+    /// Number of flattened parameter slots, including the leading `i32` env
+    /// pointer — i.e. the locals `0..n_param_slots` the body forwards.
+    n_param_slots: u32,
+    /// Interned type index, shared by the function declaration and the
+    /// `call_indirect` (identical valtypes, so the interner returns one index).
+    type_idx: u32,
 }
 
 impl ModuleBuilder {
@@ -273,6 +295,7 @@ impl ModuleBuilder {
             closure_target_slots: HashMap::new(),
             dyn_vtable_offsets: HashMap::new(),
             closure_table_idx: None,
+            closure_trampolines: Vec::new(),
         }
     }
 
@@ -1095,6 +1118,105 @@ impl ModuleBuilder {
             self.exports
                 .export(name, wasm_encoder::ExportKind::Func, idx);
         }
+    }
+
+    /// Declare and export one `call_indirect` trampoline per glue-supported
+    /// callback signature (Phase 2.5 decision G). A trampoline is a standalone
+    /// exported function `(env i32, user-params…) -> ret` that the JS glue calls
+    /// to invoke a Phoenix closure the program handed to a host: it reloads the
+    /// closure's fn-table index from `env[0]` and dispatches through the closure
+    /// table — exactly what an in-program `Op::CallIndirect` does
+    /// ([`translate::emit_closure_call_raw`]), but reachable from JS.
+    ///
+    /// Adds only the function-section entry + export here; the body is emitted
+    /// by [`Self::emit_closure_trampoline_bodies`] after the user functions and
+    /// `_start`, so the function- and code-section orders stay in lockstep. Must
+    /// run after [`Self::declare_start`] (so trampoline indices follow `_start`).
+    /// Ordering relative to [`Self::emit_exports`] doesn't matter (exports are an
+    /// unordered set); the body emitter, however, requires
+    /// [`Self::register_closure_table`] to have set the table index.
+    ///
+    /// The single closure crosses the boundary as its `i32` env pointer (the
+    /// closure object); the fn-table index lives at `env[0]` and the trampoline
+    /// reloads it, so no separate `fn_idx` slot is marshalled (a simplification
+    /// of the `(fn_idx, env_ptr)` sketch in design-decisions §Phase 2.5 decision
+    /// E — functionally equivalent, since `fn_idx` is always `env[0]`).
+    pub(super) fn declare_closure_trampolines(
+        &mut self,
+        sigs: &[translate::CallbackSig],
+    ) -> Result<(), CompileError> {
+        for sig in sigs {
+            let name = translate::closure_trampoline_name(sig).ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-linear: a callback signature reached trampoline \
+                     declaration without a marshalling name (internal compiler \
+                     bug — `collect_callback_signatures` should only yield \
+                     glue-supported signatures)"
+                        .to_string(),
+                )
+            })?;
+            // Full param valtypes: the leading `i32` env pointer, then the
+            // closure's own (flattened) user parameters. The result valtypes are
+            // the closure's return type. This is identical to the type
+            // `emit_closure_call_raw` interns for an in-program indirect call, so
+            // the trampoline's `call_indirect` target type matches the closure
+            // functions already in the table.
+            let mut params = vec![wasm_encoder::ValType::I32];
+            for ty in &sig.param_types {
+                params.extend(translate::wasm_valtypes_for(ty)?);
+            }
+            let returns = translate::wasm_return_valtypes(&sig.return_type)?;
+            let type_idx = self.types.intern(&params, &returns);
+            let func_idx = self.add_local_function(type_idx);
+            self.exports
+                .export(&name, wasm_encoder::ExportKind::Func, func_idx);
+            self.closure_trampolines.push(ClosureTrampoline {
+                n_param_slots: params.len() as u32,
+                type_idx,
+            });
+        }
+        Ok(())
+    }
+
+    /// `true` if any callback trampoline was declared — i.e. the program hands a
+    /// closure to a host. Gates the extra runtime-function exports the callback
+    /// glue needs (`phx_gc_pin` / `phx_gc_unpin`).
+    pub(super) fn has_closure_trampolines(&self) -> bool {
+        !self.closure_trampolines.is_empty()
+    }
+
+    /// Emit the body of every trampoline declared by
+    /// [`Self::declare_closure_trampolines`], in the same order. Each body
+    /// forwards its params (`env`, then the user-arg slots) and reloads the
+    /// fn-table index from `env[0]`, then `call_indirect`s through the closure
+    /// table — the standalone-function form of [`translate::emit_closure_call_raw`].
+    /// Must run after [`Self::register_closure_table`] (for the table index) and
+    /// after [`Self::emit_start_body`] (to preserve section ordering).
+    pub(super) fn emit_closure_trampoline_bodies(&mut self) -> Result<(), CompileError> {
+        if self.closure_trampolines.is_empty() {
+            return Ok(());
+        }
+        let table_idx = self.require_closure_table_idx()?;
+        // Drain so the borrow of `self.closure_trampolines` is released before
+        // `self.code` is borrowed mutably below.
+        let trampolines = std::mem::take(&mut self.closure_trampolines);
+        for t in &trampolines {
+            let mut f = wasm_encoder::Function::new([]);
+            // Push every param slot (env at local 0, then the user args).
+            for local in 0..t.n_param_slots {
+                f.instruction(&wasm_encoder::Instruction::LocalGet(local));
+            }
+            // Reload the closure's fn-table index from env[0] and dispatch.
+            f.instruction(&wasm_encoder::Instruction::LocalGet(0));
+            f.instruction(&wasm_encoder::Instruction::I32Load(i32_memarg(0)));
+            f.instruction(&wasm_encoder::Instruction::CallIndirect {
+                type_index: t.type_idx,
+                table_index: table_idx,
+            });
+            f.instruction(&wasm_encoder::Instruction::End);
+            self.code.function(&f);
+        }
+        Ok(())
     }
 
     pub(super) fn emit_phoenix_bodies(&mut self, ir_module: &IrModule) -> Result<(), CompileError> {

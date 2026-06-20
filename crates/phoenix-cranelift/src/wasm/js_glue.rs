@@ -20,12 +20,25 @@
 //! UTF-8 in, and returns the `(ptr, len)` fat pointer. Strings are **copied**,
 //! never shared (decision F).
 //!
-//! **Deferred to PR 8:** closure-typed extern parameters (callbacks). The
-//! generator never fails the build for an unsupported signature — it emits a
-//! throwing thunk so the rest of the program still links and runs; only an
-//! actual call to that extern fails.
+//! A *closure-typed* extern parameter (a callback — Phase 2.5 decision G) crosses
+//! as the closure's `i32` env pointer. The glue wraps it in a JS callable that
+//! invokes the module's exported `__phoenix_invoke_closure_<sig>` trampoline,
+//! and roots the closure across the boundary: it calls `phx_gc_pin` when it
+//! wraps the callback so a host-retained callback survives the GC after the
+//! extern returns, and `phx_gc_unpin` when the host releases it (explicitly via
+//! the wrapper's `release()`, or via a `FinalizationRegistry` when the wrapper is
+//! collected). A callback the host never releases stays pinned for the program's
+//! life — the documented, linear-only retained-callback leak.
+//!
+//! **Still deferred:** a closure *returned* from a host to Phoenix (the reverse
+//! direction), and a *nested* callback (a closure whose own parameter/return is
+//! itself a closure). The generator never fails the build for such a signature —
+//! it emits a throwing thunk so the rest of the program still links and runs;
+//! only an actual call to that extern fails.
 
-use super::translate::{ExternSig, wasm_valtypes_for};
+use super::translate::{
+    CallbackSig, ExternSig, callback_sigs_in_externs, closure_trampoline_name, wasm_valtypes_for,
+};
 use crate::error::CompileError;
 use phoenix_ir::types::IrType;
 use std::collections::BTreeMap;
@@ -131,6 +144,13 @@ export async function instantiate({ wasm, host = {}, writeStdout } = {}) {
   // function returns a `String`. A module with no string-returning extern never
   // calls it; a build that uses externs always exports it (PR 7).
   let stringAlloc = null;
+  // Set after instantiation: the module's exports (the callback trampolines the
+  // wrapped callables invoke) and the GC pin/unpin hooks that root a host-
+  // retained callback. A module that passes no closures to a host never sets the
+  // pin hooks; a build that does always exports them.
+  let exports = null;
+  let gcPin = null;
+  let gcUnpin = null;
   /**
    * Build a Phoenix `String` (a `(ptr, len)` fat pointer) in linear memory from
    * a JS string: allocate `phx_string_alloc(byteLen)` (returns the writable
@@ -219,6 +239,90 @@ export async function instantiate({ wasm, host = {}, writeStdout } = {}) {
     },
   };
 
+  // Coerce a host-supplied JS value into the `i64` a callback's `Int` parameter
+  // expects. Mirrors the lenient `Int↔Number` contract of the extern-return arm
+  // (`outbound_return`): go through `Number` so a `BigInt` doesn't make
+  // `Math.trunc` throw, and guard a non-finite value (`undefined`, an object,
+  // `NaN`) so the bug surfaces as a clear glue error rather than an opaque
+  // `RangeError` from `BigInt(NaN)`.
+  function __intArg(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n))
+      throw new Error(
+        "phoenix glue: a callback `Int` argument was passed a non-numeric value",
+      );
+    return BigInt(Math.trunc(n));
+  }
+
+  // Callback retention (design-decisions §Phase 2.5 decision G). A Phoenix
+  // closure handed to a host crosses as its `i32` env pointer. `__retainCallback`
+  // wraps it in a JS callable (invoking the relevant trampoline), pins the
+  // closure so a host-retained callback survives a GC after the extern returns,
+  // and tracks it so the *same* env pointer yields the *same* callable (stable
+  // identity, one pin per live closure). `__releaseCallback` unpins it — called
+  // explicitly via the wrapper's `release()` or by the `FinalizationRegistry`
+  // when the wrapper is collected. A callback the host never releases stays
+  // pinned for the program's life (the documented, linear-only leak).
+  //
+  // The map holds the wrapper *weakly* (`WeakRef`): a strong reference would keep
+  // the wrapper reachable forever, so the `FinalizationRegistry` could never fire
+  // and the dominant reclaim path (the host simply drops the callback) would
+  // leak. Weak storage lets the wrapper be collected once the host releases its
+  // own reference; the finalizer then unpins.
+  //
+  // Each wrapper gets a fresh identity object `token = { ptr }` used three ways:
+  // as the `FinalizationRegistry` held value (so the finalizer knows which
+  // pointer to unpin), as the unregister token, and as the staleness key stored
+  // on the map entry. Two hazards this guards:
+  //   * Env-pointer recycling after release. Once unpinned+collected, a pointer's
+  //     address can be reused by a later allocation. An explicit `release()`
+  //     therefore *unregisters* the still-armed finalizer, so it can't fire later
+  //     and unpin a *different* live closure now at the same address.
+  //   * Re-handing a still-pinned closure whose previous wrapper was collected but
+  //     whose finalizer hasn't run yet ("stale" entry). We must not double-pin:
+  //     the pin is still held, so the fresh wrapper reuses it (pin only when there
+  //     is no entry at all). The superseded finalizer then fires with the old
+  //     token, which no longer matches the entry, so it no-ops — the new wrapper
+  //     owns the single pin until it is itself released.
+  const __hasWeakRef = typeof WeakRef !== "undefined";
+  const __callbacks = new Map(); // env pointer -> { ref, token }
+  const __finalizers =
+    typeof FinalizationRegistry !== "undefined"
+      ? new FinalizationRegistry((token) => __releaseCallback(token))
+      : null;
+  function __releaseCallback(token) {
+    const entry = __callbacks.get(token.ptr);
+    // Ignore a finalizer superseded by a fresh retain of the same still-pinned
+    // pointer: the newer entry (different token) owns the pin now.
+    if (!entry || entry.token !== token) return;
+    __callbacks.delete(token.ptr);
+    if (__finalizers) __finalizers.unregister(token);
+    if (typeof gcUnpin === "function") gcUnpin(token.ptr);
+  }
+  function __retainCallback(ptr, invoke) {
+    if (ptr === 0) return null; // a null Phoenix closure crosses as 0
+    const entry = __callbacks.get(ptr);
+    // A live wrapper for this pointer => reuse it (stable identity, one pin). A
+    // stale entry (wrapper collected, finalizer pending) falls through to a fresh
+    // wrapper that reuses the still-held pin.
+    const alive = entry && (__hasWeakRef ? entry.ref.deref() : entry.ref);
+    if (alive) return alive;
+    const fn = (...args) => invoke(args);
+    const token = { ptr };
+    fn.release = () => __releaseCallback(token);
+    // Pin only on a genuinely fresh pointer; a stale entry means it is still
+    // pinned (see the hazard note above).
+    if (!entry && typeof gcPin === "function") gcPin(ptr);
+    __callbacks.set(ptr, { ref: __hasWeakRef ? new WeakRef(fn) : fn, token });
+    if (__finalizers) __finalizers.register(fn, token, token);
+    return fn;
+  }
+  // One factory per distinct callback signature, each wrapping an env pointer in
+  // a callable that marshals the host's JS arguments into the trampoline call
+  // and marshals its result back. Generated from the same signature table as the
+  // trampolines, so the names match.
+/*__CALLBACK_FACTORIES__*/
+
   const imports = {
     wasi_snapshot_preview1,
 /*__EXTERN_NAMESPACES__*/
@@ -230,6 +334,9 @@ export async function instantiate({ wasm, host = {}, writeStdout } = {}) {
   );
   memory = instance.exports.memory;
   stringAlloc = instance.exports.phx_string_alloc || null;
+  exports = instance.exports;
+  gcPin = instance.exports.phx_gc_pin || null;
+  gcUnpin = instance.exports.phx_gc_unpin || null;
   return {
     instance,
     run() {
@@ -242,6 +349,15 @@ export async function instantiate({ wasm, host = {}, writeStdout } = {}) {
         }
         throw e;
       }
+    },
+    // Diagnostic introspection (not part of the stable embedding API): the number
+    // of host-retained Phoenix callbacks still tracked — one map entry per pinned
+    // closure, including any whose wrapper was collected but whose finalizer has
+    // not yet run. Drops to zero once every retained callback has been released
+    // (explicitly or via the `FinalizationRegistry`). Exposed so tests can
+    // observe reclamation rather than only a clean exit.
+    retainedCallbackCount() {
+      return __callbacks.size;
     },
   };
 }
@@ -297,10 +413,142 @@ pub(super) fn generate(externs: &[ExternSig]) -> Result<String, CompileError> {
         .map(|n| js_string(n))
         .collect::<Vec<_>>()
         .join(", ");
+
+    // One factory per distinct glue-supported callback signature handed to a
+    // host, in first-seen order. Derived from the *same* helper as the trampoline
+    // emitter (`translate::callback_sigs_in_externs`), so every factory has a
+    // matching exported trampoline and the two sets cannot drift.
+    let mut factories = String::new();
+    for cb in callback_sigs_in_externs(externs) {
+        factories.push_str(&build_callback_factory(&cb)?);
+    }
+
     // Trim the trailing newline so the placeholder line's indentation is clean.
     Ok(GLUE_TEMPLATE
         .replace("/*__EXTERN_NAMESPACES__*/", namespaces.trim_end())
+        .replace("/*__CALLBACK_FACTORIES__*/", factories.trim_end())
         .replace("/*__REQUIRED_HOST__*/", &required_list))
+}
+
+/// The JS factory-function name for a callback signature: the trampoline export
+/// name with the `__phoenix_invoke_closure_` prefix swapped for a short `__cb_`.
+/// Both the factory definition (in [`build_callback_factory`]) and the call site
+/// (in [`inbound_arg`]) derive it the same way, from the shared
+/// [`closure_trampoline_name`], so they cannot drift.
+fn callback_factory_name(sig: &CallbackSig) -> Option<String> {
+    closure_trampoline_name(sig).map(|t| t.replace("__phoenix_invoke_closure_", "__cb_"))
+}
+
+/// Build the JS factory for one callback signature: `__cb_<sig>(ptr)` returns a
+/// retained callable that, when the host invokes it with JS arguments, marshals
+/// them into the exported trampoline call and marshals the trampoline's result
+/// back to a JS value.
+fn build_callback_factory(sig: &CallbackSig) -> Result<String, CompileError> {
+    // These names exist because the caller already filtered to glue-supported
+    // signatures; an internal-bug guard rather than a user error.
+    let trampoline = closure_trampoline_name(sig).ok_or_else(|| {
+        CompileError::new(
+            "wasm32-linear: callback factory for a non-marshallable signature \
+             (internal compiler bug)"
+                .to_string(),
+        )
+    })?;
+    let factory = callback_factory_name(sig).ok_or_else(|| {
+        CompileError::new(
+            "wasm32-linear: callback factory name for a non-marshallable \
+             signature (internal compiler bug)"
+                .to_string(),
+        )
+    })?;
+
+    // Marshal each host argument (`args[i]`) into the trampoline's wasm args. A
+    // `String` arg spreads to two slots (ptr, len), so each entry is a full
+    // expression list fragment.
+    let mut arg_exprs = Vec::with_capacity(sig.param_types.len());
+    for (i, ty) in sig.param_types.iter().enumerate() {
+        arg_exprs.push(callback_arg_to_wasm(ty, i)?);
+    }
+    let args_suffix = if arg_exprs.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", arg_exprs.join(", "))
+    };
+    let call = format!("{}(ptr{args_suffix})", js_index("exports", &trampoline));
+
+    let body = match &sig.return_type {
+        IrType::Void => format!("{call};"),
+        ret => format!(
+            "const __r = {call}; return {};",
+            callback_wasm_to_host(ret)?
+        ),
+    };
+
+    Ok(format!(
+        "    function {factory}(ptr) {{\n      \
+         return __retainCallback(ptr, (args) => {{ {body} }});\n    }}\n"
+    ))
+}
+
+/// Host→wasm marshalling for a callback parameter: the JS expression(s) feeding
+/// `args[idx]` into the trampoline call. A `String` yields a *spread* of the
+/// `(ptr, len)` pair (two wasm args from one host argument); every other type
+/// yields a single expression. Mirrors [`outbound_return`]'s host→wasm coercions.
+fn callback_arg_to_wasm(ty: &IrType, idx: usize) -> Result<String, CompileError> {
+    let a = format!("args[{idx}]");
+    Ok(match ty {
+        // Trampoline `Int` param is i64; `__intArg` applies the same lenient
+        // Int↔Number coercion the extern-return arm uses, with the non-finite
+        // guard so a bad host value gives a clear glue error, not `BigInt(NaN)`.
+        IrType::I64 => format!("__intArg({a})"),
+        IrType::F64 => a,
+        IrType::Bool => format!("({a}) ? 1 : 0"),
+        // A `String` callback arg is copied into a GC string and spread to the
+        // trampoline's `(ptr, len)` pair.
+        IrType::StringRef => format!("...buildString(String({a}))"),
+        // Each invocation interns a fresh handle; `handles` has no free path yet
+        // (see `__makeHandles`), so a callback fired in a loop accumulates one
+        // handle per call — to be reclaimed when the freeing/scoping scheme lands.
+        // Tracked in known-issues.md ("A `JsValue` argument to an `extern js`
+        // callback interns a handle per invocation on wasm32-linear").
+        IrType::JsValue => format!("handles.put({a})"),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: callback parameter type `{other}` is not \
+                 marshallable (internal compiler bug — \
+                 `callback_sig_is_glue_supported` should have rejected it)"
+            )));
+        }
+    })
+}
+
+/// Wasm→host marshalling for a callback's return type: the JS expression turning
+/// the trampoline result `__r` into the value the host callback returns. A
+/// `String` return is a 2-value wasm result (a `[ptr, len]` array on the JS
+/// side); every other type is a single value. Mirrors [`inbound_arg`]'s
+/// wasm→host reconstructions. `Void` never reaches here (its factory emits no
+/// `return`).
+fn callback_wasm_to_host(ty: &IrType) -> Result<String, CompileError> {
+    Ok(match ty {
+        IrType::I64 => "Number(__r)".to_string(),
+        IrType::F64 => "__r".to_string(),
+        IrType::Bool => "(__r !== 0)".to_string(),
+        IrType::JsValue => "handles.get(__r)".to_string(),
+        // Multi-value wasm result surfaces as a JS array `[ptr, len]`.
+        IrType::StringRef => "readString(__r[0], __r[1])".to_string(),
+        other => {
+            return Err(CompileError::new(format!(
+                "wasm32-linear: callback return type `{other}` is not \
+                 marshallable (internal compiler bug — \
+                 `callback_sig_is_glue_supported` should have rejected it)"
+            )));
+        }
+    })
+}
+
+/// Render a JS property access `obj["key"]`, with `key` as a string literal so
+/// any character in a generated export name stays valid.
+fn js_index(obj: &str, key: &str) -> String {
+    format!("{obj}[{}]", js_string(key))
 }
 
 /// Build the marshalling thunk for one extern, or `Err(reason)` if the signature
@@ -372,8 +620,33 @@ fn inbound_arg(ty: &IrType, slot: usize) -> Result<(String, usize), String> {
             );
             format!("handles.get(p{slot})")
         }
-        IrType::ClosureRef { .. } => {
-            return Err("closure (callback) parameters land in PR 8".to_string());
+        IrType::ClosureRef {
+            param_types,
+            return_type,
+        } => {
+            // A closure crosses as its single `i32` env pointer (a GC-pointer
+            // type → 1 slot via `wasm_valtypes_for`). Wrap it through the
+            // signature's factory, which retains + pins it and dispatches to the
+            // exported trampoline. A signature the linear glue can't marshal (a
+            // nested closure) has no factory name — fall back to the throwing-
+            // thunk deferral, same as a non-marshallable return type.
+            let sig = CallbackSig {
+                param_types: param_types.clone(),
+                return_type: (**return_type).clone(),
+            };
+            debug_assert_eq!(
+                wasm_valtypes_for(ty).map(|v| v.len()).unwrap_or(0),
+                1,
+                "a closure must flatten to exactly 1 wasm slot (its env pointer)"
+            );
+            match callback_factory_name(&sig) {
+                Some(factory) => format!("{factory}(p{slot})"),
+                None => {
+                    return Err("callback parameter with a non-marshallable signature \
+                         (nested closures are not supported yet)"
+                        .to_string());
+                }
+            }
         }
         other => return Err(format!("parameter type `{other}` is not marshallable")),
     };
@@ -586,28 +859,148 @@ mod tests {
     }
 
     #[test]
-    fn closure_param_emits_throwing_thunk_and_is_not_required() {
-        // A closure (callback) parameter is deferred to PR 8, so `onClick` gets
-        // a throwing thunk rather than a real marshalling thunk. Symmetric to
-        // the deferred-*return* case above: the throwing thunk keeps the import
-        // satisfied, but the extern needs no host binding, so it must be absent
-        // from the required-host list (else instantiate would force a pointless
-        // stub for an extern that can never actually be called).
+    fn callback_params_wrap_through_a_factory_and_are_required() {
+        // A `() -> Void` and an `(Int) -> Void` callback both get real thunks
+        // that wrap the crossing closure pointer through the matching factory,
+        // and both become required host bindings (the host receives the wrapped
+        // callable).
         let externs = vec![
             sig(
-                "onClick",
+                "onTick",
                 vec![IrType::ClosureRef {
                     param_types: vec![],
                     return_type: Box::new(IrType::Void),
                 }],
                 IrType::Void,
             ),
+            sig(
+                "withValue",
+                vec![IrType::ClosureRef {
+                    param_types: vec![IrType::I64],
+                    return_type: Box::new(IrType::Void),
+                }],
+                IrType::Void,
+            ),
+        ];
+        let glue = generate(&externs).unwrap();
+        // One factory per distinct signature.
+        assert!(glue.contains("function __cb__to_v(ptr)"));
+        assert!(glue.contains("function __cb_i_to_v(ptr)"));
+        // The thunk wraps the closure pointer through its factory.
+        assert!(glue.contains("host.onTick(__cb__to_v(p0))"));
+        assert!(glue.contains("host.withValue(__cb_i_to_v(p0))"));
+        // The factory dispatches to the exported trampoline, marshalling the
+        // host's argument to the i64 the trampoline expects, and retains+pins it.
+        assert!(
+            glue.contains(r#"exports["__phoenix_invoke_closure_i_to_v"](ptr, __intArg(args[0]))"#)
+        );
+        assert!(glue.contains(r#"exports["__phoenix_invoke_closure__to_v"](ptr)"#));
+        assert!(glue.contains("__retainCallback(ptr, (args) =>"));
+        // Both real thunks => both required host bindings.
+        assert!(glue.contains(r#"for (const __name of ["onTick", "withValue"])"#));
+    }
+
+    #[test]
+    fn callback_with_return_and_string_arg_marshals_both_directions() {
+        // A `(String) -> Bool` predicate exercises a string arg copied in
+        // (spread to a `(ptr, len)` pair) and a bool result marshalled back.
+        let externs = vec![sig(
+            "keep",
+            vec![IrType::ClosureRef {
+                param_types: vec![IrType::StringRef],
+                return_type: Box::new(IrType::Bool),
+            }],
+            IrType::Void,
+        )];
+        let glue = generate(&externs).unwrap();
+        assert!(glue.contains("function __cb_s_to_b(ptr)"));
+        // String arg copied into a GC string and spread to (ptr, len).
+        assert!(glue.contains("...buildString(String(args[0]))"));
+        // Bool result marshalled wasm→host, guarded by the `const __r` capture.
+        assert!(glue.contains("const __r = ") && glue.contains("return (__r !== 0);"));
+        assert!(glue.contains("host.keep(__cb_s_to_b(p0))"));
+    }
+
+    #[test]
+    fn retention_holds_wrappers_weakly_and_disarms_the_finalizer_on_release() {
+        // Two structural guarantees of the retention layer:
+        //   1. The map holds the wrapper *weakly* (`WeakRef`), so a strong
+        //      reference can't keep it alive forever and starve the
+        //      `FinalizationRegistry` — the dominant reclaim path.
+        //   2. Env pointers are recycled, so an explicit `release()` must
+        //      unregister the still-armed finalizer (keyed on the per-wrapper
+        //      `token`) — otherwise it could later fire for the same numeric
+        //      pointer now bound to a *different* live closure (a use-after-free).
+        let glue = generate(&[]).unwrap();
+        assert!(
+            glue.contains("new WeakRef(fn)"),
+            "the wrapper must be stored weakly so it can be collected and finalized"
+        );
+        assert!(
+            glue.contains("__finalizers.register(fn, token, token)"),
+            "the wrapper must be registered with a per-wrapper token as both held \
+             value and unregister token"
+        );
+        assert!(
+            glue.contains("if (__finalizers) __finalizers.unregister(token);"),
+            "an explicit release must unregister the still-armed finalizer before \
+             the env pointer can be recycled"
+        );
+        // The fresh-pin guard: a stale entry (collected wrapper, pending
+        // finalizer) must reuse the existing pin rather than double-pinning.
+        assert!(
+            glue.contains("if (!entry && typeof gcPin === \"function\") gcPin(ptr);"),
+            "a fresh pin must be taken only when there is no existing entry"
+        );
+    }
+
+    #[test]
+    fn callback_marshals_jsvalue_through_the_handle_table_both_directions() {
+        // A `(JsValue) -> JsValue` callback: the host's argument is interned into
+        // the handle table (host→wasm) and the trampoline's handle result is
+        // resolved back to the JS object (wasm→host), mirroring the extern-thunk
+        // `JsValue` path.
+        let externs = vec![sig(
+            "map",
+            vec![IrType::ClosureRef {
+                param_types: vec![IrType::JsValue],
+                return_type: Box::new(IrType::JsValue),
+            }],
+            IrType::Void,
+        )];
+        let glue = generate(&externs).unwrap();
+        assert!(glue.contains("function __cb_j_to_j(ptr)"));
+        // Arg interned host→wasm, result resolved wasm→host.
+        assert!(
+            glue.contains(
+                r#"exports["__phoenix_invoke_closure_j_to_j"](ptr, handles.put(args[0]))"#
+            )
+        );
+        assert!(glue.contains("const __r = ") && glue.contains("return handles.get(__r);"));
+        assert!(glue.contains("host.map(__cb_j_to_j(p0))"));
+    }
+
+    #[test]
+    fn nested_callback_param_emits_throwing_thunk_and_is_not_required() {
+        // A callback whose own parameter is itself a closure is not marshallable
+        // in this phase, so `weird` falls back to a throwing thunk (the deferral
+        // pattern) and needs no host binding — only `alert` is required.
+        let nested = IrType::ClosureRef {
+            param_types: vec![IrType::ClosureRef {
+                param_types: vec![],
+                return_type: Box::new(IrType::Void),
+            }],
+            return_type: Box::new(IrType::Void),
+        };
+        let externs = vec![
+            sig("weird", vec![nested], IrType::Void),
             sig("alert", vec![IrType::StringRef], IrType::Void),
         ];
         let glue = generate(&externs).unwrap();
-        assert!(glue.contains("onClick(/* ...args */) { throw new Error("));
-        assert!(glue.contains("closure (callback) parameters land in PR 8"));
-        // Only `alert` (a real thunk) is a required host binding; `onClick` is not.
+        assert!(glue.contains("weird(/* ...args */) { throw new Error("));
+        assert!(glue.contains("nested closures are not supported yet"));
         assert!(glue.contains(r#"for (const __name of ["alert"])"#));
+        // No factory emitted for the unsupported signature.
+        assert!(!glue.contains("__cb_"));
     }
 }

@@ -6,6 +6,22 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
+### A retained `extern js` callback is pinned for the program's life on wasm32-linear
+
+When a Phoenix closure is handed to a JS host as an `extern js` callback (Phase 2.5 [decision G](design-decisions.md#g-closures-as-callbacks-lifetime-per-backend)), the wasm32-linear glue pins the closure (`phx_gc_pin`) so a host that retains the callback past the extern call can still invoke it after the GC would otherwise reclaim it. The pin is released when the host releases the callback — explicitly via the wrapper's `release()`, or via a `FinalizationRegistry` when the wrapper itself is collected. A host that **never** releases the callback (drops the wrapper without `release()` in an engine whose `FinalizationRegistry` never fires, or deliberately holds it forever) leaves the closure pinned for the rest of the program's run: a slow leak of that one closure object and its captures.
+
+**Why this is linear-only and not a blocker.** This is the cost of copy-marshalling across linear memory with no shared collector. The wasm32-gc binding does **not** have it — there the callback is held by an `externref`/`funcref` the host VM GC traces, so a host-retained callback is reclaimed automatically once the host drops it (decision G's gc bullet). For linear, callbacks-only async (decision H) has no `Promise` to anchor a deterministic lifetime, so explicit release is the contract and the never-released path is the residual leak. In practice the `FinalizationRegistry` path reclaims the common case (the host drops the wrapper); only a host that pins the wrapper forever leaks, and that closure count is bounded by the program's distinct retained callbacks.
+
+**Target phase:** forward deferral — revisit if a real interop program accumulates retained callbacks unbounded. A scoped-callback API (a `withCallback { ... }` that drops at scope exit) or a weak-by-default retention mode could bound it; neither is justified at 2.5's scale. The wasm32-gc binding (Phase 2.5 PRs 12–15) sidesteps it entirely. Surfaced 2026-06-19 (PR 8).
+
+### A `JsValue` argument to an `extern js` callback interns a handle per invocation on wasm32-linear
+
+When a host invokes a Phoenix callback (`extern js` decision G) whose parameter is a `JsValue`, the wasm32-linear glue interns that JS argument into the handle table (`handles.put(...)`) on **every** call. The handle table has no free path yet, so a callback fired in a loop (or repeatedly over the program's life) accumulates one handle per invocation — unbounded growth, distinct from and worse than the retained-callback pin leak above (which is bounded by the count of *distinct* retained callbacks, not by how often they fire).
+
+**Why deferred and not a blocker.** This is the same gap as the outbound `JsValue` handle table generally: the table is allocate-only until a freeing/scoping scheme lands. Callbacks taking `JsValue` are the case that turns a one-shot leak into a per-invocation one, so it is called out separately here. Scalar/`String`/`Bool` callback args do not intern a handle and are unaffected.
+
+**Target phase:** reclaimed when the handle-table freeing/scoping scheme lands (the same work that bounds outbound `JsValue` handles). The wasm32-gc binding represents `JsValue` as a traced `externref` and has no handle table, so it sidesteps it entirely. Surfaced 2026-06-19 (PR 8).
+
 ### `defer` does not fire on hardware-trap body errors in compiled binaries
 
 The AST interpreter fires defers on *any* body error (recoverable `RuntimeError`s such as divide-by-zero or list-out-of-bounds); the IR-driven backends (Cranelift, C codegen) only fire defers on recoverable function-exit paths (fall-through, explicit `return`, `?` early-return) and **not** on hardware traps such as integer division by zero — those raise SIGFPE and abort before any deferred work runs. This is a real divergence between backends.

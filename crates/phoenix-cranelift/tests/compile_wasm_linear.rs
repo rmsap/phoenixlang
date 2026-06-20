@@ -280,6 +280,26 @@ fn import_modules(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     Ok(imports)
 }
 
+/// The names of every *function* export in `bytes`. Used by the callback tests
+/// to assert the exported `__phoenix_invoke_closure_*` trampolines and the GC
+/// pin/unpin hooks are present (or, for a callback-free module, absent). Parses
+/// the export section so an export name can't be confused with an incidental
+/// byte-sequence match.
+fn export_func_names(bytes: &[u8]) -> Vec<String> {
+    use wasmparser::{ExternalKind, Parser, Payload};
+    let mut names = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Ok(Payload::ExportSection(rdr)) = payload {
+            for export in rdr.into_iter().flatten() {
+                if export.kind == ExternalKind::Func {
+                    names.push(export.name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 /// Single-pass walk of the wasm bytes collecting the bookkeeping
 /// every phx_main / shadow-stack assertion needs:
 /// * `import_func_count` so absolute function indices can be biased
@@ -2491,6 +2511,90 @@ fn extern_signature_derived_from_first_site_validates_all_call_sites() {
             non_wasi,
             vec!["tag"],
             "non-WASI imports should be exactly the single multi-site extern: {imports:?}"
+        );
+    });
+}
+
+/// A closure handed to a host as a callback (Phase 2.5 decision G) compiles to a
+/// module that validates, declares one custom import for the callback-taking
+/// extern (the closure crosses as a single `i32` env pointer), and **exports**
+/// the matching `call_indirect` trampoline plus the GC pin/unpin hooks the glue
+/// needs to root a retained callback. Structural-tier: the `js.*` imports are
+/// unsatisfied until the glue, so it can't run under bare wasmtime (the Node
+/// round-trip lives in `phoenix-driver/tests/extern_js_glue.rs`).
+#[test]
+fn extern_js_callback_exports_trampoline_and_gc_pins_and_validates() {
+    let src = "extern js {\n  \
+                 function eachUpTo(n: Int, cb: (Int) -> Void)\n  \
+                 function onReady(cb: () -> Void)\n\
+               }\n\
+               function main() {\n  \
+                 onReady(function() { print(0) })\n  \
+                 eachUpTo(3, function(i: Int) { print(i) })\n\
+               }\n";
+    compile_or_skip(src, "extern_js_callback", |bytes| {
+        wasmparser::validate(bytes)
+            .unwrap_or_else(|e| panic!("wasmparser rejected the callback module: {e}"));
+
+        // The closure crosses as a single `i32`, so each callback-taking extern
+        // is one import; non-WASI imports are exactly the two externs.
+        let imports =
+            import_modules(bytes).unwrap_or_else(|e| panic!("parsing import section: {e}"));
+        let mut non_wasi: Vec<&str> = imports
+            .iter()
+            .filter(|(m, _)| m != "wasi_snapshot_preview1")
+            .map(|(m, n)| {
+                assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+                n.as_str()
+            })
+            .collect();
+        non_wasi.sort_unstable();
+        assert_eq!(
+            non_wasi,
+            vec!["eachUpTo", "onReady"],
+            "non-WASI imports should be exactly the callback-taking externs: {imports:?}"
+        );
+
+        // The two distinct callback signatures each get an exported trampoline,
+        // and the GC pin/unpin hooks are exported for the retention path.
+        let exports = export_func_names(bytes);
+        for name in [
+            "__phoenix_invoke_closure_i_to_v",
+            "__phoenix_invoke_closure__to_v",
+            "phx_gc_pin",
+            "phx_gc_unpin",
+        ] {
+            assert!(
+                exports.iter().any(|e| e == name),
+                "expected exported function `{name}`, got: {exports:?}"
+            );
+        }
+    });
+}
+
+/// A program with `extern js` calls but **no** callback parameters must not
+/// export the trampoline-path symbols — the pin/unpin hooks and any
+/// `__phoenix_invoke_closure_*` trampoline are gated on actually handing a
+/// closure to a host, so a scalar/string-only interop module keeps a tight
+/// export surface.
+#[test]
+fn extern_without_callbacks_exports_no_trampoline_or_gc_pins() {
+    let src = "extern js { function alert(message: String) }\n\
+               function main() { alert(\"hi\") }\n";
+    compile_or_skip(src, "extern_js_no_callbacks", |bytes| {
+        wasmparser::validate(bytes).unwrap_or_else(|e| panic!("validation failed: {e}"));
+        let exports = export_func_names(bytes);
+        assert!(
+            !exports
+                .iter()
+                .any(|e| e == "phx_gc_pin" || e == "phx_gc_unpin"),
+            "a callback-free module must not export the GC pin/unpin hooks: {exports:?}"
+        );
+        assert!(
+            !exports
+                .iter()
+                .any(|e| e.starts_with("__phoenix_invoke_closure_")),
+            "a callback-free module must not export any callback trampoline: {exports:?}"
         );
     });
 }

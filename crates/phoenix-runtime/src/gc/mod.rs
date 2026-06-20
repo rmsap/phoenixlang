@@ -10,6 +10,7 @@
 //! [`docs/design-decisions.md`](../../../../docs/design-decisions.md).
 
 pub(crate) mod heap;
+pub(crate) mod pinned;
 pub(crate) mod shadow_stack;
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -264,6 +265,30 @@ pub unsafe extern "C" fn phx_gc_set_root(
     ptr: *mut u8,
 ) {
     unsafe { shadow_stack::set_root(frame, idx, ptr) }
+}
+
+/// Pin `payload` as a persistent GC root, keeping it reachable across
+/// collections regardless of the shadow stack. Used by the `extern js`
+/// JS glue (design-decisions §Phase 2.5 decision G) when it wraps a Phoenix
+/// closure handed to a host as a callback: the host may retain and invoke the
+/// callback after the extern call that handed it over has returned, outliving
+/// the shadow-stack frame that would otherwise root it. Balanced by
+/// [`phx_gc_unpin`]; an unbalanced pin is the documented retained-callback leak.
+///
+/// `payload` is a Phoenix-heap payload pointer (the closure object). A null
+/// pointer is ignored.
+#[unsafe(no_mangle)]
+pub extern "C" fn phx_gc_pin(payload: *mut u8) {
+    pinned::pin(payload);
+}
+
+/// Remove one [`phx_gc_pin`] for `payload`. Called by the JS glue when the host
+/// releases a retained callback (explicitly via the wrapper's `release()`, or
+/// via a `FinalizationRegistry` when the wrapper is collected). A no-op if
+/// `payload` is not pinned, so a defensive double-release cannot underflow.
+#[unsafe(no_mangle)]
+pub extern "C" fn phx_gc_unpin(payload: *mut u8) {
+    pinned::unpin(payload);
 }
 
 /// Force a collection cycle. Rust-only API used by tests and benchmarks;

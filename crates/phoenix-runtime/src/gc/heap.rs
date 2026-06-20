@@ -27,7 +27,7 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashSet;
 
 use super::{
-    DEFAULT_COLLECTION_THRESHOLD, GcHeap, HEADER_SIZE, ObjectHeader, TypeTag, shadow_stack,
+    DEFAULT_COLLECTION_THRESHOLD, GcHeap, HEADER_SIZE, ObjectHeader, TypeTag, pinned, shadow_stack,
 };
 use crate::runtime_abort;
 
@@ -245,6 +245,24 @@ impl MarkSweepHeap {
         work.clear();
 
         shadow_stack::for_each_root_into(&mut roots, |root| {
+            if let Some(header) = self.header_for_payload(root)
+                && !unsafe { (*header).is_marked() }
+            {
+                unsafe { (*header).set_mark() };
+                work.push(header);
+            }
+        });
+
+        // Persistent pins (`extern js` callbacks) are
+        // additional precise roots, scanned exactly like the shadow stack: a
+        // pinned closure must survive a collection that fires after the extern
+        // call that handed it to the host returned. The buffer is local because
+        // pins are scanned once per collection and the live-pin count is tiny
+        // (one entry per host-retained callback), so a reused heap field would
+        // save a negligible allocation. `roots` already holds the shadow-stack
+        // snapshot and must not be clobbered, so this uses its own buffer.
+        let mut pins = Vec::new();
+        pinned::for_each_pinned_into(&mut pins, |root| {
             if let Some(header) = self.header_for_payload(root)
                 && !unsafe { (*header).is_marked() }
             {

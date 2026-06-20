@@ -2,10 +2,11 @@
 //! sidecar for `extern js` programs, and the generated glue actually runs the
 //! module under Node when a host is supplied.
 //!
-//! The Node smoke test is gated like the other host-dependent tiers: it skips
+//! These Node tests are gated like the other host-dependent tiers: they skip
 //! with a visible note when `node` (or the wasm runtime artifact) is absent, and
-//! hard-fails under `PHOENIX_REQUIRE_NODE=1` so CI can't silently bypass it. The
-//! full per-fixture Node harness is PR 8.
+//! hard-fail under `PHOENIX_REQUIRE_NODE=1` so CI can't silently bypass them. As
+//! of PR 8 they also cover closures-as-callbacks (synchronous + retained-across-
+//! GC); the always-on per-fixture Node harness is PR 10.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -444,6 +445,421 @@ process.stdout.write(out);
          13 UTF-8 bytes, printed back intact); lengthOf(greet(\"hi\"))=\
          len(\"Héllo, hi\")=9; lengthOf(echo(\"\"))=0 (empty return via \
          phx_string_alloc(0))"
+    );
+}
+
+/// A Phoenix closure handed to a host as a callback (Phase 2.5 decision G)
+/// crosses as its env pointer, is wrapped in a JS callable, and round-trips
+/// through the exported `__phoenix_invoke_closure_*` trampoline. This is the
+/// synchronous (drained-`setTimeout`) shape the always-on Node tier gates on:
+/// the host invokes the callback *during* the extern call, so the closure is
+/// also shadow-stack rooted — no GC subtlety. Exercises a no-arg callback and an
+/// `(Int) -> Void` callback (the arg marshals host→wasm).
+#[test]
+fn callbacks_round_trip_synchronously_through_the_glue() {
+    if !require_runtime_wasm_or_skip("callbacks_round_trip_synchronously_through_the_glue") {
+        return;
+    }
+    if !require_node_or_skip("callbacks_round_trip_synchronously_through_the_glue") {
+        return;
+    }
+
+    let dir = TempDir::new("callbacks_sync");
+    let src = dir.join("app.phx");
+    std::fs::write(
+        &src,
+        "extern js {\n  \
+           function setTimeout(cb: () -> Void, ms: Int)\n  \
+           function eachUpTo(n: Int, cb: (Int) -> Void)\n\
+         }\n\
+         function main() {\n  \
+           setTimeout(function() { print(42) }, 0)\n  \
+           eachUpTo(3, function(i: Int) { print(i) })\n\
+         }\n",
+    )
+    .unwrap();
+    let wasm = dir.join("app.wasm");
+
+    let status = phoenix_bin()
+        .args(["build", "--target", "wasm32-linear"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("failed to run phoenix build");
+    assert!(status.success(), "wasm32-linear build failed");
+
+    let bytes = std::fs::read(&wasm).unwrap();
+    // The two distinct callback signatures each get an exported trampoline, and
+    // the GC pin/unpin hooks are exported so the glue can root a retained
+    // callback (here exercised only synchronously, but the export surface must
+    // be present).
+    assert!(
+        module_exports_func(&bytes, "__phoenix_invoke_closure__to_v"),
+        "the `() -> Void` callback trampoline should be exported"
+    );
+    assert!(
+        module_exports_func(&bytes, "__phoenix_invoke_closure_i_to_v"),
+        "the `(Int) -> Void` callback trampoline should be exported"
+    );
+    assert!(
+        module_exports_func(&bytes, "phx_gc_pin") && module_exports_func(&bytes, "phx_gc_unpin"),
+        "a callback-passing module must export the GC pin/unpin hooks"
+    );
+
+    let driver = dir.join("driver.mjs");
+    std::fs::write(
+        &driver,
+        r#"
+import { readFile } from "node:fs/promises";
+import { instantiate } from "./app.js";
+const wasm = await readFile(new URL("./app.wasm", import.meta.url));
+let out = "";
+const { run } = await instantiate({
+  wasm,
+  host: {
+    // Drained setTimeout: invoke the Phoenix callback synchronously.
+    setTimeout: (cb, ms) => { cb(); },
+    eachUpTo: (n, cb) => { for (let i = 0; i < n; i++) cb(i); },
+  },
+  writeStdout: (t) => { out += t; },
+});
+run();
+process.stdout.write(out);
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new("node")
+        .arg(&driver)
+        .output()
+        .expect("failed to run node");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(output.status.success(), "node run failed: {stderr}");
+    assert_eq!(
+        stdout, "42\n0\n1\n2\n",
+        "the no-arg callback fires once (42) and the (Int)->Void callback fires \
+         per index (0,1,2 marshalled host→wasm)"
+    );
+}
+
+/// A callback that *returns* a value to the host, exercising the wasm→host
+/// result marshalling the synchronous test above doesn't reach. Two shapes:
+///   * `(String) -> String` — the host's string argument is copied in
+///     (host→wasm), and the closure's freshly-allocated string result crosses
+///     back as a multi-value `[ptr, len]` the glue reads with `readString`
+///     (`__r[0]`/`__r[1]`). This multi-value return path is the part most prone
+///     to an off-by-one, so it's the highest-value coverage here.
+///   * `(Int) -> Bool` — the closure's `Bool` result crosses back as an `i32`
+///     the glue turns into a JS boolean (`__r !== 0`).
+///
+/// The Phoenix callbacks don't print; the driver collects what the host receives
+/// from each invocation and appends it to stdout, so the assertion checks the
+/// *returned* values, not just that the callback fired.
+#[test]
+fn callbacks_marshal_string_and_bool_results_back_to_the_host() {
+    if !require_runtime_wasm_or_skip("callbacks_marshal_string_and_bool_results_back_to_the_host") {
+        return;
+    }
+    if !require_node_or_skip("callbacks_marshal_string_and_bool_results_back_to_the_host") {
+        return;
+    }
+
+    let dir = TempDir::new("callbacks_results");
+    let src = dir.join("app.phx");
+    std::fs::write(
+        &src,
+        "extern js {\n  \
+           function mapEach(cb: (String) -> String)\n  \
+           function keepBig(cb: (Int) -> Bool)\n\
+         }\n\
+         function main() {\n  \
+           mapEach(function(s: String) -> String { return s + \"!\" })\n  \
+           keepBig(function(n: Int) -> Bool { return n > 1 })\n\
+         }\n",
+    )
+    .unwrap();
+    let wasm = dir.join("app.wasm");
+
+    let status = phoenix_bin()
+        .args(["build", "--target", "wasm32-linear"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("failed to run phoenix build");
+    assert!(status.success(), "wasm32-linear build failed");
+
+    let bytes = std::fs::read(&wasm).unwrap();
+    assert!(
+        module_exports_func(&bytes, "__phoenix_invoke_closure_s_to_s"),
+        "the `(String) -> String` callback trampoline should be exported"
+    );
+    assert!(
+        module_exports_func(&bytes, "__phoenix_invoke_closure_i_to_b"),
+        "the `(Int) -> Bool` callback trampoline should be exported"
+    );
+
+    let driver = dir.join("driver.mjs");
+    std::fs::write(
+        &driver,
+        r#"
+import { readFile } from "node:fs/promises";
+import { instantiate } from "./app.js";
+const wasm = await readFile(new URL("./app.wasm", import.meta.url));
+let out = "";
+const strings = [];
+const bools = [];
+const { run } = await instantiate({
+  wasm,
+  host: {
+    // String arg copied in, string result read back out of linear memory.
+    mapEach: (cb) => { strings.push(cb("a"), cb("bb")); },
+    // Int arg marshalled in, Bool result marshalled back.
+    keepBig: (cb) => { bools.push(cb(0), cb(1), cb(2)); },
+  },
+  writeStdout: (t) => { out += t; },
+});
+run();
+// The callbacks print nothing; report what the host received from each.
+process.stdout.write(out + strings.join(",") + "|" + bools.join(","));
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new("node")
+        .arg(&driver)
+        .output()
+        .expect("failed to run node");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(output.status.success(), "node run failed: {stderr}");
+    assert_eq!(
+        stdout, "a!,bb!|false,false,true",
+        "the (String)->String callback appends `!` and the result crosses back \
+         via the multi-value (ptr,len) return; the (Int)->Bool callback returns \
+         `n > 1` marshalled to a JS boolean"
+    );
+}
+
+/// The retained-callback path of decision G: a closure created inside a function
+/// that *returns* (so its shadow-stack frame is gone) is kept alive across a
+/// real GC purely by the host pin, then fires correctly, then is released.
+///
+/// **What this proves and what it doesn't.** `churn` allocates on the order of
+/// tens of MiB of dead intermediate strings (O(n²) concatenation, ~80 MiB at
+/// 4000 iterations) — many multiples of the 1 MiB `DEFAULT_COLLECTION_THRESHOLD`
+/// — so the allocator runs many collection cycles between `register` and `fire`;
+/// a GC firing is guaranteed by allocation volume, not merely likely. A broken
+/// pin would let one of those cycles sweep the closure and recycle its slot, so
+/// `fire()`'s dispatch through the closure's `env[0]` would read reused memory
+/// and print garbage / a wrong value / trap — caught by the exact-stdout
+/// assertion below. What this test deliberately does *not* do is assert the
+/// firing count directly (no in-wasm collection counter is exported, by design);
+/// the **mechanism** — a pin roots an object across a forced collection with no
+/// frame — is proven deterministically by `gc_collects.rs`'s
+/// `pinned_allocation_survives_collection_without_a_frame`. This test is the
+/// end-to-end `phx_gc_pin` boundary check layered on top of that proof.
+#[test]
+fn a_retained_callback_survives_gc_and_is_released() {
+    if !require_runtime_wasm_or_skip("a_retained_callback_survives_gc_and_is_released") {
+        return;
+    }
+    if !require_node_or_skip("a_retained_callback_survives_gc_and_is_released") {
+        return;
+    }
+
+    let dir = TempDir::new("callbacks_retained");
+    let src = dir.join("app.phx");
+    // `setup` creates the closure and hands it to the host, then returns —
+    // popping the only frame that rooted it. `churn` then allocates ~80 MiB of
+    // dead intermediate strings (O(n²) concatenation) — ~80× the 1 MiB
+    // collection threshold, so many GC cycles run while the closure is reachable
+    // *only* through the host pin. `fire` invokes the retained callback
+    // afterwards; if the pin had failed, its slot would have been swept/reused
+    // and `fire` would not print a clean `99`.
+    std::fs::write(
+        &src,
+        "extern js {\n  \
+           function register(cb: () -> Void)\n  \
+           function fire()\n  \
+           function release()\n\
+         }\n\
+         function setup() {\n  \
+           register(function() { print(99) })\n\
+         }\n\
+         function churn() -> Int {\n  \
+           let mut s = \"seed\"\n  \
+           let mut i = 0\n  \
+           while i < 4000 {\n    \
+             s = s + \"abcdefghij\"\n    \
+             i = i + 1\n  \
+           }\n  \
+           return i\n\
+         }\n\
+         function main() {\n  \
+           setup()\n  \
+           print(churn())\n  \
+           fire()\n  \
+           release()\n\
+         }\n",
+    )
+    .unwrap();
+    let wasm = dir.join("app.wasm");
+
+    let status = phoenix_bin()
+        .args(["build", "--target", "wasm32-linear"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("failed to run phoenix build");
+    assert!(status.success(), "wasm32-linear build failed");
+
+    let driver = dir.join("driver.mjs");
+    std::fs::write(
+        &driver,
+        r#"
+import { readFile } from "node:fs/promises";
+import { instantiate } from "./app.js";
+const wasm = await readFile(new URL("./app.wasm", import.meta.url));
+let out = "";
+let stored = null;
+let released = false;
+const { run, retainedCallbackCount } = await instantiate({
+  wasm,
+  host: {
+    register: (cb) => { stored = cb; },        // retain the callback past the call
+    fire: () => { stored(); },                  // invoke it after the GC
+    release: () => { stored.release(); stored = null; released = true; },
+  },
+  writeStdout: (t) => { out += t; },
+});
+run();
+// After main() runs release(), the explicit unpin must have dropped the entry.
+process.stdout.write(out + "released=" + released + " held=" + retainedCallbackCount());
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new("node")
+        .arg(&driver)
+        .output()
+        .expect("failed to run node");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(output.status.success(), "node run failed: {stderr}");
+    assert_eq!(
+        stdout, "4000\n99\nreleased=true held=0",
+        "the retained callback survives the forced GC (fires 99 after churn \
+         prints 4000) and the host's explicit release() unpins it (held=0)"
+    );
+}
+
+/// The `FinalizationRegistry` reclamation path of decision G: a host that drops
+/// a retained callback **without** calling `release()` must still reclaim it
+/// cleanly — the wrapper's finalizer fires, calls `__releaseCallback`, and that
+/// unregisters the (now-firing) finalizer and unpins. This is the *dominant*
+/// reclamation case (hosts rarely call `release()` explicitly), and it exercises
+/// the unregister-on-finalize wiring that prevents a stale finalizer from later
+/// clobbering a recycled env pointer.
+///
+/// The test *observes* reclamation rather than merely a clean exit: the glue's
+/// `retainedCallbackCount()` is `1` while the host holds the wrapper and must
+/// drop back to `0` after the wrapper is dropped and GC is driven. A broken
+/// retention path (e.g. the map holding the wrapper strongly, starving the
+/// `FinalizationRegistry`) would leave the count at `1` and fail the assertion —
+/// a clean exit alone could not catch that. Runs Node with `--expose-gc`.
+#[test]
+fn a_dropped_callback_is_reclaimed_through_the_finalizer_without_release() {
+    if !require_runtime_wasm_or_skip(
+        "a_dropped_callback_is_reclaimed_through_the_finalizer_without_release",
+    ) {
+        return;
+    }
+    if !require_node_or_skip(
+        "a_dropped_callback_is_reclaimed_through_the_finalizer_without_release",
+    ) {
+        return;
+    }
+
+    let dir = TempDir::new("callbacks_finalizer");
+    let src = dir.join("app.phx");
+    std::fs::write(
+        &src,
+        "extern js {\n  \
+           function register(cb: () -> Void)\n\
+         }\n\
+         function main() {\n  \
+           register(function() { print(7) })\n\
+         }\n",
+    )
+    .unwrap();
+    let wasm = dir.join("app.wasm");
+
+    let status = phoenix_bin()
+        .args(["build", "--target", "wasm32-linear"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("failed to run phoenix build");
+    assert!(status.success(), "wasm32-linear build failed");
+
+    let driver = dir.join("driver.mjs");
+    std::fs::write(
+        &driver,
+        r#"
+import { readFile } from "node:fs/promises";
+import { instantiate } from "./app.js";
+const wasm = await readFile(new URL("./app.wasm", import.meta.url));
+let out = "";
+let stored = null;
+const { run, retainedCallbackCount } = await instantiate({
+  wasm,
+  host: {
+    register: (cb) => { cb(); stored = cb; },   // invoke, then retain the wrapper
+  },
+  writeStdout: (t) => { out += t; },
+});
+run();
+// One callback is retained (pinned) while the host holds the wrapper.
+const heldBefore = retainedCallbackCount();
+// Drop the wrapper WITHOUT calling release(): reclamation must flow through the
+// FinalizationRegistry. Force GC and drain tasks so the finalizer runs here.
+stored = null;
+if (typeof global.gc === "function") {
+  for (let i = 0; i < 20; i++) {
+    global.gc();
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+// After the finalizer runs the retained-callback count must return to zero —
+// this observes the unpin, not merely a clean exit.
+const heldAfter = retainedCallbackCount();
+process.stdout.write(out + "held=" + heldBefore + "," + heldAfter);
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new("node")
+        .arg("--expose-gc")
+        .arg(&driver)
+        .output()
+        .expect("failed to run node");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(output.status.success(), "node run failed: {stderr}");
+    assert_eq!(
+        stdout, "7\nheld=1,0",
+        "the callback fires during the call (7), is retained while the host holds \
+         the wrapper (held=1), and dropping the wrapper drives the finalizer to \
+         unpin it (held=0) — a strong-map regression would leave held at 1"
     );
 }
 
