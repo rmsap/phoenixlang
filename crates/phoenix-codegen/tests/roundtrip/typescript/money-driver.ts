@@ -127,6 +127,63 @@ async function main(): Promise<void> {
   }
   check(badCurrency, "server rejected invalid ISO 4217 currency");
 
+  // Reject path — NESTED elements. `reviveMoney` runs through the body reviver's
+  // list/map/nested-struct walk, so a bad Money inside a `List<Money>` /
+  // `Map<String, Money>` / `List<LineItem>` is rejected too. These are the
+  // cross-target parallel of the Go driver's nested reject cases (Go's Validate()
+  // now recurses likewise), so all three servers agree. Each carries a valid total
+  // so only the nested item is the offender.
+  const good = money("1.00", "USD");
+  const rejects = async (
+    body: Parameters<typeof api.echoInvoice>[0],
+  ): Promise<boolean> => {
+    try {
+      await api.echoInvoice(body);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+
+  check(
+    await rejects({
+      id: 1,
+      total: good,
+      items: [],
+      charges: [money("1.00", "ZZZ")],
+      byCategory: {},
+    }),
+    "server rejected bad currency in List<Money>",
+  );
+  check(
+    await rejects({
+      id: 1,
+      total: good,
+      items: [],
+      charges: [],
+      byCategory: {
+        // A bad *amount* (not currency), so we can't use the `money()` helper —
+        // its `parseDecimal` would throw client-side on "bad" before the request is
+        // sent. Cast a raw string past the branded `amount` type to drive the value
+        // all the way to the server's element validator.
+        shipping: { amount: "bad" as unknown as Money["amount"], currency: "USD" },
+      },
+    }),
+    "server rejected bad amount in Map<String, Money>",
+  );
+  check(
+    await rejects({
+      id: 1,
+      total: good,
+      items: [
+        { label: "widget", price: money("9.99", "ZZZ") },
+      ],
+      charges: [],
+      byCategory: {},
+    }),
+    "server rejected bad currency in List<LineItem>",
+  );
+
   await new Promise<void>((resolve, reject) =>
     server.close((err) => (err ? reject(err) : resolve())),
   );

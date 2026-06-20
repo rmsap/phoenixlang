@@ -811,6 +811,57 @@ struct User {
     insta::assert_snapshot!("go_validate_contains_types", files.types);
 }
 
+/// Nested/collection `Validate()` recursion. Pins the generated Go for the shapes
+/// the flat `User` snapshots above never exercise and the Money round-trip only
+/// covers for `Money`: a regex scalar inside a `List` (`ids: List<Uuid>`) and a
+/// `Map` value (`prices: Map<String, Decimal>`), an `Option`-wrapped collection of
+/// regex scalars (`tags: Option<List<Url>>` — nil-guard + range), a direct
+/// nested-struct field (`primary: Address`, whose `Validate()` is called), and a
+/// `List` of that struct (`revisions: List<Address>`). `Address` itself gets a
+/// `Validate()` from its `zip` constraint. Guards `emit_value_validate`'s
+/// recursion, loop-variable depth disambiguation, and the `Type::Named` call path —
+/// none of which the round-trip's Money-only behavioral drivers pin as source text.
+#[test]
+fn validate_nested_collections() {
+    let files = generate_from_source(
+        r#"
+struct Address {
+    zip: String where self.length == 5
+}
+
+struct Catalog {
+    ids: List<Uuid>
+    prices: Map<String, Decimal>
+    tags: Option<List<Url>>
+    primary: Address
+    revisions: List<Address>
+}
+"#,
+    );
+    insta::assert_snapshot!("go_validate_nested_collections_types", files.types);
+}
+
+/// Self-referential struct. Exercises the `visited` cycle-guard in
+/// `struct_needs_validate` / `type_is_validatable` (a naive traversal of
+/// `Tree → List<Tree> → Tree …` would not terminate) and confirms the emitted
+/// `Validate()` is *finite*: a `Type::Named` element emits a single `e0.Validate()`
+/// call rather than inlining the recursion, so termination is the runtime walk over
+/// finite data, not the generator. `Tree` is validatable via its `id: Uuid` field;
+/// without that the cycle would (correctly) make it non-validatable and emit no
+/// method.
+#[test]
+fn validate_recursive_struct() {
+    let files = generate_from_source(
+        r#"
+struct Tree {
+    id: Uuid
+    children: List<Tree>
+}
+"#,
+    );
+    insta::assert_snapshot!("go_validate_recursive_struct_types", files.types);
+}
+
 /// No Validate method when struct has no constraints.
 #[test]
 fn no_validate_without_constraints() {

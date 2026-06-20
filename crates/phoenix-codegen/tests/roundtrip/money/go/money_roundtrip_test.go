@@ -6,8 +6,9 @@
 // Currency}` struct; the proof is that a `Money` survives the wire unchanged in a
 // body (required / `Option` / nested in a list element) and as a bare response,
 // and that the server's generated `Invoice.Validate()` (which recurses into the
-// `Money` fields' own `Validate()`) ACCEPTS valid input and REJECTS a bad amount
-// and a bad currency.
+// `Money` fields' own `Validate()`, including each `List<Money>` / `Map<String,
+// Money>` / `List<LineItem>` element) ACCEPTS valid input and REJECTS a bad amount
+// or currency — whether it sits in a direct field OR nested inside a collection.
 package roundtrip_test
 
 import (
@@ -102,5 +103,41 @@ func TestMoneyRoundtrip(t *testing.T) {
 		Items: []api.LineItem{},
 	}); err == nil {
 		t.Fatal("server accepted invalid ISO 4217 currency (Validate() did not reject)")
+	}
+
+	// Reject path — NESTED elements. Go's Validate() now recurses into List/Map
+	// and List-of-struct elements (matching Python's pydantic recursion and TS's
+	// revive walk), so a bad Money inside a collection is a 400 too — not just a
+	// direct field. Each call carries a valid Total so only the nested element is
+	// the offender.
+	good := api.Money{Amount: "1.00", Currency: "USD"}
+
+	// Bad currency inside a `List<Money>` element (charges).
+	if _, err := client.EchoInvoice(api.EchoInvoiceBody{
+		Id:      1,
+		Total:   good,
+		Items:   []api.LineItem{},
+		Charges: []api.Money{{Amount: "1.00", Currency: "ZZZ"}},
+	}); err == nil {
+		t.Fatal("server accepted invalid currency in List<Money> element (no element recursion)")
+	}
+
+	// Bad amount inside a `Map<String, Money>` value (byCategory).
+	if _, err := client.EchoInvoice(api.EchoInvoiceBody{
+		Id:         1,
+		Total:      good,
+		Items:      []api.LineItem{},
+		ByCategory: map[string]api.Money{"shipping": {Amount: "bad", Currency: "USD"}},
+	}); err == nil {
+		t.Fatal("server accepted invalid amount in Map<String, Money> value (no element recursion)")
+	}
+
+	// Bad currency inside a `List<LineItem>` element's nested Money (items[].price).
+	if _, err := client.EchoInvoice(api.EchoInvoiceBody{
+		Id:    1,
+		Total: good,
+		Items: []api.LineItem{{Label: "widget", Price: api.Money{Amount: "9.99", Currency: "ZZZ"}}},
+	}); err == nil {
+		t.Fatal("server accepted invalid currency in List<struct> element's Money (no struct recursion)")
 	}
 }

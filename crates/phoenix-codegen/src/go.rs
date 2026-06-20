@@ -985,24 +985,18 @@ impl<'a> GoGenerator<'a> {
                     .map(|c| (f.name.as_str(), c, derived_field_go_type(f).1))
             })
             .collect();
-        // A `Uuid`/`Decimal` (or `Option` thereof) body field gets a format check.
-        // Pointer-ness comes from `derived_field_go_type` (a `partial`-applied
-        // scalar is `*string`), so the nil-guard can't disagree with the field type.
-        let regex_fields: Vec<(&str, bool, &'static str, &'static str)> = body
+        // Every field that needs format/nested validation — a regex scalar
+        // (`Uuid`/`Decimal`/`Url`), a `Money`, a validatable struct, or any
+        // `List`/`Map` thereof. Pointer-ness comes from `derived_field_go_type` (a
+        // `partial`-applied field is a `*T`), so the nil-guard can't disagree with
+        // the field type. `emit_value_validate` recurses into the collection shape.
+        let nested_fields: Vec<(&str, &Type, bool)> = body
             .fields
             .iter()
-            .filter_map(|f| {
-                regex_scalar(&f.ty)
-                    .map(|(var, label)| (f.name.as_str(), derived_field_go_type(f).1, var, label))
-            })
+            .filter(|f| type_is_validatable(&f.ty, self.check_result, &mut BTreeSet::new()))
+            .map(|f| (f.name.as_str(), &f.ty, derived_field_go_type(f).1))
             .collect();
-        // A `Money`/`Option<Money>` body field's own `Validate()` is called.
-        let money_fields: Vec<(&str, bool)> = body
-            .fields
-            .iter()
-            .filter_map(|f| money_field_shape(&f.ty).map(|is_ptr| (f.name.as_str(), is_ptr)))
-            .collect();
-        if fields.is_empty() && regex_fields.is_empty() && money_fields.is_empty() {
+        if fields.is_empty() && nested_fields.is_empty() {
             return;
         }
         render_validate_fn(
@@ -1014,15 +1008,16 @@ impl<'a> GoGenerator<'a> {
             },
             type_name,
             &fields,
-            &regex_fields,
-            &money_fields,
+            &nested_fields,
+            self.check_result,
         );
     }
 
     /// Emits the composite `Money` built-in into types.go: the `currencyCodes`
     /// ISO-4217 set, the `Money` struct (`{Amount, Currency}` as strings), and its
     /// `Validate()` (amount via `decimalRe`, currency via the set). Containing
-    /// structs/bodies call `m.<Field>.Validate()` (see the validators' money_fields).
+    /// structs/bodies call `m.<Field>.Validate()` (see [`emit_value_validate`],
+    /// which routes a `Money` field — direct or nested in a collection — to it).
     fn emit_money_type(&mut self) {
         self.types_needs_fmt = true;
         self.types_regex_vars.insert("decimalRe");
@@ -1087,24 +1082,18 @@ impl<'a> GoGenerator<'a> {
                     .map(|c| (f.name.as_str(), c, is_option))
             })
             .collect();
-        // `Uuid`/`Decimal` (or `Option` thereof) fields get a format check; the
-        // pointer shape is whether the field is `Option` (a struct has no
-        // `partial`, so `Option` ⇒ `*string`).
-        let regex_fields: Vec<(&str, bool, &'static str, &'static str)> = info
+        // Every field that needs format/nested validation — a regex scalar
+        // (`Uuid`/`Decimal`/`Url`), a `Money`, a validatable struct, or any
+        // `List`/`Map` thereof. A source struct has no `partial`, so a field is a
+        // Go pointer iff it is `Option<…>`; `emit_value_validate` folds that in
+        // itself, so `is_ptr` is left false and the type drives nullability.
+        let nested_fields: Vec<(&str, &Type, bool)> = info
             .fields
             .iter()
-            .filter_map(|f| {
-                let is_ptr = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
-                regex_scalar(&f.ty).map(|(var, label)| (f.name.as_str(), is_ptr, var, label))
-            })
+            .filter(|f| type_is_validatable(&f.ty, self.check_result, &mut BTreeSet::new()))
+            .map(|f| (f.name.as_str(), &f.ty, false))
             .collect();
-        // A `Money`/`Option<Money>` field's own `Validate()` is called.
-        let money_fields: Vec<(&str, bool)> = info
-            .fields
-            .iter()
-            .filter_map(|f| money_field_shape(&f.ty).map(|is_ptr| (f.name.as_str(), is_ptr)))
-            .collect();
-        if fields.is_empty() && regex_fields.is_empty() && money_fields.is_empty() {
+        if fields.is_empty() && nested_fields.is_empty() {
             return;
         }
         render_validate_fn(
@@ -1116,8 +1105,8 @@ impl<'a> GoGenerator<'a> {
             },
             &s.name,
             &fields,
-            &regex_fields,
-            &money_fields,
+            &nested_fields,
+            self.check_result,
         );
     }
 
@@ -1811,18 +1800,16 @@ impl<'a> GoGenerator<'a> {
             // exactly like the handler error mapping below — and fall back to a
             // 400 `ValidationError` when the endpoint declares no such variant.
             // `Validate()` exists (and is worth calling) when the body has a
-            // constrained field OR a `Uuid` field (whose format it checks). This
-            // condition must track `emit_body_validate_method`'s emit gate so we
-            // never call a method that wasn't generated, nor skip one that was.
-            let has_regex_field = body.fields.iter().any(|f| regex_scalar(&f.ty).is_some());
-            let has_money_field = body
+            // constrained field OR a field that needs format/nested validation (a
+            // regex scalar, a `Money`, a validatable struct, or any `List`/`Map`
+            // thereof). This condition must track `emit_body_validate_method`'s emit
+            // gate so we never call a method that wasn't generated, nor skip one
+            // that was.
+            let has_validatable_field = body
                 .fields
                 .iter()
-                .any(|f| money_field_shape(&f.ty).is_some());
-            if body.fields.iter().any(|f| f.constraint.is_some())
-                || has_regex_field
-                || has_money_field
-            {
+                .any(|f| type_is_validatable(&f.ty, self.check_result, &mut BTreeSet::new()));
+            if body.fields.iter().any(|f| f.constraint.is_some()) || has_validatable_field {
                 let (name, code) = ep
                     .errors
                     .iter()
@@ -2685,28 +2672,29 @@ struct ValidateSink<'a> {
 }
 
 /// Renders a `func (s {type_name}) Validate() error` whose body checks every
-/// constrained field, then each `Uuid`/`Option<Uuid>` field's RFC 4122 format,
-/// then `return nil`. `fields` lists each constrained field as
+/// constrained field, then every field that needs format/nested validation, then
+/// `return nil`. `fields` lists each constrained field as
 /// `(name, constraint, is_ptr)`: an `is_ptr` field is rendered as a Go pointer
 /// (either `partial`-applied or already `Option<T>`, both `*T`), so its check is
 /// nil-guarded and `self` is dereferenced inside the constraint expression; a
-/// plain field is checked directly. `regex_fields` lists each format-checked
-/// field as `(name, is_ptr, regex_var, label)` — a `Uuid` (`uuidRe`/"invalid
-/// uuid") or `Decimal` (`decimalRe`/"invalid decimal"), nil-guarded when `is_ptr`.
-/// `money_fields` lists each composite `Money` field as `(name, is_ptr)` — its
-/// own `Money.Validate()` is called (the field name wrapping the inner error via
-/// `%w`), nil-guarded when `is_ptr` (an `Option<Money>`).
+/// plain field is checked directly. `nested_fields` lists each field that
+/// [`type_is_validatable`] as `(name, type, is_ptr)` — a regex scalar
+/// (`Uuid`/`Decimal`/`Url`), a `Money`, a validatable named struct, or any
+/// `List`/`Map` thereof — emitted by [`emit_value_validate`], which recurses into
+/// the collection/`Option` shape (so a `List<Money>` / `Map<String, Uuid>` /
+/// `List<NestedStruct>` element is validated, matching Python's pydantic recursion
+/// and TypeScript's revive walk). `is_ptr` is the field's Go pointer-ness.
 /// Shared by the source-struct validator
 /// ([`GoGenerator::emit_validate_method`]) and the derived-body validator
 /// ([`GoGenerator::emit_body_validate_method`]) so the two can never drift.
-/// Callers must invoke this only when `fields`, `regex_fields`, OR `money_fields`
-/// is non-empty — an empty `Validate()` would needlessly pull in the `fmt` import.
+/// Callers must invoke this only when `fields` OR `nested_fields` is non-empty —
+/// an empty `Validate()` would needlessly pull in the `fmt` import.
 fn render_validate_fn(
     sink: ValidateSink<'_>,
     type_name: &str,
     fields: &[(&str, &Expr, bool)],
-    regex_fields: &[(&str, bool, &'static str, &'static str)],
-    money_fields: &[(&str, bool)],
+    nested_fields: &[(&str, &Type, bool)],
+    check_result: &Analysis,
 ) {
     let ValidateSink {
         out,
@@ -2741,34 +2729,19 @@ fn render_validate_fn(
         }
     }
 
-    for (name, is_ptr, var, label) in regex_fields {
-        regex_vars.insert(*var);
-        let field = to_pascal_case(name);
-        if *is_ptr {
-            out.push_str(&format!(
-                "\tif s.{field} != nil && !{var}.MatchString(*s.{field}) {{\n\t\treturn fmt.Errorf(\"{name}: {label}\")\n\t}}\n",
-            ));
-        } else {
-            out.push_str(&format!(
-                "\tif !{var}.MatchString(s.{field}) {{\n\t\treturn fmt.Errorf(\"{name}: {label}\")\n\t}}\n",
-            ));
-        }
-    }
-
-    for (name, is_ptr) in money_fields {
-        let field = to_pascal_case(name);
-        // Wrap with the field name (`%w` preserves the inner `Money.Validate()`
-        // error) so a bad nested `Money` names the offending field, matching the
-        // constraint/regex validators above which prefix `name:`.
-        if *is_ptr {
-            out.push_str(&format!(
-                "\tif s.{field} != nil {{\n\t\tif err := s.{field}.Validate(); err != nil {{\n\t\t\treturn fmt.Errorf(\"{name}: %w\", err)\n\t\t}}\n\t}}\n",
-            ));
-        } else {
-            out.push_str(&format!(
-                "\tif err := s.{field}.Validate(); err != nil {{\n\t\treturn fmt.Errorf(\"{name}: %w\", err)\n\t}}\n",
-            ));
-        }
+    for (name, ty, is_ptr) in nested_fields {
+        let access = format!("s.{}", to_pascal_case(name));
+        emit_value_validate(
+            out,
+            &access,
+            ty,
+            *is_ptr,
+            name,
+            "\t",
+            0,
+            check_result,
+            regex_vars,
+        );
     }
 
     out.push_str("\treturn nil\n}\n\n");
@@ -2788,16 +2761,12 @@ fn go_regex_pattern(var: &str) -> &'static str {
     }
 }
 
-/// If `ty` is a regex-format-checked scalar (`Uuid`/`Decimal`), unwrapping a
-/// single `Option`, returns its `(regex_var, error_label)`. `List`/`Map` element
-/// validation is not emitted (Go is the documented weak link). The pointer shape
-/// is decided by the caller (struct vs `partial`-derived body field).
-fn regex_scalar(ty: &Type) -> Option<(&'static str, &'static str)> {
-    let inner = match ty {
-        Type::Generic(name, args) if name == "Option" && args.len() == 1 => &args[0],
-        other => other,
-    };
-    match inner {
+/// If `ty` is *exactly* a regex-format-checked scalar (`Uuid`/`Decimal`/`Url`),
+/// returns its `(regex_var, error_label)` — no `Option`/`List`/`Map` unwrapping.
+/// The recursive struct-`Validate()` emitter ([`emit_value_validate`]) strips the
+/// wrappers itself, so it needs the bare-type test.
+fn regex_scalar_direct(ty: &Type) -> Option<(&'static str, &'static str)> {
+    match ty {
         Type::Uuid => Some(("uuidRe", "invalid uuid")),
         Type::Decimal => Some(("decimalRe", "invalid decimal")),
         // A `Url` is validated by a "has a scheme" regex (`scheme:`). TS's `URL_RE`
@@ -2811,20 +2780,181 @@ fn regex_scalar(ty: &Type) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// If `ty` is a `Money` (or `Option<Money>`) field — whose generated `Validate()`
-/// the containing struct calls — returns its `is_ptr` flag. `List`/`Map` of
-/// `Money` element validation is NOT emitted (parallel to the regex-scalar weak
-/// link); see `docs/known-issues.md` ("`Money` element validation inside
-/// `List`/`Map` is skipped in the Go target").
-fn money_field_shape(ty: &Type) -> Option<bool> {
+/// If `ty` is a regex-format-checked scalar (`Uuid`/`Decimal`/`Url`), unwrapping a
+/// single `Option`, returns its `(regex_var, error_label)`. Used by the
+/// query/header param parsers (which handle only a scalar or `Option<scalar>`).
+/// Struct/body field validation goes through [`emit_value_validate`] instead, which
+/// also recurses into `List`/`Map`.
+fn regex_scalar(ty: &Type) -> Option<(&'static str, &'static str)> {
+    let inner = match ty {
+        Type::Generic(name, args) if name == "Option" && args.len() == 1 => &args[0],
+        other => other,
+    };
+    regex_scalar_direct(inner)
+}
+
+/// Whether a value of `ty` needs any server-side `Validate()` work — recursing
+/// through `Option`/`List`/`Map` and named structs. True for a regex scalar
+/// (`Uuid`/`Decimal`/`Url`), a `Money`, a named struct that itself needs
+/// validation, or any collection whose element does. Drives both the
+/// `Validate()`-emit gate and the recursive emitter so a method is generated iff
+/// it would have a body. `visited` breaks reference cycles between structs.
+fn type_is_validatable(ty: &Type, check_result: &Analysis, visited: &mut BTreeSet<String>) -> bool {
     match ty {
-        Type::Money => Some(false),
-        Type::Generic(name, args)
-            if name == "Option" && args.len() == 1 && matches!(args[0], Type::Money) =>
-        {
-            Some(true)
+        Type::Uuid | Type::Decimal | Type::Url | Type::Money => true,
+        Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
+            type_is_validatable(&args[0], check_result, visited)
         }
+        Type::Generic(name, args) if name == "List" && args.len() == 1 => {
+            type_is_validatable(&args[0], check_result, visited)
+        }
+        // Map keys are always `String` (not validatable); only the value can be.
+        Type::Generic(name, args) if name == "Map" && args.len() == 2 => {
+            type_is_validatable(&args[1], check_result, visited)
+        }
+        Type::Named(n) => struct_needs_validate(n, check_result, visited),
+        _ => false,
+    }
+}
+
+/// Whether the named struct gets a generated `Validate()` method: it has at least
+/// one constrained field (`where`) or one field that [`type_is_validatable`].
+/// `visited` guards against a struct that (transitively) references itself.
+///
+/// Callers pass either a freshly-allocated `visited` (the two emit-gate filters and
+/// the [`emit_value_validate`] call-gate) or one threaded down from an in-progress
+/// traversal ([`type_is_validatable`]). Both agree on the result: validatability is
+/// monotonic — any concrete validatable field (a regex scalar, a `Money`, or a
+/// `where` constraint) makes the struct validatable regardless of traversal order,
+/// and a struct reachable only through a cycle with no such field is correctly
+/// `false` either way. So the fresh-vs-threaded distinction only affects how soon a
+/// pure cycle terminates, never the boolean.
+fn struct_needs_validate(
+    name: &str,
+    check_result: &Analysis,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    if !visited.insert(name.to_string()) {
+        return false;
+    }
+    check_result
+        .module
+        .struct_info_by_name(name)
+        .is_some_and(|info| {
+            info.fields.iter().any(|f| {
+                f.constraint.is_some() || type_is_validatable(&f.ty, check_result, visited)
+            })
+        })
+}
+
+/// Emits Go statements validating the value at `access` (a Go expression) of type
+/// `ty` into `out`, recursing through `Option` (a `*T` pointer — nil-guarded +
+/// dereferenced), `List`, and `Map`. A regex scalar is format-checked against its
+/// matcher var; a `Money` or validatable named struct has its own `Validate()`
+/// called (the inner error wrapped with the field `label` via `%w`). `nullable`
+/// is whether `access` is already a Go pointer (an `Option` field, or a
+/// `partial`-derived body field); the `Option` arm sets it for deeper levels.
+/// `depth` disambiguates the `eN` range variables of nested loops. No-op for a
+/// non-validatable type (callers gate on [`type_is_validatable`] but inner
+/// recursion may still reach one).
+#[allow(clippy::too_many_arguments)]
+fn emit_value_validate(
+    out: &mut String,
+    access: &str,
+    ty: &Type,
+    nullable: bool,
+    label: &str,
+    indent: &str,
+    depth: usize,
+    check_result: &Analysis,
+    regex_vars: &mut BTreeSet<&'static str>,
+) {
+    // Fold a single `Option<…>` into the pointer flag: Go renders it `*T`.
+    let (ty, nullable) = match ty {
+        Type::Generic(name, args) if name == "Option" && args.len() == 1 => (&args[0], true),
+        other => (other, nullable),
+    };
+
+    if let Some((var, lbl)) = regex_scalar_direct(ty) {
+        regex_vars.insert(var);
+        if nullable {
+            out.push_str(&format!(
+                "{indent}if {access} != nil && !{var}.MatchString(*{access}) {{\n{indent}\treturn fmt.Errorf(\"{label}: {lbl}\")\n{indent}}}\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "{indent}if !{var}.MatchString({access}) {{\n{indent}\treturn fmt.Errorf(\"{label}: {lbl}\")\n{indent}}}\n"
+            ));
+        }
+        return;
+    }
+
+    // A `Money` (built-in `Validate()`) or a named struct that needs one. Go's
+    // value-receiver `Validate()` is callable on a `*T` too, so a nil-guard is the
+    // only pointer handling needed. This re-walks the struct graph that the
+    // emit-gate's `type_is_validatable` already walked; the duplication is
+    // intentional — schemas are small and codegen is one-shot, so a memo cache would
+    // add state for no measurable win.
+    let calls_validate = matches!(ty, Type::Money)
+        || matches!(ty, Type::Named(n) if struct_needs_validate(n, check_result, &mut BTreeSet::new()));
+    if calls_validate {
+        if nullable {
+            out.push_str(&format!(
+                "{indent}if {access} != nil {{\n{indent}\tif err := {access}.Validate(); err != nil {{\n{indent}\t\treturn fmt.Errorf(\"{label}: %w\", err)\n{indent}\t}}\n{indent}}}\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "{indent}if err := {access}.Validate(); err != nil {{\n{indent}\treturn fmt.Errorf(\"{label}: %w\", err)\n{indent}}}\n"
+            ));
+        }
+        return;
+    }
+
+    // A `List`/`Map` whose element is validatable: range and recurse on each
+    // element (a value type, so `nullable` resets to false). A `Map`'s key is
+    // `String`, never validatable, so only the value is walked.
+    let elem = match ty {
+        Type::Generic(name, args) if name == "List" && args.len() == 1 => Some(&args[0]),
+        Type::Generic(name, args) if name == "Map" && args.len() == 2 => Some(&args[1]),
         _ => None,
+    };
+    if let Some(elem) = elem {
+        if !type_is_validatable(elem, check_result, &mut BTreeSet::new()) {
+            return;
+        }
+        let ev = format!("e{depth}");
+        if nullable {
+            let inner = format!("{indent}\t");
+            out.push_str(&format!("{indent}if {access} != nil {{\n"));
+            out.push_str(&format!("{inner}for _, {ev} := range *{access} {{\n"));
+            emit_value_validate(
+                out,
+                &ev,
+                elem,
+                false,
+                label,
+                &format!("{inner}\t"),
+                depth + 1,
+                check_result,
+                regex_vars,
+            );
+            out.push_str(&format!("{inner}}}\n"));
+            out.push_str(&format!("{indent}}}\n"));
+        } else {
+            out.push_str(&format!("{indent}for _, {ev} := range {access} {{\n"));
+            emit_value_validate(
+                out,
+                &ev,
+                elem,
+                false,
+                label,
+                &format!("{indent}\t"),
+                depth + 1,
+                check_result,
+                regex_vars,
+            );
+            out.push_str(&format!("{indent}}}\n"));
+        }
     }
 }
 

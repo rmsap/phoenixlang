@@ -115,6 +115,52 @@ async def main() -> None:
     if bad_currency.status_code < 400:
         fail(f"server accepted invalid ISO 4217 currency: HTTP {bad_currency.status_code}")
 
+    # Reject path — NESTED elements. pydantic recurses into list/map items and
+    # nested models, so a bad Money inside a `List<Money>` / `Map<String, Money>` /
+    # `List<LineItem>` is rejected too. These are the cross-target parallel of the
+    # Go driver's nested reject cases (Go's Validate() now recurses likewise), so all
+    # three servers agree. Each carries a valid total so only the nested item is bad.
+    good = {"amount": "1.00", "currency": "USD"}
+
+    bad_in_list = await client.client.post(
+        "/invoices",
+        json={
+            "id": 1,
+            "total": good,
+            "items": [],
+            "charges": [{"amount": "1.00", "currency": "ZZZ"}],
+            "by_category": {},
+        },
+    )
+    if bad_in_list.status_code < 400:
+        fail(f"server accepted bad currency in List<Money>: HTTP {bad_in_list.status_code}")
+
+    bad_in_map = await client.client.post(
+        "/invoices",
+        json={
+            "id": 1,
+            "total": good,
+            "items": [],
+            "charges": [],
+            "by_category": {"shipping": {"amount": "bad", "currency": "USD"}},
+        },
+    )
+    if bad_in_map.status_code < 400:
+        fail(f"server accepted bad amount in Map<String, Money>: HTTP {bad_in_map.status_code}")
+
+    bad_in_struct = await client.client.post(
+        "/invoices",
+        json={
+            "id": 1,
+            "total": good,
+            "items": [{"label": "widget", "price": {"amount": "9.99", "currency": "ZZZ"}}],
+            "charges": [],
+            "by_category": {},
+        },
+    )
+    if bad_in_struct.status_code < 400:
+        fail(f"server accepted bad currency in List<LineItem>: HTTP {bad_in_struct.status_code}")
+
     print("OK")
 
 

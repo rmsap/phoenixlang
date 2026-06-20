@@ -630,7 +630,7 @@ Default visibility for methods is private, matching every other declaration form
 
 ### Phase 2.7 benchmarking
 
-Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract that bench output (and any decision driven off that output) depends on; settling them before any bench code lands keeps the harness's assumptions reviewable and prevents the first numbers from shipping with implicit policy choices baked in. Decisions confirmed with the user 2026-05-04 during plan mode; phase-level scope and exit criteria live in [phase-2.md §2.7](phases/phase-2.md#27-benchmark-suite).
+Subordinate decisions for the Phase 2.7 benchmark suite. Each pins a contract that bench output (and any decision driven off that output) depends on; settling them before any bench code lands keeps the harness's assumptions reviewable and prevents the first numbers from shipping with implicit policy choices baked in. Phase-level scope and exit criteria live in [phase-2.md §2.7](phases/phase-2.md#27-benchmark-suite).
 
 #### A. Baseline storage strategy: manual snapshot in `docs/perf-baselines/`
 
@@ -851,7 +851,7 @@ Phoenix's "easy to use, web-framework-friendly GC'd lang" pitch argues hardest f
 
 ### Phase 2.4 WebAssembly compilation
 
-Subordinate decisions for the Phase 2.4 WASM backend. Each pins a scope contract before any code lands so the bench refresh, the matrix expansion, and the host-import shape don't drift mid-phase. Decisions confirmed with the user 2026-05-15 during plan mode; phase-level scope summary and exit criteria live in [phase-2.md §2.4](phases/phase-2.md#24-webassembly-target) (matching the location pattern used by §2.2 / §2.3 / §2.6 / §2.7).
+Subordinate decisions for the Phase 2.4 WASM backend. Each pins a scope contract before any code lands so the bench refresh, the matrix expansion, and the host-import shape don't drift mid-phase. Phase-level scope summary and exit criteria live in [phase-2.md §2.4](phases/phase-2.md#24-webassembly-target) (matching the location pattern used by §2.2 / §2.3 / §2.6 / §2.7).
 
 #### A0. WASM emission tool: `wasm-encoder`, not Cranelift
 
@@ -1550,7 +1550,7 @@ $builder_T = (struct (field $len (mut i64))
 
 - `List.get` with `index < 0 || index >= len` **traps** (`unreachable` after an unsigned i64 compare — negative indices wrap to huge unsigned values, one check covers both). Native prints `runtime error: list index … out of bounds` and exits 1; wasm32-gc follows the established trap precedent (divide-by-zero, K.3-era) — non-zero exit, no message, until the panic-routing slice gives traps a `proc_exit` + stderr story.
 - `List.push` copies: `array.new_default` at `len + 1`, `array.copy`, `array.set`, fresh `$list_T` — O(n), matching native immutability.
-- `List.take(n)` / `List.drop(n)`: a **negative `n` is a runtime error** (interpreters abort with `take()/drop() argument must be non-negative`; native aborts in `phx_list_take`/`phx_list_drop`; wasm32-gc traps); `n > len` clamps to `len` ("take/skip at most n") and copies. **Divergence resolved 2026-06-10 (confirmed with user):** implementing this slice surfaced that the backends disagreed — both interpreters errored on negative `n` while the native runtime silently clamped to 0 (`n.max(0)`), a divergence no fixture exercised. The error semantic won (loud failure matches `List.get`'s OOB philosophy); the native clamp was removed in the same slice and pinned by `take_negative_aborts` / `drop_negative_aborts` in phoenix-runtime plus `list_take_drop_negative_traps_under_wasmtime_gc` in compile_wasm_gc.rs.
+- `List.take(n)` / `List.drop(n)`: a **negative `n` is a runtime error** (interpreters abort with `take()/drop() argument must be non-negative`; native aborts in `phx_list_take`/`phx_list_drop`; wasm32-gc traps); `n > len` clamps to `len` ("take/skip at most n") and copies. **Divergence resolved 2026-06-10:** implementing this slice surfaced that the backends disagreed — both interpreters errored on negative `n` while the native runtime silently clamped to 0 (`n.max(0)`), a divergence no fixture exercised. The error semantic won (loud failure matches `List.get`'s OOB philosophy); the native clamp was removed in the same slice and pinned by `take_negative_aborts` / `drop_negative_aborts` in phoenix-runtime plus `list_take_drop_negative_traps_under_wasmtime_gc` in compile_wasm_gc.rs.
 - `List.contains` equality per element type, matching native's `elements_equal`: i64/i32 compare for Int/Bool, `f64.eq` for Float (IEEE — `NaN != NaN`, `-0.0 == 0.0`), `phx_str_eq` for String (byte equality), and `ref.eq` for struct/enum elements (native compares the stored 8-byte pointer — identity, not structural — so `ref.eq` is the exact analogue).
 - `ListBuilder.push` grows the buffer 2× (saturating, min 1) when `$len == array.len($data)`, like native; push or freeze on a frozen builder **traps** (native aborts with `builder was already frozen`).
 - For-in iteration needs no new machinery — the frontend lowers it to `List.length` + `List.get`.
@@ -1569,7 +1569,7 @@ Code locations: `crates/phoenix-cranelift/src/wasm/wasm_gc/lists.rs` (the whole 
 
 #### K.8. wasm32-gc closures: per-signature subtype hierarchy over typed function references (`call_ref`)
 
-**Decided 2026-06-12 (closure design lock, confirmed with user); ✅ implemented 2026-06-12 (same day), exactly as locked.** Code: `crates/phoenix-cranelift/src/wasm/wasm_gc/closures.rs` (collection + declaration + the three op lowerings, mirroring `lists.rs`); the dead template-copy closures are skipped in lockstep by `declare_phoenix_functions` / `emit_phoenix_bodies` (`is_dead_placeholder_closure`); both wasmtime harnesses now pass `-W function-references=y,gc=y`. Matrix: `closures`, `closures_ambiguous_captures`, `closures_over_generic`, `closures_over_generic_cross_width`, and `defer_closure` run five-backend byte-identical.
+**Decided 2026-06-12 (closure design lock); ✅ implemented 2026-06-12 (same day), exactly as locked.** Code: `crates/phoenix-cranelift/src/wasm/wasm_gc/closures.rs` (collection + declaration + the three op lowerings, mirroring `lists.rs`); the dead template-copy closures are skipped in lockstep by `declare_phoenix_functions` / `emit_phoenix_bodies` (`is_dead_placeholder_closure`); both wasmtime harnesses now pass `-W function-references=y,gc=y`. Matrix: `closures`, `closures_ambiguous_captures`, `closures_over_generic`, `closures_over_generic_cross_width`, and `defer_closure` run five-backend byte-identical.
 
 **Context.** Phoenix's IR closure ABI is the env-pointer calling convention (locked during the Phase 2.4 closure-capture-ambiguity fix): a closure value's heap object *is* the environment; `Op::CallIndirect(closure, args)` passes the closure verbatim as the callee's first argument; the callee reads captures via `Op::ClosureLoadCapture(env, idx)` against its `capture_types`. Call sites never know capture layouts — that is what lets two closures with the same user signature but different captures unify through a phi. The wasm32-gc mapping must preserve exactly that property. There is no capture-store op: captures are by-value and immutable once allocated.
 
@@ -1602,7 +1602,7 @@ $site_F   = (sub final $clo_SIG
 
 #### K.9. wasm32-gc `Map<K,V>`: ordered association over parallel arrays, not a hash table
 
-**Decided 2026-06-12 (map design lock); ✅ implemented 2026-06-14, exactly as locked.** Code: `crates/phoenix-cranelift/src/wasm/wasm_gc/maps.rs` (collection + `$map_KV` declaration + the literal and seven method lowerings, mirroring `lists.rs`); `collections.phx` (now exercising the K.8 list closure methods five-backend at last) and `map_hash_many_keys.phx` run byte-identical. **Cross-backend divergence resolved alongside (confirmed with user):** a map literal with duplicate keys (`{"a":1,"a":3}`) dedups **last-wins, first-position-kept** in the compiled backends (native / wasm32-linear via `phx_map_from_pairs`, and now wasm32-gc) but the two interpreters previously kept all entries — a map can't hold two same-key entries, so the interpreters were wrong. Both now dedup at literal construction; pinned five-backend by the new `map_duplicate_keys.phx` matrix fixture. No fixture had exercised it, so the matrix hadn't caught it — same latent shape as the take/drop divergence the lists slice surfaced. **Float key equality unified at the same time:** the interpreters previously compared map keys with their IEEE `==` (`±0.0` equal, `NaN` never-equal), diverging from the **byte-wise** float key comparison native and wasm32-gc use (see *"`Map<Float,V>` uses byte-wise key comparison"* above). Both interpreters now route *every* map-key comparison — literal dedup **and** `get` / `contains` / `set` / `remove` — through a `map_key_eq` helper (`crates/phoenix-{interp,ir-interp}/src/value.rs`) that compares float keys by bits, so `Map` semantics are byte-identical across all five backends; pinned by `map_key_eq_is_byte_wise_for_floats` unit tests in each crate. (This closes only the *map-key* slice of the broader float-equality drift flagged earlier in this doc — `==` in expressions and `List.contains` are still IEEE and out of scope here.) **Native `Bool`-key bug fixed alongside:** adding Bool-key matrix coverage surfaced that native (and codegen generally) stored a `Bool` with a 1-byte `i8` write into its full 8-byte container slot, leaving 7 uninitialized bytes that the type-erased map runtime then hashed — so every `Map<Bool,_>` lookup and `List<Bool>.contains` missed on native. `TypeLayout::store` now zero-extends sub-slot scalars; pinned five-backend by `map_bool_keys.phx`. See [phase-2.md §Bugs closed in this phase](phases/phase-2.md#bugs-closed-in-this-phase).
+**Decided 2026-06-12 (map design lock); ✅ implemented 2026-06-14, exactly as locked.** Code: `crates/phoenix-cranelift/src/wasm/wasm_gc/maps.rs` (collection + `$map_KV` declaration + the literal and seven method lowerings, mirroring `lists.rs`); `collections.phx` (now exercising the K.8 list closure methods five-backend at last) and `map_hash_many_keys.phx` run byte-identical. **Cross-backend divergence resolved alongside:** a map literal with duplicate keys (`{"a":1,"a":3}`) dedups **last-wins, first-position-kept** in the compiled backends (native / wasm32-linear via `phx_map_from_pairs`, and now wasm32-gc) but the two interpreters previously kept all entries — a map can't hold two same-key entries, so the interpreters were wrong. Both now dedup at literal construction; pinned five-backend by the new `map_duplicate_keys.phx` matrix fixture. No fixture had exercised it, so the matrix hadn't caught it — same latent shape as the take/drop divergence the lists slice surfaced. **Float key equality unified at the same time:** the interpreters previously compared map keys with their IEEE `==` (`±0.0` equal, `NaN` never-equal), diverging from the **byte-wise** float key comparison native and wasm32-gc use (see *"`Map<Float,V>` uses byte-wise key comparison"* above). Both interpreters now route *every* map-key comparison — literal dedup **and** `get` / `contains` / `set` / `remove` — through a `map_key_eq` helper (`crates/phoenix-{interp,ir-interp}/src/value.rs`) that compares float keys by bits, so `Map` semantics are byte-identical across all five backends; pinned by `map_key_eq_is_byte_wise_for_floats` unit tests in each crate. (This closes only the *map-key* slice of the broader float-equality drift flagged earlier in this doc — `==` in expressions and `List.contains` are still IEEE and out of scope here.) **Native `Bool`-key bug fixed alongside:** adding Bool-key matrix coverage surfaced that native (and codegen generally) stored a `Bool` with a 1-byte `i8` write into its full 8-byte container slot, leaving 7 uninitialized bytes that the type-erased map runtime then hashed — so every `Map<Bool,_>` lookup and `List<Bool>.contains` missed on native. `TypeLayout::store` now zero-extends sub-slot scalars; pinned five-backend by `map_bool_keys.phx`. See [phase-2.md §Bugs closed in this phase](phases/phase-2.md#bugs-closed-in-this-phase).
 
 **Context.** Native's `Map<K,V>` (`phoenix-runtime/src/map_methods.rs`) is an FNV-1a open-addressing hash table with linear probing, tombstones, 70%-load rehashing, *plus* a parallel `u32` insertion-order array so `keys()`/`values()` iterate in first-insertion order (the contract Phoenix shares with Python/JS dicts). The crucial observation: **nothing about the hash table is observable.** The only observable surface is (a) key-equality lookup (`get` / `contains` / `set` / `remove`), (b) `length`, and (c) **insertion-order** `keys()`/`values()`. The hash table is purely a lookup-speed optimization.
 
@@ -1721,7 +1721,7 @@ To promote the verifier invariant from *enum arguments* to *all* `__generic` (a 
 
 ### Phase 2.5 JavaScript interop
 
-Subordinate decisions for the Phase 2.5 JS-interop layer. Each pins a scope or ABI contract before any code lands so the marshalling model, the glue-artifact shape, and the test-host surface don't drift mid-phase. Decisions confirmed with the user 2026-06-17 during plan mode; phase-level scope summary and exit criteria live in [phase-2.md §2.5](phases/phase-2.md#25-javascript-interop) (matching the location pattern used by §2.3 / §2.4 / §2.6 / §2.7).
+Subordinate decisions for the Phase 2.5 JS-interop layer. Each pins a scope or ABI contract before any code lands so the marshalling model, the glue-artifact shape, and the test-host surface don't drift mid-phase. Phase-level scope summary and exit criteria live in [phase-2.md §2.5](phases/phase-2.md#25-javascript-interop) (matching the location pattern used by §2.3 / §2.4 / §2.6 / §2.7).
 
 The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)](#b-exit-criteria-runtime-wasmtime-cli) and [decision C (WASI-only host surface)](#c-host-import-surface-wasi-preview1-only) both explicitly named Phase 2.5 as the slot where browser/Node execution and Phoenix-defined custom imports arrive. 2.5 cashes that in. Three assumptions baked into the original [phase-2.md §2.5](phases/phase-2.md#25-javascript-interop) stub turned out not to hold: it depended on a package manager (Phase 3.1) that does not exist; its example used `async`/`await` that the language does not have until Phase 4.3; and an early draft scoped `extern js` as WASM-only, which has been revised.
 
@@ -3330,10 +3330,11 @@ what else the endpoint carries. (Side effect, intended: `parse*` failures elsewh
 no caller breaks; a constrained body's bad branded field now 400s too, instead of
 500.)
 
-**Still a weak link (unchanged, separate code path).** Go's struct `Validate()`
-still does not recurse into `List<Uuid>`/`Map<String, Uuid>` (or `List<Money>`)
-**field** elements — see [known-issues.md](known-issues.md). That is the
-general-nested-validation feature, orthogonal to this query/header-param slice.
+**Was a weak link, now closed (separate code path).** At the time of this slice
+Go's struct `Validate()` still did not recurse into `List<Uuid>`/`Map<String, Uuid>`
+(or `List<Money>`) **field** elements — the general-nested-validation feature,
+orthogonal to this query/header-param slice. That gap was **closed 2026-06-20** —
+see "Go nested `Validate()` recursion" below.
 
 **Verification.** Compile-lint: `UUID_SCHEMA`/`DECIMAL_SCHEMA` gained `Option<Uuid>`/
 `Option<Decimal>` query + request-header params so all four parse branches (scalar/
@@ -3468,3 +3469,80 @@ component validation / percent-encoding normalization — intentional, to round-
 exactly). No streaming/large-`Bytes` story (the whole value is in memory and base64'd
 in one pass) — fine for the small payloads the schema language targets; a multipart
 `File` body remains the path for large uploads.
+
+## Phoenix Gen — Go nested `Validate()` recursion (2026-06-20)
+
+Closes the documented Go validation weak link: the generated Go `Validate()` did not
+recurse into `List`/`Map`/`Option` **elements**, so a malformed `Uuid`/`Decimal`/
+`Url`/`Money` (or a constraint-violating nested struct) carried *inside a collection*
+was accepted by the Go server while Python (pydantic recurses into list/map items and
+nested models) and TypeScript (`revive*` walks the same structure) rejected it with a
+400/422. A direct branded-scalar or `Money` field (`total: Money`, `id: Uuid`) was
+already validated on all three. This is the **soundness-consistency** fix flagged
+before the distribution/docs push: of the two documented validation divergences, it is
+the one where the generated code was silently *less safe* on one target. (The
+mirror-image gap — multipart `where` constraints validated only in Go, not Python/TS —
+is a different mechanism and remains deferred; see
+[known-issues.md](known-issues.md).)
+
+The fix is in fact broader than the documented weak link. The old code's only
+struct-`Validate()` recursion was Money-specific (`money_field_shape` matched just
+`Money`/`Option<Money>`), so a **direct non-Money nested-struct field** — e.g. a
+`primary: Address` where `Address` carries a `where` constraint — was *also* skipped by
+the Go server (Python/TS validated it). Routing every field through
+`type_is_validatable` / `emit_value_validate` closes that direct-nested-struct case
+together with the collection-element case; both were the same missing `Type::Named`
+recursion, one level apart.
+
+**Change (Go target only).** `render_validate_fn` (`phoenix-codegen/src/go.rs`) no
+longer takes flat `regex_fields` / `money_fields` lists. It takes one `nested_fields`
+list — every field that [`type_is_validatable`] — and emits each via a new recursive
+`emit_value_validate`, which descends the type:
+- a regex scalar (`Uuid`/`Decimal`/`Url`) → `if !<re>.MatchString(v) { … }`;
+- a `Money` or a validatable named struct → `if err := v.Validate(); err != nil { return fmt.Errorf("<field>: %w", err) }`;
+- `List<T>` / `Map<String, V>` → `for _, eN := range … { <recurse on the element> }` (the map key is always `String`, never validatable);
+- `Option<T>` → folded into a Go `*T` pointer with a `!= nil` nil-guard, then recursion on the pointee.
+
+So `List<Money>`, `Map<String, Uuid>`, `List<NestedStruct>`, and arbitrarily nested
+combinations now validate every element. Two new predicates back this and keep the
+emit decision honest: `type_is_validatable` (does a value of this type need any
+`Validate()` work, recursing through collections and named structs) and
+`struct_needs_validate` (does a named struct get a `Validate()` method at all — it
+does iff it has a constrained field or a validatable field; cycle-guarded with a
+`visited` set). The single source of truth `type_is_validatable` now drives all three
+gates that must agree — the source-struct `Validate()` emit gate, the derived-body
+`Validate()` emit gate, and the server-side `body.Validate()` *call* gate — so a
+`Validate()` is generated iff it has a body and called iff it was generated. A
+**struct that previously got no `Validate()`** (e.g. one whose only validatable
+content is a `List<Uuid>`) now gets one. Generated code stays gofmt-clean and the
+value-receiver `Validate()` is callable on a `*T` element, so a pointer element needs
+only the nil-guard.
+
+**Verification.** The Go compile-lint harness (incl. the realistic fixture library —
+`payments`, etc. — which carries `List`/`Map` of validatable types) compiles +
+`gofmt`-clean. The Money round-trip already carried `List<Money>` / `Map<String,
+Money>` / `List<LineItem>` fields; its **three** drivers now each assert the
+nested-element reject path (bad currency in a `List<Money>`, bad amount in a
+`Map<String, Money>` value, bad currency in a `List<LineItem>`'s nested `Money`) so
+all three servers are proven to agree — Go's new recursion matches Python's pydantic
+recursion and TS's revive walk. The existing 250 codegen lib snapshots are unchanged
+(none exercised nested-collection validation), and a **new** snapshot
+(`go_validate_nested_collections_types`, `validate_nested_collections` in
+`go_tests.rs`) pins the previously-unpinned generated Go for the non-`Money` shapes
+the behavioral drivers don't cover as source text: a regex scalar inside a `List`
+(`List<Uuid>`) and a `Map` value (`Map<String, Decimal>`), an `Option`-wrapped
+collection (`Option<List<Url>>` — nil-guard + range), a direct nested-struct field
+(`primary: Address`), and a `List` of that struct (`List<Address>`). A second new
+snapshot (`go_validate_recursive_struct_types`, `validate_recursive_struct`) pins a
+self-referential struct (`Tree { id: Uuid, children: List<Tree> }`) to prove the
+`visited` cycle-guard terminates and that a `Type::Named` element emits a single
+`e0.Validate()` call (finite generated code; the recursion is the runtime data walk).
+clippy clean; 28 round-trips green. **Bug closed:** the `known-issues.md` entry "`Money` element
+validation inside `List`/`Map` is skipped in the Go target" (which also covered the
+regex-scalar and nested-struct element cases) is removed.
+
+**Still deferred.** Multipart body field `where` constraints remain validated only in
+Go (Python/FastAPI explodes the body into `Form(...)` params with no model; TS does
+not call the body validator on `Blob`-bearing multipart bodies) — the inverse
+divergence, a separate `Form`-validator-generation feature. See
+[known-issues.md](known-issues.md).
