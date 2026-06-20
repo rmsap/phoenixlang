@@ -175,6 +175,12 @@ pub fn lower_type(ty: &Type, check_result: &ResolvedModule) -> IrType {
         // or operations, so the placeholder representation is never materialized.
         // See `docs/design-decisions.md` (Money type).
         Type::Money => IrType::StringRef,
+        // `Url`/`Bytes` are Phoenix Gen scalars (string / base64-string on the wire)
+        // with no language-level literals or operations; same never-hit
+        // `StringRef` placeholder as the other Gen scalars (Gen never lowers to IR).
+        // See `docs/design-decisions.md` (URL & bytes types).
+        Type::Url => IrType::StringRef,
+        Type::Bytes => IrType::StringRef,
         // `JsValue` is the opaque host-FFI handle. It lowers to the
         // dedicated [`IrType::JsValue`], a single opaque scalar handle. The op
         // that produces one — [`crate::instruction::Op::ExternCall`] — has no

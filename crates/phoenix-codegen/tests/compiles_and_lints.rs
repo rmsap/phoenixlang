@@ -746,6 +746,91 @@ endpoint search: GET "/search" {
 }
 "#;
 
+/// Exercises the `Url` (branded validated string, `format: uri`) and `Bytes`
+/// (first-class binary, base64 wire, `contentEncoding: base64`) scalars across positions:
+/// `Url` as a struct field / `Option` / `List` / a query param / a `List` query
+/// param / a request header, and `Bytes` as a struct field / `Option` / `List` /
+/// a `Map` value (body + response). The `Url` query/header exercises
+/// `parseUrl`/`urlRe` validation; the `Bytes` fields exercise the base64 ↔
+/// `Uint8Array`/`[]byte`/`bytes` encode/decode (TS `encodeBytes` +
+/// `bytesFromBase64`). The `Map<String, Bytes>` field covers the only remaining
+/// combinator over `Bytes` — the TS `encodeBytes` deep-walk over a `Record` and
+/// the `Object.fromEntries` revival, Go `map[string][]byte` auto-base64, and the
+/// pydantic `Bytes` alias applied to dict values. Auth header + `error` block
+/// mirror the other schemas. `replace` adds a MULTI-STATUS
+/// (`response { 200: Asset … }`) endpoint whose shared body carries `Bytes`, so
+/// the `result.body` branch of the response-envelope codegen is exercised for the
+/// `encodeBytes` wrapping (keyed on `ep.response`, which mirrors the shared body).
+/// `page` adds a PAGINATED (`pagination { cursor }`) endpoint whose item type
+/// (`Asset`) carries `Bytes`, so the TS server's `encodeBytes` wrap on the page
+/// envelope and the client's per-item `bytesFromBase64` revival (via
+/// `pagination.item_type`) are both exercised — the one combinator the other
+/// endpoints don't reach. `get` carries a required + optional `Url` RESPONSE
+/// HEADER (`Link`/`X-Digest`), exercising the `Url` arms of the response-header
+/// write (server) and read coercion (client) — pass-through, since a `Url`'s
+/// runtime representation is already `str` (see `header_read_coercion`). `raw`
+/// and `rawList` carry a BARE `Bytes` / `List<Bytes>` RESPONSE (not struct-wrapped),
+/// exercising the inline decode path the struct fixtures skip: TS inlines
+/// `bytesFromBase64`, Go relies on `encoding/json`, and Python decodes via
+/// `base64.b64decode` (its `py_decode_expr` `Bytes` arm + `import base64`) rather
+/// than a model's pydantic alias.
+const URL_BYTES_SCHEMA: &str = r#"
+struct Asset {
+    id: Uuid
+    source: Url
+    mirror: Option<Url>
+    thumbnails: List<Url>
+    checksum: Bytes
+    signature: Option<Bytes>
+    chunks: List<Bytes>
+    tags: Map<String, Bytes>
+}
+
+endpoint upload: POST "/assets" {
+    headers { authorization: String }
+    body Asset
+    response Asset
+    error { Unauthorized(401) }
+}
+
+endpoint find: GET "/assets" {
+    headers { authorization: String  origin: Url as "X-Origin" }
+    query { source: Url  mirrors: List<Url> }
+    response List<Asset>
+    error { Unauthorized(401) }
+}
+
+endpoint get: GET "/assets/{id}" {
+    headers { authorization: String }
+    response Asset headers { canonical: Url as "Link"  digest: Option<Url> as "X-Digest" }
+    error { Unauthorized(401)  NotFound(404) }
+}
+
+endpoint replace: PUT "/assets/{id}" {
+    headers { authorization: String }
+    body Asset
+    response { 200: Asset  201: Asset  204 }
+    error { Unauthorized(401)  NotFound(404) }
+}
+
+endpoint page: GET "/assets/page" {
+    headers { authorization: String }
+    response List<Asset>
+    pagination { cursor }
+    error { Unauthorized(401) }
+}
+
+endpoint raw: GET "/assets/{id}/raw" {
+    headers { authorization: String }
+    response Bytes
+}
+
+endpoint rawList: GET "/assets/raw" {
+    headers { authorization: String }
+    response List<Bytes>
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -976,6 +1061,8 @@ fn go_output_compiles_and_lints() {
     check_go_output(&generate_go_files(PROJECTION_SCHEMA));
     // List-valued params (repeated query keys + comma-separated headers).
     check_go_output(&generate_go_files(LIST_PARAM_SCHEMA));
+    // `Url` (validated string) + `Bytes` (`[]byte`, auto base64).
+    check_go_output(&generate_go_files(URL_BYTES_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1012,6 +1099,7 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(ENUM_PARAM_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(PROJECTION_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(LIST_PARAM_SCHEMA));
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(URL_BYTES_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -1074,6 +1162,7 @@ fn openapi_output_lints() {
     check_openapi_output("ENUM_PARAM_SCHEMA", ENUM_PARAM_SCHEMA);
     check_openapi_output("PROJECTION_SCHEMA", PROJECTION_SCHEMA);
     check_openapi_output("LIST_PARAM_SCHEMA", LIST_PARAM_SCHEMA);
+    check_openapi_output("URL_BYTES_SCHEMA", URL_BYTES_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -1208,6 +1297,8 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(PROJECTION_SCHEMA));
     // List params: repeated-key query (toStringArray) + comma-split headers.
     check_typescript_output(&scaffold, &generate_typescript_files(LIST_PARAM_SCHEMA));
+    // `Url` branded + `Bytes` (`Uint8Array` revival + `encodeBytes` on send).
+    check_typescript_output(&scaffold, &generate_typescript_files(URL_BYTES_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1376,6 +1467,13 @@ fn python_output_compiles_and_lints() {
         &scaffold,
         &venv_bin,
         &generate_python_files(LIST_PARAM_SCHEMA),
+    );
+    // `Url` (`Annotated[str, BeforeValidator]`) + `Bytes` (custom `Annotated[bytes,
+    // BeforeValidator, PlainSerializer]` alias).
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(URL_BYTES_SCHEMA),
     );
 
     // Realistic schema fixture library (see FILE_FIXTURES).

@@ -324,6 +324,17 @@ impl Checker {
                         qp.span,
                     );
                 }
+                // `Bytes` is a binary value (base64 on the wire) with no scalar
+                // query encoding (a `List<Bytes>` is reported by `check_list_param`).
+                if !is_list && ty.mentions_bytes() {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: query param `{}` cannot be a `Bytes` (a binary value is not URL-encodable) — carry it in the request body",
+                            ep.name, qp.name
+                        ),
+                        qp.span,
+                    );
+                }
 
                 // Enum query params: restrict to simple enums and validate an
                 // enum-variant default (`= Normal`). Returns true when it handled
@@ -979,10 +990,17 @@ impl Checker {
             | Type::String
             | Type::DateTime
             | Type::Uuid
-            | Type::Decimal => {}
+            | Type::Decimal
+            | Type::Url => {}
             Type::Money => self.error(
                 format!(
                     "endpoint `{ep_name}`: {kind} `{name}` cannot be a `List<Money>` — `Money` is a composite, not a URL/header-encodable scalar"
+                ),
+                span,
+            ),
+            Type::Bytes => self.error(
+                format!(
+                    "endpoint `{ep_name}`: {kind} `{name}` cannot be a `List<Bytes>` — a binary value is not a URL/header-encodable scalar"
                 ),
                 span,
             ),
@@ -1056,6 +1074,12 @@ impl Checker {
                 other => other,
             };
             if matches!(unwrapped, Type::Generic(n, _) if n == "List") {
+                // List-ness is the primary (and only) reason reported here,
+                // regardless of element type: a `List<Bytes>`/`List<Money>`
+                // response header is rejected for being a list, not for its
+                // element, so we intentionally emit ONE generic diagnostic rather
+                // than also running the element-specific `mentions_*` checks below
+                // (which would surface a redundant second error for the same span).
                 self.error(
                     format!(
                         "endpoint `{}`: response header `{}` cannot be a `List<…>` (list response headers are not supported)",
@@ -1068,6 +1092,15 @@ impl Checker {
                     self.error(
                         format!(
                             "endpoint `{}`: response header `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not header-encodable) — carry it in the body, or use separate scalar headers for the amount and currency",
+                            ep.name, h.name
+                        ),
+                        h.span,
+                    );
+                }
+                if ty.mentions_bytes() {
+                    self.error(
+                        format!(
+                            "endpoint `{}`: response header `{}` cannot be a `Bytes` (a binary value is not header-encodable) — carry it in the body",
                             ep.name, h.name
                         ),
                         h.span,
@@ -1110,6 +1143,16 @@ impl Checker {
             self.error(
                 format!(
                     "endpoint `{}`: header `{}` cannot be a `Money` (a composite `{{ amount, currency }}` is not header-encodable) — carry it in the body, or use separate scalar headers for the amount and currency",
+                    ep.name, h.name
+                ),
+                h.span,
+            );
+        }
+        // `Bytes` is a binary value (base64) with no scalar header encoding.
+        if !is_list && ty.mentions_bytes() {
+            self.error(
+                format!(
+                    "endpoint `{}`: header `{}` cannot be a `Bytes` (a binary value is not header-encodable) — carry it in the body",
                     ep.name, h.name
                 ),
                 h.span,
@@ -3430,6 +3473,86 @@ mod tests {
             endpoint create: POST "/invoices" {
                 body Invoice
                 response Money
+            }
+            "#,
+        );
+    }
+
+    // ── `Bytes` position restriction ─────────────────────────────────
+    // `Bytes` is a binary value (base64 on the wire) with no scalar URL/header
+    // encoding, so — like `Money` — it is legal only in struct/body fields and
+    // responses, never a query param or header. Mirrors the `Money` rejections via
+    // `Type::mentions_bytes()`. See `docs/design-decisions.md` (URL & bytes types).
+
+    // REJECT: a bare `Bytes` query param.
+    #[test]
+    fn bytes_reject_query_param() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { blob: Bytes }
+                response String
+            }
+            "#,
+            "query param `blob` cannot be a `Bytes`",
+        );
+    }
+
+    // REJECT: a `Bytes` reached through a generic (`Option`/`List`) query param.
+    #[test]
+    fn bytes_reject_query_param_nested() {
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { blob: Option<Bytes> }
+                response String
+            }
+            "#,
+            "query param `blob` cannot be a `Bytes`",
+        );
+        assert_has_error(
+            r#"
+            endpoint search: GET "/search" {
+                query { blobs: List<Bytes> }
+                response String
+            }
+            "#,
+            "cannot be a `List<Bytes>`",
+        );
+    }
+
+    // REJECT: a `Bytes` request header and a `Bytes` response header.
+    #[test]
+    fn bytes_reject_headers() {
+        assert_has_error(
+            r#"
+            endpoint upload: POST "/upload" {
+                headers { checksum: Bytes }
+                response String
+            }
+            "#,
+            "header `checksum` cannot be a `Bytes`",
+        );
+        assert_has_error(
+            r#"
+            endpoint upload: POST "/upload" {
+                response String headers { checksum: Bytes }
+            }
+            "#,
+            "response header `checksum` cannot be a `Bytes`",
+        );
+    }
+
+    // ACCEPT: `Bytes` in struct/body fields and as a response is fine (the legal
+    // positions) — the restriction is query/header-only.
+    #[test]
+    fn bytes_accept_body_field_and_response() {
+        assert_no_errors(
+            r#"
+            struct Blob { data: Bytes }
+            endpoint create: POST "/blobs" {
+                body Blob
+                response Blob
             }
             "#,
         );

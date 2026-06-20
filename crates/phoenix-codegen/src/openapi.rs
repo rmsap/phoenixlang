@@ -438,6 +438,12 @@ fn type_to_json_schema(ty: &Type) -> Value {
         // A composite built-in: `$ref` the shared `Money` component (registered in
         // `generate_openapi`). See `docs/design-decisions.md` (Money type).
         Type::Money => json!({ "$ref": "#/components/schemas/Money" }),
+        // A `Url` is a string with the standard `uri` format. A `Bytes` is base64:
+        // this spec is OpenAPI 3.1 (JSON Schema 2020-12), where base64 binary is
+        // `contentEncoding: base64` — the 3.0 `format: byte` spelling is only an
+        // (ignored) annotation under 3.1. See `docs/design-decisions.md`.
+        Type::Url => json!({ "type": "string", "format": "uri" }),
+        Type::Bytes => json!({ "type": "string", "contentEncoding": "base64" }),
         Type::Void => json!({}),
         Type::Named(name) => json!({ "$ref": format!("#/components/schemas/{}", name) }),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {

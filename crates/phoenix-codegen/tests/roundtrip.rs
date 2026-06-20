@@ -403,6 +403,69 @@ fn list_dir() -> PathBuf {
     roundtrip_dir().join("list")
 }
 
+/// Drives the `Url` (branded validated string, exact pass-through wire) and
+/// `Bytes` (first-class binary, base64 wire) scalars end to end. The body
+/// `Payload` carries `Url` and `Bytes` each as a required field, an `Option`
+/// (present and absent across the two calls), and a `List`, plus a
+/// `Map<String, Bytes>` — so the drivers assert the base64-to-binary
+/// encode/decode (TS `encodeBytes`/`bytesFromBase64`, Go `[]byte` auto-base64,
+/// pydantic `Bytes` alias) preserves NON-UTF-8 bytes through every combinator
+/// (the `Map` exercises the TS `encodeBytes` deep-walk over a `Record` and the
+/// `Object.fromEntries` revival, Go `map[string][]byte`, and the dict-valued
+/// pydantic alias), and that a `Url` survives byte-for-byte (validated, never
+/// normalized, so query string, fragment, and scheme case are all preserved). The
+/// `Url` query, the `List<Url>` query, and the `Url` header exercise the
+/// server-side `parseUrl`/`urlRe`/`BeforeValidator` validation, echoed into the
+/// response `Echo` so the round-trip is observable. A malformed `Url` query value
+/// drives the reject path (TS/Go 400, Py 422). The `replace` MULTI-STATUS endpoint
+/// (`response { 200: Payload … }`) round-trips a `Bytes`-bearing shared body
+/// through the response envelope — behaviorally exercising the `encodeBytes` wrap
+/// on the server's `result.body` branch and the client's revival of the envelope
+/// body (compile-lint alone cannot catch a missing wrap/revival there). Kept inline
+/// (not a fixture); only these drivers consume it. See `docs/design-decisions.md`
+/// (URL & bytes types).
+const URL_BYTES_RT_SCHEMA: &str = r#"
+struct Payload {
+    source: Url
+    mirror: Option<Url>
+    thumbnails: List<Url>
+    checksum: Bytes
+    signature: Option<Bytes>
+    chunks: List<Bytes>
+    tags: Map<String, Bytes>
+}
+
+struct Echo {
+    source: Url
+    mirror: Option<Url>
+    thumbnails: List<Url>
+    checksum: Bytes
+    signature: Option<Bytes>
+    chunks: List<Bytes>
+    tags: Map<String, Bytes>
+    origin: Url
+    mirrors: List<Url>
+    referer: Url
+}
+
+endpoint upload: POST "/assets" {
+    headers { referer: Url as "X-Referer" }
+    query { origin: Url  mirrors: List<Url> }
+    body Payload
+    response Echo
+}
+
+endpoint replace: PUT "/assets/{id}" {
+    body Payload
+    response { 200: Payload  201: Payload  204 }
+}
+"#;
+
+/// Absolute path to `tests/roundtrip/url_bytes/` (the dedicated Url/Bytes drivers).
+fn url_bytes_dir() -> PathBuf {
+    roundtrip_dir().join("url_bytes")
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    compiles_and_lints.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -842,6 +905,44 @@ fn list_go_roundtrip() {
     assert!(ok, "go list round-trip test failed:\n{out}");
 }
 
+/// Dedicated `Url`/`Bytes` wire round-trip for Go: generates the `api` package
+/// from [`URL_BYTES_RT_SCHEMA`], assembles a tempdir module with the bespoke
+/// `url_bytes/go` driver, and runs `go test`. Asserts `[]byte` survives the base64
+/// wire as raw binary (non-UTF-8 bytes intact) in body/`Option`/`List`/response,
+/// and a `Url` round-trips byte-for-byte through body, query, `List` query, and a
+/// request header — plus the malformed-`Url` query reject path (`urlRe` → 400).
+#[test]
+fn url_bytes_go_roundtrip() {
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    let files = generate_go_files(URL_BYTES_RT_SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    let go_mod = std::fs::read_to_string(roundtrip_dir().join("go").join("go.mod.template"))
+        .expect("read go.mod.template");
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+
+    let driver = url_bytes_dir()
+        .join("go")
+        .join("url_bytes_roundtrip_test.go");
+    let contents = std::fs::read_to_string(&driver)
+        .unwrap_or_else(|e| panic!("read {}: {e}", driver.display()));
+    std::fs::write(root.join("url_bytes_roundtrip_test.go"), contents).expect("write driver");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go url/bytes round-trip test failed:\n{out}");
+}
+
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 /// Generates both the Express and Fastify variants from a single parse/check.
@@ -1264,6 +1365,49 @@ fn list_typescript_roundtrip() {
     );
 }
 
+/// Dedicated `Url`/`Bytes` wire round-trip for the TypeScript (Express) target:
+/// generates the Express server from [`URL_BYTES_RT_SCHEMA`] into
+/// `generated-url-bytes/` and runs `url-bytes-driver.ts` via tsx. Asserts a `Bytes`
+/// field comes back as a `Uint8Array` with identical raw bytes (proving
+/// `encodeBytes` on send + `bytesFromBase64` revival, NOT a UTF-8 string), across
+/// body/`Option`/`List`/response, and that a `Url` round-trips byte-for-byte
+/// through body, query, `List` query, and a request header — plus the
+/// malformed-`Url` query reject path (`parseUrl` → 400).
+#[test]
+fn url_bytes_typescript_roundtrip() {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("typescript");
+    let node_modules = driver_dir.join("node_modules");
+    if !node_modules.is_dir() {
+        let msg = format!(
+            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let (program, result) = parse_and_check(URL_BYTES_RT_SCHEMA);
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+
+    let generated = driver_dir.join("generated-url-bytes");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated-url-bytes dir");
+    std::fs::write(generated.join("types.ts"), &files.types).expect("write types.ts");
+    std::fs::write(generated.join("client.ts"), &files.client).expect("write client.ts");
+    std::fs::write(generated.join("handlers.ts"), &files.handlers).expect("write handlers.ts");
+    std::fs::write(generated.join("server.ts"), &files.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "url-bytes-driver.ts"]);
+    assert!(ok, "typescript url/bytes round-trip test failed:\n{out}");
+}
+
 // ── Python target ──────────────────────────────────────────────────────────
 
 fn generate_python_files(schema: &str) -> phoenix_codegen::PythonFiles {
@@ -1633,4 +1777,49 @@ fn list_python_roundtrip() {
     let python = venv_python.to_string_lossy().into_owned();
     let (ok, out) = run(&driver_dir, &python, &["list_driver.py"]);
     assert!(ok, "python list round-trip test failed:\n{out}");
+}
+
+/// Dedicated `Url`/`Bytes` wire round-trip for the Python target: generates the
+/// package from [`URL_BYTES_RT_SCHEMA`] into `generated_url_bytes/` and runs
+/// `url_bytes_driver.py` with the committed `.venv`. Asserts a `Bytes` field comes
+/// back as raw `bytes` with identical contents (the custom `Bytes` alias ↔ base64
+/// wire, preserving non-UTF-8 bytes) across body/`Option`/`List`/response, and that
+/// a `Url` round-trips byte-for-byte through body, query, `List` query, and a
+/// request header — plus the malformed-`Url` query reject path (FastAPI runs the
+/// `BeforeValidator` → 422).
+#[test]
+fn url_bytes_python_roundtrip() {
+    if gate(&missing_tools(&["python3"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("python");
+    let venv_python = driver_dir.join(".venv").join("bin").join("python");
+    if !venv_python.is_file() {
+        let msg = format!(
+            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
+             .venv/bin/pip install -r requirements.txt` in {}",
+            driver_dir.display()
+        );
+        if e2e_required() {
+            panic!("PHOENIX_GEN_E2E=1 but {msg}");
+        }
+        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+        return;
+    }
+
+    let files = generate_python_files(URL_BYTES_RT_SCHEMA);
+
+    let generated = driver_dir.join("generated_url_bytes");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated_url_bytes dir");
+    std::fs::write(generated.join("__init__.py"), &files.init).expect("write __init__.py");
+    std::fs::write(generated.join("models.py"), &files.models).expect("write models.py");
+    std::fs::write(generated.join("client.py"), &files.client).expect("write client.py");
+    std::fs::write(generated.join("handlers.py"), &files.handlers).expect("write handlers.py");
+    std::fs::write(generated.join("server.py"), &files.server).expect("write server.py");
+
+    let python = venv_python.to_string_lossy().into_owned();
+    let (ok, out) = run(&driver_dir, &python, &["url_bytes_driver.py"]);
+    assert!(ok, "python url/bytes round-trip test failed:\n{out}");
 }

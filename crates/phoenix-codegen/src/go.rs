@@ -1281,7 +1281,12 @@ impl<'a> GoGenerator<'a> {
                             qp.name, value_expr
                         )
                     }
-                    Type::String => format!("{qv}.Set(\"{}\", {})", qp.name, value_expr),
+                    // `String` and the validated-string scalars (`Uuid`/`Decimal`/
+                    // `Url`) are all Go `string`s — set them directly (no `fmt.Sprint`,
+                    // which would be a needless allocation and read less cleanly).
+                    Type::String | Type::Uuid | Type::Decimal | Type::Url => {
+                        format!("{qv}.Set(\"{}\", {})", qp.name, value_expr)
+                    }
                     // A `DateTime` goes on the wire as RFC 3339; `fmt.Sprint`
                     // would emit Go's default time layout, which the server's
                     // `time.Parse(time.RFC3339, …)` could not read back. A
@@ -2251,12 +2256,12 @@ impl<'a> GoGenerator<'a> {
                         "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\tif !cv.Valid() {{\n\t\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &cv\n\t\t}}\n"
                     )
                 }
-                Type::Uuid | Type::Decimal => {
-                    // A `Uuid`/`Decimal` (Go `string`) is format-checked against the
-                    // shared matcher var, rejecting a malformed value with 400 —
+                Type::Uuid | Type::Decimal | Type::Url => {
+                    // A `Uuid`/`Decimal`/`Url` (Go `string`) is format-checked against
+                    // the shared matcher var, rejecting a malformed value with 400 —
                     // parallel to the TS/Python scalar coercion and the list path.
                     let go_type = type_to_go(inner);
-                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    let re = regex_scalar(inner).expect("uuid/decimal/url regex var").0;
                     format!(
                         "var {camel} *{go_type}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\tif !{re}.MatchString(v) {{\n\t\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &v\n\t\t}}\n"
                     )
@@ -2329,15 +2334,15 @@ impl<'a> GoGenerator<'a> {
                         "{camel} := {seed}\n\t\tif v := r.URL.Query().Get(\"{name}\"); v != \"\" {{\n\t\t\t{camel} = {go_type}(v)\n\t\t}}\n\t\tif !{camel}.Valid() {{\n\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
                     )
                 }
-                Type::Uuid | Type::Decimal => {
-                    // A required `Uuid`/`Decimal` (Go `string`) is format-checked
+                Type::Uuid | Type::Decimal | Type::Url => {
+                    // A required `Uuid`/`Decimal`/`Url` (Go `string`) is format-checked
                     // against the shared matcher var — an absent (empty) or malformed
                     // value is rejected with 400, parallel to the enum required path
                     // and the TS/Python scalar coercion. Unlike the scalar arms above,
-                    // `qp.default_value` is intentionally NOT seeded: a `Uuid`/`Decimal`
-                    // has no literal-default form (sema accepts only Int/Float/Bool/
+                    // `qp.default_value` is intentionally NOT seeded: a `Uuid`/`Decimal`/
+                    // `Url` has no literal-default form (sema accepts only Int/Float/Bool/
                     // String defaults), so there is never a default to honor here.
-                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    let re = regex_scalar(inner).expect("uuid/decimal/url regex var").0;
                     format!(
                         "{camel} := r.URL.Query().Get(\"{name}\")\n\t\tif !{re}.MatchString({camel}) {{\n\t\t\thttp.Error(w, \"invalid query param: {name}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
                     )
@@ -2396,8 +2401,8 @@ impl<'a> GoGenerator<'a> {
                 )
             }
             Type::String => format!("{indent}{slice} = append({slice}, v)\n"),
-            Type::Uuid | Type::Decimal => {
-                let re = regex_scalar(elem).expect("uuid/decimal regex var").0;
+            Type::Uuid | Type::Decimal | Type::Url => {
+                let re = regex_scalar(elem).expect("uuid/decimal/url regex var").0;
                 format!(
                     "{indent}if !{re}.MatchString(v) {{\n{i2}http.Error(w, \"invalid {kind}: {name}\", http.StatusBadRequest)\n{i2}return\n{indent}}}\n{indent}{slice} = append({slice}, v)\n"
                 )
@@ -2475,12 +2480,12 @@ impl<'a> GoGenerator<'a> {
                         "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tcv := {go_type}(v)\n\t\t\tif !cv.Valid() {{\n\t\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &cv\n\t\t}}\n"
                     )
                 }
-                Type::Uuid | Type::Decimal => {
-                    // A `Uuid`/`Decimal` (Go `string`) header is format-checked
+                Type::Uuid | Type::Decimal | Type::Url => {
+                    // A `Uuid`/`Decimal`/`Url` (Go `string`) header is format-checked
                     // against the shared matcher var, rejecting a malformed value
                     // with 400 — parallel to the TS/Python scalar coercion.
                     let go_type = type_to_go(inner);
-                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    let re = regex_scalar(inner).expect("uuid/decimal/url regex var").0;
                     format!(
                         "var {camel} *{go_type}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\tif !{re}.MatchString(v) {{\n\t\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\t\treturn\n\t\t\t}}\n\t\t\t{camel} = &v\n\t\t}}\n"
                     )
@@ -2549,12 +2554,12 @@ impl<'a> GoGenerator<'a> {
                         "{camel} := {seed}\n\t\tif v := r.Header.Get(\"{wire}\"); v != \"\" {{\n\t\t\t{camel} = {go_type}(v)\n\t\t}}\n\t\tif !{camel}.Valid() {{\n\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
                     )
                 }
-                Type::Uuid | Type::Decimal => {
-                    // A required `Uuid`/`Decimal` (Go `string`) header is
+                Type::Uuid | Type::Decimal | Type::Url => {
+                    // A required `Uuid`/`Decimal`/`Url` (Go `string`) header is
                     // format-checked against the shared matcher var — an absent
                     // (empty) or malformed value is rejected with 400, parallel to
                     // the enum required path and the TS/Python scalar coercion.
-                    let re = regex_scalar(inner).expect("uuid/decimal regex var").0;
+                    let re = regex_scalar(inner).expect("uuid/decimal/url regex var").0;
                     format!(
                         "{camel} := r.Header.Get(\"{wire}\")\n\t\tif !{re}.MatchString({camel}) {{\n\t\t\thttp.Error(w, \"invalid header: {wire}\", http.StatusBadRequest)\n\t\t\treturn\n\t\t}}\n"
                     )
@@ -2778,6 +2783,7 @@ fn go_regex_pattern(var: &str) -> &'static str {
     match var {
         "uuidRe" => "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
         "decimalRe" => r"^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$",
+        "urlRe" => "^[a-zA-Z][a-zA-Z0-9+.-]*:",
         other => unreachable!("no regex pattern for var `{other}`"),
     }
 }
@@ -2794,6 +2800,13 @@ fn regex_scalar(ty: &Type) -> Option<(&'static str, &'static str)> {
     match inner {
         Type::Uuid => Some(("uuidRe", "invalid uuid")),
         Type::Decimal => Some(("decimalRe", "invalid decimal")),
+        // A `Url` is validated by a "has a scheme" regex (`scheme:`). TS's `URL_RE`
+        // and Python's `urlparse(...).scheme` check use the SAME scheme-presence
+        // rule, so all three servers agree on which strings are valid (a fuller
+        // parse would diverge across language URL libraries). The rest of the URL is
+        // intentionally not validated — the value is checked but never normalized,
+        // so it round-trips byte-for-byte.
+        Type::Url => Some(("urlRe", "invalid url")),
         _ => None,
     }
 }
@@ -2856,6 +2869,13 @@ fn type_to_go(ty: &Type) -> String {
         // A composite built-in: the generated `Money` struct (`{Amount, Currency}`)
         // with its own `Validate()`. See `docs/design-decisions.md` (Money type).
         Type::Money => "Money".to_string(),
+        // A `Url` is a validated string (format-checked in `Validate()` via the
+        // shared `urlRe` matcher — a scheme-presence regex, see `regex_scalar`);
+        // same `string` runtime representation as `Uuid`/`Decimal`. A `Bytes` is
+        // binary: Go `[]byte`, which `encoding/json` marshals/unmarshals as base64
+        // automatically. See `docs/design-decisions.md`.
+        Type::Url => "string".to_string(),
+        Type::Bytes => "[]byte".to_string(),
         Type::Void => "".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
@@ -3024,9 +3044,10 @@ fn multi_status_type_name(ep: &EndpointInfo) -> String {
 
 /// Renders a Go expression encoding a single scalar `value_expr` to its wire
 /// string for a repeated query/header element (`List<T>`). Mirrors the scalar
-/// query/header encoding: `String`/`Uuid`/`Decimal` (all Go `string`) pass through
-/// unconverted (no `unconvert` lint), `DateTime` formats RFC 3339, an enum (a named
-/// `string` type) takes a `string(...)` conversion, and numerics/bool use `strconv`.
+/// query/header encoding: `String`/`Uuid`/`Decimal`/`Url` (all Go `string`) pass
+/// through unconverted (no `unconvert` lint), `DateTime` formats RFC 3339, an enum
+/// (a named `string` type) takes a `string(...)` conversion, and numerics/bool use
+/// `strconv`.
 fn go_scalar_encode(elem: &Type, value_expr: &str, needs_strconv: &mut bool) -> String {
     match elem {
         Type::Int => {
@@ -3041,9 +3062,9 @@ fn go_scalar_encode(elem: &Type, value_expr: &str, needs_strconv: &mut bool) -> 
             *needs_strconv = true;
             format!("strconv.FormatBool({value_expr})")
         }
-        // `String` and the validated-string scalars (`Uuid`/`Decimal`) are already
-        // Go `string`s — a `string(...)` conversion would trip `unconvert`.
-        Type::String | Type::Uuid | Type::Decimal => value_expr.to_string(),
+        // `String` and the validated-string scalars (`Uuid`/`Decimal`/`Url`) are
+        // already Go `string`s — a `string(...)` conversion would trip `unconvert`.
+        Type::String | Type::Uuid | Type::Decimal | Type::Url => value_expr.to_string(),
         Type::DateTime => format!("{value_expr}.Format(time.RFC3339)"),
         // An enum is a named `string` type — convert it to a plain `string`.
         _ => format!("string({value_expr})"),
@@ -3069,7 +3090,10 @@ fn header_string_expr(inner: &Type, value_expr: &str, needs_strconv: &mut bool) 
             *needs_strconv = true;
             format!("strconv.FormatBool({value_expr})")
         }
-        Type::String => value_expr.to_string(),
+        // `String` and the validated-string scalars (`Uuid`/`Decimal`/`Url`) are all
+        // Go `string`s — pass through unconverted; a `string(...)` cast would trip
+        // `unconvert`. (Only a named enum type, the `_` arm below, needs the cast.)
+        Type::String | Type::Uuid | Type::Decimal | Type::Url => value_expr.to_string(),
         // A `DateTime` (`time.Time`) goes on the wire as an RFC 3339 string. A
         // dereferenced optional (`*x`) must be parenthesized: `*x.Format(...)`
         // parses as `*(x.Format(...))` and would fail to compile.

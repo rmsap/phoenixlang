@@ -7,4 +7,5 @@ generated-money/
 generated-enum/
 generated-projection/
 generated-list/
+generated-url-bytes/
 contract.json

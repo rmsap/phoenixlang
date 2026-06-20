@@ -10,6 +10,7 @@ generated_money/
 generated_enum/
 generated_projection/
 generated_list/
+generated_url_bytes/
 contract.json
 
 # Python bytecode caches.

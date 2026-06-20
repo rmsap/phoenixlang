@@ -62,6 +62,25 @@ pub enum Type {
     /// and the language has no `Money` literal). See `docs/design-decisions.md`
     /// (Money type).
     Money,
+    /// A URL, serialized on the wire as its string form (e.g.
+    /// `https://example.com/x`). A Phoenix Gen scalar usable wherever `String` is —
+    /// like `DateTime`/`Uuid`/`Decimal`, NOT position-restricted. Lowers to
+    /// `IrType::StringRef`. Validated like `Uuid` (a branded validated string), with
+    /// the SAME scheme-presence rule in every target so the servers agree on what is
+    /// valid: TS `parseUrl` tests a scheme regex, Go tests the shared `urlRe`, Python
+    /// runs a `BeforeValidator` checking `urlparse(...).scheme`. Validated but never
+    /// normalized (round-trips byte-for-byte). OpenAPI emits `format: uri`. See
+    /// `docs/design-decisions.md` (URL & bytes types).
+    Url,
+    /// A binary blob, serialized on the wire as a base64 string. A Phoenix Gen
+    /// scalar carried as a FIRST-CLASS binary value: TS `Uint8Array`, Python
+    /// `bytes`, Go `[]byte` (`encoding/json` auto-base64). Body/struct/response
+    /// only — `check_endpoint` rejects it in query/header position (a binary value
+    /// has no URL/header-scalar encoding; path params carry no declared type, so
+    /// there is no path position to reject). Lowers to `IrType::StringRef` only
+    /// as a never-hit placeholder. OpenAPI (3.1) emits `contentEncoding: base64`.
+    /// See `docs/design-decisions.md` (URL & bytes types).
+    Bytes,
     /// The unit type, used for functions that do not return a value.
     Void,
     /// An opaque JavaScript-host value handle.
@@ -137,6 +156,8 @@ impl Type {
             "Uuid" => Type::Uuid,
             "Decimal" => Type::Decimal,
             "Money" => Type::Money,
+            "Url" => Type::Url,
+            "Bytes" => Type::Bytes,
             "JsValue" => Type::JsValue,
             "Void" => Type::Void,
             other => Type::Named(other.to_string()),
@@ -222,6 +243,21 @@ impl Type {
         match self {
             Type::Money => true,
             Type::Generic(_, args) => args.iter().any(Type::mentions_money),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this type is — or has a generic argument that is —
+    /// [`Type::Bytes`]. Recurses through generics (so `Option<Bytes>`/`List<Bytes>`
+    /// are caught) but not into [`Type::Named`] (a struct *field* `Bytes` is a
+    /// separate, legal case). Used by `check_endpoint`'s query/header position
+    /// restriction — a binary value has no URL/header-scalar encoding. (Path params
+    /// carry no declared type, so there is no path position to reject.)
+    #[must_use]
+    pub fn mentions_bytes(&self) -> bool {
+        match self {
+            Type::Bytes => true,
+            Type::Generic(_, args) => args.iter().any(Type::mentions_bytes),
             _ => false,
         }
     }
@@ -318,6 +354,8 @@ impl std::fmt::Display for Type {
             Type::Uuid => write!(f, "Uuid"),
             Type::Decimal => write!(f, "Decimal"),
             Type::Money => write!(f, "Money"),
+            Type::Url => write!(f, "Url"),
+            Type::Bytes => write!(f, "Bytes"),
             Type::JsValue => write!(f, "JsValue"),
             Type::Void => write!(f, "Void"),
             Type::Named(name) => write!(f, "{}", bare_name(name)),

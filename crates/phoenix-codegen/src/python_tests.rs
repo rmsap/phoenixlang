@@ -1746,3 +1746,60 @@ endpoint upsertUser: PUT "/api/users/{id}" {
     );
     insta::assert_snapshot!("py_multi_status_request_body_client", files.client);
 }
+
+/// A bare `Bytes` response leaf (NOT wrapped in a struct) is decoded inline by
+/// the client via `py_decode_expr` → `base64.b64decode`, so the client must
+/// `import base64` and decode the wire base64 string to raw `bytes`. Without it
+/// the client would return the base64 STRING typed as `Bytes` (a runtime lie):
+/// the bug TS guards with `bare_bytes_response_imports_decoder` and Go gets for
+/// free via `encoding/json`. Every behavioral fixture wraps `Bytes` in a struct
+/// (whose `Model(**...)` runs the pydantic alias), so this is the sole coverage
+/// of the inlined bare-`Bytes` decode.
+#[test]
+fn bare_bytes_response_decodes_base64() {
+    let files = generate_from_source(
+        r#"
+endpoint download: GET "/blob" {
+    response Bytes
+}
+"#,
+    );
+    assert!(
+        files.client.contains("import base64"),
+        "bare `Bytes` response must import base64:\n{}",
+        files.client
+    );
+    assert!(
+        files
+            .client
+            .contains("return base64.b64decode(response.json())"),
+        "bare `Bytes` response must decode the wire base64 to bytes:\n{}",
+        files.client
+    );
+}
+
+/// As above but the leaf is reached through `List`, still decoded inline (the
+/// element comprehension runs `base64.b64decode` per item) — so the import is
+/// likewise required and the per-element decode must land.
+#[test]
+fn list_bytes_response_decodes_base64() {
+    let files = generate_from_source(
+        r#"
+endpoint chunks: GET "/chunks" {
+    response List<Bytes>
+}
+"#,
+    );
+    assert!(
+        files.client.contains("import base64"),
+        "`List<Bytes>` response must import base64:\n{}",
+        files.client
+    );
+    assert!(
+        files
+            .client
+            .contains("[base64.b64decode(item) for item in response.json()]"),
+        "`List<Bytes>` response must decode each element inline:\n{}",
+        files.client
+    );
+}

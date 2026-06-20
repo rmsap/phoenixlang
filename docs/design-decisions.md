@@ -3344,3 +3344,127 @@ UUID/Decimal drivers (and the list driver's `List<Uuid>` element) now issue a ra
 `fetch` and assert the exact **400** — pinning the plain-`Error`→500 fix, not just
 "client threw" — so Go and TS agree on 400 (Python 422). Clippy clean; 244 codegen
 lib tests green; 25 round-trips green.
+
+## Phoenix Gen — URL & bytes scalar types (2026-06-19)
+
+Adds two scalars the fixture library wanted: `Url` (a validated URL string) and
+`Bytes` (a first-class binary value). The user chose the semantics up front: `Bytes`
+is a **real binary value** at runtime (`Uint8Array` / `[]byte` / `bytes`) carried as
+base64 on the JSON wire — not a string the caller has to encode themselves; `Url` is
+a **branded + validated** string (the `Uuid`/`Decimal` model), validated everywhere
+but **never normalized**, so it round-trips byte-for-byte.
+
+**Type plumbing (both).** New `Type::Url` / `Type::Bytes` variants + `from_name` /
+`Display` / `object_safety` (not object-safe) / IR `lower_type` (`StringRef`
+placeholder — never executed, codegen-only types). Each of the four generators maps
+the type, (de)serializes it, and threads its import/helper through.
+
+**`Url` — validated, never normalized.** All three targets validate the SAME way —
+**scheme presence only** — so the servers agree on which strings are valid. A fuller
+parse (`URL.canParse`, `net/url.ParseRequestURI`) was rejected precisely because the
+language URL libraries disagree at the edges, which would mean a value one generated
+server accepts and another rejects — breaking the whole-stack contract guarantee.
+(One residual edge: Python's `urlparse` strips embedded `\t`/`\r`/`\n` before
+parsing, so a URL containing a raw tab/newline can validate in Python while the
+Go/TS anchored scheme regex rejects it — pathological input that would never
+round-trip identically anyway, accepted as out of scope.)
+- **TS:** a branded `Url = string & {…}` with `parseUrl`, folded into the regex-based
+  `ts_branded_scalars` machinery (revival + query/header coercion +
+  `has_validated_param`) exactly like `Uuid`/`Decimal` — a shared `URL_RE`
+  (`/^[a-zA-Z][a-zA-Z0-9+.-]*:/`, the same scheme regex as Go's `urlRe`). Added
+  `Type::Url` to every hardcoded `Uuid | Decimal` coercion arm. (An earlier draft used
+  `URL.canParse`, which validated *more* than the other two and so was inconsistent —
+  replaced with the scheme regex.)
+- **Go:** a `string` format-checked by a shared `urlRe` (`^[a-zA-Z][a-zA-Z0-9+.-]*:`
+  — requires a scheme) in struct `Validate()` and, **this slice**, in the scalar
+  query/header param branches (`Uuid | Decimal | Url`) and the `List`-element branch
+  — so a single `Url` query/header param now 400s on a malformed value, matching the
+  `List<Url>` element path and the TS/Python behavior. (Before this, a single `Url`
+  query/header reached the handler unvalidated, the same gap the prior slice closed
+  for `Uuid`/`Decimal`.)
+- **Python:** `Url = Annotated[str, BeforeValidator(_validate_url)]` where
+  `_validate_url` rejects a value whose `urlparse(...).scheme` is empty; value stays
+  `str` so it round-trips exactly; FastAPI runs the validator on query/header params.
+- **OpenAPI:** `{type: string, format: uri}`.
+
+**`Bytes` — real binary, base64 wire.**
+- **TS:** runtime `Uint8Array`. Because `JSON.stringify` turns a `Uint8Array` into an
+  index object and `res.json`/`fetch` take no replacer, a deep-walk `encodeBytes`
+  helper rewrites every `Uint8Array` to its base64 string before serialization (on
+  the client request body and the server response), guarding `Date` (so `Date.toJSON`
+  still runs) and primitives. The decode/revival path uses `bytesFromBase64` (`atob`).
+- **Go:** `[]byte` — `encoding/json` already base64s it both ways, no extra machinery.
+- **Python:** the original `Base64Bytes` choice was **behaviorally wrong** and the
+  round-trip caught it: `Base64Bytes` treats *all* construction input as base64 to
+  decode, so a caller passing raw `bytes` (or the echo handler re-wrapping the
+  decoded value) got corrupted output. Replaced with a custom alias
+  `Bytes = Annotated[bytes, BeforeValidator(_bytes_from_b64), PlainSerializer(_bytes_to_b64, return_type=str)]`:
+  the validator decodes a base64 *string* but passes raw `bytes` through unchanged
+  (so a caller works with binary directly), and the serializer base64-encodes on
+  dump. Unlike `datetime`/`UUID`/`Decimal`, `Bytes` does **not** join the client's
+  `model_dump(mode="json")` gate: `PlainSerializer` runs with the default
+  `when_used="always"`, so a `Bytes` field is already a base64 string under the plain
+  `model_dump()` — it never leaves a non-JSON-safe value that `json.dumps` would
+  reject.
+- **OpenAPI:** `{type: string, contentEncoding: base64}` (the spec is 3.1 /
+  JSON Schema 2020-12, where this — not the 3.0 `format: byte` — is the idiomatic
+  base64 representation; `format: byte` would be only an ignored annotation under 3.1).
+
+**Position restrictions (sema).** `Bytes` is body/struct/response-only — rejected in
+query/header/path via a new `Type::mentions_bytes()` predicate (a binary value is not
+a URL/header-encodable scalar), the binary analogue of the existing `Money` rejection.
+`Url` is allowed everywhere (it is a validated string).
+
+**Verification.** Compile-lint: a new `URL_BYTES_SCHEMA` (struct fields + `Option` +
+`List` + a `Map<String, Bytes>` field for both types, plus `Url` query / `List<Url>`
+query / `Url` header, and a multi-status `replace` whose shared body carries `Bytes`)
+across all four targets, green. Behavioral round-trips: a new `url_bytes` driver per
+target (Go/TS/Python) asserts (a) `Bytes` survives as raw binary including **non-UTF-8
+bytes** (0x00/0xFF/0xFE/0x80) through body/`Option`/`List`/`Map<String, Bytes>`/response
+— the server stub asserts it received a real `Uint8Array`/`bytes`, not the base64
+string — and (b) `Url` round-trips **byte-for-byte** (query string + fragment +
+non-lowercased host all preserved) through body/`Option`/`List`, a query param, a
+`List<Url>` query param, and a request header, plus the malformed-`Url` reject path
+(TS/Go 400, Py 422). The `Map<String, Bytes>` exercises the only remaining combinator
+over `Bytes` (TS `encodeBytes` deep-walk over a `Record` + `Object.fromEntries`
+revival; Go `map[string][]byte`; the dict-valued pydantic alias). A multi-status
+`replace` endpoint additionally round-trips a `Bytes`-bearing shared body through the
+`{ status, body }` response envelope, behaviorally exercising the `encodeBytes` wrap on
+the server's `result.body` branch and the client's revival of the envelope body
+(compile-lint alone cannot catch a missing wrap/revival there). A bare `Bytes` response
+leaf (not struct-wrapped) is decoded inline by the client — TS imports `bytesFromBase64`,
+and **Python** decodes via `base64.b64decode` in `py_decode_expr` (its own `Bytes` arm,
+plus an `import base64`), because a non-struct leaf never runs the pydantic `Bytes`
+alias (only `Model(**…)` does); Go gets it free from `encoding/json`. This is covered by
+per-generator unit tests (TS + Python) and a `raw`/`rawList` (`Bytes`/`List<Bytes>`)
+endpoint in `URL_BYTES_SCHEMA` so all four targets compile-lint the inline path — the
+behavioral fixtures only ever wrap `Bytes` in a struct (whose reviver/alias handles it).
+Bytes-position rejection (query/header/response-header) has parallel sema tests; the
+list-element diagnostic for a `List<…>` response header is intentionally kept generic
+(one error per span — the list-ness, not the element, is the reported reason).
+
+**TS body-revival reject → 400 (gap closed in this slice).** A `Url` (or `Uuid`/
+`Decimal`/`Money`) **body field** validates on `revive<Endpoint>Body` (`parse*` /
+`reviveMoney` throws `ValidationError`) even with no `@`-constraint. The TS server's
+`ValidationError → 400` guard was previously gated on `has_body_constraints ||
+has_validated_param`, so a body whose *only* validation is a branded-scalar field —
+and no validated query/header param — let the throw fall through to the catch-all
+**500**, diverging from Go's body `Validate() → 400`. Added a `body_has_validated`
+gate (`type_reaches_validated`, transitive through `Named` struct fields, mirroring
+`type_reaches_bytes`) to `validates` and to the `ValidationError` server-import
+condition, so such a body now 400s in both frameworks. (The `URL_BYTES` schemas
+masked this because they always pair a `Url` body with a `Url` query param;
+regression unit tests now cover a `Url`-only and a `Money`-only body.) The
+behavioral drivers also pin the `Url` reject paths to the exact status (Go/TS raw
+requests → **400**, Python → **422**, instead of "client errored" / "≥ 400", which a
+500 regression would have passed) and add a malformed `List<Url>` query-element
+reject.
+
+Clippy clean; 513 sema + 250 codegen lib + 85 integration green; 28 round-trips green
+(25 prior + 3 new).
+
+**Deferred (documented).** `Url` is validated for a scheme only (no full RFC 3986
+component validation / percent-encoding normalization — intentional, to round-trip
+exactly). No streaming/large-`Bytes` story (the whole value is in memory and base64'd
+in one pass) — fine for the small payloads the schema language targets; a multipart
+`File` body remains the path for large uploads.

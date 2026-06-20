@@ -51,6 +51,18 @@ struct PyGenerator<'a> {
     emitted_derived_types: BTreeSet<String>,
 }
 
+/// Which model-level type usages drive models.py imports. Bundles the flags
+/// `emit_models_imports` consumes so its signature stays legible. Each field is
+/// "the schema uses this type somewhere a models.py import is required."
+struct ModelsImports {
+    datetime: bool,
+    uuid: bool,
+    decimal: bool,
+    money: bool,
+    url: bool,
+    bytes: bool,
+}
+
 impl<'a> PyGenerator<'a> {
     /// Creates a new Python generator with the given semantic analysis results.
     fn new(check_result: &'a Analysis) -> Self {
@@ -76,13 +88,29 @@ impl<'a> PyGenerator<'a> {
         let models_needs_uuid = self.models_use(type_uses_uuid);
         let models_needs_decimal = self.models_use(type_uses_decimal);
         let needs_money = crate::schema_uses_money(program, self.check_result);
+        let needs_url = self.models_use(type_uses_url);
+        let needs_bytes = self.models_use(type_uses_bytes);
         self.emit_models_imports(
             program,
-            models_needs_datetime,
-            models_needs_uuid,
-            models_needs_decimal,
-            needs_money,
+            ModelsImports {
+                datetime: models_needs_datetime,
+                uuid: models_needs_uuid,
+                decimal: models_needs_decimal,
+                money: needs_money,
+                url: needs_url,
+                bytes: needs_bytes,
+            },
         );
+        // The `Url` validated-string alias (`Annotated[str, BeforeValidator(...)]`),
+        // emitted before the models that reference it.
+        if needs_url {
+            self.emit_url_alias();
+        }
+        // The `Bytes` binary alias (`Annotated[bytes, BeforeValidator, PlainSerializer]`):
+        // raw `bytes` at rest, base64 string on the JSON wire.
+        if needs_bytes {
+            self.emit_bytes_alias();
+        }
         // The composite `Money` model (+ its ISO-4217 currency set/validator),
         // once, before the user models that may embed it.
         if needs_money {
@@ -305,6 +333,57 @@ impl<'a> PyGenerator<'a> {
         struct_field || body_field || envelope_body || page_items || self.response_header_uses(uses)
     }
 
+    /// Emits the `Url` validated-string alias into models.py: a `_validate_url`
+    /// function (rejects a scheme-less string) and `Url = Annotated[str,
+    /// BeforeValidator(_validate_url)]`. The value stays a plain `str` (validated,
+    /// NOT normalized, so it round-trips exactly); pydantic runs the validator on
+    /// model fields and FastAPI runs it on `Url` query/header params.
+    fn emit_url_alias(&mut self) {
+        // Opens with a `def` (not an assignment), so 2 blank lines after imports.
+        ensure_blank_lines(&mut self.models_out, 2);
+        // The `isinstance` guard keeps a non-string JSON value (e.g. a number) on
+        // the 422 path: as a `BeforeValidator` this runs ahead of the `str` schema,
+        // so a bare `urlparse(value)` would raise `TypeError` — which pydantic does
+        // NOT treat as a validation error — and surface as a 500.
+        self.models_out.push_str(
+            "def _validate_url(value: object) -> str:\n    \
+             \"\"\"Validate that `value` is an absolute URL string (has a scheme).\"\"\"\n    \
+             if not isinstance(value, str):\n        \
+             raise ValueError(f\"invalid URL: {value!r}\")\n    \
+             if not urlparse(value).scheme:\n        \
+             raise ValueError(f\"invalid URL: {value}\")\n    \
+             return value\n\n\n\
+             Url = Annotated[str, BeforeValidator(_validate_url)]\n",
+        );
+    }
+
+    /// Emits the `Bytes` binary alias into models.py: `_bytes_from_b64` (decodes a
+    /// base64 wire string to raw `bytes`, passing raw `bytes` through unchanged so
+    /// a caller works with binary directly) + `_bytes_to_b64` (encodes raw `bytes`
+    /// to base64), wired as `Bytes = Annotated[bytes, BeforeValidator(...),
+    /// PlainSerializer(...)]`. The runtime value is real `bytes` (a first-class
+    /// binary value, NOT a base64 string); the JSON wire carries base64. pydantic
+    /// runs the validator on parse and the serializer on `model_dump`/dump-json.
+    fn emit_bytes_alias(&mut self) {
+        // Opens with a `def` (not an assignment), so 2 blank lines after imports.
+        ensure_blank_lines(&mut self.models_out, 2);
+        self.models_out.push_str(
+            "def _bytes_from_b64(value: bytes | str) -> bytes:\n    \
+             \"\"\"Decode a base64 wire string to raw bytes; pass raw bytes through.\"\"\"\n    \
+             if isinstance(value, str):\n        \
+             return base64.b64decode(value)\n    \
+             return value\n\n\n\
+             def _bytes_to_b64(value: bytes) -> str:\n    \
+             \"\"\"Encode raw bytes to a base64 wire string.\"\"\"\n    \
+             return base64.b64encode(value).decode()\n\n\n\
+             Bytes = Annotated[\n    \
+             bytes,\n    \
+             BeforeValidator(_bytes_from_b64),\n    \
+             PlainSerializer(_bytes_to_b64, return_type=str),\n\
+             ]\n",
+        );
+    }
+
     /// Emits the composite `Money` pydantic model into models.py: the ISO-4217
     /// `_CURRENCY_CODES` set, then `class Money(BaseModel)` with a `Decimal`
     /// `amount`, a `str` `currency`, and a `field_validator` rejecting non-ISO-4217
@@ -335,15 +414,18 @@ impl<'a> PyGenerator<'a> {
 
     // ── models.py emission ──────────────────────────────────────────
 
-    /// Emits imports needed by models.py based on what types are used.
-    fn emit_models_imports(
-        &mut self,
-        program: &Program,
-        needs_datetime: bool,
-        needs_uuid: bool,
-        needs_decimal: bool,
-        needs_money: bool,
-    ) {
+    /// Emits imports needed by models.py based on what types are used. Each field
+    /// of [`ModelsImports`] flags "the schema uses this type somewhere a models.py
+    /// import is required."
+    fn emit_models_imports(&mut self, program: &Program, needs: ModelsImports) {
+        let ModelsImports {
+            datetime: needs_datetime,
+            uuid: needs_uuid,
+            decimal: needs_decimal,
+            money: needs_money,
+            url: needs_url,
+            bytes: needs_bytes,
+        } = needs;
         // `Money`'s generated model uses `Decimal` (its `amount`) and subclasses
         // `BaseModel`, so a Money-using schema needs both even if no user field is
         // a bare `Decimal`.
@@ -429,6 +511,11 @@ impl<'a> PyGenerator<'a> {
         // (`from __future__ import annotations` is emitted separately first.)
         // `dataclasses` sorts before `enum` within the stdlib group.
         let mut stdlib: Vec<&str> = Vec::new();
+        // A straight `import` sorts before the `from … import …` block (isort). The
+        // `Bytes` alias base64-(de)codes via `base64.b64encode`/`b64decode`.
+        if needs_bytes {
+            stdlib.push("import base64");
+        }
         if needs_dataclass {
             stdlib.push("from dataclasses import dataclass");
         }
@@ -443,6 +530,14 @@ impl<'a> PyGenerator<'a> {
         if needs_enum {
             stdlib.push("from enum import Enum");
         }
+        // isort: `typing` < `urllib` < `uuid`. Both the `Url` and `Bytes` aliases
+        // use `Annotated` (typing); `Url` also uses `urlparse` (urllib.parse).
+        if needs_url || needs_bytes {
+            stdlib.push("from typing import Annotated");
+        }
+        if needs_url {
+            stdlib.push("from urllib.parse import urlparse");
+        }
         if needs_uuid {
             stdlib.push("from uuid import UUID");
         }
@@ -450,14 +545,22 @@ impl<'a> PyGenerator<'a> {
             self.models_out.push_str(&stdlib.join("\n"));
             self.models_out.push_str("\n\n");
         }
-        // pydantic members, alphabetical (isort): BaseModel, Field, field_validator.
-        // `Money` subclasses `BaseModel` and uses `field_validator` for its currency.
+        // pydantic members, alphabetical (isort): BaseModel, BeforeValidator,
+        // Field, PlainSerializer, field_validator. `Money` subclasses `BaseModel`
+        // and uses `field_validator`; both `Url` and `Bytes` use `BeforeValidator`;
+        // `Bytes` also uses `PlainSerializer` (raw `bytes` → base64 wire).
         let mut pydantic: Vec<&str> = Vec::new();
         if needs_base_model || needs_field || needs_money {
             pydantic.push("BaseModel");
         }
+        if needs_url || needs_bytes {
+            pydantic.push("BeforeValidator");
+        }
         if needs_field {
             pydantic.push("Field");
+        }
+        if needs_bytes {
+            pydantic.push("PlainSerializer");
         }
         if needs_money {
             pydantic.push("field_validator");
@@ -787,9 +890,34 @@ impl<'a> PyGenerator<'a> {
             .endpoints
             .iter()
             .any(|ep| !ep.query_params.is_empty() || ep.body_is_multipart);
-        // stdlib group (isort order: datetime < decimal < typing < uuid), then a
-        // blank line, then the third-party `httpx`.
+        // A bare/collection `Bytes` response leaf (reached without a `Named`
+        // struct, whose model runs the alias on construction) is decoded inline by
+        // `py_decode_expr` via `base64.b64decode`, so the client needs `base64`. A
+        // struct-wrapped `Bytes` needs nothing here — pydantic runs the alias on
+        // `Model(**...)`. Mirrors the `py_decode_expr` `Type::Bytes` arm: same gate
+        // (plain response path — not multi-status/pagination/binary) and the same
+        // `type_uses_bytes` (recurses generics, stops at `Named`).
+        //
+        // Multi-status and pagination are excluded NOT because they can't carry
+        // `Bytes` but because they never reach `py_decode_expr`: both decode their
+        // body through `model_validate` on a generated envelope/page model
+        // (`<Endpoint>Response` / `<Endpoint>Page`), so any `Bytes` inside runs the
+        // pydantic alias — never the inline `base64.b64decode` that needs the
+        // import. (A bare-scalar multi-status body isn't expressible: `model_validate`
+        // requires a model type, the same constraint that applies to `Money`/`Decimal`.)
+        let needs_base64 = self.check_result.endpoints.iter().any(|ep| {
+            ep.response_statuses.is_empty()
+                && ep.pagination.is_none()
+                && !ep.response_is_binary
+                && ep.response.as_ref().is_some_and(type_uses_bytes)
+        });
+        // stdlib group: a straight `import` (isort) sorts before the `from … import`
+        // block, then a blank line, then the third-party `httpx`. (from-imports:
+        // datetime < decimal < typing < uuid.)
         let mut stdlib: Vec<&str> = Vec::new();
+        if needs_base64 {
+            stdlib.push("import base64");
+        }
         if needs_datetime {
             stdlib.push("from datetime import datetime");
         }
@@ -1186,6 +1314,11 @@ impl<'a> PyGenerator<'a> {
             // through a nested struct field still leaves a raw `datetime`/`UUID`
             // object in the default dump, so it must force JSON mode too. `UUID`
             // has the identical problem as `datetime` — `json.dumps` rejects it.
+            // `Bytes` is intentionally NOT in this set: its alias's `PlainSerializer`
+            // runs with the default `when_used="always"`, so a `Bytes` field is
+            // already rendered to a base64 string under the plain `model_dump()` —
+            // unlike `datetime`/`UUID`/`Decimal`, it never leaves a non-JSON-safe
+            // value that would force JSON mode.
             let needs_json_dump = body.fields.iter().any(|f| {
                 type_uses_datetime_deep(&f.ty, self.check_result, &mut BTreeSet::new())
                     || type_uses_uuid_deep(&f.ty, self.check_result, &mut BTreeSet::new())
@@ -2228,6 +2361,12 @@ fn py_decode_expr(ty: &Type, src: &str) -> String {
         // `Money` is a pydantic model: build it from the decoded object (it parses
         // `amount` to `Decimal` and runs the currency validator).
         Type::Money => format!("Money(**{src})"),
+        // A bare/collection `Bytes` response leaf (one reached without a `Named`
+        // struct, whose model runs the `Bytes` alias on construction) is decoded
+        // here: the wire value is a base64 string, so decode it to raw `bytes`
+        // (the `Bytes` alias's own `_bytes_from_b64`). A `Url` needs no arm — its
+        // runtime form is already `str`, so the passthrough below is correct.
+        Type::Bytes => format!("base64.b64decode({src})"),
         Type::Named(name) => format!("{name}(**{src})"),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
             format!("[{} for item in {src}]", py_decode_expr(&args[0], "item"))
@@ -2260,6 +2399,22 @@ fn type_uses_datetime(ty: &Type) -> bool {
     match ty {
         Type::DateTime => true,
         Type::Generic(_, args) => args.iter().any(type_uses_datetime),
+        _ => false,
+    }
+}
+
+fn type_uses_url(ty: &Type) -> bool {
+    match ty {
+        Type::Url => true,
+        Type::Generic(_, args) => args.iter().any(type_uses_url),
+        _ => false,
+    }
+}
+
+fn type_uses_bytes(ty: &Type) -> bool {
+    match ty {
+        Type::Bytes => true,
+        Type::Generic(_, args) => args.iter().any(type_uses_bytes),
         _ => false,
     }
 }
@@ -2438,7 +2593,15 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
             Type::Decimal => format!("Decimal({raw}) if {raw} else None"),
             // An enum is constructed from its wire value (`Color(raw)`).
             Type::Named(n) => format!("{n}({raw}) if {raw} else None"),
-            // `str` (and any unmodeled scalar) passes through untouched.
+            // `String`/`Url` pass through untouched: their runtime representation
+            // IS `str` (a `Url` is `Annotated[str, …]`), so there is nothing to
+            // construct. The validation in the arms above is incidental to building
+            // a non-`str` runtime value (`UUID`/`Decimal`/`datetime`) — it is NOT a
+            // soundness check on the (trusted, generated) server's response, so a
+            // `Url` needs no re-validation here. (TS calls `parseUrl` only because
+            // its branded `Url` type forces a call to assign a raw string.)
+            Type::String | Type::Url => raw.clone(),
+            // Any other unmodeled scalar likewise passes through.
             _ => raw.clone(),
         }
     } else {
@@ -2465,6 +2628,11 @@ fn header_read_coercion(inner_ty: &Type, snake: &str, is_optional: bool) -> Stri
             // An enum is constructed from its wire value; the `or ""` only narrows
             // the `str | None` read (a required header is contractually present).
             Type::Named(n) => format!("{n}({raw} or \"\")"),
+            // `String`/`Url` are already `str` at runtime (a `Url` is
+            // `Annotated[str, …]`), so they pass through with only the `or ""`
+            // narrowing — no construction, and no re-validation of trusted server
+            // output (see the optional arm above for the full rationale).
+            Type::String | Type::Url => format!("{raw} or \"\""),
             _ => format!("{raw} or \"\""),
         }
     };
@@ -2588,6 +2756,16 @@ fn type_to_python(ty: &Type) -> String {
         // A composite built-in: the generated `Money` pydantic model
         // (`{amount: Decimal, currency: str}`) with a currency validator.
         Type::Money => "Money".to_string(),
+        // A `Url` is a validated string: the generated `Url` alias
+        // (`Annotated[str, BeforeValidator(...)]`) validates on parse (in models and
+        // as a FastAPI param) while keeping the value a plain `str` (no
+        // normalization, so it round-trips exactly). A `Bytes` is a first-class
+        // binary value: the generated `Bytes` alias (`Annotated[bytes,
+        // BeforeValidator, PlainSerializer]`) holds raw `bytes` at rest and
+        // (de)codes base64 on the JSON wire. See `docs/design-decisions.md`
+        // (URL & bytes types).
+        Type::Url => "Url".to_string(),
+        Type::Bytes => "Bytes".to_string(),
         Type::Void => "None".to_string(),
         Type::Named(name) => name.clone(),
         Type::Generic(name, args) if name == "List" && args.len() == 1 => {
@@ -2697,7 +2875,8 @@ fn header_ty_is_list(ty: &Type) -> bool {
 /// map each element to its exact wire string.
 fn py_list_query_value(elem: &Type, snake: &str) -> String {
     match elem {
-        Type::String | Type::Int | Type::Float => snake.to_string(),
+        // `Url` is `Annotated[str, …]` — its elements are already strings.
+        Type::String | Type::Int | Type::Float | Type::Url => snake.to_string(),
         Type::Bool => format!("[\"true\" if x else \"false\" for x in {snake}]"),
         Type::DateTime => format!("[x.isoformat() for x in {snake}]"),
         Type::Uuid | Type::Decimal => format!("[str(x) for x in {snake}]"),
@@ -2711,7 +2890,8 @@ fn py_list_query_value(elem: &Type, snake: &str) -> String {
 /// use FastAPI's native `list[T]` parsing and need no manual coercion.)
 fn py_elem_coerce(elem: &Type, expr: &str) -> String {
     match elem {
-        Type::String => expr.to_string(),
+        // `Url` is `Annotated[str, …]` — the element stays a string.
+        Type::String | Type::Url => expr.to_string(),
         Type::Int => format!("int({expr})"),
         Type::Float => format!("float({expr})"),
         Type::Bool => format!("{expr} == \"true\""),
@@ -2727,7 +2907,8 @@ fn py_elem_coerce(elem: &Type, expr: &str) -> String {
 /// the elements encoded to strings and comma-joined into one header value.
 fn py_list_header_value(elem: &Type, snake: &str) -> String {
     let part = match elem {
-        Type::String => "x".to_string(),
+        // `Url` is `Annotated[str, …]` — its elements are already strings.
+        Type::String | Type::Url => "x".to_string(),
         Type::Bool => "(\"true\" if x else \"false\")".to_string(),
         Type::DateTime => "x.isoformat()".to_string(),
         Type::Uuid | Type::Decimal | Type::Int | Type::Float => "str(x)".to_string(),
@@ -2768,6 +2949,18 @@ fn collect_python_imports(ty: &Type, imports: &mut BTreeSet<String>) {
         // imported and references `Money` within models.py.
         Type::Money => {
             imports.insert("Money".to_string());
+        }
+        // The `Url` validated-string alias lives in models.py; a signature naming it
+        // imports it (a struct *field* `Url` needs no import here — the containing
+        // struct, imported, references `Url` within models.py).
+        Type::Url => {
+            imports.insert("Url".to_string());
+        }
+        // The `Bytes` binary alias lives in models.py; a signature naming it
+        // imports it (a struct *field* `Bytes` needs no import here — the containing
+        // struct, imported, references `Bytes` within models.py).
+        Type::Bytes => {
+            imports.insert("Bytes".to_string());
         }
         Type::Generic(name, args) => {
             if !matches!(name.as_str(), "List" | "Option" | "Map" | "Result") {

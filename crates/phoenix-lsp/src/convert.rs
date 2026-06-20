@@ -142,6 +142,8 @@ pub(crate) fn format_type(ty: &Type) -> String {
         Type::Uuid => "Uuid".to_string(),
         Type::Decimal => "Decimal".to_string(),
         Type::Money => "Money".to_string(),
+        Type::Url => "Url".to_string(),
+        Type::Bytes => "Bytes".to_string(),
         Type::JsValue => "JsValue".to_string(),
         Type::Void => "Void".to_string(),
         Type::Named(name) => name.clone(),

@@ -143,6 +143,11 @@ impl<'a> TsGenerator<'a> {
         if uses_money {
             self.emit_money_helper();
         }
+        // The `Bytes` base64 ↔ `Uint8Array` helpers (`bytesFromBase64` decode,
+        // `base64FromBytes` + `encodeBytes` encode), when the schema uses `Bytes`.
+        if self.schema_uses_scalar(program, &Type::Bytes) {
+            self.emit_bytes_helpers();
+        }
 
         for decl in &program.declarations {
             match decl {
@@ -319,6 +324,52 @@ impl<'a> TsGenerator<'a> {
         self.types_out.push_str("}\n\n");
     }
 
+    /// Whether an endpoint's (non-multipart) request body transitively contains a
+    /// `Bytes` — so the client wraps it in `encodeBytes` before `JSON.stringify`.
+    fn body_has_bytes(&self, ep: &EndpointInfo) -> bool {
+        !ep.body_is_multipart
+            && ep.body.as_ref().is_some_and(|b| {
+                b.fields
+                    .iter()
+                    .any(|f| type_reaches_bytes(&f.ty, self.check_result, &mut BTreeSet::new()))
+            })
+    }
+
+    /// Whether an endpoint's response transitively contains a `Bytes` — so the
+    /// server wraps the value in `encodeBytes` before serializing it.
+    fn response_has_bytes(&self, ep: &EndpointInfo) -> bool {
+        ep.response
+            .as_ref()
+            .is_some_and(|t| type_reaches_bytes(t, self.check_result, &mut BTreeSet::new()))
+    }
+
+    /// Whether an endpoint's request body transitively contains a value whose
+    /// `revive<Endpoint>Body` transform can throw `ValidationError` — a branded
+    /// scalar (`parse*`) or `Money` (`reviveMoney`). Drives the body-revival
+    /// `ValidationError` → 400 mapping in [`emit_route_error_catch`]: without it a
+    /// malformed branded-scalar body field (e.g. a bad `Url`/`Uuid`) would fall
+    /// through to the catch-all 500, diverging from Go's body `Validate()` → 400.
+    /// Distinct from a *constrained* body (`f.constraint`): a branded scalar carries
+    /// no `constraint` but still validates on revival.
+    fn body_has_validated(&self, ep: &EndpointInfo) -> bool {
+        !ep.body_is_multipart
+            && ep.body.as_ref().is_some_and(|b| {
+                b.fields
+                    .iter()
+                    .any(|f| type_reaches_validated(&f.ty, self.check_result, &mut BTreeSet::new()))
+            })
+    }
+
+    /// The client's request-body serialize expression: `JSON.stringify(body)`, or
+    /// `JSON.stringify(encodeBytes(body))` when the body carries a `Bytes`.
+    fn body_serialize_expr(&self, ep: &EndpointInfo) -> String {
+        if self.body_has_bytes(ep) {
+            "JSON.stringify(encodeBytes(body))".to_string()
+        } else {
+            "JSON.stringify(body)".to_string()
+        }
+    }
+
     /// Whether the schema references the branded scalar `target` anywhere a
     /// generated TS file would name its alias or call its `parse*`: struct fields,
     /// body fields, query/request-header/response-header params, the response type,
@@ -446,6 +497,18 @@ impl<'a> TsGenerator<'a> {
                 "decimal string (exact, base-10)",
                 "invalid decimal",
             ),
+            // `Url` validates scheme presence only — the SAME regex as Go's `urlRe`
+            // and Python's `urlparse(...).scheme` check, so the three servers agree
+            // on which strings are valid. (A fuller parse like `URL.canParse` would
+            // reject values Go/Python accept, breaking cross-language consistency;
+            // the value is validated but NEVER normalized, so it round-trips exactly.)
+            Type::Url => (
+                "__urlBrand",
+                "URL_RE",
+                r"/^[a-zA-Z][a-zA-Z0-9+.-]*:/",
+                "URL string (with a scheme)",
+                "invalid URL",
+            ),
             other => unreachable!("not a branded scalar: {other}"),
         };
         self.types_out.push_str(&format!(
@@ -499,6 +562,61 @@ impl<'a> TsGenerator<'a> {
              if (!CURRENCY_CODES.has(o.currency)) {\n    \
              throw new Error(`invalid ISO 4217 currency code: ${o.currency}`);\n  }\n  \
              return o;\n}\n\n",
+        );
+    }
+
+    /// Emits the `Bytes` base64 ↔ `Uint8Array` helpers into types.ts:
+    /// `bytesFromBase64` (decode, run by the revival pass on each wire `Bytes`),
+    /// `base64FromBytes` (encode one value), and `encodeBytes` (a deep walk that
+    /// replaces every `Uint8Array` with its base64 string before serialization —
+    /// `JSON.stringify(Uint8Array)` would emit an index object, and `res.json`
+    /// takes no replacer, so the client wraps its body and the server its response).
+    /// `Date` and primitives pass through (so `Date.toJSON` still runs in
+    /// `JSON.stringify`). Uses `btoa`/`atob` (DOM lib, present in the fetch target).
+    /// NOTE: `encodeBytes` allocates a full structural copy of every body/response
+    /// it walks (only when the type reaches a `Bytes`, so it is never on a
+    /// bytes-free path) — fine for the small payloads this targets, but not a hot
+    /// path to reach for elsewhere.
+    fn emit_bytes_helpers(&mut self) {
+        self.types_out.push_str(
+            "/** Decodes a base64 wire string into the `Uint8Array` a `Bytes` field\n \
+             * holds at runtime. Run by the generated decode/revival path. */\n\
+             export function bytesFromBase64(value: string): Uint8Array {\n  \
+             const binary = atob(value);\n  \
+             const bytes = new Uint8Array(binary.length);\n  \
+             for (let i = 0; i < binary.length; i++) {\n    \
+             bytes[i] = binary.charCodeAt(i);\n  \
+             }\n  \
+             return bytes;\n}\n\n",
+        );
+        self.types_out.push_str(
+            "/** Encodes a `Uint8Array` to its base64 wire string. */\n\
+             export function base64FromBytes(bytes: Uint8Array): string {\n  \
+             let binary = \"\";\n  \
+             for (const b of bytes) {\n    \
+             binary += String.fromCharCode(b);\n  \
+             }\n  \
+             return btoa(binary);\n}\n\n",
+        );
+        self.types_out.push_str(
+            "/** Deep-replaces every `Uint8Array` with its base64 string, leaving\n \
+             * `Date`s and primitives intact (so `Date.toJSON` still runs), before a\n \
+             * body/response is serialized to JSON. */\n\
+             export function encodeBytes(value: unknown): unknown {\n  \
+             if (value instanceof Uint8Array) {\n    \
+             return base64FromBytes(value);\n  \
+             }\n  \
+             if (value instanceof Date || value === null || typeof value !== \"object\") {\n    \
+             return value;\n  \
+             }\n  \
+             if (Array.isArray(value)) {\n    \
+             return value.map(encodeBytes);\n  \
+             }\n  \
+             const out: Record<string, unknown> = {};\n  \
+             for (const [k, v] of Object.entries(value)) {\n    \
+             out[k] = encodeBytes(v);\n  \
+             }\n  \
+             return out;\n}\n\n",
         );
     }
 
@@ -945,6 +1063,36 @@ impl<'a> TsGenerator<'a> {
             }
         }
 
+        // `encodeBytes` (a value): the client wraps a `Bytes`-bearing request body
+        // in it before `JSON.stringify` (`Uint8Array` → base64).
+        if self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| self.body_has_bytes(ep))
+        {
+            reviver_imports.insert("encodeBytes".to_string());
+        }
+
+        // `bytesFromBase64` (a value): a bare `Bytes` response leaf (reached
+        // without passing through a `Named` struct, whose reviver would call the
+        // helper inside types.ts) inlines the decode into client.ts via
+        // `ts_revive_expr`/`bind_and_revive`, so the helper must be imported.
+        // `leaf_is` is true exactly when the call is inlined here — a struct
+        // payload (`leaf_is` false) revives through its imported `revive*`.
+        for ep in &self.check_result.endpoints {
+            let payload = if let Some(ref pag) = ep.pagination {
+                Some(&pag.item_type)
+            } else if ep.response_is_binary {
+                None
+            } else {
+                ep.response.as_ref()
+            };
+            if payload.is_some_and(|t| leaf_is(t, &Type::Bytes)) {
+                reviver_imports.insert("bytesFromBase64".to_string());
+            }
+        }
+
         let has_imports = !type_imports.is_empty() || !reviver_imports.is_empty();
         if !type_imports.is_empty() {
             let joined: Vec<_> = type_imports.into_iter().collect();
@@ -1235,7 +1383,7 @@ impl<'a> TsGenerator<'a> {
                 if body_is_multipart {
                     init_lines.push("body: formData".to_string());
                 } else {
-                    init_lines.push("body: JSON.stringify(body)".to_string());
+                    init_lines.push(format!("body: {}", self.body_serialize_expr(ep)));
                 }
             }
         } else if ep.body.is_some() {
@@ -1243,7 +1391,7 @@ impl<'a> TsGenerator<'a> {
                 init_lines.push("body: formData".to_string());
             } else {
                 init_lines.push("headers: { \"Content-Type\": \"application/json\" }".to_string());
-                init_lines.push("body: JSON.stringify(body)".to_string());
+                init_lines.push(format!("body: {}", self.body_serialize_expr(ep)));
             }
         }
         emit_fetch_call(&mut self.client_out, "    ", &url_arg, &init_lines);
@@ -1607,11 +1755,24 @@ impl<'a> TsGenerator<'a> {
                     || ep.headers.iter().any(|h| type_mentions(&h.ty, target))
             })
         });
+        // A body whose `revive<Endpoint>Body` can throw `ValidationError` (a branded
+        // scalar / `Money` field) — even with no `f.constraint` and no validated
+        // param — also drives the 400 guard, so it too requires the import.
+        let has_validated_body = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| self.body_has_validated(ep));
         // `ValidationError` is referenced by the 400 guard whenever the server
-        // validates inbound data: a constrained body, an enum query/header param
-        // whose `parse<Enum>` throws it, or a `Uuid`/`Decimal` query/header param
+        // validates inbound data: a constrained body, a branded-scalar/`Money` body
+        // field whose revival throws it, an enum query/header param whose
+        // `parse<Enum>` throws it, or a `Uuid`/`Decimal`/`Url` query/header param
         // whose `parse*` throws it.
-        if !value_imports.is_empty() || !self.param_enums.is_empty() || has_branded_param {
+        if !value_imports.is_empty()
+            || !self.param_enums.is_empty()
+            || has_branded_param
+            || has_validated_body
+        {
             value_imports.insert(0, "ValidationError".to_string());
         }
         for ep in &self.check_result.endpoints {
@@ -1637,6 +1798,16 @@ impl<'a> TsGenerator<'a> {
         // validator (BTreeSet → sorted, stable output).
         for name in &self.param_enums {
             value_imports.push(format!("parse{name}"));
+        }
+        // `encodeBytes` (a value): the server wraps a `Bytes`-bearing response in it
+        // before `res.json`/`reply.send` (`Uint8Array` → base64).
+        if self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| self.response_has_bytes(ep))
+        {
+            value_imports.push("encodeBytes".to_string());
         }
         if !value_imports.is_empty() {
             emit_import(&mut self.server_out, "import", &value_imports, "./types");
@@ -1834,7 +2005,16 @@ impl<'a> TsGenerator<'a> {
 
         // Response + error mapping are framework-independent (only the response
         // verbs differ) — see [`emit_route_response`] / [`emit_route_error_catch`].
-        emit_route_response(&mut body, ep, &args, FASTIFY_DIALECT, si, ni);
+        let response_has_bytes = self.response_has_bytes(ep);
+        emit_route_response(
+            &mut body,
+            ep,
+            &args,
+            FASTIFY_DIALECT,
+            si,
+            ni,
+            response_has_bytes,
+        );
         emit_route_error_catch(
             &mut body,
             ep,
@@ -1843,6 +2023,7 @@ impl<'a> TsGenerator<'a> {
             si,
             ni,
             &self.param_enums,
+            self.body_has_validated(ep),
         );
 
         // Emit the route. When the inline opener fits, the whole `app.X(...)` call
@@ -1943,7 +2124,16 @@ impl<'a> TsGenerator<'a> {
 
         // Response + error mapping are framework-independent (only the response
         // verbs differ) — see [`emit_route_response`] / [`emit_route_error_catch`].
-        emit_route_response(&mut body, ep, &args, EXPRESS_DIALECT, si, ni);
+        let response_has_bytes = self.response_has_bytes(ep);
+        emit_route_response(
+            &mut body,
+            ep,
+            &args,
+            EXPRESS_DIALECT,
+            si,
+            ni,
+            response_has_bytes,
+        );
         emit_route_error_catch(
             &mut body,
             ep,
@@ -1952,6 +2142,7 @@ impl<'a> TsGenerator<'a> {
             si,
             ni,
             &self.param_enums,
+            self.body_has_validated(ep),
         );
 
         // Emit the route. When the inline opener fits, the whole `router.X(...)`
@@ -2048,7 +2239,7 @@ fn ts_elem_coerce(elem: &Type, var: &str, param_enums: &BTreeSet<String>) -> Str
         Type::Int | Type::Float => format!("Number({var})"),
         Type::Bool => format!("{var} === \"true\""),
         Type::DateTime => format!("new Date({var})"),
-        Type::Uuid | Type::Decimal => {
+        Type::Uuid | Type::Decimal | Type::Url => {
             let parse = branded_scalar(elem).expect("branded scalar").1;
             format!("{parse}({var})")
         }
@@ -2095,7 +2286,7 @@ fn query_param_coercion_with(
         // A branded scalar's `parse*` validates + brands; like `new Date` it needs
         // a `string`, and `raw` here is `string | undefined`, so the `as string`
         // cast is required.
-        Type::Uuid | Type::Decimal => {
+        Type::Uuid | Type::Decimal | Type::Url => {
             let parse = branded_scalar(&qp.ty).expect("branded scalar").1;
             format!("{parse}({raw} as string)")
         }
@@ -2121,7 +2312,7 @@ fn query_param_coercion_with(
                 Type::DateTime => {
                     format!("{raw} !== undefined ? new Date({raw} as string) : undefined")
                 }
-                inner @ (Type::Uuid | Type::Decimal) => {
+                inner @ (Type::Uuid | Type::Decimal | Type::Url) => {
                     let parse = branded_scalar(inner).expect("branded scalar").1;
                     if raw_is_str_opt {
                         format!("{raw} !== undefined ? {parse}({raw}) : undefined")
@@ -2415,10 +2606,11 @@ fn push_reviver_signature(out: &mut String, fn_name: &str, ty: &str) {
 /// a branded alias + `parse*`. The single source of truth for "which scalars get
 /// a `type X = string & {…}` alias + `parseX` validator," iterated by the helper
 /// emission and the per-file import collection.
-fn ts_branded_scalars() -> [(Type, &'static str, &'static str); 2] {
+fn ts_branded_scalars() -> [(Type, &'static str, &'static str); 3] {
     [
         (Type::Uuid, "Uuid", "parseUuid"),
         (Type::Decimal, "Decimal", "parseDecimal"),
+        (Type::Url, "Url", "parseUrl"),
     ]
 }
 
@@ -2527,11 +2719,73 @@ fn body_needs_revival(ep: &EndpointInfo, set: &BTreeSet<String>) -> bool {
 /// `Named` struct already known to be revivable (`set`).
 fn ts_type_needs_revival(ty: &Type, set: &BTreeSet<String>) -> bool {
     match ty {
-        // `DateTime` → `new Date(...)`; `Uuid`/`Decimal` → `parse*(...)`;
-        // `Money` → `reviveMoney(...)`. All are post-decode transforms.
-        Type::DateTime | Type::Uuid | Type::Decimal | Type::Money => true,
+        // `DateTime` → `new Date(...)`; `Uuid`/`Decimal`/`Url` → `parse*(...)`;
+        // `Money` → `reviveMoney(...)`; `Bytes` → `bytesFromBase64(...)`. All are
+        // post-decode transforms.
+        Type::DateTime | Type::Uuid | Type::Decimal | Type::Url | Type::Money | Type::Bytes => true,
         Type::Named(name) => set.contains(name),
         Type::Generic(_, args) => args.iter().any(|a| ts_type_needs_revival(a, set)),
+        _ => false,
+    }
+}
+
+/// Whether a value of type `ty` reaches a `Bytes` (directly, through
+/// `Option`/`List`/`Map`/generic args, or transitively through a `Named` struct's
+/// fields). Gates the `encodeBytes` wrapping on a request body / response and its
+/// import. `visited` guards recursive struct definitions.
+fn type_reaches_bytes(ty: &Type, check_result: &Analysis, visited: &mut BTreeSet<String>) -> bool {
+    match ty {
+        Type::Bytes => true,
+        Type::Generic(_, args) => args
+            .iter()
+            .any(|a| type_reaches_bytes(a, check_result, visited)),
+        Type::Named(name) => {
+            if !visited.insert(name.clone()) {
+                return false;
+            }
+            check_result
+                .module
+                .struct_info_by_name(name)
+                .is_some_and(|info| {
+                    info.fields
+                        .iter()
+                        .any(|f| type_reaches_bytes(&f.ty, check_result, visited))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a value of type `ty` reaches a revival transform that can throw
+/// `ValidationError` — a branded scalar (`Uuid`/`Decimal`/`Url`, via `parse*`) or
+/// `Money` (via `reviveMoney`) — directly, through `Option`/`List`/`Map`/generic
+/// args, or transitively through a `Named` struct's fields. Gates the body-revival
+/// `ValidationError` → 400 mapping (see [`TsGenerator::body_has_validated`]).
+/// `DateTime` is intentionally excluded: its `new Date(...)` revival never throws
+/// a `ValidationError`. `visited` guards recursive struct definitions.
+fn type_reaches_validated(
+    ty: &Type,
+    check_result: &Analysis,
+    visited: &mut BTreeSet<String>,
+) -> bool {
+    match ty {
+        Type::Uuid | Type::Decimal | Type::Url | Type::Money => true,
+        Type::Generic(_, args) => args
+            .iter()
+            .any(|a| type_reaches_validated(a, check_result, visited)),
+        Type::Named(name) => {
+            if !visited.insert(name.clone()) {
+                return false;
+            }
+            check_result
+                .module
+                .struct_info_by_name(name)
+                .is_some_and(|info| {
+                    info.fields
+                        .iter()
+                        .any(|f| type_reaches_validated(&f.ty, check_result, visited))
+                })
+        }
         _ => false,
     }
 }
@@ -2543,11 +2797,15 @@ fn ts_type_needs_revival(ty: &Type, set: &BTreeSet<String>) -> bool {
 fn ts_revive_expr(ty: &Type, expr: &str, set: &BTreeSet<String>) -> Option<String> {
     match ty {
         Type::DateTime => Some(format!("new Date({expr})")),
-        // A branded scalar validates+brands via its `parse*` (e.g. `parseUuid`
-        // checks RFC 4122; `parseDecimal` checks the decimal format).
-        Type::Uuid | Type::Decimal => {
+        // A branded scalar validates+brands via its `parse*` (`parseUuid` checks
+        // RFC 4122; `parseDecimal` the decimal format; `parseUrl` tests the
+        // `URL_RE` scheme regex — the same scheme-presence rule as Go/Python).
+        Type::Uuid | Type::Decimal | Type::Url => {
             branded_scalar(ty).map(|(_, parse)| format!("{parse}({expr})"))
         }
+        // `Bytes` is binary: the decoded JSON holds a base64 STRING where the field
+        // is typed `Uint8Array`, so cast the read before decoding it back.
+        Type::Bytes => Some(format!("bytesFromBase64({expr} as unknown as string)")),
         // `Money` is a composite: `reviveMoney` validates+rebuilds it (amount via
         // `parseDecimal`, currency via the code set).
         Type::Money => Some(format!("reviveMoney({expr})")),
@@ -2698,7 +2956,16 @@ fn type_to_ts(ty: &Type) -> String {
         // distinct from a bare `string` at compile time, but a string at runtime.
         // The decode pass validates+brands via `parse*` (no native JS type to
         // revive into). See `docs/design-decisions.md`.
-        Type::Uuid | Type::Decimal => branded_scalar(ty).expect("branded scalar").0.to_string(),
+        // `Url` joins `Uuid`/`Decimal` as a branded validated string (`parseUrl`
+        // tests the `URL_RE` scheme regex on decode).
+        Type::Uuid | Type::Decimal | Type::Url => {
+            branded_scalar(ty).expect("branded scalar").0.to_string()
+        }
+        // `Bytes` is a first-class binary value: `Uint8Array` at runtime, base64 on
+        // the wire. The decode pass turns the base64 string back into a
+        // `Uint8Array`; the encode pass (a `JSON.stringify` replacer) does the
+        // reverse, since `JSON.stringify(Uint8Array)` would emit an index object.
+        Type::Bytes => "Uint8Array".to_string(),
         // A composite built-in (`{ amount: Decimal; currency: string }`); the
         // generated `Money` interface + `reviveMoney` validate it on decode.
         Type::Money => "Money".to_string(),
@@ -3196,9 +3463,20 @@ fn emit_route_response(
     d: Dialect,
     si: &str,
     ni: &str,
+    response_has_bytes: bool,
 ) {
     let recv = d.receiver;
     let call = format!("const result = await handlers.{}", ep.name);
+    // Wrap a sent JSON value in `encodeBytes(...)` when the response carries a
+    // `Bytes` (`Uint8Array` → base64), since `res.json`/`reply.send` take no
+    // replacer; a bytes-free response is sent verbatim.
+    let enc = |expr: &str| {
+        if response_has_bytes {
+            format!("encodeBytes({expr})")
+        } else {
+            expr.to_string()
+        }
+    };
     if ep.response_is_binary {
         // Binary download: the handler returns a `Buffer`; stream it to the wire
         // with a generic binary content type.
@@ -3284,8 +3562,9 @@ fn emit_route_response(
                 body.push_str(&format!("{si}}}\n"));
                 body.push_str(&format!("{si}if (result.body !== undefined) {{\n"));
                 body.push_str(&format!(
-                    "{ni}{recv}.status(result.status).{}(result.body);\n",
-                    d.json_verb
+                    "{ni}{recv}.status(result.status).{}({});\n",
+                    d.json_verb,
+                    enc("result.body")
                 ));
                 body.push_str(&format!("{si}}} else {{\n"));
                 body.push_str(&format!(
@@ -3297,8 +3576,9 @@ fn emit_route_response(
                 // Every declared status is typed, and the guard above already
                 // rejected an undefined body — so the body is always present here.
                 body.push_str(&format!(
-                    "{si}{recv}.status(result.status).{}(result.body);\n",
-                    d.json_verb
+                    "{si}{recv}.status(result.status).{}({});\n",
+                    d.json_verb,
+                    enc("result.body")
                 ));
             }
         } else {
@@ -3332,10 +3612,14 @@ fn emit_route_response(
                 emit_call_stmt(body, si, &setter, &set_args, ";");
             }
         }
-        body.push_str(&format!("{si}{recv}.{}(result.body);\n", d.json_verb));
+        body.push_str(&format!(
+            "{si}{recv}.{}({});\n",
+            d.json_verb,
+            enc("result.body")
+        ));
     } else if ep.response.is_some() {
         emit_call_stmt(body, si, &call, args, ";");
-        body.push_str(&format!("{si}{recv}.{}(result);\n", d.json_verb));
+        body.push_str(&format!("{si}{recv}.{}({});\n", d.json_verb, enc("result")));
     } else {
         emit_call_stmt(body, si, &format!("await handlers.{}", ep.name), args, ";");
         body.push_str(&format!("{si}{recv}.status(204).{}();\n", d.empty_verb));
@@ -3343,9 +3627,14 @@ fn emit_route_response(
 }
 
 /// Emits the `} catch { … }` section of a route body into `body` — the
-/// `ValidationError` → 400 guard (only when the body carries constraints) and
-/// the declared-error → status map, terminating in a catch-all 500. Shared by
-/// both frameworks via `d`. `ti`/`si`/`ni` are the try/statement/nested indents.
+/// `ValidationError` → 400 guard (when the body carries constraints, a validated
+/// query/header param, or a body field whose revival validates) and the
+/// declared-error → status map, terminating in a catch-all 500. Shared by both
+/// frameworks via `d`. `ti`/`si`/`ni` are the try/statement/nested indents.
+/// `body_has_validated` is the caller's [`TsGenerator::body_has_validated`] —
+/// whether `revive<Endpoint>Body` can throw `ValidationError` (a branded scalar /
+/// `Money`), which must also map to 400.
+#[allow(clippy::too_many_arguments)] // parameters are all distinct inputs; grouping would obscure, not clarify
 fn emit_route_error_catch(
     body: &mut String,
     ep: &EndpointInfo,
@@ -3354,6 +3643,7 @@ fn emit_route_error_catch(
     si: &str,
     ni: &str,
     param_enums: &BTreeSet<String>,
+    body_has_validated: bool,
 ) {
     let recv = d.receiver;
     let verb = d.json_verb;
@@ -3378,10 +3668,14 @@ fn emit_route_error_catch(
                 Type::Generic(n, args) if n == "List" && args.len() == 1 => &args[0],
                 other => other,
             };
-            matches!(elem, Type::Uuid | Type::Decimal)
+            matches!(elem, Type::Uuid | Type::Decimal | Type::Url)
                 || matches!(elem, Type::Named(n) if param_enums.contains(n))
         });
-    let validates = has_body_constraints || has_validated_param;
+    // A branded-scalar / `Money` body field validates on revival (`parse*` /
+    // `reviveMoney` throws), even with no `f.constraint` and no validated param —
+    // without this such a body would 500 instead of 400 (diverging from Go's body
+    // `Validate()`). See [`TsGenerator::body_has_validated`].
+    let validates = has_body_constraints || has_validated_param || body_has_validated;
 
     // The caught binding is only referenced when there is a ValidationError → 400
     // guard or declared errors; otherwise use an optional catch binding
@@ -3456,7 +3750,7 @@ fn request_header_coercion_raw(
         // `raw` across `!==`, so the `as string` cast is required (and not
         // unnecessary — it removes `undefined`).
         Type::DateTime => format!("new Date({raw} as string)"),
-        Type::Uuid | Type::Decimal => {
+        Type::Uuid | Type::Decimal | Type::Url => {
             let parse = branded_scalar(&h.ty).expect("branded scalar").1;
             format!("{parse}({raw} as string)")
         }
@@ -3472,7 +3766,7 @@ fn request_header_coercion_raw(
             Type::DateTime => {
                 format!("{raw} !== undefined ? new Date({raw} as string) : undefined")
             }
-            inner @ (Type::Uuid | Type::Decimal) => {
+            inner @ (Type::Uuid | Type::Decimal | Type::Url) => {
                 let parse = branded_scalar(inner).expect("branded scalar").1;
                 format!("{raw} !== undefined ? {parse}({raw} as string) : undefined")
             }
@@ -3526,7 +3820,7 @@ fn response_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> Strin
             Type::DateTime => {
                 format!("{raw} !== null ? new Date({raw} as string) : undefined")
             }
-            inner @ (Type::Uuid | Type::Decimal) => {
+            inner @ (Type::Uuid | Type::Decimal | Type::Url) => {
                 let parse = branded_scalar(inner).expect("branded scalar").1;
                 format!("{raw} !== null ? {parse}({raw} as string) : undefined")
             }
@@ -3553,7 +3847,7 @@ fn response_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> Strin
             Type::Int | Type::Float => format!("Number({raw})"),
             Type::Bool => format!("{raw} === \"true\""),
             Type::DateTime => format!("new Date({raw} as string)"),
-            inner @ (Type::Uuid | Type::Decimal) => {
+            inner @ (Type::Uuid | Type::Decimal | Type::Url) => {
                 let parse = branded_scalar(inner).expect("branded scalar").1;
                 format!("{parse}({raw} as string)")
             }

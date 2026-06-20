@@ -2140,3 +2140,125 @@ endpoint resetUser: PUT "/api/users/{id}/reset" {
         files.server
     );
 }
+
+#[test]
+fn bare_bytes_response_imports_decoder() {
+    // A bare `Bytes` response leaf revives inline in client.ts (via
+    // `bind_and_revive`/`ts_revive_expr`), not through a struct reviver that lives
+    // in types.ts — so the client must import `bytesFromBase64`. Without the import
+    // the inlined call is an undefined reference (a TS compile error). Regression
+    // test: struct-wrapped `Bytes` (the round-trip fixtures) never exercised this.
+    let files = generate_from_source(
+        r#"
+endpoint download: GET "/blob" {
+    response Bytes
+}
+"#,
+    );
+    assert!(
+        files
+            .client
+            .contains(r#"import { bytesFromBase64 } from "./types";"#),
+        "bare `Bytes` response must import bytesFromBase64:\n{}",
+        files.client
+    );
+    assert!(
+        files
+            .client
+            .contains("bytesFromBase64(__body as unknown as string)"),
+        "bare `Bytes` response must decode inline:\n{}",
+        files.client
+    );
+}
+
+#[test]
+fn list_bytes_response_imports_decoder() {
+    // The leaf is reached through `List`, still revived inline in client.ts, so the
+    // import is likewise required.
+    let files = generate_from_source(
+        r#"
+endpoint chunks: GET "/chunks" {
+    response List<Bytes>
+}
+"#,
+    );
+    assert!(
+        files
+            .client
+            .contains(r#"import { bytesFromBase64 } from "./types";"#),
+        "`List<Bytes>` response must import bytesFromBase64:\n{}",
+        files.client
+    );
+    // ...and actually decode each element inline (the import alone proves nothing
+    // if the per-element revival never lands). The behavioral fixtures only ever
+    // wrap `Bytes` in a struct, so this is the sole coverage of the inlined
+    // `List<Bytes>` element decode.
+    assert!(
+        files
+            .client
+            .contains("bytesFromBase64(x as unknown as string)"),
+        "`List<Bytes>` response must decode each element inline:\n{}",
+        files.client
+    );
+}
+
+#[test]
+fn branded_scalar_only_body_maps_validation_error_to_400() {
+    // A body whose only validation is a branded-scalar field (`Url`) — no
+    // `@`-constraint and no validated query/header param — still validates on
+    // `revive<Endpoint>Body` (`parseUrl` throws `ValidationError`). The server must
+    // map that to 400, not let it fall through to the catch-all 500 (which would
+    // diverge from Go's body `Validate()` → 400). Regression for the
+    // `body_has_validated` gate: before it, `validates` was false here and the
+    // catch had no 400 branch.
+    let files = generate_from_source(
+        r#"
+struct Doc { home: Url }
+endpoint create: POST "/docs" {
+    body Doc
+    response String
+}
+"#,
+    );
+    assert!(
+        files.server.contains("error instanceof ValidationError"),
+        "branded-scalar-only body must map ValidationError to 400:\n{}",
+        files.server
+    );
+    // The catch must bind `error` (referenced by the 400 guard), not `catch {`.
+    assert!(
+        files.server.contains("catch (error: unknown)"),
+        "the 400 guard requires a bound catch parameter:\n{}",
+        files.server
+    );
+    // ...and `ValidationError` must be imported, or the guard is an undefined
+    // reference (a TS compile error). No validated query/header param here, so the
+    // import must be driven by the body alone — two occurrences (the import + the
+    // guard reference), where without the import there would be only one.
+    assert!(
+        files.server.matches("ValidationError").count() >= 2,
+        "the 400 guard requires `ValidationError` to be imported:\n{}",
+        files.server
+    );
+}
+
+#[test]
+fn money_only_body_maps_validation_error_to_400() {
+    // As above, but the throwing transform is `reviveMoney` on a `Money` body field
+    // (also covered by `type_reaches_validated`): no constraint, no validated param,
+    // yet the body revival can throw, so the 400 guard must be present.
+    let files = generate_from_source(
+        r#"
+struct Invoice { total: Money }
+endpoint bill: POST "/invoices" {
+    body Invoice
+    response String
+}
+"#,
+    );
+    assert!(
+        files.server.contains("error instanceof ValidationError"),
+        "Money-only body must map ValidationError to 400:\n{}",
+        files.server
+    );
+}
