@@ -17,6 +17,7 @@ mod dyn_trait;
 mod enum_combinators;
 mod enum_helpers;
 mod enum_type_inference;
+pub(crate) mod extern_call;
 mod gc_roots;
 mod helpers;
 pub(crate) use helpers::call_runtime;
@@ -465,14 +466,13 @@ fn translate_op(
             calls::translate_call(builder, ctx, ir_module, op, result_type, state)
         }
 
-        // `extern js` host call. The native binding — a C-ABI host
-        // shim (`phx_extern_<module>__<name>`) — lands in PR 9; until then the
-        // native backend rejects it cleanly rather than emitting a dangling
-        // call. See `Op::ExternCall`.
-        Op::ExternCall(module, name, _) => Err(CompileError::new(format!(
-            "`extern js` host call `{module}.{name}` is not supported by the native \
-             backend yet — the C-ABI host-shim binding lands in Phase 2.5 PR 9"
-        ))),
+        // `extern js` host call (Phase 2.5 decision A0/E). Lowers to a call of
+        // the weak/overridable C-ABI symbol `phx_extern_<module>__<name>`, whose
+        // `FuncId` was fixed by `extern_call::declare_extern_shims` before
+        // translation.
+        Op::ExternCall(module, name, args) => {
+            extern_call::translate_extern_call(builder, ctx, module, name, args, state)
+        }
 
         Op::DynAlloc(..) | Op::UnresolvedDynAlloc(..) | Op::DynCall(..) => {
             dyn_trait::translate_dyn_op(builder, ctx, ir_module, op, state)

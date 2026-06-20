@@ -82,7 +82,7 @@
 //! into a `Function` at the end. The buffer holds `Instruction<'static>`
 //! — every op landed here owns its data, so there's no borrow churn.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use phoenix_ir::block::{BasicBlock, BlockId};
 use phoenix_ir::instruction::{Op, ValueId};
@@ -226,181 +226,28 @@ pub(super) fn declare_extern_imports(
     Ok(())
 }
 
-/// The IR-level signature of a *called* `extern js` function, derived from its
-/// call site. Shared by [`declare_extern_imports`] (which flattens
-/// it into a WASM import signature) and the JS glue generator (which uses the
-/// per-parameter and return `IrType`s to emit marshalling), so the import and
-/// its glue thunk can never drift.
-pub(super) struct ExternSig {
-    /// The host module (`"js"` today).
-    pub(super) module: String,
-    /// The host function name.
-    pub(super) name: String,
-    /// Parameter IR types, in call order.
-    pub(super) params: Vec<IrType>,
-    /// Return IR type (`Void` for a no-result extern).
-    pub(super) return_type: IrType,
-}
+// The IR-level `extern js` analysis (`ExternSig` / `collect_externs` /
+// `CallbackSig` / `callback_sigs_in_externs` / `collect_callback_signatures` /
+// `callback_sig_is_glue_supported`) is backend-neutral and lives in
+// [`crate::extern_abi`], shared with the native binding. Re-exported here so the
+// WASM call sites (import declaration, glue generator, trampoline emitter)
+// keep referring to `translate::*` unchanged.
+pub(super) use crate::extern_abi::{
+    CallbackSig, ExternSig, callback_sigs_in_externs, collect_callback_signatures, collect_externs,
+};
 
-/// Collect the distinct *called* `extern js` functions from every concrete
-/// function, deriving each one's signature from its first `Op::ExternCall` site.
-///
-/// Only externs actually *called* appear: a declared-but-uncalled extern emits
-/// no `Op::ExternCall`. The signature is taken from the first call site; sema
-/// coerces every argument to the declared parameter type and rejects
-/// non-marshallable types, so every site of a given extern agrees and matches
-/// the declaration. The IR carries no extern declaration table — only
-/// `Op::ExternCall` sites — so call-site derivation is the only signal here.
-pub(super) fn collect_externs(
-    ir_module: &phoenix_ir::module::IrModule,
-) -> Result<Vec<ExternSig>, CompileError> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut out = Vec::new();
-    for func in ir_module.concrete_functions() {
-        for block in &func.blocks {
-            for instr in &block.instructions {
-                let Op::ExternCall(module, name, args) = &instr.op else {
-                    continue;
-                };
-                if !seen.insert((module.clone(), name.clone())) {
-                    continue;
-                }
-                let mut params = Vec::with_capacity(args.len());
-                for arg in args {
-                    let ty = func.instruction_result_type(*arg).ok_or_else(|| {
-                        CompileError::new(format!(
-                            "wasm32-linear: `extern js` call `{module}.{name}` argument \
-                             {arg:?} has no recorded IR type (internal compiler bug)"
-                        ))
-                    })?;
-                    params.push(ty.clone());
-                }
-                out.push(ExternSig {
-                    module: module.clone(),
-                    name: name.clone(),
-                    params,
-                    return_type: instr.result_type.clone(),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// A distinct closure (callback) signature that crosses the `extern js`
-/// boundary as a parameter — i.e. a Phoenix closure handed to a host function.
-/// Collected by [`collect_callback_signatures`] and consumed by both the
-/// trampoline emitter ([`ModuleBuilder::declare_closure_trampolines`]) and the
-/// JS glue (which wraps the crossing closure pointer in a JS callable that
-/// invokes the matching trampoline). The two derive the trampoline's export
-/// name from the *same* [`closure_trampoline_name`], so they cannot drift.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct CallbackSig {
-    /// The closure's own parameter types (the values the host passes when it
-    /// invokes the callback). Marshalled host→wasm by the glue.
-    pub(super) param_types: Vec<IrType>,
-    /// The closure's return type (the value the callback hands back to the
-    /// host). Marshalled wasm→host by the glue. `Void` for a no-result callback.
-    pub(super) return_type: IrType,
-}
-
-/// The single-character marshalling code for a type that can cross the `extern
-/// js` boundary, or `None` for a type the linear callback glue does not marshal
-/// (today: a *nested* closure parameter/return, or any non-marshallable type
-/// sema should already have rejected at the extern signature). The codes are
-/// stable — they appear in generated trampoline export names — so a new
-/// marshallable type must append a fresh code, never reuse one.
-fn marshall_code(ty: &IrType) -> Option<char> {
-    match ty {
-        IrType::I64 => Some('i'),
-        IrType::F64 => Some('f'),
-        IrType::Bool => Some('b'),
-        IrType::StringRef => Some('s'),
-        IrType::JsValue => Some('j'),
-        IrType::Void => Some('v'),
-        _ => None,
-    }
-}
-
-/// `true` iff the linear backend can marshal this callback signature end-to-end
-/// — every parameter and the return type has a [`marshall_code`], and no
-/// parameter is `Void` (a `Void` parameter is meaningless). A *nested* closure
-/// (a callback whose own parameter/return is itself a closure) is **not**
-/// supported in this phase: it has no code, so the predicate rejects it and the
-/// glue emits a throwing thunk for the owning extern (the deferral pattern PR 7
-/// used for string-return). Shared by the trampoline emitter and the glue so
-/// they agree on exactly which callbacks get a real trampoline.
-pub(super) fn callback_sig_is_glue_supported(sig: &CallbackSig) -> bool {
-    let param_ok = sig
-        .param_types
-        .iter()
-        .all(|t| marshall_code(t).is_some_and(|c| c != 'v'));
-    let return_ok = marshall_code(&sig.return_type).is_some();
-    param_ok && return_ok
-}
-
-/// The exported name of the `call_indirect` trampoline for a callback signature.
-/// Encodes the parameter codes followed by the return code so distinct
-/// signatures get distinct names and coincident ones share a trampoline (e.g.
-/// every `(Int) -> Void` callback in the module routes through
-/// `__phoenix_invoke_closure_i_to_v`). Derived identically by the emitter and
-/// the glue. Returns `None` for a signature [`callback_sig_is_glue_supported`]
-/// rejects (a code is missing), so callers never name a trampoline they can't
-/// also marshal.
+/// The exported name of the WASM `call_indirect` trampoline for a callback
+/// signature: `__phoenix_invoke_closure_<param-codes>_to_<ret-code>` (e.g. every
+/// `(Int) -> Void` callback in the module routes through
+/// `__phoenix_invoke_closure_i_to_v`). Built from the shared
+/// [`crate::extern_abi::callback_sig_codes`] so the trampoline emitter and the
+/// glue derive the same name; the native binding formats its own
+/// `phx_invoke_closure_*` name from the same codes. Returns `None` for a
+/// non-marshallable signature, so callers never name a trampoline they can't also
+/// marshal.
 pub(super) fn closure_trampoline_name(sig: &CallbackSig) -> Option<String> {
-    let mut params = String::with_capacity(sig.param_types.len());
-    for ty in &sig.param_types {
-        match marshall_code(ty) {
-            Some('v') | None => return None,
-            Some(c) => params.push(c),
-        }
-    }
-    let ret = marshall_code(&sig.return_type)?;
-    Some(format!("__phoenix_invoke_closure_{params}_to_{ret}"))
-}
-
-/// Collect the distinct, glue-supported closure signatures that cross the
-/// `extern js` boundary as call arguments — every `ClosureRef`-typed parameter
-/// of a *called* extern (derived from [`collect_externs`], which already dedups
-/// by `(module, name)` and reads each parameter's call-site IR type). Dedup is
-/// by structural signature so two externs taking the same callback shape share
-/// one trampoline. A signature the linear glue cannot marshal
-/// ([`callback_sig_is_glue_supported`] is false — e.g. a nested closure) is
-/// dropped here so no trampoline is emitted for a callback the glue will reject
-/// with a throwing thunk anyway.
-pub(super) fn collect_callback_signatures(
-    ir_module: &phoenix_ir::module::IrModule,
-) -> Result<Vec<CallbackSig>, CompileError> {
-    Ok(callback_sigs_in_externs(&collect_externs(ir_module)?))
-}
-
-/// The distinct, glue-supported callback signatures among a set of already-
-/// collected externs — every `ClosureRef`-typed parameter, deduped by structural
-/// signature and filtered to [`callback_sig_is_glue_supported`]. Shared by
-/// [`collect_callback_signatures`] (which feeds the trampoline emitter) and the
-/// JS glue (which builds one factory per signature), so the two derive the same
-/// set in the same order and a factory can never lack its trampoline.
-pub(super) fn callback_sigs_in_externs(externs: &[ExternSig]) -> Vec<CallbackSig> {
-    let mut out: Vec<CallbackSig> = Vec::new();
-    for ext in externs {
-        for param in &ext.params {
-            let IrType::ClosureRef {
-                param_types,
-                return_type,
-            } = param
-            else {
-                continue;
-            };
-            let sig = CallbackSig {
-                param_types: param_types.clone(),
-                return_type: (**return_type).clone(),
-            };
-            if callback_sig_is_glue_supported(&sig) && !out.contains(&sig) {
-                out.push(sig);
-            }
-        }
-    }
-    out
+    crate::extern_abi::callback_sig_codes(sig)
+        .map(|(params, ret)| format!("__phoenix_invoke_closure_{params}_to_{ret}"))
 }
 
 /// Reject a placeholder-typed field at codegen. Used at both the

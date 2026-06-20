@@ -10,14 +10,26 @@
 //!   exists; the CLI just provides nothing). Binary-level host provisioning is
 //!   PR 16. A program that merely *declares* an extern without calling it runs
 //!   normally (no `Op::ExternCall` is lowered).
-//! - `build` (native Cranelift) has no host binding yet — it rejects during
-//!   IR→Cranelift translation, before linking (so no runtime/linker provisioning
-//!   is needed). The C-ABI host shim lands in PR 9.
+//! - `build` (native Cranelift) gained its C-ABI host-shim binding: a
+//!   calling program *links* (the compiler emits weak default `phx_extern_*`
+//!   shims), and the binary aborts at the call with a clear unbound-host message
+//!   when no host shim is linked. Linking needs the runtime static lib, so the
+//!   `build` tier here is gated on it (the lib-level override + round-trip live in
+//!   `phoenix-cranelift/tests/extern_js_native.rs`).
 //!
 //! (`gen`'s separate, schema-specific rejection is covered by `gen_cli.rs`.)
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod common;
+use common::skip_if_no_runtime_lib;
+
+/// Per-process counter so each test's scratch artifacts get a distinct name even
+/// when several `build`-tier tests run in the same process (the pid alone would
+/// collide). Mirrors the uniquing in `phoenix-cranelift/tests/extern_js_native.rs`.
+static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -137,11 +149,51 @@ fn run_ir_reports_unbound_host() {
 }
 
 #[test]
-fn build_rejects_extern_js() {
-    // `build` (native Cranelift) has no host binding yet — it rejects during
-    // IR→Cranelift translation, before linking (so no runtime/linker needed).
-    // The native C-ABI host shim lands in PR 9.
-    assert_execution_fails_with("build", "build", "Phase 2.5 PR 9");
+fn build_links_extern_js_and_unbound_aborts_at_runtime() {
+    // `build` (native Cranelift) now supports `extern js: a calling
+    // program links — the compiler emits a weak default `phx_extern_*` shim — and
+    // running it with no host shim linked aborts at the call with the clear
+    // unbound-host message (decision A0). Exercises the driver's own build+link
+    // path; the lib-level host-shim override + round-trip live in
+    // `phoenix-cranelift/tests/extern_js_native.rs`. Gated on the runtime static
+    // lib, which linking needs.
+    if skip_if_no_runtime_lib("build_links_extern_js_and_unbound_aborts_at_runtime") {
+        return;
+    }
+    let src = extern_js_source("build");
+    let exe = std::env::temp_dir().join(format!(
+        "phoenix_extern_js_build_{}_{}_exe",
+        std::process::id(),
+        SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let build = phoenix_bin()
+        .arg("build")
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("failed to run phoenix build");
+    let _ = std::fs::remove_file(&src);
+    assert!(
+        build.status.success(),
+        "native build of an `extern js` program should link with weak defaults; \
+         stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(&exe)
+        .output()
+        .expect("failed to run the built interop binary");
+    let _ = std::fs::remove_file(&exe);
+    assert!(
+        !run.status.success(),
+        "running a binary whose extern has no linked host shim should abort"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("no host binding for `extern js` function `alert`"),
+        "expected the clean unbound-host abort message, got: {stderr}"
+    );
 }
 
 #[test]

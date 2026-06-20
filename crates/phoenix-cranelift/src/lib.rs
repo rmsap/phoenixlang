@@ -31,6 +31,7 @@ mod abi;
 mod builtins;
 mod context;
 mod error;
+mod extern_abi;
 
 /// Crate-internal macro: panic with a recognisable "internal compiler
 /// error" prefix so the failure is grep-able and clearly distinct from
@@ -63,6 +64,7 @@ mod wasm;
 pub use error::{CompileError, CompileErrorKind};
 pub use link::{
     LinkError, RUNTIME_LIB_NAME, find_runtime_lib, find_runtime_lib_near, link_executable,
+    link_executable_with_objects,
 };
 pub use target::Target;
 
@@ -126,6 +128,41 @@ pub const GENERATED_GLUE_MARKER: &str = wasm::GENERATED_GLUE_MARKER;
 
 fn compile_native(ir_module: &IrModule) -> Result<Vec<u8>, CompileError> {
     let mut ctx = CompileContext::new(ir_module)?;
+
+    // The distinct called `extern js` functions, collected once and shared by
+    // both declaration passes below (each would otherwise rescan every
+    // instruction in the module). Empty for a non-interop program.
+    let externs = extern_abi::collect_externs(ir_module)?;
+
+    // Windows/COFF is out of scope for native `extern js`: the weak-default →
+    // strong-shim override this binding relies on is the ELF/Mach-O model and is
+    // not guaranteed under COFF (see
+    // `docs/known-issues.md#native-extern-js-interop-is-elfmach-o-only-no-windowscoff-weak-override`).
+    // Reject cleanly — pointing at the platform-neutral bindings — rather than
+    // emitting `Preemptible` COFF symbols whose link behavior is unverified (which
+    // would otherwise surface later as an opaque duplicate-symbol link error). A
+    // non-interop Windows build has no externs and is unaffected. The conditional
+    // (non-empty) return keeps non-Windows builds free of an `unreachable_code`
+    // lint.
+    #[cfg(target_os = "windows")]
+    if !externs.is_empty() {
+        return Err(CompileError::new(
+            "native `extern js` interop is not supported on Windows (the weak-symbol \
+             host-shim override is ELF/Mach-O only) — build for `wasm32` (run the \
+             paired `.wasm` + `.js` under Node) or use the interpreter binding \
+             (`phoenix run`), both of which are platform-neutral",
+        ));
+    }
+
+    // Declare every `extern js` host function as a weak/overridable C-ABI symbol
+    // with a default abort body (Phase 2.5 decision A0/E). Must run before
+    // translation so an `Op::ExternCall` can resolve its target. No-op for a
+    // program with no externs.
+    translate::extern_call::declare_extern_shims(&mut ctx, &externs)?;
+    // Export one `phx_invoke_closure_<sig>` trampoline per distinct callback
+    // signature handed to a host, so a host shim can invoke a Phoenix closure
+    // (Phase 2.5 decision G — native binding). No-op without callbacks.
+    translate::extern_call::declare_closure_trampolines(&mut ctx, &externs)?;
 
     // Translate all Phoenix IR functions to Cranelift IR.
     translate::translate_module(&mut ctx, ir_module)?;

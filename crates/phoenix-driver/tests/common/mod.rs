@@ -107,3 +107,86 @@ pub fn expect_runtime_error(source: &str, expected: &str) {
         expected,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Runtime-artifact skip gates.
+//
+// Shared by every CLI test whose `build` tier links a native binary or emits a
+// wasm module — both need a prebuilt runtime artifact the bare `cargo test`
+// invocation doesn't produce. Soft-skip when it's missing (with a one-line
+// warning) so `cargo test` is green out of the box, and turn the skip into a
+// hard failure under `PHOENIX_REQUIRE_RUNTIME_*=1` so provisioned CI can't
+// silently stop exercising the path. Kept here so `build_cli.rs`,
+// `extern_js_cli.rs`, and any future native/wasm CLI test share one copy.
+// ---------------------------------------------------------------------------
+
+/// `$VAR` is set to exactly `1`. The opt-in shape shared by every
+/// `PHOENIX_REQUIRE_*` gate in the repo.
+pub fn require(var: &str) -> bool {
+    std::env::var(var).as_deref() == Ok("1")
+}
+
+/// Whether the `phoenix` binary under test will find the runtime static
+/// library. Probes `$PHOENIX_RUNTIME_LIB` (which the binary honors) and
+/// otherwise the binary's *own* exe-relative search — NOT this test
+/// binary's. The test binary lives in `target/<profile>/deps/`, so a
+/// `find_runtime_lib()` here would see a `deps/libphoenix_runtime.a` that
+/// the spawned binary (in `target/<profile>/`) never searches — making the
+/// skip decision disagree with the build the test then runs.
+pub fn runtime_lib_visible_to_phoenix() -> bool {
+    if std::env::var_os("PHOENIX_RUNTIME_LIB").is_some() {
+        return true;
+    }
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_phoenix"));
+    phoenix_cranelift::find_runtime_lib_near(&bin).is_some()
+}
+
+/// Soft-skip the native build tier when `libphoenix_runtime.a` isn't
+/// on any search path: the CLI link step would hard-error, but linking
+/// is profile-independent and is already gated in the debug `check` job
+/// (which builds the lib and sets `PHOENIX_REQUIRE_RUNTIME_LIB=1`) and
+/// proven end-to-end by release.yml's install smoke test. Here the
+/// `release-test` / release `test` jobs run `cargo test --release`
+/// without building the lib, so without this gate they fail spuriously.
+/// `PHOENIX_REQUIRE_RUNTIME_LIB=1` turns the skip into a hard failure —
+/// same shape as `link.rs`'s in-crate `precheck` gate. Returns `true`
+/// when the caller should early-return (skip).
+#[must_use]
+pub fn skip_if_no_runtime_lib(label: &str) -> bool {
+    if runtime_lib_visible_to_phoenix() {
+        return false;
+    }
+    assert!(
+        !require("PHOENIX_REQUIRE_RUNTIME_LIB"),
+        "PHOENIX_REQUIRE_RUNTIME_LIB=1 set but libphoenix_runtime.a is not on any \
+         search path — run `cargo build -p phoenix-runtime` or set $PHOENIX_RUNTIME_LIB"
+    );
+    eprintln!(
+        "warning: skipping {label} — libphoenix_runtime.a not built \
+         (set PHOENIX_REQUIRE_RUNTIME_LIB=1 to fail instead; \
+         `cargo build -p phoenix-runtime` to fix)"
+    );
+    true
+}
+
+/// Wasm-tier counterpart of [`skip_if_no_runtime_lib`], gated by
+/// `PHOENIX_REQUIRE_RUNTIME_WASM=1`. Mirrors the skip plumbing in
+/// `phoenix-cranelift/tests/compile_wasm_linear.rs`. Returns `true`
+/// when the caller should early-return (skip).
+#[must_use]
+pub fn skip_if_no_runtime_wasm(label: &str) -> bool {
+    if phoenix_cranelift::runtime_wasm_available() {
+        return false;
+    }
+    assert!(
+        !require("PHOENIX_REQUIRE_RUNTIME_WASM"),
+        "PHOENIX_REQUIRE_RUNTIME_WASM=1 set but phoenix_runtime.wasm is not on any \
+         search path — run `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` first"
+    );
+    eprintln!(
+        "warning: skipping {label} — phoenix_runtime.wasm not built \
+         (set PHOENIX_REQUIRE_RUNTIME_WASM=1 to fail instead; \
+         `cargo build -p phoenix-runtime --target wasm32-wasip1 --release` to fix)"
+    );
+    true
+}

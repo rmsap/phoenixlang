@@ -39,6 +39,17 @@ pub struct CompileContext {
     /// function (`SigRef` is per-function, so only the `Signature` is
     /// module-level cacheable).
     pub dyn_call_sig_cache: HashMap<(String, usize), cranelift_codegen::ir::Signature>,
+    /// Cranelift `FuncId` of each `extern js` host function the program calls
+    /// (the native C-ABI host-shim binding), keyed by module then
+    /// name. Each maps to the symbol `phx_extern_<module>__<name>`, declared
+    /// **weak** (overridable by a linked host) with a default body that aborts via
+    /// `phx_extern_unbound`. Populated by
+    /// `translate::extern_call::declare_extern_shims` before function translation
+    /// so an `Op::ExternCall` site can resolve its target. Empty for a program
+    /// with no externs. Nested (rather than a `(String, String)` tuple key) so a
+    /// call site can resolve its `FuncId` from the `&str` module/name without
+    /// allocating an owned key per lookup.
+    pub extern_funcs: HashMap<String, HashMap<String, cranelift_module::FuncId>>,
 }
 
 impl CompileContext {
@@ -103,6 +114,7 @@ impl CompileContext {
             runtime,
             dyn_vtable_cache: HashMap::new(),
             dyn_call_sig_cache: HashMap::new(),
+            extern_funcs: HashMap::new(),
         })
     }
 }

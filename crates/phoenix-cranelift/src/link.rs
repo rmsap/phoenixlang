@@ -230,9 +230,26 @@ impl std::error::Error for LinkError {
 /// this returns [`LinkError::UnsupportedPlatform`] up front rather than
 /// producing an opaque linker error.
 pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), LinkError> {
+    link_executable_with_objects(obj_path, exe_path, &[])
+}
+
+/// Like [`link_executable`], but also links additional object files alongside the
+/// Cranelift object and the runtime archive.
+///
+/// The motivating use is the native `extern js` binding: the compiler
+/// emits a **weak** default definition of each `phx_extern_<module>__<name>`
+/// symbol (it aborts), and a host shim object linked here provides **strong**
+/// definitions that override them (the strong-beats-weak rule, independent of
+/// link order). With no extra objects this is exactly [`link_executable`], so a
+/// non-interop build is unaffected.
+pub fn link_executable_with_objects(
+    obj_path: &Path,
+    exe_path: &Path,
+    extra_objs: &[std::path::PathBuf],
+) -> Result<(), LinkError> {
     let runtime_dir = find_runtime_lib().ok_or(LinkError::RuntimeLibNotFound)?;
     let runtime_archive = std::path::PathBuf::from(&runtime_dir).join(RUNTIME_LIB_NAME);
-    run_linker(obj_path, exe_path, &runtime_archive)
+    run_linker(obj_path, exe_path, &runtime_archive, extra_objs)
 }
 
 /// Drive the system `cc` to combine the Cranelift object with the runtime
@@ -245,16 +262,20 @@ pub fn link_executable(obj_path: &Path, exe_path: &Path) -> Result<(), LinkError
 /// path works on Linux and macOS; `-l:libphoenix_runtime.a` would also work
 /// but is GNU-ld-only.
 #[cfg(not(target_os = "windows"))]
-fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Result<(), LinkError> {
+fn run_linker(
+    obj_path: &Path,
+    exe_path: &Path,
+    runtime_archive: &Path,
+    extra_objs: &[std::path::PathBuf],
+) -> Result<(), LinkError> {
     let platform_args = platform_link_args()?;
-    let output = std::process::Command::new("cc")
-        .arg("-o")
-        .arg(exe_path)
-        .arg(obj_path)
-        .arg(runtime_archive)
-        .args(platform_args)
-        .output()
-        .map_err(LinkError::SpawnLinker)?;
+    let mut cmd = std::process::Command::new("cc");
+    cmd.arg("-o").arg(exe_path).arg(obj_path);
+    // Host-shim objects before the runtime archive: their strong symbols
+    // override the Cranelift object's weak `phx_extern_*` defaults.
+    cmd.args(extra_objs);
+    cmd.arg(runtime_archive).args(platform_args);
+    let output = cmd.output().map_err(LinkError::SpawnLinker)?;
     report_linker_result(output)
 }
 
@@ -320,7 +341,12 @@ fn linker_diagnostics(output: &std::process::Output) -> Vec<String> {
 /// that calls the emitted `main`). VS Build Tools is a prerequisite
 /// (`docs/windows-native-link.md`).
 #[cfg(target_os = "windows")]
-fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Result<(), LinkError> {
+fn run_linker(
+    obj_path: &Path,
+    exe_path: &Path,
+    runtime_archive: &Path,
+    extra_objs: &[std::path::PathBuf],
+) -> Result<(), LinkError> {
     let target = host_msvc_target();
     let tool = cc::windows_registry::find_tool(&target, "link.exe")
         .ok_or(LinkError::MsvcToolchainNotFound)?;
@@ -336,6 +362,7 @@ fn run_linker(obj_path: &Path, exe_path: &Path, runtime_archive: &Path) -> Resul
         .arg("/SUBSYSTEM:CONSOLE")
         .arg(format!("/OUT:{}", exe_path.display()))
         .arg(obj_path)
+        .args(extra_objs)
         .arg(runtime_archive)
         .args(WINDOWS_SYSTEM_LIBS)
         .output()

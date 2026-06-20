@@ -6,6 +6,14 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
+### Native `extern js` interop is ELF/Mach-O only (no Windows/COFF weak override)
+
+The native (Cranelift) host-FFI binding (Phase 2.5 [decision E](design-decisions.md#e-extern-call-abi-per-backend-marshalled-signatures)) emits a **weak** default definition of each `phx_extern_<module>__<name>` symbol that a linked host shim's **strong** definition overrides. This relies on weak-symbol semantics and PLT interposition under position-independent code — the ELF (Linux/BSD) and Mach-O (macOS) model. On Windows/COFF, weak symbols and symbol interposition work differently (COFF "weak externals" resolve at static-link time with different override rules, and there is no PLT), so a host shim is **not** guaranteed to override the compiler's default `phx_extern_*` symbols the same way.
+
+**Impact:** native `phoenix build` + a linked host shim is supported on Linux and macOS. On Windows, native interop is out of scope for Phase 2.5: rather than emit `Preemptible` COFF symbols whose override is unverified, the native backend **rejects a Windows build that actually calls an extern** at compile time with a clear message pointing at the platform-neutral bindings (a program that merely *declares* an extern without calling it still builds, since it lowers no call). Windows hosts that need interop should use the **wasm32** bindings (run the paired `.wasm` + `.js` under Node, which is cross-platform) or the **interpreter** binding (`phoenix run` with a registered Rust host table) — both of which are platform-neutral.
+
+**Target phase:** forward deferral — revisit if native Windows interop becomes a real requirement. A fix would replace the weak-default scheme with an explicit indirection table the host populates at startup (a registration array the program consults), which is portable across object formats but adds an init step. Surfaced 2026-06-19.
+
 ### A retained `extern js` callback is pinned for the program's life on wasm32-linear
 
 When a Phoenix closure is handed to a JS host as an `extern js` callback (Phase 2.5 [decision G](design-decisions.md#g-closures-as-callbacks-lifetime-per-backend)), the wasm32-linear glue pins the closure (`phx_gc_pin`) so a host that retains the callback past the extern call can still invoke it after the GC would otherwise reclaim it. The pin is released when the host releases the callback — explicitly via the wrapper's `release()`, or via a `FinalizationRegistry` when the wrapper itself is collected. A host that **never** releases the callback (drops the wrapper without `release()` in an engine whose `FinalizationRegistry` never fires, or deliberately holds it forever) leaves the closure pinned for the rest of the program's run: a slow leak of that one closure object and its captures.
