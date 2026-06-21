@@ -1863,6 +1863,26 @@ The browser tier verifies DOM interop against a **curated, hand-declared** `exte
 - *A minimal bundler shim in 2.5* (lean on an existing esbuild/Vite + the host's `node_modules`, no Phoenix package manager). Rejected: adds bundler-integration scope to a phase that is already large, and pre-commits to a resolution model the real package manager should own.
 - *Pull Phase 3.1 forward into 2.5.* Rejected: largest scope; reorders the roadmap to satisfy a slice that is cleanly separable.
 
+#### K. Extern declarations are signature-only; the host is supplied separately (no inline JS bodies)
+
+**Decided:** 2026-06-20
+
+**Context.** `extern js { function alert(message: String) }` declares a *signature*; the implementation is provided per backend (the JS glue/host object on WASM, a linked C-ABI shim on native, a registered Rust closure in the interpreters). A natural question is why the body can't be written *inline* in the `.phx` source — `extern js { function alert(m: String) { console.log(m) } }` — instead of living in a separate host artifact. It is technically feasible: the generated WASM glue thunk already wraps a host call with marshalling (`alert(p0, p1) { ...; return host.alert(readString(p0, p1)); }`), and an inline body would simply be spliced in place of the `host.alert(...)` call. Emscripten's `EM_JS` does exactly this (inline JS bodies inside C).
+
+**Decision: signature-only.** The body is **not** written in the `.phx` source; the host is supplied by the embedding environment (`instantiate({ host })`) or the linked binding. Inline JS bodies are **rejected** as the default form.
+
+**Rationale.**
+- **`extern js` is a backend-neutral host-call, not "a JS function" ([decision A0](#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary)).** The *same* declaration binds to four backends; an inline **JS** body is meaningful only for the two WASM backends — a native binary and the pure-Rust interpreters have no JS engine. Baking JS into the source would make a `.phx` file non-portable across exactly the five-backend matrix the phase is built around. Emscripten can do `EM_JS` precisely because it only ever targets WASM+JS; Phoenix targets five backends from one source, so host-language source in the `.phx` is meaningless for three of them.
+- **The primary use case has no body to author.** Most `extern js` binds host APIs that *already exist* — `document.getElementById`, `fetch`, `localStorage`, an npm export. You declare the shape and the binding wires the call to the real thing; there is no body to write. Inline bodies would only serve the minority "tiny helper" case.
+- **The host is environment-specific, and that is a feature.** `alert` pops a dialog in a browser, logs under Node, and cannot run server-side. Supplying the host at instantiation lets the *same* `.wasm` run under a browser, Node, Deno, or a worker unchanged; an inline body hard-codes one host environment into the artifact. (The `host.mjs` files under `tests/fixtures/interop/` are *test* hosts — in real use the embedder provides the host.)
+- **Source purity / analysis.** Keeping `.phx` free of embedded host-language source preserves "a `.phx` file is pure Phoenix the toolchain can analyze," rather than carrying opaque JS blobs the compiler emits verbatim.
+
+**Not foreclosed.** If the "quick inline JS helper" ergonomic proves to matter, it can be added later as *explicit, opt-in, WASM-only* sugar — e.g. a distinct `extern js inline { ... }` form the WASM backends splice in and the native/interpreter backends reject (or require a separate binding for). That keeps the portable signature-only default clean while offering an escape hatch; it is a deliberate future language-design decision, not a default. The planned [npm slice (decision J)](#j-npm-package-slice-deferred-to-phase-31) already covers "I want real JS dependencies" the portable way.
+
+**Alternatives considered:**
+- *Inline JS bodies as the default (the `EM_JS` model).* Rejected: couples `extern js` to JS-hosted backends, breaking A0's uniform boundary and the five-backend byte-identical matrix; serves only the minority case (the common case binds existing host APIs); and hard-codes one host environment into the artifact.
+- *Inline bodies as opt-in WASM-only sugar, in 2.5.* Deferred, not rejected — a reasonable future ergonomic, but it adds a second extern form and a per-backend "this form is unsupported here" rule to a phase that is already large; revisit if demand appears.
+
 ---
 
 ## Phoenix Gen v1.0 — resolved open decisions (2026-05-30)

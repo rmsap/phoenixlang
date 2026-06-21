@@ -302,7 +302,7 @@ Full rationale and rejected alternatives in [design-decisions.md §Phase 2.5 Jav
 - **[E. Extern-call ABI](../design-decisions.md#e-extern-call-abi-per-backend-marshalled-signatures)** — per-backend marshalled signatures; one custom import per distinct `(module, name)`.
 - **[F. String ownership across the boundary](../design-decisions.md#f-string-ownership-across-the-boundary-copied-never-shared)** — copied on both backends, never shared/borrowed.
 - **[G. Closures-as-callbacks lifetime](../design-decisions.md#g-closures-as-callbacks-lifetime-per-backend)** — linear: trampoline + retention table + GC root + explicit free; WASM-GC: host-VM-traced, no manual lifetime.
-- **[H. Async = callbacks-only](../design-decisions.md#h-async-model-callbacks-only)** · **[I. DOM coverage = curated hand-declared subset](../design-decisions.md#i-dom-type-coverage-curated-hand-declared-subset)** · **[J. npm slice deferred to Phase 3.1](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)**.
+- **[H. Async = callbacks-only](../design-decisions.md#h-async-model-callbacks-only)** · **[I. DOM coverage = curated hand-declared subset](../design-decisions.md#i-dom-type-coverage-curated-hand-declared-subset)** · **[J. npm slice deferred to Phase 3.1](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)** · **[K. Extern declarations are signature-only — no inline JS bodies](../design-decisions.md#k-extern-declarations-are-signature-only-the-host-is-supplied-separately-no-inline-js-bodies)**.
 
 ### Exit criteria for declaring Phase 2.5 complete
 
