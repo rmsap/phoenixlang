@@ -190,3 +190,34 @@ pub fn skip_if_no_runtime_wasm(label: &str) -> bool {
     );
     true
 }
+
+/// Whether a `node` interpreter is on `PATH` (probed via `node --version`).
+/// The `extern js` glue tiers run the generated `.js` under Node, so they gate
+/// on this.
+pub fn node_available() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Soft-skip a Node-dependent tier when `node` isn't on `PATH`, gated by
+/// `PHOENIX_REQUIRE_NODE=1` (the same `== "1"` opt-in shape as the runtime
+/// gates above — not a bare "is set" check). Returns `true` when the caller
+/// should early-return (skip).
+#[must_use]
+pub fn skip_if_no_node(label: &str) -> bool {
+    if node_available() {
+        return false;
+    }
+    assert!(
+        !require("PHOENIX_REQUIRE_NODE"),
+        "PHOENIX_REQUIRE_NODE=1 set but `node` is not on PATH"
+    );
+    eprintln!(
+        "warning: skipping {label} — `node` not on PATH \
+         (set PHOENIX_REQUIRE_NODE=1 to fail instead)"
+    );
+    true
+}

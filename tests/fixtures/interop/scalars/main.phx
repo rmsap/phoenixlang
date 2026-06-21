@@ -1,0 +1,12 @@
+extern js {
+  function addOne(n: Int) -> Int
+  function negate(b: Bool) -> Bool
+  function halve(x: Float) -> Float
+  function floorToInt(x: Float) -> Int
+}
+
+function main() {
+  print(addOne(41))
+  print(negate(true))
+  print(floorToInt(halve(7.0)))
+}

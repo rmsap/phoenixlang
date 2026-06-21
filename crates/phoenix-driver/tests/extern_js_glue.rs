@@ -8,23 +8,12 @@
 //! of PR 8 they also cover closures-as-callbacks (synchronous + retained-across-
 //! GC); the always-on per-fixture Node harness is PR 10.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::compiled_fixtures::{TempDir, phoenix_bin};
+use common::{skip_if_no_node, skip_if_no_runtime_wasm};
+use std::path::PathBuf;
 use std::process::Command;
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
-}
-
-fn phoenix_bin() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_phoenix"));
-    cmd.current_dir(workspace_root());
-    cmd
-}
 
 /// `true` iff `wasm` has an export-section entry that is a *function* named
 /// `name`. Parses the export section rather than scanning the raw bytes for the
@@ -47,83 +36,12 @@ fn module_exports_func(wasm: &[u8], name: &str) -> bool {
     false
 }
 
-/// The wasm32-linear backend embeds-and-merges this artifact; without it a build
-/// can't produce a `.wasm`, so the glue tests have nothing to exercise.
-fn runtime_wasm_present() -> bool {
-    workspace_root()
-        .join("target/wasm32-wasip1/release/phoenix_runtime.wasm")
-        .exists()
-}
-
-fn require_runtime_wasm_or_skip(test: &str) -> bool {
-    if runtime_wasm_present() {
-        return true;
-    }
-    if std::env::var("PHOENIX_REQUIRE_RUNTIME_WASM").is_ok() {
-        panic!("{test}: PHOENIX_REQUIRE_RUNTIME_WASM=1 but phoenix_runtime.wasm is not built");
-    }
-    eprintln!(
-        "skipping {test}: phoenix_runtime.wasm not built (cargo build -p phoenix-runtime --target wasm32-wasip1 --release)"
-    );
-    false
-}
-
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn require_node_or_skip(test: &str) -> bool {
-    if node_available() {
-        return true;
-    }
-    if std::env::var("PHOENIX_REQUIRE_NODE").is_ok() {
-        panic!("{test}: PHOENIX_REQUIRE_NODE=1 but `node` is not on PATH");
-    }
-    eprintln!("skipping {test}: `node` not on PATH");
-    false
-}
-
-/// A temp directory that removes itself on drop, so a failing assertion unwinds
-/// without leaking it (the manual cleanup each test used to run at its end is
-/// skipped on panic). `Deref<Target = Path>` lets callers keep using
-/// `dir.join(...)` as if it were a `PathBuf`.
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(name: &str) -> TempDir {
-        let path =
-            std::env::temp_dir().join(format!("phoenix_glue_{}_{}", std::process::id(), name));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        TempDir { path }
-    }
-}
-
-impl std::ops::Deref for TempDir {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
 #[test]
 fn extern_js_emits_paired_glue_and_runs_under_node() {
-    if !require_runtime_wasm_or_skip("extern_js_emits_paired_glue_and_runs_under_node") {
+    if skip_if_no_runtime_wasm("extern_js_emits_paired_glue_and_runs_under_node") {
         return;
     }
-    if !require_node_or_skip("extern_js_emits_paired_glue_and_runs_under_node") {
+    if skip_if_no_node("extern_js_emits_paired_glue_and_runs_under_node") {
         return;
     }
 
@@ -201,10 +119,10 @@ process.stdout.write(out);
 
 #[test]
 fn jsvalue_bool_and_float_round_trip_through_the_glue() {
-    if !require_runtime_wasm_or_skip("jsvalue_bool_and_float_round_trip_through_the_glue") {
+    if skip_if_no_runtime_wasm("jsvalue_bool_and_float_round_trip_through_the_glue") {
         return;
     }
-    if !require_node_or_skip("jsvalue_bool_and_float_round_trip_through_the_glue") {
+    if skip_if_no_node("jsvalue_bool_and_float_round_trip_through_the_glue") {
         return;
     }
 
@@ -213,9 +131,11 @@ fn jsvalue_bool_and_float_round_trip_through_the_glue() {
     // Exercise the marshalling paths the Node smoke test above doesn't:
     // `JsValue` (opaque handle table — put on return, get on the next arg),
     // `Bool` (i32 0/1, both directions), and `Float` (f64, both directions).
-    // `print` on wasm32-linear only handles Int/String today, so the Bool and
-    // Float values are funneled back through Int-returning externs before
-    // printing — that still drives a Bool/Float across the boundary each way.
+    // `print` on wasm32-linear handles Int/Bool/String but not Float, so the
+    // Float value is funneled back through an Int-returning extern before
+    // printing; the Bool likewise round-trips through `boolToInt` here to keep
+    // the baseline purely numeric. Each still drives its type across the
+    // boundary both ways.
     std::fs::write(
         &src,
         "extern js {\n  \
@@ -291,10 +211,10 @@ process.stdout.write(out);
 /// deferring to a cryptic `host.<name> is not a function` partway through a run.
 #[test]
 fn instantiate_rejects_a_host_missing_a_required_binding() {
-    if !require_runtime_wasm_or_skip("instantiate_rejects_a_host_missing_a_required_binding") {
+    if skip_if_no_runtime_wasm("instantiate_rejects_a_host_missing_a_required_binding") {
         return;
     }
-    if !require_node_or_skip("instantiate_rejects_a_host_missing_a_required_binding") {
+    if skip_if_no_node("instantiate_rejects_a_host_missing_a_required_binding") {
         return;
     }
 
@@ -364,10 +284,10 @@ try {
 /// an *empty* return exercises `phx_string_alloc(0)`.
 #[test]
 fn string_returning_extern_round_trips_through_the_glue() {
-    if !require_runtime_wasm_or_skip("string_returning_extern_round_trips_through_the_glue") {
+    if skip_if_no_runtime_wasm("string_returning_extern_round_trips_through_the_glue") {
         return;
     }
-    if !require_node_or_skip("string_returning_extern_round_trips_through_the_glue") {
+    if skip_if_no_node("string_returning_extern_round_trips_through_the_glue") {
         return;
     }
 
@@ -457,10 +377,10 @@ process.stdout.write(out);
 /// `(Int) -> Void` callback (the arg marshals host→wasm).
 #[test]
 fn callbacks_round_trip_synchronously_through_the_glue() {
-    if !require_runtime_wasm_or_skip("callbacks_round_trip_synchronously_through_the_glue") {
+    if skip_if_no_runtime_wasm("callbacks_round_trip_synchronously_through_the_glue") {
         return;
     }
-    if !require_node_or_skip("callbacks_round_trip_synchronously_through_the_glue") {
+    if skip_if_no_node("callbacks_round_trip_synchronously_through_the_glue") {
         return;
     }
 
@@ -560,10 +480,10 @@ process.stdout.write(out);
 /// *returned* values, not just that the callback fired.
 #[test]
 fn callbacks_marshal_string_and_bool_results_back_to_the_host() {
-    if !require_runtime_wasm_or_skip("callbacks_marshal_string_and_bool_results_back_to_the_host") {
+    if skip_if_no_runtime_wasm("callbacks_marshal_string_and_bool_results_back_to_the_host") {
         return;
     }
-    if !require_node_or_skip("callbacks_marshal_string_and_bool_results_back_to_the_host") {
+    if skip_if_no_node("callbacks_marshal_string_and_bool_results_back_to_the_host") {
         return;
     }
 
@@ -665,10 +585,10 @@ process.stdout.write(out + strings.join(",") + "|" + bools.join(","));
 /// end-to-end `phx_gc_pin` boundary check layered on top of that proof.
 #[test]
 fn a_retained_callback_survives_gc_and_is_released() {
-    if !require_runtime_wasm_or_skip("a_retained_callback_survives_gc_and_is_released") {
+    if skip_if_no_runtime_wasm("a_retained_callback_survives_gc_and_is_released") {
         return;
     }
-    if !require_node_or_skip("a_retained_callback_survives_gc_and_is_released") {
+    if skip_if_no_node("a_retained_callback_survives_gc_and_is_released") {
         return;
     }
 
@@ -776,14 +696,12 @@ process.stdout.write(out + "released=" + released + " held=" + retainedCallbackC
 /// a clean exit alone could not catch that. Runs Node with `--expose-gc`.
 #[test]
 fn a_dropped_callback_is_reclaimed_through_the_finalizer_without_release() {
-    if !require_runtime_wasm_or_skip(
+    if skip_if_no_runtime_wasm(
         "a_dropped_callback_is_reclaimed_through_the_finalizer_without_release",
     ) {
         return;
     }
-    if !require_node_or_skip(
-        "a_dropped_callback_is_reclaimed_through_the_finalizer_without_release",
-    ) {
+    if skip_if_no_node("a_dropped_callback_is_reclaimed_through_the_finalizer_without_release") {
         return;
     }
 
@@ -869,12 +787,10 @@ process.stdout.write(out + "held=" + heldBefore + "," + heldAfter);
 /// `outbound_return`'s `I64` arm end-to-end.
 #[test]
 fn int_returning_host_returning_non_numeric_throws_a_clear_error() {
-    if !require_runtime_wasm_or_skip(
-        "int_returning_host_returning_non_numeric_throws_a_clear_error",
-    ) {
+    if skip_if_no_runtime_wasm("int_returning_host_returning_non_numeric_throws_a_clear_error") {
         return;
     }
-    if !require_node_or_skip("int_returning_host_returning_non_numeric_throws_a_clear_error") {
+    if skip_if_no_node("int_returning_host_returning_non_numeric_throws_a_clear_error") {
         return;
     }
 
@@ -940,7 +856,7 @@ try {
 
 #[test]
 fn extern_free_program_emits_no_js_sidecar() {
-    if !require_runtime_wasm_or_skip("extern_free_program_emits_no_js_sidecar") {
+    if skip_if_no_runtime_wasm("extern_free_program_emits_no_js_sidecar") {
         return;
     }
     let dir = TempDir::new("nosidecar");
@@ -970,7 +886,7 @@ fn extern_free_program_emits_no_js_sidecar() {
 /// file management, so it only gates on the runtime artifact.
 #[test]
 fn rebuild_without_externs_removes_a_stale_generated_sidecar() {
-    if !require_runtime_wasm_or_skip("rebuild_without_externs_removes_a_stale_generated_sidecar") {
+    if skip_if_no_runtime_wasm("rebuild_without_externs_removes_a_stale_generated_sidecar") {
         return;
     }
     let dir = TempDir::new("stale");
@@ -1016,7 +932,7 @@ fn rebuild_without_externs_removes_a_stale_generated_sidecar() {
 /// whole point, so pin that it survives byte-for-byte.
 #[test]
 fn a_hand_written_js_beside_the_wasm_is_never_clobbered() {
-    if !require_runtime_wasm_or_skip("a_hand_written_js_beside_the_wasm_is_never_clobbered") {
+    if skip_if_no_runtime_wasm("a_hand_written_js_beside_the_wasm_is_never_clobbered") {
         return;
     }
     let dir = TempDir::new("handwritten");
@@ -1052,7 +968,7 @@ fn a_hand_written_js_beside_the_wasm_is_never_clobbered() {
 /// overwrite and the warning.
 #[test]
 fn extern_build_overwrites_an_unmarked_js_with_a_warning() {
-    if !require_runtime_wasm_or_skip("extern_build_overwrites_an_unmarked_js_with_a_warning") {
+    if skip_if_no_runtime_wasm("extern_build_overwrites_an_unmarked_js_with_a_warning") {
         return;
     }
     let dir = TempDir::new("clobberwarn");
@@ -1107,7 +1023,7 @@ fn extern_build_overwrites_an_unmarked_js_with_a_warning() {
 /// the sidecar always sits beside the artifact with its stem intact.
 #[test]
 fn non_wasm_output_extension_appends_js_for_the_sidecar() {
-    if !require_runtime_wasm_or_skip("non_wasm_output_extension_appends_js_for_the_sidecar") {
+    if skip_if_no_runtime_wasm("non_wasm_output_extension_appends_js_for_the_sidecar") {
         return;
     }
     let dir = TempDir::new("ext");

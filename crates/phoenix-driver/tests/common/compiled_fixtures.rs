@@ -34,6 +34,38 @@ impl Drop for TempBin {
     }
 }
 
+/// A temp *directory* that removes itself on drop, so a failing assertion
+/// unwinds without leaking it. `Deref<Target = Path>` lets callers keep using
+/// `dir.join(...)` as if it were a `PathBuf`. The name is disambiguated by the
+/// current PID (across concurrent `cargo test` processes) and the caller's
+/// `name` (within a single run's parallel threads) so neither collides.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub fn new(name: &str) -> TempDir {
+        let path =
+            std::env::temp_dir().join(format!("phoenix_test_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir { path }
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Build `tests/fixtures/{fixture}` into a temp binary whose name is
 /// disambiguated by `bin_prefix` and the current PID so parallel test
 /// runs don't collide. Panics with the build's stderr on failure.

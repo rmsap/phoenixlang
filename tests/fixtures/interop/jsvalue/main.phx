@@ -1,0 +1,13 @@
+extern js {
+  function getEl(id: String) -> JsValue
+  function tagOf(el: JsValue) -> String
+  function sameNode(a: JsValue, b: JsValue) -> Bool
+}
+
+function main() {
+  let a: JsValue = getEl("x")
+  let b: JsValue = getEl("y")
+  print(tagOf(a))
+  print(sameNode(a, a))
+  print(sameNode(a, b))
+}

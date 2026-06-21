@@ -1,0 +1,9 @@
+extern js {
+  function shout(s: String) -> String
+  function lengthOf(s: String) -> Int
+}
+
+function main() {
+  print(shout("hello"))
+  print(lengthOf(shout("hi")))
+}

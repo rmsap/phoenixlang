@@ -1,0 +1,11 @@
+extern js {
+  function setTimeout(cb: () -> Void, ms: Int)
+  function eachUpTo(n: Int, cb: (Int) -> Void)
+  function sumMap(n: Int, cb: (Int) -> Int) -> Int
+}
+
+function main() {
+  setTimeout(function() { print(99) }, 0)
+  eachUpTo(3, function(i: Int) { print(i) })
+  print(sumMap(4, function(i: Int) -> Int { i * i }))
+}
