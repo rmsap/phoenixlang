@@ -484,6 +484,43 @@
     }
   },
   {
+    "name": "uploadAvatar_multipart_constraint_empty_caption",
+    "endpoint": "uploadAvatar",
+    "kind": "constraint",
+    "_note": "Multipart upload with an empty caption, which violates AvatarUpload's `caption: String where self.length > 0`. Proves a multipart scalar-field constraint is enforced server-side on EVERY target — the divergence that used to be Go-only (Python now binds `Form(..., min_length=1)`; TypeScript now runs `validateUploadAvatarBody` over the assembled body, which checks scalar constraints and ignores Blob file fields). The handler must NOT be called; the client sees a 400 (Go/TS) / 422 (Python). rotation/crop are valid so caption is the sole offender.",
+    "call": {
+      "path_params": {
+        "id": "7"
+      },
+      "multipart": {
+        "files": {
+          "avatar": {
+            "filename": "a.png",
+            "content": "PNGDATA-avatar"
+          }
+        },
+        "fields": {
+          "caption": "",
+          "rotation": 90,
+          "crop": true
+        }
+      }
+    },
+    "handler": {
+      "expect_not_called": true
+    },
+    "expect_client": {
+      "error": {
+        "variant": "ValidationError",
+        "status_per_target": {
+          "go": 400,
+          "typescript": 400,
+          "python": 422
+        }
+      }
+    }
+  },
+  {
     "name": "downloadAvatar_binary_response",
     "endpoint": "downloadAvatar",
     "kind": "ok",

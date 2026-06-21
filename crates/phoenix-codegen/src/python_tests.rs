@@ -827,6 +827,106 @@ endpoint upload: POST "/api/upload" { body Upload }
     );
 }
 
+/// A `where` constraint on a multipart scalar field is enforced server-side by
+/// feeding the same `constraint_to_field` extraction into the `Form(...)` call —
+/// FastAPI applies the validation kwarg and returns 422 on violation, matching
+/// the JSON pydantic `Field(...)` path (and Go). A `File` field carries no
+/// constraint, so it gets no kwarg. Regression guard for the multipart
+/// `where`-constraint parity fix (exercised end-to-end by the round-trip suite).
+#[test]
+fn multipart_scalar_where_constraint_binds_form_kwarg() {
+    let files = generate_from_source(
+        r#"
+struct AvatarUpload {
+    avatar: File
+    caption: String where self.length > 0
+    rank: Int where self >= 1
+}
+endpoint uploadAvatar: POST "/api/avatar" { body AvatarUpload }
+"#,
+    );
+    // The length constraint becomes `min_length`, the numeric one `ge` — the same
+    // kwargs the JSON `Field(...)` path extracts.
+    assert!(
+        files
+            .server
+            .contains("caption: str = Form(..., min_length=1)"),
+        "length constraint must bind min_length on the Form param:\n{}",
+        files.server
+    );
+    assert!(
+        files.server.contains("rank: int = Form(..., ge=1)"),
+        "numeric constraint must bind ge on the Form param:\n{}",
+        files.server
+    );
+    // The File field takes no constraint kwarg.
+    assert!(
+        !files.server.contains("avatar: UploadFile = Form"),
+        "the File field must not receive a Form constraint kwarg:\n{}",
+        files.server
+    );
+}
+
+/// An *optional* (`Option<T>`) multipart scalar with a constraint binds the kwarg
+/// onto `Form(None, …)` — the default is `None` rather than `...`, and the kwarg
+/// follows just as on the required path. Mirrors the JSON `Field(None, …)` path;
+/// a violation when the field IS present is a 422, while omission passes (pydantic
+/// skips length/range checks on a `None` value).
+#[test]
+fn optional_multipart_scalar_where_constraint_binds_form_kwarg() {
+    let files = generate_from_source(
+        r#"
+struct AvatarUpload {
+    avatar: File
+    caption: Option<String> where self.length > 0
+}
+endpoint uploadAvatar: POST "/api/avatar" { body AvatarUpload }
+"#,
+    );
+    assert!(
+        files
+            .server
+            .contains("caption: str | None = Form(None, min_length=1)"),
+        "optional scalar constraint must bind min_length on Form(None, …):\n{}",
+        files.server
+    );
+}
+
+/// A *non-extractable* constraint (one `constraint_to_field` can't reduce to a
+/// `min_length`/`ge`/… kwarg — e.g. `self.contains("/")`) binds NO kwarg: the
+/// multipart scalar emits a bare `Form(...)`, identical to the JSON `Field(...)`
+/// path. This is the documented Python extractable-subset limitation (see
+/// known-issues.md, "Python validates only the extractable (numeric/length)
+/// `where` subset"); the test locks the parity — multipart matches Python's own
+/// JSON behavior — so a future regression that silently dropped the bare `Form`
+/// would be caught.
+#[test]
+fn non_extractable_multipart_scalar_where_constraint_binds_no_form_kwarg() {
+    // `slug` is already snake_case, so no `alias=` kwarg is emitted — the bare
+    // `Form(...)` is unambiguous evidence that the constraint bound nothing.
+    let files = generate_from_source(
+        r#"
+struct DocUpload {
+    file: File
+    slug: String where self.contains("/")
+}
+endpoint uploadDoc: POST "/api/doc" { body DocUpload }
+"#,
+    );
+    // The constraint is unenforceable as a Form kwarg, so the field is a bare
+    // `Form(...)` — no `min_length`/`ge`/etc. trailing the default.
+    assert!(
+        files.server.contains("slug: str = Form(...)"),
+        "a non-extractable constraint must bind a bare Form(...), no kwarg:\n{}",
+        files.server
+    );
+    assert!(
+        !files.server.contains("slug: str = Form(..., "),
+        "a non-extractable constraint must NOT bind any Form kwarg:\n{}",
+        files.server
+    );
+}
+
 /// An endpoint that is BOTH a multipart upload AND a binary download
 /// (`body_is_multipart` + `response_is_binary`): the server route explodes
 /// the body into `UploadFile`/`Form(...)` params yet still returns a

@@ -1935,15 +1935,30 @@ impl<'a> PyGenerator<'a> {
                     } else {
                         String::new()
                     };
+                    // `where`-constraint kwargs, extracted exactly like the JSON
+                    // body's pydantic `Field(...)` path. FastAPI's `Form(...)`
+                    // accepts the same validation kwargs (`min_length`/`ge`/…) and
+                    // returns 422 on violation — so a multipart scalar enforces its
+                    // constraint server-side, matching the JSON body (and Go). Only
+                    // the extractable numeric/length subset is covered, identical to
+                    // the JSON path; a non-extractable constraint (e.g. `contains`)
+                    // is unvalidated on BOTH paths in Python.
+                    let constraint_args = constraint_to_field(&f.constraint)
+                        .map(|kw| format!(", {}", kw.join(", ")))
+                        .unwrap_or_default();
                     if f.optional || already_optional {
                         let ty = if f.optional && !already_optional {
                             format!("{py_type} | None")
                         } else {
                             py_type
                         };
-                        defaulted.push(format!("{snake}: {ty} = Form(None{alias_arg})"));
+                        defaulted.push(format!(
+                            "{snake}: {ty} = Form(None{constraint_args}{alias_arg})"
+                        ));
                     } else {
-                        defaulted.push(format!("{snake}: {py_type} = Form(...{alias_arg})"));
+                        defaulted.push(format!(
+                            "{snake}: {py_type} = Form(...{constraint_args}{alias_arg})"
+                        ));
                     }
                 }
             }

@@ -87,37 +87,34 @@ the `MultipartRequest` interface). **Workaround:** pass the filename as a separa
 scalar form field (`filename: String`) alongside the `File`. **Target phase:**
 demand-triggered. Surfaced 2026-06-05 building the multipart round-trip suite.
 
-### Multipart body field constraints are validated only in the Go target
+### Python validates only the extractable (numeric/length) `where` subset
 
-A scalar field of a multipart request body may carry a `where` constraint (e.g.
-`caption: String where self.length > 0`). On a **JSON** body every target enforces
-that constraint server-side; on a **multipart** body only **Go** does (it
-assembles the `<Endpoint>Body` struct from the parsed form, then calls
-`body.Validate()`, exactly like the JSON path). **Python and TypeScript silently
-skip it:**
+The Python target maps a field's `where` constraint to pydantic `Field(...)` /
+FastAPI `Form(...)` validation kwargs via `constraint_to_field`, which extracts
+only the **numeric** (`ge`/`le`/`gt`/`lt`, from `self <op> N`) and **length**
+(`min_length`/`max_length`, from `self.length <op> N`) subset. A constraint that
+is not reducible to a kwarg — e.g. `mimeType: String where self.contains("/")` —
+produces **no** validation kwarg, so Python enforces nothing for it. Go and
+TypeScript, by contrast, translate the **full** constraint expression
+(`!strings.Contains(...)` / `!obj.x.includes(...)`), so they reject what Python
+accepts.
 
-- **Python/FastAPI** explodes the multipart body into per-field `Form(...)`
-  params and emits no pydantic model, so the model-level constraint (a pydantic
-  `Field(...)` on the JSON path) is never materialized.
-- **TypeScript** assembles the body object field-by-field from the multipart
-  request and does not call the `validate<Endpoint>Body` function (whose
-  generated `typeof` checks are not designed for `Blob`-typed `File` fields).
-
-So an out-of-range scalar on a multipart upload is a 400 in Go but is accepted in
-Python/TS. The `uploadAvatar` round-trip fixture carries such a constraint
-(`caption ... where self.length > 0`); the round-trip suite sends only valid
-input, so the divergence is not exercised.
+This is uniform across body kinds: it applies identically to a **JSON** body
+(pydantic `Field`) and a **multipart** body (FastAPI `Form`) — the multipart path
+was brought into line with the JSON path (see design-decisions.md, "multipart
+`where` constraints in Python/TS"), so there is no JSON-vs-multipart divergence
+within Python; the gap is purely Python-vs-Go/TS on non-extractable expressions.
 
 **Why not fixed now:** closing it means translating arbitrary Phoenix constraint
-expressions into FastAPI `Form(...)` validators (Python) and teaching the TS
-validator generator to handle `Blob` fields (TypeScript) — both are real
-features, larger than this slice, and orthogonal to the multipart transport
-itself. Removing Go's validation to force uniformity would instead discard a
-working safety check.
+expressions into Python (a `constraint_expr_to_python`) and wiring a pydantic
+`model_validator` (JSON) plus an inline route-body check (multipart) — a general
+"Python constraint-expression parity" feature, larger than and orthogonal to the
+multipart transport. The numeric/length subset covers the common cases.
 
-**File:** `phoenix-codegen/src/python.rs` and `phoenix-codegen/src/typescript.rs`
-(multipart server routes). **Workaround:** validate the constrained field inside
-the handler. **Target phase:** demand-triggered. Surfaced 2026-06-05.
+**File:** `phoenix-codegen/src/python.rs` (`constraint_to_field`,
+`extract_pydantic_kwargs`). **Workaround:** for a non-extractable constraint that
+must hold on the Python server, validate it inside the handler. **Target phase:**
+demand-triggered. Surfaced 2026-06-20 closing the multipart-constraint gap.
 
 ### Multi-status responses cannot be combined with response headers or pagination (v1)
 

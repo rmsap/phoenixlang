@@ -1597,6 +1597,76 @@ endpoint upload: POST "/api/upload" { body Upload }
     insta::assert_snapshot!("multipart_optional_scalar_server", files.server);
 }
 
+/// A multipart body with a constrained scalar field enforces the constraint
+/// server-side: the route assembles the body inside `validate<Endpoint>Body(...)`
+/// (whose generated guard checks the scalar and ignores the `File` field) rather
+/// than the plain typed-literal assignment, and the imports wire the validator in
+/// while dropping the now-unreferenced bare body type. Without a `where`-clause
+/// this same body would emit `const body: UploadAvatarBody = {…}` and import the
+/// bare type (see `multipart_upload_client_server_handlers`).
+#[test]
+fn multipart_constrained_scalar_validates_server_side() {
+    let files = generate_from_source(
+        r#"
+struct AvatarUpload { avatar: File  caption: String where self.length > 0 }
+endpoint uploadAvatar: POST "/api/avatar" { body AvatarUpload }
+"#,
+    );
+    // The route validates the assembled body instead of casting it.
+    assert!(
+        files
+            .server
+            .contains("const body = validateUploadAvatarBody({"),
+        "constrained multipart body must run through its validator:\n{}",
+        files.server
+    );
+    assert!(
+        !files.server.contains("const body: UploadAvatarBody = {"),
+        "constrained multipart body must NOT use the plain typed literal:\n{}",
+        files.server
+    );
+    // The validator is imported; the bare body type (supplied by the validator's
+    // return) is not — importing the unused name would trip eslint.
+    assert!(
+        files
+            .server
+            .lines()
+            .any(|l| l.starts_with("import") && l.contains("validateUploadAvatarBody")),
+        "server must import the validator:\n{}",
+        files.server
+    );
+    // The bare body type must not be imported or referenced — the validator's
+    // return supplies it. Match on whole identifier tokens (split on any
+    // non-identifier char) rather than a substring so this distinguishes the bare
+    // `UploadAvatarBody` from the legitimate `validateUploadAvatarBody`, and is
+    // robust to whitespace/formatting changes the snapshot would otherwise hide.
+    let mentions_bare_type = files
+        .server
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|tok| tok == "UploadAvatarBody");
+    assert!(
+        !mentions_bare_type,
+        "server must NOT reference the bare body type (the validator's return supplies it):\n{}",
+        files.server
+    );
+    // The emitted validator guards the scalar's `where` constraint but never the
+    // `File` field (`ts_typeof_of(File)` is `None` and it carries no constraint).
+    assert!(
+        files
+            .types
+            .contains("export function validateUploadAvatarBody(")
+            && files.types.contains("caption: constraint violated"),
+        "types must emit the body validator with the scalar constraint guard:\n{}",
+        files.types
+    );
+    assert!(
+        !files.types.contains("obj.avatar"),
+        "the body validator must not reference the File field:\n{}",
+        files.types
+    );
+    insta::assert_snapshot!("multipart_constrained_scalar_server", files.server);
+}
+
 /// Binary download (single-`File` response struct): client reads a Blob;
 /// server sends a Buffer with an octet-stream content type; handler returns
 /// `Buffer`. The response struct is NOT imported anywhere.

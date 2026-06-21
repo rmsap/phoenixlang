@@ -1732,15 +1732,15 @@ impl<'a> TsGenerator<'a> {
     fn emit_server_shared_type_imports(&mut self) {
         // Value imports from `./types`: validation functions for endpoints with
         // constrained bodies, plus body revivers for Date-bearing bodies. A
-        // multipart body skips validate (it is assembled field-by-field from the
-        // request), so it never imports the validate function — only its type; and
-        // it never carries a `DateTime`, so it never imports a reviver. All value
-        // imports go in ONE statement so two `import {…} from "./types"` lines
-        // can't collide.
+        // multipart body is assembled field-by-field, but still calls its
+        // `validate<Endpoint>Body` to enforce scalar-field `where` constraints (the
+        // validator ignores `File`/`Blob` fields — `ts_typeof_of` is `None` for
+        // them and they carry no constraint); it never carries a `DateTime`, so it
+        // never imports a reviver. All value imports go in ONE statement so two
+        // `import {…} from "./types"` lines can't collide.
         let mut value_imports: Vec<String> = Vec::new();
         for ep in &self.check_result.endpoints {
             if let Some(ref body) = ep.body
-                && !ep.body_is_multipart
                 && body.fields.iter().any(|f| f.constraint.is_some())
             {
                 let type_name = format!("{}Body", capitalize(&ep.name));
@@ -1813,13 +1813,16 @@ impl<'a> TsGenerator<'a> {
             emit_import(&mut self.server_out, "import", &value_imports, "./types");
         }
 
-        // Import the body *type* for endpoints whose body is cast/assembled
-        // directly (no validate fn supplies it): JSON bodies without constraints
-        // (`req.body as XBody`) and every multipart body (`const body: XBody`).
+        // Import the body *type* for endpoints whose body is cast/assembled with an
+        // explicit annotation (no validate fn supplies the type): an unconstrained
+        // JSON body (`req.body as XBody`) or an unconstrained multipart body
+        // (`const body: XBody = {…}`). A *constrained* body — JSON or multipart —
+        // gets its type from `validate<Endpoint>Body`'s return, so the bare type
+        // name is not referenced in server.ts and importing it would trip eslint.
         let mut body_type_imports: Vec<String> = Vec::new();
         for ep in &self.check_result.endpoints {
             if let Some(ref body) = ep.body
-                && (ep.body_is_multipart || !body.fields.iter().any(|f| f.constraint.is_some()))
+                && !body.fields.iter().any(|f| f.constraint.is_some())
             {
                 body_type_imports.push(format!("{}Body", capitalize(&ep.name)));
             }
@@ -2390,17 +2393,30 @@ fn validation_field(
     } else {
         ty
     };
+    // A `File` field never carries a runtime guard. The checker rejects any
+    // `where` on a `File` (it type-checks the constraint as `Bool` with `self`
+    // bound to the field type, and a `File` exposes no operation yielding a
+    // non-trivial `Bool`), so a constraint should never reach here — but if one
+    // ever did, `negated_constraint_to_ts` would emit a guard dereferencing
+    // `obj.<file>`, which at runtime is a `Blob`, producing nonsensical code.
+    // Suppress the guard unconditionally so the multipart body validator (which
+    // assembles `File` fields straight through) can never reference one.
+    let is_file = matches!(inner_ty, Type::File);
     ValidationField {
         name: name.to_string(),
         optional: extra_optional || is_option,
         ts_typeof: ts_typeof_of(inner_ty),
-        constraint_guard: constraint.map(|c| {
-            let (code, needs_conjunct_parens) = negated_constraint_to_ts(c, name);
-            ConstraintGuard {
-                code,
-                needs_conjunct_parens,
-            }
-        }),
+        constraint_guard: if is_file {
+            None
+        } else {
+            constraint.map(|c| {
+                let (code, needs_conjunct_parens) = negated_constraint_to_ts(c, name);
+                ConstraintGuard {
+                    code,
+                    needs_conjunct_parens,
+                }
+            })
+        },
     }
 }
 
@@ -3364,7 +3380,18 @@ fn emit_route_prelude(
             body.push_str(&format!(
                 "{si}const multipart = {req} as unknown as MultipartRequest;\n"
             ));
-            body.push_str(&format!("{si}const body: {type_name} = {{\n"));
+            // A constrained multipart body runs its `validate<Endpoint>Body` over
+            // the assembled object so scalar-field `where` constraints are enforced
+            // server-side (throwing `ValidationError` → 400) — matching the JSON
+            // body and Go. The validator emits no guard for a `File` field (see
+            // `validation_field`'s `is_file` suppression for why). An unconstrained
+            // body keeps the plain typed-literal assignment.
+            let constrained = ep_body.fields.iter().any(|f| f.constraint.is_some());
+            if constrained {
+                body.push_str(&format!("{si}const body = validate{type_name}({{\n"));
+            } else {
+                body.push_str(&format!("{si}const body: {type_name} = {{\n"));
+            }
             for f in &ep_body.fields {
                 emit_object_property(
                     body,
@@ -3373,7 +3400,11 @@ fn emit_route_prelude(
                     &multipart_field_extraction(&f.name, &f.ty, f.optional),
                 );
             }
-            body.push_str(&format!("{si}}};\n"));
+            if constrained {
+                body.push_str(&format!("{si}}});\n"));
+            } else {
+                body.push_str(&format!("{si}}};\n"));
+            }
         } else {
             // The decode expression: a constrained body is validated, an
             // unconstrained one cast (`req.body` is untyped `any`/`unknown`, so

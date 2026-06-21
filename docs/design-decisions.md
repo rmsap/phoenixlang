@@ -3546,3 +3546,59 @@ Go (Python/FastAPI explodes the body into `Form(...)` params with no model; TS d
 not call the body validator on `Blob`-bearing multipart bodies) — the inverse
 divergence, a separate `Form`-validator-generation feature. See
 [known-issues.md](known-issues.md).
+
+## Phoenix Gen — multipart `where` constraints in Python/TS (2026-06-20)
+
+Closes the mirror-image of the Go-nested-validation gap: a `where` constraint on a **multipart** body's scalar
+field was enforced server-side only by Go. Go assembles the `<Endpoint>Body` from the
+parsed form and calls `body.Validate()`, but Python exploded the body into per-field
+`Form(...)` params with no validation, and TypeScript assembled the body field-by-field
+without calling `validate<Endpoint>Body`. So an out-of-range multipart scalar (e.g.
+`caption: String where self.length > 0` sent empty) was a 400 on Go but accepted by
+Python/TS. With this change each target validates a multipart scalar constraint to the
+same extent it validates the equivalent JSON body.
+
+**Python.** The multipart route already binds each scalar as `name: T = Form(...)`.
+FastAPI's `Form(...)` accepts the same validation kwargs as pydantic `Field(...)`
+(`min_length`/`max_length`/`ge`/`le`/`gt`/`lt`), so the fix is to feed the existing
+`constraint_to_field` extraction into the `Form(...)` call —
+`caption: str = Form(..., min_length=1)`, `rank: int = Form(..., ge=1)`. A violation is
+a 422 (FastAPI's validation status), identical to the JSON pydantic path. No new
+constraint-translation code; the JSON and multipart paths share `constraint_to_field`,
+so they cover exactly the same subset (see the residual note below).
+
+**TypeScript.** The generated `validate<Endpoint>Body` already (a) is emitted whenever
+the body has a constrained field — including a multipart body — and (b) **safely
+ignores `File` fields**: `ts_typeof_of(File)` is `None` and a `File` field carries no
+constraint, so `emit_validation_body` emits neither a `typeof` check nor a constraint
+guard for it. So the fix is simply to call it: the multipart route now assembles the
+body inside `validate<Endpoint>Body({ … })` (the file fields pass through untouched,
+the scalar fields' coerced values are `typeof`-checked and constraint-checked). The
+validator throws `ValidationError`, which the route's existing catch maps to 400.
+Two import gates were adjusted so the validator is imported (and the bare body *type*
+is not, since the validator's return now supplies it) for constrained multipart bodies.
+
+**Verification.** Compile-lint green on all four targets (the `file_storage` fixture's
+`ObjectUpload` carries constrained multipart scalars). A new contract round-trip case
+`uploadAvatar_multipart_constraint_empty_caption` (empty `caption`, violating
+`self.length > 0`) drives all three servers and asserts the handler is **not** called
+and the client sees the reject — 400 on Go/TS, 422 on Python — proving the gap is
+closed end-to-end. (The drivers needed no changes: each dispatches `kind: constraint`
+generically — invoke-by-endpoint, catch, assert status.) Two focused unit tests lock
+the generated-output shape the round-trip exercises only behaviorally:
+`multipart_constrained_scalar_validates_server_side` (TS — the `validate<Endpoint>Body({…})`
+wrapping, the validator import, and the dropped bare-type import, plus a new server
+snapshot) and `multipart_scalar_where_constraint_binds_form_kwarg` (Python — the
+`Form(..., min_length=…)`/`Form(..., ge=…)` binding, with the `File` field taking no
+kwarg). Pre-existing codegen lib snapshots unchanged; clippy clean; 31 round-trips green
+(the new `uploadAvatar_multipart_constraint_empty_caption` case brings the suite to 31).
+
+**Residual (documented, separate).** Python validates only the **extractable**
+(numeric/length) constraint subset, on **both** JSON and multipart — a constraint like
+`self.contains("/")` is enforced by Go/TS (full-expression translation) but not Python
+(no `Field`/`Form` kwarg). This is a pre-existing Python limitation that this fix neither
+introduced nor worsened (multipart now matches Python's own JSON behavior); it is
+tracked in [known-issues.md](known-issues.md) ("Python validates only the extractable
+(numeric/length) `where` subset") as the general "Python constraint-expression parity"
+follow-up. With this, the two cross-target validation divergences flagged before the
+v1 distribution/docs push are both addressed: Go now recurses into nested collections, and Python/TS now validate multipart scalar constraints.
