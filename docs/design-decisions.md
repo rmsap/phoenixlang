@@ -1759,6 +1759,12 @@ The framing that produced these: Phase 2.4's [decision B (wasmtime exit runtime)
 - Node gate: `PHOENIX_REQUIRE_NODE=1` turns the skip-when-absent into a hard failure, mirroring `PHOENIX_REQUIRE_WASMTIME` (§2.3 valgrind-gate shape).
 - Browser gate: `PHOENIX_REQUIRE_BROWSER=1` likewise; soft-skip with a visible warning where no browser is provisioned.
 
+**As-built — browser tier is two sub-tiers.** The DOM tier ([decision I](#i-dom-type-coverage-curated-hand-declared-subset)) ships as *two* runners over the **same** fixtures, host stubs, and baselines (`tests/fixtures/interop/dom/<name>/`), in `tests/interop-browser/`:
+- a **jsdom smoke** (no real browser; always-on wherever the harness's npm deps are installed — it soft-skips a fresh checkout until `npm ci`, see below) that loads the generated glue against a jsdom `document` under Node — it verifies the DOM-host marshalling and the retained-event-handler path (decision G) at the API level. The `click_handler` fixture genuinely stresses the pin: after registration it churns enough throwaway allocations to trip the GC threshold several times over *before* the click fires, so a regression that failed to pin the host-retained closure would sweep it and diverge from the baseline — rather than passing trivially because no collection ever ran; and
+- the **Playwright tier** (gated by `PHOENIX_REQUIRE_BROWSER=1`) that loads the page in real headless Chromium and dispatches a real click — it catches real-engine behavior jsdom cannot.
+
+The harness's npm deps (`jsdom`, `playwright-core` — the latter brings no bundled browser) are not committed; a fresh checkout runs `npm ci` in `tests/interop-browser/`. Two new gates keep this from breaking a CI that hasn't provisioned them yet: `PHOENIX_REQUIRE_BROWSER_DEPS=1` (hard-fail if the npm deps are missing) and `PHOENIX_REQUIRE_BROWSER=1` (hard-fail if no browser is launchable); both soft-skip otherwise. CI wiring (`npm ci` + `playwright install chromium` + setting the gates) lands in PR 17.
+
 **Alternatives considered:**
 - *Node only.* Rejected: leaves the DOM story — the whole point of browser interop — unverified by any test.
 - *Browser only.* Rejected: makes every interop test depend on a headless-browser rig; too heavy for the always-on gate and overkill for non-DOM marshalling fixtures.

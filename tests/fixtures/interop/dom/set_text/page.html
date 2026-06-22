@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8" /></head>
+  <body>
+    <span id="label">unset</span>
+    <!--
+      The browser tier runs the program in-page from this module script (the page
+      fetches the paired `.wasm` and imports the generated glue + the fixture
+      host). The jsdom tier ignores this script (it loads the page with
+      `runScripts: "outside-only"`) and drives the same glue + host from Node, so
+      one page.html serves both tiers.
+    -->
+    <script type="module">
+      import { instantiate } from "./app.js";
+      import { host } from "./host.mjs";
+      const wasm = await (await fetch("./app.wasm")).arrayBuffer();
+      const { run } = await instantiate({
+        wasm,
+        host: host({ document }),
+        writeStdout: () => {},
+      });
+      run();
+      window.__phoenixDone = true;
+    </script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "name": "phoenix-interop-browser",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Browser/DOM verification tier for Phoenix `extern js` interop. Runners that load the generated glue against a DOM host: `jsdom-runner.mjs` (always-on Node smoke over jsdom) and `playwright-runner.mjs` (gated real-browser tier). Driven by crates/phoenix-driver/tests/interop_browser.rs.",
+  "type": "module",
+  "dependencies": {
+    "jsdom": "^24.0.0",
+    "playwright-core": "^1.44.0"
+  }
+}

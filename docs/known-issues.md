@@ -6,6 +6,14 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
+### `JsValue` cannot be stored as a struct field or closure capture on wasm32-linear
+
+`JsValue` (the opaque host handle from `extern js`) marshals fine as an extern argument/return — it crosses as a single `i32` handle — but the wasm32-linear backend has no field-storage representation for it: `phx_field_size_bytes` / `phx_field_align_bytes` (`crates/phoenix-cranelift/src/wasm/heap_layout.rs`) have no `JsValue` arm, so it falls through to the `unsupported` error. As a result, a `JsValue` cannot be a struct/enum field or a **closure capture** in compiled wasm code — e.g. `onClick(btn, function() { setText(label, ...) })` where `label: JsValue` is captured fails at codegen. The Phase 2.5 PR-11 DOM fixtures work around it by re-fetching the element inside the handler (`getElementById("label")`) rather than capturing the handle.
+
+`JsValue` is a single `i32` (1 slot), same width as a `Bool` field — but it is an *opaque host handle, not a GC pointer*, so the collector must never trace it. That is why the existing `ty if is_gc_pointer_type(ty) => Ok(4)` fall-through in `phx_field_size_bytes`/`phx_field_align_bytes` doesn't already cover it (and must not, or the GC would chase a non-heap value): `JsValue` needs its own non-GC `i32` arms, parallel to `Bool`. The fix is then mechanical — three arms in `heap_layout.rs`, all required so load and store agree on the access width: `JsValue => Ok(4)` in `phx_field_size_bytes`, `JsValue => Ok(4)` in `phx_field_align_bytes`, and a `JsValue` arm in `is_i32_field` (so `emit_field_load`/`emit_field_store` pick the `i32` path) — plus the equivalent on the native and (eventual) wasm32-gc backends. It was left out because nothing in the interop scope so far needed to *store* a handle — only pass it across the boundary.
+
+**Target phase:** demand-triggered — fix when a real interop program needs to hold a `JsValue` in a struct or capture it (e.g. retaining a DOM element handle across calls). Surfaced 2026-06-20 (PR 11).
+
 ### Native `extern js` interop is ELF/Mach-O only (no Windows/COFF weak override)
 
 The native (Cranelift) host-FFI binding (Phase 2.5 [decision E](design-decisions.md#e-extern-call-abi-per-backend-marshalled-signatures)) emits a **weak** default definition of each `phx_extern_<module>__<name>` symbol that a linked host shim's **strong** definition overrides. This relies on weak-symbol semantics and PLT interposition under position-independent code — the ELF (Linux/BSD) and Mach-O (macOS) model. On Windows/COFF, weak symbols and symbol interposition work differently (COFF "weak externals" resolve at static-link time with different override rules, and there is no PLT), so a host shim is **not** guaranteed to override the compiler's default `phx_extern_*` symbols the same way.

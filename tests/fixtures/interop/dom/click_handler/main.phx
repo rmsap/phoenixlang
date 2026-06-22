@@ -1,0 +1,33 @@
+extern js {
+  function getElementById(id: String) -> JsValue
+  function setText(el: JsValue, text: String)
+  function onClick(el: JsValue, handler: () -> Void)
+}
+
+function main() {
+  let label: JsValue = getElementById("label")
+  let button: JsValue = getElementById("btn")
+  setText(label, "before")
+  // The handler is a Phoenix closure registered as a DOM event listener. It
+  // outlives `main` (the host's `addEventListener` retains it), so the glue must
+  // *pin* the Phoenix-side closure object (decision G) — once `onClick` returns,
+  // the closure is unreachable from any Phoenix stack root, so without the pin a
+  // GC cycle would sweep it. It re-fetches the label rather than capturing the
+  // `JsValue` (a `JsValue` capture is a separate codegen gap; see
+  // docs/known-issues.md).
+  onClick(button, function() {
+    setText(getElementById("label"), "after click")
+  })
+  // Stress the pin: churn enough throwaway allocations (~5 MiB) to trip the GC
+  // threshold (DEFAULT_COLLECTION_THRESHOLD, 1 MiB) several times over, forcing
+  // *real* collections while the closure is reachable only via the host's listener — not
+  // from any Phoenix root. If the glue failed to pin it, a collection here would
+  // sweep the closure and the later click would crash or leave the label at
+  // "before", diverging from the baseline. (Mirrors gc_keeps_alive.phx; raise the
+  // bound if the threshold grows.)
+  let mut i: Int = 0
+  while (i < 200000) {
+    let trash: String = "trash " + toString(i)
+    i = i + 1 + (trash.length() - trash.length())
+  }
+}

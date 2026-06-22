@@ -1,0 +1,9 @@
+extern js {
+  function getElementById(id: String) -> JsValue
+  function setText(el: JsValue, text: String)
+}
+
+function main() {
+  let label: JsValue = getElementById("label")
+  setText(label, "hello from phoenix")
+}
