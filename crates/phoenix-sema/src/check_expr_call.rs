@@ -11,42 +11,30 @@ use std::collections::{HashMap, HashSet};
 type CallGenericsInference = (HashMap<String, Type>, Vec<Type>, Vec<(usize, UnifyError)>);
 
 impl Checker {
-    /// Type-checks a method call (`obj.method(args)`), dispatching to built-in
-    /// methods for `List`, `String`, `Map`, `Option`, and `Result`, or looking
-    /// up user-defined methods and trait-bounded methods.
-    pub(crate) fn check_method_call(&mut self, mc: &MethodCallExpr) -> Type {
-        // Recognize `List.builder()` /
-        // `Map.builder()` before evaluating the object expression.
-        // The parser models `Type.method(...)` as a method call with
-        // `object: Ident("Type")`; evaluating the object first would
-        // hit the "undefined variable `Type`" path. The carve-out
-        // itself (in `check_builtin_static_method`) skips when the
-        // receiver name shadows a local binding, so a user
-        // `let List = some_value` then `List.builder()` falls through
-        // to the normal value-receiver path instead of being silently
-        // hijacked into the builtin.
-        if let Some(ty) = self.check_builtin_static_method(mc) {
-            return ty;
-        }
-        let obj_type = self.check_expr(&mc.object);
-        if obj_type.is_error() {
-            return Type::Error;
-        }
-        if obj_type == Type::Void {
-            self.error(format!("cannot call method on {}", obj_type), mc.span);
-            return Type::Error;
-        }
-        let (base_name, bindings) = self.extract_type_name_and_bindings(&obj_type);
+    /// Dispatches method `mc` against a built-in receiver type (`List`, `String`,
+    /// `Map`, `Option`, `Result`, `ListBuilder`, `MapBuilder`), returning the result
+    /// type — or `None` when `obj_type` is not one of those built-ins (a user/`dyn`
+    /// type hits the `_ => None` arm).
+    ///
+    /// For an unrecognized *method* the arms differ: the `Option`/`Result` arms
+    /// return `None` silently (no diagnostic), whereas the `String`/`List`/`Map`
+    /// arms report "no method … on type `String`/`List`/`Map`" and return
+    /// `Some(Type::Error)`. The constraint retry below relies on the `Option` arm's
+    /// silent `None` to gate entry, so it neither double-checks args nor
+    /// double-reports.
+    ///
+    /// Split out of [`Self::check_method_call`] so a `where` constraint can retry the
+    /// dispatch on an `Option`'s inner type (see that call site).
+    fn dispatch_builtin_method(&mut self, mc: &MethodCallExpr, obj_type: &Type) -> Option<Type> {
+        let (base_name, bindings) = self.extract_type_name_and_bindings(obj_type);
         let type_name = base_name.unwrap_or_else(|| obj_type.to_string());
-
-        // Dispatch to built-in type helpers
-        let builtin_result = match type_name.as_str() {
+        match type_name.as_str() {
             "List" => {
                 let elem_type = bindings
                     .get("T")
                     .cloned()
                     .or_else(|| {
-                        if let Type::Generic(_, ref args) = obj_type {
+                        if let Type::Generic(_, args) = obj_type {
                             args.first().cloned()
                         } else {
                             None
@@ -90,7 +78,7 @@ impl Checker {
                     .get("T")
                     .cloned()
                     .or_else(|| {
-                        if let Type::Generic(_, ref args) = obj_type {
+                        if let Type::Generic(_, args) = obj_type {
                             args.first().cloned()
                         } else {
                             None
@@ -111,8 +99,39 @@ impl Checker {
                 self.check_map_builder_method(mc, key_type, val_type)
             }
             _ => None,
-        };
-        if let Some(ty) = builtin_result {
+        }
+    }
+
+    /// Type-checks a method call (`obj.method(args)`), dispatching to built-in
+    /// methods for `List`, `String`, `Map`, `Option`, and `Result`, or looking
+    /// up user-defined methods and trait-bounded methods.
+    pub(crate) fn check_method_call(&mut self, mc: &MethodCallExpr) -> Type {
+        // Recognize `List.builder()` /
+        // `Map.builder()` before evaluating the object expression.
+        // The parser models `Type.method(...)` as a method call with
+        // `object: Ident("Type")`; evaluating the object first would
+        // hit the "undefined variable `Type`" path. The carve-out
+        // itself (in `check_builtin_static_method`) skips when the
+        // receiver name shadows a local binding, so a user
+        // `let List = some_value` then `List.builder()` falls through
+        // to the normal value-receiver path instead of being silently
+        // hijacked into the builtin.
+        if let Some(ty) = self.check_builtin_static_method(mc) {
+            return ty;
+        }
+        let obj_type = self.check_expr(&mc.object);
+        if obj_type.is_error() {
+            return Type::Error;
+        }
+        if obj_type == Type::Void {
+            self.error(format!("cannot call method on {}", obj_type), mc.span);
+            return Type::Error;
+        }
+        let (base_name, bindings) = self.extract_type_name_and_bindings(&obj_type);
+        let type_name = base_name.unwrap_or_else(|| obj_type.to_string());
+
+        // Dispatch to built-in type helpers.
+        if let Some(ty) = self.dispatch_builtin_method(mc, &obj_type) {
             return ty;
         }
 
@@ -203,6 +222,24 @@ impl Checker {
         // Check trait bounds for type variables
         if let Some(ty) = self.resolve_trait_bound_method(&obj_type, mc) {
             return ty;
+        }
+        // Last resort, inside a `where` constraint only: a String/List method
+        // (`self.contains(...)`) on an `Option<T>` field operates on the inner value
+        // — codegen nil-guards the access, exactly like the `self.length` /
+        // numeric-comparison constraint forms. No path above resolved the method on
+        // the `Option` itself (an `Option` method like `isSome` would have resolved
+        // at the user-method path and returned already), so retry the built-in
+        // dispatch on `T`. Placed here, after every `Option`-level path, so it never
+        // shadows a real `Option` method.
+        if self.in_constraint
+            && let Type::Generic(n, args) = &obj_type
+            && n == "Option"
+            && args.len() == 1
+        {
+            let inner = args[0].clone();
+            if let Some(ty) = self.dispatch_builtin_method(mc, &inner) {
+                return ty;
+            }
         }
         self.error(
             format!(

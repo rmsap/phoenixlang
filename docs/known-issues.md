@@ -189,34 +189,28 @@ The server-side default is still meaningful for **external / non-Phoenix callers
 
 ## Bugs
 
-### String/List *method* constraints (`.contains`) on an `Option<T>` field are still rejected
+### Struct-field access on an `Option<Struct>` field is rejected in a `where` constraint
 
-Mostly closed 2026-06-20 (see design-decisions.md, "schema-constraint checking
-hardening"). A `where` constraint on an `Option<T>` field now handles the common
-forms by unwrapping the `Option` to the inner value (which is what the constraint
-describes — codegen nil-guards it):
+A `where` constraint on an `Option<T>` field unwraps the `Option` to the inner
+value (which is what the constraint describes — codegen nil-guards it) across every
+form that matters: `self.length` on `Option<String>`/`Option<List>`, numeric
+comparisons on `Option<Int>`, a String/List *method* like `self.contains("@")` on
+`Option<String>`, and the `Option`'s own `self.isSome()`/`.isNone()`. See
+design-decisions.md ("schema-constraint checking hardening" / "uniform `Option`
+unwrap in constraints").
 
-- `self.length` on `Option<String>` / `Option<List>` — genuinely type-checked (an
-  `Int`), no longer silently swallowed.
-- numeric comparisons on `Option<Int>` (`self >= 0 && self <= 10`) — valid.
-- `self.isSome()` / `.isNone()` — still resolve on the `Option` itself.
+**Residual:** a struct-field access on an `Option<Struct>` field — e.g.
+`addr: Option<Address> where self.zip > 0` — is still **rejected** ("type
+`Address` has no property `zip`"). The `Option` unwrap in `check_field_access`
+feeds only the `.length` carve-out, not general struct-field resolution: the struct
+branch looks up the *outer* type (`Option`, not a struct), so the inner field is
+never resolved. Closing it means teaching the struct branch to unwrap a single
+`Option` and run the full field lookup (with cross-module privacy + generic
+substitution) on the inner struct — a larger, separate change. The rejection is
+**loud** (a real diagnostic that names the inner `Address`), not the old
+silent-acceptance bug, and no fixture hits it.
 
-**Residual:** a String/List *method* call (e.g. `self.contains("@")`) on an
-`Option<String>` field is still **rejected** ("no method `contains` on
-`Option<String>`"). The binary-op and field-access paths unwrap `Option` in a
-constraint, but the method-call dispatch does not — adding it cleanly requires the
-dispatch to try the `Option` method set first and fall back to the inner type, a
-larger restructure than this fix took on. The rejection is **loud** (a real
-diagnostic), not the old silent-acceptance bug, and no fixture hits it.
-
-Likewise, the `Option` unwrap in `check_field_access` feeds **only** the
-`.length` carve-out, not general field resolution — so a struct-field access on an
-`Option<Struct>` field (e.g. `addr: Option<Address> where self.zip > 0`) is also
-rejected ("type `Address` has no property `zip`"). Same root cause (only the outer
-type is looked up as a struct), same **loud** behavior, and no fixture hits it.
-
-**Workaround:** make the field non-optional, or use a non-method form
-(`self.length > 0` instead of a method) where possible, or validate in the
+**Workaround:** make the field non-optional, or validate the nested field in the
 handler. **Target phase:** demand-triggered. Surfaced 2026-06-09; reduced to this
 residual 2026-06-20.
 

@@ -3569,19 +3569,37 @@ blob: Bytes where self.length > 0
     );
 }
 
-/// Documents the known residual: a String/List *method* call (`self.contains`)
-/// on an `Option<T>` field is still rejected — but LOUDLY (a real diagnostic),
-/// not silently swallowed like the old field-access hole. The binary-op and
-/// field-access paths unwrap `Option` in a constraint; method dispatch does not.
+/// A String/List *method* call (`self.contains`) on an `Option<T>` field operates
+/// on the inner value in a constraint (codegen nil-guards it), matching the
+/// `self.length` / numeric-comparison forms — so it checks clean. The method
+/// dispatch retries on the unwrapped inner type as a last resort, after every
+/// `Option`-level path (so `self.isSome()` still resolves on the `Option`).
 #[test]
-fn constraint_method_call_on_optional_rejected_loudly() {
-    assert_has_error(
+fn constraint_method_call_on_optional_string_valid() {
+    assert_no_errors(
         r#"
 struct User {
 email: Option<String> where self.contains("@")
 }
 "#,
-        "no method `contains`",
+    );
+}
+
+/// An *unrecognized* method on an `Option<String>` field in a constraint is still
+/// rejected — and exactly once. The first dispatch on the `Option` returns a silent
+/// `None`, the retry dispatches on the unwrapped `String`, and `check_string_method`
+/// reports a single "no method … on type `String`" diagnostic (naming the inner
+/// type) and returns `Some(Error)`, so the catch-all below never also fires.
+#[test]
+fn constraint_unknown_method_on_optional_string_rejected_once() {
+    assert_error_count_for_message(
+        r#"
+struct User {
+email: Option<String> where self.fooBar()
+}
+"#,
+        "no method `fooBar` on type `String`",
+        1,
     );
 }
 

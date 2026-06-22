@@ -3659,3 +3659,26 @@ fallback would try the `Option` method set first, then the inner type; a larger
 restructure, no fixture needs it); (2) field access on a built-in **outside** a
 constraint (a function body) stays lenient by design, to avoid touching general
 expression checking. Both are tracked in [known-issues.md](known-issues.md).
+
+### Follow-up — uniform `Option` unwrap for method-call constraints (2026-06-20)
+
+Residual (1) above is now closed. A String/List **method** call on an `Option<T>`
+field in a constraint — `email: Option<String> where self.contains("@")` — checks
+clean, completing the "every constraint form behaves uniformly on `Option`" bar
+(`.length`, numeric, `.contains`, `.isSome()` all work). The method-dispatch block
+in `check_method_call` was extracted into a `dispatch_builtin_method(mc, ty)` helper;
+when no path resolves the method on the `Option` itself, the constraint context
+retries that helper on the unwrapped inner type **as a last resort** — placed *after*
+every `Option`-level path (built-in `Option` methods, user-method table, trait
+bounds), so a real `Option` method like `isSome` still resolves on the `Option` and
+is never shadowed. `check_option_method` returns `None` for an unrecognized method
+without side effects, so the retry neither double-checks args nor double-reports.
+
+The single remaining residual is now just struct-field access on an `Option<Struct>`
+field (`self.zip` on `Option<Address>`) — a separate path (the struct branch looks
+up the outer type), loud, no fixture hits it; tracked in
+[known-issues.md](known-issues.md). Verified by sema regression tests
+(`.contains`/`.isSome() && .length` on `Option<String>` valid; the struct-field case
+still rejected, naming the inner type); 527 sema lib tests green; 256 codegen
+snapshots unchanged (sema-only, output byte-identical); Go compile-lint + driver
+suite (uncapped) green; clippy clean.
