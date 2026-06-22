@@ -179,6 +179,11 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // decision K.10.
     builder.close_type_rec_group();
     builder.declare_memory();
+    // Declare the `extern js` custom imports before any
+    // local function: imports occupy the low function indices, so they must be in
+    // place before `declare_print_helper` / the user functions append locals.
+    // A no-op for a program with no externs.
+    builder.declare_extern_imports(ir_module)?;
     if needs_print {
         builder.declare_imports();
         builder.declare_print_helper()?;

@@ -42,6 +42,45 @@ use super::enums::{self, EnumInstantiationKey};
 use super::string_helpers;
 use super::translate;
 
+/// Flatten an `extern js` boundary type to its wasm32-gc import `ValType`s.
+/// Scalars map as everywhere else; `JsValue` is an
+/// `externref` (the host VM owns/traces it directly). `String` and
+/// closure callbacks are **not** marshalled across the boundary yet — they're
+/// rejected here, naming their landing PR, so the import section never declares a
+/// signature the JS glue can't satisfy. A `Void` return flattens to no
+/// result; a `Void` *parameter* can't occur (sema rejects it). Distinct from the
+/// internal [`translate::wasm_valtypes_for`], which maps `String` to its concrete
+/// GC type for in-program use — at the boundary that type can't cross to the host
+/// without the scratch-region copy.
+fn gc_extern_valtypes(ty: &IrType) -> Result<Vec<ValType>, CompileError> {
+    match ty {
+        IrType::I64 => Ok(vec![ValType::I64]),
+        IrType::F64 => Ok(vec![ValType::F64]),
+        IrType::Bool => Ok(vec![ValType::I32]),
+        IrType::Void => Ok(Vec::new()),
+        IrType::JsValue => Ok(vec![ValType::EXTERNREF]),
+        IrType::StringRef => Err(CompileError::new(
+            "`String` marshalling across the boundary lands in Phase 2.5 PR 13",
+        )),
+        IrType::ClosureRef { .. } => Err(CompileError::new(
+            "closure callbacks land in Phase 2.5 PR 14",
+        )),
+        other => Err(CompileError::new(format!(
+            "`{other:?}` is not marshallable across the `extern js` boundary"
+        ))),
+    }
+}
+
+/// Compose the `extern_import_lookup` key for an `extern js` host function.
+/// A NUL byte (illegal in WASM import module/name UTF-8 identifiers and in
+/// Phoenix source identifiers) separates the two halves so distinct
+/// `(module, name)` pairs can never collide on a shared key. Mirrors the
+/// wasm32-linear builder's `extern_import_key`, and lets [`ModuleBuilder::get_extern_import`]
+/// look up by `&str` without allocating a `(String, String)` tuple per call.
+fn extern_import_key(module: &str, name: &str) -> String {
+    format!("{module}\0{name}")
+}
+
 /// Linear-memory layout used by the synthesized print helper. Sizes
 /// are tiny — wasm32-gc only uses linear memory for WASI iovec
 /// staging and user string literals.
@@ -235,6 +274,15 @@ pub(super) struct ModuleBuilder {
     /// [`Self::declare_print_helper`] when emitting the helper body's
     /// `call` instruction.
     fd_write_idx: Option<u32>,
+
+    /// WASM function index of each `extern js` custom import, keyed by the
+    /// NUL-joined `(module, name)` ([`extern_import_key`], matching the linear
+    /// builder) so lookups don't allocate a tuple (Phase 2.5 — the wasm32-gc
+    /// binding). Populated by [`Self::declare_extern_imports`], read by the
+    /// `Op::ExternCall` lowering. Like `fd_write`, these are imports, so they
+    /// must be declared before any local function is added (function indices are
+    /// imports-first).
+    extern_import_lookup: HashMap<String, u32>,
 
     /// WASM function index of the synthesized `phx_print_i64` helper
     /// (digit conversion + `fd_write` with newline). Populated by
@@ -531,6 +579,7 @@ impl ModuleBuilder {
             data: wasm_encoder::DataSection::new(),
             import_func_count: 0,
             fd_write_idx: None,
+            extern_import_lookup: HashMap::new(),
             print_i64_idx: None,
             start_idx: None,
             phx_main_idx: None,
@@ -1696,11 +1745,14 @@ impl ModuleBuilder {
     /// signature is fixed by the spec:
     /// - `fd_write(fd: i32, iovs_ptr: i32, iovs_len: i32, nwritten_ptr: i32) -> i32`
     ///
-    /// Function indices are assigned in declaration order, so
-    /// `fd_write` lands at index 0. `proc_exit` is *not* imported yet:
-    /// `_start` returns normally and the MVP has no panic path, so
-    /// importing a symbol nothing calls would only burden the host.
-    /// The panic-routing slice adds it back alongside its first caller.
+    /// Function indices are assigned in declaration order.
+    // [`Self::declare_extern_imports`] runs first, so `fd_write` no
+    /// longer lands at index 0 for a program with `extern js` calls — it lands
+    /// at the live `import_func_count`, which is what gets recorded in
+    /// `fd_write_idx` (an extern-free program still puts it at 0). `proc_exit`
+    /// is *not* imported yet: `_start` returns normally and the MVP has no
+    /// panic path, so importing a symbol nothing calls would only burden the
+    /// host. The panic-routing slice adds it back alongside its first caller.
     pub(super) fn declare_imports(&mut self) {
         let fd_write_ty = self.types.intern(
             &[
@@ -1718,6 +1770,66 @@ impl ModuleBuilder {
         );
         self.fd_write_idx = Some(self.import_func_count);
         self.import_func_count += 1;
+    }
+
+    /// Declare one custom WASM function import per distinct called `extern js`
+    /// function (the wasm32-gc binding), recording each
+    /// in [`Self::extern_import_lookup`]. Driven by the backend-neutral
+    /// [`crate::extern_abi::collect_externs`], so the gc imports and the linear
+    /// imports derive from the same table.
+    ///
+    /// **Ordering:** imports occupy function indices ahead of local functions
+    /// (`add_local_function` offsets by `import_func_count`), so this must run
+    /// before any local function is declared — alongside the `fd_write` import,
+    /// before the print/string helpers and user functions.
+    ///
+    /// Only scalar (`Int`/`Float`/`Bool`/`Void`) and `JsValue`
+    /// (`externref`) cross the boundary. A `String` parameter/return (the copy
+    /// across the GC backend's scratch region lands in PR 13) or a closure
+    /// callback (PR 14) is rejected here with a diagnostic naming its landing PR,
+    /// rather than emitting an import the glue can't yet satisfy.
+    pub(super) fn declare_extern_imports(
+        &mut self,
+        ir_module: &IrModule,
+    ) -> Result<(), CompileError> {
+        for sig in crate::extern_abi::collect_externs(ir_module)? {
+            let mut params = Vec::new();
+            for (i, ty) in sig.params.iter().enumerate() {
+                params.extend(gc_extern_valtypes(ty).map_err(|e| {
+                    CompileError::new(format!(
+                        "wasm32-gc: `extern js` call `{}.{}` parameter {i}: {}",
+                        sig.module, sig.name, e.message
+                    ))
+                })?);
+            }
+            let returns = gc_extern_valtypes(&sig.return_type).map_err(|e| {
+                CompileError::new(format!(
+                    "wasm32-gc: `extern js` call `{}.{}` return type: {}",
+                    sig.module, sig.name, e.message
+                ))
+            })?;
+            let type_idx = self.types.intern(&params, &returns);
+            self.imports.import(
+                &sig.module,
+                &sig.name,
+                wasm_encoder::EntityType::Function(type_idx),
+            );
+            self.extern_import_lookup.insert(
+                extern_import_key(&sig.module, &sig.name),
+                self.import_func_count,
+            );
+            self.import_func_count += 1;
+        }
+        Ok(())
+    }
+
+    /// The WASM function index of the `extern js` import for `(module, name)`, or
+    /// `None` if undeclared (an internal bug — every called extern is declared by
+    /// [`Self::declare_extern_imports`]).
+    pub(super) fn get_extern_import(&self, module: &str, name: &str) -> Option<u32> {
+        self.extern_import_lookup
+            .get(&extern_import_key(module, name))
+            .copied()
     }
 
     /// Declare the single linear memory used by the WASI iovec

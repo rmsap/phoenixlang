@@ -75,6 +75,10 @@ fn compile_to_wasm_gc(source: &str) -> Vec<u8> {
 fn validate_gc_module(bytes: &[u8], label: &str) {
     let mut features = wasmparser::WasmFeatures::default();
     features.insert(wasmparser::WasmFeatures::GC);
+    // `externref` (`JsValue`, Phase 2.5) is part of the reference-types proposal;
+    // enable it so an `extern js` module's `(ref null extern)` import signatures
+    // validate.
+    features.insert(wasmparser::WasmFeatures::REFERENCE_TYPES);
     let mut validator = wasmparser::Validator::new_with_features(features);
     validator
         .validate_all(bytes)
@@ -217,8 +221,10 @@ fn count_ref_cast_ops(bytes: &[u8]) -> usize {
 /// Collect every import's module namespace across the module. The
 /// wasm32-gc backend emits no Rust-runtime merge — it synthesizes its
 /// helpers inline — so the only host import it ever needs is WASI
-/// `fd_write` (stdio). Used by [`only_wasi_imports_on_wasm32_gc`] to
-/// enforce the Phase 2.4 "WASI is the only host surface" exit criterion.
+/// `fd_write` (stdio). Used by [`extern_free_program_imports_only_wasi_on_wasm32_gc`]
+/// to enforce the "WASI is the only host surface" property for an extern-free
+/// program (the `extern js` imports are asserted separately by
+/// [`extern_js_imports_externref_and_validates_on_wasm32_gc`]).
 /// Returns a specific `Err` if any wasmparser step fails (mirroring the
 /// linear backend's `import_modules`) so a helper regression reads as
 /// "couldn't parse imports" rather than an empty set silently passing
@@ -251,15 +257,16 @@ fn import_module_names(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(modules)
 }
 
-/// Host-surface gate (Phase 2.4 exit criterion: "WASI imports are the
-/// only host surface — no Phoenix-defined custom imports yet"). Unlike
-/// wasm32-linear, the GC backend embeds no Rust runtime, so its import
-/// set is just WASI `fd_write`; any import from another namespace would
-/// mean a custom host dependency leaked in ahead of Phase 2.5.
-/// `collections` is the densest runtime-surface fixture (lists + maps +
-/// closures + strings). Structural-tier (no wasmtime needed).
+/// Host-surface gate for an **extern-free** program: the GC backend embeds no
+/// Rust runtime, so an extern-free module's import set is just WASI `fd_write`;
+/// any import from another namespace would mean a custom host dependency leaked
+/// in. `collections` is the densest runtime-surface fixture (lists + maps +
+/// closures + strings) and uses no `extern js`, so its only host surface is WASI.
+/// Renamed from `only_wasi_imports_on_wasm32_gc` in Phase 2.5 PR 12, when
+/// `extern js` calls began adding `js.*` imports (see
+/// `extern_js_imports_externref_and_validates_on_wasm32_gc`). Structural-tier.
 #[test]
-fn only_wasi_imports_on_wasm32_gc() {
+fn extern_free_program_imports_only_wasi_on_wasm32_gc() {
     let source = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/collections.phx"
@@ -286,6 +293,223 @@ fn only_wasi_imports_on_wasm32_gc() {
         "wasm32-gc module imports from non-WASI namespaces — a custom host \
          dependency leaked in ahead of Phase 2.5: {non_wasi:?}\n\
          full import-module list: {modules:?}"
+    );
+}
+
+/// Like [`import_module_names`] but returns `(module, name)` pairs, so a test can
+/// assert the *exact* set of custom imports — not just their namespaces.
+fn import_names(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    use wasmparser::{Imports, Parser, Payload};
+    let mut out = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::ImportSection(rdr) = payload {
+            for group in rdr {
+                match group.map_err(|e| format!("reading import section: {e}"))? {
+                    Imports::Single(_, imp) => {
+                        out.push((imp.module.to_string(), imp.name.to_string()))
+                    }
+                    Imports::Compact1 { module, items } => {
+                        for item in items {
+                            let item = item.map_err(|e| format!("reading import items: {e}"))?;
+                            out.push((module.to_string(), item.name.to_string()));
+                        }
+                    }
+                    Imports::Compact2 { module, names, .. } => {
+                        for name in names {
+                            let name = name.map_err(|e| format!("reading import names: {e}"))?;
+                            out.push((module.to_string(), name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `true` if any function type in the module has an `externref` parameter or
+/// result — i.e. `JsValue` lowered to `(ref null extern)` (Phase 2.5 decision D).
+fn module_has_externref_func_type(bytes: &[u8]) -> Result<bool, String> {
+    use wasmparser::{CompositeInnerType, Parser, Payload, ValType};
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::TypeSection(rdr) = payload {
+            for rec in rdr {
+                let rec = rec.map_err(|e| format!("reading rec group: {e}"))?;
+                for sub in rec.types() {
+                    if let CompositeInnerType::Func(ft) = &sub.composite_type.inner
+                        && ft
+                            .params()
+                            .iter()
+                            .chain(ft.results())
+                            .any(|v| *v == ValType::EXTERNREF)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// A program that calls `extern js` functions with scalar + `JsValue` parameters
+/// emits one custom WASM import per distinct extern, maps `JsValue` to
+/// `externref` (Phase 2.5 decision D), and still validates (with reference-types
+/// enabled). The `Void`-returning `notify` exercises the empty-results flattening
+/// (`gc_extern_valtypes(Void) -> []`). Structural-tier: the `js.*` imports are
+/// unsatisfied until the wasm32-gc JS glue (PR 15), so it can't run under bare
+/// wasmtime; `String` marshalling (PR 13) and closures (PR 14) are still rejected
+/// (see the `extern_js_rejects_*` tests), so this exercises exactly the PR-12
+/// scalar + `JsValue` surface.
+#[test]
+fn extern_js_imports_externref_and_validates_on_wasm32_gc() {
+    let source = "extern js {\n  \
+                    function getValue() -> JsValue\n  \
+                    function useValue(v: JsValue) -> Int\n  \
+                    function addOne(n: Int) -> Int\n  \
+                    function notify(n: Int)\n\
+                  }\n\
+                  function main() {\n  \
+                    print(addOne(41))\n  \
+                    print(useValue(getValue()))\n  \
+                    notify(7)\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_externref");
+
+    // `JsValue` crosses as `externref`.
+    assert!(
+        module_has_externref_func_type(&bytes)
+            .unwrap_or_else(|e| panic!("scanning type section: {e}")),
+        "a `JsValue` extern should put an `externref` in a function type \
+         (here, the only externref-bearing types are the `js.*` import signatures \
+         asserted just below)"
+    );
+
+    // Non-WASI imports are exactly the four declared externs from `js`.
+    let imports = import_names(&bytes).unwrap_or_else(|e| panic!("parsing imports: {e}"));
+    assert!(
+        imports
+            .iter()
+            .any(|(m, n)| m == "wasi_snapshot_preview1" && n == "fd_write"),
+        "the printing module should still import WASI fd_write: {imports:?}"
+    );
+    let mut non_wasi: Vec<&str> = imports
+        .iter()
+        .filter(|(m, _)| m != "wasi_snapshot_preview1")
+        .map(|(m, n)| {
+            assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+            n.as_str()
+        })
+        .collect();
+    non_wasi.sort_unstable();
+    assert_eq!(
+        non_wasi,
+        vec!["addOne", "getValue", "notify", "useValue"],
+        "non-WASI imports should be exactly the called externs: {imports:?}"
+    );
+}
+
+/// Calling the same `extern js` function from several sites emits exactly *one*
+/// custom import, not one per call site. `collect_externs` dedups by
+/// `(module, name)` (first-call-site signature wins), so `declare_extern_imports`
+/// declares `addOne` once even though `main` calls it three times. Structural-tier
+/// (the `js.*` import is unsatisfied until PR 15).
+#[test]
+fn extern_js_repeated_call_emits_single_import_on_wasm32_gc() {
+    let source = "extern js { function addOne(n: Int) -> Int }\n\
+                  function main() {\n  \
+                    print(addOne(1))\n  \
+                    print(addOne(2))\n  \
+                    print(addOne(3))\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_dedup");
+
+    let imports = import_names(&bytes).unwrap_or_else(|e| panic!("parsing imports: {e}"));
+    let add_one_imports: Vec<&(String, String)> = imports
+        .iter()
+        .filter(|(m, n)| m == "js" && n == "addOne")
+        .collect();
+    assert_eq!(
+        add_one_imports.len(),
+        1,
+        "three calls to the same extern should emit exactly one import: {imports:?}"
+    );
+}
+
+/// Compile `source` through `Target::Wasm32Gc` expecting *failure*, returning the
+/// diagnostic string. The front end (lexer → parser → sema → IR) must still
+/// succeed — these programs are well-typed and compile on the linear/native
+/// backends; the rejection is specific to the wasm32-gc boundary marshalling
+/// not-yet-implemented for this phase, raised at import declaration.
+fn compile_to_wasm_gc_expecting_error(source: &str) -> String {
+    let ir_module = lower_to_ir(source);
+    compile(&ir_module, Target::Wasm32Gc)
+        .expect_err("wasm32-gc compile should have rejected this extern boundary type")
+        .to_string()
+}
+
+/// A `String` parameter on an `extern js` function is rejected at import
+/// declaration on wasm32-gc (the scratch-region copy lands in PR 13), with a
+/// diagnostic naming the parameter and its landing PR — rather than emitting an
+/// import signature the JS glue can't satisfy.
+#[test]
+fn extern_js_rejects_string_param_on_wasm32_gc() {
+    let source = "extern js { function alert(message: String) }\n\
+                  function main() { alert(\"boom\") }\n";
+    let err = compile_to_wasm_gc_expecting_error(source);
+    assert!(
+        err.contains("alert"),
+        "diagnostic should name the rejected extern: {err}"
+    );
+    assert!(
+        err.contains("PR 13"),
+        "diagnostic should name `String` marshalling's landing PR: {err}"
+    );
+}
+
+/// A closure (callback) parameter on an `extern js` function is rejected at import
+/// declaration on wasm32-gc (callbacks land in PR 14), naming its landing PR, so
+/// no import is emitted that the glue can't yet satisfy.
+#[test]
+fn extern_js_rejects_closure_param_on_wasm32_gc() {
+    let source = "extern js { function eachUpTo(n: Int, cb: (Int) -> Void) }\n\
+                  function main() { eachUpTo(3, function(i: Int) { print(i) }) }\n";
+    let err = compile_to_wasm_gc_expecting_error(source);
+    assert!(
+        err.contains("eachUpTo"),
+        "diagnostic should name the rejected extern: {err}"
+    );
+    assert!(
+        err.contains("PR 14"),
+        "diagnostic should name closure callbacks' landing PR: {err}"
+    );
+}
+
+/// A `String` *return* on an `extern js` function is rejected at import
+/// declaration on wasm32-gc too (the same scratch-region copy lands in PR 13),
+/// with the diagnostic routed through the `return type:` arm rather than a
+/// parameter arm — locking the return-side wording alongside the parameter-side
+/// `extern_js_rejects_string_param_on_wasm32_gc`.
+#[test]
+fn extern_js_rejects_string_return_on_wasm32_gc() {
+    let source = "extern js { function makeName() -> String }\n\
+                  function main() { print(makeName()) }\n";
+    let err = compile_to_wasm_gc_expecting_error(source);
+    assert!(
+        err.contains("makeName"),
+        "diagnostic should name the rejected extern: {err}"
+    );
+    assert!(
+        err.contains("return type"),
+        "diagnostic should route through the return-type arm: {err}"
+    );
+    assert!(
+        err.contains("PR 13"),
+        "diagnostic should name `String` marshalling's landing PR: {err}"
     );
 }
 

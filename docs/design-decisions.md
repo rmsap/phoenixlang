@@ -1805,7 +1805,7 @@ Scopes the two **WASM** host bindings of [decision A0](#a0-parity-model-extern-f
 **Rationale:** `JsValue` is the opaque handle for a JS value Phoenix holds but never inspects. Its lowering is necessarily different per backend — linear memory has no notion of a host reference, while WASM-GC has `externref` precisely for this — but the user-facing type is identical. `Type::JsValue` is a pre-registered synthetic primitive, modeled on the Option/Result pre-registration in `resolved.rs::build_from_checker`.
 
 - Linear: an `i32` handle into a JS-owned handle table the glue manages; Phoenix never dereferences it, only passes it back to externs.
-- WASM-GC: an `externref` passed directly; the host VM owns and traces it (no handle table).
+- WASM-GC: an `externref` passed directly; the host VM owns and traces it (no handle table). **Foundation landed PR 12:** `IrType::JsValue` lowers to `(ref null extern)` (`ValType::EXTERNREF`) in the gc backend's type mapping, and `Op::ExternCall` lowers to a `call` of a custom per-extern import (one import per distinct `(module, name)`, declared before any local function). PR 12 covers scalar + `JsValue` externs; `String` (PR 13) and closures (PR 14) are rejected at import declaration; the JS glue that satisfies these gc imports (and passes real host values as `externref`) is PR 15.
 
 **Alternatives considered:**
 - *A uniform i32-handle model on both backends.* Rejected: throws away WASM-GC's externref tracing (the callback-lifetime win in decision B/G) to make the two backends superficially identical.

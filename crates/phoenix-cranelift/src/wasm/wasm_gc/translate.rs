@@ -193,15 +193,13 @@ pub(super) fn wasm_valtypes_for(
                 heap_type: HeapType::Concrete(parent_idx),
             })])
         }
-        // `JsValue` is an `externref` on `wasm32-gc`, but the op that produces
-        // one (`Op::ExternCall`) has no wasm-gc binding yet (the JS-glue binding
-        // lands in Phase 2.5 PRs 12–15), so no program can materialize a
-        // `JsValue` to lay out here. Reject explicitly rather than via the
-        // generic arm so the gap names the feature and its landing PR.
-        IrType::JsValue => Err(CompileError::new(
-            "wasm32-gc: `JsValue` host handles are not supported yet — the \
-             `extern js` JS-glue binding lands in Phase 2.5 PRs 12–15",
-        )),
+        // `JsValue` is an `externref` on `wasm32-gc` (design-decisions §Phase 2.5
+        // decision D): a host value the wasm-GC engine owns and traces directly —
+        // no handle table (that's the linear binding), no shadow-stack root (the
+        // engine traces every reference-typed local). Nullable so a null/undefined
+        // JS value crosses as `ref.null extern`, and so a `JsValue` local
+        // zero-inits to null like every other ref local.
+        IrType::JsValue => Ok(vec![ValType::EXTERNREF]),
         other => Err(CompileError::new(format!(
             "wasm32-gc MVP: IR type `{other:?}` not yet supported \
              (Phase 2.4 PR 5 slices 1-3 + PR 6 slices cover Int / Bool / \
@@ -747,6 +745,28 @@ fn translate_instruction(
             }
             ctx.emit(Instruction::Call(target_idx));
             bind_call_result(ctx, b, instr, &format!("Op::Call({func_id:?})"))
+        }
+        // `extern js` host call .
+        // Lowers to a `call` of the custom import declared for `(module, name)` by
+        // [`ModuleBuilder::declare_extern_imports`]. The JS glue  satisfies
+        // that import; the host VM passes a `JsValue` directly as `externref`
+        // (decision D). Marshals scalars + `JsValue`; `String` and
+        // closure callbacks are rejected at import declaration, so every
+        // arg reaching here is a single local.
+        Op::ExternCall(module, name, args) => {
+            let import_idx = b.get_extern_import(module, name).ok_or_else(|| {
+                CompileError::new(format!(
+                    "wasm32-gc: no import declared for `extern js` call \
+                     `{module}.{name}` (internal compiler bug — \
+                     `declare_extern_imports` must run before function bodies)"
+                ))
+            })?;
+            for arg in args {
+                let local = ctx.binding_of(*arg)?;
+                ctx.emit(Instruction::LocalGet(local));
+            }
+            ctx.emit(Instruction::Call(import_idx));
+            bind_call_result(ctx, b, instr, &format!("Op::ExternCall({module}.{name})"))
         }
         Op::BuiltinCall(name, args) => translate_builtin_call(ctx, b, name, args, instr),
         // Struct ops — see §Phase 2.4 decision K.1. Each Phoenix struct
