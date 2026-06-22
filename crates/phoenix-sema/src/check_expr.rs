@@ -177,6 +177,19 @@ impl Checker {
         Type::Error
     }
 
+    /// Unwraps a single `Option<T>` layer, returning `&T`; any other type is
+    /// returned unchanged. Used only in `where`-constraint checking, where an
+    /// `Option<T>` field's constraint describes the inner present value (codegen
+    /// nil-guards the access), so `self.length`/numeric comparisons act on the
+    /// inner `T`. The two constraint sites (`check_field_access`, `check_binary`)
+    /// share this so the unwrap rule can't drift between them.
+    fn unwrap_single_option(t: &Type) -> &Type {
+        match t {
+            Type::Generic(n, args) if n == "Option" && args.len() == 1 => &args[0],
+            other => other,
+        }
+    }
+
     /// Type-checks a field access (`obj.field`), verifying the field exists on
     /// the struct and returning the field's type (with generic substitution).
     ///
@@ -206,9 +219,44 @@ impl Checker {
                 format!("struct `{}` has no field `{}`", tn, fa.field),
                 fa.span,
             );
+            // Reported here; don't fall through to the constraint check below (it
+            // would double-report on the same span).
+            return Type::Error;
         }
         if obj_type.is_error() {
             return Type::Error;
+        }
+        // Inside a `where` constraint, `self.<x>` on a built-in (non-struct) base is
+        // only meaningful for the length property: `self.length` on a `String` or
+        // `List<_>` is the established constraint idiom (every target renders it —
+        // TS `.length`, Go `len(...)`, Python `min_length`/`max_length`) and is an
+        // `Int`. Anything else (a typo like `self.lenght`, `.length` on an
+        // `Int`/`Map`, or a struct-field access on an `Option<Struct>`) is a mistake
+        // and is REPORTED, not silently swallowed as an error type. Outside a
+        // constraint, field access on a non-struct keeps its lenient
+        // error-without-diagnostic behavior so general expression checking
+        // (module/enum-qualified names, etc.) is unaffected.
+        if self.in_constraint {
+            // `self.length` on an `Option<String>`/`Option<List>` field is the inner
+            // value's length (codegen nil-guards the access), so unwrap a single
+            // `Option` before testing for a lengthable base. The unwrapped `base` is
+            // also what the diagnostic names — a schema author thinks of an
+            // `Option<String>` field as a string, so "type `String` has no property
+            // `lenght`" reads better than naming the outer `Option<String>`.
+            let base = Self::unwrap_single_option(&obj_type);
+            // Deliberately only `String` and `List`: these are the bases every
+            // target renders a length check for. `Map` (no `.length` idiom) and
+            // `Bytes` (byte-length is ambiguous and unused by any fixture) are
+            // intentionally excluded, so `.length` on them is a hard error.
+            let is_lengthable =
+                matches!(base, Type::String) || matches!(base, Type::Generic(n, _) if n == "List");
+            if fa.field == "length" && is_lengthable {
+                return Type::Int;
+            }
+            self.error(
+                format!("type `{base}` has no property `{}`", fa.field),
+                fa.span,
+            );
         }
         Type::Error
     }
@@ -661,6 +709,37 @@ impl Checker {
         if left.is_error() || right.is_error() {
             return Type::Error;
         }
+
+        // Inside a `where` constraint, an `Option<T>` operand means the inner value
+        // (codegen nil-guards the constraint), so a numeric/comparison constraint
+        // like `Option<Int> n where self >= 0` compares the inner `Int`. Unwrap a
+        // single `Option` from each side. Outside a constraint this never runs, so
+        // ordinary expression checking still rejects `Option<Int>`-vs-`Int`.
+        //
+        // This unwrap is gated only on `in_constraint`, so it also applies to the
+        // `&&`/`||` arms below (an `Option<Bool>` operand unwraps to `Bool`). That
+        // is intentional and consistent: a constraint describes the present value,
+        // so a logical operand reads as the inner bool just as a numeric operand
+        // reads as the inner number.
+        //
+        // Both sides are unwrapped, but in practice only the side holding `self`
+        // is ever an `Option`: `self` is the lone binding in a field constraint,
+        // so the other operand is a literal or another `self`-rooted expression.
+        // Unwrapping the RHS is therefore a safe no-op in the common case and
+        // simply keeps the two sides symmetric.
+        //
+        // Note this shadows `left`/`right` for the rest of the function, so any
+        // comparison-mismatch diagnostic below names the unwrapped inner type
+        // (e.g. "cannot compare `String` and `Int`", not `Option<String>`) — the
+        // intended reading for a constraint, which describes the present value.
+        let (left, right) = if self.in_constraint {
+            (
+                Self::unwrap_single_option(&left).clone(),
+                Self::unwrap_single_option(&right).clone(),
+            )
+        } else {
+            (left, right)
+        };
 
         match binary.op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {

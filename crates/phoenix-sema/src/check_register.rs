@@ -513,6 +513,12 @@ impl Checker {
                         // Validate constraint expression if present: bind `self` to
                         // the field type, type-check the expression, verify it is Bool.
                         if let Some(ref constraint) = f.constraint {
+                            // `self` is bound to the field's full type — including
+                            // `Option<T>`, so a presence check like
+                            // `Option<Int> x where self.isSome()` still resolves the
+                            // `isSome` method on the Option. Inner-value access
+                            // (`self.length`) unwraps the `Option` at the access site
+                            // in `check_field_access` instead.
                             this.scopes.push();
                             this.scopes.define(
                                 "self".to_string(),
@@ -522,7 +528,13 @@ impl Checker {
                                     definition_span: f.span,
                                 },
                             );
+                            // Inside a constraint, `check_field_access` enforces that
+                            // `self.<x>` names a real property — so a typo like
+                            // `self.lenght` is rejected instead of silently swallowed.
+                            let prev_in_constraint = this.in_constraint;
+                            this.in_constraint = true;
                             let constraint_ty = this.check_expr(constraint);
+                            this.in_constraint = prev_in_constraint;
                             this.scopes.pop();
                             if constraint_ty != crate::types::Type::Bool
                                 && !constraint_ty.is_error()

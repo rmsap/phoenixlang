@@ -3602,3 +3602,60 @@ tracked in [known-issues.md](known-issues.md) ("Python validates only the extrac
 (numeric/length) `where` subset") as the general "Python constraint-expression parity"
 follow-up. With this, the two cross-target validation divergences flagged before the
 v1 distribution/docs push are both addressed: Go now recurses into nested collections, and Python/TS now validate multipart scalar constraints.
+
+## Phoenix Gen — schema-constraint checking hardening (2026-06-20)
+
+Closes the schema-language footgun flagged before the v1 distribution/docs push: a
+malformed `where` constraint was **silently swallowed** rather than reported. The
+root cause was `check_field_access` (phoenix-sema): for a non-struct base type it
+returned `Type::Error` with no diagnostic, and downstream checks go quiet on error
+types to avoid cascades — so `String name where self.lenght > 0` (a typo) passed
+`phoenix check` and landed in the constraint AST as a no-op, and `.length`
+constraints were never actually type-checked anywhere (only meaningful because
+codegen renders them). For a tool whose pitch is type-safety, a typo'd constraint
+compiling to nothing is a trust hole.
+
+**Change (phoenix-sema, checker only — no codegen change).** A new `in_constraint`
+flag is set while type-checking a struct field's `where` expression. It is the one
+place `self.<x>` legitimately appears on a built-in base, so the strictness is
+scoped there and general expression checking (function bodies, module/enum-qualified
+names) is untouched. Within a constraint:
+- `check_field_access` recognizes `self.length` on a `String`/`List` (an `Int`, the
+  established constraint idiom every target renders — TS `.length`, Go `len(...)`,
+  Python `min_length`/`max_length`), unwrapping a single `Option` first so
+  `Option<String> bio where self.length > 0` checks the inner `String`. Any other
+  field on a built-in base (a typo, or `.length` on an `Int`/`Map`) is a hard error
+  ("type `T` has no property `x`") instead of a silent skip.
+- `check_binary` unwraps a single `Option` from each operand, so a numeric
+  constraint on an optional — `Option<Int> n where self >= 0 && self <= 10` — checks
+  the inner `Int` rather than being rejected as `Option<Int>`-vs-`Int`.
+- `self` stays bound to the field's **full** type (including `Option<T>`), so a
+  presence check like `Option<Int> x where self.isSome()` still resolves `isSome` on
+  the `Option`. Inner-value access unwraps at the use site (above), not at the bind.
+
+This fixes the `.length`-never-checked bug and the `Option<T>` numeric/length
+inconsistency, while preserving `.isSome()`/`.isNone()`. The constraint AST handed
+to the generators is unchanged, so generated output is byte-identical (256 codegen
+snapshots unchanged).
+
+**Verification.** Thirteen new sema regression tests: a typo'd `.length` is rejected;
+`.length` on `String`/`Option<String>`/`List`/`Option<List>` is valid; `.length` on
+`Int`/`Map`/`Bytes` is rejected; numeric and equality comparisons on `Option<Int>`
+are valid; a presence-plus-length idiom (`self.isSome() && self.length > 0`) on
+`Option<String>` is valid; the two residuals are LOUD — a `.contains` method call and
+a struct-field access (`self.zip`) on an `Option<_>` field each produce a real
+diagnostic; `self.isSome()` on `Option<Int>` still valid (pre-existing test, unchanged). 524 sema lib tests green; the Go compile-lint
+harness (which runs every realistic fixture — all of which use `Option<String>
+where self.length > 0`-style constraints — through the full pipeline) green; the
+constraint-heavy `gen_api.phx` round-trips green; clippy clean. The whole driver
+test suite passes uncapped (the `matrix_*` failures seen under `ulimit -v` are
+wasmtime `mmap` reservations starved by the cap, unrelated).
+
+**Residual (documented, separate).** Two narrow leftovers, both now LOUD (real
+diagnostics) rather than silent: (1) a String/List **method** call (`self.contains`)
+on an `Option<T>` field is still rejected — the binary-op and field-access paths
+unwrap `Option` in a constraint but the method-call *dispatch* does not (a cleaner
+fallback would try the `Option` method set first, then the inner type; a larger
+restructure, no fixture needs it); (2) field access on a built-in **outside** a
+constraint (a function body) stays lenient by design, to avoid touching general
+expression checking. Both are tracked in [known-issues.md](known-issues.md).

@@ -189,75 +189,60 @@ The server-side default is still meaningful for **external / non-Phoenix callers
 
 ## Bugs
 
-### `where` constraints behave inconsistently on `Option<T>` — and `.length` constraints are never actually type-checked
+### String/List *method* constraints (`.contains`) on an `Option<T>` field are still rejected
 
-Observed behavior: a `.length` constraint on an `Option<String>` is accepted
-(`Option<String> reason where self.length > 0` passes `phoenix check`), but
-`.contains(...)` on an `Option<String>` and a numeric comparison on an
-`Option<Int>` (`Option<Int> code where self >= 100`) are both **rejected** (the
-latter with "cannot compare `Option<Int>` and `Int` with `>=`"). A user
-reasonably expects all three to behave the same way.
+Mostly closed 2026-06-20 (see design-decisions.md, "schema-constraint checking
+hardening"). A `where` constraint on an `Option<T>` field now handles the common
+forms by unwrapping the `Option` to the inner value (which is what the constraint
+describes — codegen nil-guards it):
 
-The real split is NOT string-vs-numeric, it is **field access vs
-method-call/comparison**. `self.length` (no parens) parses as a *field access*,
-and field access on a non-struct base type silently type-checks as an error type
-with no diagnostic (see the entry "Field access on a built-in (non-struct) type
-silently type-checks as an error type" — that bug is the root cause here). The
-binary-op checker then short-circuits on the error type and the constraint
-validator skips its Bool requirement for error types, so the `.length`
-constraint is **silently unvalidated**, not "unwrapped to the inner `String`".
-Consequences:
+- `self.length` on `Option<String>` / `Option<List>` — genuinely type-checked (an
+  `Int`), no longer silently swallowed.
+- numeric comparisons on `Option<Int>` (`self >= 0 && self <= 10`) — valid.
+- `self.isSome()` / `.isNone()` — still resolve on the `Option` itself.
 
-- `Option<Int> code where self.length > 0` is accepted too — nonsense, unchecked.
-- No `.length` constraint anywhere — including on plain `String` fields — is
-  actually type-checked by sema; it is only meaningful because codegen renders
-  it. (Generated output for the existing `.length` constraints is correct, so
-  this is a checking gap, not a miscompile.)
-- `.contains(...)` (a real method call) and numeric comparisons go through the
-  method-dispatch / binary-op paths, which type-check for real and loudly
-  reject `Option<T>` receivers.
+**Residual:** a String/List *method* call (e.g. `self.contains("@")`) on an
+`Option<String>` field is still **rejected** ("no method `contains` on
+`Option<String>`"). The binary-op and field-access paths unwrap `Option` in a
+constraint, but the method-call dispatch does not — adding it cleanly requires the
+dispatch to try the `Option` method set first and fall back to the inner type, a
+larger restructure than this fix took on. The rejection is **loud** (a real
+diagnostic), not the old silent-acceptance bug, and no fixture hits it.
 
-**Workaround:** drop the constraint on the optional field, or make the field
-non-optional. **Planned fix:** two parts — (1) unwrap `Option<T>` to `T` when
-type-checking a field constraint's `self`, so `.contains` and numeric
-comparisons work on optionals; (2) close the silent field-access hole (the
-"Field access on a built-in (non-struct) type" entry) and recognize `.length`
-as a property of `String` during constraint checking, so `.length` constraints
-are genuinely validated. Note that (1) alone does NOT make `.length` checked —
-without (2) it stays silently unvalidated.
-**Target phase:** demand-triggered for (1); (2) should ride along with any sema
-work since it also swallows constraint typos — but see the ordering constraint
-in that entry: landing (2) without (1) (or without an `Option<String>`
-special case) turns the fixture-library gate red. Surfaced 2026-06-09.
+Likewise, the `Option` unwrap in `check_field_access` feeds **only** the
+`.length` carve-out, not general field resolution — so a struct-field access on an
+`Option<Struct>` field (e.g. `addr: Option<Address> where self.zip > 0`) is also
+rejected ("type `Address` has no property `zip`"). Same root cause (only the outer
+type is looked up as a struct), same **loud** behavior, and no fixture hits it.
 
-### Field access on a built-in (non-struct) type silently type-checks as an error type — no diagnostic
+**Workaround:** make the field non-optional, or use a non-method form
+(`self.length > 0` instead of a method) where possible, or validate in the
+handler. **Target phase:** demand-triggered. Surfaced 2026-06-09; reduced to this
+residual 2026-06-20.
 
-`check_field_access` (`phoenix-sema/src/check_expr.rs`) only knows struct
-fields. For any non-struct base type (`String`, `Int`, `Option<...>`,
-`List<...>`, …) the struct lookup fails and the function falls through to
-`return Type::Error` **without emitting a diagnostic**. Downstream checks
-(binary ops, the field-constraint Bool requirement) deliberately go quiet on
-error types to avoid diagnostic cascades, so the mistake never surfaces.
+### Field access on a built-in (non-struct) type is lenient OUTSIDE a `where` constraint
 
-Concrete consequence: a constraint typo like `String name where self.lenght > 0`
-passes `phoenix check` silently and lands in the constraint AST the generators
-consume. It is also the root cause of the inconsistency described in the
-"`where` constraints behave inconsistently on `Option<T>`" entry — `.length`
-constraints are accepted everywhere because they are never checked at all.
+`check_field_access` (`phoenix-sema/src/check_expr.rs`) only knows struct fields.
+For a non-struct base type (`String`, `Int`, `Option<...>`, `List<...>`, …) the
+struct lookup fails. **Inside a `where` constraint** this is now reported (a typo
+like `self.lenght` is a hard error, and `self.length` is recognized — fixed
+2026-06-20, see design-decisions.md). **Everywhere else** — field access on a
+built-in in a function body, e.g. `let n = someString.lenght` — it still falls
+through to `Type::Error` with no diagnostic, so the mistake surfaces only as a
+downstream type error (or silently, if the result feeds an error-tolerant slot).
 
-**Workaround:** none — there is no signal that anything was skipped.
-**Planned fix:** emit a diagnostic from `check_field_access` when the base type
-is not a struct (or the struct lacks the field), and special-case the
-schema-constraint property `.length` on `String` so the established
-`self.length` constraint style still checks clean. Add a regression test that a
-misspelled constraint field is rejected. **Ordering constraint:** the fixture
-library leans heavily on `Option<String> x where self.length > 0`-style
-constraints (accepted today only because of this hole), so this fix must also
-special-case `.length` on `Option<String>` — or land together with part (1) of
-the `Option<T>` entry (unwrap `Option<T>` for constraint `self`) — otherwise
-every `gen_schema_fixtures` test goes red the moment the diagnostic lands.
-**Target phase:** with the `Option<T>` constraint fix.
-Surfaced 2026-06-12 while reviewing the fixture library.
+This residual is deliberately scoped out of the constraint fix: the constraint
+context is the one place `self.<x>` on a built-in is idiomatic (`self.length`), so
+that is where the strict check (and the `.length` carve-out) was added, via an
+`in_constraint` flag. Making `check_field_access` strict *everywhere* risks
+breaking general expression checking (module/enum-qualified names that may route
+through here) and is a separate, broader change with no known footgun — function
+bodies are full Phoenix code where a bad field access generally does cascade into
+a visible error.
+
+**Workaround:** none needed for schemas (the constraint footgun is closed).
+**Target phase:** demand-triggered. Surfaced 2026-06-12; reduced to the
+non-constraint case 2026-06-20.
 
 ### Silent zero substitution on out-of-range integer/float literals
 

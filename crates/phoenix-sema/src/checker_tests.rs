@@ -3415,6 +3415,217 @@ maxRetries: Option<Int> where self.isSome()
     );
 }
 
+/// A typo'd constraint property (`self.lenght`) is REJECTED, not silently
+/// swallowed as an error type. Regression for the field-access-on-builtin hole.
+#[test]
+fn constraint_typo_length_property_rejected() {
+    assert_has_error(
+        r#"
+struct User {
+name: String where self.lenght > 0
+}
+"#,
+        "has no property `lenght`",
+    );
+}
+
+/// `self.length` is a real property of a `String` field (an `Int`); the
+/// constraint checks clean.
+#[test]
+fn constraint_length_on_string_valid() {
+    assert_no_errors(
+        r#"
+struct User {
+name: String where self.length > 0 && self.length <= 100
+}
+"#,
+    );
+}
+
+/// `self.length` on an `Option<String>` field unwraps the `Option` to the inner
+/// `String` (the constraint describes the present value), so it checks clean.
+#[test]
+fn constraint_length_on_optional_string_valid() {
+    assert_no_errors(
+        r#"
+struct User {
+bio: Option<String> where self.length > 0
+}
+"#,
+    );
+}
+
+/// `self.length` is meaningful for a `List` field too (every target renders a
+/// length check).
+#[test]
+fn constraint_length_on_list_valid() {
+    assert_no_errors(
+        r#"
+struct Cart {
+items: List<String> where self.length > 0
+}
+"#,
+    );
+}
+
+/// `self.length` on an `Option<List>` field unwraps the `Option` to the inner
+/// `List` (the unwrap-then-`List` arm of the lengthable carve-out), so it checks
+/// clean — same as `Option<String>` but exercising the `List` branch.
+#[test]
+fn constraint_length_on_optional_list_valid() {
+    assert_no_errors(
+        r#"
+struct Cart {
+items: Option<List<String>> where self.length > 0
+}
+"#,
+    );
+}
+
+/// `self.length` on a non-lengthable type (`Int`) is a misuse and is rejected
+/// rather than silently accepted as nonsense.
+#[test]
+fn constraint_length_on_int_rejected() {
+    assert_has_error(
+        r#"
+struct User {
+age: Int where self.length > 0
+}
+"#,
+        "has no property `length`",
+    );
+}
+
+/// A numeric comparison constraint on an `Option<Int>` field checks the inner
+/// `Int` (the constraint describes the present value), so it is valid — not
+/// rejected as `Option<Int>`-vs-`Int`.
+#[test]
+fn constraint_numeric_on_optional_int_valid() {
+    assert_no_errors(
+        r#"
+struct Config {
+maxRetries: Option<Int> where self >= 0 && self <= 10
+}
+"#,
+    );
+}
+
+/// An equality comparison constraint on an `Option<Int>` field checks the inner
+/// `Int` (same `Option` unwrap as the ordering operators, but exercising the
+/// `==` arm of the binary-op match), so it is valid.
+#[test]
+fn constraint_equality_on_optional_int_valid() {
+    assert_no_errors(
+        r#"
+struct Config {
+mode: Option<Int> where self == 0
+}
+"#,
+    );
+}
+
+/// The realistic optional idiom: a presence check `&&` an inner-length check on
+/// the same `Option<String>` field. `self.isSome()` resolves on the `Option`
+/// (method dispatch keeps `self` at its full type) while `self.length` unwraps to
+/// the inner `String` (field-access carve-out) — both paths in one expression.
+#[test]
+fn constraint_issome_and_length_on_optional_string_valid() {
+    assert_no_errors(
+        r#"
+struct User {
+bio: Option<String> where self.isSome() && self.length > 0
+}
+"#,
+    );
+}
+
+/// `self.length` on a `Map` field is rejected — `Map` is not a lengthable base
+/// for constraint purposes (only `String`/`List` are). Locks the `Map` arm of
+/// the same non-lengthable path that `Int` exercises.
+#[test]
+fn constraint_length_on_map_rejected() {
+    assert_has_error(
+        r#"
+struct Cache {
+entries: Map<String, Int> where self.length > 0
+}
+"#,
+        "has no property `length`",
+    );
+}
+
+/// `self.length` on a `Bytes` field is rejected — `Bytes` is deliberately
+/// excluded from the lengthable bases (byte-length is ambiguous and unused by
+/// any fixture), so the carve-out treats it like any other non-lengthable type.
+#[test]
+fn constraint_length_on_bytes_rejected() {
+    assert_has_error(
+        r#"
+struct Upload {
+blob: Bytes where self.length > 0
+}
+"#,
+        "has no property `length`",
+    );
+}
+
+/// Documents the known residual: a String/List *method* call (`self.contains`)
+/// on an `Option<T>` field is still rejected — but LOUDLY (a real diagnostic),
+/// not silently swallowed like the old field-access hole. The binary-op and
+/// field-access paths unwrap `Option` in a constraint; method dispatch does not.
+#[test]
+fn constraint_method_call_on_optional_rejected_loudly() {
+    assert_has_error(
+        r#"
+struct User {
+email: Option<String> where self.contains("@")
+}
+"#,
+        "no method `contains`",
+    );
+}
+
+/// Documents the other known residual: a struct-field access on an
+/// `Option<Struct>` field (`self.zip`) is still rejected — the `Option` unwrap in
+/// `check_field_access` feeds only the `.length` carve-out, not general field
+/// resolution (only the outer type is looked up as a struct). Rejection is LOUD
+/// (a real diagnostic) and names the inner struct, not `Option<Address>`.
+#[test]
+fn constraint_struct_field_access_on_optional_rejected_loudly() {
+    assert_has_error(
+        r#"
+struct Address {
+zip: Int
+}
+struct User {
+addr: Option<Address> where self.zip > 0
+}
+"#,
+        "type `Address` has no property `zip`",
+    );
+}
+
+/// A typo'd subfield on a *plain* (non-optional) struct field is reported through
+/// the struct branch — "struct `X` has no field `Y`", worded for a struct, not the
+/// built-in "type `T` has no property" carve-out. The struct branch returns early
+/// so the `in_constraint` check below cannot also fire (no double-report on the
+/// same span).
+#[test]
+fn constraint_struct_field_typo_rejected_once() {
+    assert_error_count_for_message(
+        r#"
+struct Address {
+zip: Int
+}
+struct User {
+addr: Address where self.zpi > 0
+}
+"#,
+        "struct `Address` has no field `zpi`",
+        1,
+    );
+}
+
 // ── Query param default value type mismatch ──────────────────────
 
 /// An Int query param with a String default produces an error.

@@ -709,6 +709,17 @@ pub struct Checker {
     /// the struct up by name without calling `resolve_type_expr`, so only the
     /// `response` resolution site sets this flag. Default `false`.
     pub(crate) file_bearing_struct_allowed: bool,
+    /// `true` solely while type-checking a struct field's `where` constraint
+    /// expression (see `register_struct`). Field access in a constraint is the one
+    /// place `self.<x>` appears on a built-in (non-struct) base: `self.length` is
+    /// the established string/list length property, and a typo like `self.lenght`
+    /// must be REJECTED rather than silently swallowed as an error type. Outside a
+    /// constraint, `check_field_access` keeps its lenient behavior (a non-struct
+    /// base returns `Type::Error` with no diagnostic) so general expression
+    /// checking — module/enum-qualified names, etc. — is unaffected. Default
+    /// `false`. See `docs/known-issues.md` (the `.length`/`Option<T>` constraint
+    /// entries this closes).
+    pub(crate) in_constraint: bool,
     /// Resolved type for each expression, keyed by source span.
     pub(crate) expr_types: HashMap<Span, Type>,
     /// Symbol references collected during checking.
@@ -806,6 +817,7 @@ impl Checker {
             current_type_param_bounds: Vec::new(),
             file_field_allowed: false,
             file_bearing_struct_allowed: false,
+            in_constraint: false,
             expr_types: HashMap::new(),
             symbol_references: HashMap::new(),
             call_type_args: HashMap::new(),
