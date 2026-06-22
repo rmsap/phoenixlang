@@ -3784,3 +3784,62 @@ wire keys verbatim. The Python round-trip harness's `to_snake` helper gained the
 aligned with the generated (alias-free) models. 519 sema + 256 codegen lib green (no
 snapshot churn — `gen_api.phx` is the round-trip schema, not a snapshotted fixture);
 clippy clean; 4 compile-lint targets + all round-trips green.
+
+## Phoenix Gen — v1 robustness pass (2026-06-20)
+
+A deliberate sweep against *valid-but-adversarial* schemas — the class of input the
+curated fixtures never exercise, which is where the prior slices' bugs kept hiding.
+Probed several dimensions by generating + compiling/importing the output; fixed what
+broke, rejected what can't be cleanly generated, and documented the rest. Guiding
+principle (matching the existing collision checks): **a valid schema must produce
+clean output or a clear schema-check error — never silently-wrong or uncompilable
+output.**
+
+**Fixed — silent data loss → sema rejection** (the worst class: wrong, not loud):
+- A **leading-underscore field name** (`_hidden`) — Python's pydantic treats it as a
+  private attribute (dropped from the model) and Go leaves it unexported (skipped by
+  `encoding/json`); two targets silently drop the field. Now rejected in
+  `register_struct` with a clear diagnostic.
+- Two field names that **collapse to the same `snake_case`** (`fooBar` + `foo_bar`) —
+  the Python model declares the attribute twice and the second silently wins. Now
+  rejected. A shared `phoenix_common::to_snake_case` (de-duplicated from the Python
+  backend) backs the check so it predicts exactly the names codegen emits.
+
+The check covers struct-field names — the primary data-bearing surface
+(request/response bodies are derived from named structs, and enum variant fields are
+positional, not named). Query/header param names are intentionally out of scope: a
+snake-collision there produces a duplicate-kwarg Python `SyntaxError` (loud,
+harness-caught) and a leading-underscore param is a valid, non-dropped function
+argument — neither is the silent-loss failure mode this check targets.
+
+**Fixed — crash / uncompilable on degenerate schemas:**
+- A schema with **no endpoints** (a types-only package) generated an empty Python
+  `class Handlers(Protocol):` body — an `IndentationError`. Now emits `pass`. The
+  rest of the no-endpoint output was made lint-clean across targets too: Go gates the
+  `net/http` import (a routeless chi server doesn't use it) and skips an empty import
+  group; TypeScript emits `Handlers` as `Record<string, never>` (eslint
+  `no-empty-object-type`), gates the `Request`/`Response`/`Handlers` imports, drops
+  the unused `createRouter` `handlers` param, and emits the empty client as
+  `export const api = {};` (prettier). A no-endpoint schema now generates and
+  compiles/lints on all four targets.
+
+**Probed and clear (no action needed):** unicode identifiers (`Café`/`naïve` — all
+three languages accept them), an empty struct, a single-variant enum, redefining a
+built-in type name (`struct Money` — already guarded by `reject_builtin_name_shadow`),
+and derived-body-type-name collisions (already rejected by
+`check_generated_type_collisions`).
+
+**Verification.** Two new compile-lint fixtures — `RESERVED_WORDS_SCHEMA` (prior
+slice) and `NO_ENDPOINT_SCHEMA` — run on all four targets; new sema regression tests
+cover the underscore / snake-collision rejections and a no-false-positive case
+(`name` + `avatarUrl` don't collide). 531 sema + 257 codegen + 77 common lib green
+(no snapshot churn — the new conditionals only fire on degenerate/adversarial input);
+clippy clean; all round-trips green.
+
+**Deferred (documented in [known-issues.md](known-issues.md)).** Two remaining
+identifier-collision cases, both **loud** (a target compile error the harness would
+catch), not silent: a **keyword type name** (`struct class`) and a **user type
+colliding with a fixed generated helper** (`struct ValidationError` vs the TS
+`ValidationError` class). Both are longer reserved-name-list extensions of the
+existing checks, lower-frequency (types are PascalCase by convention), and were
+scoped out behind the higher-value silent-data-loss rejections.

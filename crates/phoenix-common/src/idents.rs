@@ -45,9 +45,38 @@ pub fn to_screaming_snake(s: &str) -> String {
     result
 }
 
+/// Converts a `camelCase`/`PascalCase` name to `snake_case` (`avatarUrl` →
+/// `avatar_url`): a `_` before each non-leading uppercase char, then everything
+/// lowercased. The pure casing rule with no language-keyword escaping — the Python
+/// backend wraps this to escape keywords, and sema uses it to predict when two
+/// distinct field names would collide as one Python attribute. Shared so the
+/// collision check and the generator cannot diverge.
+pub fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            result.push('_');
+        }
+        result.push(c.to_lowercase().next().unwrap_or(c));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_snake_case_lowers_and_splits_camel() {
+        assert_eq!(to_snake_case("avatarUrl"), "avatar_url");
+        assert_eq!(to_snake_case("postId"), "post_id");
+        assert_eq!(to_snake_case("id"), "id");
+        assert_eq!(to_snake_case("foo_bar"), "foo_bar");
+        // `fooBar` and `foo_bar` both collapse to `foo_bar` — the collision sema
+        // rejects.
+        assert_eq!(to_snake_case("fooBar"), "foo_bar");
+        assert_eq!(to_snake_case(""), "");
+    }
 
     #[test]
     fn to_screaming_snake_splits_on_word_boundaries() {

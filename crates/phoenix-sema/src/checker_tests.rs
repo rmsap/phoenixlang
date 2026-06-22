@@ -3415,6 +3415,69 @@ maxRetries: Option<Int> where self.isSome()
     );
 }
 
+/// A field name starting with `_` is REJECTED — Python's pydantic model drops it
+/// (private attribute) and Go leaves it unexported, both a silent data loss.
+#[test]
+fn field_leading_underscore_rejected() {
+    assert_has_error(
+        r#"
+struct Thing {
+_hidden: Int
+}
+"#,
+        "starts with `_`",
+    );
+}
+
+/// Two field names that collapse to the same snake_case are REJECTED — the Python
+/// model would declare the attribute twice and silently drop one.
+#[test]
+fn fields_snake_case_collision_rejected() {
+    assert_has_error(
+        r#"
+struct Thing {
+fooBar: Int
+foo_bar: String
+}
+"#,
+        "snake_case collision",
+    );
+}
+
+/// Distinct field names that snake-case to distinct attributes are accepted (no
+/// false positive: `avatarUrl` and `name` don't collide).
+#[test]
+fn fields_distinct_snake_case_ok() {
+    assert_no_errors(
+        r#"
+struct Author {
+name: String
+avatarUrl: String
+}
+"#,
+    );
+}
+
+/// The collision check fires on a struct used as a request body (the
+/// codegen-relevant path, not just a free-standing struct) — the body model is the
+/// surface that actually crosses the wire, so the rejection must reach it.
+#[test]
+fn body_struct_snake_case_collision_rejected() {
+    assert_has_error(
+        r#"
+struct CreateThing {
+fooBar: Int
+foo_bar: String
+}
+endpoint createThing: POST "/things" {
+body CreateThing
+response CreateThing
+}
+"#,
+        "snake_case collision",
+    );
+}
+
 /// A typo'd constraint property (`self.lenght`) is REJECTED, not silently
 /// swallowed as an error type. Regression for the field-access-on-builtin hole.
 #[test]

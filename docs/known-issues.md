@@ -107,6 +107,29 @@ is fixed.
 collides with a lowercase keyword. **Target phase:** the broader v1 robustness pass
 (adversarial-identifier fixtures). Surfaced 2026-06-20.
 
+### A user type whose name collides with a generated helper class is not rejected
+
+The generated-type-collision check (`check_generated_type_collisions`) rejects a
+user type that collides with a *per-endpoint* generated type (`<Endpoint>Body`,
+`<Endpoint>Result`, …) and the multipart `FileUpload` helper. It does NOT yet cover
+the *fixed* helper classes a backend emits unconditionally: notably TypeScript's
+`ValidationError` (emitted whenever any body/param is validated) and `ApiError`
+(the client error class), plus `MultipartRequest`. A user `struct ValidationError`
+then emits both `export interface ValidationError` and the generated
+`export class ValidationError extends Error` — a duplicate-declaration TS compile
+error. (Built-in *type* names — `Money`/`Url`/`Bytes` — are already rejected by
+`reject_builtin_name_shadow`.)
+
+This is the same class of bug as the existing `FileUpload` check, just a longer
+(target-specific) reserved-name list; the robustness pass scoped it out after the
+higher-value silent-data-loss rejections (underscore / snake-collide field names).
+The failure is **loud** (a TS compile error surfaced by the compile-lint harness),
+not a silent miscompile.
+
+**Workaround:** avoid naming a struct/enum `ValidationError`, `ApiError`, or
+`MultipartRequest`. **Target phase:** extend `check_generated_type_collisions` with
+the fixed-helper reserved-name set. Surfaced 2026-06-20 in the robustness pass.
+
 ### Keyword escaping can collide with an explicit `<name>_` sibling
 
 Reserved-word handling escapes a keyword identifier by appending `_` (`class` →

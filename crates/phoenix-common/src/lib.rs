@@ -33,7 +33,7 @@ pub mod source;
 pub mod span;
 
 pub use diagnostics::Diagnostic;
-pub use idents::{capitalize, to_screaming_snake};
+pub use idents::{capitalize, to_screaming_snake, to_snake_case};
 pub use ids::{EnumId, FuncId, StructId, TraitId};
 pub use module_path::{ModulePath, module_qualify};
 pub use source::SourceMap;

@@ -895,6 +895,21 @@ endpoint createWidget: POST "/widgets" {
 }
 "#;
 
+/// A degenerate but valid schema: type declarations with **no endpoints** (a
+/// types-only package). Regression guard for the Python empty-`Protocol` crash (an
+/// endpoint-less `class Handlers(Protocol):` body is an `IndentationError` without a
+/// `pass`). Exercises every target's "no routes" path: an empty handler interface
+/// (`Handlers(Protocol)`/`interface Handlers {}`/`type Handlers interface {}`), an
+/// empty router, a client with no methods, and an OpenAPI spec with `paths: {}`.
+const NO_ENDPOINT_SCHEMA: &str = r#"
+struct Config {
+    retries: Int
+    label: String
+}
+
+enum Mode { fast  slow }
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -1128,6 +1143,7 @@ fn go_output_compiles_and_lints() {
     // `Url` (validated string) + `Bytes` (`[]byte`, auto base64).
     check_go_output(&generate_go_files(URL_BYTES_SCHEMA));
     check_go_output(&generate_go_files(RESERVED_WORDS_SCHEMA));
+    check_go_output(&generate_go_files(NO_ENDPOINT_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1169,6 +1185,7 @@ fn go_output_compiles_and_lints() {
         &go_chi_scaffold,
         &generate_go_chi_files(RESERVED_WORDS_SCHEMA),
     );
+    check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(NO_ENDPOINT_SCHEMA));
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -1233,6 +1250,7 @@ fn openapi_output_lints() {
     check_openapi_output("LIST_PARAM_SCHEMA", LIST_PARAM_SCHEMA);
     check_openapi_output("URL_BYTES_SCHEMA", URL_BYTES_SCHEMA);
     check_openapi_output("RESERVED_WORDS_SCHEMA", RESERVED_WORDS_SCHEMA);
+    check_openapi_output("NO_ENDPOINT_SCHEMA", NO_ENDPOINT_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -1370,6 +1388,7 @@ fn typescript_output_compiles_and_lints() {
     // `Url` branded + `Bytes` (`Uint8Array` revival + `encodeBytes` on send).
     check_typescript_output(&scaffold, &generate_typescript_files(URL_BYTES_SCHEMA));
     check_typescript_output(&scaffold, &generate_typescript_files(RESERVED_WORDS_SCHEMA));
+    check_typescript_output(&scaffold, &generate_typescript_files(NO_ENDPOINT_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1550,6 +1569,11 @@ fn python_output_compiles_and_lints() {
         &scaffold,
         &venv_bin,
         &generate_python_files(RESERVED_WORDS_SCHEMA),
+    );
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(NO_ENDPOINT_SCHEMA),
     );
 
     // Realistic schema fixture library (see FILE_FIXTURES).

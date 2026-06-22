@@ -494,6 +494,7 @@ impl Checker {
             self.consume_orphan_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
             return;
         }
+        self.check_codegen_safe_field_names(&s.fields);
         let fields: Vec<crate::checker::FieldInfo> =
             self.with_type_params(&s.type_params, None, |this| {
                 s.fields
@@ -580,6 +581,56 @@ impl Checker {
         );
 
         self.register_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
+    }
+
+    /// Rejects struct field names that the codegen backends cannot represent
+    /// without SILENTLY losing data — these are reported at schema-check time
+    /// rather than producing a quietly-wrong client/server:
+    ///
+    /// - A leading-underscore name (`_hidden`): the Python backend's pydantic
+    ///   model treats it as a private attribute (dropped from the model — the
+    ///   field vanishes from the wire), and Go leaves the field unexported (so
+    ///   `encoding/json` skips it). Two targets silently drop it.
+    /// - Two field names that collapse to the same `snake_case` (`fooBar` and
+    ///   `foo_bar`): the Python model declares the attribute twice and the second
+    ///   silently wins, dropping the first field.
+    ///
+    /// (Field names that merely collide with a *keyword* are escaped by the
+    /// backends and need no rejection — see the reserved-word handling.)
+    fn check_codegen_safe_field_names(&mut self, fields: &[phoenix_parser::ast::FieldDecl]) {
+        use std::collections::HashMap;
+        let mut seen_snake: HashMap<String, String> = HashMap::new();
+        for f in fields {
+            if f.name.starts_with('_') {
+                self.error(
+                    format!(
+                        "field `{}` starts with `_`, which the Python generator drops (a pydantic private attribute) and Go leaves unexported (skipped by `encoding/json`) — a silent data loss; rename it without the leading underscore",
+                        f.name
+                    ),
+                    f.span,
+                );
+                continue;
+            }
+            // The *pure* casing rule — no keyword escaping. This catches the
+            // collision codegen produces from distinct camel/snake spellings
+            // (`fooBar` + `foo_bar`), but NOT a collision introduced only by the
+            // Python backend's keyword escaping (`class` → `class_` colliding with
+            // an explicit `class_` sibling): that's the separate, documented
+            // "keyword escaping can collide with an explicit `<name>_` sibling"
+            // known issue, so this check is deliberately not exhaustive here.
+            let snake = phoenix_common::to_snake_case(&f.name);
+            if let Some(first) = seen_snake.get(&snake) {
+                self.error(
+                    format!(
+                        "fields `{first}` and `{}` both map to the Python attribute `{snake}` (a snake_case collision), which would silently drop one of them; rename one",
+                        f.name
+                    ),
+                    f.span,
+                );
+            } else {
+                seen_snake.insert(snake, f.name.clone());
+            }
+        }
     }
 
     /// Registers an enum declaration, resolving each variant's field types and

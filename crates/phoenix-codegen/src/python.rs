@@ -192,6 +192,11 @@ impl<'a> PyGenerator<'a> {
         self.handlers_out
             .push_str("\n\nclass Handlers(Protocol):\n");
 
+        // A schema with no endpoints (a types-only package) yields an empty
+        // Protocol body, which is a Python `IndentationError` — emit `pass`.
+        if self.check_result.endpoints.is_empty() {
+            self.handlers_out.push_str("    pass\n");
+        }
         for ep in &self.check_result.endpoints {
             self.emit_handler_method(ep);
         }
@@ -2837,15 +2842,12 @@ fn type_to_python(ty: &Type) -> String {
     }
 }
 
-/// Converts a camelCase identifier to snake_case.
+/// Converts a camelCase identifier to snake_case, then escapes Python keywords.
+/// The pure casing rule is the shared `phoenix_common::to_snake_case`, so sema's
+/// field-name-collision check (which uses the same function) predicts exactly the
+/// names this emits.
 fn to_snake_case(s: &str) -> String {
-    let mut result = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            result.push('_');
-        }
-        result.push(c.to_lowercase().next().unwrap_or(c));
-    }
+    let mut result = phoenix_common::to_snake_case(s);
     // A name that snake-cases to a Python keyword (`class`, `async`, `lambda`, …)
     // can't be an attribute/parameter name, so append `_`. This makes the snake
     // form diverge from the original wire name, which the existing alias logic
