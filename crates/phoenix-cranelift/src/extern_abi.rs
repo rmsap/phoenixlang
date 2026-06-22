@@ -150,6 +150,20 @@ pub(crate) fn callback_sig_codes(sig: &CallbackSig) -> Option<(String, char)> {
     Some((params, ret))
 }
 
+/// The exported name of the WASM `call_indirect`/`call_ref` trampoline for a
+/// callback signature: `__phoenix_invoke_closure_<param-codes>_to_<ret-code>`
+/// (e.g. every `(Int) -> Void` callback routes through
+/// `__phoenix_invoke_closure_i_to_v`). Shared by **both** WASM backends — the
+/// linear binding (which `call_indirect`s through the closure's env pointer) and
+/// the wasm32-gc binding (which `call_ref`s the closure's funcref) — so a single
+/// generated JS glue references the same name on either target. The native shim
+/// uses a distinct `phx_invoke_closure_*` name (a C symbol, not a JS export).
+/// `None` for a non-marshallable signature.
+pub(crate) fn wasm_closure_trampoline_name(sig: &CallbackSig) -> Option<String> {
+    callback_sig_codes(sig)
+        .map(|(params, ret)| format!("__phoenix_invoke_closure_{params}_to_{ret}"))
+}
+
 /// The distinct, marshallable callback signatures among a set of already-
 /// collected externs — every `ClosureRef`-typed parameter, deduped by structural
 /// signature and filtered to [`callback_sig_is_glue_supported`], in first-seen

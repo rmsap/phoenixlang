@@ -246,6 +246,13 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // functions (so the function/code sections stay parallel) and emit
     // their bodies right after the user bodies. See §Phase 2.4 K.10.
     builder.declare_dyn_trampolines(ir_module, &dyn_vtable_keys)?;
+    // Callback trampolines: one exported `call_ref` trampoline
+    // per distinct closure signature handed to a host, so the JS glue can invoke
+    // a Phoenix closure. Declared after the user functions / dyn trampolines (so
+    // their indices precede `_start`); bodies emitted after the dyn-trampoline
+    // bodies. No-op without callback externs.
+    let callback_sigs = crate::extern_abi::callback_sigs_in_externs(&externs);
+    builder.declare_callback_trampolines(&callback_sigs)?;
     // `ref.func` validation requires every closure target and dyn
     // trampoline in an `(elem declare func …)` segment — emitted now
     // that the function indices exist. See §Phase 2.4 K.8 / K.10.
@@ -261,6 +268,9 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // dyn trampoline bodies last among the deferred bodies (after the
     // user bodies), keeping the function/code sections parallel.
     builder.emit_dyn_trampoline_bodies(ir_module, &dyn_vtable_keys)?;
+    // Callback trampoline bodies, in the same order they were declared — kept
+    // parallel with their function-section entries (the dyn-trampoline pattern).
+    builder.emit_callback_trampoline_bodies()?;
     builder.emit_start_body()?;
 
     builder.finish()

@@ -359,10 +359,10 @@ fn module_has_externref_func_type(bytes: &[u8]) -> Result<bool, String> {
 /// `externref` (Phase 2.5 decision D), and still validates (with reference-types
 /// enabled). The `Void`-returning `notify` exercises the empty-results flattening
 /// (`gc_extern_valtypes(Void) -> []`). Structural-tier: the `js.*` imports are
-/// unsatisfied until the wasm32-gc JS glue (PR 15), so it can't run under bare
-/// wasmtime; `String` marshalling (PR 13) and closures (PR 14) are still rejected
-/// (see the `extern_js_rejects_*` tests), so this exercises exactly the PR-12
-/// scalar + `JsValue` surface.
+/// unsatisfied until the wasm32-gc JS glue, so it can't run under bare
+/// wasmtime. Scoped to the scalar + `JsValue` surface; `String` marshalling (PR
+/// 13) and closure callbacks have their own dedicated tests
+/// (`extern_js_string_*` / `extern_js_closure_callback_*`).
 #[test]
 fn extern_js_imports_externref_and_validates_on_wasm32_gc() {
     let source = "extern js {\n  \
@@ -440,18 +440,6 @@ fn extern_js_repeated_call_emits_single_import_on_wasm32_gc() {
     );
 }
 
-/// Compile `source` through `Target::Wasm32Gc` expecting *failure*, returning the
-/// diagnostic string. The front end (lexer → parser → sema → IR) must still
-/// succeed — these programs are well-typed and compile on the linear/native
-/// backends; the rejection is specific to the wasm32-gc boundary marshalling
-/// not-yet-implemented for this phase, raised at import declaration.
-fn compile_to_wasm_gc_expecting_error(source: &str) -> String {
-    let ir_module = lower_to_ir(source);
-    compile(&ir_module, Target::Wasm32Gc)
-        .expect_err("wasm32-gc compile should have rejected this extern boundary type")
-        .to_string()
-}
-
 /// The function-export names of a module (mirrors `import_names`), so a test can
 /// assert the wasm32-gc String-marshalling helpers are exported for the glue.
 fn export_func_names(bytes: &[u8]) -> Result<Vec<String>, String> {
@@ -471,21 +459,201 @@ fn export_func_names(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// A closure (callback) parameter on an `extern js` function is rejected at import
-/// declaration on wasm32-gc (callbacks land in PR 14), naming its landing PR, so
-/// no import is emitted that the glue can't yet satisfy.
+/// A Phoenix closure handed to a host as an `extern js` callback
+/// crosses as its `(ref null $clo_SIG)` managed ref and is invoked through an
+/// exported `__phoenix_invoke_closure_<sig>` trampoline (one per distinct callback
+/// signature, the same name the linear backend uses so one glue serves both). The
+/// host VM traces a host-retained closure ref automatically — no pin/unpin export
+/// (the gc win over linear). Exercises a `(Int) -> Void`, a value-returning
+/// `(Int) -> Int`, a ref-param `(String) -> Void`, and a `(JsValue) -> Bool`
+/// callback — the last two so the trampoline's non-`i64` slots are covered (a
+/// `(ref $string)` param, an `externref` param, and an `i32`/`Bool` result),
+/// not just scalars; the module still validates (the trampolines `call_ref` the
+/// closure funcref).
+/// Structural-tier (the `js.*` imports are unsatisfied until the glue);
+/// that the trampoline actually dispatches to the right closure body is verified
+/// round-trip once the glue lands in, mirroring the `extern_js_string_*`
+/// tests.
 #[test]
-fn extern_js_rejects_closure_param_on_wasm32_gc() {
-    let source = "extern js { function eachUpTo(n: Int, cb: (Int) -> Void) }\n\
-                  function main() { eachUpTo(3, function(i: Int) { print(i) }) }\n";
-    let err = compile_to_wasm_gc_expecting_error(source);
+fn extern_js_closure_callback_exports_trampoline_and_validates_on_wasm32_gc() {
+    let source = "extern js {\n  \
+                    function getValue() -> JsValue\n  \
+                    function eachUpTo(n: Int, cb: (Int) -> Void)\n  \
+                    function sumMap(n: Int, cb: (Int) -> Int) -> Int\n  \
+                    function logEach(label: String, cb: (String) -> Void)\n  \
+                    function probe(v: JsValue, cb: (JsValue) -> Bool) -> Bool\n\
+                  }\n\
+                  function main() {\n  \
+                    eachUpTo(3, function(i: Int) { print(i) })\n  \
+                    print(sumMap(4, function(i: Int) -> Int { i * i }))\n  \
+                    logEach(\"tag\", function(s: String) { print(s) })\n  \
+                    print(probe(getValue(), function(v: JsValue) -> Bool { true }))\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_closure_callback");
+
+    // One exported trampoline per distinct callback signature — including the
+    // ref-param `s_to_v` (param flattens to `(ref $string)`) and `j_to_b` (an
+    // `externref` param and an `i32`/`Bool` result, so non-`i64` slots are
+    // exercised on both sides of the `call_ref`).
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
+    for tramp in [
+        "__phoenix_invoke_closure_i_to_v",
+        "__phoenix_invoke_closure_i_to_i",
+        "__phoenix_invoke_closure_s_to_v",
+        "__phoenix_invoke_closure_j_to_b",
+    ] {
+        assert!(
+            exports.iter().any(|e| e == tramp),
+            "a callback extern should export the trampoline `{tramp}`, got: {exports:?}"
+        );
+    }
+
+    // No pin/unpin exports on wasm32-gc — the host VM traces the closure ref
+    // (decision G); pinning is the linear binding's manual-rooting machinery.
     assert!(
-        err.contains("eachUpTo"),
-        "diagnostic should name the rejected extern: {err}"
+        !exports
+            .iter()
+            .any(|e| e == "phx_gc_pin" || e == "phx_gc_unpin"),
+        "wasm32-gc must not export GC pin/unpin (no manual rooting): {exports:?}"
     );
+
+    // Non-WASI imports are exactly the five declared externs (the four
+    // callback-taking ones plus the `getValue` that feeds `probe`).
+    let imports = import_names(&bytes).unwrap_or_else(|e| panic!("parsing imports: {e}"));
+    let mut non_wasi: Vec<&str> = imports
+        .iter()
+        .filter(|(m, _)| m != "wasi_snapshot_preview1")
+        .map(|(m, n)| {
+            assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+            n.as_str()
+        })
+        .collect();
+    non_wasi.sort_unstable();
+    assert_eq!(
+        non_wasi,
+        vec!["eachUpTo", "getValue", "logEach", "probe", "sumMap"],
+        "non-WASI imports should be exactly the declared externs: {imports:?}"
+    );
+}
+
+/// A *multi-parameter* callback (`(Int, String) -> Bool`) exercises the
+/// trampoline body's argument-forwarding loop with more than one user slot — the
+/// single-param callbacks above only ever run it with `n_user_slots == 1`. The
+/// forwarding is checked *structurally* by validation, not just by the export
+/// name: the body pushes `closure, local1 (i64), local2 ((ref $string))` and
+/// `call_ref`s the closure's `$fn_SIG`, so if the loop forwarded the wrong number
+/// of args — or pushed the heterogeneous `Int`/`String` slots in the wrong order —
+/// the `call_ref` operand stack would mismatch `$fn_SIG` and `wasmparser` would
+/// reject the module. A validating `__phoenix_invoke_closure_is_to_b` therefore
+/// proves the loop forwards exactly `param_types.len()` slots, in order, for
+/// `n > 1`. Structural-tier, like the sibling callback tests (round-trip arrives
+/// with the glue).
+#[test]
+fn extern_js_multi_param_callback_forwards_all_slots_on_wasm32_gc() {
+    let source = "extern js {\n  \
+                    function zip(n: Int, cb: (Int, String) -> Bool) -> Bool\n\
+                  }\n\
+                  function main() {\n  \
+                    print(zip(3, function(i: Int, s: String) -> Bool { true }))\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_multi_param_callback");
+
+    // The two-param `(Int, String) -> Bool` signature gets its own trampoline,
+    // named from both param codes (`is`) and the return code (`b`). That it
+    // validates is the load-bearing assertion (see the doc comment): a
+    // mis-forwarded `call_ref` would not type-check.
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
     assert!(
-        err.contains("PR 14"),
-        "diagnostic should name closure callbacks' landing PR: {err}"
+        exports
+            .iter()
+            .any(|e| e == "__phoenix_invoke_closure_is_to_b"),
+        "a `(Int, String) -> Bool` callback should export `__phoenix_invoke_closure_is_to_b`, \
+         got: {exports:?}"
+    );
+}
+
+/// Two `extern js` functions that take the *same* callback signature
+/// (`(Int) -> Void`) share a single trampoline: the signature is deduped by
+/// `callback_sigs_in_externs`, so the module exports exactly one
+/// `__phoenix_invoke_closure_i_to_v` (not one per extern). Both externs still get
+/// their own import. Locks in the dedup the JS glue relies on (it builds one
+/// factory per distinct signature).
+#[test]
+fn extern_js_shared_callback_signature_exports_one_trampoline_on_wasm32_gc() {
+    let source = "extern js {\n  \
+                    function forEach(n: Int, cb: (Int) -> Void)\n  \
+                    function repeat(times: Int, cb: (Int) -> Void)\n\
+                  }\n\
+                  function main() {\n  \
+                    forEach(3, function(i: Int) { print(i) })\n  \
+                    repeat(2, function(i: Int) { print(i) })\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_shared_callback_signature");
+
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
+    let trampolines = exports
+        .iter()
+        .filter(|e| e.as_str() == "__phoenix_invoke_closure_i_to_v")
+        .count();
+    assert_eq!(
+        trampolines, 1,
+        "two externs sharing `(Int) -> Void` must export exactly one \
+         `__phoenix_invoke_closure_i_to_v`, got {trampolines}: {exports:?}"
+    );
+
+    // Both externs are still imported (dedup is on the trampoline, not the import).
+    let imports = import_names(&bytes).unwrap_or_else(|e| panic!("parsing imports: {e}"));
+    let mut non_wasi: Vec<&str> = imports
+        .iter()
+        .filter(|(m, _)| m != "wasi_snapshot_preview1")
+        .map(|(_, n)| n.as_str())
+        .collect();
+    non_wasi.sort_unstable();
+    assert_eq!(
+        non_wasi,
+        vec!["forEach", "repeat"],
+        "both callback externs should still be imported: {imports:?}"
+    );
+}
+
+/// A *nested*-closure callback (`((Int) -> Void) -> Void`) is not glue-supported
+/// (a callback whose own parameter is a closure has no marshalling code), so it
+/// takes the deferral path: the extern is still imported (the closure crosses as
+/// its `(ref null $clo_SIG)` managed ref, a single slot), but **no** trampoline is
+/// emitted for it — the glue wires a throwing thunk. This mirrors the
+/// linear backend, where the same callback crosses as a bare `i32` env pointer
+/// with no trampoline. The point is that the non-glue-supported subset compiles
+/// gracefully (a clean module, not a confusing internal error) rather than being
+/// hard-rejected, and that the trampoline emitter never names a signature it can't
+/// marshal.
+#[test]
+fn extern_js_nested_closure_callback_defers_without_trampoline_on_wasm32_gc() {
+    let source = "extern js {\n  \
+                    function runWith(cb: ((Int) -> Void) -> Void)\n\
+                  }\n\
+                  function main() {\n  \
+                    runWith(function(g: (Int) -> Void) { g(0) })\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_nested_closure_callback");
+
+    // The extern is imported (the closure flattens to a single managed ref)…
+    let imports = import_names(&bytes).unwrap_or_else(|e| panic!("parsing imports: {e}"));
+    assert!(
+        imports.iter().any(|(m, n)| m == "js" && n == "runWith"),
+        "the nested-closure extern should still be imported: {imports:?}"
+    );
+
+    // …but no callback trampoline is emitted for the non-glue-supported signature.
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
+    assert!(
+        !exports
+            .iter()
+            .any(|e| e.starts_with("__phoenix_invoke_closure_")),
+        "a nested-closure callback must not emit a trampoline: {exports:?}"
     );
 }
 

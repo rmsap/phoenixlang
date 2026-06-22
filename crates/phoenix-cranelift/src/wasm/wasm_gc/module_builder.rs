@@ -48,25 +48,48 @@ use super::translate;
 /// — the JS host can't read a gc object, so the glue copies the bytes
 /// through the linear-memory scratch region via the exported
 /// `phx_extern_str_to_scratch` / `phx_extern_str_from_scratch` helpers.
-/// A `Void` return flattens to no result; a `Void` *parameter* can't occur (sema
-/// rejects it). Only closure callbacks remain unsupported.
+/// A closure crosses as its `(ref null $clo_SIG)` managed ref — the host VM
+/// traces a host-retained callback automatically (no manual rooting, decision G),
+/// and the glue invokes it through the exported `__phoenix_invoke_closure_<sig>`
+/// trampoline. A `Void` return flattens to no result; a `Void`
+/// *parameter* can't occur (sema rejects it). Every marshallable boundary type
+/// now crosses; the catch-all guards an internal-bug shape (sema rejects
+/// non-marshallable extern types upstream).
 fn gc_extern_valtypes(b: &ModuleBuilder, ty: &IrType) -> Result<Vec<ValType>, CompileError> {
     match ty {
-        // Scalars, `Void`, `JsValue` (externref), and `String` (`(ref $string)`)
-        // all flatten the same way they do for in-program use.
+        // Scalars, `Void`, `JsValue` (externref), `String` (`(ref $string)`), and
+        // a closure (`(ref $clo_SIG)`) all flatten the same way they do for
+        // in-program use — each a single slot.
         IrType::I64
         | IrType::F64
         | IrType::Bool
         | IrType::Void
         | IrType::JsValue
-        | IrType::StringRef => translate::wasm_valtypes_for(ty, b),
-        IrType::ClosureRef { .. } => Err(CompileError::new(
-            "closure callbacks land in Phase 2.5 PR 14",
-        )),
+        | IrType::StringRef
+        | IrType::ClosureRef { .. } => translate::wasm_valtypes_for(ty, b),
         other => Err(CompileError::new(format!(
             "`{other:?}` is not marshallable across the `extern js` boundary"
         ))),
     }
+}
+
+/// A recorded `extern js` callback trampoline awaiting its body.
+/// Declared (function-section entry + export) early so its index precedes
+/// `_start`; the body is emitted after the user / dyn-trampoline bodies, keeping
+/// the function- and code-section orders parallel (the dyn-trampoline pattern).
+struct CallbackTrampoline {
+    /// The closure signature parent struct type (`$clo_SIG`) — param 0's type and
+    /// the `struct.get` target for the funcref field.
+    parent_idx: u32,
+    /// The closure's function-reference type (`$fn_SIG`) — the `call_ref` type.
+    fn_type_idx: u32,
+    /// Number of user-argument slots the body forwards (locals `1..=n`; local 0
+    /// is the closure). The trampoline's params are built with the *same*
+    /// `single_slot_for` helper as the closure's `$fn_SIG`
+    /// ([`Self::declare_callback_trampolines`]), which yields exactly one slot per
+    /// param — so this is just the user param count, and the trampoline params
+    /// can't desync from the funcref's signature by construction.
+    n_user_slots: u32,
 }
 
 /// Compose the `extern_import_lookup` key for an `extern js` host function.
@@ -275,12 +298,19 @@ pub(super) struct ModuleBuilder {
 
     /// WASM function index of each `extern js` custom import, keyed by the
     /// NUL-joined `(module, name)` ([`extern_import_key`], matching the linear
-    /// builder) so lookups don't allocate a tuple (Phase 2.5 — the wasm32-gc
+    /// builder) so lookups don't allocate a tuple (the wasm32-gc
     /// binding). Populated by [`Self::declare_extern_imports`], read by the
     /// `Op::ExternCall` lowering. Like `fd_write`, these are imports, so they
     /// must be declared before any local function is added (function indices are
     /// imports-first).
     extern_import_lookup: HashMap<String, u32>,
+
+    /// Recorded `extern js` callback trampolines, one per
+    /// distinct closure signature handed to a host. Populated by
+    /// [`Self::declare_callback_trampolines`] (function-section entry + export)
+    /// and drained by [`Self::emit_callback_trampoline_bodies`] (code-section
+    /// body, in the same order). Empty for a program with no callback externs.
+    callback_trampolines: Vec<CallbackTrampoline>,
 
     /// WASM function index of the synthesized `phx_print_i64` helper
     /// (digit conversion + `fd_write` with newline). Populated by
@@ -578,6 +608,7 @@ impl ModuleBuilder {
             import_func_count: 0,
             fd_write_idx: None,
             extern_import_lookup: HashMap::new(),
+            callback_trampolines: Vec::new(),
             print_i64_idx: None,
             start_idx: None,
             phx_main_idx: None,
@@ -1858,6 +1889,125 @@ impl ModuleBuilder {
         if marshal.string_in {
             let from_idx = string_helpers::synthesize_extern_str_from_scratch(self)?;
             self.export_func("phx_extern_str_from_scratch", from_idx);
+        }
+        Ok(())
+    }
+
+    /// Declare and export one `call_ref` trampoline per distinct callback
+    /// signature handed to a host (the wasm32-gc binding). A
+    /// Phoenix closure crosses to the JS host as its `(ref null $clo_SIG)` managed
+    /// ref; the glue invokes it by calling `__phoenix_invoke_closure_<sig>(closure,
+    /// args…)`, which `call_ref`s the closure's funcref — the standalone-function
+    /// form of [`super::closures::emit_closure_call`]. The trampoline name matches
+    /// the linear backend's (both WASM bindings share one generated glue,
+    /// decision C). The host VM traces a host-retained closure ref automatically,
+    /// so there is **no** pin/unpin and no rooting (the gc win over linear,
+    /// decision G).
+    ///
+    /// Adds only the function-section entry + export here; the body is emitted by
+    /// [`Self::emit_callback_trampoline_bodies`] after the user / dyn-trampoline
+    /// bodies, so the section orders stay parallel. Must run before
+    /// [`Self::declare_start`].
+    pub(super) fn declare_callback_trampolines(
+        &mut self,
+        sigs: &[crate::extern_abi::CallbackSig],
+    ) -> Result<(), CompileError> {
+        for sig in sigs {
+            let name = crate::extern_abi::wasm_closure_trampoline_name(sig).ok_or_else(|| {
+                CompileError::new(
+                    "wasm32-gc: a callback signature reached trampoline declaration \
+                     without a marshalling name (internal compiler bug — \
+                     `collect_callback_signatures` should only yield marshallable \
+                     signatures)",
+                )
+            })?;
+            // The closure's `($fn_SIG, $clo_SIG)` indices. Unlike the linear
+            // backend — which builds its trampoline type purely from the
+            // signature's `wasm_valtypes_for` and so never needs the closure
+            // declared — the gc trampoline `call_ref`s the funcref and must name
+            // the concrete `$fn_SIG`/`$clo_SIG`, so it depends on
+            // `declare_phoenix_closures` having recorded this signature. That
+            // dependency can't fail for a valid program: `sigs` comes from
+            // `callback_sigs_in_externs`, which draws only from *called* externs
+            // (`Op::ExternCall`), and a closure passed as a call argument is an SSA
+            // value whose `ClosureRef` type `declare_phoenix_closures`'s `walk_type`
+            // visits — so the signature is always recorded by the time we get here.
+            // The `ok_or_else` is the internal-bug guard, not an expected path.
+            let key: super::closures::ClosureSigKey =
+                (sig.param_types.clone(), sig.return_type.clone());
+            let (fn_type_idx, parent_idx) = self.require_closure_sig(&key)?;
+
+            // Trampoline signature: `(closure parent ref, user args…) -> ret`,
+            // built through the *same* `single_slot_for` per-param/return helper
+            // that `declare_phoenix_closures` uses to build the closure's
+            // `$fn_SIG` (and the same `IrType::Void => []` return rule) — so the
+            // trampoline's flattened params/return are identical to the funcref it
+            // `call_ref`s by construction, not merely equal today. The one
+            // deliberate difference is param 0: narrowed from the abstract `(ref
+            // null struct)` env to the concrete `(ref null $clo_SIG)` — a subtype,
+            // so `call_ref` still validates, and a typed ref is nicer for the glue.
+            let parent_ref = wasm_encoder::ValType::Ref(wasm_encoder::RefType {
+                nullable: true,
+                heap_type: wasm_encoder::HeapType::Concrete(parent_idx),
+            });
+            let mut params = vec![parent_ref];
+            for ty in &sig.param_types {
+                params.push(super::closures::single_slot_for(
+                    ty,
+                    self,
+                    "callback trampoline parameter",
+                )?);
+            }
+            let returns: Vec<ValType> = match &sig.return_type {
+                IrType::Void => Vec::new(),
+                ty => vec![super::closures::single_slot_for(
+                    ty,
+                    self,
+                    "callback trampoline return",
+                )?],
+            };
+            // `single_slot_for` yields exactly one slot per user param, so the
+            // body forwards `param_types.len()` user-arg locals (locals `1..=n`).
+            let n_user_slots = sig.param_types.len() as u32;
+
+            let type_idx = self.intern_signature(&params, &returns);
+            let idx = self.add_local_function(type_idx);
+            self.export_func(&name, idx);
+            self.callback_trampolines.push(CallbackTrampoline {
+                parent_idx,
+                fn_type_idx,
+                n_user_slots,
+            });
+        }
+        Ok(())
+    }
+
+    /// Emit the body of every callback trampoline declared by
+    /// [`Self::declare_callback_trampolines`], in the same order. Each forwards
+    /// its params (`closure`, then the user-arg slots) and `call_ref`s the
+    /// closure's funcref (loaded from `$clo_SIG` field 0) — the env-pointer ABI of
+    /// [`super::closures::emit_closure_call`], as a standalone exported function.
+    /// Must run after the user / dyn-trampoline bodies and before
+    /// [`Self::emit_start_body`], so the function- and code-section orders stay
+    /// parallel (alongside the dyn-trampoline bodies).
+    pub(super) fn emit_callback_trampoline_bodies(&mut self) -> Result<(), CompileError> {
+        let trampolines = std::mem::take(&mut self.callback_trampolines);
+        for t in &trampolines {
+            let mut f = wasm_encoder::Function::new([]);
+            // env (the closure), then the user args.
+            f.instruction(&wasm_encoder::Instruction::LocalGet(0));
+            for i in 0..t.n_user_slots {
+                f.instruction(&wasm_encoder::Instruction::LocalGet(i + 1));
+            }
+            // Load the funcref from the closure and `call_ref`.
+            f.instruction(&wasm_encoder::Instruction::LocalGet(0));
+            f.instruction(&wasm_encoder::Instruction::StructGet {
+                struct_type_index: t.parent_idx,
+                field_index: super::closures::CLO_CODE,
+            });
+            f.instruction(&wasm_encoder::Instruction::CallRef(t.fn_type_idx));
+            f.instruction(&wasm_encoder::Instruction::End);
+            self.code.function(&f);
         }
         Ok(())
     }

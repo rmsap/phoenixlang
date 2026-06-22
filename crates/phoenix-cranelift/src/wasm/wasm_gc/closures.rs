@@ -281,8 +281,16 @@ fn closure_depth(ty: &IrType) -> usize {
 }
 
 /// Resolve one closure-related type to its single WASM slot via the
-/// shared mapping, with a closure-specific diagnostic label.
-fn single_slot_for(ty: &IrType, b: &ModuleBuilder, what: &str) -> Result<ValType, CompileError> {
+/// shared mapping, with a closure-specific diagnostic label. Used both to
+/// build a closure's `$fn_SIG` (here) and the callback `call_ref` trampoline's
+/// signature ([`ModuleBuilder::declare_callback_trampolines`]) — sharing this
+/// one helper is what keeps the trampoline's flattened params/return identical
+/// to the funcref it calls *by construction*, not merely equal today.
+pub(super) fn single_slot_for(
+    ty: &IrType,
+    b: &ModuleBuilder,
+    what: &str,
+) -> Result<ValType, CompileError> {
     let slots = wasm_valtypes_for(ty, b)?;
     if slots.len() == 1 {
         Ok(slots[0])
@@ -329,7 +337,7 @@ fn walk_type(ty: &IrType, sigs: &mut HashSet<ClosureSigKey>) {
 // ───────────────────────── K.8 closure lowerings ─────────────────────────
 
 /// `$clo_SIG` field index of `$code`.
-const CLO_CODE: u32 = 0;
+pub(super) const CLO_CODE: u32 = 0;
 
 /// `Op::ClosureAlloc(target, captures)` — `ref.func $target` plus the
 /// capture values, wrapped in `struct.new $site_target`. The result

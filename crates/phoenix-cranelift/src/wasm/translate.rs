@@ -234,21 +234,8 @@ pub(super) fn declare_extern_imports(
 // keep referring to `translate::*` unchanged.
 pub(super) use crate::extern_abi::{
     CallbackSig, ExternSig, callback_sigs_in_externs, collect_callback_signatures, collect_externs,
+    wasm_closure_trampoline_name as closure_trampoline_name,
 };
-
-/// The exported name of the WASM `call_indirect` trampoline for a callback
-/// signature: `__phoenix_invoke_closure_<param-codes>_to_<ret-code>` (e.g. every
-/// `(Int) -> Void` callback in the module routes through
-/// `__phoenix_invoke_closure_i_to_v`). Built from the shared
-/// [`crate::extern_abi::callback_sig_codes`] so the trampoline emitter and the
-/// glue derive the same name; the native binding formats its own
-/// `phx_invoke_closure_*` name from the same codes. Returns `None` for a
-/// non-marshallable signature, so callers never name a trampoline they can't also
-/// marshal.
-pub(super) fn closure_trampoline_name(sig: &CallbackSig) -> Option<String> {
-    crate::extern_abi::callback_sig_codes(sig)
-        .map(|(params, ret)| format!("__phoenix_invoke_closure_{params}_to_{ret}"))
-}
 
 /// Reject a placeholder-typed field at codegen. Used at both the
 /// alloc and get sites for enum-variant fields where a `result_type`
