@@ -1903,3 +1903,62 @@ endpoint chunks: GET "/chunks" {
         files.client
     );
 }
+
+/// Guards the lockstep coupling between the generator's `is_python_keyword` and the
+/// round-trip harness's `keyword.iskeyword` (tests/roundtrip/python/harness.py
+/// `to_snake`): both decide the escaped wire key for a keyword model field, so they
+/// must agree on exactly which lowercased identifiers are escaped. Without this, a
+/// stray edit to the `is_python_keyword` match arm (a dropped or added word) would go
+/// unnoticed until a fixture happened to use the drifted word — the existing
+/// `class`/`async` round-trip only covers those two.
+///
+/// `HARD_KEYWORDS` is a checked-in copy of CPython's `keyword.kwlist` with the three
+/// capitalized keywords (`True`/`False`/`None`) removed — `is_python_keyword`'s sole
+/// caller lowercases its input first, so those can never reach it (their lowercased
+/// forms are legal identifiers). This is exactly the set `keyword.iskeyword` returns
+/// true for on a lowercased string, so asserting `is_python_keyword` matches it pins
+/// the generator to the same decision the harness makes at runtime.
+#[test]
+fn is_python_keyword_matches_cpython_hard_keyword_set() {
+    // CPython `keyword.kwlist` minus `True`/`False`/`None`. Stable since 3.10
+    // (`async`/`await` became hard keywords in 3.7; no hard keyword has been added
+    // or removed since). If a future Python promotes a soft keyword (`match`/`case`/
+    // `type`/`_`) to hard, add it here AND in `is_python_keyword` (harness.py picks
+    // it up automatically via `keyword.iskeyword`).
+    const HARD_KEYWORDS: &[&str] = &[
+        "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
+        "elif", "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is",
+        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with",
+        "yield",
+    ];
+
+    for kw in HARD_KEYWORDS {
+        assert!(
+            is_python_keyword(kw),
+            "`{kw}` is a Python hard keyword but is_python_keyword returned false — \
+             the match arm has drifted from keyword.kwlist",
+        );
+    }
+
+    // Nothing OUTSIDE that set may be escaped, or the generator would diverge from
+    // the harness (which escapes only `keyword.iskeyword` matches). Spot-check the
+    // categories the doc comment on `is_python_keyword` calls out as intentionally
+    // excluded: soft keywords, builtins, the lowercased forms of the capitalized
+    // keywords, and an already-escaped identifier (idempotence of the escape).
+    const NOT_ESCAPED: &[&str] = &[
+        // soft keywords (legal identifiers)
+        "match", "case", "type", "_", // builtins / common identifiers
+        "id", "list", "dict", "str", "self", "object",
+        // lowercased capitalized keywords — reach the check post-lowercasing and stay
+        "true", "false", "none", // an already-escaped keyword must not be re-escaped
+        "class_", "async_",
+    ];
+
+    for ident in NOT_ESCAPED {
+        assert!(
+            !is_python_keyword(ident),
+            "`{ident}` is not a Python hard keyword but is_python_keyword returned \
+             true — escaping it would diverge from the harness's keyword.iskeyword",
+        );
+    }
+}

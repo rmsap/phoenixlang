@@ -3682,3 +3682,105 @@ up the outer type), loud, no fixture hits it; tracked in
 still rejected, naming the inner type); 527 sema lib tests green; 256 codegen
 snapshots unchanged (sema-only, output byte-identical); Go compile-lint + driver
 suite (uncapped) green; clippy clean.
+
+## Phoenix Gen — reserved-word handling + multi-word path-param fix (2026-06-20)
+
+Found by stress-testing rather than curated fixtures: a schema whose identifiers
+collide with a **target-language keyword** generated **uncompilable output**, with
+no diagnostic. The generators used Phoenix identifiers verbatim, so a field `class`
+emitted `class: str` (a Python `SyntaxError`); a query/path param `range`/`map`/
+`func` emitted Go `range := …` (a Go syntax error). Phoenix's own parser rejects
+names that are *Phoenix* keywords (`type`, `return`, `import`), which had masked the
+gap — but `class`, `async`, `interface`, `func`, `range`, `map`, … are valid Phoenix
+identifiers and only blow up downstream. No fixture used such names.
+
+**The rule: escape the language identifier, never the wire name** — with one
+acknowledged exception, Python **model fields**, which carry no alias and so
+serialize by the (escaped) attribute name (`class` → wire key `class_`). That is
+*not* a regression: Python models already serialize multi-word fields by their
+snake_case name (`avatarUrl` → `avatar_url`), so the Python wire form already
+diverges from Go/TS — the Python round-trip is same-language, where the convention
+holds (see the "no `Field(alias=…)`" note in python.rs). Keyword field escaping just
+extends that existing convention. Everywhere else (Go fields/params, TS
+fields/params, all query/header/path params on every target) the wire name is
+preserved verbatim.
+
+Each target has its own keyword set and its own positions where a schema name
+becomes a *binding* (vs. a wire string or an object/property key, which tolerate
+keywords):
+
+- **Go** — struct fields are exported (`to_pascal_case`, capitalized), and Go
+  keywords are lowercase, so fields are inherently safe; the wire name rides a JSON
+  tag or a `Query().Get("…")` literal. Only lowercase **param/local** identifiers
+  collide. Fixed by escaping in `to_camel` (append `_`: `range_`, `map_`, `func_`) —
+  the single function all param idents flow through, so sig/locals/handler-args/the
+  collision-avoidance set stay consistent in one change. Beyond the 25 keywords,
+  `to_camel` also escapes two **predeclared** identifiers, `nil` and `iota`, which
+  are not keywords but which the generated body uses as bare literals no local-
+  renaming can dodge (a param `nil` would shadow the predeclared `nil`, so
+  `return nil, err` stops compiling). Predeclared *types* (`int`, `string`) and
+  *builtins* (`len`, `make`) are left alone: shadowing them as a parameter is legal
+  Go, so escaping would be pure churn (`is_go_unsafe_predeclared`).
+- **TypeScript** — object **property** names accept reserved words (`{ class: … }`,
+  `interface Item { class: string }` are legal), so struct fields and the
+  `query`/`headers` objects need nothing. Only **path params** become standalone
+  bindings (a client positional param + a server `const` + the URL template var).
+  Fixed with `safe_ts_ident` (trailing `_`) at those binding sites + `build_url_expr`
+  (which interpolates `${binding}`); member access (`req.params.class`) keeps the
+  original wire key. `is_ts_reserved` covers the ECMAScript reserved words plus
+  `eval`/`arguments`, which are not reserved words but are illegal as binding names
+  in strict-mode code — and generated TS is an ES module, hence always strict, so a
+  path param `{eval}` would otherwise emit `const eval = …`, a `SyntaxError`.
+- **Python** — the worst case: model **field** names and **param** names are all
+  attribute/parameter bindings. Fixed by escaping in `to_snake_case` (append `_`),
+  which both renames the identifier and — for params — makes the snake form diverge
+  from the wire name, so the **existing** `snake != name` alias logic
+  (`Field`/`Query`/`Header`/`Form(alias=…)`) carries the original name to the wire
+  for free. Model fields carry no alias and serialize by the (escaped) field name,
+  which the Python client/server agree on.
+
+**Latent multi-word path-param bug (fixed in passing).** While wiring Python path
+params, a separate, pre-existing bug surfaced: a multi-word path param `{postId}`
+became the Python parameter `post_id`, but FastAPI matches path params by the
+*function-parameter name* — so `{postId}` never bound (`post_id` was read as a
+missing query param → **422 at runtime**). It compiled fine, so the compile-lint
+harness never caught it, and the round-trip contract only ever used single-word path
+params (`{id}`), so it was untested. The fix is the same `Path(alias="…")` the
+keyword path-param case needs: whenever the Python identifier diverges from the wire
+`{pp}` segment (camelCase *or* keyword), emit `name: Annotated[str, Path(alias="pp")]`
+(the `Annotated` form keeps it non-defaulted, before the body). Verified FastAPI
+honors `Path(alias=…)`. This pushed the `from fastapi import …` line past black's 88
+columns, so that emit now uses the shared `format_from_import` wrapper (parenthesized
+multi-line when long) instead of a hand-built single line.
+
+**Scope / residual (documented).** Handled: **field names** and **all param names**
+(query/header/path). NOT handled, both tracked in
+[known-issues.md](known-issues.md) for the broader robustness pass: (1) a **type
+name** (struct/enum) that is itself a keyword — `struct class { … }` still emits
+Python `class class(BaseModel)` / TS `interface class` (rarer, conventionally
+PascalCase, and a larger change touching every reference site); and (2) an
+**escape collision** — escaping appends `_` without a uniqueness pass, so a schema
+declaring both `class` and `class_` in one scope yields duplicate identifiers (a Go/TS
+compile error; in Python the duplicate pydantic field is silently dropped). Both share
+one root cause — escaping is per-identifier with no global uniqueness pass — so the
+robustness pass should fix them together.
+
+**Verification.** A new `RESERVED_WORDS_SCHEMA` (keyword field names + keyword
+query/header/path params + a `nil` query param exercising the Go predeclared-
+identifier escape + a multi-word `{widgetId}` path + a `{arguments}` path exercising
+the TS strict-mode binding escape) is compile-linted on all four targets (Python
+`ast`/black/ruff/mypy, Go build/gofmt/golangci, TS tsc/eslint/prettier, redocly) —
+proving the escaped output actually compiles. Two round-trip cases then prove the
+two runtime-sensitive behaviors compile-lint cannot catch: (1)
+`listComments_multiword_path_param` (the `{postId}` endpoint, wired into the
+Go/Python/TS drivers + contract) proves the path param **binds at runtime** on every
+target — the regression guard the 422 bug needed; and (2) the shared `gen_api.phx`
+`Catalog` struct now carries reserved-word fields (`class`/`async`) echoed through
+`syncCatalog`, so `syncCatalog_roundtrips_composite_types` proves the escaped Python
+field (`class_`/`async_`) **serializes and decodes** on both legs (its wire key
+diverges, since the model carries no alias) and that Go/TS carry the `class`/`async`
+wire keys verbatim. The Python round-trip harness's `to_snake` helper gained the same
+`keyword.iskeyword` escape so its body-construction and symmetric comparison stay
+aligned with the generated (alias-free) models. 519 sema + 256 codegen lib green (no
+snapshot churn — `gen_api.phx` is the round-trip schema, not a snapshotted fixture);
+clippy clean; 4 compile-lint targets + all round-trips green.

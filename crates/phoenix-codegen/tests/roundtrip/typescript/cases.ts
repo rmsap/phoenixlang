@@ -13,6 +13,7 @@ import { api } from "./generated/client";
 import type {
   Author,
   Catalog,
+  Comment,
   CreatePostBody,
   GetPostMeteredResult,
   ListPostsCursorPage,
@@ -226,12 +227,21 @@ export function makeStub(c: ContractCase, state: CaseState): Handlers {
         labels: body.labels,
         allowedStatuses: body.allowedStatuses,
         entries: body.entries,
+        // Reserved-word fields: TS keeps `class`/`async` verbatim as object
+        // properties (legal as property keys, unlike bindings), so they echo
+        // straight through.
+        class: body.class,
+        async: body.async,
       } satisfies Catalog;
     },
     updatePost: () => unexpected("updatePost"),
     patchPost: () => unexpected("patchPost"),
     deletePost: () => unexpected("deletePost"),
-    listComments: () => unexpected("listComments"),
+    async listComments(postId, query) {
+      state.hit = true;
+      state.received = { postId, page: query.page, limit: query.limit };
+      return signal<Comment[]>(c);
+    },
     createComment: () => unexpected("createComment"),
     getAuthorProfile: () => unexpected("getAuthorProfile"),
   };
@@ -248,6 +258,15 @@ export async function invoke(c: ContractCase): Promise<unknown> {
       const id = c.call.path_params?.id;
       assert.ok(id !== undefined, `${c.name}: missing path_params.id`);
       return api.getPost(id);
+    }
+    case "listComments": {
+      const postId = c.call.path_params?.postId;
+      assert.ok(postId !== undefined, `${c.name}: missing path_params.postId`);
+      const q = c.call.query ?? {};
+      return api.listComments(postId, {
+        page: q.page as number,
+        limit: q.limit as number,
+      });
     }
     case "listPosts": {
       const q = c.call.query ?? {};

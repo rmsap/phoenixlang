@@ -831,6 +831,70 @@ endpoint rawList: GET "/assets/raw" {
 }
 "#;
 
+/// Exercises target-language reserved words as schema identifiers — names that are
+/// valid Phoenix identifiers but keywords (or unsafe predeclared identifiers) in
+/// Python/Go/TypeScript, which the generators must escape (keeping the wire name
+/// intact) or the output won't compile. Covers: struct **field** names
+/// (`class`/`async`/`lambda` break Python attrs), **query** params (`range`/`map`
+/// break Go locals; `class` breaks Python params; `nil`/`iota` shadow Go's
+/// predeclared identifiers — `nil` so `return nil, err` stops compiling, `iota` the
+/// predeclared counter — both escaped by `is_go_unsafe_predeclared`), a
+/// **request-header** param, and a
+/// **path** param (`{func}` breaks Go locals + a Python `Path(alias=…)` bind). Also
+/// exercises a multi-word path param (`{widgetId}`), whose Python identifier
+/// (`widget_id`) likewise needs the `Path(alias=…)` bind, and a `{arguments}` path
+/// param — not a reserved word but illegal as a strict-mode (ES-module) `const`
+/// binding, which TS must escape. The body reuses the struct so the derived-body
+/// model + validator + client/server/handler all round through the escaped field
+/// names.
+///
+/// COVERAGE NOTE: this fixture proves keyword *escaping* compiles lint-clean on
+/// every target. The *runtime wire* behavior of keyword fields is covered
+/// separately by the round-trip suite: the shared `gen_api.phx` `Catalog` struct
+/// carries reserved-word fields (`class`/`async`), echoed through `syncCatalog`, so
+/// `syncCatalog_roundtrips_composite_types` proves the escaped Python field
+/// (`class_`/`async_`, whose wire key diverges since the model carries no alias)
+/// serializes AND decodes on both legs, and that Go/TS carry the `class`/`async`
+/// wire keys verbatim. The other runtime-sensitive case — a path param whose Python
+/// identifier diverges from the wire segment, which silently 422s if mis-bound — is
+/// round-tripped via `listComments_multiword_path_param`. The keyword *query*/
+/// *header*/*path* params and the Go predeclared-`nil`/`iota` escapes in THIS
+/// fixture remain compile-lint-only (their wire names ride a tag/alias/string-
+/// literal already exercised by every non-keyword param).
+const RESERVED_WORDS_SCHEMA: &str = r#"
+struct Widget {
+    class: String
+    async: Bool
+    lambda: Int
+    func: String
+    interface: Bool
+    map: Int
+}
+
+endpoint listWidgets: GET "/widgets/{func}" {
+    query { range: String  map: Int  class: String  nil: Int  iota: Int }
+    headers { lambda: String as "X-Lambda" }
+    response List<Widget>
+    error { NotFound(404) }
+}
+
+endpoint getWidget: GET "/widgets/{widgetId}/detail" {
+    response Widget
+    error { NotFound(404) }
+}
+
+endpoint getThing: GET "/things/{arguments}" {
+    response Widget
+    error { NotFound(404) }
+}
+
+endpoint createWidget: POST "/widgets" {
+    body Widget
+    response Widget
+    error { ValidationError(400) }
+}
+"#;
+
 /// The realistic schema fixture library (workspace `tests/fixtures/`; see the
 /// "type-system gaps" entry in docs/design-decisions.md). Parse/sema
 /// cleanliness is guarded by `phoenix-driver`'s `gen_schema_fixtures.rs`; every
@@ -1063,6 +1127,7 @@ fn go_output_compiles_and_lints() {
     check_go_output(&generate_go_files(LIST_PARAM_SCHEMA));
     // `Url` (validated string) + `Bytes` (`[]byte`, auto base64).
     check_go_output(&generate_go_files(URL_BYTES_SCHEMA));
+    check_go_output(&generate_go_files(RESERVED_WORDS_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1100,6 +1165,10 @@ fn go_output_compiles_and_lints() {
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(PROJECTION_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(LIST_PARAM_SCHEMA));
     check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(URL_BYTES_SCHEMA));
+    check_go_chi_output(
+        &go_chi_scaffold,
+        &generate_go_chi_files(RESERVED_WORDS_SCHEMA),
+    );
     for (name, schema) in FILE_FIXTURES.iter().copied() {
         eprintln!("chi fixture library: {name}");
         check_go_chi_output(&go_chi_scaffold, &generate_go_chi_files(schema));
@@ -1163,6 +1232,7 @@ fn openapi_output_lints() {
     check_openapi_output("PROJECTION_SCHEMA", PROJECTION_SCHEMA);
     check_openapi_output("LIST_PARAM_SCHEMA", LIST_PARAM_SCHEMA);
     check_openapi_output("URL_BYTES_SCHEMA", URL_BYTES_SCHEMA);
+    check_openapi_output("RESERVED_WORDS_SCHEMA", RESERVED_WORDS_SCHEMA);
 
     // Realistic schema fixture library (see FILE_FIXTURES). NOTE: redocly's WASM
     // runtime needs a large address space; do not run this under a tight
@@ -1299,6 +1369,7 @@ fn typescript_output_compiles_and_lints() {
     check_typescript_output(&scaffold, &generate_typescript_files(LIST_PARAM_SCHEMA));
     // `Url` branded + `Bytes` (`Uint8Array` revival + `encodeBytes` on send).
     check_typescript_output(&scaffold, &generate_typescript_files(URL_BYTES_SCHEMA));
+    check_typescript_output(&scaffold, &generate_typescript_files(RESERVED_WORDS_SCHEMA));
 
     // Realistic schema fixture library (see FILE_FIXTURES).
     for (name, schema) in FILE_FIXTURES.iter().copied() {
@@ -1474,6 +1545,11 @@ fn python_output_compiles_and_lints() {
         &scaffold,
         &venv_bin,
         &generate_python_files(URL_BYTES_SCHEMA),
+    );
+    check_python_output(
+        &scaffold,
+        &venv_bin,
+        &generate_python_files(RESERVED_WORDS_SCHEMA),
     );
 
     // Realistic schema fixture library (see FILE_FIXTURES).

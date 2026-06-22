@@ -37,12 +37,23 @@ struct CatalogEntry {
 
 /** A catalog payload exercising the three composite type shapes the rest of
  *  gen_api.phx doesn't round-trip: a `Map<String, String>`, a `List<enum>`, and
- *  a `List<struct>` as a FIELD (not a top-level list response). */
+ *  a `List<struct>` as a FIELD (not a top-level list response).
+ *
+ *  Also carries two reserved-word field names: `class`/`async` are valid Phoenix
+ *  identifiers but Python keywords, so the Python generator escapes them to
+ *  `class_`/`async_` and — carrying no alias — serializes by that escaped name, so
+ *  the Python WIRE key diverges from Go/TS (Go capitalizes to `Class`/`Async` with
+ *  a `class`/`async` JSON tag; TS keeps them verbatim as object properties). Echoed
+ *  through syncCatalog, the round-trip proves the escaped Python field serializes
+ *  and decodes on every target — the one reserved-word behavior compile-lint alone
+ *  can't catch (see design-decisions.md, "reserved-word handling"). */
 struct Catalog {
     id: Int
     labels: Map<String, String>
     allowedStatuses: List<PostStatus>
     entries: List<CatalogEntry>
+    class: String
+    async: Bool
 }
 
 // ── Endpoints ─────────────────────────────────────────────────

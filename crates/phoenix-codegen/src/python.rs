@@ -1711,7 +1711,14 @@ impl<'a> PyGenerator<'a> {
             );
             (is_file || is_opt_file) && to_snake_case(&f.name) != f.name
         });
-        let needs_annotated = needs_file;
+        // A path param whose Python identifier diverges from the wire `{pp}` segment
+        // (camelCase or a keyword) binds via `Annotated[str, Path(alias=...)]`.
+        let needs_path = self
+            .check_result
+            .endpoints
+            .iter()
+            .any(|ep| ep.path_params.iter().any(|pp| to_snake_case(pp) != *pp));
+        let needs_annotated = needs_file || needs_path;
         let needs_form = multipart_fields().any(|f| {
             let is_file = matches!(&f.ty, Type::File);
             let is_opt_file = matches!(
@@ -1764,6 +1771,9 @@ impl<'a> PyGenerator<'a> {
         if needs_http_exception {
             names.push("HTTPException");
         }
+        if needs_path {
+            names.push("Path");
+        }
         if needs_query {
             names.push("Query");
         }
@@ -1773,8 +1783,15 @@ impl<'a> PyGenerator<'a> {
         if needs_multipart {
             names.push("UploadFile");
         }
+        // Use the shared wrapping emitter so the line folds into the parenthesized
+        // multi-line form when it exceeds black's line length (the names already
+        // arrive alphabetized, which the helper's case-insensitive sort preserves).
+        // Widen the `&'static str` names to `String` for the `&[String]` helper
+        // signature (a clone of each literal, not a reallocation of the list).
+        let names: Vec<String> = names.into_iter().map(String::from).collect();
         self.server_out
-            .push_str(&format!("from fastapi import {}\n\n", names.join(", ")));
+            .push_str(&format_from_import("fastapi", &names));
+        self.server_out.push('\n');
 
         let mut model_imports = BTreeSet::new();
         for ep in &self.check_result.endpoints {
@@ -1871,7 +1888,19 @@ impl<'a> PyGenerator<'a> {
         let mut required = Vec::new();
         let mut defaulted = Vec::new();
         for pp in &ep.path_params {
-            required.push(format!("{}: str", to_snake_case(pp)));
+            let snake = to_snake_case(pp);
+            // When the Python identifier diverges from the wire `{pp}` segment — a
+            // camelCase param (`{postId}` → `post_id`) or a keyword (`{class}` →
+            // `class_`) — FastAPI matches path params by the function-parameter name,
+            // so the binding needs `Path(alias="<wire>")` or it never binds (a 422 at
+            // runtime). The `Annotated` form keeps it a non-defaulted param (path
+            // params precede the body, which has no default). A param that is already
+            // identical (`{id}` → `id`) stays a plain `str`, unchanged.
+            if snake != *pp {
+                required.push(format!("{snake}: Annotated[str, Path(alias=\"{pp}\")]"));
+            } else {
+                required.push(format!("{snake}: str"));
+            }
         }
         if ep.body_is_multipart {
             // Multipart: explode the body struct into per-field FastAPI params.
@@ -2817,7 +2846,68 @@ fn to_snake_case(s: &str) -> String {
         }
         result.push(c.to_lowercase().next().unwrap_or(c));
     }
+    // A name that snake-cases to a Python keyword (`class`, `async`, `lambda`, …)
+    // can't be an attribute/parameter name, so append `_`. This makes the snake
+    // form diverge from the original wire name, which the existing alias logic
+    // (`snake != name` → `Field`/`Query`/`Header`/`Form`/`Path(alias=…)`) then
+    // carries to the wire — so the escaped identifier never changes the wire name.
+    // (Model fields carry no alias and serialize by the snake field name, so a
+    // keyword field's wire key becomes the escaped form, which the Python
+    // client/server agree on.)
+    if is_python_keyword(&result) {
+        result.push('_');
+    }
     result
+}
+
+/// Whether `s` is a Python hard keyword. Excludes soft keywords like `match`/`type`
+/// and builtin names like `id`/`list`, which are legal identifiers. The sole caller
+/// is `to_snake_case`, which lowercases its input before this check, so the three
+/// capitalized keywords (`True`/`False`/`None`) are intentionally omitted — they can
+/// never appear here, and their lowercased forms (`true`/`false`/`none`) are legal
+/// identifiers that need no escaping.
+///
+/// This set must stay in lockstep with the round-trip harness's escape mirror
+/// (`tests/roundtrip/python/harness.py` `to_snake`, which uses `keyword.iskeyword`):
+/// both decide the same escaped wire key for keyword model fields. They agree today
+/// because `keyword.iskeyword` covers exactly the lowercase hard keywords below and
+/// no soft keywords; if a future Python promotes a soft keyword to hard, update both.
+fn is_python_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+    )
 }
 
 use crate::{capitalize, to_screaming_snake};

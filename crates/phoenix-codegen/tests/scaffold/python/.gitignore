@@ -1,2 +1,11 @@
 .venv/
 generated/
+
+# Generated output belongs in generated/; guard against it leaking into the
+# scaffold root (a misaimed generator run). The tracked root files are only
+# .gitignore, pyproject.toml, requirements-dev.txt.
+/__init__.py
+/models.py
+/client.py
+/handlers.py
+/server.py

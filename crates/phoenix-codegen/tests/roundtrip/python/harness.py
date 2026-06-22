@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import keyword
 from typing import Any
 
 import httpx
@@ -36,7 +37,21 @@ def to_snake(key: str) -> str:
             out.append(ch.lower())
         else:
             out.append(ch)
-    return "".join(out)
+    result = "".join(out)
+    # Mirror the generator's keyword escaping (python.rs `to_snake_case`): a field
+    # whose snake form is a Python hard keyword gets a trailing `_`, so the wire
+    # key for e.g. `class` is `class_`. Keeping this helper in step keeps body
+    # construction (driver.py maps contract camelCase keys through it) and the
+    # symmetric normalize() comparison aligned with the generated models, which
+    # carry no alias and so serialize keyword fields by the escaped name.
+    # `keyword.iskeyword` matches the generator's `is_python_keyword` set exactly
+    # here: the input is already lowercased, so the only hard keywords it can hit are
+    # the lowercase ones the generator also escapes (True/False/None never reach this
+    # branch). If that set ever diverges from `keyword.iskeyword`, update both (the
+    # generator-side note in python.rs `is_python_keyword` flags the same coupling).
+    if keyword.iskeyword(result):
+        result += "_"
+    return result
 
 
 def normalize(value: Any) -> Any:

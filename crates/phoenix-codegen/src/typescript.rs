@@ -1211,7 +1211,7 @@ impl<'a> TsGenerator<'a> {
         // Build function parameters
         let mut params: Vec<Param> = Vec::new();
         for pp in &ep.path_params {
-            params.push(Param::Simple(format!("{pp}: string")));
+            params.push(Param::Simple(format!("{}: string", safe_ts_ident(pp))));
         }
         if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
@@ -1653,7 +1653,7 @@ impl<'a> TsGenerator<'a> {
 
         let mut params: Vec<Param> = Vec::new();
         for pp in &ep.path_params {
-            params.push(Param::Simple(format!("{pp}: string")));
+            params.push(Param::Simple(format!("{}: string", safe_ts_ident(pp))));
         }
         if ep.body.is_some() {
             let body_type = format!("{}Body", capitalize(&ep.name));
@@ -3362,8 +3362,11 @@ fn emit_route_prelude(
             format!("{req}.params")
         };
         for pp in &ep.path_params {
-            body.push_str(&format!("{si}const {pp} = {base}.{pp};\n"));
-            args.push(pp.clone());
+            // The binding is escaped (a path param named `new`/`class` can't be a
+            // `const` name); the member access keeps the original wire key.
+            let binding = safe_ts_ident(pp);
+            body.push_str(&format!("{si}const {binding} = {base}.{pp};\n"));
+            args.push(binding);
         }
     }
 
@@ -3893,8 +3896,91 @@ fn response_header_coercion(h: &phoenix_sema::checker::HeaderParamInfo) -> Strin
 /// Builds a URL template expression with path parameter substitution.
 ///
 /// `/api/users/{id}` → `/api/users/${id}`
-fn build_url_expr(path: &str, _params: &[String]) -> String {
-    path.replace('{', "${")
+fn build_url_expr(path: &str, params: &[String]) -> String {
+    // Interpolate each `{name}` path segment as `${binding}`, where `binding` is
+    // the escaped path-param identifier (`safe_ts_ident`) so a param named a JS
+    // reserved word (`new`, `class`, …) references the renamed local rather than a
+    // nonexistent `${new}`. A non-keyword name is unchanged.
+    let mut out = path.to_string();
+    for p in params {
+        out = out.replace(&format!("{{{p}}}"), &format!("${{{}}}", safe_ts_ident(p)));
+    }
+    out
+}
+
+/// Returns a TypeScript binding identifier safe from reserved-word collisions: a
+/// name equal to a JS/TS reserved word (which cannot be a `const`/`let`/parameter
+/// name) gets a trailing `_`. Used for path-param bindings — the only place a
+/// schema identifier becomes a standalone binding. Object-property positions
+/// (interface fields, the `query`/`headers` objects) accept reserved words as-is,
+/// and member access (`req.params.class`) keeps the original wire name, so neither
+/// is escaped.
+fn safe_ts_ident(name: &str) -> String {
+    if is_ts_reserved(name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Whether `name` is a JS/TS reserved word that cannot be used as a binding
+/// (`const`/`let`/parameter) name. Covers the ECMAScript reserved keywords, the
+/// strict-mode/contextual words that still error in a `const` position, and `eval`/
+/// `arguments` — which are not reserved words but are forbidden as binding names in
+/// strict-mode code (generated TS is an ES module, hence always strict, so
+/// `const eval = …` is a `SyntaxError`).
+fn is_ts_reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "arguments"
+            | "eval"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "yield"
+            | "await"
+    )
 }
 
 use crate::{capitalize, to_screaming_snake};

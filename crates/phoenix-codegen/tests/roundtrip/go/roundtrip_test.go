@@ -338,6 +338,11 @@ func (s *stub) SyncCatalog(body api.SyncCatalogBody) (*api.Catalog, error) {
 		Labels:          body.Labels,
 		AllowedStatuses: body.AllowedStatuses,
 		Entries:         body.Entries,
+		// Reserved-word fields: Go capitalizes `class`/`async` to exported
+		// `Class`/`Async` (json tags keep the `class`/`async` wire keys), so they
+		// echo like any other field.
+		Class: body.Class,
+		Async: body.Async,
 	}, nil
 }
 
@@ -355,8 +360,14 @@ func (s *stub) DeletePost(id string) error {
 	return nil
 }
 func (s *stub) ListComments(postId string, page int64, limit int64) (*[]api.Comment, error) {
-	s.t.Fatalf("unexpected call to ListComments")
-	return nil, nil
+	s.hit = true
+	assertReceived(s.t, s.c, map[string]interface{}{"postId": postId, "page": page, "limit": limit})
+	if err := s.errOrNil(); err != nil {
+		return nil, err
+	}
+	var out []api.Comment
+	mustUnmarshal(s.t, s.c.Handler.Returns, &out)
+	return &out, nil
 }
 func (s *stub) CreateComment(postId string, body api.CreateCommentBody) (*api.Comment, error) {
 	s.t.Fatalf("unexpected call to CreateComment")
@@ -438,6 +449,18 @@ func invoke(t *testing.T, client *api.ApiClient, c contractCase) error {
 	switch c.Endpoint {
 	case "getPost":
 		got, err := client.GetPost(c.Call.PathParams["id"])
+		if err != nil {
+			return err
+		}
+		assertOK(t, c, got)
+		return nil
+
+	case "listComments":
+		got, err := client.ListComments(
+			c.Call.PathParams["postId"],
+			queryInt(c, "page", 1),
+			queryInt(c, "limit", 50),
+		)
 		if err != nil {
 			return err
 		}

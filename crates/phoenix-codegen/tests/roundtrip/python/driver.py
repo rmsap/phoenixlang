@@ -339,6 +339,11 @@ class Stub:
             labels=body.labels,
             allowed_statuses=body.allowed_statuses,
             entries=body.entries,
+            # Reserved-word fields: the generator escapes Python keywords, so the
+            # model attributes are `class_`/`async_` (and, carrying no alias,
+            # serialize by that escaped name — the Python wire key diverges).
+            class_=body.class_,
+            async_=body.async_,
         )
 
     # Unused endpoints — present to satisfy the Protocol; loud if ever routed.
@@ -354,7 +359,16 @@ class Stub:
     async def list_comments(
         self, post_id: str, *, page: int, limit: int
     ) -> list[m.Comment]:
-        raise AssertionError("unexpected call to list_comments")
+        self.hit = True
+        self.received = {"postId": post_id, "page": page, "limit": limit}
+        self._maybe_raise()
+        # The shared contract is camelCase; the Python model fields are snake_case
+        # (e.g. `postId` → `post_id`, a REQUIRED field), so map keys before
+        # constructing — exactly like the other camelCase-bodied stubs.
+        return [
+            m.Comment(**{to_snake(k): v for k, v in x.items()})
+            for x in self._returns()
+        ]
 
     async def create_comment(
         self, post_id: str, body: m.CreateCommentBody
@@ -377,6 +391,14 @@ async def invoke(client: ApiClient, case: dict[str, Any]) -> Any:
 
     if endpoint == "getPost":
         return await client.get_post(call["path_params"]["id"])
+
+    if endpoint == "listComments":
+        # Multi-word path param `{postId}` → Python `post_id`, which binds only via
+        # the generated `Path(alias="postId")`. Regression guard for that.
+        q = call.get("query", {})
+        return await client.list_comments(
+            call["path_params"]["postId"], page=q["page"], limit=q["limit"]
+        )
 
     if endpoint == "searchPosts":
         q = call.get("query", {})

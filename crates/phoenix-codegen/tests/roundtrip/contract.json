@@ -1,5 +1,26 @@
 [
   {
+    "name": "listComments_multiword_path_param",
+    "endpoint": "listComments",
+    "kind": "ok",
+    "_note": "Multi-word path param `{postId}`. Regression guard: the Python identifier is `post_id`, which binds ONLY via the generated `Path(alias=\"postId\")` — without it FastAPI 422s (a latent bug compile-lint can't catch, since the code is valid Python). Also proves Go/TS bind a multi-word path param. The handler echoes back one comment; page/limit are explicit (non-default) so the query round-trip is observable too.",
+    "call": {
+      "path_params": { "postId": "42" },
+      "query": { "page": 2, "limit": 10 }
+    },
+    "handler": {
+      "expect_received": { "postId": "42", "page": 2, "limit": 10 },
+      "returns": [
+        { "id": 1, "postId": 42, "text": "first", "authorName": "Ada", "parentId": null }
+      ]
+    },
+    "expect_client": {
+      "ok": [
+        { "id": 1, "postId": 42, "text": "first", "authorName": "Ada", "parentId": null }
+      ]
+    }
+  },
+  {
     "name": "getPost_happy_path_param",
     "endpoint": "getPost",
     "kind": "ok",
@@ -1097,7 +1118,7 @@
     "name": "syncCatalog_roundtrips_composite_types",
     "endpoint": "syncCatalog",
     "kind": "ok",
-    "_note": "Composite type-shape round-trip the rest of gen_api.phx doesn't cover: a Map<String,String> (labels), a List<enum> (allowedStatuses), and a List<struct> as a FIELD (entries, each carrying an enum). The stub ECHOES the decoded body into the Catalog response, so expect_client.ok == call.body and the existing deep-JSON assertion proves the shapes survive BOTH the client->server and server->client legs. The `ownerTeam` label key is deliberately camelCase: it is a Map VALUE key (data, not a struct field), so generators must pass it through verbatim. The Go/TS drivers deep-equal exactly and prove that; the Python driver normalizes both sides symmetrically (it can't distinguish a map key from a field), so it can't catch map-key mangling on its own — Go/TS cover it.",
+    "_note": "Composite type-shape round-trip the rest of gen_api.phx doesn't cover: a Map<String,String> (labels), a List<enum> (allowedStatuses), and a List<struct> as a FIELD (entries, each carrying an enum). The stub ECHOES the decoded body into the Catalog response, so expect_client.ok == call.body and the existing deep-JSON assertion proves the shapes survive BOTH the client->server and server->client legs. The `ownerTeam` label key is deliberately camelCase: it is a Map VALUE key (data, not a struct field), so generators must pass it through verbatim. The Go/TS drivers deep-equal exactly and prove that; the Python driver normalizes both sides symmetrically (it can't distinguish a map key from a field), so it can't catch map-key mangling on its own — Go/TS cover it. The `class` (String) and `async` (Bool) fields are RESERVED-WORD field names: the Python generator escapes them to `class_`/`async_` and serializes by that name (no alias), so the Python WIRE key diverges from Go/TS — the round-trip proves the escaped Python field serializes AND decodes (the wire-key contract here is camelCase `class`/`async`, which Go's JSON tags and TS's verbatim properties match directly, and the Python driver maps to via its keyword-aware to_snake). This is the runtime guard for keyword field names that compile-lint alone can't provide.",
     "call": {
       "body": {
         "id": 7,
@@ -1106,7 +1127,9 @@
         "entries": [
           { "key": "alpha", "status": "Published" },
           { "key": "beta", "status": "Archived" }
-        ]
+        ],
+        "class": "premium",
+        "async": true
       }
     },
     "handler": {},
@@ -1118,7 +1141,9 @@
         "entries": [
           { "key": "alpha", "status": "Published" },
           { "key": "beta", "status": "Archived" }
-        ]
+        ],
+        "class": "premium",
+        "async": true
       }
     }
   }

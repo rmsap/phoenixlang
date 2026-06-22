@@ -3252,9 +3252,74 @@ fn to_pascal_case(s: &str) -> String {
 }
 
 /// Returns a camelCase identifier (Go unexported / parameter name).
-/// Phoenix identifiers are already camelCase, so this is mostly identity.
+/// Phoenix identifiers are already camelCase, so this is mostly identity —
+/// EXCEPT a name that collides with a Go keyword (`range`, `map`, `func`, `type`,
+/// …) or an unsafe predeclared identifier (`nil`, `iota`) gets a trailing `_`,
+/// since these appear as Go parameter names and local variables (a schema query
+/// param `range` would otherwise emit `range := …`, a syntax error; a param `nil`
+/// would shadow the predeclared `nil` so the body's `return nil, err` no longer
+/// compiles). Exported struct fields go through `to_pascal_case` (capitalized, so
+/// never a keyword) and are unaffected; the wire name is carried by a JSON tag or a
+/// string literal (`r.URL.Query().Get("range")`), so escaping the Go-side
+/// identifier never changes the wire.
 fn to_camel(s: &str) -> String {
-    s.to_string()
+    if is_go_keyword(s) || is_go_unsafe_predeclared(s) {
+        format!("{s}_")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Predeclared Go identifiers escaped as a generated parameter/local name. Only
+/// `nil` is strictly required: the generated client body references it as a bare
+/// literal that no local-renaming can dodge (every `return nil, err`), so a param
+/// `nil` shadowing the predeclared `nil` makes that `return` stop compiling. `iota`
+/// is escaped *defensively*, not out of necessity — as an ordinary param/local it is
+/// a perfectly legal name and the generated bodies never reference it (it is only
+/// special inside a `const` block, which codegen never emits around a param); it is
+/// kept here so the "predeclared counter" can never be shadowed by a future emitter
+/// that does use a `const` block. (`true`/`false`/`error` are predeclared too but
+/// are Phoenix keywords, so they never reach codegen as identifiers.) Predeclared
+/// *type* names (`int`, `string`, …) and *builtin functions* (`len`, `make`, …) are
+/// deliberately NOT escaped: shadowing them as a parameter is legal Go (a type
+/// annotation is resolved in the enclosing scope, and the builtins aren't referenced
+/// in generated bodies), so escaping them would only add churn.
+fn is_go_unsafe_predeclared(s: &str) -> bool {
+    matches!(s, "nil" | "iota")
+}
+
+/// Whether `s` is a Go reserved word (the 25 keywords from the language spec).
+/// `range`/`map`/`func`/`type`/`select`/`chan`/etc. are valid Phoenix identifiers
+/// but cannot be Go parameter/variable names.
+fn is_go_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "break"
+            | "case"
+            | "chan"
+            | "const"
+            | "continue"
+            | "default"
+            | "defer"
+            | "else"
+            | "fallthrough"
+            | "for"
+            | "func"
+            | "go"
+            | "goto"
+            | "if"
+            | "import"
+            | "interface"
+            | "map"
+            | "package"
+            | "range"
+            | "return"
+            | "select"
+            | "struct"
+            | "switch"
+            | "type"
+            | "var"
+    )
 }
 
 use crate::capitalize;

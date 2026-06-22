@@ -87,6 +87,48 @@ the `MultipartRequest` interface). **Workaround:** pass the filename as a separa
 scalar form field (`filename: String`) alongside the `File`. **Target phase:**
 demand-triggered. Surfaced 2026-06-05 building the multipart round-trip suite.
 
+### A struct/enum **type name** that is a target keyword is not escaped
+
+Reserved-word handling (see design-decisions.md, "reserved-word handling") escapes
+**field names** and **all param names** (query/header/path) so a schema identifier
+that collides with a Python/Go/TS keyword still generates compiling code. It does
+NOT escape a **type name**: `struct class { … }` emits Python `class class(BaseModel)`
+and TS `interface class`/`type class` — syntax errors. (Go is unaffected: `class`
+isn't a Go keyword, and Go type names are generated as written.)
+
+Type-name escaping was scoped out because a type name is referenced from many sites
+(field types, response types, client return types, imports, the wire envelope), so
+renaming it consistently is a larger change than the field/param fix — and a type
+named after a keyword is rare (types are conventionally PascalCase: `User`, `Post`).
+A field/param named a keyword (`class`, `range`, `func`) is far more common, and that
+is fixed.
+
+**Workaround:** name structs/enums in PascalCase (the convention), which never
+collides with a lowercase keyword. **Target phase:** the broader v1 robustness pass
+(adversarial-identifier fixtures). Surfaced 2026-06-20.
+
+### Keyword escaping can collide with an explicit `<name>_` sibling
+
+Reserved-word handling escapes a keyword identifier by appending `_` (`class` →
+`class_`, `range` → `range_`). It does NOT check whether the escaped form already
+exists as a sibling, so a schema that deliberately declares both the keyword and its
+escaped spelling — two struct fields `class` and `class_`, or two query params
+`range` and `range_` — produces two identical generated identifiers. In Go/TS this is
+a duplicate-binding **compile error** (caught at build time). In Python it is worse: a
+pydantic model with two `class_: …` fields silently keeps only the last, so the other
+field is **dropped from the wire** with no diagnostic — a soundness hole, not a
+compile error.
+
+This shares the root cause of the type-name gap above (escaping is per-identifier with
+no global uniqueness pass) and is comparably rare: it requires intentionally naming a
+field/param after a keyword *and* its `_`-suffixed twin in the same scope. A
+collision-free escape would need a uniqueness pass over each struct's fields and each
+endpoint's params (the same pass type-name escaping wants).
+
+**Workaround:** don't name a field/param both `<keyword>` and `<keyword>_` in one
+scope. **Target phase:** the broader v1 robustness pass (adversarial-identifier
+fixtures), with type-name escaping. Surfaced 2026-06-22.
+
 ### Python validates only the extractable (numeric/length) `where` subset
 
 The Python target maps a field's `where` constraint to pydantic `Field(...)` /
