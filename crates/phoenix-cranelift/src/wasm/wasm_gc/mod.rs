@@ -182,8 +182,10 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // Declare the `extern js` custom imports before any
     // local function: imports occupy the low function indices, so they must be in
     // place before `declare_print_helper` / the user functions append locals.
-    // A no-op for a program with no externs.
-    builder.declare_extern_imports(ir_module)?;
+    // A no-op for a program with no externs. Collected once here and reused for
+    // the String-marshalling helper decision below, so the module is walked once.
+    let externs = crate::extern_abi::collect_externs(ir_module)?;
+    builder.declare_extern_imports(&externs)?;
     if needs_print {
         builder.declare_imports();
         builder.declare_print_helper()?;
@@ -216,6 +218,17 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     // but the Float arm reuses `phx_ryu_format_f64` from just above
     // and every arm allocates a `$string` (types declared earlier).
     builder.declare_tostring_helpers(helper_needs)?;
+
+    // When a `String` crosses an `extern js` boundary,
+    // synthesize + export the scratch-marshalling helper(s) the JS glue calls to
+    // read/build Phoenix strings (a gc `$string` can't be read by a JS host
+    // directly). Only the helper for each direction actually used is emitted.
+    // Before `declare_start` so the helpers' function indices precede `_start`.
+    // No-op when no extern passes a `String`.
+    let string_marshal = ExternStringMarshal::of(&externs);
+    if string_marshal.any() {
+        builder.declare_extern_string_helpers(string_marshal)?;
+    }
 
     // Declare Phoenix user functions (so call sites can resolve their
     // WASM function indices before any body is emitted), then emit
@@ -251,4 +264,41 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     builder.emit_start_body()?;
 
     builder.finish()
+}
+
+/// Which wasm32-gc `extern js` String-marshalling helpers a module needs.
+/// A `String` *parameter* crosses Phoenix→host, so the host reads it
+/// via `phx_extern_str_to_scratch` (String-OUT); a `String` *return* crosses
+/// host→Phoenix, built via `phx_extern_str_from_scratch` (String-IN). A module
+/// may need one, both, or neither — only the needed helper is synthesized and
+/// exported, so the export surface matches what the glue (PR 15) actually calls.
+#[derive(Clone, Copy)]
+pub(crate) struct ExternStringMarshal {
+    /// Some extern takes a `String` parameter — needs `phx_extern_str_to_scratch`.
+    pub(crate) string_out: bool,
+    /// Some extern returns a `String` — needs `phx_extern_str_from_scratch`.
+    pub(crate) string_in: bool,
+}
+
+impl ExternStringMarshal {
+    /// Derive the per-direction needs from the already-collected externs (same
+    /// backend-neutral [`crate::extern_abi::collect_externs`] set the import
+    /// declaration uses), so the module is walked once.
+    fn of(externs: &[crate::extern_abi::ExternSig]) -> Self {
+        use phoenix_ir::types::IrType;
+        let mut m = ExternStringMarshal {
+            string_out: false,
+            string_in: false,
+        };
+        for sig in externs {
+            m.string_out |= sig.params.iter().any(|t| matches!(t, IrType::StringRef));
+            m.string_in |= matches!(sig.return_type, IrType::StringRef);
+        }
+        m
+    }
+
+    /// `true` if any `String` crosses the boundary (either direction).
+    fn any(self) -> bool {
+        self.string_out || self.string_in
+    }
 }

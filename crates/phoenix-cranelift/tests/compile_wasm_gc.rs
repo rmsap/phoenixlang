@@ -452,23 +452,23 @@ fn compile_to_wasm_gc_expecting_error(source: &str) -> String {
         .to_string()
 }
 
-/// A `String` parameter on an `extern js` function is rejected at import
-/// declaration on wasm32-gc (the scratch-region copy lands in PR 13), with a
-/// diagnostic naming the parameter and its landing PR — rather than emitting an
-/// import signature the JS glue can't satisfy.
-#[test]
-fn extern_js_rejects_string_param_on_wasm32_gc() {
-    let source = "extern js { function alert(message: String) }\n\
-                  function main() { alert(\"boom\") }\n";
-    let err = compile_to_wasm_gc_expecting_error(source);
-    assert!(
-        err.contains("alert"),
-        "diagnostic should name the rejected extern: {err}"
-    );
-    assert!(
-        err.contains("PR 13"),
-        "diagnostic should name `String` marshalling's landing PR: {err}"
-    );
+/// The function-export names of a module (mirrors `import_names`), so a test can
+/// assert the wasm32-gc String-marshalling helpers are exported for the glue.
+fn export_func_names(bytes: &[u8]) -> Result<Vec<String>, String> {
+    use wasmparser::{ExternalKind, Parser, Payload};
+    let mut names = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::ExportSection(rdr) = payload {
+            for export in rdr {
+                let export = export.map_err(|e| format!("reading export: {e}"))?;
+                if export.kind == ExternalKind::Func {
+                    names.push(export.name.to_string());
+                }
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// A closure (callback) parameter on an `extern js` function is rejected at import
@@ -489,28 +489,123 @@ fn extern_js_rejects_closure_param_on_wasm32_gc() {
     );
 }
 
-/// A `String` *return* on an `extern js` function is rejected at import
-/// declaration on wasm32-gc too (the same scratch-region copy lands in PR 13),
-/// with the diagnostic routed through the `return type:` arm rather than a
-/// parameter arm — locking the return-side wording alongside the parameter-side
-/// `extern_js_rejects_string_param_on_wasm32_gc`.
+/// A `String` crossing an `extern js` boundary on wasm32-gc
+/// marshals via the linear-memory scratch region: the String crosses as its
+/// concrete `(ref null $string)` import type, and the module exports the two
+/// helpers the JS glue calls — `phx_extern_str_to_scratch` (String-OUT)
+/// and `phx_extern_str_from_scratch` (String-IN) — plus `memory`. Exercises a
+/// `String` parameter (`shout`/`lengthOf`) and a `String` return (`shout`), so
+/// both helpers are emitted. The module still validates; structural-tier (the
+/// `js.*` imports are unsatisfied until the glue, so it can't run under bare
+/// wasmtime). Runtime byte-copy correctness rides on the OUT helper being a
+/// faithful mirror of the wasmtime-tested `print` copy loop — a refactor of
+/// either must keep them in sync.
 #[test]
-fn extern_js_rejects_string_return_on_wasm32_gc() {
-    let source = "extern js { function makeName() -> String }\n\
-                  function main() { print(makeName()) }\n";
-    let err = compile_to_wasm_gc_expecting_error(source);
+fn extern_js_string_marshals_via_scratch_helpers_on_wasm32_gc() {
+    let source = "extern js {\n  \
+                    function shout(s: String) -> String\n  \
+                    function lengthOf(s: String) -> Int\n\
+                  }\n\
+                  function main() {\n  \
+                    print(shout(\"hi\"))\n  \
+                    print(lengthOf(\"abc\"))\n\
+                  }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_string_marshal");
+
+    // The two String-marshalling helpers + `memory` are exported for the glue.
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
+    for helper in ["phx_extern_str_to_scratch", "phx_extern_str_from_scratch"] {
+        assert!(
+            exports.iter().any(|e| e == helper),
+            "a String extern should export `{helper}` for the glue, got: {exports:?}"
+        );
+    }
     assert!(
-        err.contains("makeName"),
-        "diagnostic should name the rejected extern: {err}"
+        module_exports_memory(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}")),
+        "the glue needs `memory` exported to read/write the string scratch region"
+    );
+
+    // The String externs are imported (one each); non-WASI imports are exactly
+    // the two `js` externs.
+    let imports = import_names(&bytes).unwrap_or_else(|e| panic!("parsing imports: {e}"));
+    let mut non_wasi: Vec<&str> = imports
+        .iter()
+        .filter(|(m, _)| m != "wasi_snapshot_preview1")
+        .map(|(m, n)| {
+            assert_eq!(m, "js", "unexpected non-WASI import module: {m}.{n}");
+            n.as_str()
+        })
+        .collect();
+    non_wasi.sort_unstable();
+    assert_eq!(
+        non_wasi,
+        vec!["lengthOf", "shout"],
+        "non-WASI imports should be exactly the String externs: {imports:?}"
+    );
+}
+
+/// Only the helper for the direction actually used is emitted (Phase 2.5 PR 13):
+/// an extern with a `String` *parameter* but no `String` return needs only the
+/// String-OUT helper, so `phx_extern_str_to_scratch` is exported and
+/// `phx_extern_str_from_scratch` is **not** — the export surface matches what the
+/// glue calls. The mirror case (return-only → only String-IN) is covered by
+/// `extern_js_string_return_only_exports_in_helper_on_wasm32_gc`.
+#[test]
+fn extern_js_string_param_only_exports_out_helper_on_wasm32_gc() {
+    let source = "extern js { function lengthOf(s: String) -> Int }\n\
+                  function main() { print(lengthOf(\"abc\")) }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_string_param_only");
+
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
+    assert!(
+        exports.iter().any(|e| e == "phx_extern_str_to_scratch"),
+        "a String-param extern should export the OUT helper, got: {exports:?}"
     );
     assert!(
-        err.contains("return type"),
-        "diagnostic should route through the return-type arm: {err}"
+        !exports.iter().any(|e| e == "phx_extern_str_from_scratch"),
+        "no String return means the IN helper should not be emitted, got: {exports:?}"
+    );
+}
+
+/// The mirror of `extern_js_string_param_only_exports_out_helper_on_wasm32_gc`:
+/// an extern with a `String` *return* but only scalar parameters needs only the
+/// String-IN helper, so `phx_extern_str_from_scratch` is exported and
+/// `phx_extern_str_to_scratch` is **not**.
+#[test]
+fn extern_js_string_return_only_exports_in_helper_on_wasm32_gc() {
+    let source = "extern js { function nameOf(id: Int) -> String }\n\
+                  function main() { print(nameOf(7)) }\n";
+    let bytes = compile_to_wasm_gc(source);
+    validate_gc_module(&bytes, "extern_js_string_return_only");
+
+    let exports = export_func_names(&bytes).unwrap_or_else(|e| panic!("parsing exports: {e}"));
+    assert!(
+        exports.iter().any(|e| e == "phx_extern_str_from_scratch"),
+        "a String-return extern should export the IN helper, got: {exports:?}"
     );
     assert!(
-        err.contains("PR 13"),
-        "diagnostic should name `String` marshalling's landing PR: {err}"
+        !exports.iter().any(|e| e == "phx_extern_str_to_scratch"),
+        "no String param means the OUT helper should not be emitted, got: {exports:?}"
     );
+}
+
+/// `true` if the module exports a memory named `memory`.
+fn module_exports_memory(bytes: &[u8]) -> Result<bool, String> {
+    use wasmparser::{ExternalKind, Parser, Payload};
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| format!("parsing payload header: {e}"))?;
+        if let Payload::ExportSection(rdr) = payload {
+            for export in rdr {
+                let export = export.map_err(|e| format!("reading export: {e}"))?;
+                if export.kind == ExternalKind::Memory && export.name == "memory" {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Compile `source`, structurally validate it, and — when wasmtime is

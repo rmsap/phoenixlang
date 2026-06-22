@@ -14,6 +14,14 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 **Target phase:** demand-triggered — fix when a real interop program needs to hold a `JsValue` in a struct or capture it (e.g. retaining a DOM element handle across calls). Surfaced 2026-06-20 (PR 11).
 
+### wasm32-gc `extern js` strings are capped at 4095 bytes
+
+On wasm32-gc a Phoenix `String` is a GC object a JS host can't read directly, so an `extern js` `String` is marshalled by copying its bytes through a fixed linear-memory scratch buffer (Phase 2.5 [decision E](design-decisions.md#e-extern-call-abi-per-backend-marshalled-signatures)) via the exported `phx_extern_str_to_scratch` / `phx_extern_str_from_scratch` helpers. That buffer is the GC backend's existing print scratch (`PRINT_STR_BUF`, 4096 bytes), so a string longer than `PRINT_STR_MAX_LEN` (4095 bytes) **traps** (`unreachable`) crossing the boundary — the same cap `print` already has on wasm32-gc. The wasm32-linear binding has no such cap (it marshals strings through the GC heap via `phx_string_alloc`).
+
+**Why bounded.** The GC backend has no linear-memory allocator (allocation is GC-space `struct.new`/`array.new`); it uses linear memory only for the small WASI iovec staging + a fixed print buffer. Copying an arbitrary-length string to/from linear memory would need either a growable scratch region (a linear bump-allocator the GC backend deliberately doesn't have) or chunked transfer.
+
+**Target phase:** demand-triggered — revisit if a real wasm32-gc interop program needs to pass strings over ~4 KiB. A fix would add a dedicated, growable extern-string scratch region (or chunk the copy in the marshalling helpers + glue). Surfaced 2026-06-21.
+
 ### Native `extern js` interop is ELF/Mach-O only (no Windows/COFF weak override)
 
 The native (Cranelift) host-FFI binding (Phase 2.5 [decision E](design-decisions.md#e-extern-call-abi-per-backend-marshalled-signatures)) emits a **weak** default definition of each `phx_extern_<module>__<name>` symbol that a linked host shim's **strong** definition overrides. This relies on weak-symbol semantics and PLT interposition under position-independent code — the ELF (Linux/BSD) and Mach-O (macOS) model. On Windows/COFF, weak symbols and symbol interposition work differently (COFF "weak externals" resolve at static-link time with different override rules, and there is no PLT), so a host shim is **not** guaranteed to override the compiler's default `phx_extern_*` symbols the same way.

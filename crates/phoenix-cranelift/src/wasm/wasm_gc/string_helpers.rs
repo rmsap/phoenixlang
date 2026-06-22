@@ -276,6 +276,196 @@ pub(super) fn synthesize_str_concat(b: &mut ModuleBuilder) -> Result<u32, Compil
     Ok(b.add_and_emit_function(sig, &func))
 }
 
+/// `phx_extern_str_to_scratch(s: (ref null $string)) -> i32` — copy `s`'s bytes
+/// into the linear-memory scratch buffer and return the byte length,
+/// the wasm32-gc `extern js` String-OUT marshalling helper).
+///
+/// A gc `$string` is a GC object a JS host can't read directly, so the bytes are
+/// copied into linear memory; the JS glue then reads
+/// `memory[PRINT_STR_BUF_START .. +len]` via `TextDecoder`. Reuses the print
+/// scratch buffer (and its [`PRINT_STR_MAX_LEN`] cap — oversized strings trap),
+/// which is safe because the glue copies-then-reads each string serially, before
+/// any host code runs. Mirrors [`synthesize_print_str`]'s copy loop without the
+/// trailing newline / iovec / `fd_write`.
+///
+/// Param: `s` (local 0). Locals: `len` (i32, 1), `offset` (i32, 2), `i` (i32, 3),
+/// `data` (`(ref $bytes)`, 4).
+pub(super) fn synthesize_extern_str_to_scratch(b: &mut ModuleBuilder) -> Result<u32, CompileError> {
+    let string_idx = b.require_string_type_idx()?;
+    let bytes_idx = b.require_bytes_type_idx()?;
+    let string_ref_param = ValType::Ref(RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(string_idx),
+    });
+    let sig = b.intern_signature(&[string_ref_param], &[ValType::I32]);
+
+    let bytes_ref_local = ValType::Ref(RefType {
+        nullable: false,
+        heap_type: HeapType::Concrete(bytes_idx),
+    });
+    let mut func = wasm_encoder::Function::new([
+        (3, ValType::I32),    // len, offset, i
+        (1, bytes_ref_local), // data
+    ]);
+    let byte_memarg = wasm_encoder::MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+    let s_local: u32 = 0;
+    let len_local: u32 = 1;
+    let offset_local: u32 = 2;
+    let i_local: u32 = 3;
+    let data_local: u32 = 4;
+
+    // len = s.$len
+    func.instruction(&Instruction::LocalGet(s_local));
+    func.instruction(&Instruction::StructGet {
+        struct_type_index: string_idx,
+        field_index: STR_LEN,
+    });
+    func.instruction(&Instruction::LocalSet(len_local));
+    // Trap on overflow — the scratch buffer is fixed-size (same bound print uses).
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::I32Const(PRINT_STR_MAX_LEN as i32));
+    func.instruction(&Instruction::I32GtU);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::Unreachable);
+    func.instruction(&Instruction::End);
+    // offset = s.$offset
+    func.instruction(&Instruction::LocalGet(s_local));
+    func.instruction(&Instruction::StructGet {
+        struct_type_index: string_idx,
+        field_index: STR_OFFSET,
+    });
+    func.instruction(&Instruction::LocalSet(offset_local));
+    // data = s.$data
+    func.instruction(&Instruction::LocalGet(s_local));
+    func.instruction(&Instruction::StructGet {
+        struct_type_index: string_idx,
+        field_index: STR_DATA,
+    });
+    func.instruction(&Instruction::LocalSet(data_local));
+    // i = 0
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(i_local));
+    // Copy loop: while i < len { mem[BUF + i] = data[offset + i]; i++ }
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+    // address: BUF_START + i
+    func.instruction(&Instruction::I32Const(PRINT_STR_BUF_START as i32));
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::I32Add);
+    // value: array.get_u $bytes data (offset + i)
+    func.instruction(&Instruction::LocalGet(data_local));
+    func.instruction(&Instruction::LocalGet(offset_local));
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::ArrayGetU(bytes_idx));
+    func.instruction(&Instruction::I32Store8(byte_memarg));
+    // i += 1
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(i_local));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // close loop
+    func.instruction(&Instruction::End); // close block
+    // return len
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::End);
+    Ok(b.add_and_emit_function(sig, &func))
+}
+
+/// `phx_extern_str_from_scratch(len: i32) -> (ref $string)` — build a fresh
+/// Phoenix `$string` from `len` bytes at the start of the scratch buffer.
+///
+/// The JS glue writes a JS string's UTF-8 bytes into
+/// `memory[PRINT_STR_BUF_START .. +len]` (via `TextEncoder`) and calls this; the
+/// helper allocates a `$bytes` array, copies the bytes in (the inverse of
+/// [`synthesize_extern_str_to_scratch`]'s loop — no GC↔linear bulk op exists), and
+/// wraps it in a `$string` with `$offset = 0`. The bytes are **copied**, never
+/// shared (decision F). Traps on `len > `[`PRINT_STR_MAX_LEN`].
+///
+/// Param: `len` (i32, local 0). Locals: `i` (i32, 1), `data` (`(ref $bytes)`, 2).
+pub(super) fn synthesize_extern_str_from_scratch(
+    b: &mut ModuleBuilder,
+) -> Result<u32, CompileError> {
+    let string_idx = b.require_string_type_idx()?;
+    let bytes_idx = b.require_bytes_type_idx()?;
+    let string_ref_nn = ValType::Ref(RefType {
+        nullable: false,
+        heap_type: HeapType::Concrete(string_idx),
+    });
+    let sig = b.intern_signature(&[ValType::I32], &[string_ref_nn]);
+
+    let bytes_ref_local = ValType::Ref(RefType {
+        nullable: false,
+        heap_type: HeapType::Concrete(bytes_idx),
+    });
+    let mut func = wasm_encoder::Function::new([
+        (1, ValType::I32),    // i
+        (1, bytes_ref_local), // data
+    ]);
+    let byte_memarg = wasm_encoder::MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+    let len_local: u32 = 0;
+    let i_local: u32 = 1;
+    let data_local: u32 = 2;
+
+    // Trap on overflow — defensive; the glue bounds-checks before writing.
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::I32Const(PRINT_STR_MAX_LEN as i32));
+    func.instruction(&Instruction::I32GtU);
+    func.instruction(&Instruction::If(BlockType::Empty));
+    func.instruction(&Instruction::Unreachable);
+    func.instruction(&Instruction::End);
+    // data = array.new_default $bytes len
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::ArrayNewDefault(bytes_idx));
+    func.instruction(&Instruction::LocalSet(data_local));
+    // i = 0
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(i_local));
+    // Copy loop: while i < len { data[i] = mem[BUF + i]; i++ }
+    func.instruction(&Instruction::Block(BlockType::Empty));
+    func.instruction(&Instruction::Loop(BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+    // array.set $bytes data i (i32.load8_u (BUF + i))
+    func.instruction(&Instruction::LocalGet(data_local));
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::I32Const(PRINT_STR_BUF_START as i32));
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Load8U(byte_memarg));
+    func.instruction(&Instruction::ArraySet(bytes_idx));
+    // i += 1
+    func.instruction(&Instruction::LocalGet(i_local));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(i_local));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // close loop
+    func.instruction(&Instruction::End); // close block
+    // struct.new $string (data, 0, len)
+    func.instruction(&Instruction::LocalGet(data_local));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::StructNew(string_idx));
+    func.instruction(&Instruction::End);
+    Ok(b.add_and_emit_function(sig, &func))
+}
+
 /// `phx_str_eq(a: (ref null $string), b: (ref null $string)) -> i32`
 /// — return `1` if both strings have equal length and byte
 /// contents (offset-adjusted), `0` otherwise.
@@ -904,4 +1094,178 @@ pub(super) fn synthesize_str_length(b: &mut ModuleBuilder) -> Result<u32, Compil
     func.instruction(&Instruction::I64ExtendI32U);
     func.instruction(&Instruction::End);
     Ok(b.add_and_emit_function(sig, &func))
+}
+
+#[cfg(test)]
+mod extern_str_roundtrip_exec {
+    //! End-to-end **execution** check for the wasm32-gc `extern js`
+    //! String-marshalling helpers.
+    //!
+    //! The integration tests in `tests/compile_wasm_gc.rs` only validate
+    //! these helpers *structurally*: the real extern path needs the PR 15
+    //! JS glue to satisfy the `js.*` imports, which bare wasmtime can't
+    //! supply, so the byte-copy loops never actually run there. This test
+    //! closes that gap without the glue — it hand-builds a minimal module
+    //! whose `_start` drives a `$string` out through
+    //! [`synthesize_extern_str_to_scratch`] (String-OUT, `$string` →
+    //! scratch) and back in through [`synthesize_extern_str_from_scratch`]
+    //! (String-IN, scratch → fresh `$string`), then compares the rebuilt
+    //! string to the original with [`synthesize_str_eq`] and traps
+    //! (`unreachable`) on any mismatch. Run under the same wasmtime CLI
+    //! tier the integration tests use: a clean exit proves the round-trip
+    //! is byte-faithful, a trap means a copy loop is wrong.
+    //!
+    //! This matters most for `from_scratch` (linear-memory → fresh
+    //! `$bytes` → `$string`): unlike `to_scratch`, which mirrors the
+    //! wasmtime-tested `print` copy loop, it has no executed analogue
+    //! anywhere else, so this is its only runtime coverage.
+    //!
+    //! Lives in the crate (not the integration suite) because the
+    //! `synthesize_*` helpers are `pub(super)` — reachable here, not from
+    //! an external test binary.
+
+    use std::process::{Command, Stdio};
+
+    use wasm_encoder::{BlockType, HeapType, Instruction, RefType, ValType};
+
+    use super::super::module_builder::ModuleBuilder;
+    use super::{
+        synthesize_extern_str_from_scratch, synthesize_extern_str_to_scratch, synthesize_str_eq,
+    };
+
+    /// The probe string. Includes a multi-byte UTF-8 sequence (`é` =
+    /// `0xC3 0xA9`) so the round-trip exercises high (>127) bytes through
+    /// `i32.store8` / `i32.load8_u` and `array.set` / `array.get_u`, not
+    /// just 7-bit ASCII — a sign-extension slip in either helper would
+    /// corrupt these and fail the `str_eq` check.
+    const PROBE: &[u8] = b"P\xC3\xA9!"; // "Pé!" — 4 bytes
+
+    /// Build a self-contained wasm32-gc module whose `_start` round-trips
+    /// [`PROBE`] through the two marshalling helpers and traps on any
+    /// byte mismatch. No `js.*` imports and no WASI — `_start` drives the
+    /// helpers directly, so bare wasmtime can run it.
+    fn build_roundtrip_module() -> Vec<u8> {
+        let mut b = ModuleBuilder::new();
+        // Same prefix ordering as `compile_wasm_gc`: declare the `$bytes`
+        // / `$string` types, seal the rec group, then the memory the
+        // scratch buffer lives in. The helpers are local functions, so
+        // they must follow the (here empty) import section.
+        b.declare_string_types();
+        b.close_type_rec_group();
+        b.declare_memory();
+
+        let string_idx = b.require_string_type_idx().expect("string type declared");
+        let bytes_idx = b.require_bytes_type_idx().expect("bytes type declared");
+        let to_idx = synthesize_extern_str_to_scratch(&mut b).expect("OUT helper synthesizes");
+        let from_idx = synthesize_extern_str_from_scratch(&mut b).expect("IN helper synthesizes");
+        let eq_idx = synthesize_str_eq(&mut b).expect("str_eq helper synthesizes");
+
+        let bytes_ref_nn = ValType::Ref(RefType {
+            nullable: false,
+            heap_type: HeapType::Concrete(bytes_idx),
+        });
+        let string_ref_null = ValType::Ref(RefType {
+            nullable: true,
+            heap_type: HeapType::Concrete(string_idx),
+        });
+        let start_sig = b.intern_signature(&[], &[]);
+
+        // Locals: 0 = src_data (ref $bytes), 1 = src (ref null $string),
+        // 2 = rebuilt (ref null $string).
+        let src_data: u32 = 0;
+        let src: u32 = 1;
+        let rebuilt: u32 = 2;
+        let len = PROBE.len() as i32;
+        let mut f = wasm_encoder::Function::new([(1, bytes_ref_nn), (2, string_ref_null)]);
+
+        // src_data = array.new_default $bytes <len>; then fill each byte.
+        f.instruction(&Instruction::I32Const(len));
+        f.instruction(&Instruction::ArrayNewDefault(bytes_idx));
+        f.instruction(&Instruction::LocalSet(src_data));
+        for (i, &byte) in PROBE.iter().enumerate() {
+            f.instruction(&Instruction::LocalGet(src_data));
+            f.instruction(&Instruction::I32Const(i as i32));
+            f.instruction(&Instruction::I32Const(i32::from(byte)));
+            f.instruction(&Instruction::ArraySet(bytes_idx));
+        }
+        // src = struct.new $string (src_data, $offset = 0, $len = len).
+        f.instruction(&Instruction::LocalGet(src_data));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(len));
+        f.instruction(&Instruction::StructNew(string_idx));
+        f.instruction(&Instruction::LocalSet(src));
+        // rebuilt = from_scratch(to_scratch(src)). `to_scratch` copies
+        // src's bytes into the scratch buffer and returns the length;
+        // `from_scratch` reads that many bytes back into a fresh `$string`.
+        f.instruction(&Instruction::LocalGet(src));
+        f.instruction(&Instruction::Call(to_idx));
+        f.instruction(&Instruction::Call(from_idx));
+        f.instruction(&Instruction::LocalSet(rebuilt));
+        // if str_eq(src, rebuilt) == 0 { unreachable } — trap on a
+        // byte-unfaithful round-trip.
+        f.instruction(&Instruction::LocalGet(src));
+        f.instruction(&Instruction::LocalGet(rebuilt));
+        f.instruction(&Instruction::Call(eq_idx));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End); // function end
+
+        let start_idx = b.add_and_emit_function(start_sig, &f);
+        b.export_func("_start", start_idx);
+        b.finish().expect("module finishes")
+    }
+
+    /// Structurally validate with the same GC feature set the integration
+    /// harness uses, so a hand-assembly mistake fails with a parser
+    /// diagnostic here rather than an opaque wasmtime load error.
+    fn validate(bytes: &[u8]) {
+        let mut features = wasmparser::WasmFeatures::default();
+        features.insert(wasmparser::WasmFeatures::GC);
+        features.insert(wasmparser::WasmFeatures::REFERENCE_TYPES);
+        wasmparser::Validator::new_with_features(features)
+            .validate_all(bytes)
+            .expect("hand-built round-trip module validates");
+    }
+
+    #[test]
+    fn extern_str_helpers_roundtrip_under_wasmtime() {
+        let bytes = build_roundtrip_module();
+        validate(&bytes);
+
+        // Same soft-skip / hard-require gating as the integration tier:
+        // skip cleanly when wasmtime is absent unless
+        // `PHOENIX_REQUIRE_WASMTIME=1` makes its absence a failure.
+        let require = std::env::var("PHOENIX_REQUIRE_WASMTIME").as_deref() == Ok("1");
+        if Command::new("wasmtime").arg("--version").output().is_err() {
+            assert!(
+                !require,
+                "PHOENIX_REQUIRE_WASMTIME=1 set but `wasmtime` is not on PATH"
+            );
+            eprintln!(
+                "warning: skipping extern-String round-trip execution — \
+                 `wasmtime` not on PATH"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("extern_str_roundtrip.wasm");
+        std::fs::write(&path, &bytes).expect("write wasm");
+        let out = Command::new("wasmtime")
+            .args(["-W", "function-references=y,gc=y"])
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("invoke wasmtime");
+        assert!(
+            out.status.success(),
+            "extern-String round-trip trapped under wasmtime — a marshalling \
+             copy loop is byte-unfaithful: status={:?}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
 }

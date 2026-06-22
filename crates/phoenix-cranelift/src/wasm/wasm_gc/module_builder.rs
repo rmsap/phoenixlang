@@ -43,25 +43,23 @@ use super::string_helpers;
 use super::translate;
 
 /// Flatten an `extern js` boundary type to its wasm32-gc import `ValType`s.
-/// Scalars map as everywhere else; `JsValue` is an
-/// `externref` (the host VM owns/traces it directly). `String` and
-/// closure callbacks are **not** marshalled across the boundary yet — they're
-/// rejected here, naming their landing PR, so the import section never declares a
-/// signature the JS glue can't satisfy. A `Void` return flattens to no
-/// result; a `Void` *parameter* can't occur (sema rejects it). Distinct from the
-/// internal [`translate::wasm_valtypes_for`], which maps `String` to its concrete
-/// GC type for in-program use — at the boundary that type can't cross to the host
-/// without the scratch-region copy.
-fn gc_extern_valtypes(ty: &IrType) -> Result<Vec<ValType>, CompileError> {
+/// Scalars map as everywhere else; `JsValue` is an `externref` (the host VM owns
+/// and traces it directly); `String` crosses as its concrete `(ref null $string)`
+/// — the JS host can't read a gc object, so the glue copies the bytes
+/// through the linear-memory scratch region via the exported
+/// `phx_extern_str_to_scratch` / `phx_extern_str_from_scratch` helpers.
+/// A `Void` return flattens to no result; a `Void` *parameter* can't occur (sema
+/// rejects it). Only closure callbacks remain unsupported.
+fn gc_extern_valtypes(b: &ModuleBuilder, ty: &IrType) -> Result<Vec<ValType>, CompileError> {
     match ty {
-        IrType::I64 => Ok(vec![ValType::I64]),
-        IrType::F64 => Ok(vec![ValType::F64]),
-        IrType::Bool => Ok(vec![ValType::I32]),
-        IrType::Void => Ok(Vec::new()),
-        IrType::JsValue => Ok(vec![ValType::EXTERNREF]),
-        IrType::StringRef => Err(CompileError::new(
-            "`String` marshalling across the boundary lands in Phase 2.5 PR 13",
-        )),
+        // Scalars, `Void`, `JsValue` (externref), and `String` (`(ref $string)`)
+        // all flatten the same way they do for in-program use.
+        IrType::I64
+        | IrType::F64
+        | IrType::Bool
+        | IrType::Void
+        | IrType::JsValue
+        | IrType::StringRef => translate::wasm_valtypes_for(ty, b),
         IrType::ClosureRef { .. } => Err(CompileError::new(
             "closure callbacks land in Phase 2.5 PR 14",
         )),
@@ -1783,26 +1781,25 @@ impl ModuleBuilder {
     /// before any local function is declared — alongside the `fd_write` import,
     /// before the print/string helpers and user functions.
     ///
-    /// Only scalar (`Int`/`Float`/`Bool`/`Void`) and `JsValue`
-    /// (`externref`) cross the boundary. A `String` parameter/return (the copy
-    /// across the GC backend's scratch region lands in PR 13) or a closure
-    /// callback (PR 14) is rejected here with a diagnostic naming its landing PR,
-    /// rather than emitting an import the glue can't yet satisfy.
+    /// Scalar (`Int`/`Float`/`Bool`/`Void`), `JsValue` (`externref`), and
+    /// `String` (`(ref $string)`) cross the boundary; only a closure callback
+    /// is rejected here with a diagnostic, rather
+    /// than emitting an import the glue can't yet satisfy.
     pub(super) fn declare_extern_imports(
         &mut self,
-        ir_module: &IrModule,
+        externs: &[crate::extern_abi::ExternSig],
     ) -> Result<(), CompileError> {
-        for sig in crate::extern_abi::collect_externs(ir_module)? {
+        for sig in externs {
             let mut params = Vec::new();
             for (i, ty) in sig.params.iter().enumerate() {
-                params.extend(gc_extern_valtypes(ty).map_err(|e| {
+                params.extend(gc_extern_valtypes(self, ty).map_err(|e| {
                     CompileError::new(format!(
                         "wasm32-gc: `extern js` call `{}.{}` parameter {i}: {}",
                         sig.module, sig.name, e.message
                     ))
                 })?);
             }
-            let returns = gc_extern_valtypes(&sig.return_type).map_err(|e| {
+            let returns = gc_extern_valtypes(self, &sig.return_type).map_err(|e| {
                 CompileError::new(format!(
                     "wasm32-gc: `extern js` call `{}.{}` return type: {}",
                     sig.module, sig.name, e.message
@@ -1830,6 +1827,39 @@ impl ModuleBuilder {
         self.extern_import_lookup
             .get(&extern_import_key(module, name))
             .copied()
+    }
+
+    /// Export the function at WASM index `idx` under `name`. Used to expose the
+    /// `extern js` String-marshalling helpers so the JS glue can call them.
+    pub(super) fn export_func(&mut self, name: &str, idx: u32) {
+        self.exports
+            .export(name, wasm_encoder::ExportKind::Func, idx);
+    }
+
+    /// Synthesize and export the wasm32-gc `extern js` String-marshalling helpers:
+    /// `phx_extern_str_to_scratch` (a `$string` → linear-memory
+    /// scratch, for String-OUT) and `phx_extern_str_from_scratch` (scratch → a
+    /// fresh `$string`, for String-IN). The JS glue calls these to read/build
+    /// Phoenix strings via the scratch region, since a gc `$string` can't be read
+    /// by a JS host directly. Only the helper for each direction `marshal` reports
+    /// is emitted — a param-only extern needs just String-OUT, a return-only one
+    /// just String-IN — so the export surface matches what the glue calls. Called
+    /// only when some `String` crosses an extern boundary; must run before
+    /// `declare_start` (these add local functions, whose indices must precede
+    /// `_start`).
+    pub(super) fn declare_extern_string_helpers(
+        &mut self,
+        marshal: super::ExternStringMarshal,
+    ) -> Result<(), CompileError> {
+        if marshal.string_out {
+            let to_idx = string_helpers::synthesize_extern_str_to_scratch(self)?;
+            self.export_func("phx_extern_str_to_scratch", to_idx);
+        }
+        if marshal.string_in {
+            let from_idx = string_helpers::synthesize_extern_str_from_scratch(self)?;
+            self.export_func("phx_extern_str_from_scratch", from_idx);
+        }
+        Ok(())
     }
 
     /// Declare the single linear memory used by the WASI iovec
