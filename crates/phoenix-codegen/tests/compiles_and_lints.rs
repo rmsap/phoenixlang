@@ -68,10 +68,18 @@ endpoint getItem: GET "/api/items/{id}" {
 /// be broken across lines (the condition, the `!(...)` operands, and the long
 /// throw message). Exercises the wrapping path `MINIMAL_SCHEMA`/`SCHEMA` don't
 /// reach, and locks the output to what `prettier`/`black` actually accept.
+///
+/// The second field covers a distinct overflow: an *optional* field whose
+/// single-bound condition fits on its own wrapped line, but whose
+/// `<accessor> is not None and ` None-guard pushes the `if … not (` header past
+/// the print width. Python's guard emitter must count that guard toward the
+/// header before choosing the wrapped form (else it emits an 89-col header that
+/// fails `ruff`/`black`), falling back to the short `value<n>` snapshot local.
 const WIDE_SCHEMA: &str = r#"
 struct Profile {
     id: Int
     thisIsAnIntentionallyLongFieldNameToForceGuardWrapping: String where self.length > 0 && self.length <= 100
+    aVeryLongOptionalProfileFieldNameForGuardWrap: Option<String> where self.length <= 100
 }
 
 endpoint createProfile: POST "/api/profiles" {

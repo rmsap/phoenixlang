@@ -3984,3 +3984,52 @@ Each driver also pins the `listAccounts` request query (`page=2`), not just
 Python, and TS provably emit/accept one wire. This is the test that would have caught
 the Python snake-wire bug (Python's wire would not have matched the golden Go/TS meet).
 clippy clean; the full 31-test round-trip suite green.
+
+## Phoenix Gen — Python constraint-expression parity (closed 2026-06-23)
+
+**The gap.** The Python target enforced a field's `where` constraint by extracting
+pydantic `Field(...)` / FastAPI `Form(...)` validation kwargs (`ge`/`le`/`gt`/`lt`
+from `self <op> N`, `min_length`/`max_length` from `self.length <op> N`). That covers
+only constraints reducible to a kwarg. A non-reducible one — `email: String where
+self.contains("@")`, or any boolean/equality/multi-term expression — produced **no
+kwarg**, so the Python server **silently accepted** values that Go and TypeScript
+(which translate the *full* expression to `!strings.Contains(...)` /
+`!x.includes(...)`) reject. A pure cross-language enforcement divergence: same-language
+round-trips never sent constraint-violating data of the non-extractable kind, so it
+never surfaced. This was the last *silent* (vs. loud/compile-time) Python codegen
+residual.
+
+**The fix — one full-expression mechanism, mirroring Go/TS.** Replace the
+extractable-kwarg path with a single translator + enforcement, so Python has ONE
+constraint path (like each of Go/TS) instead of a kwarg/none split:
+
+- `constraint_expr_to_python(expr, accessor) -> (String, prec)` — a **precedence-aware**
+  emitter (mirrors `constraint_expr_to_go`) that renders the constraint with MINIMAL
+  parentheses. `self`→`accessor`, `self.length`→`len(...)`, `self.contains(x)`→`x in …`,
+  `&&`/`||`→`and`/`or`, etc. Returning a precedence level lets callers add only the
+  parens Python actually needs (ruff UP034 rejects extraneous ones).
+- **JSON bodies / projections:** a `@model_validator(mode="after")`
+  (`emit_constraints_validator`) raises `ValueError` (→ FastAPI 422) on violation;
+  an optional field is checked only when present.
+- **Multipart bodies:** an inline route-body check raises `HTTPException(422)` (no model
+  to attach a validator to). `Form(...)`/`Field(...)` now carry only the wire `alias=`.
+
+**Staying formatter-clean without a formatter.** The generated guards are pre-shaped to
+pass `black --check` and `ruff` (the compile-and-lint harness gate) with no post-pass:
+single folded `if` (not nested → SIM102); `not` parenthesised only when precedence
+needs it (→ UP034); a sole membership test negates to `x not in y` (→ E713); a long `if`
+is pre-wrapped inside the `not (...)` parens exactly as black would; a long `raise`
+message is wrapped likewise. For a pathologically long field name (whose `len(self.x) …
+and len(self.x) …` would force black's deep per-operand wrapping, impractical to
+reproduce), the field is first snapshot into a short `value` local so the condition
+shrinks; if even the wrapped message string would still trip E501, the message drops the
+(very long) field name for a generic one. The `WIDE_SCHEMA` fixture (a 50-char field
+name) locks this path.
+
+**Verification.** Behaviorally confirmed end-to-end: the generated `Author` model
+rejects `email="noatsign"` (length>3, no `@`) — the exact value the old code silently
+accepted — with a pydantic `ValidationError`, while a valid email passes and a length
+violation still rejects. Python compile-and-lint green across all fixtures
+(black/ruff/mypy); 258 lib tests + 10 Python round-trips green; clippy clean. Closes the
+known-issue of the same name; see [phase-5.md](phases/phase-5.md) "Bugs closed in this
+phase".

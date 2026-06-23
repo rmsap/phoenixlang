@@ -435,18 +435,21 @@ impl<'a> PyGenerator<'a> {
         // `BaseModel`, so a Money-using schema needs both even if no user field is
         // a bare `Decimal`.
         let needs_decimal = needs_decimal || needs_money;
-        let mut needs_field = false;
+        // `needs_validator`: any emitted model has a `where`-constrained field, so it
+        // gets a `@model_validator(mode="after")` enforcing the full constraint
+        // expression → pull in pydantic's `model_validator`.
+        let mut needs_validator = false;
         let mut needs_enum = false;
         // `ConfigDict(populate_by_name=True)` is emitted on any model carrying an
         // aliased field — a field whose schema (wire) name differs from its
         // snake_case Python attribute (a camelCase name, or a keyword escaped with a
         // trailing `_`), or a pagination envelope (whose `totalCount`/`nextCursor`
-        // always alias). It shares the SAME emit gating as `needs_field` — same model
-        // set, same `is_file_bearing`/`is_multipart` exclusions — so the two flags are
-        // computed together in one traversal to keep them from drifting from each
+        // always alias). It shares the SAME emit gating as `needs_validator` — same
+        // model set, same `is_file_bearing`/`is_multipart` exclusions — so the flags
+        // are computed together in one traversal to keep them from drifting from each
         // other or from the emitters. The import must track the emitted
-        // `model_config`/`Field(alias=…)` lines exactly, or ruff flags an
-        // unused/undefined name.
+        // `model_config`/`Field(alias=…)`/`model_validator` lines exactly, or ruff
+        // flags an unused/undefined name.
         let mut needs_config_dict = false;
 
         for decl in &program.declarations {
@@ -459,7 +462,7 @@ impl<'a> PyGenerator<'a> {
                         && !info.is_file_bearing
                     {
                         if info.fields.iter().any(|f| f.constraint.is_some()) {
-                            needs_field = true;
+                            needs_validator = true;
                         }
                         if info.fields.iter().any(|f| is_aliased(&f.name)) {
                             needs_config_dict = true;
@@ -477,7 +480,7 @@ impl<'a> PyGenerator<'a> {
                 && let Some(ref body) = ep.body
             {
                 if body.fields.iter().any(|f| f.constraint.is_some()) {
-                    needs_field = true;
+                    needs_validator = true;
                 }
                 if body.fields.iter().any(|f| is_aliased(&f.name)) {
                     needs_config_dict = true;
@@ -485,7 +488,7 @@ impl<'a> PyGenerator<'a> {
             }
             if let Some(ref proj) = ep.response_projection {
                 if proj.fields.iter().any(|f| f.constraint.is_some()) {
-                    needs_field = true;
+                    needs_validator = true;
                 }
                 if proj.fields.iter().any(|f| is_aliased(&f.name)) {
                     needs_config_dict = true;
@@ -582,13 +585,15 @@ impl<'a> PyGenerator<'a> {
             self.models_out.push_str(&stdlib.join("\n"));
             self.models_out.push_str("\n\n");
         }
-        // pydantic members, alphabetical (isort): BaseModel, BeforeValidator,
-        // ConfigDict, Field, PlainSerializer, field_validator. `Money` subclasses
-        // `BaseModel` and uses `field_validator`; both `Url` and `Bytes` use
-        // `BeforeValidator`; `Bytes` also uses `PlainSerializer` (raw `bytes` →
-        // base64 wire); `ConfigDict` carries `populate_by_name` on aliased models.
+        // pydantic members in ruff's isort `order-by-type` order: the CamelCase
+        // classes (BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer)
+        // before the snake_case functions (field_validator, model_validator). `Money`
+        // subclasses `BaseModel` and uses `field_validator`; both `Url` and `Bytes`
+        // use `BeforeValidator`; `Bytes` also uses `PlainSerializer` (raw `bytes` →
+        // base64 wire); `ConfigDict` carries `populate_by_name` on aliased models;
+        // `model_validator` enforces `where`-constraints on constrained models.
         let mut pydantic: Vec<&str> = Vec::new();
-        if needs_base_model || needs_field || needs_money {
+        if needs_base_model || needs_validator || needs_money {
             pydantic.push("BaseModel");
         }
         if needs_url || needs_bytes {
@@ -597,10 +602,11 @@ impl<'a> PyGenerator<'a> {
         if needs_config_dict {
             pydantic.push("ConfigDict");
         }
-        // `Field` is needed for a constraint kwarg OR an `alias=` (every aliased
-        // field renders `Field(alias=…)`), so an aliased-but-unconstrained model
-        // (e.g. a pagination envelope) still imports it.
-        if needs_field || needs_config_dict {
+        // `Field` is needed only for an `alias=` now (every aliased field renders
+        // `Field(alias=…)`); `where`-constraints moved to `model_validator`. So an
+        // aliased model (e.g. a pagination envelope) imports `Field`, an
+        // unconstrained-and-unaliased one imports neither.
+        if needs_config_dict {
             pydantic.push("Field");
         }
         if needs_bytes {
@@ -608,6 +614,9 @@ impl<'a> PyGenerator<'a> {
         }
         if needs_money {
             pydantic.push("field_validator");
+        }
+        if needs_validator {
+            pydantic.push("model_validator");
         }
         if !pydantic.is_empty() {
             self.models_out
@@ -661,16 +670,24 @@ impl<'a> PyGenerator<'a> {
                 for f in &info.fields {
                     let py_type = type_to_python(&f.ty);
                     let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
-                    let field_str = constraint_to_field(&f.constraint);
                     let snake = to_snake_case(&f.name);
-                    self.models_out.push_str(&pydantic_model_field(
-                        &snake,
-                        &py_type,
-                        is_option,
-                        field_str.as_deref(),
-                        &f.name,
-                    ));
+                    self.models_out
+                        .push_str(&pydantic_model_field(&snake, &py_type, is_option, &f.name));
                 }
+                // `where`-constraints are enforced by a model_validator over the
+                // full expression (`Field(...)` now carries only the alias).
+                let constrained: Vec<(String, bool, &phoenix_parser::ast::Expr, String)> = info
+                    .fields
+                    .iter()
+                    .filter_map(|f| {
+                        f.constraint.as_ref().map(|c| {
+                            let is_option =
+                                matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                            (to_snake_case(&f.name), is_option, c, f.name.clone())
+                        })
+                    })
+                    .collect();
+                emit_constraints_validator(&mut self.models_out, &s.name, &constrained);
             }
         }
     }
@@ -738,7 +755,9 @@ impl<'a> PyGenerator<'a> {
     /// Emits a pydantic `BaseModel` named `type_name` over `fields` (the derived
     /// field set of a request body or a response projection). Deduped via
     /// `emitted_derived_types`. Honors per-field optionality (`Option<T>` or a
-    /// `partial` modifier) and constraint `Field(...)` kwargs.
+    /// `partial` modifier); `where`-constraints are enforced by a trailing
+    /// `@model_validator` over the full expression (see `emit_constraints_validator`),
+    /// not `Field(...)` kwargs.
     fn emit_pydantic_model(&mut self, type_name: &str, fields: &[DerivedField]) {
         if !self.emitted_derived_types.insert(type_name.to_string()) {
             return;
@@ -754,7 +773,6 @@ impl<'a> PyGenerator<'a> {
             self.emit_model_config_if_aliased(fields.iter().map(|f| f.name.as_str()));
             for f in fields {
                 let py_type = type_to_python(&f.ty);
-                let field_str = constraint_to_field(&f.constraint);
                 // A field can be optional either because the source type is
                 // `Option<T>` or because a `partial` modifier marked it optional.
                 // Avoid emitting `T | None | None` when both apply. Test the
@@ -770,14 +788,22 @@ impl<'a> PyGenerator<'a> {
                 };
                 let field_ty = if f.optional { &optional_type } else { &py_type };
                 let snake = to_snake_case(&f.name);
-                self.models_out.push_str(&pydantic_model_field(
-                    &snake,
-                    field_ty,
-                    f.optional,
-                    field_str.as_deref(),
-                    &f.name,
-                ));
+                self.models_out
+                    .push_str(&pydantic_model_field(&snake, field_ty, f.optional, &f.name));
             }
+            // Enforce `where`-constraints over the full expression (see emit_model).
+            // A field is checked-when-present if it's `partial`-optional or `Option<T>`.
+            let constrained: Vec<(String, bool, &phoenix_parser::ast::Expr, String)> = fields
+                .iter()
+                .filter_map(|f| {
+                    f.constraint.as_ref().map(|c| {
+                        let is_option = f.optional
+                            || matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                        (to_snake_case(&f.name), is_option, c, f.name.clone())
+                    })
+                })
+                .collect();
+            emit_constraints_validator(&mut self.models_out, type_name, &constrained);
         }
     }
 
@@ -868,7 +894,6 @@ impl<'a> PyGenerator<'a> {
                     "total_count",
                     "int",
                     false,
-                    None,
                     "totalCount",
                 ));
             }
@@ -880,7 +905,6 @@ impl<'a> PyGenerator<'a> {
                     "next_cursor",
                     "str | None",
                     true,
-                    None,
                     "nextCursor",
                 ));
             }
@@ -1712,11 +1736,18 @@ impl<'a> PyGenerator<'a> {
         // `HTTPException` only when some endpoint maps errors; `Query` only when
         // some query param needs an `alias=` (its wire name differs from the
         // snake_case Python parameter — see `emit_server_route`).
-        let needs_http_exception = self
-            .check_result
-            .endpoints
-            .iter()
-            .any(|ep| !ep.errors.is_empty());
+        // `HTTPException` is raised both by the error-mapping `except` blocks and by
+        // the inline multipart `where`-constraint checks (a constraint on an exploded
+        // Form field has no model_validator to live in, so the route raises 422
+        // directly). Either pulls in the import.
+        let needs_http_exception = self.check_result.endpoints.iter().any(|ep| {
+            !ep.errors.is_empty()
+                || (ep.body_is_multipart
+                    && ep
+                        .body
+                        .as_ref()
+                        .is_some_and(|b| b.fields.iter().any(|f| f.constraint.is_some())))
+        });
         let needs_query = self.check_result.endpoints.iter().any(|ep| {
             ep.query_params.iter().any(|qp| {
                 // An aliased param OR any list-valued param (always bound via
@@ -2017,30 +2048,21 @@ impl<'a> PyGenerator<'a> {
                     } else {
                         String::new()
                     };
-                    // `where`-constraint kwargs, extracted exactly like the JSON
-                    // body's pydantic `Field(...)` path. FastAPI's `Form(...)`
-                    // accepts the same validation kwargs (`min_length`/`ge`/…) and
-                    // returns 422 on violation — so a multipart scalar enforces its
-                    // constraint server-side, matching the JSON body (and Go). Only
-                    // the extractable numeric/length subset is covered, identical to
-                    // the JSON path; a non-extractable constraint (e.g. `contains`)
-                    // is unvalidated on BOTH paths in Python.
-                    let constraint_args = constraint_to_field(&f.constraint)
-                        .map(|kw| format!(", {}", kw.join(", ")))
-                        .unwrap_or_default();
+                    // `where`-constraints are enforced inline in the route body (the
+                    // multipart-constraint block below), over the FULL expression —
+                    // so `Form(...)` carries only the alias. This replaces the old
+                    // extractable-only `Form(min_length=…)` kwargs, which silently
+                    // dropped non-numeric/length constraints (e.g. `contains`),
+                    // mirroring the JSON body's move to a model_validator.
                     if f.optional || already_optional {
                         let ty = if f.optional && !already_optional {
                             format!("{py_type} | None")
                         } else {
                             py_type
                         };
-                        defaulted.push(format!(
-                            "{snake}: {ty} = Form(None{constraint_args}{alias_arg})"
-                        ));
+                        defaulted.push(format!("{snake}: {ty} = Form(None{alias_arg})"));
                     } else {
-                        defaulted.push(format!(
-                            "{snake}: {py_type} = Form(...{constraint_args}{alias_arg})"
-                        ));
+                        defaulted.push(format!("{snake}: {py_type} = Form(...{alias_arg})"));
                     }
                 }
             }
@@ -2157,6 +2179,39 @@ impl<'a> PyGenerator<'a> {
             &format!(" -> {response_type}:"),
         );
         self.server_out.push_str(&sig);
+
+        // Multipart scalar `where`-constraints: FastAPI's `Form(...)` no longer
+        // carries the constraint, so enforce the FULL expression inline (→ 422),
+        // matching the JSON body's model_validator and Go/TS. Emitted before any
+        // error-handling `try:`, so a violation is a 422 regardless of the
+        // handler's error mapping. Constraints only ever sit on scalar fields.
+        if ep.body_is_multipart
+            && let Some(body) = ep.body.as_ref()
+        {
+            // `slot` indexes the constrained fields (not all fields), so the unique
+            // snapshot local each guard may emit (`value<slot>`) stays collision-free.
+            for (slot, f) in body
+                .fields
+                .iter()
+                .filter(|f| f.constraint.is_some())
+                .enumerate()
+            {
+                let constraint = f.constraint.as_ref().expect("filtered to Some above");
+                let snake = to_snake_case(&f.name);
+                let is_optional =
+                    f.optional || matches!(&f.ty, Type::Generic(name, _) if name == "Option");
+                let detail = format!("{}: constraint not satisfied", f.name);
+                push_constraint_guard(
+                    &mut self.server_out,
+                    "        ",
+                    is_optional,
+                    constraint,
+                    &snake,
+                    slot,
+                );
+                push_http_exception_422(&mut self.server_out, "            ", &detail);
+            }
+        }
 
         // Error handling wrapper
         let has_errors = !ep.errors.is_empty();
@@ -3149,73 +3204,308 @@ fn collect_python_imports(ty: &Type, imports: &mut BTreeSet<String>) {
 ///
 /// Returns `Some("ge=0, le=150")` for numeric bounds, `Some("min_length=1")`
 /// for string length, or `None` if no extractable constraints.
-fn constraint_to_field(constraint: &Option<phoenix_parser::ast::Expr>) -> Option<Vec<String>> {
-    let constraint = constraint.as_ref()?;
-    let mut kwargs = Vec::new();
-    extract_pydantic_kwargs(constraint, &mut kwargs);
-    if kwargs.is_empty() {
-        None
-    } else {
-        Some(kwargs)
+// Python operator precedence levels (higher binds tighter), used to emit only the
+// parentheses a sub-expression actually needs — ruff's UP034 rejects extraneous
+// ones, so a blanket "wrap every node" strategy doesn't lint.
+const PREC_OR: u8 = 1;
+const PREC_AND: u8 = 2;
+const PREC_CMP: u8 = 3;
+const PREC_ADD: u8 = 4;
+const PREC_MUL: u8 = 5;
+const PREC_UNARY: u8 = 6;
+const PREC_ATOM: u8 = 7;
+
+/// Translates a `where`-constraint expression into an equivalent Python boolean
+/// expression with MINIMAL parentheses, returning `(text, precedence)`. `self` is
+/// rendered as `accessor` — `self.<field>` inside a model `@model_validator`, or the
+/// bare exploded local inside a multipart route. Mirrors the Go
+/// (`constraint_expr_to_go`) and TS translators so all three targets enforce the
+/// FULL constraint, not just the extractable numeric/length subset Python used to
+/// cover via `Field(...)`/`Form(...)` kwargs.
+fn constraint_expr_to_python(expr: &phoenix_parser::ast::Expr, accessor: &str) -> (String, u8) {
+    use phoenix_parser::ast::{BinaryOp, Expr, LiteralKind, UnaryOp};
+
+    // Render `child`, wrapping it in parens only when its precedence binds looser
+    // than `parent` requires (so `a and b` inside `not (...)` keeps its parens but
+    // `a > b` inside `a > b and …` does not).
+    let wrapped = |child: &phoenix_parser::ast::Expr, parent: u8| -> String {
+        let (text, prec) = constraint_expr_to_python(child, accessor);
+        if prec < parent {
+            format!("({text})")
+        } else {
+            text
+        }
+    };
+
+    match expr {
+        Expr::Ident(ident) if ident.name == "self" => (accessor.to_string(), PREC_ATOM),
+        Expr::Ident(ident) => (ident.name.clone(), PREC_ATOM),
+        Expr::Literal(lit) => {
+            let s = match &lit.kind {
+                LiteralKind::Int(v) => v.to_string(),
+                LiteralKind::Float(v) => format_python_float(*v),
+                LiteralKind::String(v) => format!("\"{v}\""),
+                LiteralKind::Bool(v) => if *v { "True" } else { "False" }.to_string(),
+            };
+            (s, PREC_ATOM)
+        }
+        // self.length → len(accessor)
+        Expr::FieldAccess(fa) if fa.field == "length" && is_self_ident(&fa.object) => {
+            (format!("len({accessor})"), PREC_ATOM)
+        }
+        Expr::FieldAccess(fa) => {
+            let object = wrapped(&fa.object, PREC_ATOM);
+            (format!("{object}.{}", fa.field), PREC_ATOM)
+        }
+        // self.contains(arg) → `arg in accessor` (a comparison) — works for both
+        // `str` substrings and `list` membership, matching Phoenix's `contains`.
+        Expr::MethodCall(mc) if mc.method == "contains" && is_self_ident(&mc.object) => {
+            let arg = mc
+                .args
+                .first()
+                .map(|a| constraint_expr_to_python(a, accessor).0)
+                .unwrap_or_default();
+            (format!("{arg} in {accessor}"), PREC_CMP)
+        }
+        Expr::MethodCall(mc) => {
+            let object = wrapped(&mc.object, PREC_ATOM);
+            let args: Vec<String> = mc
+                .args
+                .iter()
+                .map(|a| constraint_expr_to_python(a, accessor).0)
+                .collect();
+            (
+                format!("{object}.{}({})", mc.method, args.join(", ")),
+                PREC_ATOM,
+            )
+        }
+        Expr::Binary(bin) => {
+            let (op, prec) = match bin.op {
+                BinaryOp::Mul => ("*", PREC_MUL),
+                BinaryOp::Div => ("/", PREC_MUL),
+                BinaryOp::Mod => ("%", PREC_MUL),
+                BinaryOp::Add => ("+", PREC_ADD),
+                BinaryOp::Sub => ("-", PREC_ADD),
+                BinaryOp::Eq => ("==", PREC_CMP),
+                BinaryOp::NotEq => ("!=", PREC_CMP),
+                BinaryOp::Lt => ("<", PREC_CMP),
+                BinaryOp::Gt => (">", PREC_CMP),
+                BinaryOp::LtEq => ("<=", PREC_CMP),
+                BinaryOp::GtEq => (">=", PREC_CMP),
+                BinaryOp::And => ("and", PREC_AND),
+                BinaryOp::Or => ("or", PREC_OR),
+            };
+            // Wrap the right operand at one level tighter so a same-precedence
+            // right child (e.g. `a - (b - c)`) keeps its parens; left-assoc left
+            // children never need them.
+            let left = wrapped(&bin.left, prec);
+            let right = wrapped(&bin.right, prec + 1);
+            (format!("{left} {op} {right}"), prec)
+        }
+        Expr::Unary(un) => {
+            let operand = wrapped(&un.operand, PREC_UNARY);
+            let s = match un.op {
+                UnaryOp::Neg => format!("-{operand}"),
+                UnaryOp::Not => format!("not {operand}"),
+            };
+            (s, PREC_UNARY)
+        }
+        // Unreachable for well-typed input: sema (`phoenix-sema::check_expr`)
+        // restricts `where` constraints to exactly the forms handled above
+        // (idents, literals, field access, method calls, binary/unary ops). Any
+        // other `Expr` variant would have been rejected at check time, so this arm
+        // exists only for exhaustiveness. It renders `True` (an inert, always-pass
+        // constraint) rather than panicking — matching `constraint_expr_to_go`'s
+        // fallback — so an unforeseen grammar addition degrades to "not enforced"
+        // instead of crashing codegen. If a future constraint form should be
+        // enforced, add it here AND to the Go/TS translators in lockstep.
+        _ => ("True".to_string(), PREC_ATOM),
     }
 }
 
-/// Recursively extracts Pydantic Field kwargs from constraint expressions.
-fn extract_pydantic_kwargs(expr: &phoenix_parser::ast::Expr, kwargs: &mut Vec<String>) {
-    use phoenix_parser::ast::{BinaryOp, Expr, LiteralKind};
+/// Emits a `@model_validator(mode="after")` method into a pydantic model body that
+/// enforces each field's full `where`-constraint, raising `ValueError` (→ FastAPI
+/// 422 on a request body) on violation. An optional field is checked only when
+/// present (`is not None`), matching Go's nil-guard and TS's optional handling. A
+/// free function (not a `&mut self` method) so it can borrow `out` (a single struct
+/// field) while the caller still holds an immutable borrow of `self.check_result`.
+///
+/// `items` is `(snake_name, is_optional, constraint_expr, wire_name)` per
+/// constrained field; emits nothing when empty (so unconstrained models don't churn).
+fn emit_constraints_validator(
+    out: &mut String,
+    type_name: &str,
+    items: &[(String, bool, &phoenix_parser::ast::Expr, String)],
+) {
+    if items.is_empty() {
+        return;
+    }
+    out.push('\n');
+    out.push_str("    @model_validator(mode=\"after\")\n");
+    out.push_str(&format!(
+        "    def _validate_constraints(self) -> {type_name}:\n"
+    ));
+    for (slot, (snake, is_optional, expr, wire)) in items.iter().enumerate() {
+        push_constraint_guard(
+            out,
+            "        ",
+            *is_optional,
+            expr,
+            &format!("self.{snake}"),
+            slot,
+        );
+        push_value_error(out, "            ", wire);
+    }
+    out.push_str("        return self\n");
+}
 
-    match expr {
-        // expr1 and expr2 → extract from both
-        Expr::Binary(bin) if bin.op == BinaryOp::And => {
-            extract_pydantic_kwargs(&bin.left, kwargs);
-            extract_pydantic_kwargs(&bin.right, kwargs);
+/// Emits an `if <guard>not <cond>:` guard header at `indent` whose body (emitted by
+/// the caller at `indent` + 4) raises on a violated constraint. An optional field
+/// (`is_optional`) gains an `<accessor> is not None and ` guard so the check is
+/// skipped when absent. `slot` is the field's index among the constrained fields of
+/// the enclosing model/route, used only to name a unique snapshot local (see below).
+/// Design points that keep the output `ruff`- and `black --check`-clean without
+/// shelling out to either during codegen:
+///   * the guard is folded into a SINGLE `if` (not nested) → ruff SIM102 quiet;
+///   * `not` parenthesises its operand only when precedence requires it → ruff
+///     UP034 (extraneous parens) quiet;
+///   * a long line is pre-wrapped inside the `not (...)` parens exactly as black
+///     would;
+///   * if even that wrapped form would overflow — either the indented `cond` line or
+///     the `if <guard>not (` header, whose width INCLUDES an optional field's
+///     `… is not None and ` guard — the field is first snapshot into a short
+///     `value<slot>` local so both shrink, sidestepping black's deep per-operand
+///     wrapping (impractical to reproduce here). The `slot` suffix keeps the local
+///     unique across fields, so two snapshot-needing fields of different types in
+///     one scope don't collide on `value` and trip mypy's redefinition check.
+fn push_constraint_guard(
+    out: &mut String,
+    indent: &str,
+    is_optional: bool,
+    expr: &phoenix_parser::ast::Expr,
+    accessor: &str,
+    slot: usize,
+) {
+    use phoenix_parser::ast::Expr;
+
+    // Builds (negated_condition, wrappable_inner, guard) for an accessor:
+    //   * `wrappable_inner` is `Some(cond)` when the form is `not (cond)` (a long
+    //     line can break inside those parens), `None` for forms that never need
+    //     wrapping (`x not in y`, `not atom`).
+    //   * `not` binds tighter than every binary operator, so an `and`/`or`/comparison
+    //     operand needs parens; a bare atom does not (ruff UP034 rejects extras).
+    //   * a SOLE membership test negates to `x not in y`, never `not (x in y)`
+    //     (ruff E713).
+    let negated = |acc: &str| -> (String, Option<String>, String) {
+        let guard = if is_optional {
+            format!("{acc} is not None and ")
+        } else {
+            String::new()
+        };
+        if let Expr::MethodCall(mc) = expr
+            && mc.method == "contains"
+            && is_self_ident(&mc.object)
+        {
+            let arg = mc
+                .args
+                .first()
+                .map(|a| constraint_expr_to_python(a, acc).0)
+                .unwrap_or_default();
+            return (format!("{arg} not in {acc}"), None, guard);
         }
-        // self >= N, self <= N, etc.
-        Expr::Binary(bin) if is_self_ident(&bin.left) => {
-            if let Expr::Literal(lit) = &bin.right {
-                let val = match &lit.kind {
-                    LiteralKind::Int(v) => v.to_string(),
-                    LiteralKind::Float(v) => format_python_float(*v),
-                    _ => return,
-                };
-                match bin.op {
-                    BinaryOp::GtEq => kwargs.push(format!("ge={val}")),
-                    BinaryOp::LtEq => kwargs.push(format!("le={val}")),
-                    BinaryOp::Gt => kwargs.push(format!("gt={val}")),
-                    BinaryOp::Lt => kwargs.push(format!("lt={val}")),
-                    _ => {}
-                }
-            }
+        let (cond, prec) = constraint_expr_to_python(expr, acc);
+        if prec < PREC_UNARY {
+            (format!("not ({cond})"), Some(cond), guard)
+        } else {
+            (format!("not {cond}"), None, guard)
         }
-        // self.length >= N, etc.
-        Expr::Binary(bin) if is_self_length(&bin.left) => {
-            if let Expr::Literal(lit) = &bin.right
-                && let LiteralKind::Int(n) = &lit.kind
-            {
-                match bin.op {
-                    BinaryOp::GtEq => kwargs.push(format!("min_length={n}")),
-                    BinaryOp::LtEq => kwargs.push(format!("max_length={n}")),
-                    BinaryOp::Gt => kwargs.push(format!("min_length={}", n + 1)),
-                    BinaryOp::Lt => kwargs.push(format!("max_length={}", n - 1)),
-                    _ => {}
-                }
-            }
+    };
+
+    let local = format!("value{slot}");
+    let (mut not_expr, mut inner, mut guard) = negated(accessor);
+    let fits_one = format!("{indent}if {guard}{not_expr}:").len() <= 88;
+    // The wrapped form emits `{indent}if {guard}not (` then `{indent}    {cond}` then
+    // `{indent}):`. BOTH the header (guard included — an optional field's guard rides
+    // on it) and the indented `cond` line must fit ≤88, or it doesn't lint either.
+    let fits_wrapped = inner.as_ref().is_some_and(|c| {
+        format!("{indent}if {guard}not (").len() <= 88 && indent.len() + 4 + c.len() <= 88
+    });
+    if !fits_one && !fits_wrapped {
+        // Snapshot the field into a short local so the condition shrinks, dodging
+        // black's deep per-operand wrapping for a very long field name.
+        out.push_str(&format!("{indent}{local} = {accessor}\n"));
+        (not_expr, inner, guard) = negated(&local);
+    }
+
+    let line = format!("{indent}if {guard}{not_expr}:");
+    match inner {
+        Some(cond) if line.len() > 88 => {
+            // black breaks the over-long line inside the `not (...)` parens.
+            out.push_str(&format!("{indent}if {guard}not (\n"));
+            out.push_str(&format!("{indent}    {cond}\n"));
+            out.push_str(&format!("{indent}):\n"));
         }
-        _ => {}
+        // The membership (`x not in y`) and bare-atom (`not atom`) forms have no
+        // `not (...)` parens to break inside (`inner` is `None`), so they emit as a
+        // single line even after the `value<slot>` snapshot. A real schema can't
+        // overflow here: the only variable-width parts are a short snapshot local and
+        // a constraint literal, and a literal long enough to push this past 88 cols
+        // (~70+ chars) is not something any `where` constraint in practice carries.
+        _ => {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+}
+
+/// Emits a `raise ValueError("<wire>: constraint not satisfied")` at `indent`,
+/// wrapped exactly as black would when the single-line form exceeds 88 cols. black
+/// never splits a string literal, so for a pathologically long field name (whose
+/// message string alone would still trip ruff's E501 even on its own line) the field
+/// name is dropped for a generic message — the only way to stay ≤88.
+fn push_value_error(out: &mut String, indent: &str, wire: &str) {
+    let msg = format!("\"{wire}: constraint not satisfied\"");
+    let one_line = format!("{indent}raise ValueError({msg})");
+    if one_line.len() <= 88 {
+        out.push_str(&one_line);
+        out.push('\n');
+    } else if indent.len() + 4 + msg.len() <= 88 {
+        out.push_str(&format!("{indent}raise ValueError(\n"));
+        out.push_str(&format!("{indent}    {msg}\n"));
+        out.push_str(&format!("{indent})\n"));
+    } else {
+        out.push_str(&format!(
+            "{indent}raise ValueError(\"constraint not satisfied\")\n"
+        ));
+    }
+}
+
+/// Emits a `raise HTTPException(status_code=422, detail="…")` at `indent`, wrapped
+/// across lines exactly as black would when the single-line form exceeds 88 cols
+/// (the two kwargs stay together on a continuation line). As with [`push_value_error`],
+/// a pathologically long field name falls back to a generic detail to stay ≤88.
+fn push_http_exception_422(out: &mut String, indent: &str, detail: &str) {
+    let one_line = format!("{indent}raise HTTPException(status_code=422, detail=\"{detail}\")");
+    if one_line.len() <= 88 {
+        out.push_str(&one_line);
+        out.push('\n');
+        return;
+    }
+    let cont = format!("{indent}    status_code=422, detail=\"{detail}\"");
+    if cont.len() <= 88 {
+        out.push_str(&format!("{indent}raise HTTPException(\n"));
+        out.push_str(&format!("{cont}\n"));
+        out.push_str(&format!("{indent})\n"));
+    } else {
+        out.push_str(&format!(
+            "{indent}raise HTTPException(status_code=422, detail=\"constraint not satisfied\")\n"
+        ));
     }
 }
 
 /// Returns true if the expression is the `self` identifier.
 fn is_self_ident(expr: &phoenix_parser::ast::Expr) -> bool {
     matches!(expr, phoenix_parser::ast::Expr::Ident(i) if i.name == "self")
-}
-
-/// Returns true if the expression is `self.length`.
-fn is_self_length(expr: &phoenix_parser::ast::Expr) -> bool {
-    matches!(
-        expr,
-        phoenix_parser::ast::Expr::FieldAccess(fa) if fa.field == "length" && is_self_ident(&fa.object)
-    )
 }
 
 #[cfg(test)]

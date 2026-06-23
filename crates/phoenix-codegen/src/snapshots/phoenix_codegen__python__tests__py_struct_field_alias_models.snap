@@ -6,12 +6,18 @@ expression: files.models
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Profile(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id: int
-    avatar_url: str | None = Field(None, alias="avatarUrl", max_length=200)
+    avatar_url: str | None = Field(None, alias="avatarUrl")
     display_name: str = Field(..., alias="displayName")
+
+    @model_validator(mode="after")
+    def _validate_constraints(self) -> Profile:
+        if self.avatar_url is not None and not (len(self.avatar_url) <= 200):
+            raise ValueError("avatarUrl: constraint not satisfied")
+        return self

@@ -65,8 +65,10 @@ pub(crate) fn pydantic_field_line(
 /// a keyword escaped with a trailing `_`), a `Field(alias="<wire>")` keeps the wire
 /// key as the schema name (the model needs `populate_by_name` so it still
 /// constructs by `py_name`); otherwise the plain `name: type[ = None]` form is kept
-/// so single-word fields don't churn. `constraint_kwargs` (numeric/length bounds)
-/// are merged into the same `Field(...)`.
+/// so single-word fields don't churn. `where`-constraints are NOT rendered here:
+/// they are enforced by a `@model_validator` over the FULL expression (see
+/// `python.rs::emit_constraints_validator`), matching Go/TS rather than the old
+/// extractable-only `Field(...)` kwargs.
 ///
 /// Callers MUST pass `to_snake_case(<wire>)` as `py_name`, so the `py_name != wire`
 /// test here is exactly `python.rs::is_aliased(wire)` — the single alias predicate
@@ -76,15 +78,11 @@ pub(crate) fn pydantic_model_field(
     py_name: &str,
     ty: &str,
     is_optional: bool,
-    constraint_kwargs: Option<&[String]>,
     wire: &str,
 ) -> String {
     let mut kwargs: Vec<String> = Vec::new();
     if py_name != wire {
         kwargs.push(format!("alias=\"{wire}\""));
-    }
-    if let Some(ck) = constraint_kwargs {
-        kwargs.extend(ck.iter().cloned());
     }
     if kwargs.is_empty() {
         if is_optional {

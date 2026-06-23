@@ -171,34 +171,27 @@ endpoint's params (the same pass type-name escaping wants).
 scope. **Target phase:** the broader v1 robustness pass (adversarial-identifier
 fixtures), with type-name escaping. Surfaced 2026-06-22.
 
-### Python validates only the extractable (numeric/length) `where` subset
+### A `where` constraint on a *nested* `.length` generates an invalid `.length` access
 
-The Python target maps a field's `where` constraint to pydantic `Field(...)` /
-FastAPI `Form(...)` validation kwargs via `constraint_to_field`, which extracts
-only the **numeric** (`ge`/`le`/`gt`/`lt`, from `self <op> N`) and **length**
-(`min_length`/`max_length`, from `self.length <op> N`) subset. A constraint that
-is not reducible to a kwarg — e.g. `mimeType: String where self.contains("/")` —
-produces **no** validation kwarg, so Python enforces nothing for it. Go and
-TypeScript, by contrast, translate the **full** constraint expression
-(`!strings.Contains(...)` / `!obj.x.includes(...)`), so they reject what Python
-accepts.
+The constraint translators special-case `.length` to a real length idiom
+(`len(...)` in Python, `len(...)` in Go, `.length` in TS) **only when its object is
+`self` directly** — `name: String where self.length > 0`. A constraint that reaches
+`.length` through an intermediate struct field, e.g.
+`addr: Address where self.zip.length == 5`, is permitted by sema (the `in_constraint`
+rule in `phoenix-sema::check_expr` allows `.length` on any `String`/`List` base it can
+reach), but the translators fall through to the generic field-access arm and emit the
+literal attribute — Python `len(self.addr.zip.length)`'s precursor `self.addr.zip.length`,
+Go `s.Addr.zip.length` — neither of which is valid (`str`/Go-string have no `.length`).
 
-This is uniform across body kinds: it applies identically to a **JSON** body
-(pydantic `Field`) and a **multipart** body (FastAPI `Form`) — the multipart path
-was brought into line with the JSON path (see design-decisions.md, "multipart
-`where` constraints in Python/TS"), so there is no JSON-vs-multipart divergence
-within Python; the gap is purely Python-vs-Go/TS on non-extractable expressions.
-
-**Why not fixed now:** closing it means translating arbitrary Phoenix constraint
-expressions into Python (a `constraint_expr_to_python`) and wiring a pydantic
-`model_validator` (JSON) plus an inline route-body check (multipart) — a general
-"Python constraint-expression parity" feature, larger than and orthogonal to the
-multipart transport. The numeric/length subset covers the common cases.
-
-**File:** `phoenix-codegen/src/python.rs` (`constraint_to_field`,
-`extract_pydantic_kwargs`). **Workaround:** for a non-extractable constraint that
-must hold on the Python server, validate it inside the handler. **Target phase:**
-demand-triggered. Surfaced 2026-06-20 closing the multipart-constraint gap.
+This is a **shared limitation across all three targets** (Python's
+`constraint_expr_to_python`, Go's `constraint_expr_to_go`, and the TS translator all
+match `self.length` only at depth 1), not a Python-specific regression — the pre-fix
+Python kwarg path silently no-op'd the same constraint rather than emitting bad code.
+Closing it means recursing the `.length` special-case through field-access chains in
+all three translators in lockstep. **Workaround:** hoist the nested value into its own
+top-level field with a direct `self.length` constraint, or validate it in the handler.
+**Target phase:** demand-triggered. Surfaced 2026-06-23 in the Python
+constraint-expression parity review.
 
 ### Multi-status responses cannot be combined with response headers or pagination (v1)
 

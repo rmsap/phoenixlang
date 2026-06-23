@@ -89,10 +89,12 @@ fn emits_package_init() {
 #[test]
 fn models_has_pydantic_import() {
     let files = generate_full();
+    // `where`-constraints are enforced by a `@model_validator` (not `Field(...)`
+    // kwargs), and no field here is aliased, so `Field` is no longer imported.
     assert!(
         files
             .models
-            .contains("from pydantic import BaseModel, Field")
+            .contains("from pydantic import BaseModel, model_validator")
     );
 }
 
@@ -101,19 +103,38 @@ fn models_has_user_class() {
     let files = generate_full();
     assert!(files.models.contains("class User(BaseModel):"));
     assert!(files.models.contains("    id: int"));
-    assert!(files.models.contains("    name: str = Field("));
+    // Constrained fields render bare now (the constraint moved to the validator).
+    assert!(files.models.contains("    name: str\n"));
     assert!(files.models.contains("    email: str"));
-    assert!(files.models.contains("    age: int = Field("));
+    assert!(files.models.contains("    age: int\n"));
     assert!(files.models.contains("    bio: str | None = None"));
 }
 
 #[test]
 fn models_has_constraints() {
     let files = generate_full();
-    assert!(files.models.contains("min_length=1"));
-    assert!(files.models.contains("max_length=100"));
-    assert!(files.models.contains("ge=0"));
-    assert!(files.models.contains("le=150"));
+    // Constraints are enforced over the FULL expression in a model_validator,
+    // raising `ValueError` (→ 422) keyed by the wire name — not `Field` kwargs.
+    assert!(
+        files
+            .models
+            .contains("    @model_validator(mode=\"after\")")
+    );
+    assert!(
+        files
+            .models
+            .contains("        if not (len(self.name) > 0 and len(self.name) <= 100):")
+    );
+    assert!(
+        files
+            .models
+            .contains("        if not (self.age >= 0 and self.age <= 150):")
+    );
+    assert!(
+        files
+            .models
+            .contains("            raise ValueError(\"name: constraint not satisfied\")")
+    );
 }
 
 #[test]
@@ -365,13 +386,21 @@ endpoint updateUser: PATCH "/api/users/{id}" {
     let (program, _) = parser::parse(&tokens);
     let result = checker::check(&program);
     let files = phoenix_codegen::generate_python(&program, &result);
-    // Optional fields with constraints should use Field(None, ...)
+    // Partial-optional fields render bare `= None`; the inherited constraint is
+    // enforced by a None-guarded model_validator over the full expression, so a
+    // present-but-invalid value still 422s while an omitted one passes.
+    assert!(files.models.contains("    name: str | None = None"));
+    assert!(files.models.contains("    age: int | None = None"));
     assert!(
         files
             .models
-            .contains("name: str | None = Field(None, min_length=1)")
+            .contains("        if self.name is not None and not (len(self.name) > 0):")
     );
-    assert!(files.models.contains("age: int | None = Field(None, ge=0)"));
+    assert!(
+        files
+            .models
+            .contains("        if self.age is not None and not (self.age >= 0):")
+    );
 }
 
 // ── Additional type/method tests ────────────────────────────────────

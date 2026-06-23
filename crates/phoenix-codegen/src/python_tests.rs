@@ -133,11 +133,12 @@ struct User {
 /// the schema name — cross-language-compatible with Go's `json:"avatarUrl"` / TS's
 /// `avatarUrl` — and the model gains `model_config = ConfigDict(populate_by_name=True)`
 /// so handlers/tests still construct by the Python name. A single-word field keeps
-/// the plain `name: type` form (no churn). When an aliased field ALSO carries a
-/// constraint, the `alias=` kwarg precedes the constraint kwargs in the same
-/// `Field(...)` (`Field(..., alias="avatarUrl", max_length=200)`). This guards the
-/// general struct/derived alias path that the pagination snapshots only cover for
-/// the hardcoded `totalCount`/`nextCursor` envelope fields.
+/// the plain `name: type` form (no churn). A `where`-constraint no longer adds
+/// `Field(...)` kwargs — it is enforced by a `@model_validator` over the full
+/// expression — so an aliased+constrained field renders `Field(None, alias=…)` and
+/// the constraint lives in the validator method. This guards the general
+/// struct/derived alias path that the pagination snapshots only cover for the
+/// hardcoded `totalCount`/`nextCursor` envelope fields.
 #[test]
 fn camel_case_struct_field_aliases_to_wire_name() {
     let files = generate_from_source(
@@ -172,12 +173,13 @@ struct Profile {
         "single-word field must stay plain `id: int`:\n{}",
         files.models
     );
-    // camelCase + constraint: `alias=` precedes the constraint kwarg.
+    // camelCase + constraint: `Field` carries ONLY the alias; the constraint is
+    // enforced by the model_validator (checked below), not a `Field(...)` kwarg.
     assert!(
-        files.models.contains(
-            "    avatar_url: str | None = Field(None, alias=\"avatarUrl\", max_length=200)\n"
-        ),
-        "optional camelCase field with a constraint must render alias before the constraint kwarg:\n{}",
+        files
+            .models
+            .contains("    avatar_url: str | None = Field(None, alias=\"avatarUrl\")\n"),
+        "optional camelCase field renders alias-only Field (constraint moved to validator):\n{}",
         files.models
     );
     // camelCase, required, unconstrained: `alias=` only.
@@ -186,6 +188,15 @@ struct Profile {
             .models
             .contains("    display_name: str = Field(..., alias=\"displayName\")\n"),
         "required camelCase field must render `Field(..., alias=\"displayName\")`:\n{}",
+        files.models
+    );
+    // The constraint is enforced over the full expression in a model_validator,
+    // keyed by the WIRE name in the message (the optional field is None-guarded).
+    assert!(
+        files.models.contains(
+            "        if self.avatar_url is not None and not (len(self.avatar_url) <= 200):\n"
+        ),
+        "optional constraint must be enforced (None-guarded) in the validator:\n{}",
         files.models
     );
 }
@@ -889,11 +900,11 @@ endpoint upload: POST "/api/upload" { body Upload }
     );
 }
 
-/// A `where` constraint on a multipart scalar field is enforced server-side by
-/// feeding the same `constraint_to_field` extraction into the `Form(...)` call —
-/// FastAPI applies the validation kwarg and returns 422 on violation, matching
-/// the JSON pydantic `Field(...)` path (and Go). A `File` field carries no
-/// constraint, so it gets no kwarg. Regression guard for the multipart
+/// A `where` constraint on a multipart scalar field is enforced server-side by an
+/// inline check in the route body (FastAPI's `Form(...)` no longer carries the
+/// constraint), raising 422 over the FULL expression — matching the JSON body's
+/// model_validator and Go/TS. The `Form(...)` param is bare (alias only); a `File`
+/// field carries no constraint. Regression guard for the multipart
 /// `where`-constraint parity fix (exercised end-to-end by the round-trip suite).
 #[test]
 fn multipart_scalar_where_constraint_binds_form_kwarg() {
@@ -907,33 +918,46 @@ struct AvatarUpload {
 endpoint uploadAvatar: POST "/api/avatar" { body AvatarUpload }
 "#,
     );
-    // The length constraint becomes `min_length`, the numeric one `ge` — the same
-    // kwargs the JSON `Field(...)` path extracts.
+    // `Form(...)` is bare (no constraint kwarg) — the constraint moved to an inline
+    // check.
+    assert!(
+        files.server.contains("caption: str = Form(...)"),
+        "scalar Form param must be bare (constraint moved to inline check):\n{}",
+        files.server
+    );
+    assert!(
+        files.server.contains("rank: int = Form(...)"),
+        "numeric scalar Form param must be bare:\n{}",
+        files.server
+    );
+    // Both constraints are enforced inline over the full expression, raising 422.
     assert!(
         files
             .server
-            .contains("caption: str = Form(..., min_length=1)"),
-        "length constraint must bind min_length on the Form param:\n{}",
+            .contains("        if not (len(caption) > 0):\n")
+            && files
+                .server
+                .contains("detail=\"caption: constraint not satisfied\""),
+        "length constraint must be enforced inline (422):\n{}",
         files.server
     );
     assert!(
-        files.server.contains("rank: int = Form(..., ge=1)"),
-        "numeric constraint must bind ge on the Form param:\n{}",
+        files.server.contains("        if not (rank >= 1):\n"),
+        "numeric constraint must be enforced inline (422):\n{}",
         files.server
     );
-    // The File field takes no constraint kwarg.
+    // The File field takes no Form marker / constraint.
     assert!(
         !files.server.contains("avatar: UploadFile = Form"),
-        "the File field must not receive a Form constraint kwarg:\n{}",
+        "the File field must not receive a Form marker:\n{}",
         files.server
     );
 }
 
-/// An *optional* (`Option<T>`) multipart scalar with a constraint binds the kwarg
-/// onto `Form(None, …)` — the default is `None` rather than `...`, and the kwarg
-/// follows just as on the required path. Mirrors the JSON `Field(None, …)` path;
-/// a violation when the field IS present is a 422, while omission passes (pydantic
-/// skips length/range checks on a `None` value).
+/// An *optional* (`Option<T>`) multipart scalar with a constraint binds a bare
+/// `Form(None)` and is checked inline only when present (`caption is not None and
+/// …`) — mirroring the JSON `Field(None, …)` + None-guarded model_validator path. A
+/// violation when present is a 422; omission passes.
 #[test]
 fn optional_multipart_scalar_where_constraint_binds_form_kwarg() {
     let files = generate_from_source(
@@ -946,22 +970,24 @@ endpoint uploadAvatar: POST "/api/avatar" { body AvatarUpload }
 "#,
     );
     assert!(
+        files.server.contains("caption: str | None = Form(None)"),
+        "optional scalar Form param must be bare `Form(None)`:\n{}",
+        files.server
+    );
+    assert!(
         files
             .server
-            .contains("caption: str | None = Form(None, min_length=1)"),
-        "optional scalar constraint must bind min_length on Form(None, …):\n{}",
+            .contains("        if caption is not None and not (len(caption) > 0):\n"),
+        "optional scalar constraint must be enforced inline, None-guarded:\n{}",
         files.server
     );
 }
 
-/// A *non-extractable* constraint (one `constraint_to_field` can't reduce to a
-/// `min_length`/`ge`/… kwarg — e.g. `self.contains("/")`) binds NO kwarg: the
-/// multipart scalar emits a bare `Form(...)`, identical to the JSON `Field(...)`
-/// path. This is the documented Python extractable-subset limitation (see
-/// known-issues.md, "Python validates only the extractable (numeric/length)
-/// `where` subset"); the test locks the parity — multipart matches Python's own
-/// JSON behavior — so a future regression that silently dropped the bare `Form`
-/// would be caught.
+/// A *non-extractable* constraint (e.g. `self.contains("/")`) is now ENFORCED on
+/// the multipart path too: it emits a bare `Form(...)` plus an inline membership
+/// check (`"/" in slug`), closing the old Python extractable-subset gap so multipart
+/// matches the JSON body and Go/TS. A sole membership test negates to `not in`
+/// (ruff E713), not `not ("/" in slug)`.
 #[test]
 fn non_extractable_multipart_scalar_where_constraint_binds_no_form_kwarg() {
     // `slug` is already snake_case, so no `alias=` kwarg is emitted — the bare
@@ -975,17 +1001,64 @@ struct DocUpload {
 endpoint uploadDoc: POST "/api/doc" { body DocUpload }
 "#,
     );
-    // The constraint is unenforceable as a Form kwarg, so the field is a bare
-    // `Form(...)` — no `min_length`/`ge`/etc. trailing the default.
+    // The Form param is bare; the constraint is enforced by an inline `not in` check.
     assert!(
         files.server.contains("slug: str = Form(...)"),
-        "a non-extractable constraint must bind a bare Form(...), no kwarg:\n{}",
+        "a non-extractable constraint must still bind a bare Form(...):\n{}",
         files.server
     );
     assert!(
-        !files.server.contains("slug: str = Form(..., "),
-        "a non-extractable constraint must NOT bind any Form kwarg:\n{}",
+        files.server.contains("        if \"/\" not in slug:\n"),
+        "a membership constraint must be enforced inline as `not in` (E713):\n{}",
         files.server
+    );
+}
+
+/// A `where`-constraint on a field picked into an inline response projection is
+/// carried onto the generated `<Endpoint>Response` model and enforced by the same
+/// `@model_validator` path as a struct/request-body constraint — the projection
+/// emitter (`emit_pydantic_model`) shares it. Guards the response-side codepath the
+/// struct/body constraint tests don't reach. The projected `email` field is
+/// non-extractable (`contains`), the exact case the old `Field(...)`-kwarg path
+/// silently dropped.
+#[test]
+fn response_projection_constraint_enforced_by_validator() {
+    let files = generate_from_source(
+        r#"
+struct User {
+    id: Int
+    email: String where self.contains("@")
+}
+endpoint getUser: GET "/api/users/{id}" {
+    response User pick { id, email }
+}
+"#,
+    );
+    assert!(
+        files.models.contains("class GetUserResponse(BaseModel):"),
+        "projection must emit a <Endpoint>Response model:\n{}",
+        files.models
+    );
+    assert!(
+        files
+            .models
+            .contains("    @model_validator(mode=\"after\")\n    def _validate_constraints(self) -> GetUserResponse:"),
+        "projection model must carry the constraint validator:\n{}",
+        files.models
+    );
+    assert!(
+        files
+            .models
+            .contains("        if \"@\" not in self.email:\n"),
+        "projected constraint must be enforced over the full expression (`not in`):\n{}",
+        files.models
+    );
+    assert!(
+        files
+            .models
+            .contains("            raise ValueError(\"email: constraint not satisfied\")"),
+        "projected constraint violation must raise a wire-keyed ValueError:\n{}",
+        files.models
     );
 }
 

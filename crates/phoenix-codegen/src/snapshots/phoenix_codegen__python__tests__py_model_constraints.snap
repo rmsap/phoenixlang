@@ -6,10 +6,18 @@ expression: files.models
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, model_validator
 
 
 class User(BaseModel):
     id: int
-    name: str = Field(..., min_length=1, max_length=100)
-    age: int = Field(..., ge=0, le=150)
+    name: str
+    age: int
+
+    @model_validator(mode="after")
+    def _validate_constraints(self) -> User:
+        if not (len(self.name) > 0 and len(self.name) <= 100):
+            raise ValueError("name: constraint not satisfied")
+        if not (self.age >= 0 and self.age <= 150):
+            raise ValueError("age: constraint not satisfied")
+        return self
