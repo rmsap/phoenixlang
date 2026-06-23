@@ -1,0 +1,37 @@
+// Interop boundary-cost baseline: a pure-WASM call, no `extern js` boundary in
+// the timed loop.
+//
+// `work` is an ordinary Phoenix function, so the loop is a tight intra-module
+// call (no host crossing, no marshalling). This is the "pure-wasm call" half of
+// the Phase 2.5 boundary-cost bench: subtracting this workload's whole-process
+// time from an extern workload's cancels node startup + glue `instantiate` + the
+// loop scaffold, leaving the boundary-crossing cost itself.
+//
+// It declares one extern (`marker`) and calls it *once*, before the timed loop,
+// purely so the build emits the `.js` glue and runs through the identical
+// Node-driver harness as the other two interop workloads — otherwise the fixed
+// overhead being subtracted wouldn't match. One crossing out of a million is
+// negligible; the loop is pure.
+//
+// INVARIANT: the iteration count (1_000_000) must match the other two interop
+// workloads and `ITERS` in bench-corpus/run-interop.sh — the per-call figures
+// divide the whole-process delta by it.
+
+extern js {
+  function marker()
+}
+
+function work(n: Int) -> Int {
+  n + 1
+}
+
+function main() {
+  marker()
+  let mut acc: Int = 0
+  let mut i: Int = 0
+  while (i < 1000000) {
+    acc = acc + work(i)
+    i = i + 1
+  }
+  print(acc)
+}

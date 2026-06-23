@@ -1,0 +1,26 @@
+// Interop boundary-cost: a full `String` round-trip across the boundary.
+//
+// Each `echo(s)` call marshals a Phoenix `String` *out* to the host (copied into
+// the host's representation) and the returned string *back in* (copied into a
+// fresh GC-managed Phoenix string — decision F: strings are copied, never
+// shared). `.length()` forces the inbound string to actually materialize.
+// Subtracting `interop_noop_extern` isolates this marshalling cost from the bare
+// crossing; subtracting `interop_pure_call` gives the headline figure — the cost
+// of a string round-trip vs. a pure-WASM call.
+//
+// INVARIANT: the iteration count (1_000_000) and the literal ("phoenix", 7
+// bytes) must match `ITERS` / the expected sum in bench-corpus/run-interop.sh.
+
+extern js {
+  function echo(s: String) -> String
+}
+
+function main() {
+  let mut acc: Int = 0
+  let mut i: Int = 0
+  while (i < 1000000) {
+    acc = acc + echo("phoenix").length()
+    i = i + 1
+  }
+  print(acc)
+}

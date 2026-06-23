@@ -6,6 +6,18 @@ Paired Phoenix and Go programs for the off-CI comparison documented in [`docs/pe
 - **Four workloads:** `fib_recursive`, `sort_ints`, `hash_map_churn`, `alloc_walk_struct`. New workloads must update [`docs/design-decisions.md`](../docs/design-decisions.md#e-cross-language-comparison-scope-go-122-only) — the locked-scope wording prevents drive-by additions.
 - **Off-CI, informational only.** Refreshed at each phase close (2.7, then 2.4, then 2.5 — listed in decision order, which is also their chronological order in the roadmap). Not a regression gate — Phoenix-vs-Phoenix numbers in [`docs/perf-baselines/`](../docs/perf-baselines/) remain the gating signal.
 
+## Bench families in this directory
+
+The cross-language comparison above is what this directory was built for, but `bench-corpus/` now hosts a few Phoenix-only refreshes too. All are off-CI, hyperfine-timed, correctness-gated against `expected.txt`, and published under `docs/perf/`:
+
+| runner | workloads | output | comparison |
+|---|---|---|---|
+| [`run.sh`](run.sh) | the four cross-language workloads (Go pairs) | [`phoenix-vs-go.md`](../docs/perf/phoenix-vs-go.md) | Phoenix vs. Go |
+| [`run-wasm.sh`](run-wasm.sh) | the same four workloads | [`phoenix-wasm-vs-native.md`](../docs/perf/phoenix-wasm-vs-native.md) | native vs. `wasm32-linear` vs. `wasm32-gc` |
+| [`run-interop.sh`](run-interop.sh) | the three `interop_*` workloads (no Go pair) | [`phoenix-interop-boundary.md`](../docs/perf/phoenix-interop-boundary.md) | `extern js` boundary cost, both WASM backends under Node |
+
+The `interop_*` workloads (`interop_pure_call`, `interop_noop_extern`, `interop_string_roundtrip`) are a **separate family**, not a fifth cross-language workload — decision E's four-workload lock is about the Go comparison and doesn't constrain these. They have a `host.mjs` (the JS host stub) instead of a `go/` directory, and they isolate the per-call boundary-crossing / marshalling cost by subtraction (see [`run-interop.sh`](run-interop.sh)'s header and each workload's `README.md`).
+
 ## Layout
 
 ```

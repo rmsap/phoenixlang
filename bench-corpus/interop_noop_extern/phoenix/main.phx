@@ -1,0 +1,23 @@
+// Interop boundary-cost: a bare `extern js` crossing with zero marshalling.
+//
+// `nop` takes no arguments and returns nothing, so each call crosses the host
+// boundary (a real WASM→JS import call the engine cannot inline away) but
+// marshals no values. Subtracting `interop_pure_call` gives the *bare*
+// boundary-crossing cost; subtracting this from `interop_string_roundtrip`
+// isolates the string-marshalling cost on top of the crossing.
+//
+// INVARIANT: the iteration count (1_000_000) must match the other two interop
+// workloads and `ITERS` in bench-corpus/run-interop.sh.
+
+extern js {
+  function nop()
+}
+
+function main() {
+  let mut i: Int = 0
+  while (i < 1000000) {
+    nop()
+    i = i + 1
+  }
+  print(i)
+}
