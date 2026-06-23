@@ -14,7 +14,7 @@ use phoenix_parser::ast::{
     DerivedType, EndpointDecl, Expr, HeaderParam, HttpMethod, Literal, LiteralKind, NamedType,
     TypeExpr, TypeModifier,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Outcome of looking for an inline response projection on an endpoint
 /// (`response Struct pick/omit/partial`, incl. a `List<…>` element).
@@ -267,6 +267,7 @@ impl Checker {
 
         // Validate error variants
         let mut seen_errors = HashSet::new();
+        let mut seen_status: HashMap<i64, &str> = HashMap::new();
         let mut errors = Vec::new();
         for ev in &ep.errors {
             if !seen_errors.insert(&ev.name) {
@@ -283,6 +284,22 @@ impl Checker {
                     format!(
                         "endpoint `{}`: status code {} is not a client/server error (expected 400–599)",
                         ep.name, ev.status_code
+                    ),
+                    ev.span,
+                );
+            }
+            // The generated clients distinguish error variants by HTTP STATUS CODE,
+            // not response body (Go reports `HTTP <code>`, Python `raise_for_status`,
+            // TS maps status → variant; none decodes the body). Two variants sharing a
+            // status are therefore indistinguishable to a client — the TS mapping makes
+            // the second branch dead code, and Go/Python cannot recover the variant at
+            // all. Reject it here rather than emit a silently-wrong client. See
+            // docs/design-decisions.md (status code is the error discriminator).
+            if let Some(prev) = seen_status.insert(ev.status_code, &ev.name) {
+                self.error(
+                    format!(
+                        "endpoint `{}`: error variants `{}` and `{}` both use status code {} — each variant needs a unique status code, since the generated clients distinguish errors by status code, not by response body",
+                        ep.name, prev, ev.name, ev.status_code
                     ),
                     ev.span,
                 );
@@ -2354,6 +2371,45 @@ mod tests {
             }
             "#,
             "duplicate error variant `NotFound`",
+        );
+    }
+
+    /// Two error variants sharing a status code are rejected: the generated clients
+    /// discriminate errors by status code (not response body), so a shared status
+    /// makes one variant unreachable (TS) or unrecoverable (Go/Python). Guards
+    /// against emitting a silently-wrong client.
+    #[test]
+    fn duplicate_error_status_code() {
+        assert_has_error(
+            r#"
+            struct User { id: Int }
+            endpoint createUser: POST "/api/users" {
+                body User
+                error {
+                    BadInput(400)
+                    Conflicting(400)
+                }
+            }
+            "#,
+            "`BadInput` and `Conflicting` both use status code 400",
+        );
+    }
+
+    /// Distinct status codes on multiple error variants are fine.
+    #[test]
+    fn distinct_error_status_codes_ok() {
+        assert_no_errors(
+            r#"
+            struct User { id: Int }
+            endpoint createUser: POST "/api/users" {
+                body User
+                error {
+                    BadInput(400)
+                    NotFound(404)
+                    Conflict(409)
+                }
+            }
+            "#,
         );
     }
 

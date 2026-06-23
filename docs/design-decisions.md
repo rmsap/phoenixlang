@@ -4033,3 +4033,36 @@ violation still rejects. Python compile-and-lint green across all fixtures
 (black/ruff/mypy); 258 lib tests + 10 Python round-trips green; clippy clean. Closes the
 known-issue of the same name; see [phase-5.md](phases/phase-5.md) "Bugs closed in this
 phase".
+
+## Phoenix Gen — error responses: status code is the discriminator (2026-06-23)
+
+**Observation.** The generated error-response BODIES differ per target: Go writes
+`http.Error(w, "<Variant>", code)` (plain text), Python raises
+`HTTPException(status_code=code, detail="<Variant>")` (`{"detail": …}` JSON), and TS
+does `res.status(code).json({ error: "<Variant>" })` (`{"error": …}` JSON). Three
+shapes, two content-types.
+
+**Why this is NOT an interop bug (unlike the camelCase wire bug).** No generated
+*client* decodes the error body: Go returns `fmt.Errorf("HTTP %d", status)`, Python
+calls `response.raise_for_status()`, and TS maps the **status code** to the variant
+(`if (response.status === 404) throw new ApiError("NotFound", 404, body)`) and carries
+the body only as an opaque text field. So every client discriminates errors by **HTTP
+status code**, which IS consistent across all targets; the body is opaque and
+target-idiomatic. A cross-language client therefore recovers the same error from the
+status regardless of which server it talks to.
+
+**Decision.** The status code is the cross-language error contract; the error body is
+deliberately target-idiomatic and opaque (not part of the contract). We do NOT force a
+uniform structured error body in v1 — a structured, body-decoded error scheme (e.g.
+RFC 7807 `application/problem+json` with a discriminator field) is a real feature that
+would let multiple variants share a status and be distinguished by body; it is deferred
+to a deliberate design pass (beta will show whether it's wanted).
+
+**Consequence — enforced.** Because the discriminator is the status code, two error
+variants in one endpoint's `error { }` block MUST have distinct status codes; otherwise
+the variant is unrecoverable — the TS client's second `if (status === …)` branch is
+dead code, and Go/Python can't tell the variants apart at all. `check_endpoint.rs` now
+**rejects** duplicate error status codes within an endpoint (alongside the existing
+duplicate-name and 400–599-range checks), turning what was silently-wrong client output
+into a clear compile-time error. Tests: `duplicate_error_status_code` (rejection) and
+`distinct_error_status_codes_ok` (positive) in `crates/phoenix-sema/src/check_endpoint.rs`.
