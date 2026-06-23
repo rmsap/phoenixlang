@@ -466,6 +466,77 @@ fn url_bytes_dir() -> PathBuf {
     roundtrip_dir().join("url_bytes")
 }
 
+/// The cross-LANGUAGE wire-conformance schema. Unlike every other round-trip —
+/// which pairs a target's generated client with its OWN server (same-language) —
+/// this one checks each target against a single committed golden wire
+/// (`cross_lang/wire.json`). Each target's driver constructs the matching typed
+/// values, drives its generated client against its generated server, captures the
+/// actual HTTP bytes at the client transport (Go `RoundTripper`, Python httpx event
+/// hooks, TS `fetch` wrapper), and asserts the request/response wire equals the
+/// golden. Conformance of all three to ONE wire ⟹ any client interoperates with any
+/// server (transitivity), so no cross-process pairing is needed. The schema
+/// concentrates the cross-target divergence surfaces in one shot: camelCase field
+/// names + a nested struct, enum *values* (`Role`), the scalar zoo
+/// (`Uuid`/`DateTime`/`Decimal`/`Url`/`Bytes`/`Money`), an `Option` (absent → null),
+/// `List<String>`, a multi-word path param (`{accountId}`), a camelCase query param,
+/// a `List<enum>` repeated-key query, an aliased request header, and the pagination
+/// envelope (`totalCount`). See `docs/design-decisions.md` (Python camelCase wire).
+const CROSS_LANG_SCHEMA: &str = r#"
+enum Role { admin  guest }
+
+struct Profile {
+    displayName: String
+    // INVARIANT: `avatarUrl` must remain the ONLY null-valued field in the golden
+    // wire (it is null in `cross_lang/wire.json`). The comparator's absent≡null rule
+    // means a *renamed* null field reads as null==null and slips through; every other
+    // field is non-null so a snake_case rename is caught. Adding a second nullable
+    // field widens that blind spot. See docs/design-decisions.md (cross-language wire).
+    avatarUrl: Option<String>
+}
+
+struct Account {
+    id: Uuid
+    createdAt: DateTime
+    balance: Decimal
+    homepage: Url
+    avatar: Bytes
+    wallet: Money
+    role: Role
+    profile: Profile
+    tags: List<String>
+    active: Bool
+}
+
+endpoint createAccount: POST "/accounts" {
+    body Account
+    response Account
+    // `BadRequest`, not `ValidationError`: the latter collides with a generated
+    // helper type in some targets (a documented LOUD residual in known-issues.md),
+    // and a permanent fixture should not sit on that edge — the error path is never
+    // exercised here anyway, so the name only matters at codegen/compile time.
+    error { BadRequest(400) }
+}
+
+endpoint getAccount: GET "/accounts/{accountId}" {
+    headers { requestId: String as "X-Request-Id" }
+    query { includeArchived: Bool  roles: List<Role> }
+    response Account
+    error { NotFound(404) }
+}
+
+endpoint listAccounts: GET "/accounts" {
+    query { page: Int = 1 }
+    response List<Account>
+    pagination { offset }
+    error { NotFound(404) }
+}
+"#;
+
+/// Absolute path to `tests/roundtrip/cross_lang/` (the golden wire + Go driver).
+fn cross_lang_dir() -> PathBuf {
+    roundtrip_dir().join("cross_lang")
+}
+
 // ── Toolchain gating + subprocess runner live in `common` (shared with
 //    compiles_and_lints.rs), as does the schema → AST + analysis pipeline. ──
 
@@ -474,6 +545,48 @@ fn roundtrip_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("roundtrip")
+}
+
+/// Gates a TypeScript round-trip on its committed npm project being installed.
+/// Returns `true` if `<driver_dir>/node_modules` exists. Otherwise SKIPs (returns
+/// `false`) with an install hint — UNLESS `PHOENIX_GEN_E2E=1`, where a missing
+/// dependency tree is a hard failure so CI cannot silently skip. The caller is
+/// responsible for `return`ing on `false`.
+fn require_node_modules(driver_dir: &Path) -> bool {
+    if driver_dir.join("node_modules").is_dir() {
+        return true;
+    }
+    let msg = format!(
+        "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
+        driver_dir.display()
+    );
+    if e2e_required() {
+        panic!("PHOENIX_GEN_E2E=1 but {msg}");
+    }
+    eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    false
+}
+
+/// Gates a Python round-trip on its committed `.venv` being present, returning the
+/// path to its `python` interpreter when it is. Otherwise SKIPs (returns `None`)
+/// with an install hint — UNLESS `PHOENIX_GEN_E2E=1`, where a missing `.venv` is a
+/// hard failure so CI cannot silently skip. The caller is responsible for
+/// `return`ing on `None`.
+fn require_venv(driver_dir: &Path) -> Option<PathBuf> {
+    let venv_python = driver_dir.join(".venv").join("bin").join("python");
+    if venv_python.is_file() {
+        return Some(venv_python);
+    }
+    let msg = format!(
+        "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
+         .venv/bin/pip install -r requirements.txt` in {}",
+        driver_dir.display()
+    );
+    if e2e_required() {
+        panic!("PHOENIX_GEN_E2E=1 but {msg}");
+    }
+    eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    None
 }
 
 // ── Go target ───────────────────────────────────────────────────────────────
@@ -943,6 +1056,51 @@ fn url_bytes_go_roundtrip() {
     assert!(ok, "go url/bytes round-trip test failed:\n{out}");
 }
 
+/// Cross-language wire conformance for the Go target: generates the `api` package
+/// from [`CROSS_LANG_SCHEMA`], assembles a tempdir module with the `cross_lang/go`
+/// driver plus the shared golden `wire.json`, and runs `go test`. The driver drives
+/// the generated client against the generated server through a recording
+/// `http.RoundTripper`, then asserts the captured request/response bytes equal the
+/// golden — proving Go speaks the same wire every other target is checked against.
+#[test]
+fn cross_lang_go_conformance() {
+    // Unlike the TS/Python conformance tests there is no `e2e_required()` escalation
+    // here: Go has no pre-installed dependency dir (`node_modules`/`.venv`) to gate on
+    // — `go test` resolves the module itself — so the only gate is toolchain presence,
+    // matching every other Go round-trip in this file.
+    if gate(&missing_tools(&["go"])) {
+        return;
+    }
+
+    let files = generate_go_files(CROSS_LANG_SCHEMA);
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let api_dir = root.join("api");
+    std::fs::create_dir(&api_dir).expect("create api dir");
+    std::fs::write(api_dir.join("types.go"), &files.types).expect("write types.go");
+    std::fs::write(api_dir.join("client.go"), &files.client).expect("write client.go");
+    std::fs::write(api_dir.join("handlers.go"), &files.handlers).expect("write handlers.go");
+    std::fs::write(api_dir.join("server.go"), &files.server).expect("write server.go");
+
+    let go_mod = std::fs::read_to_string(roundtrip_dir().join("go").join("go.mod.template"))
+        .expect("read go.mod.template");
+    std::fs::write(root.join("go.mod"), go_mod).expect("write go.mod");
+
+    let driver = cross_lang_dir().join("go").join("cross_lang_test.go");
+    let contents = std::fs::read_to_string(&driver)
+        .unwrap_or_else(|e| panic!("read {}: {e}", driver.display()));
+    std::fs::write(root.join("cross_lang_test.go"), contents).expect("write driver");
+
+    // The golden wire lives beside the module root so the driver reads `./wire.json`.
+    let wire = std::fs::read_to_string(cross_lang_dir().join("wire.json"))
+        .expect("read cross_lang/wire.json");
+    std::fs::write(root.join("wire.json"), wire).expect("write wire.json");
+
+    let (ok, out) = run(root, "go", &["test", "./..."]);
+    assert!(ok, "go cross-language wire conformance failed:\n{out}");
+}
+
 // ── TypeScript target ─────────────────────────────────────────────────────
 
 /// Generates both the Express and Fastify variants from a single parse/check.
@@ -1014,16 +1172,7 @@ fn typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1073,16 +1222,7 @@ fn datetime_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1113,16 +1253,7 @@ fn uuid_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1154,16 +1285,7 @@ fn decimal_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1194,16 +1316,7 @@ fn money_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1235,16 +1348,7 @@ fn enum_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1276,16 +1380,7 @@ fn projection_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1324,16 +1419,7 @@ fn list_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1380,16 +1466,7 @@ fn url_bytes_typescript_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("typescript");
-    let node_modules = driver_dir.join("node_modules");
-    if !node_modules.is_dir() {
-        let msg = format!(
-            "TypeScript round-trip driver has no node_modules; run `npm ci` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    if !require_node_modules(&driver_dir) {
         return;
     }
 
@@ -1406,6 +1483,40 @@ fn url_bytes_typescript_roundtrip() {
 
     let (ok, out) = run(&driver_dir, "npx", &["tsx", "url-bytes-driver.ts"]);
     assert!(ok, "typescript url/bytes round-trip test failed:\n{out}");
+}
+
+/// Cross-language wire conformance for the TypeScript target: generates the Express
+/// server + client from [`CROSS_LANG_SCHEMA`] into `generated-cross-lang/` and runs
+/// `cross-lang-driver.ts`, which drives the generated client against the generated
+/// server through a `fetch` wrapper that records the wire, then asserts the captured
+/// request/response bytes equal the shared golden `cross_lang/wire.json`.
+#[test]
+fn cross_lang_typescript_conformance() {
+    if gate(&missing_tools(&["node", "npm", "npx"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("typescript");
+    if !require_node_modules(&driver_dir) {
+        return;
+    }
+
+    let (program, result) = parse_and_check(CROSS_LANG_SCHEMA);
+    let files = phoenix_codegen::generate_typescript(&program, &result);
+
+    let generated = driver_dir.join("generated-cross-lang");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated-cross-lang dir");
+    std::fs::write(generated.join("types.ts"), &files.types).expect("write types.ts");
+    std::fs::write(generated.join("client.ts"), &files.client).expect("write client.ts");
+    std::fs::write(generated.join("handlers.ts"), &files.handlers).expect("write handlers.ts");
+    std::fs::write(generated.join("server.ts"), &files.server).expect("write server.ts");
+
+    let (ok, out) = run(&driver_dir, "npx", &["tsx", "cross-lang-driver.ts"]);
+    assert!(
+        ok,
+        "typescript cross-language wire conformance failed:\n{out}"
+    );
 }
 
 // ── Python target ──────────────────────────────────────────────────────────
@@ -1445,19 +1556,9 @@ fn python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(SCHEMA);
 
@@ -1490,19 +1591,9 @@ fn datetime_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(DATETIME_RT_SCHEMA);
 
@@ -1533,19 +1624,9 @@ fn uuid_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(UUID_RT_SCHEMA);
 
@@ -1577,19 +1658,9 @@ fn decimal_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(DECIMAL_RT_SCHEMA);
 
@@ -1619,19 +1690,9 @@ fn money_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(MONEY_RT_SCHEMA);
 
@@ -1663,19 +1724,9 @@ fn enum_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(ENUM_RT_SCHEMA);
 
@@ -1705,19 +1756,9 @@ fn projection_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(PROJECTION_RT_SCHEMA);
 
@@ -1749,19 +1790,9 @@ fn list_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(LIST_RT_SCHEMA);
 
@@ -1794,19 +1825,9 @@ fn url_bytes_python_roundtrip() {
     }
 
     let driver_dir = roundtrip_dir().join("python");
-    let venv_python = driver_dir.join(".venv").join("bin").join("python");
-    if !venv_python.is_file() {
-        let msg = format!(
-            "Python round-trip driver has no .venv; run `python3 -m venv .venv && \
-             .venv/bin/pip install -r requirements.txt` in {}",
-            driver_dir.display()
-        );
-        if e2e_required() {
-            panic!("PHOENIX_GEN_E2E=1 but {msg}");
-        }
-        eprintln!("SKIP (set PHOENIX_GEN_E2E=1 to enforce): {msg}");
+    let Some(venv_python) = require_venv(&driver_dir) else {
         return;
-    }
+    };
 
     let files = generate_python_files(URL_BYTES_RT_SCHEMA);
 
@@ -1822,4 +1843,38 @@ fn url_bytes_python_roundtrip() {
     let python = venv_python.to_string_lossy().into_owned();
     let (ok, out) = run(&driver_dir, &python, &["url_bytes_driver.py"]);
     assert!(ok, "python url/bytes round-trip test failed:\n{out}");
+}
+
+/// Cross-language wire conformance for the Python target: generates the package
+/// from [`CROSS_LANG_SCHEMA`] into `generated_cross_lang/` and runs
+/// `cross_lang_driver.py`, which drives the generated httpx client against the
+/// generated FastAPI server through an httpx event hook that records the wire, then
+/// asserts the captured request/response bytes equal the shared golden
+/// `cross_lang/wire.json`. This is the regression guard for the Python camelCase
+/// wire fix — it proves Python's wire matches the contract Go/TS are held to.
+#[test]
+fn cross_lang_python_conformance() {
+    if gate(&missing_tools(&["python3"])) {
+        return;
+    }
+
+    let driver_dir = roundtrip_dir().join("python");
+    let Some(venv_python) = require_venv(&driver_dir) else {
+        return;
+    };
+
+    let files = generate_python_files(CROSS_LANG_SCHEMA);
+
+    let generated = driver_dir.join("generated_cross_lang");
+    let _ = std::fs::remove_dir_all(&generated);
+    std::fs::create_dir_all(&generated).expect("create generated_cross_lang dir");
+    std::fs::write(generated.join("__init__.py"), &files.init).expect("write __init__.py");
+    std::fs::write(generated.join("models.py"), &files.models).expect("write models.py");
+    std::fs::write(generated.join("client.py"), &files.client).expect("write client.py");
+    std::fs::write(generated.join("handlers.py"), &files.handlers).expect("write handlers.py");
+    std::fs::write(generated.join("server.py"), &files.server).expect("write server.py");
+
+    let python = venv_python.to_string_lossy().into_owned();
+    let (ok, out) = run(&driver_dir, &python, &["cross_lang_driver.py"]);
+    assert!(ok, "python cross-language wire conformance failed:\n{out}");
 }

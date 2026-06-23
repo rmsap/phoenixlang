@@ -6,6 +6,25 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
+### An absent optional field serializes as omitted (TS) vs `null` (Go/Python)
+
+For an `Option<T>` field with no value, the TypeScript target omits the key entirely
+(`JSON.stringify` drops `undefined`), while Go (`*T`→`null`) and Python (`None`→`null`,
+with `model_dump(by_alias=True)`) emit `"field": null`. For Phoenix's `Option`
+semantics these are equivalent — every generated decoder accepts both forms (Go→`nil`,
+Python→`None`, TS→`undefined`), so all three targets interoperate (verified by the
+cross-language wire-conformance test, whose comparator treats a missing key as `null`
+— a side effect of that absent≡null rule is the test's one documented soundness gap: it
+cannot catch a *renamed null optional* or an *extra spurious null-valued field*, which is
+why the conformance schema keeps `avatarUrl` as its only null field).
+
+The residual is only for a **non-Phoenix external consumer** that distinguishes
+"absent" from "explicit null" (e.g. JSON Merge Patch semantics): such a peer would see
+TS and Go/Python differently. Canonicalizing (TS emit `null`, or Go/Python omit) is a
+deliberate wire-policy choice deferred until a consumer needs it. **Workaround:** none
+needed for Phoenix-generated peers. **Target phase:** demand-triggered. Surfaced
+2026-06-21 building the cross-language conformance test.
+
 ### `JsValue` cannot be stored as a struct field or closure capture on wasm32-linear
 
 `JsValue` (the opaque host handle from `extern js`) marshals fine as an extern argument/return — it crosses as a single `i32` handle — but the wasm32-linear backend has no field-storage representation for it: `phx_field_size_bytes` / `phx_field_align_bytes` (`crates/phoenix-cranelift/src/wasm/heap_layout.rs`) have no `JsValue` arm, so it falls through to the `unsupported` error. As a result, a `JsValue` cannot be a struct/enum field or a **closure capture** in compiled wasm code — e.g. `onClick(btn, function() { setText(label, ...) })` where `label: JsValue` is captured fails at codegen. The Phase 2.5 PR-11 DOM fixtures work around it by re-fetching the element inside the handler (`getElementById("label")`) rather than capturing the handle.

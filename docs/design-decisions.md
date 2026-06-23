@@ -3911,3 +3911,76 @@ codegen fix is verified by compile-lint + same-language round-trips; the
 cross-language harness is the agreed follow-up to scope. (That harness should also
 check non-field wire surfaces — enum variant values, scalar wire formats — for the
 same cross-target parity.)
+
+## Phoenix Gen — cross-language wire-conformance tests (2026-06-21)
+
+The companion guard to the Python-camelCase-wire fix: every prior round-trip pairs a
+target's client with its OWN server (same-language), so a cross-language wire
+divergence — like Python's snake_case keys — slips through invisibly. This adds the
+missing layer.
+
+**Architecture: conformance to one golden wire, not N×N pairing.** Standing up live
+cross-process pairs (Py-client↔Go-server, …) is O(N²), dual-toolchain, flaky. But the
+guarantee factors: if every target's client *emits* the canonical wire and every
+target's server *accepts+emits* it, then any client interoperates with any server by
+transitivity — O(N) conformance checks, no pairing. A committed golden
+(`tests/roundtrip/cross_lang/wire.json`) is that canonical contract.
+
+**Mechanism (augments the existing per-language round-trips).** A new bespoke
+round-trip (`cross_lang`) drives each target's generated client against its generated
+server through a wire **recorder** at the client transport — Go a custom
+`http.RoundTripper`, Python an httpx wrapping transport, TS a `fetch` wrapper — and
+asserts the captured request/response bytes equal the golden. All three drivers
+compare against the *same* file, so conformance ⟹ pairwise interop.
+
+**Comparison is structural with two deliberate equivalences:**
+- **datetime as instant.** Go emits RFC 3339 `…Z`, Python `…+00:00`, TS `….000Z` —
+  all valid RFC 3339 and mutually parseable, so the targets interoperate despite the
+  differing strings. The comparator parses datetime-shaped strings and compares
+  instants; everything else (Uuid/Decimal/Url/Bytes/Money/enum/String) is a canonical
+  passthrough and compares exactly.
+- **absent ≡ null for optionals.** Surfaced by the test: TS omits an absent optional
+  field (`{displayName}`) while Go (`*string`→`null`) and Python (`None`→`null`) emit
+  it explicitly. For a Phoenix `Option` these are semantically identical — every
+  decoder accepts both (Go→nil, Python→None, TS→undefined), so interop holds. The
+  comparator treats a missing key as `null`; a present *value* vs a missing key still
+  differs, so a dropped REQUIRED field is still caught. **Corollary (the one soundness
+  gap):** a *renamed* field is caught only when its golden value is non-null — a renamed
+  null optional (e.g. `avatarUrl`), or equivalently any *extra spurious null-valued
+  field* a target might emit, reads as `null≡null` and slips through. So the schema is
+  built with `avatarUrl` as the *only* null field; every other field (`displayName`,
+  `createdAt`, the scalar zoo, …) is non-null and would catch a snake_case rename. This
+  is what makes the test the regression guard for the Python snake-wire bug.
+
+**Concentrated schema** (one schema, the divergence-prone surfaces): camelCase fields
++ a nested struct, enum *values* (`Role`), the scalar zoo
+(`Uuid`/`DateTime`/`Decimal`/`Url`/`Bytes`/`Money`), an `Option` (absent→null), a
+`List`, a multi-word path param, a camelCase query param, a `List<enum>` repeated-key
+query, an aliased request header, and the pagination envelope (`totalCount`).
+
+**Scope boundary.** This proves the wire *contract*; it does not run real cross-process
+pairings (the transitivity argument makes them redundant). A single true
+Py-client↔Go-server smoke remains an optional belt-and-suspenders follow-up. It also
+asserts only that each client *emits* the golden param wire (path/query/header): the
+stub handlers ignore their decoded params, so server-side *param decode* is not
+re-checked here — it is delegated to the per-language round-trips (each proves its
+server decodes its own client's output, which == golden, so decode-of-golden holds
+transitively). Request-body decode *is* exercised directly, via the `createAccount`
+echo handler.
+
+**Meta-guard (the test tests itself).** The whole guarantee rests on the comparator
+actually *rejecting* a divergence — so each driver first runs three negative assertions
+before any conformance check. (1) `jsonEqual(rename("createdAt"→"created_at",
+golden.account), golden.account)` must be **false** — guards the key rule (if a future
+edit intersected keys instead of unioning them, every conformance assertion would pass
+vacuously). (2) Two *different* RFC 3339 instants must compare **unequal**, and (3) two
+different non-datetime strings (`"admin"`/`"guest"`) must compare **unequal** — together
+these guard the datetime-instant path (if the RFC-3339 prefix gate were dropped or the
+instant rule over-broadened, an over-lenient comparator would likewise pass vacuously).
+Each driver also pins the `listAccounts` request query (`page=2`), not just
+`getAccount`, so the pagination param wire is checked alongside the response envelope.
+
+**Verification.** All three conformance drivers green against the shared golden — Go,
+Python, and TS provably emit/accept one wire. This is the test that would have caught
+the Python snake-wire bug (Python's wire would not have matched the golden Go/TS meet).
+clippy clean; the full 31-test round-trip suite green.

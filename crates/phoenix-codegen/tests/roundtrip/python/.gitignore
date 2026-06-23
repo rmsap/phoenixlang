@@ -11,6 +11,7 @@ generated_enum/
 generated_projection/
 generated_list/
 generated_url_bytes/
+generated_cross_lang/
 contract.json
 
 # Python bytecode caches.

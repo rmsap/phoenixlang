@@ -1,0 +1,52 @@
+{
+  "_comment": "The canonical cross-language wire contract. Each target's round-trip (Go/Python/TS) constructs the matching TYPED values in its own language, drives the generated client against the generated server, captures the actual HTTP bytes at the client transport, and asserts they equal this golden. Conformance of all three to ONE wire ⟹ any client interoperates with any server (transitivity), without cross-process pairing. Comparison is structural with two rules: datetime strings compare as INSTANTS (Go emits `…Z`, Python `…+00:00`, TS `….000Z` — all RFC 3339, mutually parseable), everything else compares exactly (Uuid/Decimal/Url/Bytes/Money/enum/String are canonical passthroughs). `account` and `page` are the canonical response/echo bodies; `getAccountRequest` and `listAccountsRequest` pin the param wire (path/query/header).",
+
+  "account": {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "createdAt": "2026-01-15T08:30:00Z",
+    "balance": "19.99",
+    "homepage": "https://Example.com/u?x=1#f",
+    "avatar": "AAH/",
+    "wallet": { "amount": "5.00", "currency": "USD" },
+    "role": "admin",
+    "profile": { "displayName": "Ada", "avatarUrl": null },
+    "tags": ["x", "y"],
+    "active": true
+  },
+
+  "page": {
+    "items": [
+      {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "createdAt": "2026-01-15T08:30:00Z",
+        "balance": "19.99",
+        "homepage": "https://Example.com/u?x=1#f",
+        "avatar": "AAH/",
+        "wallet": { "amount": "5.00", "currency": "USD" },
+        "role": "admin",
+        "profile": { "displayName": "Ada", "avatarUrl": null },
+        "tags": ["x", "y"],
+        "active": true
+      }
+    ],
+    "totalCount": 3
+  },
+
+  "getAccountRequest": {
+    "method": "GET",
+    "path": "/accounts/acc-7",
+    "query": { "includeArchived": ["true"], "roles": ["admin", "guest"] },
+    "headers": { "X-Request-Id": "req-1" }
+  },
+
+  "createAccountRequest": {
+    "method": "POST",
+    "path": "/accounts"
+  },
+
+  "listAccountsRequest": {
+    "method": "GET",
+    "path": "/accounts",
+    "query": { "page": ["2"] }
+  }
+}
