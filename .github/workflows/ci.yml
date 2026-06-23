@@ -12,10 +12,13 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
-      # Node drives the wasm32-linear `extern js` glue tests
-      # (`phoenix-driver/tests/extern_js_glue.rs`): the generated `.js` is
-      # imported and run under Node. Provision it here so those tests actually
-      # execute rather than soft-skip, and so `PHOENIX_REQUIRE_NODE=1` below is
+      # Node drives every `extern js` interop tier that runs the generated glue:
+      # the glue unit tests (`extern_js_glue.rs`), the always-on Node fixture tier
+      # (`interop_node.rs`), and the WASM columns of the five-backend interop
+      # matrix (`interop_matrix.rs`) — on BOTH wasm targets (wasm32-linear and
+      # wasm32-gc, the latter via node's native WasmGC support). Provision Node
+      # here so those tiers actually execute rather than soft-skip, and so the
+      # `PHOENIX_REQUIRE_NODE` / `PHOENIX_REQUIRE_WASM_GC` gates below are
       # satisfiable.
       - uses: actions/setup-node@v4
         with:
@@ -84,9 +87,17 @@ jobs:
           PHOENIX_REQUIRE_RUNTIME_LIB: "1"
           PHOENIX_REQUIRE_RUNTIME_WASM: "1"
           PHOENIX_REQUIRE_WASMTIME: "1"
-          # `node` is provisioned above, so the `extern js` glue tests must run,
-          # not soft-skip. A missing `node` is then a hard failure here.
+          # `node` is provisioned above, so the `extern js` glue + interop tiers
+          # must run, not soft-skip. A missing `node` is then a hard failure here.
           PHOENIX_REQUIRE_NODE: "1"
+          # The wasm32-gc interop columns (interop_node + interop_matrix) run the
+          # gc glue under node's native WasmGC support — a distinct path from the
+          # wasmtime gc execution gated above. Require it so a node build without
+          # WasmGC is a hard failure rather than a silent skip of the gc columns.
+          # (The DOM/browser tier's gc tests in this same crate still soft-skip:
+          # they additionally need the browser npm deps, absent in this job — the
+          # `interop-browser` job below provisions those and runs them hard.)
+          PHOENIX_REQUIRE_WASM_GC: "1"
       - run: cargo test -p phoenix-cranelift
         env:
           PHOENIX_REQUIRE_RUNTIME_LIB: "1"
@@ -118,6 +129,55 @@ jobs:
           cargo test -p phoenix-cranelift --lib link::
         env:
           PHOENIX_REQUIRE_RUNTIME_LIB: "1"
+
+  # Browser / DOM verification tier for `extern js` interop (Phase 2.5 decision I).
+  # The same DOM fixtures + baselines (`tests/fixtures/interop/dom/<name>/`) run on
+  # BOTH wasm targets through two runners in `tests/interop-browser/`: the jsdom
+  # smoke (DOM-host marshalling + the retained-event-handler path at the API level)
+  # and the real-Chromium Playwright tier (a real click in a real engine). Kept off
+  # the fast `check` job because it provisions npm deps + a headless browser (slow,
+  # and a browser download). The gates make every requirement a HARD failure so
+  # this job can't silently stop exercising the DOM path:
+  #   - REQUIRE_BROWSER_DEPS: jsdom + playwright-core must be installed (npm ci)
+  #   - REQUIRE_BROWSER:      a headless Chromium must be launchable
+  #   - REQUIRE_NODE / RUNTIME_WASM / WASM_GC: node + both wasm targets, no skips
+  # See crates/phoenix-driver/tests/interop_browser.rs.
+  interop-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The linear DOM build links the wasm runtime (gc embeds none), so build it
+      # here for the same reason the `check` job does — otherwise the linear
+      # columns soft-skip. No native runtime lib / wasmtime needed: this tier runs
+      # entirely under node + the browser, never natively or under wasmtime.
+      - run: cargo build -p phoenix-runtime --target wasm32-wasip1 --release
+      # Install the harness's npm deps (jsdom + playwright-core) from the committed
+      # lockfile; REQUIRE_BROWSER_DEPS below then hard-fails if they're missing.
+      - name: Install interop-browser npm deps (npm ci)
+        working-directory: tests/interop-browser
+        run: npm ci
+      # Provision the Chromium build matching the pinned playwright-core, via its
+      # OWN installer CLI (run from the harness dir so npx resolves the local,
+      # version-locked playwright-core) — so the browser revision can't drift from
+      # the launcher. `--with-deps` pulls the OS libraries headless Chromium needs.
+      - name: Install headless Chromium (matching playwright-core)
+        working-directory: tests/interop-browser
+        run: npx playwright-core install --with-deps chromium
+      - name: Browser/DOM interop tier (both wasm targets, jsdom + Playwright)
+        run: cargo test -p phoenix-driver --test interop_browser
+        env:
+          PHOENIX_REQUIRE_NODE: "1"
+          PHOENIX_REQUIRE_RUNTIME_WASM: "1"
+          PHOENIX_REQUIRE_WASM_GC: "1"
+          PHOENIX_REQUIRE_BROWSER_DEPS: "1"
+          PHOENIX_REQUIRE_BROWSER: "1"
 
   # Shift-left release gate: the `check` job above runs the suite in debug, but
   # the binaries we ship are built `--release`, where `debug_assert!` is
