@@ -24,84 +24,19 @@
 
 mod common;
 
-use common::compiled_fixtures::{TempDir, phoenix_bin, workspace_root};
+use common::interop::{read_expected, run_fixture_under_node};
 use common::{skip_if_no_node, skip_if_no_runtime_wasm, skip_if_no_wasm_gc};
-use std::path::PathBuf;
-use std::process::Command;
-
-fn interop_fixtures_dir() -> PathBuf {
-    workspace_root().join("tests/fixtures/interop")
-}
-
-/// The static Node driver. It lives next to the built glue + the copied host
-/// stub, so every import is a sibling relative path. Phoenix `print` output
-/// (routed through the glue's `writeStdout`) and any host-side `emit` both
-/// accumulate into one buffer in call order, written out once at the end — so the
-/// captured bytes pin the exact interleaving. `writeStdout`'s second arg is the
-/// fd; it's intentionally ignored so *all* program output is captured.
-const DRIVER_MJS: &str = r#"
-import { readFile } from "node:fs/promises";
-import { instantiate } from "./app.js";
-import { host as makeHost } from "./host.mjs";
-
-const wasm = await readFile(new URL("./app.wasm", import.meta.url));
-let out = "";
-const emit = (t) => { out += t; };
-const { run } = await instantiate({
-  wasm,
-  host: makeHost({ emit }),
-  writeStdout: (t, _fd) => { out += t; },
-});
-run();
-process.stdout.write(out);
-"#;
 
 /// Build `tests/fixtures/interop/<name>/main.phx` for `target`, run it under Node
-/// with that fixture's `host.mjs`, and assert stdout equals `expected.txt`.
+/// with that fixture's `host.mjs`, and assert stdout equals `expected.txt`. The
+/// build + `node` invocation is shared with the five-backend matrix via
+/// [`common::interop`]; this tier owns the byte-exact baseline assertion.
 fn run_interop_fixture(name: &str, target: &str) {
-    let fdir = interop_fixtures_dir().join(name);
-    let main = fdir.join("main.phx");
-    let host = fdir.join("host.mjs");
-    let expected = std::fs::read_to_string(fdir.join("expected.txt"))
-        .unwrap_or_else(|e| panic!("reading expected.txt for interop fixture `{name}`: {e}"));
-
-    let dir = TempDir::new(&format!("interop_{name}_{}", target.replace(['-'], "_")));
-    let wasm = dir.join("app.wasm");
-
-    let status = phoenix_bin()
-        .args(["build", "--target", target])
-        .arg(&main)
-        .arg("-o")
-        .arg(&wasm)
-        .status()
-        .unwrap_or_else(|e| panic!("spawning `phoenix build` for `{name}`: {e}"));
-    assert!(
-        status.success(),
-        "`{target}` build of interop fixture `{name}` failed"
-    );
-    assert!(
-        dir.join("app.js").exists(),
-        "interop fixture `{name}` should produce a paired .js glue sidecar"
-    );
-
-    // The driver imports `./host.mjs` as a sibling, so copy the fixture's stub in.
-    std::fs::copy(&host, dir.join("host.mjs"))
-        .unwrap_or_else(|e| panic!("copying host.mjs for `{name}`: {e}"));
-    let driver = dir.join("driver.mjs");
-    std::fs::write(&driver, DRIVER_MJS).unwrap();
-
-    let output = Command::new("node")
-        .arg(&driver)
-        .output()
-        .unwrap_or_else(|e| panic!("running node for interop fixture `{name}`: {e}"));
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "node run of interop fixture `{name}` ({target}) failed: {stderr}"
-    );
+    let test = format!("interop_{name}_{}", target.replace(['-'], "_"));
+    let stdout = run_fixture_under_node(&test, name, target);
     assert_eq!(
-        stdout, expected,
+        stdout,
+        read_expected(name),
         "interop fixture `{name}` ({target}) stdout did not match its baseline"
     );
 }
@@ -144,6 +79,11 @@ interop_node_test!(
     interop_strings_in_and_out,
     interop_strings_in_and_out_gc,
     "strings"
+);
+interop_node_test!(
+    interop_strings_unicode_round_trip,
+    interop_strings_unicode_round_trip_gc,
+    "strings_unicode"
 );
 interop_node_test!(
     interop_jsvalue_handle_round_trip,

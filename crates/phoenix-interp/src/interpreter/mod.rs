@@ -2045,10 +2045,27 @@ pub fn run_and_capture(
     program: &Program,
     lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
 ) -> std::result::Result<Vec<String>, RuntimeError> {
+    run_with_host_capture(program, lambda_captures, |_| {})
+}
+
+/// Like [`run_and_capture`], but registers host-FFI bindings (built by
+/// `register`) before running, so `extern js` calls dispatch to the registered
+/// Rust host functions. The AST-interpreter counterpart to
+/// `phoenix_ir_interp::run_with_host_capture`: the two share one host-stub
+/// contract ([`phoenix_common::host`]), which is what lets the five-backend
+/// interop matrix register the *same* closures on both interpreters and assert
+/// line-identical output (the byte-exact baseline is the Node tier's job).
+/// Captures `print()` output as lines.
+pub fn run_with_host_capture(
+    program: &Program,
+    lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
+    register: impl FnOnce(&mut Interpreter),
+) -> std::result::Result<Vec<String>, RuntimeError> {
     let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
     let writer = SharedWriter(buffer.clone());
     let mut interpreter = Interpreter::with_output(Box::new(writer));
     interpreter.lambda_captures = lambda_captures;
+    register(&mut interpreter);
     interpreter.run_program(program)?;
     let bytes = buffer.borrow();
     let output = String::from_utf8_lossy(&bytes);

@@ -15,5 +15,5 @@ pub mod interpreter;
 /// Runtime value representation for the Phoenix interpreter.
 pub mod value;
 
-pub use interpreter::{RuntimeError, run, run_and_capture};
+pub use interpreter::{RuntimeError, run, run_and_capture, run_with_host_capture};
 pub use value::Value;

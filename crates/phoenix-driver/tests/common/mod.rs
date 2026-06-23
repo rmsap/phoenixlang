@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod compiled_fixtures;
+pub mod interop;
 pub mod matrix_harness;
 #[cfg(target_os = "linux")]
 pub mod rlimit;

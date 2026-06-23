@@ -1,0 +1,13 @@
+extern js {
+  function echo(s: String) -> String
+  function byteLen(s: String) -> Int
+}
+
+function main() {
+  // A multi-byte UTF-8 string: H + é (2B) + ASCII + 世界 (3B each) + 🚀 (4B).
+  // `echo` must hand back the exact same bytes; `byteLen` is the UTF-8 byte
+  // count — the one length every backend agrees on, because UTF-8 is what
+  // actually crossed the wire.
+  print(echo("Héllo, 世界! 🚀"))
+  print(byteLen("Héllo, 世界! 🚀"))
+}
