@@ -226,14 +226,13 @@ pub(super) fn declare_extern_imports(
     Ok(())
 }
 
-// The IR-level `extern js` analysis (`ExternSig` / `collect_externs` /
-// `CallbackSig` / `callback_sigs_in_externs` / `collect_callback_signatures` /
-// `callback_sig_is_glue_supported`) is backend-neutral and lives in
-// [`crate::extern_abi`], shared with the native binding. Re-exported here so the
-// WASM call sites (import declaration, glue generator, trampoline emitter)
-// keep referring to `translate::*` unchanged.
+// The IR-level `extern js` analysis is backend-neutral and lives in
+// [`crate::extern_abi`], shared with the native binding. The subset re-exported
+// here is what the WASM import-declaration / trampoline call sites reach through
+// `translate::*` unchanged. The glue generators import the rest (`ExternSig`,
+// `callback_sigs_in_externs`) straight from [`crate::extern_abi`].
 pub(super) use crate::extern_abi::{
-    CallbackSig, ExternSig, callback_sigs_in_externs, collect_callback_signatures, collect_externs,
+    CallbackSig, collect_callback_signatures, collect_externs,
     wasm_closure_trampoline_name as closure_trampoline_name,
 };
 

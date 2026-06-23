@@ -30,7 +30,7 @@
 mod common;
 
 use common::compiled_fixtures::{TempDir, phoenix_bin, workspace_root};
-use common::{require, skip_if_no_node, skip_if_no_runtime_wasm};
+use common::{require, skip_if_no_node, skip_if_no_runtime_wasm, skip_if_no_wasm_gc};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -119,15 +119,18 @@ fn run_runner(runner: &str, build_dir: &Path) -> Output {
         .unwrap_or_else(|e| panic!("spawning node for `{runner}`: {e}"))
 }
 
-/// jsdom tier: build the fixture, run it under jsdom, assert observed DOM output.
-fn run_jsdom_dom_fixture(test: &str, fixture: &str) {
-    if skip_if_no_runtime_wasm(test)
+/// jsdom tier: build the fixture for `target`, run it under jsdom, assert observed
+/// DOM output. wasm32-gc embeds no Phoenix runtime, so only the linear target
+/// needs the runtime wasm.
+fn run_jsdom_dom_fixture(test: &str, fixture: &str, target: &str) {
+    if (target == "wasm32-linear" && skip_if_no_runtime_wasm(test))
         || skip_if_no_node(test)
+        || (target == "wasm32-gc" && skip_if_no_wasm_gc(test))
         || skip_if_no_browser_dep(test, "jsdom")
     {
         return;
     }
-    let (dir, expected) = build_dom_fixture(test, fixture, "wasm32-linear");
+    let (dir, expected) = build_dom_fixture(test, fixture, target);
     let out = run_runner("jsdom-runner.mjs", &dir);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -151,14 +154,26 @@ fn browser_unavailable(out: &Output) -> bool {
 /// Playwright tier: build the fixture, run it in real headless Chromium, assert
 /// observed DOM output. Soft-skips when no browser is launchable unless
 /// `PHOENIX_REQUIRE_BROWSER=1`.
-fn run_browser_dom_fixture(test: &str, fixture: &str) {
-    if skip_if_no_runtime_wasm(test)
+fn run_browser_dom_fixture(test: &str, fixture: &str, target: &str) {
+    // The gc module actually runs in Playwright's bundled Chromium, not Node, so
+    // the node WasmGC probe is a proxy here: a gc-capable toolchain implies a
+    // recent enough bundled Chromium (WasmGC has shipped in Chromium since v119).
+    // It errs toward a soft-skip rather than a hard instantiate failure on an old
+    // engine, and `PHOENIX_REQUIRE_WASM_GC=1` still forces a failure in CI.
+    //
+    // Conscious asymmetry: because the gate probes Node rather than the launched
+    // Chromium, the one configuration it can't soft-skip is a GC-capable Node with
+    // an unexpectedly old bundled Chromium — that hard-fails at instantiate instead
+    // of skipping. We accept it: `playwright-core` pins a recent Chromium, so the
+    // two engines' GC support don't realistically diverge in practice.
+    if (target == "wasm32-linear" && skip_if_no_runtime_wasm(test))
         || skip_if_no_node(test)
+        || (target == "wasm32-gc" && skip_if_no_wasm_gc(test))
         || skip_if_no_browser_dep(test, "playwright-core")
     {
         return;
     }
-    let (dir, expected) = build_dom_fixture(test, fixture, "wasm32-linear");
+    let (dir, expected) = build_dom_fixture(test, fixture, target);
     let out = run_runner("playwright-runner.mjs", &dir);
 
     if browser_unavailable(&out) {
@@ -186,29 +201,42 @@ fn run_browser_dom_fixture(test: &str, fixture: &str) {
     );
 }
 
-/// One jsdom test + one Playwright test per DOM fixture. Adding a fixture is a
-/// `tests/fixtures/interop/dom/<name>/` directory plus a line here.
+/// jsdom + Playwright tests per DOM fixture, **per WASM target** — the same
+/// fixture + host + page runs on both `wasm32-linear` and `wasm32-gc`, asserting
+/// identical observed DOM. Adding a fixture is a `tests/fixtures/interop/dom/<name>/`
+/// directory plus a line here.
 macro_rules! dom_fixture_tests {
-    ($jsdom_fn:ident, $browser_fn:ident, $fixture:literal) => {
+    ($jsdom:ident, $jsdom_gc:ident, $browser:ident, $browser_gc:ident, $fixture:literal) => {
         #[test]
-        fn $jsdom_fn() {
-            run_jsdom_dom_fixture(stringify!($jsdom_fn), $fixture);
+        fn $jsdom() {
+            run_jsdom_dom_fixture(stringify!($jsdom), $fixture, "wasm32-linear");
         }
-
         #[test]
-        fn $browser_fn() {
-            run_browser_dom_fixture(stringify!($browser_fn), $fixture);
+        fn $jsdom_gc() {
+            run_jsdom_dom_fixture(stringify!($jsdom_gc), $fixture, "wasm32-gc");
+        }
+        #[test]
+        fn $browser() {
+            run_browser_dom_fixture(stringify!($browser), $fixture, "wasm32-linear");
+        }
+        #[test]
+        fn $browser_gc() {
+            run_browser_dom_fixture(stringify!($browser_gc), $fixture, "wasm32-gc");
         }
     };
 }
 
 dom_fixture_tests!(
     interop_dom_jsdom_set_text,
+    interop_dom_jsdom_set_text_gc,
     interop_dom_browser_set_text,
+    interop_dom_browser_set_text_gc,
     "set_text"
 );
 dom_fixture_tests!(
     interop_dom_jsdom_click_handler,
+    interop_dom_jsdom_click_handler_gc,
     interop_dom_browser_click_handler,
+    interop_dom_browser_click_handler_gc,
     "click_handler"
 );

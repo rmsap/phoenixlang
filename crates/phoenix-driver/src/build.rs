@@ -91,25 +91,29 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>) {
     // Phase 2.4 PR 2; `Wasm32Gc` still errors at `compile` and never gets
     // here.
     if target.is_wasm() {
-        // For a `wasm32-linear` module that uses `extern js`,
+        // For a `wasm32-linear` or `wasm32-gc` module that uses `extern js`,
         // emit a paired `.js` glue sidecar next to the `.wasm` so the module can
         // be instantiated under Node / the browser (the glue provides WASI + the
         // host-import thunks). Programs without externs get no sidecar — the
-        // bare `.wasm` runs under wasmtime as before. (wasm32-gc glue is PR 14.)
+        // bare `.wasm` runs under wasmtime as before. The two targets share the
+        // glue core and differ only in the value-ABI marshalling (decision C).
         //
         // Generate the glue *before* writing the `.wasm`: a glue-generation
         // failure then aborts the build without leaving a stale `.wasm` behind
         // (an artifact whose paired sidecar never got written).
-        let js_glue = if matches!(target, Target::Wasm32Linear) {
-            match phoenix_cranelift::wasm_linear_js_glue(&ir_module) {
-                Ok(glue) => glue,
-                Err(err) => {
-                    eprintln!("error: generating JS glue: {err}");
-                    process::exit(1);
-                }
+        // `is_wasm()` admits only these two targets, so the match is total here;
+        // each binding dispatches to its backend's glue generator (decision C).
+        let js_glue_result = match target {
+            Target::Wasm32Linear => phoenix_cranelift::wasm_linear_js_glue(&ir_module),
+            Target::Wasm32Gc => phoenix_cranelift::wasm_gc_js_glue(&ir_module),
+            Target::Native => unreachable!("guarded by `target.is_wasm()`"),
+        };
+        let js_glue = match js_glue_result {
+            Ok(glue) => glue,
+            Err(err) => {
+                eprintln!("error: generating JS glue: {err}");
+                process::exit(1);
             }
-        } else {
-            None
         };
 
         if let Err(err) = fs::write(&out_path, &artifact_bytes) {

@@ -120,6 +120,14 @@ pub fn wasm_linear_js_glue(ir_module: &IrModule) -> Result<Option<String>, Compi
     wasm::generate_js_glue(ir_module)
 }
 
+/// Generate the paired JavaScript glue for a wasm32-**gc** module's `extern js`
+/// imports, or `None` if the program declares/calls no externs. The gc analog of
+/// [`wasm_linear_js_glue`]; both share the [`GENERATED_GLUE_MARKER`] and the glue
+/// core, differing only in the value-ABI marshalling.
+pub fn wasm_gc_js_glue(ir_module: &IrModule) -> Result<Option<String>, CompileError> {
+    wasm::generate_gc_js_glue(ir_module)
+}
+
 /// The sentinel header every generated JS glue file begins with. The driver uses
 /// it to recognise a build-owned `.js` sidecar: when an `extern js` program is
 /// rebuilt with no externs, a now-stale sidecar is removed only if it carries

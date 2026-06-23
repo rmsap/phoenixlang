@@ -25,7 +25,7 @@
 mod common;
 
 use common::compiled_fixtures::{TempDir, phoenix_bin, workspace_root};
-use common::{skip_if_no_node, skip_if_no_runtime_wasm};
+use common::{skip_if_no_node, skip_if_no_runtime_wasm, skip_if_no_wasm_gc};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -106,26 +106,57 @@ fn run_interop_fixture(name: &str, target: &str) {
     );
 }
 
-/// One always-on Node test per interop fixture. Adding a fixture is: a
-/// `tests/fixtures/interop/<name>/` directory plus a line here. The WASM target
-/// is a parameter so PR 15 adds the WASM-GC column without restructuring.
+/// One always-on Node test per interop fixture **per WASM target**: the *same*
+/// fixture + host stub + baseline runs on both `wasm32-linear` and `wasm32-gc`,
+/// asserting byte-identical output (the two glues differ only in marshalling).
+/// Adding a fixture is a `tests/fixtures/interop/<name>/` directory plus a line
+/// here. wasm32-gc embeds no Phoenix runtime, so its build needs only `node`
+/// (not the linear runtime wasm).
 macro_rules! interop_node_test {
-    ($test_name:ident, $fixture:literal) => {
+    ($linear:ident, $gc:ident, $fixture:literal) => {
         #[test]
-        fn $test_name() {
-            if skip_if_no_runtime_wasm(stringify!($test_name)) {
+        fn $linear() {
+            if skip_if_no_runtime_wasm(stringify!($linear)) {
                 return;
             }
-            if skip_if_no_node(stringify!($test_name)) {
+            if skip_if_no_node(stringify!($linear)) {
                 return;
             }
             run_interop_fixture($fixture, "wasm32-linear");
         }
+
+        #[test]
+        fn $gc() {
+            if skip_if_no_node(stringify!($gc)) || skip_if_no_wasm_gc(stringify!($gc)) {
+                return;
+            }
+            run_interop_fixture($fixture, "wasm32-gc");
+        }
     };
 }
 
-interop_node_test!(interop_scalars_round_trip, "scalars");
-interop_node_test!(interop_strings_in_and_out, "strings");
-interop_node_test!(interop_jsvalue_handle_round_trip, "jsvalue");
-interop_node_test!(interop_closures_as_callbacks, "callbacks");
-interop_node_test!(interop_host_side_effect_ordering, "host_effect");
+interop_node_test!(
+    interop_scalars_round_trip,
+    interop_scalars_round_trip_gc,
+    "scalars"
+);
+interop_node_test!(
+    interop_strings_in_and_out,
+    interop_strings_in_and_out_gc,
+    "strings"
+);
+interop_node_test!(
+    interop_jsvalue_handle_round_trip,
+    interop_jsvalue_handle_round_trip_gc,
+    "jsvalue"
+);
+interop_node_test!(
+    interop_closures_as_callbacks,
+    interop_closures_as_callbacks_gc,
+    "callbacks"
+);
+interop_node_test!(
+    interop_host_side_effect_ordering,
+    interop_host_side_effect_ordering_gc,
+    "host_effect"
+);

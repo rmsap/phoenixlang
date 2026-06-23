@@ -66,6 +66,7 @@ mod closures;
 mod dyn_trait;
 mod enums;
 mod float_helpers;
+mod js_glue;
 mod lists;
 mod map_hash_index;
 mod maps;
@@ -274,6 +275,20 @@ pub(crate) fn compile_wasm_gc(ir_module: &IrModule) -> Result<Vec<u8>, CompileEr
     builder.emit_start_body()?;
 
     builder.finish()
+}
+
+/// Generate the paired JavaScript glue for a wasm32-gc module's `extern js`
+/// imports, or `None` if the program declares/calls no externs (no `.js` sidecar
+/// is emitted then — the bare `.wasm` runs under wasmtime). Driven by the same
+/// [`crate::extern_abi::collect_externs`] table the import section was built from,
+/// so imports and glue can't drift; the gc glue plugin
+/// ([`js_glue`]) marshals over the wasm32-gc value ABI.
+pub(crate) fn generate_js_glue(ir_module: &IrModule) -> Result<Option<String>, CompileError> {
+    let externs = crate::extern_abi::collect_externs(ir_module)?;
+    if externs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(js_glue::generate(&externs)?))
 }
 
 /// Which wasm32-gc `extern js` String-marshalling helpers a module needs.

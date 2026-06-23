@@ -283,10 +283,15 @@ pub(super) fn synthesize_str_concat(b: &mut ModuleBuilder) -> Result<u32, Compil
 /// A gc `$string` is a GC object a JS host can't read directly, so the bytes are
 /// copied into linear memory; the JS glue then reads
 /// `memory[PRINT_STR_BUF_START .. +len]` via `TextDecoder`. Reuses the print
-/// scratch buffer (and its [`PRINT_STR_MAX_LEN`] cap — oversized strings trap),
-/// which is safe because the glue copies-then-reads each string serially, before
-/// any host code runs. Mirrors [`synthesize_print_str`]'s copy loop without the
-/// trailing newline / iovec / `fd_write`.
+/// scratch buffer, which is safe because the glue copies-then-reads each string
+/// serially, before any host code runs. A string past the [`PRINT_STR_MAX_LEN`]
+/// cap is *not* copied: the helper returns its true length unchanged so the JS
+/// glue can detect `len > cap` and raise a clear "string exceeds the scratch
+/// buffer" error (symmetric with the build-side `__buildGcString` check) rather
+/// than the opaque trap an `Unreachable` would raise here — the glue never reads
+/// the buffer when the returned length is over the cap. Mirrors
+/// [`synthesize_print_str`]'s copy loop without the trailing newline / iovec /
+/// `fd_write`.
 ///
 /// Param: `s` (local 0). Locals: `len` (i32, 1), `offset` (i32, 2), `i` (i32, 3),
 /// `data` (`(ref $bytes)`, 4).
@@ -325,12 +330,17 @@ pub(super) fn synthesize_extern_str_to_scratch(b: &mut ModuleBuilder) -> Result<
         field_index: STR_LEN,
     });
     func.instruction(&Instruction::LocalSet(len_local));
-    // Trap on overflow — the scratch buffer is fixed-size (same bound print uses).
+    // Oversize: return the true length *without* copying. The scratch buffer is
+    // fixed-size (same bound print uses), but instead of trapping we let the JS
+    // glue see `len > cap` and raise a clear error (the read-side analog of
+    // `__buildGcString`'s cap check); the glue leaves the buffer unread in that
+    // case, so the early return is sound.
     func.instruction(&Instruction::LocalGet(len_local));
     func.instruction(&Instruction::I32Const(PRINT_STR_MAX_LEN as i32));
     func.instruction(&Instruction::I32GtU);
     func.instruction(&Instruction::If(BlockType::Empty));
-    func.instruction(&Instruction::Unreachable);
+    func.instruction(&Instruction::LocalGet(len_local));
+    func.instruction(&Instruction::Return);
     func.instruction(&Instruction::End);
     // offset = s.$offset
     func.instruction(&Instruction::LocalGet(s_local));
@@ -1128,7 +1138,7 @@ mod extern_str_roundtrip_exec {
 
     use wasm_encoder::{BlockType, HeapType, Instruction, RefType, ValType};
 
-    use super::super::module_builder::ModuleBuilder;
+    use super::super::module_builder::{ModuleBuilder, PRINT_STR_MAX_LEN};
     use super::{
         synthesize_extern_str_from_scratch, synthesize_extern_str_to_scratch, synthesize_str_eq,
     };
@@ -1229,41 +1239,106 @@ mod extern_str_roundtrip_exec {
             .expect("hand-built round-trip module validates");
     }
 
-    #[test]
-    fn extern_str_helpers_roundtrip_under_wasmtime() {
-        let bytes = build_roundtrip_module();
-        validate(&bytes);
-
-        // Same soft-skip / hard-require gating as the integration tier:
-        // skip cleanly when wasmtime is absent unless
-        // `PHOENIX_REQUIRE_WASMTIME=1` makes its absence a failure.
+    /// Run a hand-built module under the wasmtime CLI (GC features on), returning
+    /// its [`std::process::Output`], or `None` when wasmtime is absent — the same
+    /// soft-skip / hard-require gating the integration tier uses
+    /// (`PHOENIX_REQUIRE_WASMTIME=1` turns a missing `wasmtime` into a failure).
+    /// Shared by the round-trip and oversize execution tests.
+    fn run_under_wasmtime(bytes: &[u8]) -> Option<std::process::Output> {
         let require = std::env::var("PHOENIX_REQUIRE_WASMTIME").as_deref() == Ok("1");
         if Command::new("wasmtime").arg("--version").output().is_err() {
             assert!(
                 !require,
                 "PHOENIX_REQUIRE_WASMTIME=1 set but `wasmtime` is not on PATH"
             );
-            eprintln!(
-                "warning: skipping extern-String round-trip execution — \
-                 `wasmtime` not on PATH"
-            );
-            return;
+            eprintln!("warning: skipping extern-String execution — `wasmtime` not on PATH");
+            return None;
         }
-
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("extern_str_roundtrip.wasm");
-        std::fs::write(&path, &bytes).expect("write wasm");
-        let out = Command::new("wasmtime")
-            .args(["-W", "function-references=y,gc=y"])
-            .arg(&path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("invoke wasmtime");
+        let path = dir.path().join("extern_str_exec.wasm");
+        std::fs::write(&path, bytes).expect("write wasm");
+        Some(
+            Command::new("wasmtime")
+                .args(["-W", "function-references=y,gc=y"])
+                .arg(&path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("invoke wasmtime"),
+        )
+    }
+
+    #[test]
+    fn extern_str_helpers_roundtrip_under_wasmtime() {
+        let bytes = build_roundtrip_module();
+        validate(&bytes);
+        let Some(out) = run_under_wasmtime(&bytes) else {
+            return;
+        };
         assert!(
             out.status.success(),
             "extern-String round-trip trapped under wasmtime — a marshalling \
              copy loop is byte-unfaithful: status={:?}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// Build a module whose `_start` constructs a `$string` whose `$len` is one byte
+    /// past [`PRINT_STR_MAX_LEN`], calls [`synthesize_extern_str_to_scratch`], and
+    /// traps unless the helper returns that exact length. The helper's oversize arm
+    /// must `return len` *without copying* (not `unreachable`) so the JS glue can see
+    /// `len > __STR_MAX` and raise a clear error; the old behavior trapped here.
+    fn build_oversize_to_scratch_module() -> Vec<u8> {
+        let mut b = ModuleBuilder::new();
+        b.declare_string_types();
+        b.close_type_rec_group();
+        b.declare_memory();
+
+        let string_idx = b.require_string_type_idx().expect("string type declared");
+        let bytes_idx = b.require_bytes_type_idx().expect("bytes type declared");
+        let to_idx = synthesize_extern_str_to_scratch(&mut b).expect("OUT helper synthesizes");
+
+        // The smallest `$len` the helper must reject. The backing bytes are never
+        // read (the oversize arm returns before the copy loop), so the array (still
+        // allocated, since `$len` must match) needn't be filled with real bytes — a
+        // zero-filled `array.new_default` of the claimed length suffices.
+        let oversize = PRINT_STR_MAX_LEN as i32 + 1;
+        let start_sig = b.intern_signature(&[], &[]);
+        let mut f = wasm_encoder::Function::new([]);
+        // src = struct.new $string (array.new_default $bytes <oversize>, 0, oversize).
+        f.instruction(&Instruction::I32Const(oversize));
+        f.instruction(&Instruction::ArrayNewDefault(bytes_idx));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(oversize));
+        f.instruction(&Instruction::StructNew(string_idx));
+        // if to_scratch(src) != oversize { unreachable } — fails if the helper
+        // trapped (old behavior) or returned a wrong/copied length.
+        f.instruction(&Instruction::Call(to_idx));
+        f.instruction(&Instruction::I32Const(oversize));
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End); // function end
+
+        let start_idx = b.add_and_emit_function(start_sig, &f);
+        b.export_func("_start", start_idx);
+        b.finish().expect("module finishes")
+    }
+
+    #[test]
+    fn extern_str_to_scratch_returns_length_on_oversize_under_wasmtime() {
+        let bytes = build_oversize_to_scratch_module();
+        validate(&bytes);
+        let Some(out) = run_under_wasmtime(&bytes) else {
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "oversize `phx_extern_str_to_scratch` trapped or returned the wrong \
+             length under wasmtime — it must return the true (uncopied) length so \
+             the JS glue can reject `len > __STR_MAX`: status={:?}\nstderr: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr),
         );

@@ -221,3 +221,70 @@ pub fn skip_if_no_node(label: &str) -> bool {
     );
     true
 }
+
+/// Whether the `node` on `PATH` confirms support for the WasmGC proposal
+/// (struct/array types) that the `wasm32-gc` glue tier instantiates. Probes by
+/// asking Node to `WebAssembly.validate` a minimal module whose type section
+/// declares a GC `struct`: a GC-capable engine exits `0`, an engine without GC
+/// support exits `1` (`validate` returns `false`, it does *not* throw). WasmGC is
+/// enabled by default in Node ≈22+; an older Node validates the bytes as `false`.
+///
+/// The probe checks only a GC struct, not `externref` directly — but `externref`
+/// (reference-types) long predates the GC proposal, so any engine that validates
+/// a GC struct necessarily has the `externref` the glue also uses. The struct is
+/// the strictly-newer feature, hence the sufficient gate.
+///
+/// Returns `true` only on a clean exit `0`. Any other outcome — a definitive
+/// exit `1`, *or* a probe that couldn't run cleanly (a node crash, a signal) —
+/// returns `false`: this is a soft capability gate, so "not confirmed" is treated
+/// the same as "unsupported". Callers that need the gc engine set
+/// `PHOENIX_REQUIRE_WASM_GC=1` (see [`skip_if_no_wasm_gc`]). Distinguishing "no
+/// node" from "node without GC" is the caller's job: this is only reached after
+/// [`skip_if_no_node`].
+pub fn node_supports_wasm_gc() -> bool {
+    // Memoized: this is called once per gc test (via `skip_if_no_wasm_gc`), so the
+    // `node -e` subprocess runs only on the first probe and every later call reads
+    // the cached verdict.
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        // 00 61 73 6d  wasm magic | 01 00 00 00  version 1
+        // 01 03        type section (id 1), 3-byte payload
+        // 01 5f 00     one type: struct (0x5f = 95) with zero fields
+        let probe = "process.exit(WebAssembly.validate(\
+                     new Uint8Array([0,97,115,109,1,0,0,0,1,3,1,95,0])) ? 0 : 1);";
+        // Only a clean exit `0` confirms support. `status.success()` is already
+        // exactly "exited 0", so an exit `1` (no GC) and a non-exit failure (crash,
+        // signal) both fall through to `false` — the messages below are worded to
+        // not over-claim *which* of those it was.
+        std::process::Command::new("node")
+            .arg("-e")
+            .arg(probe)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Soft-skip a wasm32-gc glue tier when the `node` on `PATH` can't run WasmGC,
+/// gated by `PHOENIX_REQUIRE_WASM_GC=1`. Call *after* [`skip_if_no_node`]: a gc
+/// module fails to even compile on a pre-GC engine, so without this probe those
+/// tiers would hard-fail rather than soft-skip the way every other capability
+/// gate does. Returns `true` when the caller should early-return (skip).
+#[must_use]
+pub fn skip_if_no_wasm_gc(label: &str) -> bool {
+    if node_supports_wasm_gc() {
+        return false;
+    }
+    assert!(
+        !require("PHOENIX_REQUIRE_WASM_GC"),
+        "PHOENIX_REQUIRE_WASM_GC=1 set but the `node` on PATH did not pass the WasmGC \
+         probe — it lacks the GC proposal, or the probe failed to run \
+         (needs Node ≈22+, where the GC proposal is on by default)"
+    );
+    eprintln!(
+        "warning: skipping {label} — the `node` on PATH did not pass the WasmGC probe \
+         (lacks the GC proposal, or the probe failed to run; set \
+         PHOENIX_REQUIRE_WASM_GC=1 to fail instead; needs Node ≈22+)"
+    );
+    true
+}

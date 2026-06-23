@@ -78,9 +78,10 @@ use crate::error::CompileError;
 
 mod builtins;
 mod gc_root;
+mod glue;
 mod heap_layout;
 mod js_glue;
-pub(crate) use js_glue::GENERATED_MARKER as GENERATED_GLUE_MARKER;
+pub(crate) use glue::GENERATED_MARKER as GENERATED_GLUE_MARKER;
 mod module_builder;
 pub(crate) mod runtime_discovery;
 mod runtime_merge;
@@ -90,6 +91,7 @@ mod validate;
 mod wasm_gc;
 
 pub(crate) use wasm_gc::compile_wasm_gc;
+pub(crate) use wasm_gc::generate_js_glue as generate_gc_js_glue;
 
 use module_builder::ModuleBuilder;
 

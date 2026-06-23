@@ -3053,3 +3053,54 @@ pub(super) fn emit_fd_write_call(func: &mut wasm_encoder::Function, fd_write_idx
     func.instruction(&wasm_encoder::Instruction::Call(fd_write_idx));
     func.instruction(&wasm_encoder::Instruction::Drop);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `extern js` boundary type that can appear as a *parameter* flattens to
+    /// exactly one wasm slot on wasm32-gc. This is the invariant the gc glue plugin
+    /// (`wasm_gc::js_glue::GcGlue::inbound_arg`) hardcodes as its returned slot count
+    /// `1` — unlike the linear plugin, which derives the count from `wasm_valtypes_for`
+    /// and pins it with a `debug_assert`. The gc plugin holds no `ModuleBuilder`, so it
+    /// *can't* assert against this function inline; this test is that coupling's
+    /// enforcement. A future gc boundary type that flattened to >1 slot here would
+    /// desync the shared `build_thunk`'s `p{slot}` accumulation from the import
+    /// section — caught here rather than silently shifting later params.
+    #[test]
+    fn every_gc_extern_param_type_is_one_slot() {
+        let mut b = ModuleBuilder::new();
+        // `String` and a closure need their type-section entries declared before
+        // `wasm_valtypes_for` can resolve the concrete ref; the scalars / `externref`
+        // don't touch the builder. The closure's fn-type index is unused by the
+        // valtype mapping (it returns the parent ref), so any placeholder works.
+        b.declare_string_types();
+        let clo_key = (vec![IrType::I64], IrType::Void);
+        let parent_idx = b.declare_closure_parent_struct(&[]);
+        b.record_closure_sig(clo_key, 0, parent_idx);
+
+        let one_slot = [
+            IrType::I64,
+            IrType::F64,
+            IrType::Bool,
+            IrType::JsValue,
+            IrType::StringRef,
+            IrType::ClosureRef {
+                param_types: vec![IrType::I64],
+                return_type: Box::new(IrType::Void),
+            },
+        ];
+        for ty in &one_slot {
+            assert_eq!(
+                gc_extern_valtypes(&b, ty).unwrap().len(),
+                1,
+                "gc extern param type `{ty:?}` must flatten to exactly one wasm slot \
+                 (the gc glue's `inbound_arg` hardcodes a slot count of 1)"
+            );
+        }
+        // `Void` never appears as a parameter (sema rejects it), but as a *return* it
+        // flattens to no result — pin that the only non-1 cases stay `Void` (0) and the
+        // catch-all (`Err`), so a new multi-slot type can't slip through unnoticed.
+        assert!(gc_extern_valtypes(&b, &IrType::Void).unwrap().is_empty());
+    }
+}
