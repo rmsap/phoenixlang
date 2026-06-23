@@ -16,7 +16,7 @@ class ApiClient:
 
     async def create_user(self, body: CreateUserBody) -> User:
         response = await self.client.post(
-            f"{self.base_url}/api/users", json=body.model_dump()
+            f"{self.base_url}/api/users", json=body.model_dump(by_alias=True)
         )
         response.raise_for_status()
         return User(**response.json())

@@ -29,7 +29,7 @@ def create_router(handlers: Handlers) -> APIRouter:
             )
         if result.body is not None:
             return Response(
-                content=result.body.model_dump_json(),
+                content=result.body.model_dump_json(by_alias=True),
                 status_code=result.status,
                 media_type="application/json",
             )

@@ -39,11 +39,14 @@ def to_snake(key: str) -> str:
             out.append(ch)
     result = "".join(out)
     # Mirror the generator's keyword escaping (python.rs `to_snake_case`): a field
-    # whose snake form is a Python hard keyword gets a trailing `_`, so the wire
-    # key for e.g. `class` is `class_`. Keeping this helper in step keeps body
-    # construction (driver.py maps contract camelCase keys through it) and the
-    # symmetric normalize() comparison aligned with the generated models, which
-    # carry no alias and so serialize keyword fields by the escaped name.
+    # whose snake form is a Python hard keyword gets a trailing `_`. The generated
+    # models now alias keyword fields to the original schema name on the wire
+    # (`Field(alias="class")`), but this harness compares values via `model_dump()`
+    # WITHOUT `by_alias` (see `_result_to_plain`), so it sees the escaped Python
+    # attribute name (`class_`), not the wire key. Keeping this helper in step keeps
+    # body construction (driver.py maps contract camelCase keys through it, then
+    # constructs by the escaped attribute via populate_by_name) and the symmetric
+    # normalize() comparison aligned with that escaped attribute name.
     # `keyword.iskeyword` matches the generator's `is_python_keyword` set exactly
     # here: the input is already lowercased, so the only hard keywords it can hit are
     # the lowercase ones the generator also escapes (True/False/None never reach this

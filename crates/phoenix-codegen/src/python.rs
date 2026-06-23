@@ -437,30 +437,62 @@ impl<'a> PyGenerator<'a> {
         let needs_decimal = needs_decimal || needs_money;
         let mut needs_field = false;
         let mut needs_enum = false;
+        // `ConfigDict(populate_by_name=True)` is emitted on any model carrying an
+        // aliased field — a field whose schema (wire) name differs from its
+        // snake_case Python attribute (a camelCase name, or a keyword escaped with a
+        // trailing `_`), or a pagination envelope (whose `totalCount`/`nextCursor`
+        // always alias). It shares the SAME emit gating as `needs_field` — same model
+        // set, same `is_file_bearing`/`is_multipart` exclusions — so the two flags are
+        // computed together in one traversal to keep them from drifting from each
+        // other or from the emitters. The import must track the emitted
+        // `model_config`/`Field(alias=…)` lines exactly, or ruff flags an
+        // unused/undefined name.
+        let mut needs_config_dict = false;
 
         for decl in &program.declarations {
             match decl {
                 Declaration::Struct(s) => {
+                    // File-bearing structs emit no model (see `emit_model`), so
+                    // neither their constraints nor their field names reach the
+                    // import gate.
                     if let Some(info) = self.check_result.module.struct_info_by_name(&s.name)
-                        // File-bearing structs emit no model (see `emit_model`),
-                        // so their constraints never reference `Field`.
                         && !info.is_file_bearing
-                        && info.fields.iter().any(|f| f.constraint.is_some())
                     {
-                        needs_field = true;
+                        if info.fields.iter().any(|f| f.constraint.is_some()) {
+                            needs_field = true;
+                        }
+                        if info.fields.iter().any(|f| is_aliased(&f.name)) {
+                            needs_config_dict = true;
+                        }
                     }
                 }
                 Declaration::Enum(_) => needs_enum = true,
                 _ => {}
             }
         }
-        // Check derived types for constraints too. Multipart bodies emit no model.
+        // Derived models (request bodies, response projections) and the pagination
+        // envelope, mirroring their emitters. Multipart bodies emit no model.
         for ep in &self.check_result.endpoints {
             if !ep.body_is_multipart
                 && let Some(ref body) = ep.body
-                && body.fields.iter().any(|f| f.constraint.is_some())
             {
-                needs_field = true;
+                if body.fields.iter().any(|f| f.constraint.is_some()) {
+                    needs_field = true;
+                }
+                if body.fields.iter().any(|f| is_aliased(&f.name)) {
+                    needs_config_dict = true;
+                }
+            }
+            if let Some(ref proj) = ep.response_projection {
+                if proj.fields.iter().any(|f| f.constraint.is_some()) {
+                    needs_field = true;
+                }
+                if proj.fields.iter().any(|f| is_aliased(&f.name)) {
+                    needs_config_dict = true;
+                }
+            }
+            if ep.pagination.is_some() {
+                needs_config_dict = true;
             }
         }
 
@@ -551,9 +583,10 @@ impl<'a> PyGenerator<'a> {
             self.models_out.push_str("\n\n");
         }
         // pydantic members, alphabetical (isort): BaseModel, BeforeValidator,
-        // Field, PlainSerializer, field_validator. `Money` subclasses `BaseModel`
-        // and uses `field_validator`; both `Url` and `Bytes` use `BeforeValidator`;
-        // `Bytes` also uses `PlainSerializer` (raw `bytes` → base64 wire).
+        // ConfigDict, Field, PlainSerializer, field_validator. `Money` subclasses
+        // `BaseModel` and uses `field_validator`; both `Url` and `Bytes` use
+        // `BeforeValidator`; `Bytes` also uses `PlainSerializer` (raw `bytes` →
+        // base64 wire); `ConfigDict` carries `populate_by_name` on aliased models.
         let mut pydantic: Vec<&str> = Vec::new();
         if needs_base_model || needs_field || needs_money {
             pydantic.push("BaseModel");
@@ -561,7 +594,13 @@ impl<'a> PyGenerator<'a> {
         if needs_url || needs_bytes {
             pydantic.push("BeforeValidator");
         }
-        if needs_field {
+        if needs_config_dict {
+            pydantic.push("ConfigDict");
+        }
+        // `Field` is needed for a constraint kwarg OR an `alias=` (every aliased
+        // field renders `Field(alias=…)`), so an aliased-but-unconstrained model
+        // (e.g. a pagination envelope) still imports it.
+        if needs_field || needs_config_dict {
             pydantic.push("Field");
         }
         if needs_bytes {
@@ -618,37 +657,35 @@ impl<'a> PyGenerator<'a> {
             if info.fields.is_empty() {
                 self.models_out.push_str("    pass\n");
             } else {
+                self.emit_model_config_if_aliased(info.fields.iter().map(|f| f.name.as_str()));
                 for f in &info.fields {
                     let py_type = type_to_python(&f.ty);
                     let is_option = matches!(&f.ty, Type::Generic(name, _) if name == "Option");
                     let field_str = constraint_to_field(&f.constraint);
-
                     let snake = to_snake_case(&f.name);
-                    if is_option {
-                        if let Some(ref field_kwargs) = field_str {
-                            self.models_out.push_str(&pydantic_field_line(
-                                &snake,
-                                &py_type,
-                                "None",
-                                field_kwargs,
-                            ));
-                        } else {
-                            self.models_out
-                                .push_str(&format!("    {snake}: {py_type} = None\n"));
-                        }
-                    } else if let Some(ref field_kwargs) = field_str {
-                        self.models_out.push_str(&pydantic_field_line(
-                            &snake,
-                            &py_type,
-                            "...",
-                            field_kwargs,
-                        ));
-                    } else {
-                        self.models_out
-                            .push_str(&format!("    {snake}: {py_type}\n"));
-                    }
+                    self.models_out.push_str(&pydantic_model_field(
+                        &snake,
+                        &py_type,
+                        is_option,
+                        field_str.as_deref(),
+                        &f.name,
+                    ));
                 }
             }
+        }
+    }
+
+    /// Emits `model_config = ConfigDict(populate_by_name=True)` as the first line of
+    /// a model body when any field's wire name (the schema name) diverges from its
+    /// snake_case Python attribute — i.e. when the model carries `Field(alias=…)`
+    /// fields. The config lets the model construct by the Python name (handlers,
+    /// tests) while parsing/serializing the schema name on the wire (camelCase,
+    /// matching Go/TS). No-op for an all-single-word model, so those don't churn.
+    fn emit_model_config_if_aliased<'n>(&mut self, mut wire_names: impl Iterator<Item = &'n str>) {
+        let needs = wire_names.any(is_aliased);
+        if needs {
+            self.models_out
+                .push_str("    model_config = ConfigDict(populate_by_name=True)\n\n");
         }
     }
 
@@ -714,6 +751,7 @@ impl<'a> PyGenerator<'a> {
         if fields.is_empty() {
             self.models_out.push_str("    pass\n");
         } else {
+            self.emit_model_config_if_aliased(fields.iter().map(|f| f.name.as_str()));
             for f in fields {
                 let py_type = type_to_python(&f.ty);
                 let field_str = constraint_to_field(&f.constraint);
@@ -730,27 +768,15 @@ impl<'a> PyGenerator<'a> {
                 } else {
                     py_type.clone()
                 };
-
+                let field_ty = if f.optional { &optional_type } else { &py_type };
                 let snake = to_snake_case(&f.name);
-                if f.optional {
-                    if let Some(ref kwargs) = field_str {
-                        self.models_out.push_str(&pydantic_field_line(
-                            &snake,
-                            &optional_type,
-                            "None",
-                            kwargs,
-                        ));
-                    } else {
-                        self.models_out
-                            .push_str(&format!("    {snake}: {optional_type} = None\n"));
-                    }
-                } else if let Some(ref kwargs) = field_str {
-                    self.models_out
-                        .push_str(&pydantic_field_line(&snake, &py_type, "...", kwargs));
-                } else {
-                    self.models_out
-                        .push_str(&format!("    {snake}: {py_type}\n"));
-                }
+                self.models_out.push_str(&pydantic_model_field(
+                    &snake,
+                    field_ty,
+                    f.optional,
+                    field_str.as_deref(),
+                    &f.name,
+                ));
             }
         }
     }
@@ -804,12 +830,11 @@ impl<'a> PyGenerator<'a> {
     /// - **cursor** → `class ListPostsPage(BaseModel): items: list[Post];
     ///   next_cursor: str | None = None`
     ///
-    /// Field names are snake_case attributes that ARE the wire names — the Python
-    /// generator emits NO `Field(alias=...)` on any model (structs, body, result
-    /// envelope), so the wire form is snake_case (`total_count`/`next_cursor`),
-    /// matching every other Python model. (Cross-target OpenAPI uses camelCase,
-    /// but that divergence is pre-existing for all Python models, not introduced
-    /// here; the Python round-trip is same-language so the convention holds.)
+    /// The page envelope IS serialized to JSON (it is the paginated response body),
+    /// so its wire keys must match Go's `json:"totalCount"`/`"nextCursor"` and TS's
+    /// `totalCount`/`nextCursor`. The metadata fields carry `Field(alias="…")` (with
+    /// `populate_by_name` so the handler still builds them by the snake name);
+    /// `items` is single-word and needs none.
     ///
     /// Endpoints without pagination emit nothing here and keep returning their
     /// bare response type. Pagination and response headers are mutually exclusive
@@ -828,18 +853,36 @@ impl<'a> PyGenerator<'a> {
         ensure_blank_lines(&mut self.models_out, 2);
         self.models_out
             .push_str(&format!("class {type_name}(BaseModel):\n"));
+        // Wire names (camelCase) the model aliases to; `items` matches its snake
+        // form, the metadata field does not.
+        let meta_wire = match pag.mode {
+            PaginationMode::Offset => "totalCount",
+            PaginationMode::Cursor => "nextCursor",
+        };
+        self.emit_model_config_if_aliased(["items", meta_wire].into_iter());
         self.models_out
             .push_str(&format!("    items: list[{item_type}]\n"));
         match pag.mode {
             PaginationMode::Offset => {
-                self.models_out.push_str("    total_count: int\n");
+                self.models_out.push_str(&pydantic_model_field(
+                    "total_count",
+                    "int",
+                    false,
+                    None,
+                    "totalCount",
+                ));
             }
             // `next_cursor` is null/absent on the last page — render it optional
             // with a `None` default, matching how an optional envelope field is
             // emitted elsewhere.
             PaginationMode::Cursor => {
-                self.models_out
-                    .push_str("    next_cursor: str | None = None\n");
+                self.models_out.push_str(&pydantic_model_field(
+                    "next_cursor",
+                    "str | None",
+                    true,
+                    None,
+                    "nextCursor",
+                ));
             }
         }
     }
@@ -1329,10 +1372,15 @@ impl<'a> PyGenerator<'a> {
                     || type_uses_uuid_deep(&f.ty, self.check_result, &mut BTreeSet::new())
                     || type_uses_decimal_deep(&f.ty, self.check_result, &mut BTreeSet::new())
             });
+            // `by_alias=True` serializes the schema (camelCase) wire names so the
+            // body matches what the Go/TS targets send/expect — and it recurses, so
+            // a nested model's aliased fields are covered too. It is a no-op when
+            // nothing is aliased (the alias equals the field name), so it is emitted
+            // unconditionally rather than gated on a transitive-alias scan.
             let dump = if needs_json_dump {
-                "body.model_dump(mode=\"json\")"
+                "body.model_dump(mode=\"json\", by_alias=True)"
             } else {
-                "body.model_dump()"
+                "body.model_dump(by_alias=True)"
             };
             call_args.push(format!("json={dump}"));
         }
@@ -1811,8 +1859,8 @@ impl<'a> PyGenerator<'a> {
             // not the item type (an unused item import would trip ruff F401).
             // A multi-status route returns a `Response` built from the envelope's
             // `result.status`/`result.body`; the route never names the body type
-            // (it serializes via `result.body.model_dump_json()`), so importing it
-            // here would trip ruff F401. Nothing to import for this branch.
+            // (it serializes via `result.body.model_dump_json(by_alias=True)`), so
+            // importing it here would trip ruff F401. Nothing to import for this branch.
             if !ep.response_statuses.is_empty() {
                 // intentionally no model import
             } else if ep.pagination.is_some() {
@@ -2271,7 +2319,7 @@ impl<'a> PyGenerator<'a> {
                     );
                 }
                 self.server_out.push_str(&format!(
-                    "{indent}if result.body is not None:\n{indent}    return Response(\n{indent}        content=result.body.model_dump_json(),\n{indent}        status_code=result.status,\n{indent}        media_type=\"application/json\",\n{indent}    )\n{indent}return Response(status_code=result.status)\n"
+                    "{indent}if result.body is not None:\n{indent}    return Response(\n{indent}        content=result.body.model_dump_json(by_alias=True),\n{indent}        status_code=result.status,\n{indent}        media_type=\"application/json\",\n{indent}    )\n{indent}return Response(status_code=result.status)\n"
                 ));
             } else {
                 self.server_out.push_str(&format!(
@@ -2850,16 +2898,29 @@ fn to_snake_case(s: &str) -> String {
     let mut result = phoenix_common::to_snake_case(s);
     // A name that snake-cases to a Python keyword (`class`, `async`, `lambda`, …)
     // can't be an attribute/parameter name, so append `_`. This makes the snake
-    // form diverge from the original wire name, which the existing alias logic
+    // form diverge from the original wire name, which the alias logic
     // (`snake != name` → `Field`/`Query`/`Header`/`Form`/`Path(alias=…)`) then
     // carries to the wire — so the escaped identifier never changes the wire name.
-    // (Model fields carry no alias and serialize by the snake field name, so a
-    // keyword field's wire key becomes the escaped form, which the Python
-    // client/server agree on.)
+    // (Model fields now alias like any other diverging field: a keyword field
+    // renders `Field(alias="class")`, so its wire key is the original schema name
+    // — matching Go/TS — while the Python attribute is the escaped `class_`.)
     if is_python_keyword(&result) {
         result.push('_');
     }
     result
+}
+
+/// Whether a model field's schema (wire) name diverges from its snake_case Python
+/// attribute — i.e. whether it must render `Field(alias="<wire>")` and force
+/// `ConfigDict(populate_by_name=True)` on its model. This is THE single source of
+/// truth for the alias decision: the import-gating scan and
+/// `emit_model_config_if_aliased` both call it, and `pydantic_model_field`'s
+/// `py_name != wire` check is its equivalent (callers always pass
+/// `to_snake_case(name)` as `py_name`). All three must agree or the emitted
+/// `model_config`/`Field` lines won't match the imported names and ruff/pyright
+/// rejects the output.
+fn is_aliased(wire_name: &str) -> bool {
+    to_snake_case(wire_name) != wire_name
 }
 
 /// Whether `s` is a Python hard keyword. Excludes soft keywords like `match`/`type`

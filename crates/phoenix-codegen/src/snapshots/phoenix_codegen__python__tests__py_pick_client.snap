@@ -16,7 +16,7 @@ class ApiClient:
 
     async def update_email(self, id: str, body: UpdateEmailBody) -> User:
         response = await self.client.patch(
-            f"{self.base_url}/api/users/{id}", json=body.model_dump()
+            f"{self.base_url}/api/users/{id}", json=body.model_dump(by_alias=True)
         )
         response.raise_for_status()
         return User(**response.json())

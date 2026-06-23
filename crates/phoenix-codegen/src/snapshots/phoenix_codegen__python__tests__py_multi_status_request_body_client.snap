@@ -16,7 +16,7 @@ class ApiClient:
 
     async def upsert_user(self, id: str, body: UpsertUserBody) -> UpsertUserResponse:
         response = await self.client.put(
-            f"{self.base_url}/api/users/{id}", json=body.model_dump()
+            f"{self.base_url}/api/users/{id}", json=body.model_dump(by_alias=True)
         )
         response.raise_for_status()
         response_body: User | None = None

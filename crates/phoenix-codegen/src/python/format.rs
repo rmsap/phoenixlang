@@ -58,6 +58,46 @@ pub(crate) fn pydantic_field_line(
     format_call("    ", &format!("{name}: {ty} = Field"), &args, "")
 }
 
+/// Renders a single pydantic model field line for a model whose wire format is the
+/// schema's original (camelCase) names — the cross-language-compatible form shared
+/// with the Go (`json:"…"`) and TS targets. `py_name` is the snake_case Python
+/// attribute, `wire` the schema field name. When they differ (a camelCase field, or
+/// a keyword escaped with a trailing `_`), a `Field(alias="<wire>")` keeps the wire
+/// key as the schema name (the model needs `populate_by_name` so it still
+/// constructs by `py_name`); otherwise the plain `name: type[ = None]` form is kept
+/// so single-word fields don't churn. `constraint_kwargs` (numeric/length bounds)
+/// are merged into the same `Field(...)`.
+///
+/// Callers MUST pass `to_snake_case(<wire>)` as `py_name`, so the `py_name != wire`
+/// test here is exactly `python.rs::is_aliased(wire)` — the single alias predicate
+/// the import-gating scan and `model_config` emission also use. (This module stays
+/// free of Phoenix semantics, so it can't call `is_aliased` directly.)
+pub(crate) fn pydantic_model_field(
+    py_name: &str,
+    ty: &str,
+    is_optional: bool,
+    constraint_kwargs: Option<&[String]>,
+    wire: &str,
+) -> String {
+    let mut kwargs: Vec<String> = Vec::new();
+    if py_name != wire {
+        kwargs.push(format!("alias=\"{wire}\""));
+    }
+    if let Some(ck) = constraint_kwargs {
+        kwargs.extend(ck.iter().cloned());
+    }
+    if kwargs.is_empty() {
+        if is_optional {
+            format!("    {py_name}: {ty} = None\n")
+        } else {
+            format!("    {py_name}: {ty}\n")
+        }
+    } else {
+        let sentinel = if is_optional { "None" } else { "..." };
+        pydantic_field_line(py_name, ty, sentinel, &kwargs)
+    }
+}
+
 /// Formats a `from <module> import <names>` statement the way `black` would:
 /// one line if it fits in the line length, otherwise a parenthesized block with
 /// one name per line and a magic trailing comma.

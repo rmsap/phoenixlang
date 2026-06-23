@@ -3843,3 +3843,65 @@ colliding with a fixed generated helper** (`struct ValidationError` vs the TS
 `ValidationError` class). Both are longer reserved-name-list extensions of the
 existing checks, lower-frequency (types are PascalCase by convention), and were
 scoped out behind the higher-value silent-data-loss rejections.
+
+## Phoenix Gen — Python wire names made cross-language compatible (2026-06-21)
+
+Closes the cross-language interop gap surfaced by stress-testing: the Go and TS
+targets put the schema's field name on the wire verbatim (Go `json:"avatarUrl"`, TS
+`avatarUrl`), but the Python target serialized **snake_case** (`avatar_url`) with no
+alias. So a Python client/server could not interoperate with a Go/TS counterpart —
+a TS frontend POSTing `{avatarUrl}` to a FastAPI backend expecting `avatar_url`
+silently dropped the field. Every round-trip test is same-language (Py↔Py), so this
+was never exercised; it directly undercuts the product's whole-stack-integration
+pitch ("one schema → a TS client + a Go/Python server that actually talk"). Now all
+three targets share one wire format: the schema's (camelCase) names.
+
+**Scope — fields only.** Query/header/path **params** already emitted
+`Query/Header/Path(alias="<schemaName>")`, so they were camelCase on the wire
+already. Only struct/derived/projection bodies and the pagination envelope used
+snake_case. (The response-header and multi-status envelopes are internal carriers —
+the body is serialized by its own model and header/status values go to HTTP
+headers/status, never as JSON keys — so they need no alias.)
+
+This also shifts the wire key for a **keyword field**: a field named `class`
+serialized as the escaped `class_` before (model fields had no alias), but now
+aliases to the original `class` — matching Go's `json:"class"` and TS's `class`. The
+escaped form survives only as the Python attribute name (`class_`), no longer on the
+wire. This is the same camelCase-parity fix applied to keyword-escaped names, but
+worth calling out because it changes the wire key of an existing case.
+
+**Change (python.rs / python/format.rs):**
+- A new `pydantic_model_field` helper emits `Field(alias="<schemaName>")` whenever the
+  snake_case Python attribute diverges from the schema name (a camelCase field, or a
+  keyword escaped with a trailing `_`), merging the alias with any constraint kwargs;
+  single-word fields keep the plain `name: type` form (no churn).
+- Aliased models get `model_config = ConfigDict(populate_by_name=True)` so handlers
+  and tests still construct by the Python name while the wire uses the alias. The
+  `ConfigDict` (and `Field`, for an aliased-but-unconstrained envelope) imports are
+  gated on the same condition.
+- Applied across all five field-bearing model emitters (structs, derived bodies,
+  response projections via the shared `emit_pydantic_model`, and the pagination
+  envelope's `totalCount`/`nextCursor`).
+- Serialization emits the alias: client bodies use `model_dump(..., by_alias=True)`
+  and the multi-status server uses `model_dump_json(by_alias=True)` — both
+  unconditional (a no-op when nothing is aliased, and correct for nested aliased
+  models). All other responses are FastAPI direct returns, which serialize
+  `by_alias=True` **by default** (verified), so they needed no change. Inbound
+  parsing is unchanged — pydantic matches by alias by default (client
+  `model_validate`/`Model(**json)`, FastAPI body parse).
+
+**Verification.** Python compile-lint green (every aliased model compiles, lints,
+and type-checks — `populate_by_name` + `by_alias` confirmed against the scaffold's
+pydantic/FastAPI). All 9 Python round-trips green (Py↔Py is now camelCase↔camelCase,
+self-consistent). 257 codegen lib snapshots re-baselined (the diff is exactly
+`alias=`/`model_config`/`by_alias=True`); Go/TS unaffected (their round-trips green);
+clippy clean. The `phoenix_common::to_snake_case` added in the robustness pass backs
+both the alias decision here and the field-collision sema check, so they can't drift.
+
+**Not yet done (next, per plan):** a genuine **cross-language round-trip** test
+(e.g. a Python client driving a Go/TS server, or a wire-key parity assertion across
+the three targets) — the test that would have caught this and now guards it. The
+codegen fix is verified by compile-lint + same-language round-trips; the
+cross-language harness is the agreed follow-up to scope. (That harness should also
+check non-field wire surfaces — enum variant values, scalar wire formats — for the
+same cross-target parity.)

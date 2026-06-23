@@ -128,6 +128,68 @@ struct User {
     insta::assert_snapshot!("py_model_constraints", files.models);
 }
 
+/// A struct field whose schema name diverges from its snake_case Python attribute
+/// (a camelCase name) renders `Field(alias="<schemaName>")` so the wire key stays
+/// the schema name — cross-language-compatible with Go's `json:"avatarUrl"` / TS's
+/// `avatarUrl` — and the model gains `model_config = ConfigDict(populate_by_name=True)`
+/// so handlers/tests still construct by the Python name. A single-word field keeps
+/// the plain `name: type` form (no churn). When an aliased field ALSO carries a
+/// constraint, the `alias=` kwarg precedes the constraint kwargs in the same
+/// `Field(...)` (`Field(..., alias="avatarUrl", max_length=200)`). This guards the
+/// general struct/derived alias path that the pagination snapshots only cover for
+/// the hardcoded `totalCount`/`nextCursor` envelope fields.
+#[test]
+fn camel_case_struct_field_aliases_to_wire_name() {
+    let files = generate_from_source(
+        r#"
+struct Profile {
+    id: Int
+    avatarUrl: Option<String> where self.length <= 200
+    displayName: String
+}
+"#,
+    );
+    insta::assert_snapshot!("py_struct_field_alias_models", files.models);
+
+    // The aliasing model carries `populate_by_name` and imports `ConfigDict`.
+    assert!(
+        files
+            .models
+            .contains("from pydantic import BaseModel, ConfigDict, Field"),
+        "aliased model must import ConfigDict + Field:\n{}",
+        files.models
+    );
+    assert!(
+        files.models.contains(
+            "class Profile(BaseModel):\n    model_config = ConfigDict(populate_by_name=True)\n"
+        ),
+        "model with a camelCase field must emit model_config:\n{}",
+        files.models
+    );
+    // Single-word field: plain form, no alias (no churn).
+    assert!(
+        files.models.contains("    id: int\n"),
+        "single-word field must stay plain `id: int`:\n{}",
+        files.models
+    );
+    // camelCase + constraint: `alias=` precedes the constraint kwarg.
+    assert!(
+        files.models.contains(
+            "    avatar_url: str | None = Field(None, alias=\"avatarUrl\", max_length=200)\n"
+        ),
+        "optional camelCase field with a constraint must render alias before the constraint kwarg:\n{}",
+        files.models
+    );
+    // camelCase, required, unconstrained: `alias=` only.
+    assert!(
+        files
+            .models
+            .contains("    display_name: str = Field(..., alias=\"displayName\")\n"),
+        "required camelCase field must render `Field(..., alias=\"displayName\")`:\n{}",
+        files.models
+    );
+}
+
 #[test]
 fn get_with_path_param() {
     let files = generate_from_source(
@@ -1251,10 +1313,11 @@ fn dyn_type_records_import() {
 // ── pagination tests ────────────────────────────────────────────
 
 /// An offset-paginated endpoint produces an `<Endpoint>Page` pydantic model
-/// `{ items: list[T]; total_count: int }` (snake_case attrs ARE the wire
-/// names — no `Field(alias=...)`, matching every other Python model). The
-/// client returns and `model_validate`s the page; the handler returns the
-/// page; the server route is annotated with and returns the page.
+/// `{ items: list[T]; total_count: int }` whose `total_count` aliases to the
+/// camelCase wire key `totalCount` (`Field(alias=...)` + `populate_by_name`),
+/// matching the Go/TS envelope. The client returns and `model_validate`s the
+/// page; the handler returns the page; the server route is annotated with and
+/// returns the page.
 #[test]
 fn offset_pagination_envelope() {
     let files = generate_from_source(
@@ -1272,17 +1335,13 @@ endpoint listPosts: GET "/api/posts" {
     insta::assert_snapshot!("py_offset_pagination_handlers", files.handlers);
     insta::assert_snapshot!("py_offset_pagination_server", files.server);
 
-    // Model shape: snake_case wire names, no alias machinery.
+    // Model shape: camelCase wire keys via `Field(alias=...)` (+ `populate_by_name`)
+    // so the envelope is cross-language-compatible with the Go/TS `totalCount`.
     assert!(
         files.models.contains(
-            "class ListPostsPage(BaseModel):\n    items: list[Post]\n    total_count: int\n"
+            "class ListPostsPage(BaseModel):\n    model_config = ConfigDict(populate_by_name=True)\n\n    items: list[Post]\n    total_count: int = Field(..., alias=\"totalCount\")\n"
         ),
-        "offset page model must be {{ items: list[Post]; total_count: int }}:\n{}",
-        files.models
-    );
-    assert!(
-        !files.models.contains("alias=") && !files.models.contains("populate_by_name"),
-        "page model must NOT use Field(alias=...) / populate_by_name:\n{}",
+        "offset page model must alias total_count to totalCount:\n{}",
         files.models
     );
     // Client return type + model_validate of the page.
@@ -1339,12 +1398,13 @@ endpoint listPosts: GET "/api/posts" {
     insta::assert_snapshot!("py_cursor_pagination_handlers", files.handlers);
     insta::assert_snapshot!("py_cursor_pagination_server", files.server);
 
-    // Model shape: optional next_cursor with a None default.
+    // Model shape: optional next_cursor aliased to the camelCase wire `nextCursor`
+    // (cross-language-compatible), with a None default.
     assert!(
             files.models.contains(
-                "class ListPostsPage(BaseModel):\n    items: list[Post]\n    next_cursor: str | None = None\n"
+                "class ListPostsPage(BaseModel):\n    model_config = ConfigDict(populate_by_name=True)\n\n    items: list[Post]\n    next_cursor: str | None = Field(None, alias=\"nextCursor\")\n"
             ),
-            "cursor page model must be {{ items: list[Post]; next_cursor: str | None = None }}:\n{}",
+            "cursor page model must alias next_cursor to nextCursor:\n{}",
             files.models
         );
     assert!(
@@ -1447,7 +1507,7 @@ endpoint upsertUser: PUT "/api/users/{id}" {
             .contains("result = await handlers.upsert_user(id=id)")
             && files
                 .server
-                .contains("content=result.body.model_dump_json(),")
+                .contains("content=result.body.model_dump_json(by_alias=True),")
             && files.server.contains("status_code=result.status,")
             && !files.server.contains("status_code=204"),
         "server must return a dynamic-status Response from result.status/body:\n{}",
@@ -1830,7 +1890,7 @@ endpoint upsertUser: PUT "/api/users/{id}" {
     // The request body still serializes from the `body` parameter...
     assert!(
         files.client.contains("body: UpsertUserBody")
-            && files.client.contains("json=body.model_dump()"),
+            && files.client.contains("json=body.model_dump(by_alias=True)"),
         "request body must serialize from the `body` parameter:\n{}",
         files.client
     );
@@ -1906,11 +1966,14 @@ endpoint chunks: GET "/chunks" {
 
 /// Guards the lockstep coupling between the generator's `is_python_keyword` and the
 /// round-trip harness's `keyword.iskeyword` (tests/roundtrip/python/harness.py
-/// `to_snake`): both decide the escaped wire key for a keyword model field, so they
-/// must agree on exactly which lowercased identifiers are escaped. Without this, a
-/// stray edit to the `is_python_keyword` match arm (a dropped or added word) would go
-/// unnoticed until a fixture happened to use the drifted word — the existing
-/// `class`/`async` round-trip only covers those two.
+/// `to_snake`): both decide the escaped snake-case *attribute* name for a keyword
+/// model field — the wire key itself is the original schema name, carried by
+/// `Field(alias=…)` — so they must agree on exactly which lowercased identifiers are
+/// escaped (the harness compares via `model_dump()` without `by_alias`, so it sees
+/// that escaped attribute name). Without this, a stray edit to the
+/// `is_python_keyword` match arm (a dropped or added word) would go unnoticed until a
+/// fixture happened to use the drifted word — the existing `class`/`async`
+/// round-trip only covers those two.
 ///
 /// `HARD_KEYWORDS` is a checked-in copy of CPython's `keyword.kwlist` with the three
 /// capitalized keywords (`True`/`False`/`None`) removed — `is_python_keyword`'s sole

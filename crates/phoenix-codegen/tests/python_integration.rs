@@ -181,7 +181,9 @@ fn client_has_post_with_body() {
             .client
             .contains("async def create_user(self, body: CreateUserBody)")
     );
-    assert!(files.client.contains("json=body.model_dump()"));
+    // The request body serializes by alias so the wire keys are the schema's
+    // (camelCase) names — cross-language-compatible with the Go/TS targets.
+    assert!(files.client.contains("json=body.model_dump(by_alias=True)"));
 }
 
 #[test]

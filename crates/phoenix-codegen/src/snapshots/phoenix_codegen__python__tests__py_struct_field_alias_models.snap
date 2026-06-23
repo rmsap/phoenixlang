@@ -9,13 +9,9 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class Post(BaseModel):
-    id: int
-    title: str
-
-
-class ListPostsPage(BaseModel):
+class Profile(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    items: list[Post]
-    total_count: int = Field(..., alias="totalCount")
+    id: int
+    avatar_url: str | None = Field(None, alias="avatarUrl", max_length=200)
+    display_name: str = Field(..., alias="displayName")
