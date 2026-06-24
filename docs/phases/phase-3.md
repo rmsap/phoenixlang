@@ -14,11 +14,55 @@ Annotations ([4.5](./phase-4.md#45-annotation-system)) are the keystone for the 
 
 ## 3.1 Package Manager
 
-- `phoenix.toml` manifest file (name, version, dependencies)
-- Dependency resolution (semver)
-- Start with git-based dependencies, add a registry later
-- `phoenix init`, `phoenix add`, `phoenix build`, `phoenix test`
-- **Depends on:** Module system and visibility (2.6) — cross-package imports require intra-project modules
+**Status: scoped, not started.** This is the active item on the tooling track. **Depends on:** Module system and visibility (2.6, complete) — cross-package imports build on intra-project modules. Independent of all Phase 4 work (see [Parallel-track note](#31-parallel-track-note) below).
+
+### Goal
+
+A `phoenix.toml`-driven package manager: declare a package and its dependencies, resolve them (semver), fetch git-based dependencies into a cache, pin them in a lockfile, and let `import` reach across package boundaries. Make `phoenix build` / `run` / `check` dependency-aware so a multi-package project builds from a clean checkout.
+
+### Current state (what exists today)
+
+- `crates/phoenix-driver/src/config.rs` — `PhoenixConfig` parses `phoenix.toml` with **only** a `[gen]` section (`#[serde(deny_unknown_fields)]`); `find_and_load(start_dir)` walks up the tree for the manifest. TOML plumbing (`toml` 0.8), `serde`, and a tempdir CLI test pattern (`crates/phoenix-driver/tests/`) already exist.
+- `crates/phoenix-modules/src/lib.rs` — `resolve()` / `resolve_with_overlay()` compute the project root as the entry file's parent dir; `resolve_module_path(root, root_canon, target, span)` maps `a.b.c` → `<root>/a/b/c.phx` or `…/c/mod.phx`; `ensure_under_root()` enforces the `EscapesRoot` safety check. **The cross-package seam is `resolve_module_path` + the import loop** (it currently knows only the single project root).
+- `crates/phoenix-driver/src/main.rs` — clap `Commands` enum dispatches to `lib.rs` handlers (`run_gen` pattern). **`phoenix build` already exists** (`src/build.rs`); `init`, `add`, and `test` do not.
+- Workspace `Cargo.toml` already has `serde` / `serde_json` / `toml` / `clap` / `tempfile`. **Newly added deps:** `semver` and a git client (`git2` or `gix`).
+
+### Design decisions to lock (record in design-decisions.md when implemented)
+
+- **Manifest schema.** `[package]` = `name`, `version` (semver), optional `description` / `authors` / `license`. `[dependencies]` accepts **git** (`dep = { git = "url", tag|rev|branch = "…" }`) and **local path** (`dep = { path = "../foo" }`) sources. Path deps are invaluable for local dev, monorepos, and testing the resolver itself. A bare-string semver value (`dep = "^1.2"`) is **reserved for the future registry** and, until then, is a clear "no registry configured" error rather than a silent failure.
+- **Resolution + lockfile.** Resolve transitively, solve semver with the `semver` crate, and write `phoenix.lock` pinning each dependency to a resolved commit SHA. A present lockfile is authoritative (reproducible builds); `--locked` fails if the manifest and lock disagree.
+- **Dependency cache.** Fetch into `$PHOENIX_HOME/cache` (default `~/.phoenix/cache`), keyed by URL + SHA; never inside the project tree.
+- **Package root + cross-package imports.** A dependency's root is the directory containing **its** `phoenix.toml`; its modules resolve under that root with the same rules (and the same `EscapesRoot` check) as a local project. An `import`'s **first path segment** is matched against declared dependency names first; a match resolves in that package's root, otherwise it's local. A local module colliding with a dependency name is an error, not silent precedence.
+- **Visibility across packages.** Only `public` declarations are importable across a package boundary (the 2.6 rule, now enforced at the package edge too).
+
+### Scope boundaries (carved out, with forward pointers)
+
+- **`phoenix test` is NOT in 3.1.** It belongs to the test framework ([Phase 4.9](./phase-4.md#49-test-framework)), which depends on annotations/async/HTTP/db. 3.1 ships `init` and `add`; `build`/`run`/`check` become dependency-aware. (The earlier `phoenix.toml (name, version, dependencies)` bullet listing `phoenix test` was aspirational; this supersedes it.)
+- **Registry + `phoenix publish` are deferred.** 3.1 is git-first; a central registry, search, and publishing ride a later phase (see [Phase 6.2](./phase-6.md)).
+- **The npm / `js-dependencies` slice is a carved-out follow-up, not a 3.1 close gate.** Phase 2.5 decision J deferred `import js "pkg"` string-source imports + `[js-dependencies]` to "Phase 3.1," but that slice (npm fetch, typings, bundling) is orthogonal to the Phoenix-package core and far larger. It rides a dedicated **3.1-js** follow-up once the core package manager works; the core close criteria below do not depend on it. The `extern js` import-section machinery (Phase 2.5) is the seam it will extend.
+
+### PR sequence
+
+1. **Manifest.** Extend `PhoenixConfig` with `[package]` + `[dependencies]` (keep `deny_unknown_fields`; `[gen]` keeps working). Unit tests for parse/validation; update `phoenix.toml.example`.
+2. **Resolver semver core.** Pull in `semver`; model the dependency graph + constraint solving + conflict diagnostics (no fetching yet — operate over a test-injected set of manifests).
+3. **Dependency fetch + lockfile.** Git sources clone into the cache (`git2`/`gix`); local `path` sources resolve in place (no fetch, not SHA-pinned); transitive resolution; write/read `phoenix.lock`; `--locked`.
+4. **Cross-package imports.** Thread a `dependency_roots: HashMap<String, PathBuf>` through `resolve_module_path`; first-segment dispatch; per-package `EscapesRoot`; collision + missing-dependency diagnostics. Make `build`/`run`/`check` resolve+fetch before compiling.
+5. **CLI.** `phoenix init [--name]` scaffolds `phoenix.toml` + an entry `.phx`; `phoenix add <name> (--git <url> [--tag|--rev|--branch] | --path <dir>)` edits the manifest and refreshes the lockfile. Tempdir + local-git-repo integration tests.
+6. **Close.** Exit criteria below; design-decisions.md writeup; known-issues entries for the carve-outs.
+
+### Exit criteria for declaring Phase 3.1 complete
+
+- [ ] `[package]` + `[dependencies]` parse from `phoenix.toml`; `[gen]` still parses; malformed manifests give clear diagnostics. Unit tests cover the schema.
+- [ ] Semver resolution solves a transitive graph and reports conflicts legibly; covered by tests over injected manifests.
+- [ ] Git dependencies fetch into the cache and local `path` dependencies resolve in place; `phoenix.lock` is generated, respected, and makes git-backed builds reproducible from a clean checkout; `--locked` detects drift.
+- [ ] `import dep.module { ... }` resolves to the fetched package (public-only), with per-package `EscapesRoot` preserved and collision/missing-dep diagnostics. Multi-package integration fixture builds and runs.
+- [ ] `phoenix build` / `run` / `check` resolve + fetch dependencies first; `phoenix init` and `phoenix add` work, with tempdir + local-git-repo integration tests.
+- [ ] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
+- [ ] `phoenix.toml.example` updated; design-decisions.md records the locked decisions; known-issues opened for the registry and npm/js carve-outs.
+
+### 3.1 Parallel-track note
+
+3.1 lives entirely in **`phoenix-driver`** (config, CLI, a new resolver/lockfile module or a `phoenix-package` crate) and **`phoenix-modules`** (the resolver seam), plus new workspace deps. It does **not** touch the lexer, parser, sema, IR, runtime, or codegen — so it is disjoint from [Phase 4.6](./phase-4.md#46-json-and-serialization) and any other stdlib work. The only files both tracks might touch are the workspace `Cargo.toml` `[workspace.dependencies]` table (each appends distinct entries), `tests/fixtures/` (additive new files), and the docs (different sections). Rebase those few touch-points frequently; everything else is in separate crates.
 
 ## 3.2 Language Server Protocol (LSP)
 

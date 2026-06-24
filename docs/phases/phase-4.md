@@ -656,13 +656,67 @@ Database-hint annotations (`@primary`, `@unique`, `@index`) may also be recogniz
 
 ## 4.6 JSON and Serialization
 
-- Every type auto-serializes (compiler-generated, zero boilerplate)
-- `json.encode(value) -> String`
-- `json.decode<T>(String) -> Result<T, JsonError>`
-- Custom serialization names/formats via annotations (4.5)
-- Binary serialization format for high-performance internal communication
+**Status: scoped, not started.** First consumer of the [Annotation system (4.5)](#45-annotation-system), which has landed. **Depends on:** Annotations (4.5, complete) for `@jsonName`/`@skip`; generic monomorphization (2.2, complete). Independent of all Phase 3 work (see [Parallel-track note](#46-parallel-track-note) below).
 
-## 4.7 Database Access (Compile-Time Typed Queries)
+### Goal
+
+Compiler-generated JSON serialization for the language's own types, zero boilerplate:
+
+- `json.encode(value) -> String`
+- `json.decode<T>(text) -> Result<T, JsonError>`
+- `@jsonName("wire_key")` / `@skip` field annotations honored in both directions.
+
+It must behave identically across all five backends (AST interp, IR interp, native, `wasm32-linear`, `wasm32-gc`), like every other language feature.
+
+### Core architecture decision — compile-time per-type synthesis, not runtime reflection
+
+The runtime carries **no field-level reflection**: a compiled struct/enum is an opaque payload behind an 8-byte GC header with only a coarse type tag (`Struct`/`Enum`/…), and `print`/`toString` render user structs opaquely. So serialization **cannot** be one generic runtime routine over type tags. Instead:
+
+- **Per type, synthesize encoder/decoder IR** in the **lowering pass** (`crates/phoenix-ir/src/lower_decl.rs`), which is the one stage that sees both the resolved type info **and** the AST (where 4.5 stores `FieldDecl::annotations` — they are deliberately *not* on resolved `StructInfo`/`FieldInfo`). Because the synthesized routines are ordinary IR, all five backends execute them uniformly with no per-backend duplication.
+- **`json.encode`** lowers to a generic `Op::BuiltinCall` that dispatches to the synthesized encoder for the argument's static type, building a JSON string via low-level scalar/escape primitives.
+- **`json.decode<T>`** is monomorphized per concrete `T` (reusing the existing user-generic monomorphizer, which already keys on concrete type args). It calls a runtime **parse-to-DOM** primitive, then the synthesized per-`T` validator walks the opaque JSON DOM via navigation builtins and builds a typed value or a `JsonError`.
+- **Heavy lifting stays in Rust, shared:** the DOM parser is `serde_json` (already a workspace dep; MIT/Apache, linked not vendored) exposed through `phoenix-runtime` C-ABI (native/wasm) and called directly by the interpreters. Per-type *logic* stays in IR; only generic parsing/escaping is native.
+
+### Design decisions to lock (record in design-decisions.md when implemented)
+
+- **`json.decode<T>` resolves its target type by inference, with an explicit call-site type argument as a fallback.** Inference is the default — `T` flows from the binding/return through `?`/`Result` (`let u: User = json.decode(s)?`); an explicit `json.decode<User>(s)` overrides it for ambiguous spots. `CallExpr` gains a `type_args` field (parser → sema → IR → monomorphizer) for the explicit form, mirroring `MethodCallExpr`; the inferred path feeds the same monomorphization key.
+- **`JsonError`** is a pre-registered builtin enum (like `Option`/`Result`): minimally `ParseError(String)`, `TypeMismatch(String)`, `MissingField(String)`. Decode never panics on bad input — it returns `Err`.
+- **Wire encodings** (lock and document; revisit for consistency when built-in serialization 5.1 generalizes this):
+  - Scalars: `Int`/`Float` as JSON numbers, `Bool` as `true`/`false`, `String` as a JSON string (escaped).
+  - `Option<T>`: `None` → `null`, `Some(x)` → `encode(x)` (nullable, overriding the generic enum rule).
+  - Struct: JSON object keyed by field name (or `@jsonName`).
+  - Enum: **adjacently tagged** — always an object with a discriminator: unit variant → `{ "type": "Variant" }`; variant with fields → `{ "type": "Variant", "value": [field0, …] }`. (`Result` is just an enum.)
+  - `List<T>` → array. `Map<String, V>` → JSON object; **non-`String`-key maps → an array of `[key, value]` pairs** — lossless and round-trippable for any key type (decode knows `K` statically), and never excludes arbitrary-key maps.
+- **Annotations:** `@jsonName("k")` renames the wire key (encode + decode); `@skip` omits the field from encode and, on decode, supplies no value — so **`@skip` is only valid on `Option<T>` fields** (decode → `None`), an error otherwise (the language has no field defaults yet). The 4.5 sema registry already validates `@jsonName`/`@skip` on field targets; 4.6 adds the `@skip`-must-be-`Option` rule and consumes them during synthesis.
+
+### Scope boundaries (carved out, with forward pointers)
+
+- **Binary serialization format ships as an immediate follow-up — 4.6.2 — not in this slice.** 4.6 completes JSON encode/decode end-to-end first; the binary format reuses the same per-type synthesis machinery and lands right after.
+- **Built-in `derive`-free universal serialization (5.1) is the generalization, not 4.6.** 4.6 is the concrete JSON instance; [Phase 5.1](./phase-5.md) lifts the machinery to a format-agnostic, every-type guarantee.
+- **`@jsonName` on enum variants, custom/streaming formats, and `DateTime`/`Uuid`/`Decimal`/`Money`/`Url`/`Bytes`** (Phoenix Gen schema types, not language runtime types) are out of scope — open known-issues for the ones that surface.
+
+### PR sequence
+
+1. **`JsonError` + annotation rule.** Pre-register `JsonError`; add the `@skip`-must-be-`Option` sema rule. Front-end only; no codegen.
+2. **Decode type resolution.** Add `CallExpr::type_args` (parser → sema → IR → monomorphizer) for the explicit `json.decode<T>(s)` form, **and** contextual inference of `T` from the binding/return so the bare `json.decode(s)` works as the default. Both feed the same monomorphization key. Tested independently.
+3. **Encode.** Scalar/escape primitives in `phoenix-runtime` + interpreter equivalents; synthesize per-type encoder IR in lowering; `json.encode` dispatch. Cover scalars/struct/enum/`Option`/`List`/`Map<String,_>`/nested, byte-identical on all five backends.
+4. **Decode.** `serde_json`-backed parse-to-DOM primitive + DOM navigation builtins; synthesize per-`T` decoder IR producing `Result<T, JsonError>`; `json.decode<T>` dispatch. Malformed input → `Err`. All five backends.
+5. **Annotations end-to-end.** `@jsonName`/`@skip` honored in both directions; round-trip (encode∘decode == identity) fixtures.
+6. **Close.** Five-backend `json_*.phx` matrix; phase-close writeup; design-decisions.md records the synthesis-strategy / type-arg / encoding decisions; known-issues for carve-outs.
+
+### Exit criteria for declaring Phase 4.6 complete
+
+- [ ] `JsonError` pre-registered; `@skip`-on-non-`Option` is a sema error; `@jsonName`/`@skip` validated on field targets (4.5) and consumed by 4.6.
+- [ ] `json.decode` resolves `T` by inference by default and via an explicit `json.decode<T>(s)` argument when given; both paths covered by regression tests.
+- [ ] `json.encode` covers scalars / struct / enum (adjacently tagged) / `Option` (null) / `List` / `Map` (string-keyed → object, other keys → `[k,v]` pairs) / nested, **byte-identical across all five backends** (per-fixture matrix tests).
+- [ ] `json.decode<T>` round-trips those types, returns `Result<T, JsonError>`, and turns malformed input into `Err` (never a panic/trap) on all five backends.
+- [ ] `@jsonName` renames wire keys and `@skip` omits fields in both directions; encode∘decode identity fixtures pass five-backend.
+- [ ] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI wasm (`PHOENIX_REQUIRE_WASMTIME=1`) and node gates green.
+- [ ] design-decisions.md records the locked decisions; known-issues opened for the binary-format, non-`String`-key-`Map`, and Gen-scalar carve-outs.
+
+### 4.6 Parallel-track note
+
+4.6 spans the compiler spine and runtime: **`phoenix-parser`** (`CallExpr::type_args`), **`phoenix-sema`** (`json.*` builtins, type args, `JsonError`, `@skip` rule), **`phoenix-ir`** (per-type synthesis in lowering, monomorphizer, JSON builtins/ops), **`phoenix-runtime`** (scalar/escape/parse primitives + `serde_json`), **`phoenix-cranelift`** (native + both wasm builtin lowering), and both interpreters. It does **not** touch `phoenix-driver` config/CLI or the `phoenix-modules` resolver — so it is disjoint from [Phase 3.1](./phase-3.md#31-package-manager). The only files both tracks might touch are the workspace `Cargo.toml` `[workspace.dependencies]` table (`serde_json` is already present; 4.6 likely adds nothing, 3.1 adds `semver`/git — distinct lines), `tests/fixtures/` (additive new files), and the docs (different sections). Note the one *intra*-track ordering inside 4.6: PR 2 changes the grammar (`CallExpr::type_args`), so it should land before the formatter (3.3) is built over the grammar — but 3.3 is not in flight, so there's no live conflict.
 
 Phoenix validates SQL queries against an explicit schema declaration at compile time. The compiler checks column names, column types, table relationships, and infers the result type from the query's SELECT clause — no manual struct mapping, no runtime type mismatches.
 
