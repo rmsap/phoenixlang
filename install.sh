@@ -46,6 +46,15 @@ cp "$TMP/phoenix" "$INSTALL_DIR/phoenix"
 cp "$TMP/phoenix-lsp" "$INSTALL_DIR/phoenix-lsp"
 chmod +x "$INSTALL_DIR/phoenix" "$INSTALL_DIR/phoenix-lsp"
 
+# Standalone `phoenix-gen` (codegen-only entry point; same implementation as
+# `phoenix gen`). Guarded so installing against an older release that predates
+# it still succeeds.
+if [ -f "$TMP/phoenix-gen" ]; then
+    cp "$TMP/phoenix-gen" "$INSTALL_DIR/phoenix-gen"
+    chmod +x "$INSTALL_DIR/phoenix-gen"
+    GEN_INSTALLED=true
+fi
+
 # Install runtime library (needed by `phoenix build`)
 LIB_DIR="$(dirname "$INSTALL_DIR")/lib"
 mkdir -p "$LIB_DIR"
@@ -65,7 +74,11 @@ fi
 # Clean up
 rm -rf "$TMP"
 
-echo "Installed phoenix and phoenix-lsp to $INSTALL_DIR"
+if [ "$GEN_INSTALLED" = true ]; then
+    echo "Installed phoenix, phoenix-lsp, and phoenix-gen to $INSTALL_DIR"
+else
+    echo "Installed phoenix and phoenix-lsp to $INSTALL_DIR"
+fi
 if [ "$RUNTIME_INSTALLED" = true ]; then
     echo "Installed libphoenix_runtime.a to $LIB_DIR"
 else

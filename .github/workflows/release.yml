@@ -106,6 +106,7 @@ jobs:
           mkdir -p dist dist/lib
           cp target/${{ matrix.target }}/release/phoenix dist/
           cp target/${{ matrix.target }}/release/phoenix-lsp dist/
+          cp target/${{ matrix.target }}/release/phoenix-gen dist/
           cp target/${{ matrix.target }}/release/libphoenix_runtime.a dist/lib/
           cp target/wasm32-wasip1/release/phoenix_runtime.wasm dist/lib/
           tar czf phoenix-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist .
@@ -118,6 +119,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/lib
           Copy-Item target/${{ matrix.target }}/release/phoenix.exe dist/
           Copy-Item target/${{ matrix.target }}/release/phoenix-lsp.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/phoenix-gen.exe dist/
           Copy-Item target/${{ matrix.target }}/release/phoenix_runtime.lib dist/lib/
           Copy-Item target/wasm32-wasip1/release/phoenix_runtime.wasm dist/lib/
           Compress-Archive -Path dist/* -DestinationPath phoenix-${{ github.ref_name }}-${{ matrix.target }}.zip

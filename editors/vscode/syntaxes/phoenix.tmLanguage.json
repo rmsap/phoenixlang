@@ -117,8 +117,16 @@
           "match": "\\b(function|struct|enum|trait|impl|type)\\b"
         },
         {
+          "name": "storage.modifier.phoenix",
+          "match": "\\b(public|dyn|extern)\\b"
+        },
+        {
           "name": "keyword.control.phoenix",
-          "match": "\\b(if|else|while|for|in|match|return|break|continue)\\b"
+          "match": "\\b(if|else|while|for|in|match|return|break|continue|defer)\\b"
+        },
+        {
+          "name": "keyword.control.import.phoenix",
+          "match": "\\b(import|as)\\b"
         },
         {
           "name": "keyword.declaration.phoenix",
@@ -126,7 +134,7 @@
         },
         {
           "name": "keyword.other.endpoint.phoenix",
-          "match": "\\b(endpoint|body|response|error|omit|pick|partial|query|where|schema)\\b"
+          "match": "\\b(endpoint|body|response|error|omit|pick|partial|query|headers|pagination|where|schema|api)\\b"
         },
         {
           "name": "keyword.other.http-method.phoenix",
@@ -138,11 +146,11 @@
       "patterns": [
         {
           "name": "support.type.primitive.phoenix",
-          "match": "\\b(Int|Float|String|Bool|Void)\\b"
+          "match": "\\b(Int|Float|String|Bool|Void|File|DateTime|Uuid|Decimal|Money|Url|Bytes|JsValue)\\b"
         },
         {
           "name": "support.type.generic.phoenix",
-          "match": "\\b(List|Map|Option|Result)\\b"
+          "match": "\\b(List|Map|Option|Result|ListBuilder|MapBuilder)\\b"
         },
         {
           "comment": "PascalCase type names (user-defined structs, enums, traits)",
