@@ -867,6 +867,7 @@ mod tests {
             methods: vec![],
             trait_impls: vec![],
             doc_comment: None,
+            annotations: vec![],
             visibility: Visibility::Private,
             span: Span::BUILTIN,
         };

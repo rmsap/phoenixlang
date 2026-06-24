@@ -3,6 +3,7 @@
 //! Pre-registers built-in types, user-declared types, functions, traits,
 //! and impl blocks so that the checking pass can resolve references.
 
+use crate::check_annotations::AnnotationTarget;
 use crate::checker::{
     Checker, EnumInfo, FunctionInfo, MethodInfo, StructInfo, TraitInfo, TraitMethodInfo,
     TypeAliasInfo,
@@ -228,6 +229,7 @@ impl Checker {
             // reads identically whichever declaration comes first.
             self.error(format!("`{}` is already defined", func.name), func.span);
         }
+        self.validate_annotations(&func.annotations, AnnotationTarget::Function);
         let (params, param_names, default_param_exprs, return_type) =
             self.with_type_params(&func.type_params, None, |this| {
                 let non_self_params: Vec<&Param> =
@@ -492,9 +494,18 @@ impl Checker {
         if self.is_within_module_duplicate(existing, s.name_span) {
             self.error(format!("struct `{}` is already defined", s.name), s.span);
             self.consume_orphan_inline_methods(&s.name, &s.methods, &s.trait_impls, s.span);
+            // A within-module duplicate is dropped, so its annotations are not
+            // validated — consistent with the function-vs-function duplicate
+            // path, which also bails before `validate_annotations`. The error is
+            // already reported; piling annotation diagnostics onto a discarded
+            // declaration would be noise.
             return;
         }
         self.check_codegen_safe_field_names(&s.fields);
+        self.validate_annotations(&s.annotations, AnnotationTarget::Struct);
+        for f in &s.fields {
+            self.validate_annotations(&f.annotations, AnnotationTarget::Field);
+        }
         let fields: Vec<crate::checker::FieldInfo> =
             self.with_type_params(&s.type_params, None, |this| {
                 s.fields
@@ -652,8 +663,12 @@ impl Checker {
         if self.is_within_module_duplicate(existing, e.name_span) {
             self.error(format!("enum `{}` is already defined", e.name), e.span);
             self.consume_orphan_inline_methods(&e.name, &e.methods, &e.trait_impls, e.span);
+            // Duplicate dropped; annotations are left unvalidated, mirroring the
+            // struct and function-vs-function duplicate paths (see
+            // `register_struct`).
             return;
         }
+        self.validate_annotations(&e.annotations, AnnotationTarget::Enum);
         let variants: Vec<(String, Vec<Type>)> =
             self.with_type_params(&e.type_params, None, |this| {
                 e.variants

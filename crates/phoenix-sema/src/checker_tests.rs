@@ -5187,3 +5187,71 @@ fn extern_js_unresolved_param_type_reports_one_error() {
         analysis.diagnostics
     );
 }
+
+// ── Annotation validation tests ──────────────────────────
+
+use phoenix_common::diagnostics::Severity;
+
+/// Valid built-in annotations on their correct targets produce no diagnostics.
+#[test]
+fn valid_annotations_produce_no_diagnostics() {
+    assert_no_errors(
+        "@jsonSerializable\nstruct User {\n  @jsonName(\"user_name\")\n  name: String\n  @skip\n  cached: String\n}",
+    );
+}
+
+/// An unrecognized annotation is a warning (ignored), not an error.
+#[test]
+fn unknown_annotation_warns() {
+    let diags = check_source("@mysteryMeat\nstruct User { name: String }");
+    let warning = diags
+        .iter()
+        .find(|d| d.message.contains("unknown annotation `@mysteryMeat`"))
+        .unwrap_or_else(|| panic!("expected unknown-annotation warning, got: {diags:?}"));
+    assert_eq!(warning.severity, Severity::Warning);
+}
+
+/// A field-only annotation on a struct is an error naming the right target.
+#[test]
+fn jsonname_on_struct_is_error() {
+    assert_has_error(
+        "@jsonName(\"x\")\nstruct User { name: String }",
+        "`@jsonName` can only be applied to a struct field",
+    );
+}
+
+/// A marker annotation given arguments is an error.
+#[test]
+fn skip_with_args_is_error() {
+    assert_has_error(
+        "struct User {\n  @skip(\"oops\")\n  name: String\n}",
+        "`@skip` does not take any arguments",
+    );
+}
+
+/// `@jsonName` without its required string argument is an error.
+#[test]
+fn jsonname_without_arg_is_error() {
+    assert_has_error(
+        "struct User {\n  @jsonName\n  name: String\n}",
+        "`@jsonName` expects a single string argument",
+    );
+}
+
+/// A struct-only annotation on an enum is an error naming the right target.
+#[test]
+fn json_serializable_on_enum_is_error() {
+    assert_has_error(
+        "@jsonSerializable\nenum Color {\n  Red\n  Green\n}",
+        "`@jsonSerializable` can only be applied to a struct, not an enum",
+    );
+}
+
+/// A repeated annotation name on one declaration is an error.
+#[test]
+fn duplicate_annotation_is_error() {
+    assert_has_error(
+        "struct User {\n  @jsonName(\"a\")\n  @jsonName(\"b\")\n  name: String\n}",
+        "duplicate annotation `@jsonName`",
+    );
+}

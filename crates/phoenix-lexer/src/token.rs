@@ -254,6 +254,12 @@ pub enum TokenKind {
     RBracket,
 
     // ── Special ──────────────────────────────────────────────
+    /// The `@` sigil, introducing an annotation (`@name` or `@name(args)`).
+    ///
+    /// Annotations attach compile-time metadata to declarations and fields
+    /// (e.g. `@jsonName("user_name")`, `@skip`). See
+    /// `docs/phases/phase-4.md#45-annotation-system`.
+    At,
     /// A doc comment `/** ... */`. The token text contains the inner content
     /// (stripped of the `/**` and `*/` delimiters).
     DocComment,

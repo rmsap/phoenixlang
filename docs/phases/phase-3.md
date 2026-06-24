@@ -2,13 +2,15 @@
 
 **Status: Not started**
 
-Developers will not adopt a language without good tooling. Tooling and the stdlib are interleaved, not strictly sequenced. The keystone is [Annotations (4.5)](./phase-4.md#45-annotation-system) — small, with no dependencies — which unblocks JSON serialization, config loading, database hints, and the test framework. Most of phase 3 (package manager, LSP gap-closing, formatter) is independent of phase 4 and can land in parallel with stdlib work.
+Developers will not adopt a language without good tooling. Phase 3 (tooling) and [Phase 4](./phase-4.md) (the standard library) are **independent tracks that run in parallel** — nothing in Phase 3 depends on Phase 4. Every Phase 3 item rests only on foundations that already shipped in Phase 2: the package manager (3.1) on the module system (2.6), the LSP gap-closing (3.2) on the 2.6 LSP pipeline, the formatter (3.3) on the parser, and error-message quality (3.5) on the 2.6 diagnostic builder.
+
+Annotations ([4.5](./phase-4.md#45-annotation-system)) are the keystone for the **stdlib** track, not for tooling — they unblock JSON serialization, config loading, database hints, and the test framework, so 4.5 is the first item on the Phase 4 track. The only cross-track touch-point is the formatter (3.3), which will need to format `@annotation` syntax once 4.5 lands (see 3.3).
 
 ## Recommended order
 
-- **First:** [4.5 Annotations](./phase-4.md#45-annotation-system) — keystone for the rest of the stdlib.
-- **In parallel after 4.5:** 3.1 Package Manager, 3.2 LSP gap-closing, 3.3 Formatter, plus 4.1 / 4.3 / 4.6 on the stdlib side.
+- **In parallel from the start:** 3.1 Package Manager, 3.2 LSP gap-closing, 3.3 Formatter — all independent of each other and of Phase 4. The shared constraint is intra-Phase-3, not cross-phase: the formatter and LSP both consume whatever grammar the parser produces, so any new language surface (e.g. 4.5 annotations) lands before, or is followed up in, those tools.
 - **Continuous:** 3.5 Error Message quality — the diagnostic-builder foundation already landed in 2.6, so this is an ongoing investment that improves with every release rather than a discrete milestone.
+- **On the stdlib track (Phase 4):** 4.5 Annotations goes first; see [Phase 4](./phase-4.md#recommended-order).
 
 ## 3.1 Package Manager
 
@@ -64,6 +66,7 @@ The [diagnostic builder](../design-decisions.md#diagnostic-builder-pattern) (lan
 - `phoenix fmt` — opinionated code formatter
 - One canonical style (no configuration bikeshedding)
 - Format-on-save in the LSP
+- **Grammar dependency:** the formatter prints every AST node, so it must keep pace with new language surface. In particular, when [Annotations (4.5)](./phase-4.md#45-annotation-system) land on the stdlib track, the formatter must format `@name` / `@name(args)` on declarations and fields (one canonical placement — typically each annotation on its own line above the declaration). If the formatter ships before 4.5, annotation formatting is a small follow-up; if 4.5 ships first, the formatter handles it from day one.
 
 ## 3.4 Test Framework — moved to 4.9
 

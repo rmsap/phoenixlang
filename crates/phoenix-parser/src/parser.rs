@@ -1,10 +1,10 @@
 use crate::api_version::validate_api_version;
 use crate::ast::{
-    Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant, EnumDecl, EnumVariant,
-    ExternFnSig, ExternJsBlock, FieldDecl, FunctionDecl, HeaderParam, HttpMethod, ImplBlock,
-    ImportDecl, ImportItem, ImportItems, InlineTraitImpl, NamedType, PaginationMode, Param,
-    Program, QueryParam, ResponseStatus, SchemaDecl, SchemaTable, StructDecl, TraitDecl,
-    TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
+    Annotation, AnnotationArg, Block, Declaration, DerivedType, EndpointDecl, EndpointErrorVariant,
+    EnumDecl, EnumVariant, ExternFnSig, ExternJsBlock, FieldDecl, FunctionDecl, HeaderParam,
+    HttpMethod, ImplBlock, ImportDecl, ImportItem, ImportItems, InlineTraitImpl, NamedType,
+    PaginationMode, Param, Program, QueryParam, ResponseStatus, SchemaDecl, SchemaTable,
+    StructDecl, TraitDecl, TraitMethodSig, TypeAliasDecl, TypeExpr, TypeModifier, Visibility,
 };
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::span::{SourceId, Span};
@@ -72,6 +72,7 @@ fn token_kind_display(kind: &TokenKind) -> &'static str {
         TokenKind::Patch => "'PATCH'",
         TokenKind::Delete => "'DELETE'",
         TokenKind::DocComment => "doc comment",
+        TokenKind::At => "'@'",
         TokenKind::IntType => "Int",
         TokenKind::FloatType => "Float",
         TokenKind::StringType => "String",
@@ -381,6 +382,11 @@ impl<'src> Parser<'src> {
         // Consume a doc comment if present — it attaches to the next declaration.
         let doc_comment = self.try_consume_doc_comment();
 
+        // Consume leading annotations (`@name` / `@name(args)`). They attach to
+        // the declaration kinds that carry an `annotations` field (function,
+        // struct, enum); other kinds reject them below.
+        let annotations = self.parse_annotations();
+
         // Consume optional `public` visibility modifier. Capture its span
         // before advancing so we can emit a precise diagnostic if `public`
         // precedes a non-public-able decl (e.g. `impl`, `import`).
@@ -398,33 +404,46 @@ impl<'src> Parser<'src> {
         };
 
         match self.peek().kind {
-            TokenKind::Function => self
-                .parse_function_decl(visibility)
-                .map(Declaration::Function),
+            TokenKind::Function => self.parse_function_decl(visibility).map(|mut f| {
+                f.annotations = annotations;
+                Declaration::Function(f)
+            }),
             TokenKind::Struct => self
                 .parse_struct_decl(doc_comment, visibility)
-                .map(Declaration::Struct),
-            TokenKind::Enum => self
-                .parse_enum_decl(doc_comment, visibility)
-                .map(Declaration::Enum),
+                .map(|mut s| {
+                    s.annotations = annotations;
+                    Declaration::Struct(s)
+                }),
+            TokenKind::Enum => self.parse_enum_decl(doc_comment, visibility).map(|mut e| {
+                e.annotations = annotations;
+                Declaration::Enum(e)
+            }),
             TokenKind::Impl => {
                 self.reject_public_modifier(
                     public_span,
                     "`public` cannot precede `impl` — impl visibility is derived from the trait and the type",
                 );
+                self.reject_annotations(&annotations, "annotations cannot precede `impl`");
                 self.parse_impl_block().map(Declaration::Impl)
             }
-            TokenKind::Trait => self.parse_trait_decl(visibility).map(Declaration::Trait),
-            TokenKind::Type => self
-                .parse_type_alias_decl(visibility)
-                .map(Declaration::TypeAlias),
+            TokenKind::Trait => {
+                self.reject_annotations(&annotations, "annotations cannot precede `trait`");
+                self.parse_trait_decl(visibility).map(Declaration::Trait)
+            }
+            TokenKind::Type => {
+                self.reject_annotations(&annotations, "annotations cannot precede `type`");
+                self.parse_type_alias_decl(visibility)
+                    .map(Declaration::TypeAlias)
+            }
             TokenKind::Endpoint => {
                 self.reject_public_modifier(public_span, "`public` cannot precede `endpoint`");
+                self.reject_annotations(&annotations, "annotations cannot precede `endpoint`");
                 self.parse_endpoint_decl(doc_comment)
                     .map(Declaration::Endpoint)
             }
             TokenKind::Schema => {
                 self.reject_public_modifier(public_span, "`public` cannot precede `schema`");
+                self.reject_annotations(&annotations, "annotations cannot precede `schema`");
                 self.parse_schema_decl().map(Declaration::Schema)
             }
             TokenKind::Import => {
@@ -432,12 +451,17 @@ impl<'src> Parser<'src> {
                     public_span,
                     "`import` declarations cannot be marked `public`",
                 );
+                self.reject_annotations(&annotations, "annotations cannot precede `import`");
                 self.parse_import_decl().map(Declaration::Import)
             }
             TokenKind::Extern => {
                 self.reject_public_modifier(
                     public_span,
                     "`extern js` blocks cannot be marked `public` — the declared functions are external, not Phoenix declarations",
+                );
+                self.reject_annotations(
+                    &annotations,
+                    "annotations cannot precede `extern js` blocks",
                 );
                 self.parse_extern_js_block().map(Declaration::ExternJs)
             }
@@ -454,6 +478,42 @@ impl<'src> Parser<'src> {
     fn reject_public_modifier(&mut self, public_span: Option<Span>, message: &'static str) {
         if let Some(span) = public_span {
             self.diagnostics.push(Diagnostic::error(message, span));
+        }
+    }
+
+    /// Emit a diagnostic at the first annotation's span if annotations preceded
+    /// a declaration kind that does not carry an `annotations` field. Called
+    /// from the declaration-kind arms that don't accept annotations.
+    fn reject_annotations(&mut self, annotations: &[Annotation], message: &'static str) {
+        if let Some(first) = annotations.first() {
+            self.diagnostics
+                .push(Diagnostic::error(message, first.span));
+        }
+    }
+
+    /// Emit a diagnostic if a doc comment or annotations were consumed before a
+    /// struct- or enum-body member that does not carry them (a method or an
+    /// inline `impl`). Phoenix attaches doc comments and annotations to fields
+    /// and to top-level declarations, not to members nested in a type body.
+    /// `member` names the offending construct ("a method"). The annotation span
+    /// is preferred; the doc-comment span is the fallback. The member itself is
+    /// still parsed by the caller, so only the misplaced metadata is dropped.
+    fn reject_member_metadata(
+        &mut self,
+        doc_span: Option<Span>,
+        annotations: &[Annotation],
+        member: &str,
+    ) {
+        if let Some(first) = annotations.first() {
+            self.diagnostics.push(Diagnostic::error(
+                format!("annotations cannot precede {member}"),
+                first.span,
+            ));
+        } else if let Some(span) = doc_span {
+            self.diagnostics.push(Diagnostic::error(
+                format!("a doc comment cannot precede {member}"),
+                span,
+            ));
         }
     }
 
@@ -723,6 +783,98 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Parses a run of leading annotations (`@name` or `@name(args)`).
+    ///
+    /// Newlines between consecutive annotations — and between the final
+    /// annotation and the declaration or field it precedes — are consumed, so
+    /// each annotation may sit on its own line. Returns an empty vector when
+    /// the cursor is not on an `@`. Argument lists accept literals and bare
+    /// identifiers; the semantic checker validates names, targets, and arities.
+    fn parse_annotations(&mut self) -> Vec<Annotation> {
+        let mut annotations = Vec::new();
+        while self.peek().kind == TokenKind::At {
+            let start = self.peek().span;
+            self.advance(); // consume `@`
+            let Some(name_tok) = self.expect_ident_or_contextual() else {
+                // `expect_ident_or_contextual` already recorded a diagnostic.
+                break;
+            };
+            let name = name_tok.text.clone();
+            let mut end = name_tok.span;
+            let mut args = Vec::new();
+            if self.peek().kind == TokenKind::LParen {
+                self.advance(); // consume `(`
+                self.skip_newlines();
+                args = self.parse_comma_separated(TokenKind::RParen, |p| p.parse_annotation_arg());
+                self.skip_newlines();
+                if let Some(rparen) = self.expect(TokenKind::RParen) {
+                    end = rparen.span;
+                }
+            }
+            annotations.push(Annotation {
+                name,
+                args,
+                span: start.merge(end),
+            });
+            self.skip_newlines();
+        }
+        annotations
+    }
+
+    /// Parses a single annotation argument: a string/int/float/bool literal or
+    /// a bare identifier. Records a diagnostic and returns `None` on anything
+    /// else, which ends the surrounding comma-separated list.
+    ///
+    /// A numeric literal may carry a leading `-` (e.g. `@range(-40, 120)`); the
+    /// sign lexes as a separate `Minus` operator token, so it is consumed here
+    /// and applied to the literal. A `-` before a non-numeric argument is an
+    /// error.
+    fn parse_annotation_arg(&mut self) -> Option<AnnotationArg> {
+        let negate = self.eat(TokenKind::Minus);
+        match self.peek().kind {
+            TokenKind::StringLiteral if !negate => {
+                let raw = self.advance().text.clone();
+                Some(AnnotationArg::String(strip_string_literal_quotes(&raw)))
+            }
+            TokenKind::IntLiteral => {
+                let tok_text = self.advance().text.clone();
+                match tok_text.parse::<i64>() {
+                    Ok(n) => Some(AnnotationArg::Int(if negate { -n } else { n })),
+                    Err(_) => {
+                        self.error_at_current(
+                            "integer literal is out of range for an annotation argument",
+                        );
+                        None
+                    }
+                }
+            }
+            TokenKind::FloatLiteral => {
+                let tok_text = self.advance().text.clone();
+                // A `FloatLiteral` lexeme always parses: an out-of-range
+                // magnitude yields infinity rather than an error, so the
+                // fallback below is unreachable in practice and exists only to
+                // avoid an `unwrap` on a token whose shape the lexer guarantees.
+                let n = tok_text.parse::<f64>().unwrap_or(f64::INFINITY);
+                Some(AnnotationArg::Float(if negate { -n } else { n }))
+            }
+            TokenKind::True if !negate => {
+                self.advance();
+                Some(AnnotationArg::Bool(true))
+            }
+            TokenKind::False if !negate => {
+                self.advance();
+                Some(AnnotationArg::Bool(false))
+            }
+            TokenKind::Ident if !negate => Some(AnnotationArg::Ident(self.advance().text.clone())),
+            _ => {
+                self.error_at_current(
+                    "expected an annotation argument (string, number, boolean, or identifier)",
+                );
+                None
+            }
+        }
+    }
+
     /// Parses a function declaration including optional type parameters, params, return type, and body.
     ///
     /// `visibility` is supplied by the caller — top-level declarations and
@@ -761,6 +913,9 @@ impl<'src> Parser<'src> {
             params,
             return_type,
             body,
+            // Top-level functions get their annotations attached by
+            // `parse_declaration`; inline methods carry none.
+            annotations: Vec::new(),
             visibility,
             span,
         })
@@ -1156,6 +1311,17 @@ impl<'src> Parser<'src> {
         let mut methods = Vec::new();
         let mut trait_impls = Vec::new();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            // Consume a leading doc comment and annotations up front. They
+            // attach to a *field*; a method or inline `impl` carries neither, so
+            // `reject_member_metadata` reports a targeted error (and the member
+            // still parses) when one of those follows instead. Consuming here
+            // also preserves the field ordering rule — doc first, then
+            // annotations: `@skip /** doc */ name` leaves the doc comment as the
+            // next token, which the field arm rejects as a misplaced field.
+            let doc_span = (self.peek().kind == TokenKind::DocComment).then(|| self.peek().span);
+            let field_doc = self.try_consume_doc_comment();
+            let field_annotations = self.parse_annotations();
+
             // Hoist `public` consumption when followed by `function` (public
             // method) or `impl` (rejected — inline trait impls have no
             // visibility of their own). For fields, the field branch below
@@ -1171,6 +1337,7 @@ impl<'src> Parser<'src> {
             };
 
             if self.peek().kind == TokenKind::Function {
+                self.reject_member_metadata(doc_span, &field_annotations, "a method");
                 let visibility = if public_span.is_some() {
                     Visibility::Public
                 } else {
@@ -1182,6 +1349,7 @@ impl<'src> Parser<'src> {
                     self.synchronize_stmt();
                 }
             } else if self.peek().kind == TokenKind::Impl {
+                self.reject_member_metadata(doc_span, &field_annotations, "an inline `impl`");
                 self.reject_public_modifier(
                     public_span,
                     "`public` cannot precede inline `impl` — trait-impl method visibility is fixed by the trait",
@@ -1192,11 +1360,11 @@ impl<'src> Parser<'src> {
                     self.synchronize_stmt();
                 }
             } else {
-                // Field: [doc_comment] [public] name ':' Type [where <constraint-expr>]
-                // — colon syntax, unified with params / let bindings / the
-                // endpoint DSL (see design-decisions §Field declarations,
-                // 2026-06-10).
-                let field_doc = self.try_consume_doc_comment();
+                // Field: [doc_comment] [annotations] [public] name ':' Type
+                // [where <constraint-expr>] — colon syntax, unified with params
+                // / let bindings / the endpoint DSL (see design-decisions
+                // §Field declarations, 2026-06-10). The doc comment and
+                // annotations were consumed at the top of the loop.
                 let fstart = self.peek().span;
                 let field_vis = if self.eat(TokenKind::Public) {
                     Visibility::Public
@@ -1225,6 +1393,7 @@ impl<'src> Parser<'src> {
                         name: name_tok.text.clone(),
                         constraint,
                         doc_comment: field_doc,
+                        annotations: field_annotations,
                         visibility: field_vis,
                         span,
                     });
@@ -1248,12 +1417,24 @@ impl<'src> Parser<'src> {
             methods,
             trait_impls,
             doc_comment,
+            // Attached by `parse_declaration`.
+            annotations: Vec::new(),
             visibility,
             span: start.merge(end),
         })
     }
 
-    /// Parses an enum declaration: `enum Name { Variant, Variant(Type), methods, impl blocks }`.
+    /// Parses an enum declaration. Variants, methods, and inline `impl` blocks
+    /// are newline-separated inside the braces (Phoenix does not use commas as
+    /// variant separators); a variant may carry a parenthesised payload:
+    ///
+    /// ```text
+    /// enum Shape {
+    ///   Circle(Float)
+    ///   Rectangle(Float, Float)
+    ///   function area(self) -> Float { ... }
+    /// }
+    /// ```
     ///
     /// The optional `doc_comment` parameter carries the text of a preceding
     /// `/** ... */` doc comment, if one was consumed by
@@ -1276,6 +1457,15 @@ impl<'src> Parser<'src> {
         let mut methods = Vec::new();
         let mut trait_impls = Vec::new();
         while self.peek().kind != TokenKind::RBrace && self.peek().kind != TokenKind::Eof {
+            // An enum carries doc comments and annotations on the declaration
+            // itself (written before `enum`), never on members inside the body:
+            // variants, methods, and inline `impl`s all reject them. Consume any
+            // leading doc comment / annotations here so the offending member can
+            // report a targeted error rather than a generic "expected Ident".
+            let doc_span = (self.peek().kind == TokenKind::DocComment).then(|| self.peek().span);
+            self.try_consume_doc_comment(); // dropped; only its presence (doc_span) matters
+            let member_annotations = self.parse_annotations();
+
             // Hoist `public` consumption when followed by `function` (public
             // method) or `impl` (rejected — inline trait impls have no
             // visibility of their own). Variants do not accept `public`.
@@ -1290,6 +1480,7 @@ impl<'src> Parser<'src> {
             };
 
             if self.peek().kind == TokenKind::Function {
+                self.reject_member_metadata(doc_span, &member_annotations, "a method");
                 let visibility = if public_span.is_some() {
                     Visibility::Public
                 } else {
@@ -1301,6 +1492,7 @@ impl<'src> Parser<'src> {
                     self.synchronize_stmt();
                 }
             } else if self.peek().kind == TokenKind::Impl {
+                self.reject_member_metadata(doc_span, &member_annotations, "an inline `impl`");
                 self.reject_public_modifier(
                     public_span,
                     "`public` cannot precede inline `impl` — trait-impl method visibility is fixed by the trait",
@@ -1312,6 +1504,7 @@ impl<'src> Parser<'src> {
                 }
             } else {
                 // Variant
+                self.reject_member_metadata(doc_span, &member_annotations, "an enum variant");
                 let vstart = self.peek().span;
                 if let Some(vname) = self.expect(TokenKind::Ident) {
                     let mut fields = Vec::new();
@@ -1327,6 +1520,17 @@ impl<'src> Parser<'src> {
                         fields,
                         span: vstart.merge(vend),
                     });
+                } else {
+                    // Guaranteed progress: a malformed variant (e.g. a stray
+                    // `,` between variants, which Phoenix does not use as a
+                    // separator) used to leave the cursor untouched, spinning
+                    // this loop forever — the same parser-hang class fixed for
+                    // struct fields on 2026-06-10. `expect` above already
+                    // recorded the diagnostic; skip the single offending token
+                    // (not `synchronize_stmt`, which would overshoot — a comma
+                    // suppresses the following newline, so the next variant sits
+                    // right after it) so the surviving variants still parse.
+                    self.advance();
                 }
             }
             self.skip_newlines();
@@ -1341,6 +1545,8 @@ impl<'src> Parser<'src> {
             methods,
             trait_impls,
             doc_comment,
+            // Attached by `parse_declaration`.
+            annotations: Vec::new(),
             visibility,
             span: start.merge(end),
         })
@@ -3262,6 +3468,48 @@ mod tests {
         }
     }
 
+    /// A comma between enum variants is not Phoenix syntax. The parser must
+    /// reject it with a diagnostic and still terminate — a malformed variant
+    /// once spun the variant loop forever (parser-hang class, see the variant
+    /// arm of `parse_enum_decl`). This test would hang on a regression. The
+    /// stray comma is skipped, so the surviving variants still parse.
+    #[test]
+    fn parse_enum_comma_separated_variants_is_rejected_and_terminates() {
+        let source = "enum Color { Red, Green }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for comma-separated enum variants"
+        );
+        match &program.declarations[0] {
+            Declaration::Enum(e) => {
+                let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, vec!["Red", "Green"]);
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    /// The multi-line spelling of the same malformed input must behave
+    /// identically — a comma suppresses the following newline, so both cases
+    /// reduce to the same token stream and recover the same way.
+    #[test]
+    fn parse_enum_trailing_comma_recovers_following_variant() {
+        let source = "enum Color {\n  Red,\n  Green\n}";
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for the stray comma"
+        );
+        match &program.declarations[0] {
+            Declaration::Enum(e) => {
+                let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, vec!["Red", "Green"]);
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
     #[test]
     fn parse_impl_block() {
         let source = r#"impl Point { function display(self) -> String { return "hi" } }"#;
@@ -4559,6 +4807,284 @@ mod tests {
             }
             other => panic!("expected Enum, got {:?}", other),
         }
+    }
+
+    // ── Annotation attachment tests ──────────────────────────────────
+
+    #[test]
+    fn parse_marker_annotation_on_struct() {
+        let source = "@jsonSerializable\nstruct User { name: String }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                assert_eq!(s.annotations.len(), 1);
+                assert_eq!(s.annotations[0].name, "jsonSerializable");
+                assert!(s.annotations[0].args.is_empty());
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_annotation_with_string_arg_on_field() {
+        let source = "struct User {\n  @jsonName(\"user_name\")\n  name: String\n}";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                let field = &s.fields[0];
+                assert_eq!(field.name, "name");
+                assert_eq!(field.annotations.len(), 1);
+                assert_eq!(field.annotations[0].name, "jsonName");
+                assert_eq!(
+                    field.annotations[0].args,
+                    vec![AnnotationArg::String("user_name".to_string())]
+                );
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_annotations_and_doc_on_field() {
+        let source = "struct User {\n  /** the name */\n  @skip\n  @jsonName(\"n\")\n  public name: String\n}";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Struct(s) => {
+                let field = &s.fields[0];
+                assert!(field.doc_comment.is_some());
+                assert_eq!(field.visibility, Visibility::Public);
+                let names: Vec<&str> = field.annotations.iter().map(|a| a.name.as_str()).collect();
+                assert_eq!(names, vec!["skip", "jsonName"]);
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_annotation_on_function() {
+        let source = "@test\nfunction testThing() { }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(f.annotations.len(), 1);
+                assert_eq!(f.annotations[0].name, "test");
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_annotation_multiple_arg_kinds() {
+        let source = "@every(15, true, info)\nfunction job() { }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(
+                    f.annotations[0].args,
+                    vec![
+                        AnnotationArg::Int(15),
+                        AnnotationArg::Bool(true),
+                        AnnotationArg::Ident("info".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_annotation_empty_parens_has_no_args() {
+        // `@marker()` is accepted and behaves like the bare `@marker` form.
+        let source = "@marker()\nfunction job() { }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(f.annotations[0].name, "marker");
+                assert!(f.annotations[0].args.is_empty());
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_annotation_negative_numeric_args() {
+        // A leading `-` negates int and float literal arguments.
+        let source = "@range(-40, -1.5)\nfunction job() { }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Function(f) => {
+                assert_eq!(
+                    f.annotations[0].args,
+                    vec![AnnotationArg::Int(-40), AnnotationArg::Float(-1.5)]
+                );
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_annotation_minus_before_non_numeric_is_rejected() {
+        // `-` is only meaningful before a numeric literal.
+        let source = "@tag(-yes)\nfunction job() { }";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("expected an annotation argument")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_annotation_int_arg_out_of_range_is_rejected() {
+        let source = "@big(99999999999999999999)\nfunction job() { }";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("out of range for an annotation argument")),
+            "expected out-of-range diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_struct_method_is_rejected() {
+        // Annotations attach to fields, not methods nested in a struct body.
+        // The method itself still parses; only the annotation is rejected.
+        let source = "struct S {\n  @skip\n  function f(self) -> Int { return 1 }\n}";
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede a method")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::Struct(s) => assert_eq!(s.methods.len(), 1, "method should still parse"),
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn annotation_before_enum_variant_is_rejected() {
+        // Enums carry annotations on the declaration, never on a variant.
+        let source = "enum E {\n  @skip\n  Red\n  Green\n}";
+        let (program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("annotations cannot precede an enum variant")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::Enum(e) => {
+                let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+                assert_eq!(names, vec!["Red", "Green"], "variants should still parse");
+            }
+            other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn annotation_before_trait_is_rejected() {
+        let source = "@skip\ntrait Drawable { function draw(self) -> String }";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede `trait`")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_type_alias_is_rejected() {
+        let source = "@skip\ntype Id = Int";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede `type`")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_schema_is_rejected() {
+        let source = "@skip\nschema db { }";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede `schema`")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_extern_js_is_rejected() {
+        let source = "@skip\nextern js {\n  function alert(message: String)\n}";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("annotations cannot precede `extern js` blocks")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_import_is_rejected() {
+        let source = "@skip\nimport a.b { Foo }";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede `import`")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_endpoint_is_rejected() {
+        let source = "@skip\nendpoint deleteUser: DELETE \"/api/users/{id}\" {\n response Void\n}";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede `endpoint`")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn annotation_before_impl_is_rejected() {
+        let source = "@skip\nimpl Foo { function bar() { } }";
+        let (_program, diagnostics) = parse_source(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("annotations cannot precede `impl`")),
+            "expected rejection diagnostic, got: {:?}",
+            diagnostics
+        );
     }
 
     #[test]

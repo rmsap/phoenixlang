@@ -6,6 +6,7 @@
 //! mutability violations, etc.).
 #![warn(missing_docs)]
 
+mod check_annotations;
 mod check_builtins_list;
 mod check_builtins_map;
 mod check_builtins_option;

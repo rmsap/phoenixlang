@@ -659,6 +659,12 @@ impl<'src> Lexer<'src> {
                     Token::new(TokenKind::RBracket, "]", self.span(s))
                 }
 
+                b'@' => {
+                    let s = self.pos;
+                    self.advance();
+                    Token::new(TokenKind::At, "@", self.span(s))
+                }
+
                 b'-' | b'=' | b'!' | b'<' | b'>' | b'?' | b'|' | b'&' => self.lex_operator(),
 
                 _ => {
@@ -873,8 +879,41 @@ mod tests {
 
     #[test]
     fn unknown_character() {
-        let kinds = token_kinds("@");
+        let kinds = token_kinds("#");
         assert_eq!(kinds, vec![Error, Eof]);
+    }
+
+    #[test]
+    fn at_token() {
+        let tokens = tokenize("@", SourceId(0));
+        assert_eq!(tokens[0].kind, At);
+        assert_eq!(tokens[0].text, "@");
+        assert_eq!(tokens[1].kind, Eof);
+    }
+
+    #[test]
+    fn annotation_marker_tokens() {
+        // `@skip` lexes as At followed by the annotation name (a plain Ident).
+        assert_eq!(token_kinds("@skip"), vec![At, Ident, Eof]);
+    }
+
+    #[test]
+    fn annotation_with_args_tokens() {
+        // `@jsonName("user_name")` — At, Ident, then the parenthesised args.
+        assert_eq!(
+            token_kinds("@jsonName(\"user_name\")"),
+            vec![At, Ident, LParen, StringLiteral, RParen, Eof]
+        );
+    }
+
+    #[test]
+    fn annotation_args_span_newlines() {
+        // Newlines inside the annotation's `()` are suppressed by paren depth,
+        // so a multi-line argument list lexes without spurious Newline tokens.
+        assert_eq!(
+            token_kinds("@config(\n\"APP\"\n)"),
+            vec![At, Ident, LParen, StringLiteral, RParen, Eof]
+        );
     }
 
     #[test]

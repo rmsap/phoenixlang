@@ -1803,6 +1803,14 @@ impl Checker {
         self.diagnostics.push(Diagnostic::error(message, span));
     }
 
+    /// Records a semantic warning diagnostic at the given source span.
+    ///
+    /// Warnings do not fail the build; they flag forward-compatible concerns
+    /// such as an unknown annotation that the compiler will ignore.
+    pub(crate) fn warn(&mut self, message: String, span: Span) {
+        self.diagnostics.push(Diagnostic::warning(message, span));
+    }
+
     /// Records a symbol reference at the given use-site span.
     ///
     /// This is called during type checking whenever an identifier, field access,

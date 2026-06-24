@@ -163,6 +163,8 @@ pub struct FunctionDecl {
     pub return_type: Option<TypeExpr>,
     /// The function body.
     pub body: Block,
+    /// Annotations attached to this function (`@name` / `@name(args)`).
+    pub annotations: Vec<Annotation>,
     /// Module visibility (public or private). Default: private.
     pub visibility: Visibility,
     /// Source span covering the entire function declaration.
@@ -422,6 +424,49 @@ pub struct ForStmt {
     pub span: Span,
 }
 
+/// A single annotation attached to a declaration or field.
+///
+/// Annotations carry compile-time metadata using `@name` or `@name(args)`
+/// syntax (e.g. `@skip`, `@jsonName("user_name")`). See
+/// `docs/phases/phase-4.md#45-annotation-system`. The interpreter ignores
+/// annotations — they are validated by the semantic checker and consumed by
+/// later stages (serialization, config, the test framework).
+///
+/// Placement is ordered: a doc comment (if any) comes first, then annotations,
+/// then the `public` modifier, then the declaration or field — i.e. the same
+/// order on top-level declarations and on struct fields. Annotations placed
+/// before a doc comment, or after `public`, are not recognized as annotations
+/// and produce a generic parse error.
+#[derive(Debug, Clone, Serialize)]
+pub struct Annotation {
+    /// The annotation name (the identifier following `@`).
+    pub name: String,
+    /// Positional literal arguments; empty for marker annotations (`@skip`).
+    pub args: Vec<AnnotationArg>,
+    /// Source span covering the whole annotation, from the `@` through the
+    /// closing `)` (or the end of the name for marker annotations).
+    pub span: Span,
+}
+
+/// A single positional argument to an annotation.
+///
+/// Arguments are restricted to literals and bare identifiers, matching the
+/// fixed, compiler-known annotation set. User-defined annotation processing
+/// is deferred to `comptime` (Phase 5.5).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum AnnotationArg {
+    /// A string-literal argument: `@jsonName("user_name")`.
+    String(String),
+    /// An integer-literal argument: `@maxLength(255)`.
+    Int(i64),
+    /// A float-literal argument.
+    Float(f64),
+    /// A boolean-literal argument: `true` or `false`.
+    Bool(bool),
+    /// A bare identifier argument: `@config(env)`.
+    Ident(String),
+}
+
 /// A struct type declaration. May include generic type parameters.
 ///
 /// ```text
@@ -451,6 +496,8 @@ pub struct StructDecl {
     pub trait_impls: Vec<InlineTraitImpl>,
     /// Doc comment attached to this struct, if any.
     pub doc_comment: Option<String>,
+    /// Annotations attached to this struct (`@name` / `@name(args)`).
+    pub annotations: Vec<Annotation>,
     /// Module visibility (public or private). Default: private.
     pub visibility: Visibility,
     /// Source span covering the entire struct declaration.
@@ -474,6 +521,8 @@ pub struct FieldDecl {
     pub constraint: Option<Expr>,
     /// Doc comment attached to this field, if any.
     pub doc_comment: Option<String>,
+    /// Annotations attached to this field (`@name` / `@name(args)`).
+    pub annotations: Vec<Annotation>,
     /// Module visibility (public or private). Default: private. Independent
     /// of the parent struct's visibility — a `public struct` can have private
     /// fields, and a private struct can have `public` fields (only meaningful
@@ -514,6 +563,8 @@ pub struct EnumDecl {
     pub trait_impls: Vec<InlineTraitImpl>,
     /// Doc comment attached to this enum, if any.
     pub doc_comment: Option<String>,
+    /// Annotations attached to this enum (`@name` / `@name(args)`).
+    pub annotations: Vec<Annotation>,
     /// Module visibility (public or private). Default: private. A public
     /// enum exports all of its variants automatically.
     pub visibility: Visibility,
