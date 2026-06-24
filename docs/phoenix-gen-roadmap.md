@@ -6,7 +6,9 @@ The decision frame: **Phoenix Gen ships from the phoenixlang repo but is branded
 
 A user adopting Phoenix Gen should never need to install the full Phoenix toolchain or learn the language to ship code with it. Conversely, anyone who installs Phoenix the language gets `phoenix gen` for free. The `.phx` files Gen consumes are still Phoenix syntax, so a power user *can* dig into the language; the goal is that they never *have* to.
 
-For the current state of Phoenix Gen as a feature, see [phoenix-gen.md](phoenix-gen.md). For the full language roadmap, see [roadmap.md](roadmap.md).
+For the current state of Phoenix Gen as a feature, see [phoenix-gen.md](phoenix-gen.md). For the design decisions behind each feature (the what and the why), see [phoenix-gen-design-decisions.md](phoenix-gen-design-decisions.md). For the full language roadmap, see [roadmap.md](roadmap.md).
+
+**Current state (updated 2026-06-23).** The Gen-facing schema features targeted for v1.0 are implemented and proven by both harnesses (compile-and-lint + cross-language round-trip): request/response **headers**, **multipart upload + binary download**, **pagination** (offset + cursor), **multi-status responses** (content negotiation deferred), and the **API versioning prefix**. The type system has since expanded past the original §4 plan — `DateTime`, `Uuid`, `Decimal`, a built-in `Money` composite, `Url`, and `Bytes` scalars; enum and `List<T>` query/header params; and inline `response` projection (`pick` / `omit` / `partial`) — and cross-language interoperability is now guarded by a golden-wire conformance suite, with `where`-constraint enforcement at full parity across TypeScript, Go, and Python. The standalone `phoenix-gen` binary ships, and the top-level README gives Gen co-equal billing (Block A, item 5). The v1.0-blocking decisions in [§9](#9-open-decisions) are resolved (see [phoenix-gen-design-decisions.md](phoenix-gen-design-decisions.md)). **Remaining for v1.0:** the docs site (Block E), the distribution channels (Block F), a second TypeScript server framework, the broader fixture library (Block D), and the beta (Block G).
 
 ---
 
@@ -219,6 +221,8 @@ Most users adopting Phoenix Gen will have an existing tRPC or OpenAPI setup. Mig
 ## 9. Open decisions
 
 These need answers before the plan executes. Each blocks at least one downstream task.
+
+**Update (2026-06-23):** the schema/codegen-blocking decisions below are resolved and implemented — the standalone binary ships as an extra `[[bin]]`, the server-framework list is locked (TS: Express + Fastify; Python: FastAPI; Go: net/http + chi), and pagination supports both cursor and offset (see [phoenix-gen-design-decisions.md](phoenix-gen-design-decisions.md)). The decisions still genuinely open are the branding / distribution / operational ones — GitHub org, domain, npm scope, telemetry fields, and the beta recruitment plan.
 
 | Decision | Blocks | Recommendation |
 |---|---|---|

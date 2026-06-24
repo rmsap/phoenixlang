@@ -217,7 +217,7 @@ when pagination is needed.
 **Planned fix (additive, non-breaking):** nest the envelopes (e.g. the
 `<Endpoint>Result` envelope's `body` slot could hold a `<Endpoint>Response` or
 `<Endpoint>Page`). Full rationale in
-[design-decisions.md](design-decisions.md#phoenix-gen--multi-status-responses-design-2026-06-07)
+[phoenix-gen-design-decisions.md](phoenix-gen-design-decisions.md#phoenix-gen--multi-status-responses-design-2026-06-07)
 (decision 4). **Target phase:** demand-triggered.
 
 ### Pagination and response headers cannot be combined on one endpoint (v1)
@@ -240,7 +240,7 @@ envelope (`<Endpoint>Result { body: <Endpoint>Page, <headers...> }`) — the hea
 envelope already has a `body` slot that pagination can fill — or flat-merge the
 fields with codegen routing each to body vs. HTTP header. Full rationale and both
 options are recorded in
-[design-decisions.md](design-decisions.md#phoenix-gen--pagination-design-2026-06-06)
+[phoenix-gen-design-decisions.md](phoenix-gen-design-decisions.md#phoenix-gen--pagination-design-2026-06-06)
 (decision 7). **Target phase:** demand-triggered.
 
 ### Defaulted request and query inputs diverge per target and mostly can't trigger the server default

@@ -26,7 +26,7 @@
 
 ## Quick Start
 
-Install Phoenix — see the [main README](../README.md#quick-start) for full install options, and the [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang) for syntax highlighting and inline diagnostics while editing `.phx` files.
+Install Phoenix — see the [main README](../README.md#install) for full install options, and the [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang) for syntax highlighting and inline diagnostics while editing `.phx` files.
 
 ### 1. Write a schema
 

@@ -3,88 +3,100 @@
 **Type-safe from database to DOM. One language, no drift.**
 
 [![CI](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml/badge.svg)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-3%2C300%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-3%2C700%2B-brightgreen)](https://github.com/rmsap/phoenixlang/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Phoenix is a statically typed language for full-stack web development where one sound type system spans your whole app — database query, API endpoint, and browser — and the compiler checks every boundary between them.** Write your data model once and the compiler keeps the SQL, the serialization, the API client, and the server handler in agreement: if the two ends drift, the build fails, not production. It feels like the TypeScript and Python you already write — garbage-collected, async-first, familiar syntax — and it's safe in a way neither of them is.
+**Phoenix is a statically typed language for full-stack web development where one sound type system spans your whole app — database query, API endpoint, and browser — and the compiler checks every boundary between them.** Write your data model once and the compiler keeps the SQL, the serialization, the API client, and the server handler in agreement: if the two ends drift, the build fails, not production. It feels like the TypeScript and Python you already write — garbage-collected, familiar syntax — and it's safe in a way neither of them is.
 
-*Today:* a compiled language (native via Cranelift, GC, full type system, LSP) plus **Phoenix Gen**, a codegen tool that brings the type-safety story to TypeScript / Python / Go teams right now. *Coming:* typed endpoints, compile-time SQL, a WASM frontend, and refinement types — the full DB-to-DOM vision. See the [roadmap](docs/roadmap.md) and [vision](docs/vision.md).
+*Today:* a compiled language (native via Cranelift, a WebAssembly target, GC, full type system, JavaScript interop, LSP) plus **Phoenix Gen**, a codegen tool that brings the type-safety story to TypeScript / Python / Go teams right now. *Coming:* async/await, typed endpoints, compile-time SQL, a WASM frontend, and refinement types — the full DB-to-DOM vision. See the [roadmap](docs/roadmap.md) and [vision](docs/vision.md).
 
 > When searching online, use **phoenixlang** to distinguish this project from the [Phoenix Framework](https://www.phoenixframework.org/) for Elixir.
 
 ---
 
-## Two products in one repo
+## Two ways in
 
-This repository ships **two products** that share one compiler front-end:
+This repository ships **two products** that share one compiler front-end, so they cannot drift apart:
 
-1. **The Phoenix language** — a strict, statically-typed language with its own lexer, parser, type checker, interpreter, and (in progress) native/WASM backends.
-2. **Phoenix Gen** — a multi-language API codegen tool that turns a `.phx` schema into typed clients and servers for **TypeScript, Python, and Go**, plus an **OpenAPI 3.1** spec. It is usable **without learning the Phoenix language**: write a schema, generate code, ship it.
-
-Phoenix Gen has two entry points that share one implementation, so they cannot drift:
-
-- `phoenix gen schema.phx --target typescript --out ./generated` — the `gen` subcommand of the language driver.
-- `phoenix-gen schema.phx --target typescript --out ./generated` — a standalone binary for teams who only want codegen.
-
-See [docs/phoenix-gen.md](docs/phoenix-gen.md) for the current feature set and [docs/phoenix-gen-roadmap.md](docs/phoenix-gen-roadmap.md) for the path to a v1.0 product.
+- **🚀 [Phoenix Gen](#phoenix-gen--typed-apis-across-languages-today) — usable today.** A multi-language API codegen tool: turn one `.phx` schema into typed clients and servers for **TypeScript, Python, and Go**, plus an **OpenAPI 3.1** spec. No need to learn the Phoenix language — write a schema, generate code, ship it. **Start here if you want type-safe APIs now.**
+- **🔭 [The Phoenix language](#the-phoenix-language) — the full vision.** A strict, statically-typed language with its own lexer, parser, type checker, interpreter, and native + WebAssembly backends. The end goal: one type system from the database to the DOM. **Start here if you want to follow or hack on the language.**
 
 ---
 
-## Highlights
+## Install
 
-- **Two execution modes** — tree-walk interpreter for fast iteration, Cranelift-backed native compilation for production
-- **SSA-style intermediate representation** with a round-trip IR interpreter for verification
-- **Multi-file modules with `public`/private visibility** — `import a.b.c { Foo }` syntax, lazy import-driven discovery, cross-module visibility enforcement with rich diagnostics
-- **Multi-target API codegen** — generate TypeScript, Python, Go, or OpenAPI 3.1 clients and servers from `.phx` schemas
-- **Full Language Server Protocol** — diagnostics, hover, autocomplete, go-to-definition, find-references, rename
-- **Modern type system** — generics with trait bounds, `dyn Trait` dynamic dispatch, algebraic data types, pattern matching, closures, first-class functions
-- **First-class error handling** — built-in `Option<T>`, `Result<T, E>`, the `?` operator, and a rich functional-collection standard library
-
----
-
-## Compilation Pipeline
-
-```
- .phx source
-     │
-     ▼
-┌─────────┐   ┌──────────┐   ┌─────────┐   ┌────────┐
-│  Lexer  │──▶│  Parser  │──▶│  Sema   │──▶│   IR   │
-└─────────┘   └──────────┘   └─────────┘   └────┬───┘
-                                                │
-         ┌───────────────────┬──────────────────┼──────────────────┐
-         ▼                   ▼                  ▼                  ▼
-   tree-walk interp    IR round-trip    Cranelift native       Codegen
-    (phoenix run)         interp        (phoenix build)    TS · Py · Go · OpenAPI
-                                                              (phoenix gen)
-```
-
----
-
-## Quick Start
-
-Install (adds `phoenix` and `phoenix-lsp` to `/usr/local/bin`):
+Adds `phoenix` and `phoenix-lsp` to `/usr/local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rmsap/phoenixlang/main/install.sh | sudo sh
 ```
 
-Or grab binaries directly from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases).
+Or grab binaries directly from [GitHub Releases](https://github.com/rmsap/phoenixlang/releases), or [build from source](CONTRIBUTING.md#building-from-source).
 
-Build from source (requires [Rust](https://www.rust-lang.org/tools/install) stable):
-
-```bash
-git clone https://github.com/rmsap/phoenixlang.git
-cd phoenixlang
-cargo build --release
-./target/release/phoenix run path/to/file.phx
-```
+The same `phoenix` binary runs your code (`phoenix run`/`build`) and generates API code (`phoenix gen`). Teams who only want codegen can use the standalone `phoenix-gen` binary instead — it shares the exact same implementation.
 
 ---
 
-## Examples
+## Phoenix Gen — typed APIs across languages, today
 
-### Hello World
+Write an API schema once in `.phx`; generate typed clients and servers across multiple languages. Field-level constraints (`where`), path/query parameters, response types, and error variants are all type-checked and carried through every target.
+
+```phoenix
+struct Post {
+  id: Int
+  title: String where self.length > 0 && self.length <= 200
+  body: String where self.length > 0
+  tags: List<String>
+}
+
+endpoint createPost: POST "/api/posts" {
+  body Post omit { id }
+  response Post
+  error {
+    ValidationError(400)
+    Unauthorized(401)
+  }
+}
+```
+
+```bash
+phoenix gen api.phx                      # TypeScript (types, client, handlers, server)
+phoenix gen api.phx --target python      # Python (Pydantic, FastAPI, httpx)
+phoenix gen api.phx --target go          # Go (structs, net/http, client)
+phoenix gen api.phx --target openapi     # OpenAPI 3.1 JSON spec
+phoenix gen api.phx --client             # Types + client SDK only
+phoenix gen api.phx --server             # Types + handlers + router only
+phoenix gen api.phx --watch              # Regenerate on change
+```
+
+### No drift — the mismatch shows up in your build, not in production
+
+The schema is the single source of truth for the client *and* the server, so they physically cannot disagree. Generate a TypeScript client and a Go server from the schema above, then rename `title` to `headline` and regenerate:
+
+- the TypeScript frontend still constructing `{ title }` **fails `tsc`**,
+- the Go handler still returning `Title` **stops compiling**.
+
+A TypeScript client and a Go server, generated from one schema, can't fall out of sync — the kind of drift that normally surfaces as a 4 PM production bug becomes a compile error. And the `where` constraints aren't documentation: they compile to **real runtime validators** on the server (a too-long `title` is rejected with the error variant you declared, in every target).
+
+See **[docs/phoenix-gen.md](docs/phoenix-gen.md)** for the full guide, or [`tests/fixtures/gen_api.phx`](tests/fixtures/gen_api.phx) for a realistic blog-platform schema.
+
+---
+
+## The Phoenix language
+
+A strict, statically-typed, garbage-collected language that compiles to native code (via Cranelift) and to WebAssembly. The bet: a single sound type system that eventually spans the database query, the API endpoint, and the browser, with the compiler checking every boundary in between.
+
+- **One sound type system, checked at every boundary** — the core bet of the project
+- **Two execution modes** — tree-walk interpreter for fast iteration, Cranelift-backed native compilation for production
+- **WebAssembly target** — two backends (linear-memory embed-and-merge and inline WASM-GC), byte-identical to native across the fixture matrix, with JavaScript/DOM interop via `extern js`
+- **Modern type system** — generics with trait bounds, `dyn Trait` dynamic dispatch, algebraic data types, pattern matching, closures, first-class functions
+- **First-class error handling** — built-in `Option<T>`, `Result<T, E>`, the `?` operator, and a rich functional-collection standard library (`map`/`filter`/`reduce`/…), plus `ListBuilder` / `MapBuilder` transient-mutable accumulators for O(n) bulk construction
+- **Multi-file modules with `public`/private visibility** — `import a.b.c { Foo }` syntax, lazy import-driven discovery, cross-module visibility enforcement with rich diagnostics
+- **Full Language Server Protocol** — diagnostics, hover, autocomplete, go-to-definition, find-references, rename — via a [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang)
+
+### Examples
+
+#### Hello World
 
 ```phoenix
 function main() {
@@ -92,7 +104,7 @@ function main() {
 }
 ```
 
-### Traits, generics, and pattern matching
+#### Traits, generics, and pattern matching
 
 ```phoenix
 trait Display {
@@ -136,7 +148,7 @@ function main() {
 }
 ```
 
-### Static and dynamic dispatch
+#### Static and dynamic dispatch
 
 `<T: Trait>` gives static dispatch (monomorphized). `dyn Trait` gives runtime dispatch through a vtable — use it when you need one function to accept multiple concrete types behind a trait without a generic type parameter. See **[docs/dyn-trait.md](docs/dyn-trait.md)** for the full guide. Both examples below reuse the `Display` trait defined in the previous snippet.
 
@@ -145,7 +157,7 @@ function describeStatic<T: Display>(item: T) -> String { item.toString() }
 function describeDyn(item: dyn Display) -> String      { item.toString() }
 ```
 
-### Error handling with `Result` and `?`
+#### Error handling with `Result` and `?`
 
 ```phoenix
 function safeDivide(a: Int, b: Int) -> Result<Int, String> {
@@ -169,7 +181,7 @@ function main() {
 }
 ```
 
-### Modules and visibility
+#### Modules and visibility
 
 Each `.phx` file is a module. Declarations are private by default; mark them `public` to export. `import a.b.c { Item }` brings names into scope, with `as` aliases and `{ * }` wildcards. Discovery is lazy (only files reachable via imports are parsed), and the project root is the directory of the entry file.
 
@@ -199,76 +211,7 @@ function main() {
 
 See [`tests/fixtures/`](tests/fixtures/) and [`tests/fixtures/multi/`](tests/fixtures/multi/) for more, plus [`crates/phoenix-bench/benches/fixtures/large.phx`](crates/phoenix-bench/benches/fixtures/large.phx).
 
----
-
-## Phoenix Gen
-
-Write an API schema once in `.phx`; generate typed clients and servers across multiple languages. Field-level constraints (`where`), path parameters, query parameters, response types, and error variants are all type-checked and carried through every target.
-
-```phoenix
-struct Post {
-  id: Int
-  title: String where self.length > 0 && self.length <= 200
-  body: String where self.length > 0
-  tags: List<String>
-}
-
-endpoint createPost: POST "/api/posts" {
-  body Post omit { id }
-  response Post
-  error {
-    ValidationError(400)
-    Unauthorized(401)
-  }
-}
-```
-
-```bash
-phoenix gen api.phx                      # TypeScript (types, client, handlers, server)
-phoenix gen api.phx --target python      # Python (Pydantic, FastAPI, httpx)
-phoenix gen api.phx --target go          # Go (structs, net/http, client)
-phoenix gen api.phx --target openapi     # OpenAPI 3.1 JSON spec
-phoenix gen api.phx --client             # Types + client SDK only
-phoenix gen api.phx --server             # Types + handlers + router only
-phoenix gen api.phx --watch              # Regenerate on change
-```
-
-See **[docs/phoenix-gen.md](docs/phoenix-gen.md)** for the full guide, or [`tests/fixtures/gen_api.phx`](tests/fixtures/gen_api.phx) for a realistic blog-platform schema.
-
----
-
-## Language Features
-
-**Syntax & Types**
-- `let` / `let mut` with type inference or explicit annotations, compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`)
-- Functions with typed, named, and default parameters
-- Structs with inline methods, field assignment, and `where` field constraints (`String name where self.length > 0`)
-- Enums/ADTs with variant destructuring, wildcards, literals, and inline methods & trait impls
-- Generics on functions, structs, and enums with trait bounds (`<T: Display>`)
-- Traits with `trait` declarations and `impl Trait for Type`
-- Type aliases, recursive types, destructuring, implicit returns
-- Modules and visibility — file-as-module, `import a.b.c { Item, Item as Alias, * }`, `public` keyword on declarations and struct fields (private by default)
-- Pipe operator (`|>`), string interpolation, block and line comments
-
-**Collections & Errors**
-- `List<T>` literals with `map`, `filter`, `reduce`, `find`, `any`, `all`, `flatMap`, `sortBy`, `first`, `last`, `contains`, `take`, `drop`
-- `Map<K, V>` literals with `get`, `set`, `contains`, `remove`, `keys`, `values`
-- `ListBuilder<T>` / `MapBuilder<K, V>` — transient-mutable accumulators (`List.builder()` / `Map.builder()` → `.push()` / `.set()` → `.freeze()`) for O(n) bulk construction; runtime-checked use-after-freeze
-- Built-in `Option<T>` and `Result<T, E>` with full combinator sets (`map`, `andThen`, `orElse`, `mapErr`, `filter`, `okOr`, `unwrapOrElse`, …)
-- `?` operator for error propagation
-- Rich `String` method suite with ordering comparisons
-
-**Tooling & Codegen**
-- Tree-walk interpreter and Cranelift-backed native compilation
-- SSA-style IR with a standalone round-trip interpreter
-- Full LSP server and [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang)
-- Phoenix Gen targets: TypeScript, Python (Pydantic/FastAPI/httpx), Go (net/http), OpenAPI 3.1 — see [docs/phoenix-gen.md](docs/phoenix-gen.md)
-- Endpoint declarations for typed API schemas
-- CI pipeline enforcing `cargo fmt`, `clippy`, and `cargo test`
-
----
-
-## CLI
+### CLI
 
 ```bash
 phoenix run file.phx                       # Execute via the tree-walk interpreter
@@ -281,54 +224,23 @@ phoenix lex | parse | ir file.phx          # Inspect internal compiler stages
 
 `phoenix build` requires a C compiler (gcc or clang) for linking. Run `phoenix --help` for the full command list.
 
----
-
-## Editor Support
+### Editor support
 
 A [VS Code extension](https://marketplace.visualstudio.com/items?itemName=rmsap.phoenixlang) provides syntax highlighting, inline diagnostics, hover type info, autocomplete, go-to-definition, find-references, and rename — powered by the `phoenix-lsp` binary.
 
 ---
 
-## Architecture
-
-Phoenix is implemented in Rust as a Cargo workspace of 15 crates, each representing one stage of the compiler pipeline or an independent tool.
-
-| Crate | Purpose |
-|-------|---------|
-| `phoenix-common` | Shared types (spans, diagnostics, source maps, module paths) |
-| `phoenix-lexer` | Tokenization |
-| `phoenix-parser` | Recursive-descent parser and AST |
-| `phoenix-modules` | Module resolver: maps an entry `.phx` file to a deterministic, lazy import-driven set of parsed modules |
-| `phoenix-sema` | Semantic analysis (name resolution, visibility, and type checking) |
-| `phoenix-interp` | Tree-walk interpreter |
-| `phoenix-ir` | SSA-style intermediate representation and AST-to-IR lowering |
-| `phoenix-ir-interp` | IR interpreter for round-trip verification |
-| `phoenix-cranelift` | Cranelift-based native code generation |
-| `phoenix-runtime` | Runtime library linked into compiled Phoenix binaries |
-| `phoenix-codegen` | Code generation backends (TypeScript, Python, Go, OpenAPI) |
-| `phoenix-lsp` | Language Server Protocol server |
-| `phoenix-driver` | CLI binary |
-| `phoenix-bench` | Benchmarks for the compiler pipeline (Criterion) |
-| `phoenix-bench-diff` | Post-merge regression detector: diffs criterion output against committed `docs/perf-baselines/` |
-
----
-
 ## Roadmap & Vision
 
-Phase 1 (core language), Phase 2.2 (native compilation via Cranelift), Phase 2.6 (module system and visibility), Phase 2.3 (tracing GC, runtime, and `defer` syntax), Phase 2.7 (benchmark suite + `ListBuilder` / `MapBuilder` transient-mutable accumulators), and Phase 2.4 (WebAssembly target — `wasm32-linear` embed-and-merge plus inline `wasm32-gc`, both byte-identical to native across the full fixture matrix) are complete. Phase 2.5 (JavaScript interop) is the active work. Async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
+Phase 1 (core language) and all of Phase 2 are complete: IR (2.1), native compilation via Cranelift (2.2), the module system and visibility (2.6), tracing GC + runtime + `defer` syntax (2.3), the benchmark suite + `ListBuilder` / `MapBuilder` transient-mutable accumulators (2.7), the WebAssembly target (2.4 — `wasm32-linear` embed-and-merge plus inline `wasm32-gc`, both byte-identical to native across the full fixture matrix), and JavaScript interop (2.5 — `extern js` as a uniform host-FFI boundary across all five backends). The active phase is 3.1 (package manager). Async/await with structured concurrency, typed database queries, refinement types, and first-class reactivity for a full-stack web language follow.
 
-See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features.
+See **[Roadmap](docs/roadmap.md)** for the implementation timeline and **[Language Vision](docs/vision.md)** for designs of planned features. Phoenix Gen tracks its own [feature set](docs/phoenix-gen.md), [roadmap](docs/phoenix-gen-roadmap.md), and [design decisions](docs/phoenix-gen-design-decisions.md).
 
 ---
 
 ## Contributing
 
-Phoenix is in early development and contributions are welcome.
-
-1. Check the [roadmap](docs/roadmap.md) for current priorities
-2. Look at [known issues](docs/known-issues.md) for things that need fixing, or [design decisions](docs/design-decisions.md) for open questions about the language
-3. Open an issue to discuss before starting large changes
-4. All PRs should pass `cargo fmt`, `cargo clippy`, and `cargo test` — git hooks (pre-commit: fmt + clippy; pre-push: tests) install automatically via [cargo-husky](https://github.com/rhysd/cargo-husky) on first `cargo test`
+Phoenix is in early development and contributions are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for how to get started, build from source, the compilation pipeline, and the crate-by-crate architecture. In short: check the [roadmap](docs/roadmap.md) for priorities, open an issue before large changes, and make sure PRs pass `cargo fmt`, `cargo clippy`, and `cargo test`.
 
 ---
 

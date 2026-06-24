@@ -304,7 +304,7 @@ Phoenix uses **structured concurrency** — every spawned task has a parent scop
 **Open design decisions for this phase** (see [design-decisions.md](../design-decisions.md)):
 
 - **[`mut` aliasing / shared mutable captures](../design-decisions.md#mut-gives-no-aliasing-guarantees-closures-share-mutable-captures-freely)** — today closures can share mutable captures freely. Benign under single-threaded execution; the shape of a data race once tasks run concurrently. Decide task-boundary constraint model (forbid shared mutable captures? require `Atomic` / `Mutex` at task-crossing? channel-only?) before `spawn` / task APIs get designed here — retrofitting `Send`-equivalent bounds after task APIs exist creates permanent coloring problems.
-- **[`defer` for resource cleanup](../design-decisions.md#defer-for-resource-cleanup)** — forced by the tracing GC decision (no `Drop`-style deterministic destruction). The "do we need it" question is answered yes; syntax (`defer`, `using`, `with`) still open. Resolve before async resource-management patterns solidify.
+- **[`defer` for resource cleanup](../design-decisions.md#g-scope-bound-cleanup-syntax-go-style-statement-level-defer)** — forced by the tracing GC decision (no `Drop`-style deterministic destruction). Decided and shipped in Phase 2.3 as Go-style statement-level `defer`; carried here as the resource-management primitive async patterns build on.
 
 **GC context:** the [tracing GC decision](../design-decisions.md#gc-strategy) was made partly with this phase in mind — tracing GCs compose cleanly with concurrent collection, whereas RC would need atomic refcount ops (10–100× slower under contention).
 

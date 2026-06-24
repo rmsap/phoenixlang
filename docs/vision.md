@@ -1,6 +1,6 @@
 # Phoenix Language Vision
 
-This document describes the **planned features** that define Phoenix's long-term direction as a full-stack web language. None of the features below are implemented yet — the code examples show the intended design, not working code. For what works today, see the [README](../README.md).
+This document describes the **planned features** that define Phoenix's long-term direction as a full-stack web language. Most are not implemented yet — the code examples show the intended design, not working code — though some foundations have since landed (the garbage collector, the WebAssembly target, and the first stage of JavaScript interop). For what works today, see the [README](../README.md).
 
 For implementation timeline and priorities, see the [roadmap](roadmap.md).
 
@@ -142,7 +142,7 @@ Phoenix aims to be a **single-language full-stack** web language where compile-t
 
 ### Stage 1: JavaScript Interop (Phase 2.5)
 
-Phoenix compiles to WebAssembly and calls into the JavaScript ecosystem via `extern js` declarations and npm imports. Developers use **existing frameworks** (React, Svelte, Vue) for the UI layer and write business logic, state management, and backend code in Phoenix. This delivers immediate value: Phoenix's type safety for data and API calls, the JS ecosystem for UI.
+Phoenix compiles to WebAssembly and calls into the JavaScript ecosystem via `extern js` declarations and npm imports. The `extern js` host-FFI boundary **shipped in Phase 2.5** (uniform across all five backends); the `import js "pkg"` npm-resolution slice shown below is deferred to Phase 3.1 (the package manager). Developers use **existing frameworks** (React, Svelte, Vue) for the UI layer and write business logic, state management, and backend code in Phoenix. This delivers immediate value: Phoenix's type safety for data and API calls, the JS ecosystem for UI.
 
 ```phoenix
 // Use React from Phoenix via JS interop

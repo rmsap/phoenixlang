@@ -11,7 +11,7 @@ This document outlines the path from the current implementation to a production-
 | Phase | Name | Status | Description |
 |-------|------|--------|-------------|
 | [1](phases/phase-1.md) | Core Language | ✅ Complete | Variables, functions, control flow, structs, enums, generics, traits, closures, collections, error handling, and all ergonomic features |
-| [2](phases/phase-2.md) | Compilation | In Progress | IR (complete), Cranelift native compilation (complete), modules and visibility (complete), runtime + GC + `defer` (complete), benchmark suite + `ListBuilder` / `MapBuilder` (complete), WebAssembly target (active), JS interop |
+| [2](phases/phase-2.md) | Compilation | ✅ Complete | IR, Cranelift native compilation, modules and visibility, runtime + GC + `defer`, benchmark suite + `ListBuilder` / `MapBuilder`, WebAssembly target, and JavaScript interop — all complete |
 | [3](phases/phase-3.md) | Tooling | Planned | Package manager, LSP, formatter, error message quality |
 | [4](phases/phase-4.md) | Standard Library | Planned | Core types (tuples, Date/Time, Regex, iterators), config, async runtime, HTTP/WebSocket/SSE, typed routing, annotations, JSON serialization, database access (typed SQL + a transparent data layer, no ORM), logging, test framework |
 | [5](phases/phase-5.md) | Differentiating Features | Planned | Built-in serialization, refinement types, reactivity, typed endpoints, comptime, auto-generated API docs, built-in observability, frontend framework |
@@ -23,9 +23,11 @@ See also: [Known Issues](known-issues.md) | [Design Decisions](design-decisions.
 
 ## Parallel Track: Phoenix Gen
 
-**[Phoenix Gen](phoenix-gen.md)** is a standalone code generation tool that uses Phoenix syntax to define API schemas and generates typed code for existing languages (TypeScript, Go, Rust, etc.). It runs alongside the main phases — buildable now with the existing parser and type checker — to bring Phoenix's type safety story to developers before the full compiler exists.
+**[Phoenix Gen](phoenix-gen.md)** is a standalone code generation tool that uses Phoenix syntax to define API schemas and generates typed code for existing languages (TypeScript, Python, and Go, plus an OpenAPI 3.1 spec). It runs alongside the main phases — buildable now with the existing parser and type checker — to bring Phoenix's type safety story to developers before the full compiler exists.
 
 Phoenix Gen is a stepping stone to the full language: `.phx` schema files are valid Phoenix code that becomes importable modules when the compiler ships, and developers who adopt the tool become the first users of the full language.
+
+Phoenix Gen tracks its design decisions separately in **[phoenix-gen-design-decisions.md](phoenix-gen-design-decisions.md)**; the feature set lives in [phoenix-gen.md](phoenix-gen.md) and the v1.0 plan in [phoenix-gen-roadmap.md](phoenix-gen-roadmap.md).
 
 ---
 
@@ -38,7 +40,7 @@ Phoenix Gen is a stepping stone to the full language: `.phx` schema files are va
 Map, string methods, functional collection methods, pipes, named/default parameters, destructuring, inline methods,
 CI pipeline, type registries exposed, and expression types annotated.
 
-**M2 — "Compiled language"** (Phase 2)
+**M2 — "Compiled language"** (Phase 2) ✅
 
 > Phoenix produces native binaries and WASM. Module system with `public`/private visibility enables multi-file projects. Performance becomes competitive with Go.
 
@@ -67,10 +69,10 @@ CI pipeline, type registries exposed, and expression types annotated.
 | 1–29 | Phase 1 (all items) | — | — | ✅ Done |
 | 30 | IR + Cranelift compilation | — | High | ✅ Done |
 | 30a | Tracing GC + `defer` + runtime | Cranelift | High | ✅ Done |
-| 30b | Benchmark suite (GC + codegen baseline) | GC, Cranelift | Medium | 🔧 In Progress |
-| 31 | WebAssembly target | Cranelift, GC, Bench | Medium | |
+| 30b | Benchmark suite (GC + codegen baseline) | GC, Cranelift | Medium | ✅ Done |
+| 31 | WebAssembly target | Cranelift, GC, Bench | Medium | ✅ Done |
 | 32 | Module system and visibility (`public`/private) | Semantic analysis | High | ✅ Done |
-| 33 | JavaScript interop | WASM, Package manager | High | |
+| 33 | JavaScript interop | WASM | High | ✅ Done |
 | 34 | Package manager | Compilation, modules | Medium | |
 | 35 | LSP + VS Code extension | Modules | High | |
 | 36 | Formatter | Parser | Small | |
