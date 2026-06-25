@@ -4,14 +4,28 @@
 //! providing default values for the `gen` subcommand so that users
 //! don't need to pass `--target`, `--out`, etc. every time.
 
+use crate::manifest::{Dependency, ManifestError, PackageConfig, parse_dependency};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Top-level `phoenix.toml` configuration.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhoenixConfig {
+    /// Package metadata (`[package]` section). Present for any project that
+    /// declares dependencies or is itself a depend-able package; absent for a
+    /// bare `[gen]`-only schema project.
+    pub package: Option<PackageConfig>,
+    /// Declared dependencies (`[dependencies]` section), as raw TOML values so
+    /// the source kind (git / path / reserved registry string) can be validated
+    /// with precise diagnostics by [`PhoenixConfig::dependencies`] rather than
+    /// the generic serde "did not match any variant" message. Read through the
+    /// validating [`PhoenixConfig::dependencies`] accessor rather than this raw
+    /// field, which is `pub(crate)` only so deserialization and tests can reach
+    /// it.
+    #[serde(default, rename = "dependencies")]
+    pub(crate) raw_dependencies: BTreeMap<String, toml::Value>,
     /// Code generation configuration (`[gen]` section).
     #[serde(default, rename = "gen")]
     pub codegen: GenConfig,
@@ -174,6 +188,12 @@ pub enum ConfigError {
     /// `clippy::result_large_err` threshold unboxed on some targets
     /// (notably windows-msvc).
     ParseError(PathBuf, Box<toml::de::Error>),
+    /// The TOML parsed, but the manifest failed semantic validation
+    /// (invalid `[package]` metadata or a malformed dependency source).
+    /// `ManifestError` is boxed for the same reason as `ParseError` above:
+    /// keep `ConfigError` (and the `Result`s carrying it) under the
+    /// `clippy::result_large_err` threshold.
+    ManifestError(PathBuf, Box<ManifestError>),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -184,6 +204,9 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::ParseError(path, e) => {
                 write!(f, "invalid config in '{}': {}", path.display(), e)
+            }
+            ConfigError::ManifestError(path, e) => {
+                write!(f, "invalid manifest in '{}': {}", path.display(), e)
             }
         }
     }
@@ -196,21 +219,63 @@ impl PhoenixConfig {
     /// Returns `Ok(None)` if no config file is found (the normal case for
     /// projects that don't use a config file).
     pub fn find_and_load(start_dir: &Path) -> Result<Option<Self>, ConfigError> {
+        Ok(Self::find_with_path(start_dir)?.map(|(config, _path)| config))
+    }
+
+    /// Like [`find_and_load`](Self::find_and_load) but also returns the path of
+    /// the `phoenix.toml` that was loaded, so callers can resolve relative
+    /// `path` dependencies and write back the lockfile beside it.
+    pub fn find_with_path(start_dir: &Path) -> Result<Option<(Self, PathBuf)>, ConfigError> {
         let mut dir = start_dir.to_path_buf();
         loop {
             let candidate = dir.join("phoenix.toml");
             if candidate.is_file() {
-                let contents = std::fs::read_to_string(&candidate)
-                    .map_err(|e| ConfigError::ReadError(candidate.clone(), e))?;
-                let config: PhoenixConfig = toml::from_str(&contents)
-                    .map_err(|e| ConfigError::ParseError(candidate, Box::new(e)))?;
-                return Ok(Some(config));
+                let config = Self::load_file(&candidate)?;
+                return Ok(Some((config, candidate)));
             }
             if !dir.pop() {
                 break;
             }
         }
         Ok(None)
+    }
+
+    /// Loads, parses, and validates a specific `phoenix.toml` file.
+    ///
+    /// Beyond raw TOML parsing this runs [`PackageConfig::validate`] and
+    /// [`PhoenixConfig::dependencies`] so a malformed manifest (bad semver,
+    /// conflicting dependency source, etc.) is rejected here rather than
+    /// staying latent until a downstream consumer happens to look.
+    pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::ReadError(path.to_path_buf(), e))?;
+        let config: PhoenixConfig = toml::from_str(&contents)
+            .map_err(|e| ConfigError::ParseError(path.to_path_buf(), Box::new(e)))?;
+        config.validate_manifest(path)?;
+        Ok(config)
+    }
+
+    /// Runs semantic validation over the parsed manifest: `[package]`
+    /// metadata and every `[dependencies]` source. Maps the first
+    /// [`ManifestError`] to a [`ConfigError`] carrying `path` for context.
+    fn validate_manifest(&self, path: &Path) -> Result<(), ConfigError> {
+        let to_config_err = |e| ConfigError::ManifestError(path.to_path_buf(), Box::new(e));
+        if let Some(pkg) = &self.package {
+            pkg.validate().map_err(to_config_err)?;
+        }
+        self.dependencies().map_err(to_config_err)?;
+        Ok(())
+    }
+
+    /// Validates and returns the declared dependencies as typed [`Dependency`]
+    /// values, keyed by dependency name. Returns the first [`ManifestError`]
+    /// encountered (bare registry string, missing/conflicting source, etc.).
+    pub fn dependencies(&self) -> Result<BTreeMap<String, Dependency>, ManifestError> {
+        let mut out = BTreeMap::new();
+        for (name, value) in &self.raw_dependencies {
+            out.insert(name.clone(), parse_dependency(name, value)?);
+        }
+        Ok(out)
     }
 }
 
@@ -489,5 +554,188 @@ target = "go"
         let config = PhoenixConfig::find_and_load(&dir).unwrap().unwrap();
         assert_eq!(config.codegen.target.as_deref(), Some("python"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── [package] + [dependencies] schema ──────────────────
+
+    #[test]
+    fn parse_package_section() {
+        let config: PhoenixConfig = toml::from_str(
+            r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+description = "An example"
+authors = ["Ada <ada@example.com>"]
+license = "MIT"
+"#,
+        )
+        .unwrap();
+        let pkg = config.package.as_ref().expect("package present");
+        assert_eq!(pkg.name, "my-app");
+        assert_eq!(pkg.version, "0.1.0");
+        assert_eq!(pkg.description.as_deref(), Some("An example"));
+        assert_eq!(
+            pkg.authors.as_deref(),
+            Some(&["Ada <ada@example.com>".to_string()][..])
+        );
+        assert_eq!(pkg.license.as_deref(), Some("MIT"));
+        pkg.validate().expect("valid package");
+    }
+
+    #[test]
+    fn package_and_gen_coexist() {
+        // The [gen] section must keep parsing alongside [package]/[dependencies].
+        let config: PhoenixConfig = toml::from_str(
+            r#"
+[package]
+name = "svc"
+version = "1.0.0"
+
+[dependencies]
+util = { path = "../util" }
+
+[gen]
+schema = "api.phx"
+target = "go"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.package.as_ref().unwrap().name, "svc");
+        assert_eq!(config.codegen.target.as_deref(), Some("go"));
+        let deps = config.dependencies().unwrap();
+        assert!(deps.contains_key("util"));
+    }
+
+    #[test]
+    fn package_missing_name_is_parse_error() {
+        let result: Result<PhoenixConfig, _> = toml::from_str("[package]\nversion = \"1.0.0\"\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn package_unknown_field_rejected() {
+        let result: Result<PhoenixConfig, _> =
+            toml::from_str("[package]\nname = \"x\"\nversion = \"1.0.0\"\nfoo = 1\n");
+        assert!(result.is_err());
+    }
+
+    // Exhaustive `parse_dependency` and `PackageConfig::validate` cases live in
+    // `manifest.rs`; these tests cover only the wiring from a parsed
+    // `PhoenixConfig` through `dependencies()` and `load_file` validation.
+
+    #[test]
+    fn dependencies_method_maps_raw_values_to_typed() {
+        let config: PhoenixConfig = toml::from_str(
+            r#"
+[dependencies]
+http = { git = "https://example.com/http.git", tag = "v1.2.3" }
+util = { path = "../util" }
+"#,
+        )
+        .unwrap();
+        let deps = config.dependencies().unwrap();
+        assert_eq!(
+            deps["http"],
+            Dependency::Git {
+                url: "https://example.com/http.git".to_string(),
+                reference: crate::manifest::GitRef::Tag("v1.2.3".to_string()),
+            }
+        );
+        assert_eq!(
+            deps["util"],
+            Dependency::Path {
+                path: "../util".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn dependencies_method_surfaces_first_error() {
+        let config: PhoenixConfig =
+            toml::from_str("[dependencies]\nx = { git = \"u\", path = \"p\" }\n").unwrap();
+        assert!(matches!(
+            config.dependencies().unwrap_err(),
+            ManifestError::ConflictingSource { .. }
+        ));
+    }
+
+    #[test]
+    fn load_file_rejects_invalid_package_version() {
+        // Validation must fire at load time, not stay latent until a consumer
+        // happens to call `validate()`.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("phoenix.toml");
+        std::fs::write(&path, "[package]\nname = \"x\"\nversion = \"nope\"\n").unwrap();
+        let err = PhoenixConfig::load_file(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ManifestError(_, inner)
+                if matches!(*inner, ManifestError::InvalidPackageVersion(..))
+        ));
+    }
+
+    #[test]
+    fn load_file_rejects_malformed_dependency() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("phoenix.toml");
+        std::fs::write(&path, "[dependencies]\nx = { git = \"u\", path = \"p\" }\n").unwrap();
+        let err = PhoenixConfig::load_file(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ManifestError(_, inner)
+                if matches!(*inner, ManifestError::ConflictingSource { .. })
+        ));
+    }
+
+    #[test]
+    fn load_file_accepts_gen_only_manifest() {
+        // The common existing case: a schema-only project with no [package]
+        // and no [dependencies]. Manifest validation must accept it (nothing
+        // to validate) rather than a future `validate_manifest` change
+        // accidentally rejecting a package-less config.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("phoenix.toml");
+        std::fs::write(&path, "[gen]\nschema = \"api.phx\"\ntarget = \"go\"\n").unwrap();
+        let config = PhoenixConfig::load_file(&path).expect("gen-only manifest loads");
+        assert!(config.package.is_none());
+        assert!(config.dependencies().unwrap().is_empty());
+        assert_eq!(config.codegen.target.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn find_with_path_walks_up_and_returns_manifest_path() {
+        // The config lives at an ancestor of the start dir; `find_with_path`
+        // must walk up to it and return that file's path (so callers can
+        // resolve relative `path` deps and write the lockfile beside it).
+        let root = tempfile::tempdir().expect("create tempdir");
+        let manifest = root.path().join("phoenix.toml");
+        std::fs::write(&manifest, "[package]\nname = \"x\"\nversion = \"1.0.0\"\n").unwrap();
+        let nested = root.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let (config, found) = PhoenixConfig::find_with_path(&nested)
+            .expect("load succeeds")
+            .expect("manifest found");
+        assert_eq!(config.package.as_ref().unwrap().name, "x");
+        // Canonicalize both sides: tempdirs on macOS resolve through /private.
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&manifest).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_with_path_returns_none_when_absent() {
+        // No `phoenix.toml` anywhere up the walk → `Ok(None)`, the normal case
+        // for projects that don't use a config file.
+        let root = tempfile::tempdir().expect("create tempdir");
+        let nested = root.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(
+            PhoenixConfig::find_with_path(&nested)
+                .expect("walk succeeds")
+                .is_none()
+        );
     }
 }

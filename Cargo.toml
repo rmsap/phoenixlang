@@ -58,6 +58,12 @@ serde_json = "1"
 # Configuration
 toml = "0.8"
 
+# Package manager. `semver` validates `[package] version` and
+# (later) solves dependency version constraints. `toml_edit` (format-preserving
+# `phoenix.toml` edits for `phoenix add`) and `git2` (cloning git-sourced
+# dependencies) are added alongside the resolver/`add` code that uses them.
+semver = "1"
+
 # Native code generation
 cranelift-codegen = "0.116"
 cranelift-frontend = "0.116"

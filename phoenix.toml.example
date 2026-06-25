@@ -1,8 +1,41 @@
 # Phoenix project configuration.
 #
-# Copy this file to phoenix.toml in your project root to configure
-# `phoenix gen` defaults. Run `phoenix gen` with no arguments to
-# generate code using these settings.
+# Copy this file to phoenix.toml in your project root. The [gen] section
+# configures `phoenix gen` defaults. The [package] and [dependencies]
+# sections declare the package-manager manifest: they are
+# parsed and validated today, but resolving and building against
+# dependencies is wired into `phoenix build`/`run`/`check` in a later
+# step.
+
+# ── Package metadata ───────────────────────────────────────────
+# Identifies this package so it can be depended upon (and, eventually,
+# published). When present, `name` and `version` (semver) are required and
+# the rest are optional. Uncomment this section to make the project a
+# depend-able package; leave it commented for a schema-only project that
+# just uses [gen].
+#
+# [package]
+# name = "my-app"
+# version = "0.1.0"
+# description = "An example Phoenix package"
+# authors = ["Ada <ada@example.com>"]
+# license = "MIT"
+
+# ── Dependencies ───────────────────────────────────────────────
+# Each dependency is a git source or a local path source. An import's
+# first path segment is matched against these names first, then local
+# modules (a local module colliding with a dependency name is an error).
+# A bare version string (e.g. `http = "^1.2"`) is reserved for a future
+# registry and currently errors with "no registry configured".
+#
+# [dependencies]
+# # Git source — pin with exactly one of tag / rev / branch (or omit for
+# # the remote's default branch). The resolved commit is recorded in
+# # phoenix.lock so builds are reproducible.
+# http = { git = "https://github.com/example/phoenix-http.git", tag = "v1.2.3" }
+# # Local path source — relative to this file's directory. Resolves in
+# # place and is never SHA-pinned; ideal for monorepos and local dev.
+# util = { path = "../util" }
 
 [gen]
 # Path to your .phx schema file.

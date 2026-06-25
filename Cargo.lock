@@ -1233,6 +1233,7 @@ dependencies = [
  "phoenix-modules",
  "phoenix-parser",
  "phoenix-sema",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
