@@ -213,6 +213,16 @@ pub struct Interpreter {
     /// Keyed by the lambda's source span.
     pub(crate) lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
 
+    /// Spans of namespace calls (`lib.func(...)`) that sema resolved,
+    /// drained from sema's `Analysis`. The tree-walk interpreter does not
+    /// yet execute namespace calls (the receiver is a namespace, not a
+    /// value) — that execution support is the staged "I2" follow-up. Until
+    /// then [`Interpreter::eval_method_call`] consults this set to fail
+    /// with a clear, named error rather than the misleading "undefined
+    /// variable" that lowering the namespace receiver would otherwise
+    /// produce. Empty for single-file inputs without sema metadata.
+    pub(crate) namespace_call_targets: HashMap<Span, String>,
+
     /// Per-module visibility scopes (drained from sema's `Analysis`).
     /// Used by [`Interpreter::qualify`] to translate user-source bare
     /// names into qualified registry keys (mirrors what the IR layer
@@ -319,6 +329,7 @@ impl Interpreter {
             pending_control_flow: None,
             last_return_was_explicit: false,
             lambda_captures: HashMap::new(),
+            namespace_call_targets: HashMap::new(),
             output,
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),
@@ -1508,6 +1519,23 @@ impl Interpreter {
     /// Evaluates a method call, dispatching to built-in type methods or
     /// user-defined methods.
     fn eval_method_call(&mut self, mc: &MethodCallExpr) -> Result<Value> {
+        // Namespace call (`lib.func(...)`) resolved by sema but not yet
+        // executable: the receiver is a namespace, not a value, so the
+        // execution side is the staged "I2" follow-up. Fail with a named
+        // error rather than falling through to evaluate the namespace
+        // receiver, which would report a misleading "undefined variable".
+        // See docs/known-issues.md and design-decisions.md (Decision 5).
+        if self.namespace_call_targets.contains_key(&mc.span) {
+            let receiver = match &mc.object {
+                Expr::Ident(id) => id.name.as_str(),
+                _ => "<namespace>",
+            };
+            return error(format!(
+                "namespace call `{}.{}(...)` type-checks but is not executable yet — \
+                 namespace-call execution lands in the I2 follow-up (see docs/known-issues.md)",
+                receiver, mc.method,
+            ));
+        }
         // Recognize the builtin static constructors `List.builder()` and
         // `Map.builder()` before evaluating the object. The parser models
         // `Type.method(...)` as a method call with `object: Ident("Type")`;
@@ -3374,8 +3402,7 @@ function main() {
         let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
         let writer = SharedWriter(buffer.clone());
         let mut interpreter = Interpreter::with_output(Box::new(writer));
-        interpreter.lambda_captures = std::mem::take(&mut analysis.module.lambda_captures);
-        interpreter.module_scopes = std::mem::take(&mut analysis.module.module_scopes);
+        interpreter.seed_from_resolved(&mut analysis.module);
         interpreter
             .run_modules_inner(&modules)
             .expect("runtime error");
@@ -3384,6 +3411,59 @@ function main() {
             .lines()
             .map(String::from)
             .collect()
+    }
+
+    /// Namespace calls (`lib.func(...)`) type-check but the tree-walk
+    /// interpreter cannot execute them yet — the receiver is a namespace,
+    /// not a value, so execution is the staged "I2" follow-up. Pin that the
+    /// guard in `eval_method_call` (keyed on the drained
+    /// `namespace_call_targets`) fails with a clear, named error rather than
+    /// the misleading "undefined variable `lib`" that evaluating the
+    /// namespace receiver would otherwise produce. Goes through the public
+    /// `run_modules` entry so the drain is exercised end to end. Remove or
+    /// flip this test when I2 lands.
+    #[test]
+    fn namespace_call_execution_is_staged_until_i2() {
+        use phoenix_modules::{ModulePath, ResolvedSourceModule};
+        use std::path::PathBuf;
+        let mk = |path: ModulePath, src: &str, id: SourceId, is_entry: bool| {
+            let tokens = tokenize(src, id);
+            let (program, errs) = parser::parse(&tokens);
+            assert!(errs.is_empty(), "parse errors: {:?}", errs);
+            ResolvedSourceModule {
+                module_path: path,
+                source_id: id,
+                program,
+                is_entry,
+                file_path: PathBuf::from("<test>"),
+            }
+        };
+        let entry = mk(
+            ModulePath::entry(),
+            "import lib\nfunction main() { lib.shout() }",
+            SourceId(0),
+            true,
+        );
+        let lib = mk(
+            ModulePath(vec!["lib".to_string()]),
+            "public function shout() -> String { \"hi\" }",
+            SourceId(1),
+            false,
+        );
+        let modules = [entry, lib];
+        let mut analysis = phoenix_sema::checker::check_modules(&modules);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "namespace call should type-check; sema diagnostics: {:?}",
+            analysis.diagnostics
+        );
+        let err =
+            run_modules(&modules, &mut analysis).expect_err("namespace call must not execute yet");
+        assert!(
+            err.message.contains("not executable yet"),
+            "expected the staged I2 error, got: {}",
+            err.message
+        );
     }
 
     /// Like [`run_modules_capturing`], but registers host-FFI bindings (built
@@ -3419,8 +3499,7 @@ function main() {
         let buffer = Rc::new(RefCell::new(Vec::<u8>::new()));
         let writer = SharedWriter(buffer.clone());
         let mut interpreter = Interpreter::with_output(Box::new(writer));
-        interpreter.lambda_captures = std::mem::take(&mut analysis.module.lambda_captures);
-        interpreter.module_scopes = std::mem::take(&mut analysis.module.module_scopes);
+        interpreter.seed_from_resolved(&mut analysis.module);
         register(&mut interpreter);
         interpreter.run_modules_inner(&modules)?;
         let bytes = buffer.borrow();

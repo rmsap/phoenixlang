@@ -70,6 +70,34 @@ pub(crate) struct ModuleScope {
     /// "name not in scope" by callers (typically via the bodied
     /// `lookup_*` helpers).
     pub visible_symbols: HashMap<String, String>,
+    /// `local_name → namespace target` for namespace imports
+    /// (`import a.b` / `import a.b as c` / `import json`). Distinct from
+    /// [`Self::visible_symbols`]: a namespace name is neither a value nor
+    /// a type — it only legalizes qualified calls `name.func(...)`,
+    /// dispatched in [`crate::check_expr_call`]. Empty for modules that
+    /// use only destructuring imports.
+    pub namespaces: HashMap<String, NamespaceTarget>,
+}
+
+/// What a namespace-import local name resolves to. Cloned out of the
+/// module scope at each `ns.func(...)` call site (see
+/// [`Checker::namespace_target`]).
+#[derive(Debug, Clone)]
+pub(crate) enum NamespaceTarget {
+    /// `import models.user` → the resolved source module whose public
+    /// functions are reachable as `user.func(...)`.
+    UserModule(ModulePath),
+    /// `import json` → a compiler-intrinsic namespace with synthesized
+    /// members (no source file).
+    Intrinsic(IntrinsicNs),
+}
+
+/// The set of compiler-intrinsic namespaces. Today only `json`
+/// (Phase 4.6); future stdlib intrinsics extend this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntrinsicNs {
+    /// The `json` namespace: `json.encode` / `json.decode`.
+    Json,
 }
 
 /// One enum visible in the current module's scope that owns the
@@ -92,6 +120,12 @@ impl ModuleScope {
     /// then imports (which can override builtins by alias).
     pub(crate) fn insert(&mut self, local_name: String, qualified_key: String) {
         self.visible_symbols.insert(local_name, qualified_key);
+    }
+
+    /// Insert a namespace binding (`import a.b` / `import json`). Silently
+    /// overwrites a prior binding under the same local name.
+    pub(crate) fn insert_namespace(&mut self, local_name: String, target: NamespaceTarget) {
+        self.namespaces.insert(local_name, target);
     }
 }
 
@@ -237,6 +271,15 @@ impl Checker {
     pub(crate) fn resolve_visible(&self, local_name: &str) -> Option<&str> {
         let scope = self.module_scopes.get(&self.current_module)?;
         scope.visible_symbols.get(local_name).map(|s| s.as_str())
+    }
+
+    /// Resolve a namespace-import local name (`json`, `user`) in the
+    /// current module's scope to its target, cloned so callers can drop
+    /// the `module_scopes` borrow before dispatching. Returns `None` when
+    /// the name is not a namespace binding here.
+    pub(crate) fn namespace_target(&self, local_name: &str) -> Option<NamespaceTarget> {
+        let scope = self.module_scopes.get(&self.current_module)?;
+        scope.namespaces.get(local_name).cloned()
     }
 
     /// Canonicalize a possibly-bare-or-qualified name to the key the

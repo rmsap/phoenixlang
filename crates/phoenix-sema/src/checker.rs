@@ -727,6 +727,13 @@ pub struct Checker {
     /// Concrete type arguments inferred at each generic function call site,
     /// keyed by the call expression's source span.
     pub(crate) call_type_args: HashMap<Span, Vec<Type>>,
+    /// Resolved target for each namespace call (`ns.func(...)`), keyed by
+    /// the `MethodCallExpr`'s source span. For a user-module namespace the
+    /// value is the callee's qualified key (e.g. `"models.user::createUser"`),
+    /// which IR lowering maps to a `FuncId`. Intrinsic namespaces (`json`)
+    /// do not record here — they dispatch to synthesized builtins by method
+    /// name. See [`ResolvedModule::namespace_call_targets`].
+    pub(crate) namespace_call_targets: HashMap<Span, String>,
     /// Resolved annotation type for each `let`-with-annotation, keyed by
     /// the `VarDecl`'s source span. See
     /// [`ResolvedModule::var_annotation_types`].
@@ -768,6 +775,17 @@ pub struct Checker {
     /// module-qualified table key. See
     /// [`crate::module_scope::ModuleScope`].
     pub(crate) module_scopes: HashMap<ModulePath, crate::module_scope::ModuleScope>,
+    /// Per-module local names introduced by an `import`, with the span of
+    /// the *first* import to bind each. Populated during import resolution
+    /// (Phase B) by [`Checker::register_import_local`] to reject duplicate
+    /// imports that bind the same local name across any import forms
+    /// (`import a.user` + `import b.user`, `import x { foo }` +
+    /// `import y { foo }`, namespace-vs-named, …). Kept apart from
+    /// [`crate::module_scope::ModuleScope::visible_symbols`], which Phase A
+    /// pre-seeds with own-module decls and builtins — so presence there
+    /// can't distinguish an import-introduced name from a coincidental
+    /// match.
+    pub(crate) import_local_spans: HashMap<ModulePath, HashMap<String, Span>>,
     /// Bare names of every builtin currently registered in the symbol
     /// tables. Captured once after [`crate::check_register::Checker::register_builtins`]
     /// (via [`Self::snapshot_builtin_names`]) so per-module scope
@@ -821,6 +839,7 @@ impl Checker {
             expr_types: HashMap::new(),
             symbol_references: HashMap::new(),
             call_type_args: HashMap::new(),
+            namespace_call_targets: HashMap::new(),
             var_annotation_types: HashMap::new(),
             next_func_id: 0,
             user_method_offset: 0,
@@ -828,6 +847,7 @@ impl Checker {
             pending_user_method_ids: HashMap::new(),
             current_module: ModulePath::entry(),
             module_scopes: HashMap::new(),
+            import_local_spans: HashMap::new(),
             builtin_local_names: std::collections::HashSet::new(),
         }
     }

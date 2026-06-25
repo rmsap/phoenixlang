@@ -228,6 +228,16 @@ pub struct ResolvedModule {
     // assigned at parse time; see docs/known-issues.md and the
     // doc-comment above for the rationale.
     pub call_type_args: HashMap<Span, Vec<Type>>,
+    /// Resolved callee key for each namespace call (`ns.func(...)`),
+    /// keyed by the `MethodCallExpr`'s source span. For a user-module
+    /// namespace the value is the callee's qualified key (e.g.
+    /// `"models.user::createUser"`); IR lowering maps it to the target
+    /// `FuncId`. Intrinsic-namespace calls (`json.encode`) are absent —
+    /// they lower to synthesized builtins keyed by method name.
+    ///
+    /// Shares the [`Span`]-keying caveat noted on
+    /// [`Self::call_type_args`].
+    pub namespace_call_targets: HashMap<Span, String>,
     /// Resolved type annotation for each `let` binding that carried
     /// one, keyed by the `VarDecl`'s source span. Absent entries mean
     /// the binding was unannotated.
@@ -683,6 +693,7 @@ pub(crate) fn build_from_checker(program: &Program, mut checker: Checker) -> Ana
     // ── Per-span maps onto ResolvedModule: move, don't clone.
     rm.expr_types = std::mem::take(&mut checker.expr_types);
     rm.call_type_args = std::mem::take(&mut checker.call_type_args);
+    rm.namespace_call_targets = std::mem::take(&mut checker.namespace_call_targets);
     rm.var_annotation_types = std::mem::take(&mut checker.var_annotation_types);
     rm.lambda_captures = std::mem::take(&mut checker.lambda_captures);
     // ── Module-scope handoff: flatten ModuleScope into a plain
@@ -727,6 +738,7 @@ fn empty_resolved_module() -> ResolvedModule {
         trait_by_name: HashMap::new(),
         expr_types: HashMap::new(),
         call_type_args: HashMap::new(),
+        namespace_call_targets: HashMap::new(),
         var_annotation_types: HashMap::new(),
         lambda_captures: HashMap::new(),
         module_scopes: HashMap::new(),

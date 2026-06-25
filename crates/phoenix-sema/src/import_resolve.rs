@@ -11,11 +11,12 @@
 use std::collections::HashMap;
 
 use phoenix_common::diagnostics::Diagnostic;
-use phoenix_common::module_path::{ModulePath, module_qualify};
+use phoenix_common::module_path::{ModulePath, is_intrinsic_namespace, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{Declaration, ImportDecl, ImportItems, Program, Visibility};
 
 use crate::checker::Checker;
+use crate::module_scope::{IntrinsicNs, NamespaceTarget};
 
 /// One AST decl matched by [`Checker::collect_named_import_matches`],
 /// used to drive both single-match resolution and the cross-namespace
@@ -61,6 +62,14 @@ impl Checker {
             let importer_path = module.module_path.clone();
             for decl in &module.program.declarations {
                 if let Declaration::Import(imp) = decl {
+                    // Compiler-intrinsic namespaces (`import json`) have no
+                    // target AST — the resolver skipped them (so they never
+                    // appear in `import_targets` either). Bind them directly
+                    // and move on.
+                    if is_intrinsic_namespace(&imp.path) {
+                        self.resolve_intrinsic_import(&importer_path, imp);
+                        continue;
+                    }
                     // Use the resolver-provided cross-package target identity
                     // (e.g. a dependency's verbatim `import helpers` → the
                     // package-qualified `greet.helpers`). For a single-package
@@ -114,7 +123,12 @@ impl Checker {
                     let local_name = item.alias.as_deref().unwrap_or(&item.name).to_string();
                     match resolution {
                         Ok(()) => {
-                            self.insert_into_scope(importer_path, local_name, qualified_target);
+                            self.insert_into_scope(
+                                importer_path,
+                                local_name,
+                                qualified_target,
+                                item.span,
+                            );
                         }
                         Err(ImportResolveError::NotFound) => {
                             self.diagnostics.push(Diagnostic::error(
@@ -142,20 +156,167 @@ impl Checker {
             ImportItems::Wildcard => {
                 // Enumerate every public named decl in the target
                 // module's AST and insert each under its bare name.
+                // Wildcard members share the import's span — the source
+                // has no per-name token to point at. A single wildcard can
+                // collide on many names at once (e.g. the same module
+                // wildcard-imported twice), so report the collision once
+                // per import statement, not once per name, while still
+                // binding the names that don't collide.
                 let exported = Self::collect_public_items_from_ast(target_path, target_program);
+                let mut reported_duplicate = false;
                 for (bare, qualified) in exported {
-                    self.insert_into_scope(importer_path, bare, qualified);
+                    match self.note_import_local(importer_path, &bare, imp.span) {
+                        None => self.insert_scope_symbol(importer_path, bare, qualified),
+                        Some(first_span) => {
+                            if !reported_duplicate {
+                                self.emit_duplicate_import(&bare, imp.span, first_span);
+                                reported_duplicate = true;
+                            }
+                        }
+                    }
                 }
             }
-            ImportItems::Namespace { .. } => {
-                // Namespace imports (`import a.b` / `import a.b as c`) bind the
-                // module itself as a qualified namespace rather than pulling
-                // individual names into scope. Binding + `ns.func(...)`
-                // dispatch land in the follow-up PR (Phase 4 imports I1); the
-                // syntax already parses and triggers file discovery via the
-                // resolver, so this arm is intentionally a no-op for now.
+            ImportItems::Namespace { alias } => {
+                // `import a.b` / `import a.b as c` — bind the module itself
+                // as a namespace under its last segment (or the alias).
+                // Per-member visibility is enforced per-call at the
+                // dispatch site, not here.
+                let local = Self::namespace_local_name(imp, alias.as_deref());
+                self.bind_namespace(
+                    importer_path,
+                    local,
+                    NamespaceTarget::UserModule(target_path.clone()),
+                    imp.span,
+                );
             }
         }
+    }
+
+    /// Resolve a compiler-intrinsic namespace import (`import json`).
+    /// The namespace form binds the intrinsic; destructuring/wildcard
+    /// forms of an intrinsic are not yet supported (their members are
+    /// synthesized by the JSON serialization work).
+    fn resolve_intrinsic_import(&mut self, importer_path: &ModulePath, imp: &ImportDecl) {
+        // Today the only intrinsic namespace is `json`.
+        match &imp.items {
+            ImportItems::Namespace { alias } => {
+                let local = Self::namespace_local_name(imp, alias.as_deref());
+                self.bind_namespace(
+                    importer_path,
+                    local,
+                    NamespaceTarget::Intrinsic(IntrinsicNs::Json),
+                    imp.span,
+                );
+            }
+            ImportItems::Named(_) | ImportItems::Wildcard => {
+                self.diagnostics.push(Diagnostic::error(
+                    "destructuring import of `json` members is not available yet — \
+                     use `import json` and call `json.encode(...)` / `json.decode(...)`",
+                    imp.span,
+                ));
+            }
+        }
+    }
+
+    /// The local name a namespace import binds: the explicit `as` alias,
+    /// else the last segment of the dotted path.
+    fn namespace_local_name(imp: &ImportDecl, alias: Option<&str>) -> String {
+        alias
+            .map(str::to_string)
+            .or_else(|| imp.path.last().cloned())
+            .expect("namespace import path has at least one segment (parser guarantees it)")
+    }
+
+    /// Insert a namespace binding into the importer module's scope.
+    /// Phase A always builds the scope first, so an absent scope is an
+    /// invariant violation (mirrors [`Self::insert_into_scope`]).
+    /// A duplicate local name (already bound by another import in this
+    /// module) is rejected and not bound — see [`Self::register_import_local`].
+    fn bind_namespace(
+        &mut self,
+        importer_path: &ModulePath,
+        local_name: String,
+        target: NamespaceTarget,
+        span: Span,
+    ) {
+        if !self.register_import_local(importer_path, &local_name, span) {
+            return;
+        }
+        self.module_scopes
+            .get_mut(importer_path)
+            .expect("module scope must be built in Phase A before Phase B binds namespaces")
+            .insert_namespace(local_name, target);
+    }
+
+    /// Record that an `import` in `importer_path` binds `local_name` (at
+    /// `span`), returning `true` when this is the first import to do so —
+    /// the caller then commits the binding. Returns `false` and emits a
+    /// duplicate-import diagnostic when a prior import in the same module
+    /// already bound the name; the first import wins and the caller skips.
+    ///
+    /// All import forms funnel through here (named, wildcard, namespace,
+    /// intrinsic), so two imports binding the same local name — of any
+    /// forms — are caught uniformly. The check can't piggyback on
+    /// `visible_symbols`: Phase A pre-seeds it with own-module decls and
+    /// builtins, so presence there can't tell an import-introduced name
+    /// from a coincidental match.
+    fn register_import_local(
+        &mut self,
+        importer_path: &ModulePath,
+        local_name: &str,
+        span: Span,
+    ) -> bool {
+        match self.note_import_local(importer_path, local_name, span) {
+            Some(first_span) => {
+                self.emit_duplicate_import(local_name, span, first_span);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Lower-level half of [`Self::register_import_local`]: record that
+    /// `local_name` is bound by an import in `importer_path` (at `span`).
+    /// Returns `None` when this is the first binding (now recorded), or
+    /// `Some(first_span)` — the span of the earlier import that already
+    /// bound it — on collision, *without* emitting a diagnostic. Callers
+    /// that bind many names at once (wildcard imports) use this to report
+    /// the collision once per import statement rather than once per name.
+    fn note_import_local(
+        &mut self,
+        importer_path: &ModulePath,
+        local_name: &str,
+        span: Span,
+    ) -> Option<Span> {
+        if let Some(first_span) = self
+            .import_local_spans
+            .get(importer_path)
+            .and_then(|m| m.get(local_name))
+            .copied()
+        {
+            return Some(first_span);
+        }
+        self.import_local_spans
+            .entry(importer_path.clone())
+            .or_default()
+            .insert(local_name.to_string(), span);
+        None
+    }
+
+    /// Emit the duplicate-import diagnostic: `local_name` was already
+    /// bound at `first_span` and the import at `span` collides. Carries a
+    /// note (first import) and an `as`-rename suggestion.
+    fn emit_duplicate_import(&mut self, local_name: &str, span: Span, first_span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!("`{local_name}` is already imported in this module"),
+                span,
+            )
+            .with_note(first_span, "first imported here")
+            .with_suggestion(format!(
+                "rename one import with `as` to bind `{local_name}` under a distinct name"
+            )),
+        );
     }
 
     /// Walk the target module's AST and collect every declaration that
@@ -274,7 +435,29 @@ impl Checker {
     /// the scope must already exist; an absent scope is a real
     /// invariant violation and we surface it via `expect` rather than
     /// silently creating a fresh one (which would mask the bug).
+    /// A duplicate local name (already bound by another import in this
+    /// module) is rejected and not inserted — see
+    /// [`Self::register_import_local`].
     fn insert_into_scope(
+        &mut self,
+        importer_path: &ModulePath,
+        local_name: String,
+        qualified_key: String,
+        span: Span,
+    ) {
+        if !self.register_import_local(importer_path, &local_name, span) {
+            return;
+        }
+        self.insert_scope_symbol(importer_path, local_name, qualified_key);
+    }
+
+    /// Commit `local_name → qualified_key` into the importer module's
+    /// scope, *without* the duplicate-import check (the caller has
+    /// already cleared it via [`Self::register_import_local`] or
+    /// [`Self::note_import_local`]). Phase A always builds the scope
+    /// first, so an absent scope is an invariant violation surfaced via
+    /// `expect` rather than masked by a silent insert.
+    fn insert_scope_symbol(
         &mut self,
         importer_path: &ModulePath,
         local_name: String,

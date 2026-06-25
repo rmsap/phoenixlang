@@ -64,6 +64,19 @@ impl Interpreter {
         phoenix_common::module_path::module_qualify(current_module, name)
     }
 
+    /// Seed the per-module metadata the interpreter consumes from sema's
+    /// resolved output, draining (`mem::take`) each map out of `resolved`
+    /// rather than cloning. Every `ResolvedModule` → `Interpreter` handoff
+    /// funnels through here so a newly added per-span map can't be wired
+    /// into one construction site and silently forgotten in another — the
+    /// multi-module runner, the host-FFI runner, and the test harnesses
+    /// all call it.
+    pub(crate) fn seed_from_resolved(&mut self, resolved: &mut phoenix_sema::ResolvedModule) {
+        self.lambda_captures = std::mem::take(&mut resolved.lambda_captures);
+        self.module_scopes = std::mem::take(&mut resolved.module_scopes);
+        self.namespace_call_targets = std::mem::take(&mut resolved.namespace_call_targets);
+    }
+
     /// Multi-module orchestration for [`run_modules`]. Registers every
     /// module's declarations under module-qualified keys (matching
     /// sema's `module_qualify`), then invokes `main` in the entry
@@ -260,8 +273,7 @@ pub fn run_modules_with_host(
     host_registry: phoenix_common::host::HostRegistry,
 ) -> std::result::Result<(), RuntimeError> {
     let mut interpreter = Interpreter::new();
-    interpreter.lambda_captures = std::mem::take(&mut analysis.module.lambda_captures);
-    interpreter.module_scopes = std::mem::take(&mut analysis.module.module_scopes);
+    interpreter.seed_from_resolved(&mut analysis.module);
     interpreter.host_registry = Rc::new(host_registry);
     interpreter.run_modules_inner(modules)
 }

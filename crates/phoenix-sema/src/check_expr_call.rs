@@ -1,8 +1,10 @@
 use crate::check_types::UnifyError;
 use crate::checker::{Checker, FunctionInfo};
+use crate::module_scope::{IntrinsicNs, NamespaceTarget};
 use crate::types::Type;
+use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
-use phoenix_parser::ast::{CallExpr, Expr, MethodCallExpr, StructLiteralExpr};
+use phoenix_parser::ast::{CallExpr, Expr, MethodCallExpr, StructLiteralExpr, Visibility};
 use std::collections::{HashMap, HashSet};
 
 /// Output of [`Checker::infer_and_check_call_generics`]:
@@ -106,6 +108,19 @@ impl Checker {
     /// methods for `List`, `String`, `Map`, `Option`, and `Result`, or looking
     /// up user-defined methods and trait-bounded methods.
     pub(crate) fn check_method_call(&mut self, mc: &MethodCallExpr) -> Type {
+        // Namespace calls (`json.encode(...)`, `user.createUser(...)`)
+        // dispatch before evaluating the object: the parser models them as
+        // a `MethodCallExpr` with `object: Ident("json"|"user")`, and
+        // evaluating that object as a value would hit "undefined variable".
+        // `check_namespace_call` skips when the name is shadowed by a local
+        // binding, so a `let json = …` falls through to the value path.
+        // It runs before the builtin-static carve-out below, so a module
+        // aliased to a builtin type name (`import x.List` → `List`) would
+        // win over `List.builder()`; that collision is purely theoretical
+        // (a namespace bound to the exact name `List`/`Map`) and left as-is.
+        if let Some(ty) = self.check_namespace_call(mc) {
+            return ty;
+        }
         // Recognize `List.builder()` /
         // `Map.builder()` before evaluating the object expression.
         // The parser models `Type.method(...)` as a method call with
@@ -546,6 +561,109 @@ impl Checker {
         Type::Error
     }
 
+    /// Dispatch a namespace call `name.method(args)` where `name` is a
+    /// namespace-import binding (`import models.user` / `import json`).
+    /// Returns `None` when `mc.object` is not an `Ident`, the name is
+    /// shadowed by a local value binding, or the name is not a namespace —
+    /// callers then fall through to the normal receiver-value path.
+    fn check_namespace_call(&mut self, mc: &MethodCallExpr) -> Option<Type> {
+        let Expr::Ident(id) = &mc.object else {
+            return None;
+        };
+        // A local binding of the same name shadows the namespace, exactly
+        // like the builtin-static-method carve-out. The value-receiver
+        // path then handles `name.method(...)` against that value's type.
+        if self.scopes.lookup(&id.name).is_some() {
+            return None;
+        }
+        match self.namespace_target(&id.name)? {
+            NamespaceTarget::UserModule(path) => {
+                Some(self.check_user_namespace_call(&id.name, &path, mc))
+            }
+            NamespaceTarget::Intrinsic(IntrinsicNs::Json) => {
+                Some(self.check_json_namespace_call(mc))
+            }
+        }
+    }
+
+    /// Type-check `user.func(args)` against a user-module namespace: the
+    /// callee must be a public function of the target module. Records the
+    /// resolved qualified key for IR lowering and validates args through
+    /// the shared function-call machinery (so generics, defaults, and
+    /// arity diagnostics all match a normal call).
+    fn check_user_namespace_call(
+        &mut self,
+        ns_name: &str,
+        path: &ModulePath,
+        mc: &MethodCallExpr,
+    ) -> Type {
+        let qualified = module_qualify(path, &mc.method);
+        let Some(func_info) = self.functions.get(&qualified).cloned() else {
+            self.error(
+                format!("module `{path}` has no function `{}`", mc.method),
+                mc.span,
+            );
+            // Surface errors inside the arguments too (matches the json
+            // arm); a missing callee shouldn't swallow a bad arg.
+            self.check_call_args(&mc.args);
+            return Type::Error;
+        };
+        // Cross-module access honors visibility — only `public` functions
+        // are reachable through a namespace (the 2.6 rule, applied here).
+        if func_info.visibility != Visibility::Public {
+            self.emit_private_access_diagnostic(
+                format!("function `{}` is private to module `{path}`", mc.method),
+                mc.span,
+                func_info.definition_span,
+                format!(
+                    "mark `{}` as `public` in `{path}` to call it as `{ns_name}.{}`",
+                    mc.method, mc.method,
+                ),
+            );
+            self.check_call_args(&mc.args);
+            return Type::Error;
+        }
+        // Hand off to IR lowering (I2): which `FuncId` this call targets.
+        // (No `record_reference` here: regular method calls don't record
+        // one either, and `MethodCallExpr` carries no span for the method
+        // name to anchor a precise reference — deferred with I2.)
+        self.namespace_call_targets.insert(mc.span, qualified);
+        // Validate arguments via the shared call machinery. A namespace
+        // call has no named args; we pass the arg slice directly rather
+        // than synthesizing (and cloning into) a `CallExpr`.
+        // Diagnostics show the source form (`user.add`, or the alias) — the
+        // internal `::`-qualified key never leaks into user-facing messages.
+        let display = format!("{ns_name}.{}", mc.method);
+        self.check_call_with_info(&display, &func_info, &mc.args, &[], mc.span)
+    }
+
+    /// Dispatch a `json.<method>(args)` intrinsic call. The `json`
+    /// namespace binds (Phase 4 imports), but its `encode`/`decode`
+    /// members are synthesized by the JSON serialization work (Phase 4.6)
+    /// and are not available yet.
+    fn check_json_namespace_call(&mut self, mc: &MethodCallExpr) -> Type {
+        self.error(
+            format!(
+                "`json.{}` is not available yet — JSON serialization lands in Phase 4.6",
+                mc.method
+            ),
+            mc.span,
+        );
+        // Still type-check the arguments so errors inside them surface.
+        self.check_call_args(&mc.args);
+        Type::Error
+    }
+
+    /// Type-check each argument expression for its side effects (surfacing
+    /// nested diagnostics) while discarding the resulting types. Used by the
+    /// namespace-call error paths, where the call itself already failed but
+    /// errors *inside* the arguments should still be reported.
+    fn check_call_args(&mut self, args: &[Expr]) {
+        for arg in args {
+            self.check_expr(arg);
+        }
+    }
+
     /// Recognize the static-method shape `TypeName.method(args)` for
     /// builtin types. Today only the builder
     /// constructors fire here (`List.builder()`, `Map.builder()`);
@@ -650,7 +768,13 @@ impl Checker {
                     crate::checker::SymbolKind::Function,
                     ident.name.clone(),
                 );
-                return self.check_call_with_info(&ident.name, &func_info, call);
+                return self.check_call_with_info(
+                    &ident.name,
+                    &func_info,
+                    &call.args,
+                    &call.named_args,
+                    call.span,
+                );
             }
 
             // `extern js` host function (Phase 2.5). Externs live in a separate
@@ -662,7 +786,13 @@ impl Checker {
                     crate::checker::SymbolKind::Function,
                     ident.name.clone(),
                 );
-                return self.check_call_with_info(&ident.name, &extern_info, call);
+                return self.check_call_with_info(
+                    &ident.name,
+                    &extern_info,
+                    &call.args,
+                    &call.named_args,
+                    call.span,
+                );
             }
 
             // Check if it's a variable with a function type
@@ -681,17 +811,25 @@ impl Checker {
 
     /// Validates a call against a known `FunctionInfo`, handling positional
     /// args, named args, and default parameter values.
+    ///
+    /// Takes the argument lists and call span as borrowed slices rather
+    /// than a `&CallExpr` so callers without a real `CallExpr` node —
+    /// namespace calls, which the parser models as a `MethodCallExpr` —
+    /// can reuse it without synthesizing (and deep-cloning into) one. The
+    /// callee expression is never consulted here.
     fn check_call_with_info(
         &mut self,
         func_name: &str,
         func_info: &FunctionInfo,
-        call: &CallExpr,
+        args: &[Expr],
+        named_args: &[(String, Expr)],
+        call_span: Span,
     ) -> Type {
         let total_params = func_info.params.len();
-        let positional_count = call.args.len();
-        let named_count = call.named_args.len();
+        let positional_count = args.len();
+        let named_count = named_args.len();
 
-        self.validate_named_args(func_name, func_info, call, positional_count);
+        self.validate_named_args(func_name, func_info, named_args, positional_count);
 
         // Positional args must not exceed total params
         if positional_count > total_params {
@@ -700,7 +838,7 @@ impl Checker {
                     "function `{}` takes {} argument(s), got {}",
                     func_name, total_params, positional_count
                 ),
-                call.span,
+                call_span,
             );
             return func_info.return_type.clone();
         }
@@ -711,7 +849,7 @@ impl Checker {
         for c in covered.iter_mut().take(positional_count.min(total_params)) {
             *c = true;
         }
-        for (name, _) in &call.named_args {
+        for (name, _) in named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name) {
                 covered[idx] = true;
             }
@@ -732,7 +870,7 @@ impl Checker {
                     func_name,
                     missing.join(", ")
                 ),
-                call.span,
+                call_span,
             );
             return func_info.return_type.clone();
         }
@@ -745,28 +883,34 @@ impl Checker {
                     "function `{}` takes {} argument(s), got {} (positional) + {} (named)",
                     func_name, total_params, positional_count, named_count
                 ),
-                call.span,
+                call_span,
             );
             return func_info.return_type.clone();
         }
 
         // Now type-check all provided arguments
         if !func_info.type_params.is_empty() {
-            let (bindings, arg_types, errors) =
-                self.infer_and_check_call_generics(func_name, func_info, call, positional_count);
+            let (bindings, arg_types, errors) = self.infer_and_check_call_generics(
+                func_name,
+                func_info,
+                args,
+                named_args,
+                call_span,
+                positional_count,
+            );
             self.record_inferred_type_args(
                 func_name,
                 &func_info.type_params,
                 &bindings,
                 &errors,
                 &arg_types,
-                call.span,
+                call_span,
             );
             return Self::substitute(&func_info.return_type, &bindings);
         }
 
         // Non-generic: type-check positional args
-        for (i, arg) in call.args.iter().enumerate() {
+        for (i, arg) in args.iter().enumerate() {
             let arg_type = self.check_expr(arg);
             if !arg_type.is_error()
                 && !func_info.params[i].is_error()
@@ -789,7 +933,7 @@ impl Checker {
             self.pin_inferred_type_to_annotation(arg, &func_info.params[i]);
         }
         // Type-check named args
-        for (name, expr) in &call.named_args {
+        for (name, expr) in named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name) {
                 let arg_type = self.check_expr(expr);
                 if !arg_type.is_error()
@@ -817,11 +961,11 @@ impl Checker {
         &mut self,
         func_name: &str,
         func_info: &FunctionInfo,
-        call: &CallExpr,
+        named_args: &[(String, Expr)],
         positional_count: usize,
     ) {
         let mut named_set = HashSet::new();
-        for (name, expr) in &call.named_args {
+        for (name, expr) in named_args {
             if !named_set.insert(name.clone()) {
                 self.error(format!("duplicate named argument `{}`", name), expr.span());
             }
@@ -832,7 +976,7 @@ impl Checker {
                 );
             }
         }
-        for (name, expr) in &call.named_args {
+        for (name, expr) in named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name)
                 && idx < positional_count
             {
@@ -867,17 +1011,19 @@ impl Checker {
         &mut self,
         func_name: &str,
         func_info: &FunctionInfo,
-        call: &CallExpr,
+        args: &[Expr],
+        named_args: &[(String, Expr)],
+        call_span: Span,
         positional_count: usize,
     ) -> CallGenericsInference {
         let total_params = func_info.params.len();
 
         // Build the full arg_types array in param order
         let mut arg_types = vec![Type::Error; total_params];
-        for (i, arg) in call.args.iter().enumerate() {
+        for (i, arg) in args.iter().enumerate() {
             arg_types[i] = self.check_expr(arg);
         }
-        for (name, expr) in &call.named_args {
+        for (name, expr) in named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name) {
                 arg_types[idx] = self.check_expr(expr);
             }
@@ -887,8 +1033,7 @@ impl Checker {
             if *at == Type::Error
                 && func_info.default_param_exprs.contains_key(&i)
                 && i >= positional_count
-                && !call
-                    .named_args
+                && !named_args
                     .iter()
                     .any(|(n, _)| *n == func_info.param_names[i])
             {
@@ -905,7 +1050,7 @@ impl Checker {
         // The compatibility check uses `types_compatible` (not `==`) so a
         // concrete arg flowing into a `dyn Trait` parameter coerces just
         // like in the non-generic call path.
-        for (i, arg) in call.args.iter().enumerate() {
+        for (i, arg) in args.iter().enumerate() {
             let expected = Self::substitute(&func_info.params[i], &bindings);
             if !expected.has_type_vars() && !self.types_compatible(&expected, &arg_types[i]) {
                 self.error(
@@ -925,7 +1070,7 @@ impl Checker {
             // `pin_inferred_type_to_annotation`.
             self.pin_inferred_type_to_annotation(arg, &expected);
         }
-        for (name, expr) in &call.named_args {
+        for (name, expr) in named_args {
             if let Some(idx) = func_info.param_names.iter().position(|n| n == name) {
                 let expected = Self::substitute(&func_info.params[idx], &bindings);
                 if !expected.has_type_vars() && !self.types_compatible(&expected, &arg_types[idx]) {
@@ -960,7 +1105,7 @@ impl Checker {
                                 "type `{}` does not implement trait `{}`",
                                 concrete_name, bound_trait
                             ),
-                            call.span,
+                            call_span,
                         );
                     }
                 }

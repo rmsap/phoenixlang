@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{entry_only, non_entry};
+use common::{entry_only, non_entry, non_entry_dotted};
 use phoenix_common::module_path::ModulePath;
 use phoenix_common::span::SourceId;
 use phoenix_sema::checker::check_modules;
@@ -281,13 +281,12 @@ fn namespace_import_from_unknown_module_diagnoses() {
 }
 
 #[test]
-fn namespace_import_binds_nothing_yet() {
-    // A *valid* namespace import is currently a no-op in resolution:
-    // binding the module under a local name (and `ns.func(...)` dispatch)
-    // lands in a follow-up PR. Pin that contract here so the follow-up
-    // can't regress it silently — the import must (a) not error and (b)
-    // not pull the target's public names, nor the namespace name itself,
-    // into the importer's scope.
+fn namespace_import_does_not_pollute_visible_symbols() {
+    // A namespace import binds into the module's *namespaces* map, kept
+    // separate from `visible_symbols`. Pin that it does not (a) error or
+    // (b) leak the target's public names, nor the namespace name itself,
+    // into the importer's value/type scope — qualified access goes
+    // through `ns.func(...)` dispatch, not a bare-name lookup.
     let entry = entry_only("import lib\nfunction main() {}");
     let other = non_entry(
         "lib",
@@ -307,12 +306,12 @@ fn namespace_import_binds_nothing_yet() {
         .expect("entry module scope must exist");
     assert!(
         !entry_scope.contains_key("add"),
-        "namespace import must not pull `add` into scope (scope keys: {:?})",
+        "namespace import must not pull `add` into visible_symbols (keys: {:?})",
         entry_scope.keys().collect::<Vec<_>>()
     );
     assert!(
         !entry_scope.contains_key("lib"),
-        "namespace binding is deferred — `lib` must not be in scope yet (scope keys: {:?})",
+        "namespace name `lib` must not enter visible_symbols (keys: {:?})",
         entry_scope.keys().collect::<Vec<_>>()
     );
 }
@@ -669,6 +668,466 @@ fn field_assignment_own_module_private_field_is_allowed() {
             .iter()
             .all(|d| !d.message.contains("cannot be set")),
         "same-module assignment must not trigger the private-field gate, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+// ── namespace imports (`import lib` → `lib.func(...)`) ──────────────
+
+#[test]
+fn namespace_import_calls_public_function() {
+    let entry = entry_only("import lib\nfunction main() { let x: Int = lib.add(1, 2) print(x) }");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "expected no diagnostics, got: {:?}",
+        analysis.diagnostics
+    );
+    // The resolved call target is recorded under the qualified key for IR.
+    assert!(
+        analysis
+            .module
+            .namespace_call_targets
+            .values()
+            .any(|t| t == "lib::add"),
+        "expected namespace_call_targets to record `lib::add`, got: {:?}",
+        analysis.module.namespace_call_targets
+    );
+}
+
+#[test]
+fn namespace_import_aliased_calls_public_function() {
+    let entry = entry_only(
+        "import lib as helpers\nfunction main() { let x: Int = helpers.add(1, 2) print(x) }",
+    );
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "expected no diagnostics, got: {:?}",
+        analysis.diagnostics
+    );
+    // The recorded target is keyed by module path, not the alias: aliasing
+    // is purely local, so IR still resolves `helpers.add` to `lib::add`.
+    assert!(
+        analysis
+            .module
+            .namespace_call_targets
+            .values()
+            .any(|t| t == "lib::add"),
+        "expected the aliased call to record `lib::add`, got: {:?}",
+        analysis.module.namespace_call_targets
+    );
+}
+
+#[test]
+fn namespace_call_arity_mismatch_is_rejected() {
+    // Arity diagnostics flow through the shared call machinery
+    // (`check_call_with_info`, fed the arg slices directly — no synthetic
+    // `CallExpr`); pin that the namespace path reaches them.
+    let entry = entry_only("import lib\nfunction main() { lib.add(1, 2, 3) }");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("takes 2 argument(s), got 3")),
+        "expected an arity diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn namespace_call_to_private_function_is_rejected() {
+    let entry = entry_only("import lib\nfunction main() { lib.add(1, 2) }");
+    let other = non_entry(
+        "lib",
+        "function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("is private to module `lib`")),
+        "expected private-access diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn namespace_call_to_unknown_function_is_rejected() {
+    let entry = entry_only("import lib\nfunction main() { lib.missing(1) }");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("module `lib` has no function `missing`")),
+        "expected unknown-function diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn namespace_call_type_checks_arguments() {
+    let entry =
+        entry_only("import lib\nfunction main() { let x: Int = lib.add(1, \"two\") print(x) }");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected `Int` but got `String`")),
+        "expected an argument-type diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn local_binding_shadows_namespace() {
+    // A `let lib = ...` shadows the namespace: `lib.add(...)` then dispatches
+    // on the Int value, which has no such method.
+    let entry = entry_only(
+        "import lib\nfunction main() { let lib: Int = 5 let y: Int = lib.add(1, 2) print(y) }",
+    );
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("no method `add` on type `Int`")),
+        "expected the shadowing local to route to the value path, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn intrinsic_json_namespace_binds_but_methods_pending() {
+    // `import json` binds the intrinsic namespace (no source file needed);
+    // its methods are not implemented until Phase 4.6.
+    let entry = entry_only("import json\nfunction main() { json.encode(5) }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.encode` is not available yet")),
+        "expected the json-not-yet diagnostic (proving the namespace bound), got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn intrinsic_json_namespace_aliased_binds() {
+    // `import json as j` binds the intrinsic under the alias, exactly like
+    // a user-module namespace; the alias dispatches to the same intrinsic.
+    let entry = entry_only("import json as j\nfunction main() { j.encode(5) }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.encode` is not available yet")),
+        "expected the json-not-yet diagnostic via the alias, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn destructuring_import_of_json_is_rejected() {
+    let entry = entry_only("import json { encode }\nfunction main() {}");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("destructuring import of `json` members is not available")),
+        "expected the json-destructuring diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn wildcard_import_of_json_is_rejected() {
+    // The wildcard form of an intrinsic is rejected with the same guidance
+    // as the named form — only `import json` (namespace) is supported.
+    let entry = entry_only("import json { * }\nfunction main() {}");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("destructuring import of `json` members is not available")),
+        "expected the json-wildcard diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+// ── duplicate imports (same local name, any import forms) ───────────
+
+#[test]
+fn duplicate_namespace_import_is_rejected() {
+    // `import a.user` + `import b.user` both bind the last segment `user`;
+    // the second is rejected (first-import-wins) rather than silently
+    // shadowing the first.
+    let entry = entry_only("import a.user\nimport b.user\nfunction main() {}");
+    let a_user = non_entry_dotted("a.user", "public function f() -> Int { 0 }", SourceId(1));
+    let b_user = non_entry_dotted("b.user", "public function f() -> Int { 0 }", SourceId(2));
+    let analysis = check_modules(&[entry, a_user, b_user]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`user` is already imported in this module")),
+        "expected a duplicate-import diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_named_import_is_rejected() {
+    // `import a { foo }` + `import b { foo }` both bind `foo` — rejected.
+    let entry = entry_only("import a { foo }\nimport b { foo }\nfunction main() {}");
+    let a = non_entry("a", "public function foo() -> Int { 0 }", SourceId(1));
+    let b = non_entry("b", "public function foo() -> Int { 0 }", SourceId(2));
+    let analysis = check_modules(&[entry, a, b]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`foo` is already imported in this module")),
+        "expected a duplicate-import diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_import_across_kinds_is_rejected() {
+    // A named import and a namespace import that bind the same local name
+    // collide just like two of the same kind: the tracking is form-agnostic.
+    let entry = entry_only("import a { foo }\nimport b as foo\nfunction main() {}");
+    let a = non_entry("a", "public function foo() -> Int { 0 }", SourceId(1));
+    let b = non_entry("b", "public function bar() -> Int { 0 }", SourceId(2));
+    let analysis = check_modules(&[entry, a, b]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`foo` is already imported in this module")),
+        "expected a cross-kind duplicate-import diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_import_diagnostic_is_rich() {
+    // The diagnostic carries a note (the first import's span) and a
+    // suggestion (`as`), mirroring the private-import diagnostic shape.
+    let entry = entry_only("import a { foo }\nimport b { foo }\nfunction main() {}");
+    let a = non_entry("a", "public function foo() -> Int { 0 }", SourceId(1));
+    let b = non_entry("b", "public function foo() -> Int { 0 }", SourceId(2));
+    let analysis = check_modules(&[entry, a, b]);
+    let dup = analysis
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.message
+                .contains("`foo` is already imported in this module")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a duplicate-import diagnostic, got: {:?}",
+                analysis.diagnostics
+            )
+        });
+    assert!(
+        !dup.notes.is_empty(),
+        "expected a note pointing at the first import"
+    );
+    assert!(
+        dup.suggestion.is_some(),
+        "expected an `as`-rename suggestion"
+    );
+}
+
+#[test]
+fn namespace_call_diagnostic_uses_source_form() {
+    // Diagnostics for a namespace call name the callee in source form
+    // (`helpers.add`, honoring the alias) — the internal `::`-qualified
+    // key (`lib::add`) must never leak into a user-facing message.
+    let entry = entry_only("import lib as helpers\nfunction main() { helpers.add(1, 2, 3) }");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    let arity = analysis
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("takes 2 argument(s), got 3"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an arity diagnostic, got: {:?}",
+                analysis.diagnostics
+            )
+        });
+    assert!(
+        arity.message.contains("`helpers.add`"),
+        "diagnostic should name the source form `helpers.add`, got: {:?}",
+        arity.message
+    );
+    assert!(
+        !arity.message.contains("::"),
+        "diagnostic must not leak the internal `::`-qualified key, got: {:?}",
+        arity.message
+    );
+}
+
+#[test]
+fn namespace_call_error_path_surfaces_arg_errors() {
+    // An unknown-function namespace call still type-checks its arguments,
+    // so an error *inside* an argument (here an undefined variable) is not
+    // swallowed by the missing-callee diagnostic.
+    let entry = entry_only("import lib\nfunction main() { lib.missing(nope) }");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("module `lib` has no function `missing`")),
+        "expected the missing-function diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("undefined variable `nope`")),
+        "expected the nested undefined-variable diagnostic to survive, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_wildcard_import_reports_once() {
+    // Two wildcard imports of modules that share several public names
+    // collide on every shared name, but the duplicate is reported once
+    // per import statement — not once per colliding name.
+    let entry = entry_only("import a { * }\nimport b { * }\nfunction main() {}");
+    let a = non_entry(
+        "a",
+        "public function foo() -> Int { 0 }\n\
+         public function bar() -> Int { 0 }\n\
+         public function baz() -> Int { 0 }",
+        SourceId(1),
+    );
+    let b = non_entry(
+        "b",
+        "public function foo() -> Int { 0 }\n\
+         public function bar() -> Int { 0 }\n\
+         public function baz() -> Int { 0 }",
+        SourceId(2),
+    );
+    let analysis = check_modules(&[entry, a, b]);
+    let dups = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("is already imported in this module"))
+        .count();
+    assert_eq!(
+        dups, 1,
+        "expected exactly one duplicate-import diagnostic for the wildcard, got {}: {:?}",
+        dups, analysis.diagnostics
+    );
+}
+
+#[test]
+fn aliasing_resolves_duplicate_namespace_import() {
+    // The `as` escape hatch: rebinding the second import to a distinct
+    // name clears the collision, and both namespaces stay callable.
+    let entry = entry_only(
+        "import a.user\nimport b.user as admin\n\
+         function main() { let x: Int = user.f() let y: Int = admin.f() print(x) print(y) }",
+    );
+    let a_user = non_entry_dotted("a.user", "public function f() -> Int { 0 }", SourceId(1));
+    let b_user = non_entry_dotted("b.user", "public function f() -> Int { 0 }", SourceId(2));
+    let analysis = check_modules(&[entry, a_user, b_user]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "expected no diagnostics once aliased, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn intrinsic_json_cannot_be_shadowed_by_source_module() {
+    // `import json` reserves the intrinsic namespace: even when a source
+    // module literally named `json` is present, the import binds the
+    // compiler intrinsic (resolver skips file resolution for it), not the
+    // file. If the source module won, `json.encode(5)` would resolve to
+    // its public `encode` and type-check cleanly; instead we must see the
+    // intrinsic's "not available yet" diagnostic — proving the reservation.
+    let entry = entry_only("import json\nfunction main() { let x: Int = json.encode(5) print(x) }");
+    let json_module = non_entry(
+        "json",
+        "public function encode(x: Int) -> Int { x }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, json_module]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.encode` is not available yet")),
+        "expected the intrinsic to win over a same-named source module, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_intrinsic_import_is_rejected() {
+    // Two `import json` statements bind the same local name `json`; the
+    // intrinsic form funnels through the same duplicate-import check as
+    // user-module imports, so the second is rejected.
+    let entry = entry_only("import json\nimport json\nfunction main() {}");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`json` is already imported in this module")),
+        "expected a duplicate-import diagnostic for the repeated intrinsic, got: {:?}",
         analysis.diagnostics
     );
 }

@@ -1908,6 +1908,40 @@ fn lower_modules_qualifies_non_entry_function() {
     );
 }
 
+/// Namespace calls (`lib.func(...)`) type-check — sema records the target
+/// in `namespace_call_targets` — but the IR execution side ("I2") has not
+/// landed. Lowering one must fail with the intentional, named
+/// `unimplemented!` guard at the top of `lower_method_call`, not the
+/// misleading "unknown identifier `lib`" panic that lowering the namespace
+/// receiver would otherwise raise. Pin that staged boundary so I2 flips it
+/// deliberately (and so a regression doesn't silently re-route to the
+/// confusing panic). Remove/replace this test when I2 lands.
+#[test]
+#[should_panic(expected = "not yet lowerable")]
+fn namespace_call_lowering_is_staged_until_i2() {
+    let entry = make_module(
+        ModulePath::entry(),
+        "import lib\nfunction main() { lib.shout() }",
+        SourceId(0),
+        true,
+    );
+    let lib = make_module(
+        ModulePath(vec!["lib".to_string()]),
+        "public function shout() -> String { \"hi\" }",
+        SourceId(1),
+        false,
+    );
+    let modules = vec![entry, lib];
+    let analysis = checker::check_modules(&modules);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "namespace call should type-check; sema errors: {:?}",
+        analysis.diagnostics
+    );
+    // Panics: namespace-call lowering is staged for I2.
+    let _ = lower_modules(&modules, &analysis.module);
+}
+
 /// `qualify_resolved` must pass through any name that already contains
 /// `::` (treating it as canonical) and qualify bare names against
 /// `current_module`. This is the contract the no-field enum-variant

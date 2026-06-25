@@ -963,6 +963,35 @@ impl<'a> LoweringContext<'a> {
     /// defaults — at monomorphization time for the trait-bounded
     /// branch, since the concrete impl is not known here.
     fn lower_method_call(&mut self, mc: &MethodCallExpr) -> ValueId {
+        // Namespace call (`lib.func(...)`) resolved by sema: sema records
+        // the target's qualified key in `namespace_call_targets`, but the
+        // execution side (IR lowering of the call into an `Op::Call`, plus
+        // the interpreters) is the staged follow-up "I2". Until it lands,
+        // a namespace call type-checks but cannot be lowered.
+        //
+        // The CLI driver gates the IR-based backends on
+        // `namespace_call_targets` *before* calling `lower_modules`
+        // (`report_unlowerable_namespace_calls` in `phoenix-driver`), so a
+        // real user invocation surfaces a clean span-anchored diagnostic
+        // and never reaches here. This `unimplemented!` is the
+        // defense-in-depth backstop for callers that lower directly (the
+        // IR tests, future embedders): it fails with an intentional, named
+        // message rather than falling through to `lower_ident`'s
+        // `unreachable!("unknown identifier ...")` on the namespace
+        // receiver, which would misattribute the gap.
+        // See docs/known-issues.md and design-decisions.md (Decision 5).
+        if self.check.namespace_call_targets.contains_key(&mc.span) {
+            let receiver = match &mc.object {
+                Expr::Ident(id) => id.name.as_str(),
+                _ => "<namespace>",
+            };
+            unimplemented!(
+                "namespace call `{}.{}(...)` type-checks but is not yet lowerable — \
+                 namespace-call execution lands in the I2 follow-up (see docs/known-issues.md)",
+                receiver,
+                mc.method,
+            );
+        }
         // Phase 2.7 decision F: recognize `List.builder()` /
         // `Map.builder()` *before* evaluating the receiver. Phoenix's
         // parser models `Type.method(...)` as a `MethodCallExpr`

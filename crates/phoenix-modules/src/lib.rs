@@ -142,6 +142,18 @@ pub enum ResolveError {
         name: String,
         import_span: Span,
     },
+    /// An `import` names a reserved compiler-intrinsic namespace (e.g.
+    /// `import json`) *and* a source file that would otherwise resolve
+    /// under that name exists on disk. The intrinsic always wins, so the
+    /// file is unreachable — rather than silently shadowing it (leaving a
+    /// developer wondering why their `json.phx` never runs), the resolver
+    /// rejects the collision and asks for a rename. The same trade-off as
+    /// a reserved keyword; see design-decisions.md .
+    ReservedModuleName {
+        name: String,
+        import_span: Span,
+        file_path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -218,6 +230,15 @@ impl std::fmt::Display for ResolveError {
             ResolveError::UnresolvedDependency { name, .. } => write!(
                 f,
                 "import refers to dependency `{name}`, which is declared but was not resolved"
+            ),
+            ResolveError::ReservedModuleName {
+                name, file_path, ..
+            } => write!(
+                f,
+                "module name '{}' is reserved as a built-in intrinsic namespace; \
+                 the source file {} cannot be imported under that name — rename it",
+                name,
+                file_path.display()
             ),
         }
     }
@@ -594,6 +615,31 @@ fn resolve_core(
         let mut my_edges: Vec<(ModulePath, Span)> = Vec::new();
         let mut import_targets: HashMap<Vec<String>, ModulePath> = HashMap::new();
         for imp in iter_imports(&program) {
+            // Compiler-intrinsic namespaces (`import json`) have no source
+            // file — they are bound and dispatched in sema. Skip file
+            // resolution and don't add a module-graph edge for them. But
+            // first reject the case where a source file *would* resolve
+            // under the reserved name: the intrinsic always wins, so that
+            // file is unreachable, and silently shadowing it would leave a
+            // developer wondering why their `json.phx` never runs. (An
+            // ambiguous resolution — Err — falls through to the skip; the
+            // collision only matters when a concrete file exists.) The
+            // probe runs against the *importing* module's package root, so
+            // a dependency's own `import json` is checked the same way as
+            // the entry package's.
+            if phoenix_common::module_path::is_intrinsic_namespace(&imp.path) {
+                let target = ModulePath(imp.path.clone());
+                if let Ok(shadowed) =
+                    resolve_module_path(&ctx.root, &ctx.root_canon, &target, imp.span)
+                {
+                    return Err(ResolveError::ReservedModuleName {
+                        name: imp.path.join("."),
+                        import_span: imp.span,
+                        file_path: shadowed,
+                    });
+                }
+                continue;
+            }
             let (target_id, target_file, target_ctx) =
                 dispatch_import(&ctx, &imp.path, imp.span, &pkg_ctxs)?;
             import_targets.insert(imp.path.clone(), target_id.clone());
@@ -1874,5 +1920,45 @@ mod tests {
         let pa: Vec<_> = a.iter().map(|m| m.module_path.clone()).collect();
         let pb: Vec<_> = b.iter().map(|m| m.module_path.clone()).collect();
         assert_eq!(pa, pb);
+    }
+
+    #[test]
+    fn intrinsic_import_with_no_file_is_skipped() {
+        // `import json` with no `json.phx` present binds the compiler
+        // intrinsic in sema; the resolver skips it entirely — no edge, no
+        // module in the output set, no error.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(td.path(), "main.phx", "import json\nfunction main() {}\n");
+        let out = modules_for(&entry).unwrap();
+        assert_eq!(out.len(), 1, "json must not become a module: {:?}", out);
+        assert!(out[0].is_entry);
+    }
+
+    #[test]
+    fn intrinsic_import_shadowing_source_file_is_rejected() {
+        // A `json.phx` next to the entry would resolve under the reserved
+        // name `json`, but `import json` always binds the intrinsic — so
+        // the file is unreachable. Reject the collision loudly rather than
+        // silently shadowing it.
+        let td = TempDir::new().unwrap();
+        write_file(
+            td.path(),
+            "json.phx",
+            "public function encode(x: Int) -> Int { x }\n",
+        );
+        let entry = write_file(td.path(), "main.phx", "import json\nfunction main() {}\n");
+        match modules_for(&entry) {
+            Err(ResolveError::ReservedModuleName {
+                name, file_path, ..
+            }) => {
+                assert_eq!(name, "json");
+                assert!(
+                    file_path.ends_with("json.phx"),
+                    "expected the shadowed file path, got {:?}",
+                    file_path
+                );
+            }
+            other => panic!("expected ReservedModuleName, got {:?}", other),
+        }
     }
 }

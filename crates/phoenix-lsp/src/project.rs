@@ -269,6 +269,12 @@ pub(crate) fn render_resolve_error(
         | ResolveError::UnresolvedDependency { import_span, .. } => {
             push_diag(Some(*import_span), err.to_string());
         }
+        // Same no-drift reuse of the `Display` text; kept as its own arm
+        // because — unlike the cross-package variants above — this one is
+        // reachable from the editor.
+        ResolveError::ReservedModuleName { import_span, .. } => {
+            push_diag(Some(*import_span), err.to_string());
+        }
         ResolveError::EntryNotFound { .. } | ResolveError::FileReadFailures { .. } => {
             push_diag(None, err.to_string());
         }

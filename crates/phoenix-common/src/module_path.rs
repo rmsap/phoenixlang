@@ -147,6 +147,25 @@ pub fn module_qualify(module: &ModulePath, name: &str) -> String {
     }
 }
 
+/// Names reserved as compiler-*intrinsic* namespaces: importable as
+/// `import json` but backed by no `.phx` source file. A single-segment
+/// import path matching one of these binds an intrinsic namespace whose
+/// members the compiler synthesizes (e.g. `import json` →
+/// `json.encode(...)`), rather than resolving to a module on disk.
+///
+/// Reserving these names means a project cannot shadow them with a
+/// top-level source module of the same name (the resolver skips file
+/// resolution for them) — the same trade-off as a reserved keyword.
+pub const INTRINSIC_NAMESPACES: &[&str] = &["json"];
+
+/// True iff `path` is a single segment naming a compiler-intrinsic
+/// namespace (see [`INTRINSIC_NAMESPACES`]). The module resolver uses
+/// this to skip file resolution, and sema uses it to bind the intrinsic
+/// namespace instead of looking the path up as a source module.
+pub fn is_intrinsic_namespace(path: &[String]) -> bool {
+    matches!(path, [seg] if INTRINSIC_NAMESPACES.contains(&seg.as_str()))
+}
+
 /// Inverse of [`module_qualify`]: extract the bare name from a qualified
 /// key. For an entry/builtin key like `"Option"` (no `::` separator) the
 /// input is returned unchanged; for a non-entry key like `"a.b::foo"`

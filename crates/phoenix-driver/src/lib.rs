@@ -249,6 +249,41 @@ fn report_diagnostics(
     }
 }
 
+/// Namespace calls (`ns.func(...)`) type-check, but their execution side
+/// — IR lowering into an `Op::Call`, plus the IR interpreter and native
+/// backend — is the staged "I2" follow-up (see docs/known-issues.md). The
+/// tree-walk interpreter (`phoenix run`) reports this as a runtime error;
+/// the IR-based backends would otherwise hit the defensive `unimplemented!`
+/// guard in `lower_method_call` and panic. Gate those backends here so the
+/// user gets a clean, span-anchored diagnostic instead of a compiler panic.
+/// Returns `true` (and reports the diagnostics) when any namespace call is
+/// present; callers then exit before lowering.
+fn report_unlowerable_namespace_calls(
+    analysis: &phoenix_sema::Analysis,
+    source_map: &SourceMap,
+) -> bool {
+    let targets = &analysis.module.namespace_call_targets;
+    if targets.is_empty() {
+        return false;
+    }
+    // Deterministic order: sort the call sites by span so the reported
+    // list is stable across runs (HashMap iteration order is not).
+    let mut spans: Vec<phoenix_common::span::Span> = targets.keys().copied().collect();
+    spans.sort_by_key(|s| (s.source_id.0, s.start, s.end));
+    let diags: Vec<phoenix_common::diagnostics::Diagnostic> = spans
+        .into_iter()
+        .map(|span| {
+            phoenix_common::diagnostics::Diagnostic::error(
+                "namespace calls are not executable yet — namespace-call execution \
+                 lands in the I2 follow-up (see docs/known-issues.md)",
+                span,
+            )
+        })
+        .collect();
+    report_diagnostics(&diags, source_map);
+    true
+}
+
 /// Tokenizes a source file and prints the token stream.
 pub fn cmd_lex(path: &str) {
     let (_source_map, source_id, contents) = read_source(path);
@@ -387,7 +422,10 @@ pub fn cmd_check(path: &str, locked: bool) {
 /// `check`/`run`/`build` — this is a non-`--locked`-aware path: the lockfile may
 /// be updated but is never gated.
 pub fn cmd_ir(path: &str) {
-    let (modules, check_result, _sm) = parse_resolve_check(path, false);
+    let (modules, check_result, sm) = parse_resolve_check(path, false);
+    if report_unlowerable_namespace_calls(&check_result, &sm) {
+        process::exit(1);
+    }
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     // Run the IR verifier to catch structural errors.
@@ -423,7 +461,10 @@ pub fn cmd_run(path: &str, locked: bool) {
 /// is a non-`--locked`-aware path: the lockfile may be updated but is never
 /// gated.
 pub fn cmd_run_ir(path: &str) {
-    let (modules, check_result, _sm) = parse_resolve_check(path, false);
+    let (modules, check_result, sm) = parse_resolve_check(path, false);
+    if report_unlowerable_namespace_calls(&check_result, &sm) {
+        process::exit(1);
+    }
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
@@ -1454,5 +1495,97 @@ endpoint getUser: GET "/api/users/{id}" {
         )
         .expect_err("unsupported target must error");
         assert!(err.contains("unsupported target 'cobol'"), "got: {err}");
+    }
+
+    // ── `report_unlowerable_namespace_calls` — the gate that stops the
+    //    IR-based backends (`build`/`ir`/`run-ir`) before they reach the
+    //    `unimplemented!` in `lower_method_call` on a staged namespace call.
+    //    The backend guards it backstops are covered in phoenix-ir /
+    //    phoenix-interp; these pin the driver-level gate decision itself.
+
+    use phoenix_common::module_path::ModulePath;
+    use std::path::PathBuf;
+
+    /// Tokenize, parse, and wrap `src` as a `ResolvedSourceModule` under
+    /// `path`, registering it in `sm` so the gate's diagnostic-reporting
+    /// path resolves spans against real source (same `SourceId` on both).
+    fn module_in(
+        sm: &mut SourceMap,
+        path: ModulePath,
+        src: &str,
+        is_entry: bool,
+    ) -> ResolvedSourceModule {
+        let source_id = sm.add(format!("<test:{}>", path), src);
+        let tokens = tokenize(src, source_id);
+        let (program, errs) = parser::parse(&tokens);
+        assert!(errs.is_empty(), "parse errors: {errs:?}");
+        ResolvedSourceModule {
+            module_path: path,
+            source_id,
+            program,
+            is_entry,
+            file_path: PathBuf::from("<test>"),
+            import_targets: Default::default(),
+        }
+    }
+
+    #[test]
+    fn namespace_call_gate_fires_and_reports() {
+        // A valid namespace call (`lib.shout()`) type-checks, so the gate
+        // must return `true` — the callers then exit before lowering, which
+        // is what keeps a real `build`/`ir`/`run-ir` invocation from hitting
+        // the defensive `unimplemented!` in `lower_method_call`. Building a
+        // real `SourceMap` also exercises the diagnostic-reporting path, not
+        // just the bool.
+        let mut sm = SourceMap::new();
+        let entry = module_in(
+            &mut sm,
+            ModulePath::entry(),
+            "import lib\nfunction main() { lib.shout() }",
+            true,
+        );
+        let lib = module_in(
+            &mut sm,
+            ModulePath(vec!["lib".to_string()]),
+            "public function shout() -> String { \"hi\" }",
+            false,
+        );
+        let analysis = checker::check_modules(&[entry, lib]);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "namespace call should type-check; sema diagnostics: {:?}",
+            analysis.diagnostics
+        );
+        assert!(
+            !analysis.module.namespace_call_targets.is_empty(),
+            "sema should have recorded the namespace-call target"
+        );
+        assert!(
+            report_unlowerable_namespace_calls(&analysis, &sm),
+            "the gate must fire (return true) when a namespace call is present"
+        );
+    }
+
+    #[test]
+    fn namespace_call_gate_inert_without_namespace_calls() {
+        // No namespace call anywhere: the gate is a no-op and must return
+        // `false` so lowering proceeds normally.
+        let mut sm = SourceMap::new();
+        let entry = module_in(
+            &mut sm,
+            ModulePath::entry(),
+            "function main() { let x: Int = 1 print(x) }",
+            true,
+        );
+        let analysis = checker::check_modules(&[entry]);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "expected clean type-check, got: {:?}",
+            analysis.diagnostics
+        );
+        assert!(
+            !report_unlowerable_namespace_calls(&analysis, &sm),
+            "the gate must stay inert (return false) with no namespace calls"
+        );
     }
 }

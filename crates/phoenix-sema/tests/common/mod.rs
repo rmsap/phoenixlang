@@ -42,3 +42,18 @@ pub fn non_entry(name: &str, source: &str, source_id: SourceId) -> ResolvedSourc
         import_targets: Default::default(),
     }
 }
+
+/// Like [`non_entry`] but `dotted` is a dotted module path (`"a.user"`),
+/// split into its segments — for tests that need a multi-segment module
+/// path (e.g. namespace imports `import a.user`, whose local name is the
+/// last segment).
+pub fn non_entry_dotted(dotted: &str, source: &str, source_id: SourceId) -> ResolvedSourceModule {
+    ResolvedSourceModule {
+        module_path: ModulePath(dotted.split('.').map(str::to_string).collect()),
+        source_id,
+        program: parse(source, source_id),
+        is_entry: false,
+        file_path: PathBuf::from(format!("<test:{}>", dotted)),
+        import_targets: Default::default(),
+    }
+}
