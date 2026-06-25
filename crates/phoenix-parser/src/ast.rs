@@ -61,6 +61,8 @@ pub enum Declaration {
 /// import models.user { User, createUser }
 /// import models.user { * }
 /// import models.user { User as UserModel }
+/// import models.user            // namespace import — bind `user`
+/// import models.user as people  // namespace import — bind `people`
 /// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportDecl {
@@ -79,6 +81,14 @@ pub enum ImportItems {
     Wildcard,
     /// `import a.b { Foo, Bar as Baz }` — an explicit list of items.
     Named(Vec<ImportItem>),
+    /// `import a.b` or `import a.b as c` — bind the module itself as a
+    /// namespace under its last path segment (or the alias), enabling
+    /// qualified access like `c.func(...)`. No braces.
+    Namespace {
+        /// An optional local alias (`import a.b as c` → `Some("c")`); when
+        /// `None`, the bound name is the last segment of `path`.
+        alias: Option<String>,
+    },
 }
 
 /// A single item in the `Named` form of an `import` declaration.

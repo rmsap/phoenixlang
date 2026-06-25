@@ -462,6 +462,9 @@ Phase 2.6 introduces multi-file modules. Four interlocking sub-decisions land to
 
 **Scope deferred to follow-ups (not part of 2.6):** Explicit `public`/private on `impl` blocks (default for 2.6 = "impls are in scope iff both trait and type are visible"); re-exports (`public import a.b { Item }`); cross-package imports (Phase 3.1).
 
+**Decision (5, Phase 4) — namespace imports.** Alongside the brace forms (`import a.b { Foo }`, `import a.b { * }`), `import a.b` and `import a.b as c` (no braces) bind the *module itself* as a qualified namespace under its last path segment (or the explicit alias), enabling `c.func(...)` access. The brace must hug the path on the same line — `import a.b` followed by a brace on the next line is the named form mis-typed and is rejected with a dedicated diagnostic, not silently read as a namespace import. The single-segment form (`import json`) is the idiomatic stdlib shape.
+**Landing in two steps:** the *syntax* (parser + AST `ImportItems::Namespace`) lands first; it parses, triggers file discovery via the resolver, and flows through the same module-existence check as the brace forms. The *binding + `ns.func(...)` dispatch* land in a follow-up PR — until then a valid namespace import is a no-op in resolution and pulls nothing into scope.
+
 **Bundled scope:** The closure capture type ambiguity bug (since fixed) was originally tied to this refactor on the assumption that capture metadata would land in a unified IR closure representation alongside the AST-to-IR switch. With the reversal, the bug is fixed independently in IR + Cranelift via an env-pointer calling convention (closure functions take their environment pointer as the first arg and unpack captures from the heap object themselves; capture types never cross the indirect-call boundary, structurally eliminating the ambiguity). `phoenix-interp` is not touched by that fix.
 
 ### Endpoints are checked in the body-check pass, not the registration pass

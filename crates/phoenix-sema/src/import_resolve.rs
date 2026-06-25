@@ -147,6 +147,14 @@ impl Checker {
                     self.insert_into_scope(importer_path, bare, qualified);
                 }
             }
+            ImportItems::Namespace { .. } => {
+                // Namespace imports (`import a.b` / `import a.b as c`) bind the
+                // module itself as a qualified namespace rather than pulling
+                // individual names into scope. Binding + `ns.func(...)`
+                // dispatch land in the follow-up PR (Phase 4 imports I1); the
+                // syntax already parses and triggers file discovery via the
+                // resolver, so this arm is intentionally a no-op for now.
+            }
         }
     }
 

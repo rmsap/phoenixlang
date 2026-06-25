@@ -261,6 +261,63 @@ fn cannot_import_from_unknown_module() {
 }
 
 #[test]
+fn namespace_import_from_unknown_module_diagnoses() {
+    // The namespace form (`import a.b`, no braces) flows through the same
+    // in-resolution module-existence check as the named/wildcard forms: an
+    // unresolvable target must still produce a "cannot find module"
+    // diagnostic (here via the defense-in-depth arm in `resolve_imports`,
+    // since no file resolver runs in this harness), not be silently accepted
+    // by the no-op `Namespace` resolution arm.
+    let entry = entry_only("import nonexistent\nfunction main() {}");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot find module `nonexistent`")),
+        "expected unknown-module diagnostic for namespace import, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn namespace_import_binds_nothing_yet() {
+    // A *valid* namespace import is currently a no-op in resolution:
+    // binding the module under a local name (and `ns.func(...)` dispatch)
+    // lands in a follow-up PR. Pin that contract here so the follow-up
+    // can't regress it silently — the import must (a) not error and (b)
+    // not pull the target's public names, nor the namespace name itself,
+    // into the importer's scope.
+    let entry = entry_only("import lib\nfunction main() {}");
+    let other = non_entry(
+        "lib",
+        "public function add(a: Int, b: Int) -> Int { a + b }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "valid namespace import must not error, got: {:?}",
+        analysis.diagnostics
+    );
+    let entry_scope = analysis
+        .module
+        .module_scopes
+        .get(&ModulePath::entry())
+        .expect("entry module scope must exist");
+    assert!(
+        !entry_scope.contains_key("add"),
+        "namespace import must not pull `add` into scope (scope keys: {:?})",
+        entry_scope.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !entry_scope.contains_key("lib"),
+        "namespace binding is deferred — `lib` must not be in scope yet (scope keys: {:?})",
+        entry_scope.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn field_visibility_public_field_accessible_from_other_module() {
     let entry = entry_only(
         "import lib { User }\nfunction main() { let u: User = User(\"alice\") print(u.name) }",

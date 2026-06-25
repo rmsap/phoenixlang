@@ -518,7 +518,8 @@ impl<'src> Parser<'src> {
     }
 
     /// Parses an `import` declaration:
-    /// `import a.b.c { Foo, Bar as Baz }` or `import a.b.c { * }`.
+    /// `import a.b.c { Foo, Bar as Baz }`, `import a.b.c { * }`, or the
+    /// namespace forms `import a.b.c` / `import a.b.c as d` (no braces).
     fn parse_import_decl(&mut self) -> Option<ImportDecl> {
         let start = self.peek().span;
         self.expect(TokenKind::Import)?;
@@ -527,9 +528,58 @@ impl<'src> Parser<'src> {
         let mut path = Vec::new();
         let first = self.expect(TokenKind::Ident)?;
         path.push(first.text.clone());
+        let mut path_end = first.span;
         while self.eat(TokenKind::Dot) {
             let segment = self.expect(TokenKind::Ident)?;
             path.push(segment.text.clone());
+            path_end = segment.span;
+        }
+
+        // Namespace import: no `{ ... }` follows the path. Bind the module
+        // itself under its last segment (or an explicit `as` alias).
+        if self.peek().kind != TokenKind::LBrace {
+            // Catch the common mistake of writing the import list on the line
+            // *after* the path (`import a.b⏎{ Foo }`). The brace must hug the
+            // path on the same line; without this guard the path alone would
+            // parse as a namespace import and the `{ ... }` would be
+            // mis-parsed as a separate declaration, yielding a misleading
+            // "unexpected `{`" error one line down. A stray `as` alias is not
+            // checked here — that author clearly meant a namespace import.
+            if self.peek().kind == TokenKind::Newline {
+                let mut ahead = 1;
+                while self.peek_at(ahead).kind == TokenKind::Newline {
+                    ahead += 1;
+                }
+                if self.peek_at(ahead).kind == TokenKind::LBrace {
+                    self.diagnostics.push(Diagnostic::error(
+                        "the import list `{ ... }` must be on the same line as the import path",
+                        self.peek_at(ahead).span,
+                    ));
+                    return None;
+                }
+            }
+            let (alias, end) = if self.eat(TokenKind::As) {
+                let alias_tok = self.expect(TokenKind::Ident)?;
+                (Some(alias_tok.text.clone()), alias_tok.span)
+            } else {
+                (None, path_end)
+            };
+            // A namespace import must end here: only a newline or EOF may
+            // follow. Rejecting a stray token (rather than treating "not a
+            // brace" as "definitely a namespace import") keeps the caret on
+            // the offending token instead of letting it be mis-parsed as the
+            // start of the next declaration.
+            if !matches!(self.peek().kind, TokenKind::Newline | TokenKind::Eof) {
+                self.error_at_current(
+                    "expected `{`, `as`, or end of declaration after the import path",
+                );
+                return None;
+            }
+            return Some(ImportDecl {
+                path,
+                items: ImportItems::Namespace { alias },
+                span: start.merge(end),
+            });
         }
 
         let lbrace_span = self.expect(TokenKind::LBrace)?.span;
@@ -6871,6 +6921,108 @@ schema db {
             },
             other => panic!("expected Import decl, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_import_namespace_bare() {
+        // `import models.user` — namespace import, no braces; bound name is
+        // the last path segment.
+        let (program, diagnostics) = parse_source("import models.user\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => {
+                assert_eq!(imp.path, vec!["models", "user"]);
+                match &imp.items {
+                    ImportItems::Namespace { alias } => assert!(alias.is_none()),
+                    other => panic!("expected Namespace items, got {:?}", other),
+                }
+            }
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_namespace_aliased() {
+        // `import models.user as people` — namespace import with an alias.
+        let (program, diagnostics) =
+            parse_source("import models.user as people\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => {
+                assert_eq!(imp.path, vec!["models", "user"]);
+                match &imp.items {
+                    ImportItems::Namespace { alias } => {
+                        assert_eq!(alias.as_deref(), Some("people"));
+                    }
+                    other => panic!("expected Namespace items, got {:?}", other),
+                }
+            }
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_namespace_single_segment() {
+        // `import json` — single-segment namespace import (the idiomatic
+        // stdlib form).
+        let (program, diagnostics) = parse_source("import json\nfunction main() {}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::Import(imp) => {
+                assert_eq!(imp.path, vec!["json"]);
+                match &imp.items {
+                    ImportItems::Namespace { alias } => assert!(alias.is_none()),
+                    other => panic!("expected Namespace items, got {:?}", other),
+                }
+            }
+            other => panic!("expected Import decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_namespace_rejects_trailing_garbage() {
+        // `import models.user foo` — a stray token after the path is neither
+        // a brace, an `as` alias, nor end-of-declaration; it must be a parse
+        // error rather than silently binding `models.user` and leaving `foo`
+        // to be mis-parsed as the next declaration.
+        let (_program, diagnostics) = parse_source("import models.user foo\nfunction main() {}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("after the import path")),
+            "expected a trailing-token diagnostic, got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn parse_import_namespace_rejects_missing_alias() {
+        // `import models.user as` — the `as` keyword with no following
+        // identifier must produce a parse error, not bind a namespace with a
+        // bogus or missing alias.
+        let (_program, diagnostics) = parse_source("import models.user as\nfunction main() {}");
+        assert!(
+            !diagnostics.is_empty(),
+            "expected a diagnostic for the missing alias identifier"
+        );
+    }
+
+    #[test]
+    fn parse_import_rejects_list_on_next_line() {
+        // `import models.user⏎{ User }` — the import list on the line after
+        // the path is a common mistake. It must surface a diagnostic that
+        // names the problem directly, rather than silently parsing the path
+        // as a namespace import and mis-reporting the `{` as a stray token in
+        // the next declaration.
+        let (_program, diagnostics) =
+            parse_source("import models.user\n{ User }\nfunction main() {}");
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("must be on the same line as the import path")),
+            "expected a same-line import-list diagnostic, got: {:?}",
+            diagnostics
+        );
     }
 
     #[test]
