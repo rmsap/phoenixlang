@@ -1363,6 +1363,27 @@ The browser tier verifies DOM interop against a **curated, hand-declared** `exte
 - *Inline JS bodies as the default (the `EM_JS` model).* Rejected: couples `extern js` to JS-hosted backends, breaking A0's uniform boundary and the five-backend byte-identical matrix; serves only the minority case (the common case binds existing host APIs); and hard-codes one host environment into the artifact.
 - *Inline bodies as opt-in WASM-only sugar, in 2.5.* Deferred, not rejected — a reasonable future ergonomic, but it adds a second extern form and a per-backend "this form is unsupported here" rule to a phase that is already large; revisit if demand appears.
 
+### Phase 3.1 Package manager
+
+Subordinate decisions for the Phase 3.1 package manager. Phase-level scope and exit criteria live in [phase-3.md §3.1](phases/phase-3.md#31-package-manager).
+
+#### A. Registry-readiness seams (do as part of 3.1)
+
+**Decided:** 2026-06-27
+**Context:** 3.1 is git-first; a central registry is deferred to a later phase (see [phase-3.md §3.1 scope boundaries](phases/phase-3.md#31-package-manager) and [Phase 6.2](phase-6.md)). The resolver, fetcher, and lockfile are nonetheless built so a registry can be added later as an additive source rather than a rewrite. An audit of the 3.1 implementation found the **plumbing** already registry-ready but two concrete assumptions worth neutralizing *now*, while the git code is being written, so the eventual registry doesn't have to break a signature or a serialized format.
+
+**What is already registry-ready (keep it this way):**
+- **`ManifestProvider` is the source seam.** The graph walker (`deps/graph.rs`) never mentions git — it fetches through the trait and unifies on an opaque `source_id` string. A registry is "another provider" as far as this layer's interface is concerned.
+- **The manifest reserves registry syntax.** A bare-string dep (`dep = "^1.2"`) is parsed and rejected with `RegistryUnsupported`, not silently mishandled (`manifest.rs`). The grammar slot exists.
+- **`Dependency` is a closed enum** — a `Registry { name, req }` variant is purely additive.
+- **The lockfile is schema-versioned** (`LOCKFILE_VERSION`) so adding registry entries is a clean migration with a loud error on mismatch.
+
+**The seams to fix as part of 3.1 (these are the decision):**
+1. **Make source-kind explicit on `ResolvedPackage` / `LockedPackage`; do not infer it from "has a rev."** Today git-vs-other is told apart by `pkg.rev.is_some()` (e.g. `Lockfile::from_graph` in `deps/lock.rs`). A registry package has no git rev but **must** be locked (by version + checksum), so the rev-presence heuristic would silently drop it from the lockfile. Carry an explicit source-kind discriminant instead. `LockedPackage` is currently git-shaped (required `git`, plus `tag` / `branch` / `rev_req` / `rev`); it should become an enum (or gain a source-kind tag) so a registry entry (`name` / `version` / `checksum` / registry id) is representable without overloading the git fields.
+2. **Sketch a version-enumeration capability into the provider trait now.** `ManifestProvider::fetch` returns exactly **one** `FetchedPackage` per edge, because a git ref resolves to exactly one commit → one version. This is the deeper mismatch: a registry resolves the *opposite* direction — each dep states a version *requirement range*, and the resolver must choose among many *published* versions a set that satisfies all constraints jointly (in general, with backtracking). The current "fetch one concrete version → unify by caret → pick highest, no backtracking" is a genuinely different algorithm, and the two "known residual" tests in `deps/graph.rs` (shared-transitive-dep conflict; superseded-but-compatible version selection) are symptoms of having no real solver. The full backtracking solver is **out of scope for 3.1** — but the trait should be shaped now (e.g. an `available_versions(name) -> [Version]` capability alongside `fetch`) so the eventual registry + solver does not force a breaking change to the source seam. Document that git/path providers return a one-element version set (the ref *is* the version choice).
+
+**Why fix the seams now and not at registry time:** both are cheap while the git code is in flight and expensive afterward — (1) is a serialized lockfile format, so changing it post-hoc means a format migration on every user's `phoenix.lock`; (2) is the public shape of the provider trait, so changing it post-hoc breaks every provider. Neither requires implementing any registry behavior in 3.1; they only stop the git-shaped code from hardening assumptions a registry would have to undo. The accurate framing recorded here so it isn't forgotten: **adding a registry later is "add a provider *and* add a version solver," not "add a provider"** — git got to skip the solver only because a ref already pins the version.
+
 
 ---
 

@@ -58,11 +58,31 @@ serde_json = "1"
 # Configuration
 toml = "0.8"
 
-# Package manager. `semver` validates `[package] version` and
-# (later) solves dependency version constraints. `toml_edit` (format-preserving
-# `phoenix.toml` edits for `phoenix add`) and `git2` (cloning git-sourced
-# dependencies) are added alongside the resolver/`add` code that uses them.
+# Package manager. `semver` validates `[package] version` and solves
+# dependency version constraints; `gix` (pure-Rust git — no libgit2) clones
+# git-sourced dependencies into the cache over a rustls HTTPS transport. gix is
+# chosen over git2/libgit2 deliberately, for two benefits that hold:
+#   * Licensing: libgit2 is GPL-2.0-with-linking-exception, whereas gix and its
+#     rustls stack are permissively licensed (MIT/Apache-2.0/ISC) — no copyleft.
+#   * No system OpenSSL: rustls replaces it, so the binary carries no runtime
+#     `libssl`/`libcrypto` shared-library dependency and stays self-contained.
+# Caveat (it is *not* "pure Rust all the way down"): rustls's default crypto
+# provider here is `aws-lc-rs`, whose `aws-lc-sys` is C (AWS-LC). It is vendored
+# and statically linked at build time — no runtime/system dependency — but it
+# does mean a C compiler is required when building, including for the aarch64
+# cross target in the release matrix (which installs a cross C toolchain for
+# exactly this). reqwest 0.13's rustls transport exposes no `ring` alternative,
+# so the C-free `ring` provider isn't reachable through this stack today.
+# `toml_edit` (format-preserving `phoenix.toml` edits for `phoenix add`) is
+# added alongside the `add` code that uses it.
 semver = "1"
+# Keep gix's (pure-Rust) defaults — sha1, zlib, parallel, revision/index — and
+# add only the blocking rustls HTTPS transport and worktree checkout we need.
+gix = { version = "0.85", features = [
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+    "worktree-mutation",
+] }
 
 # Native code generation
 cranelift-codegen = "0.116"

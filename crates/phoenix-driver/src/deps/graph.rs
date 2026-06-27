@@ -59,7 +59,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::manifest::{Dependency, ManifestError};
+use crate::manifest::{Dependency, GitRef, ManifestError};
 
 /// A package's manifest as seen by the resolver: its name, version, and its own
 /// declared dependencies. Built from a fetched/located `phoenix.toml`.
@@ -87,6 +87,13 @@ pub struct FetchedPackage {
     /// the git URL for a git source, or the canonical root path for a `path`
     /// source. Distinct refs of the same git repo share a `source_id`.
     pub source_id: String,
+    /// For a git source, the resolved commit SHA (what gets pinned in the
+    /// lockfile); `None` for a `path` source, which is never SHA-pinned.
+    pub rev: Option<String>,
+    /// For a git source, the ref the manifest *requested* (tag/branch/rev/
+    /// default). Recorded in the lockfile so a manifest ref change is detected
+    /// as drift; `None` for a `path` source.
+    pub git_ref: Option<GitRef>,
 }
 
 /// Locates a dependency and parses its manifest.
@@ -122,6 +129,12 @@ pub struct ResolvedPackage {
     pub dependencies: BTreeMap<String, Dependency>,
     /// The upstream source identity (see [`FetchedPackage::source_id`]).
     pub source_id: String,
+    /// The resolved commit SHA for a git source; `None` for a `path` source.
+    /// Drives lockfile generation ([`super::lock::Lockfile::from_graph`]).
+    pub rev: Option<String>,
+    /// The manifest-requested ref for a git source; `None` for a `path` source.
+    /// Recorded in the lockfile so a ref change surfaces as drift.
+    pub git_ref: Option<GitRef>,
 }
 
 /// The fully resolved dependency graph: one [`ResolvedPackage`] per name.
@@ -237,6 +250,12 @@ fn caret_compatible(a: &semver::Version, b: &semver::Version) -> bool {
 /// package — so they share this one selection rule rather than reimplementing
 /// it and risking drift. The slice is never empty at either call site (every
 /// candidate list is created via `or_default().push`).
+///
+/// Same-version candidates are already collapsed upstream by the `visited`
+/// dedup (keyed by name + source + version), so this never has to break a
+/// same-version tie — which is what keeps the chosen `rev`/`git_ref`
+/// deterministic (first-fetched wins, per the dedup note in `resolve_graph`).
+/// If that dedup key ever changes, revisit the tie-break here.
 fn select_highest(candidates: &[FetchedPackage]) -> &FetchedPackage {
     candidates
         .iter()
@@ -259,6 +278,13 @@ pub fn resolve_graph(
     let mut candidates: BTreeMap<String, Vec<FetchedPackage>> = BTreeMap::new();
     // Dedup identical (name, source_id, version): a diamond must neither
     // reprocess the same package's subtree nor record it as a candidate twice.
+    // For git sources `source_id` is the URL *without* the ref, so the same name
+    // reached via the same URL at two refs that resolve to the *same* version
+    // (e.g. a branch that moved) collapses here: `select_highest` then keeps the
+    // first-fetched commit and the lockfile pins it, rather than erroring on the
+    // same-version/different-commit ambiguity. This is intentional (first-seen
+    // wins); a ref that resolves to a *different* version is still unified or
+    // conflict-checked normally.
     let mut visited: std::collections::HashSet<(String, String, semver::Version)> =
         std::collections::HashSet::new();
 
@@ -386,6 +412,8 @@ pub fn resolve_graph(
                 root: chosen.root,
                 dependencies: chosen.manifest.dependencies,
                 source_id: chosen.source_id,
+                rev: chosen.rev,
+                git_ref: chosen.git_ref,
             },
         );
     }
@@ -461,6 +489,8 @@ mod tests {
                 },
                 root: PathBuf::from(format!("/virtual/{sid}")),
                 source_id: sid,
+                rev: None,
+                git_ref: None,
             })
         }
     }
@@ -536,6 +566,8 @@ mod tests {
                             },
                             root: PathBuf::from("/proj/util"),
                             source_id: "/proj/util".to_string(),
+                            rev: None,
+                            git_ref: None,
                         })
                     }
                     "core" => {
@@ -549,6 +581,8 @@ mod tests {
                             },
                             root: PathBuf::from("/proj/core"),
                             source_id: "/proj/core".to_string(),
+                            rev: None,
+                            git_ref: None,
                         })
                     }
                     other => panic!("unexpected fetch for `{other}`"),
@@ -629,6 +663,8 @@ mod tests {
                         },
                         root: PathBuf::from("/virtual/core"),
                         source_id: "u/core".to_string(),
+                        rev: None,
+                        git_ref: None,
                     });
                 }
                 // `a` wants core v1.2; `b` wants core v1.5.
@@ -643,6 +679,8 @@ mod tests {
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
                     source_id: format!("u/{name}"),
+                    rev: None,
+                    git_ref: None,
                 })
             }
         }
@@ -701,6 +739,8 @@ mod tests {
                         },
                         root: PathBuf::from("/virtual/core"),
                         source_id: "u/core".to_string(),
+                        rev: None,
+                        git_ref: None,
                     });
                 }
                 // `a` depends on core v2.
@@ -714,6 +754,8 @@ mod tests {
                     },
                     root: PathBuf::from("/virtual/a"),
                     source_id: "u/a".to_string(),
+                    rev: None,
+                    git_ref: None,
                 })
             }
         }
@@ -839,6 +881,8 @@ mod tests {
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
                     source_id,
+                    rev: None,
+                    git_ref: None,
                 })
             }
         }
@@ -1059,6 +1103,8 @@ mod tests {
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
                     source_id,
+                    rev: None,
+                    git_ref: None,
                 })
             }
         }
@@ -1160,6 +1206,8 @@ mod tests {
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
                     source_id,
+                    rev: None,
+                    git_ref: None,
                 })
             }
         }
@@ -1174,5 +1222,88 @@ mod tests {
         // wins over the surviving requirement's v1.1. The intended post-fix
         // result is "1.1.0".
         assert_eq!(graph.packages["shared"].version.to_string(), "1.3.0");
+    }
+
+    #[test]
+    fn same_version_diamond_keeps_first_fetched_rev() {
+        // app → a (git) → core (git u/core)
+        // app → b (git) → core (git u/core)
+        //
+        // Both edges reach `core` at the *same* source and version but resolve to
+        // *different* commits (a moving ref fetched twice). The `visited` dedup
+        // collapses them on (name, source_id, version), so the first-fetched
+        // candidate wins and its `rev`/`git_ref` is what the lockfile pins. This
+        // locks in the deterministic tie-break documented on `select_highest`:
+        // the DFS visits `a` before `b`, so `core`'s commit is `a`'s "aaaa…",
+        // never `b`'s "bbbb…".
+        #[derive(Default)]
+        struct P {
+            core_fetches: u32,
+        }
+        impl ManifestProvider for P {
+            fn fetch(
+                &mut self,
+                name: &str,
+                _dep: &Dependency,
+                _parent_dir: &std::path::Path,
+            ) -> Result<FetchedPackage, ResolveError> {
+                let (source_id, deps): (String, BTreeMap<String, Dependency>) = match name {
+                    "a" => (
+                        "u/a".to_string(),
+                        [("core".to_string(), git("u/core", "main"))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "b" => (
+                        "u/b".to_string(),
+                        [("core".to_string(), git("u/core", "main"))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    "core" => ("u/core".to_string(), BTreeMap::new()),
+                    other => panic!("unexpected fetch for `{other}`"),
+                };
+                // `core` is fetched once per in-edge (the resolver dedups only
+                // after fetching); hand back a different commit each time so the
+                // tie-break has something to choose between.
+                let (rev, git_ref) = if name == "core" {
+                    self.core_fetches += 1;
+                    if self.core_fetches == 1 {
+                        (Some("a".repeat(40)), GitRef::Branch("main".into()))
+                    } else {
+                        (Some("b".repeat(40)), GitRef::Branch("main".into()))
+                    }
+                } else {
+                    (Some(format!("{name}rev")), GitRef::Tag("v1".into()))
+                };
+                Ok(FetchedPackage {
+                    manifest: PackageManifest {
+                        name: name.to_string(),
+                        version: semver::Version::parse("1.0.0").unwrap(),
+                        dependencies: deps,
+                    },
+                    root: PathBuf::from(format!("/virtual/{name}")),
+                    source_id,
+                    rev,
+                    git_ref: Some(git_ref),
+                })
+            }
+        }
+
+        let mut p = P::default();
+        let graph = resolve_graph(
+            &root_deps(&[("a", git("u/a", "v1")), ("b", git("u/b", "v1"))]),
+            std::path::Path::new("/proj"),
+            &mut p,
+        )
+        .unwrap();
+        // Both edges were fetched (dedup happens *after* fetch), but the resolved
+        // `core` keeps the first-fetched commit, not the second.
+        assert_eq!(p.core_fetches, 2, "both in-edges fetch core before dedup");
+        assert_eq!(
+            graph.packages["core"].rev.as_deref(),
+            Some("a".repeat(40).as_str()),
+            "the first-fetched commit must win the same-version tie-break"
+        );
     }
 }

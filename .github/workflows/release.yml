@@ -87,11 +87,20 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # gcc-aarch64-linux-gnu: the cross C toolchain. It is needed for the
+          # linker AND to compile aws-lc-sys (C) — rustls's crypto provider via
+          # gix's HTTPS transport — for aarch64. cmake is aws-lc-sys's build
+          # fallback when its prebuilt path doesn't apply, so install it too.
+          sudo apt-get install -y gcc-aarch64-linux-gnu cmake
 
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+          # Point the `cc` crate (used by aws-lc-sys et al.) at the cross C
+          # compiler/archiver for the aarch64 target so the C portions build for
+          # aarch64 rather than the x86_64 host.
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-ar' || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       # The wasm runtime is host-independent (a WebAssembly module), so the

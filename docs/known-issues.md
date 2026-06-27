@@ -6,6 +6,86 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
+### The dependency cache has no inter-process locking
+
+The git dependency cache (`$PHOENIX_HOME/cache`) is mutated without an OS file
+lock. `deps::fetch::ensure_db` removes and re-clones `git/db/<slug>` on a
+non-offline resolve, and `materialize_checkout` writes `git/checkouts/<slug>/<sha>`.
+Two Phoenix processes sharing a `$PHOENIX_HOME` (e.g. concurrent `phoenix build`
+invocations across projects, or a CI matrix with a shared cache volume) can
+therefore interleave a wipe-and-re-clone against another process's in-progress
+read of the same slug, producing spurious fetch/checkout failures. The
+single-process and offline-fast-path cases (a pinned commit already checked out)
+are unaffected — the latter never touches `git/db` at all.
+
+**Planned fix:** take an advisory file lock (e.g. `fs4`/flock) on the cache root —
+or per-slug — around the fetch + checkout, as Cargo does for its registry/git
+cache. The offline reuse path can stay lock-free since it only reads an
+already-materialized checkout.
+
+**File:** `crates/phoenix-driver/src/deps/fetch.rs` (`ensure_db` /
+`materialize_checkout`).
+**Priority: Medium** — only bites concurrent builds sharing one cache; the common
+single-build and reproducible `--locked` paths are safe. Surfaced 2026-06-25
+during the Phase 3.3 fetch + lockfile review.
+
+### An unlocked resolve re-clones each git dependency from scratch
+
+`deps::fetch::ensure_db` wipes `git/db/<slug>` and performs a full clone (rather
+than an incremental fetch) for every distinct git URL reached on a non-offline
+resolve. This is deliberate — it guarantees a newly published ref (e.g. a freshly
+pushed tag/branch) is visible on an unlocked re-resolve — and it is bounded: the
+`refreshed` set collapses it to one clone per URL per resolve, and the offline
+fast path (`--locked` with the pinned commit already checked out) never clones at
+all. But it does mean a `phoenix build` *without* `--locked` against a large git
+dependency pays a full network clone each time, where Cargo would do an
+incremental fetch.
+
+**Planned fix:** open the existing `git/db/<slug>` clone and run an incremental
+fetch (updating refs) instead of wipe-and-clone, falling back to a fresh clone
+only when the cached clone is missing or corrupt. Pairs naturally with the cache
+locking work above.
+
+**File:** `crates/phoenix-driver/src/deps/fetch.rs` (`ensure_db`).
+**Priority: Low** — correctness is unaffected and the reproducible `--locked` /
+offline path already avoids it; this is a fetch-latency optimization for repeated
+unlocked builds. Surfaced 2026-06-25 during the Phase 3.3 fetch + lockfile review.
+
+### Release binaries don't bundle third-party dependency license notices
+
+Phoenix is MIT-licensed and links a large tree of permissively-licensed crates
+(MIT / Apache-2.0 / ISC / BSD) — cranelift/wasmtime (Apache-2.0-WITH-LLVM-exception),
+clap, serde, toml, semver, and the `gix` + `rustls` + `aws-lc-rs` package-manager
+stack. Each of those licenses requires that **binary distributions** reproduce the
+upstream copyright + permission notice (MIT/BSD/ISC), and Apache-2.0 §4(d) additionally
+requires propagating any upstream `NOTICE` file. The release tarballs produced by
+`.github/workflows/release.yml` currently bundle only the Phoenix binaries — no
+aggregated third-party license manifest — so each tagged release ships without the
+attribution its linked dependencies' licenses require.
+
+This is a **pre-existing, project-wide** gap, not specific to any one dependency: it
+predates the package manager (the Apache-2.0 cranelift/wasmtime tree already triggers
+it). `THIRD-PARTY-NOTICES.md` does **not** cover it — that file is scoped to *source
+ported or vendored into the tree* (e.g. the musl `fmod` port), whereas this is about
+*linked* dependencies in distributed binaries. No copyleft is involved (the package
+manager deliberately uses `gix`, not GPL libgit2), so there is no source-disclosure
+obligation — only attribution.
+
+**Planned fix:** add a license-aggregation step to `release.yml` that runs
+`cargo about generate` (with an `about.toml` allowlist of acceptable licenses, which
+doubles as a CI guard against an accidental copyleft dependency) — or
+`cargo-bundle-licenses` — and drops the generated `LICENSE-THIRD-PARTY` (plus any
+propagated `NOTICE` content) into each release tarball alongside the binaries.
+Generating it in CI keeps it current as the dependency tree changes rather than
+hand-maintaining a list.
+
+**File:** `.github/workflows/release.yml` (per-target `dist/` assembly step); new
+`about.toml` at the repo root.
+**Priority: High** — every tagged release distributes binaries without the required
+dependency attribution until this lands; it should precede the next release tag.
+**Target phase:** before the next release (Phase 3.1 or sooner). Surfaced 2026-06-25
+during the Phase 3.1 git-client (`gix`) migration review.
+
 ### An absent optional field serializes as omitted (TS) vs `null` (Go/Python)
 
 For an `Option<T>` field with no value, the TypeScript target omits the key entirely

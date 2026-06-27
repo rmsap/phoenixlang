@@ -36,6 +36,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 semver = { workspace = true }
+# Clones git-sourced dependencies into the cache (package manager). Also used by
+# the package-manager integration tests to build throwaway local git repos.
+gix = { workspace = true }
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
