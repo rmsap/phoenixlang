@@ -3643,6 +3643,94 @@ mod tests {
         }
     }
 
+    /// `obj.method<Int>(x)` — a turbofish on a method call records the
+    /// explicit type args on the `MethodCallExpr`.
+    #[test]
+    fn parse_method_call_with_turbofish() {
+        let source = "function main() { let y: Int = b.wrap<Int>(42) }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        let Declaration::Function(f) = &program.declarations[0] else {
+            panic!("expected Function");
+        };
+        let Statement::VarDecl(v) = &f.body.statements[0] else {
+            panic!("expected VarDecl, got {:?}", f.body.statements[0]);
+        };
+        match &v.initializer {
+            Expr::MethodCall(mc) => {
+                assert_eq!(mc.method, "wrap");
+                assert_eq!(mc.type_args.len(), 1, "expected one explicit type arg");
+                assert_eq!(mc.args.len(), 1);
+            }
+            other => panic!("expected MethodCall, got {:?}", other),
+        }
+    }
+
+    /// `a.b < c` must stay a comparison (the turbofish only commits when the
+    /// `<...>` is immediately followed by `(`), not be mis-parsed as a
+    /// type-argument list.
+    #[test]
+    fn field_access_less_than_is_comparison_not_turbofish() {
+        let source = "function main() { let z: Bool = a.b < c }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        let Declaration::Function(f) = &program.declarations[0] else {
+            panic!("expected Function");
+        };
+        let Statement::VarDecl(v) = &f.body.statements[0] else {
+            panic!("expected VarDecl, got {:?}", f.body.statements[0]);
+        };
+        match &v.initializer {
+            Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Lt),
+            other => panic!("expected a `<` comparison, got {:?}", other),
+        }
+    }
+
+    /// `a.b < c > d` is a chain of comparisons, not a turbofish — the
+    /// trailing `(` requirement keeps the backtracking sound.
+    #[test]
+    fn field_access_comparison_chain_is_not_turbofish() {
+        let source = "function main() { let z: Bool = a.b < c > d }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        let Declaration::Function(f) = &program.declarations[0] else {
+            panic!("expected Function");
+        };
+        let Statement::VarDecl(v) = &f.body.statements[0] else {
+            panic!("expected VarDecl, got {:?}", f.body.statements[0]);
+        };
+        match &v.initializer {
+            Expr::Binary(b) => assert_eq!(b.op, BinaryOp::Gt),
+            other => panic!("expected a comparison chain, got {:?}", other),
+        }
+    }
+
+    /// The one residual ambiguity of bare-angle turbofish: a *parenthesised*
+    /// right operand supplies the trailing `(`, so `a.b < c > (d)` commits as
+    /// the method call `a.b<c>(d)` rather than the comparison `(a.b < c) > (d)`.
+    /// This pins the accepted trade-off so it can't regress silently — see
+    /// `try_parse_method_turbofish`.
+    #[test]
+    fn field_access_comparison_then_paren_commits_as_turbofish() {
+        let source = "function main() { let z: Bool = a.b < c > (d) }";
+        let (program, diagnostics) = parse_source(source);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        let Declaration::Function(f) = &program.declarations[0] else {
+            panic!("expected Function");
+        };
+        let Statement::VarDecl(v) = &f.body.statements[0] else {
+            panic!("expected VarDecl, got {:?}", f.body.statements[0]);
+        };
+        match &v.initializer {
+            Expr::MethodCall(mc) => {
+                assert_eq!(mc.method, "b");
+                assert_eq!(mc.type_args.len(), 1, "expected the `<c>` turbofish");
+                assert_eq!(mc.args.len(), 1, "expected the `(d)` argument list");
+            }
+            other => panic!("expected a turbofish method call, got {:?}", other),
+        }
+    }
+
     #[test]
     fn parse_struct_literal() {
         let source = "function main() { let p: Point = Point(1, 2) }";

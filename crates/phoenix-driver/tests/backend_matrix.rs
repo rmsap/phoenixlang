@@ -161,6 +161,9 @@ backend_matrix_test!(matrix_builders, "builders.phx");
 // printed prefix (wasm32-gc lowering added 2026-06-15).
 backend_matrix_test!(matrix_list_query_methods, "list_query_methods.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
+// Explicit turbofish type args on a generic method (`b.wrap<Int>(42)`),
+// threaded through monomorphization — two instantiations, both backends.
+backend_matrix_test!(matrix_method_turbofish, "method_turbofish.phx");
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

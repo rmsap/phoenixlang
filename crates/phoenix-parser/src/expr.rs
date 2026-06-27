@@ -2,8 +2,8 @@ use crate::ast::{
     AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, ElseBranch, Expr, FieldAccessExpr,
     FieldAssignmentExpr, IdentExpr, IfExpr, LambdaExpr, ListLiteralExpr, Literal, LiteralKind,
     MapLiteralExpr, MatchArm, MatchBody, MatchExpr, MethodCallExpr, Pattern,
-    StringInterpolationExpr, StringSegment, StructLiteralExpr, TryExpr, UnaryExpr, UnaryOp,
-    VariantPattern,
+    StringInterpolationExpr, StringSegment, StructLiteralExpr, TryExpr, TypeExpr, UnaryExpr,
+    UnaryOp, VariantPattern,
 };
 use crate::parser::Parser;
 use phoenix_common::span::SourceId;
@@ -390,11 +390,19 @@ impl<'src> Parser<'src> {
                 continue;
             }
 
-            // Field access / method call: expr.field or expr.method(args)
+            // Field access / method call: expr.field or expr.method(args),
+            // with optional turbofish type args: expr.method<T, U>(args).
             if op_kind == TokenKind::Dot {
                 self.advance();
                 let field_token = self.expect(TokenKind::Ident)?;
                 let field_name = field_token.text.clone();
+
+                // Speculative turbofish: `<T, U>` is only accepted when it
+                // parses as a type-arg list AND is immediately followed by
+                // `(`. Otherwise we backtrack so `a.b < c` still parses as a
+                // comparison. (Same save/restore shape as the constructor
+                // turbofish in `parse_ident_or_constructor`.)
+                let type_args = self.try_parse_method_turbofish();
 
                 // Check if this is a method call: expr.method(args)
                 if self.peek().kind == TokenKind::LParen {
@@ -405,6 +413,7 @@ impl<'src> Parser<'src> {
                     lhs = Expr::MethodCall(Box::new(MethodCallExpr {
                         object: lhs,
                         method: field_name,
+                        type_args,
                         args,
                         span,
                     }));
@@ -657,6 +666,56 @@ impl<'src> Parser<'src> {
                 span: token.span,
             }))
         }
+    }
+
+    /// Speculatively parse a method-call turbofish (`<T, U>`) immediately
+    /// before the argument list. Commits *only* when the `<...>` parses as a
+    /// type-argument list and is immediately followed by `(` — so a comparison
+    /// like `a.b < c` (or the chain `a.b < c > d`) is left intact for the
+    /// binary-operator layer. On any mismatch the token position and
+    /// diagnostics are restored. Returns the parsed type args, or an empty
+    /// vector when there is no committable turbofish.
+    ///
+    /// One residual ambiguity is inherent to bare-angle turbofish (and shared
+    /// with the constructor form in `parse_ident_or_constructor`): a
+    /// parenthesised right operand supplies the trailing `(`, so
+    /// `a.b < c > (d)` commits as the call `a.b<c>(d)` rather than the
+    /// comparison `(a.b < c) > (d)`. This is an accepted trade-off of the
+    /// `::`-less turbofish syntax — see `docs/design-decisions.md`.
+    fn try_parse_method_turbofish(&mut self) -> Vec<TypeExpr> {
+        if self.peek().kind != TokenKind::Lt {
+            return Vec::new();
+        }
+        let saved_pos = self.pos;
+        let saved_diag_len = self.diagnostics.len();
+        self.advance(); // consume '<'
+        let mut type_args = Vec::new();
+        let mut args_ok = true;
+        loop {
+            if let Some(t) = self.parse_type_expr() {
+                type_args.push(t);
+            } else {
+                args_ok = false;
+                break;
+            }
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        // Commit only on `> (` — the trailing `(` is what disambiguates a
+        // turbofish from a chain of comparisons. This is deliberately
+        // *stricter* than the constructor form in `parse_ident_or_constructor`,
+        // which commits on a bare `>` (it can afford to: the constructor path
+        // only fires for an uppercase name, where `Name<...>` is already
+        // unambiguous). Here the receiver-name layer has no such guard, so the
+        // trailing `(` must be part of the commit condition — do not relax it
+        // to match the constructor shape.
+        if args_ok && self.eat(TokenKind::Gt) && self.peek().kind == TokenKind::LParen {
+            return type_args;
+        }
+        self.pos = saved_pos;
+        self.diagnostics.truncate(saved_diag_len);
+        Vec::new()
     }
 
     /// Parses a function call argument list after the opening `(` has been consumed.

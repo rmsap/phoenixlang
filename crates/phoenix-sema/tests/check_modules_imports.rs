@@ -752,6 +752,29 @@ fn namespace_call_arity_mismatch_is_rejected() {
 }
 
 #[test]
+fn namespace_call_with_turbofish_is_rejected() {
+    // A namespaced free-function call infers its type args from the
+    // arguments; an explicit turbofish is meaningless and is rejected (the
+    // `json.*` intrinsic path, which will define its own type-arg semantics
+    // and is handled separately and not affected here).
+    let entry = entry_only("import lib\nfunction main() { lib.id<Int>(1) }");
+    let other = non_entry(
+        "lib",
+        "public function id(x: Int) -> Int { x }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, other]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`lib.id` does not take type arguments")),
+        "expected a turbofish-rejection diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn namespace_call_to_private_function_is_rejected() {
     let entry = entry_only("import lib\nfunction main() { lib.add(1, 2) }");
     let other = non_entry(

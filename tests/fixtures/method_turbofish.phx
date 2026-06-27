@@ -1,0 +1,20 @@
+// Explicit type arguments (turbofish) on a generic method:
+// `obj.method<T>(args)`. The `<T>` is threaded through the same
+// span-keyed monomorphization path as inferred method type args, so each
+// instantiation is specialized and runs byte-identically on every backend.
+
+struct Box {
+  id: Int
+}
+
+impl Box {
+  function wrap<U>(self, value: U) -> U {
+    value
+  }
+}
+
+function main() {
+  let b: Box = Box(1)
+  print(b.wrap<Int>(42))
+  print(b.wrap<String>("hello"))
+}

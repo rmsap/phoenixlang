@@ -3975,6 +3975,199 @@ function main() {
     );
 }
 
+// ── Explicit method type arguments (turbofish) ────────────────────
+
+/// An explicit turbofish (`t.phantom<Int>(...)`) supplies a type parameter that
+/// no argument constrains, and the resolved arg is recorded in
+/// `call_type_args` (the same channel inference feeds, so IR monomorphizes
+/// it identically).
+#[test]
+fn explicit_method_type_args_are_recorded() {
+    let tokens = tokenize(
+        r#"
+struct Tag {
+    n: Int
+}
+impl Tag {
+    function phantom<U>(self, label: String) -> String { label }
+}
+function main() {
+    let t = Tag(1)
+    let r = t.phantom<Int>("x")
+    print(r)
+}
+"#,
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected errors: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result
+            .module
+            .call_type_args
+            .values()
+            .any(|v| v.as_slice() == [Type::Int]),
+        "expected call_type_args to record [Int] from the turbofish, got: {:?}",
+        result.module.call_type_args
+    );
+}
+
+/// The phantom-parameter method above genuinely *requires* the turbofish:
+/// without it, no argument constrains `U`, so inference fails. This pins
+/// that the previous test is meaningful (the explicit path is exercised,
+/// not a silent fallback to inference).
+#[test]
+fn phantom_method_type_param_without_turbofish_cannot_infer() {
+    assert_has_error(
+        "struct Tag {\n  n: Int\n}\n\
+         impl Tag {\n  function phantom<U>(self, label: String) -> String { label }\n}\n\
+         function main() {\n  let t = Tag(1)\n  print(t.phantom(\"x\"))\n}",
+        "cannot infer",
+    );
+}
+
+/// A turbofish whose arity doesn't match the method's type parameters is an
+/// error.
+#[test]
+fn explicit_method_type_args_arity_mismatch_is_error() {
+    assert_has_error(
+        "struct Holder {\n  tag: Int\n}\n\
+         impl Holder {\n  function wrap<U>(self, x: U) -> U { x }\n}\n\
+         function main() {\n  let h = Holder(7)\n  print(h.wrap<Int, String>(42))\n}",
+        "expects 1 type argument(s), got 2",
+    );
+}
+
+/// A turbofish on a method that declares no type parameters is an error.
+#[test]
+fn type_args_on_non_generic_method_is_error() {
+    assert_has_error(
+        "struct Holder {\n  tag: Int\n}\n\
+         impl Holder {\n  function get(self) -> Int { self.tag }\n}\n\
+         function main() {\n  let h = Holder(7)\n  print(h.get<Int>())\n}",
+        "method `get` does not take type arguments",
+    );
+}
+
+/// A turbofish on a built-in method is an error (their type args are fixed by
+/// the receiver and arguments, never supplied explicitly).
+#[test]
+fn type_args_on_builtin_method_is_error() {
+    assert_has_error(
+        "function main() {\n  print(\"hello\".contains<Int>(\"e\"))\n}",
+        "built-in method `contains` does not take type arguments",
+    );
+}
+
+/// The explicit turbofish *overrides* inference but does not bypass argument
+/// checking: once `U` is pinned to `Int` by `wrap<Int>`, a `String` argument
+/// is rejected. This is the core soundness property of the explicit path — if
+/// `check_method_args` ever stopped seeing the turbofish bindings, this would
+/// silently start passing.
+#[test]
+fn explicit_method_type_arg_conflicting_with_argument_is_error() {
+    assert_has_error(
+        "struct Holder {\n  tag: Int\n}\n\
+         impl Holder {\n  function wrap<U>(self, x: U) -> U { x }\n}\n\
+         function main() {\n  let h = Holder(7)\n  print(h.wrap<Int>(\"hello\"))\n}",
+        "expected `Int` but got `String`",
+    );
+}
+
+/// A turbofish on a builtin static method (`List.builder<Int>()`) is an error:
+/// the builder's element type comes from the binding annotation, never an
+/// explicit turbofish. (Pins that the static-method path rejects rather than
+/// silently dropping the type args.)
+#[test]
+fn type_args_on_builtin_static_method_is_error() {
+    assert_has_error(
+        "function main() {\n  let b: ListBuilder<Int> = List.builder<Int>()\n  b.push(1)\n}",
+        "built-in `List.builder` does not take type arguments",
+    );
+}
+
+/// A method type parameter that *shadows* a same-named struct type parameter
+/// must win over the receiver's binding for that key. Here `Pair<A, B>` binds
+/// `A = Int` from the receiver, but the method's own `<A>` is pinned to `Bool`
+/// by the turbofish: the argument (`true: Bool`) and the return annotation
+/// (`Bool`) must both check against `Bool`, not the receiver's `Int`. This pins
+/// the `insert`-over-`or_insert` choice in `apply_explicit_method_type_args` —
+/// swapping it to `or_insert` would leave `A = Int` and make this fail with an
+/// "expected `Int` but got `Bool`" argument error.
+#[test]
+fn turbofish_method_type_param_shadows_receiver_binding() {
+    let tokens = tokenize(
+        r#"
+struct Pair<A, B> {
+    first: A
+    second: B
+}
+impl Pair {
+    function recast<A>(self, x: A) -> A { x }
+}
+function main() {
+    let p: Pair<Int, String> = Pair(1, "hi")
+    let r: Bool = p.recast<Bool>(true)
+    print(r)
+}
+"#,
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let result = check(&program);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected errors (method `A` should shadow the receiver's `A`): {:?}",
+        result.diagnostics
+    );
+    // The recorded type arg is the method's own `A` (`Bool`), never the
+    // receiver's `A` (`Int`).
+    let recorded: Vec<Vec<Type>> = result.module.call_type_args.values().cloned().collect();
+    assert!(
+        recorded.iter().any(|v| v.as_slice() == [Type::Bool]),
+        "expected [Bool] from the `<Bool>` turbofish, have: {:?}",
+        recorded
+    );
+    assert!(
+        !recorded.iter().any(|v| v.as_slice() == [Type::Int]),
+        "the receiver's `A` (Int) must not leak into the method's type args, have: {:?}",
+        recorded
+    );
+}
+
+/// A turbofish on a trait-object (`dyn Trait`) method call is an error: trait
+/// methods are not generic, so the type args have nothing to bind. Pins that
+/// the `dyn` dispatch path rejects rather than silently dropping them.
+#[test]
+fn type_args_on_dyn_trait_method_is_error() {
+    assert_has_error(
+        "trait Display {\n  function toString(self) -> String\n}\n\
+         function describe(d: dyn Display) -> String { d.toString<Int>() }\n\
+         function main() {}",
+        "trait method `toString` does not take type arguments",
+    );
+}
+
+/// A turbofish on a trait-bound method call (`item.toString<Int>()` where
+/// `item: T` and `T: Display`) is an error, for the same reason. Pins that the
+/// trait-bound dispatch path rejects rather than silently dropping them.
+#[test]
+fn type_args_on_trait_bound_method_is_error() {
+    assert_has_error(
+        "trait Display {\n  function toString(self) -> String\n}\n\
+         function show<T: Display>(item: T) -> String { item.toString<Int>() }\n\
+         function main() {}",
+        "trait method `toString` does not take type arguments",
+    );
+}
+
 // ── Generic method on a *generic* struct ──────────────────────────
 
 /// A generic method on a generic struct must record only the method's own

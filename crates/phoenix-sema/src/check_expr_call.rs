@@ -147,11 +147,29 @@ impl Checker {
 
         // Dispatch to built-in type helpers.
         if let Some(ty) = self.dispatch_builtin_method(mc, &obj_type) {
+            if !mc.type_args.is_empty() {
+                self.error(
+                    format!(
+                        "built-in method `{}` does not take type arguments",
+                        mc.method
+                    ),
+                    mc.span,
+                );
+            }
             return ty;
         }
 
         // Trait-object method dispatch: single-bound `dyn Trait` only.
         if let Type::Dyn(trait_name) = &obj_type {
+            // Trait methods are not generic today, so an explicit turbofish has
+            // nothing to bind — reject it rather than silently dropping it,
+            // matching every other dispatch path above.
+            if !mc.type_args.is_empty() {
+                self.error(
+                    format!("trait method `{}` does not take type arguments", mc.method),
+                    mc.span,
+                );
+            }
             // Clone just the method signature so we don't hold a borrow of
             // `self.traits` across `check_method_args`. Sema rejects
             // `dyn UnknownTrait` upstream in `resolve_type_expr`, so the
@@ -209,19 +227,35 @@ impl Checker {
             // args for IR monomorphization.
             let mut all_bindings = bindings.clone();
             if !method_info.type_params.is_empty() {
-                // Pre-check arg types so inference has something to unify.
-                let arg_types: Vec<Type> = mc.args.iter().map(|a| self.check_expr(a)).collect();
-                let (method_bindings, errors) =
-                    self.infer_type_args(&method_info.params, &arg_types);
-                for (k, v) in method_bindings.iter() {
-                    all_bindings.entry(k.clone()).or_insert_with(|| v.clone());
+                if !mc.type_args.is_empty() {
+                    // Explicit turbofish (`obj.method<Int>(x)`) overrides
+                    // inference: resolve, validate arity, and record directly.
+                    self.apply_explicit_method_type_args(
+                        mc,
+                        &method_info.type_params,
+                        &type_name,
+                        &mut all_bindings,
+                    );
+                } else {
+                    // Pre-check arg types so inference has something to unify.
+                    let arg_types: Vec<Type> = mc.args.iter().map(|a| self.check_expr(a)).collect();
+                    let (method_bindings, errors) =
+                        self.infer_type_args(&method_info.params, &arg_types);
+                    for (k, v) in method_bindings.iter() {
+                        all_bindings.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    self.record_inferred_type_args(
+                        &format!("{}.{}", type_name, mc.method),
+                        &method_info.type_params,
+                        &all_bindings,
+                        &errors,
+                        &arg_types,
+                        mc.span,
+                    );
                 }
-                self.record_inferred_type_args(
-                    &format!("{}.{}", type_name, mc.method),
-                    &method_info.type_params,
-                    &all_bindings,
-                    &errors,
-                    &arg_types,
+            } else if !mc.type_args.is_empty() {
+                self.error(
+                    format!("method `{}` does not take type arguments", mc.method),
                     mc.span,
                 );
             }
@@ -367,6 +401,15 @@ impl Checker {
                     Some(m) => m,
                     None => continue,
                 };
+                // Trait methods are not generic today, so an explicit turbofish
+                // has nothing to bind — reject it rather than silently dropping
+                // it, matching every other dispatch path.
+                if !mc.type_args.is_empty() {
+                    self.error(
+                        format!("trait method `{}` does not take type arguments", mc.method),
+                        mc.span,
+                    );
+                }
                 let empty_bindings = HashMap::new();
                 // Trait-bound method dispatch ignores defaults for now —
                 // defaults on trait methods require mono-time synthesis.
@@ -597,6 +640,19 @@ impl Checker {
         path: &ModulePath,
         mc: &MethodCallExpr,
     ) -> Type {
+        // A namespaced free-function call infers its type args from the
+        // arguments like any other call; an explicit turbofish has no
+        // meaning here (the json intrinsic path defines its own type-arg
+        // semantics and is handled separately).
+        if !mc.type_args.is_empty() {
+            self.error(
+                format!(
+                    "function `{}.{}` does not take type arguments",
+                    ns_name, mc.method
+                ),
+                mc.span,
+            );
+        }
         let qualified = module_qualify(path, &mc.method);
         let Some(func_info) = self.functions.get(&qualified).cloned() else {
             self.error(
@@ -693,7 +749,7 @@ impl Checker {
         if self.scopes.lookup(&type_ident.name).is_some() {
             return None;
         }
-        match (type_ident.name.as_str(), mc.method.as_str()) {
+        let result = match (type_ident.name.as_str(), mc.method.as_str()) {
             ("List", "builder") => {
                 if !mc.args.is_empty() {
                     self.error("List.builder() takes no arguments".to_string(), mc.span);
@@ -715,7 +771,22 @@ impl Checker {
                 ))
             }
             _ => None,
+        };
+        // Builder constructors take their element types from the binding's
+        // annotation, never from an explicit turbofish — reject it the same
+        // way instance built-ins do, rather than silently dropping it. Only
+        // fires once the call is recognized as a builtin static method, so an
+        // unrecognized `Type.method<…>()` falls through without a stray error.
+        if result.is_some() && !mc.type_args.is_empty() {
+            self.error(
+                format!(
+                    "built-in `{}.{}` does not take type arguments",
+                    type_ident.name, mc.method
+                ),
+                mc.span,
+            );
         }
+        result
     }
 
     /// Type-checks a function call expression, resolving the callee and
@@ -1113,6 +1184,56 @@ impl Checker {
         }
 
         (bindings, arg_types, errors)
+    }
+
+    /// Apply explicit turbofish type arguments for a generic method call.
+    ///
+    /// Validates the count against the method's type parameters, resolves
+    /// each `TypeExpr`, binds them, and inserts the ordered list into
+    /// `call_type_args` — the same span-keyed channel the inferred path
+    /// feeds, so IR monomorphizes the call identically. On an arity mismatch
+    /// a diagnostic is emitted and nothing is recorded.
+    fn apply_explicit_method_type_args(
+        &mut self,
+        mc: &MethodCallExpr,
+        type_params: &[String],
+        type_name: &str,
+        bindings: &mut HashMap<String, Type>,
+    ) {
+        if mc.type_args.len() != type_params.len() {
+            self.error(
+                format!(
+                    "method `{}.{}` expects {} type argument(s), got {}",
+                    type_name,
+                    mc.method,
+                    type_params.len(),
+                    mc.type_args.len()
+                ),
+                mc.span,
+            );
+            return;
+        }
+        let resolved: Vec<Type> = mc
+            .type_args
+            .iter()
+            .map(|te| self.resolve_type_expr(te))
+            .collect();
+        // `insert` (overwrite), not `or_insert`: `type_params` are the
+        // method's *own* binders, which lexically shadow any same-named
+        // impl-level param already in `bindings` from the receiver. So the
+        // explicit value must win for those keys. This is deliberately
+        // *opposite* to the inferred path, which uses `or_insert` because
+        // `infer_type_args` can hand back impl-level keys that the
+        // receiver already pinned authoritatively — there the receiver
+        // must win. The two never disagree in the common case (distinct
+        // names); they only differ under a method/impl name collision, and
+        // each path's choice is correct for its own key set.
+        for (tp, ty) in type_params.iter().zip(resolved.iter()) {
+            bindings.insert(tp.clone(), ty.clone());
+        }
+        if !resolved.iter().any(Type::is_error) {
+            self.call_type_args.insert(mc.span, resolved);
+        }
     }
 
     /// Finalize a generic call: emit diagnostics for any unification errors

@@ -1368,6 +1368,10 @@ pub struct MethodCallExpr {
     pub object: Expr,
     /// The method name.
     pub method: String,
+    /// Explicit type arguments (`obj.method<Int>(x)` turbofish). Empty when
+    /// the call relies on inference. Used to override inference for generic
+    /// methods and to resolve `json.decode<T>(s)`.
+    pub type_args: Vec<TypeExpr>,
     /// The argument expressions (not including the receiver).
     pub args: Vec<Expr>,
     /// Source span covering the entire method call.
