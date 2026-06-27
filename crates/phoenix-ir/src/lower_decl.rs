@@ -213,16 +213,19 @@ impl<'a> LoweringContext<'a> {
     /// in [`EnumId`] order and installs each entry into
     /// [`IrModule::enum_layouts`].  Generic enums additionally
     /// register their type parameters in
-    /// [`IrModule::enum_type_params`].  Built-in `Option` and
-    /// `Result` are skipped here — they're installed by
-    /// `register_builtin_enum_layouts` because their generic
-    /// payload-type handling differs from user-declared enums.
+    /// [`IrModule::enum_type_params`].  Built-in `Option`, `Result`,
+    /// and `JsonError` are skipped here — they're installed by
+    /// `register_builtin_enum_layouts` (single source of truth for
+    /// builtin layouts), so installing them here too would just be a
+    /// redundant duplicate insert.
     fn register_enum_layouts(&mut self) {
         let check = self.check;
         let entries: Vec<EnumLayoutEntry> = check
             .enums_with_names()
             .filter(|(name, _, _)| {
-                *name != crate::types::OPTION_ENUM && *name != crate::types::RESULT_ENUM
+                *name != crate::types::OPTION_ENUM
+                    && *name != crate::types::RESULT_ENUM
+                    && *name != crate::types::JSON_ERROR_ENUM
             })
             .map(|(name, _id, info)| {
                 let variants: Vec<(String, Vec<IrType>)> = info

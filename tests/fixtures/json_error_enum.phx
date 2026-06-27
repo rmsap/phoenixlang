@@ -1,0 +1,22 @@
+// `JsonError` is a pre-registered builtin enum. It must be
+// usable with no import: as a parameter type, constructed via its bare
+// variant names, matched on, and as the error arm of `Result<T, JsonError>`
+// (the shape `json.decode<T>` will return).
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: {m}"
+    TypeMismatch(m) -> "type: {m}"
+    MissingField(m) -> "missing: {m}"
+  }
+}
+
+function main() {
+  print(describe(MissingField("name")))
+  print(describe(ParseError("bad token")))
+  let r: Result<Int, JsonError> = Err(TypeMismatch("expected Int"))
+  match r {
+    Ok(v) -> print("ok {toString(v)}")
+    Err(e) -> print(describe(e))
+  }
+}

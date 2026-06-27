@@ -99,9 +99,9 @@ impl fmt::Display for StructId {
 }
 
 /// Stable identifier for a user-declared enum declaration within a
-/// resolved module.  Built-in `Option` is `EnumId(0)` and built-in
-/// `Result` is `EnumId(1)`; user-declared enums follow in
-/// declaration order.
+/// resolved module.  Built-in `Option` is `EnumId(0)`, `Result` is
+/// `EnumId(1)`, and `JsonError` is `EnumId(2)`; user-declared enums
+/// follow in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EnumId(
     /// Raw u32 index. Public for transparent IR interop; prefer
@@ -127,12 +127,19 @@ pub const OPTION_ENUM_ID: EnumId = EnumId(0);
 /// user-declared enums start at [`FIRST_USER_ENUM_ID`].
 pub const RESULT_ENUM_ID: EnumId = EnumId(1);
 
+/// `EnumId` reserved for the built-in `JsonError` enum.
+/// Pinned at construction time by
+/// `phoenix_sema::resolved::build_from_checker`; user-declared enums
+/// start at [`FIRST_USER_ENUM_ID`].
+pub const JSON_ERROR_ENUM_ID: EnumId = EnumId(2);
+
 /// First `EnumId` available for user-declared enums.  Equal to the
 /// number of reserved built-in enum slots
-/// ([`OPTION_ENUM_ID`] + [`RESULT_ENUM_ID`] = 2).  Adding a third
-/// built-in enum requires updating this constant *and* the placement
-/// loop in `phoenix_sema::resolved::build_from_checker`.
-pub const FIRST_USER_ENUM_ID: EnumId = EnumId(2);
+/// ([`OPTION_ENUM_ID`] + [`RESULT_ENUM_ID`] + [`JSON_ERROR_ENUM_ID`] =
+/// 3).  Adding a fourth built-in enum requires updating this constant
+/// *and* the placement loop in
+/// `phoenix_sema::resolved::build_from_checker`.
+pub const FIRST_USER_ENUM_ID: EnumId = EnumId(3);
 
 impl fmt::Display for EnumId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -216,10 +223,11 @@ mod tests {
     fn reserved_enum_id_constants_match_documented_layout() {
         assert_eq!(OPTION_ENUM_ID, EnumId(0));
         assert_eq!(RESULT_ENUM_ID, EnumId(1));
-        assert_eq!(FIRST_USER_ENUM_ID, EnumId(2));
+        assert_eq!(JSON_ERROR_ENUM_ID, EnumId(2));
+        assert_eq!(FIRST_USER_ENUM_ID, EnumId(3));
         // FIRST_USER_ENUM_ID must be one past the last reserved id;
         // if a future built-in is added, update both this assertion
         // and `build_from_checker`'s placement loop together.
-        assert_eq!(FIRST_USER_ENUM_ID.0, RESULT_ENUM_ID.0 + 1);
+        assert_eq!(FIRST_USER_ENUM_ID.0, JSON_ERROR_ENUM_ID.0 + 1);
     }
 }

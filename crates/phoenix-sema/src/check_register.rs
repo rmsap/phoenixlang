@@ -113,6 +113,25 @@ impl Checker {
             },
         );
 
+        // Register built-in JsonError enum (JSON serialization).
+        // Non-generic: every variant carries a `String` message. Registered
+        // here (like Option/Result) so `json.decode<T>` can return
+        // `Result<T, JsonError>` in every module with no import, and so the
+        // name is reserved against user redeclaration.
+        self.enums.insert(
+            "JsonError".to_string(),
+            EnumInfo {
+                definition_span: Span::BUILTIN,
+                type_params: vec![],
+                variants: crate::types::JSON_ERROR_VARIANTS
+                    .iter()
+                    .map(|v| (v.to_string(), vec![Type::String]))
+                    .collect(),
+                visibility: Visibility::Public,
+                def_module: ModulePath::builtin(),
+            },
+        );
+
         // Register built-in Option methods
         self.methods.insert(
             "Option".to_string(),
@@ -521,6 +540,38 @@ impl Checker {
                         this.file_field_allowed = true;
                         let ty = this.resolve_type_expr(&f.type_annotation);
                         this.file_field_allowed = prev_file;
+
+                        // `@skip` omits a field from JSON and supplies
+                        // no value on decode, so it is only valid on `Option<T>`
+                        // fields (decode fills them with `None` — the language has
+                        // no field defaults yet). The check is unconditional on the
+                        // struct's `@jsonSerializable` marker: `@skip` is meaningful
+                        // only under serialization, but requiring `Option<T>`
+                        // everywhere keeps the rule simple and catches the mistake
+                        // even before the struct is opted in. Needs the resolved
+                        // type, so it runs here rather than in `validate_annotation`.
+                        // Only a well-formed `@skip` (no args) is type-checked here;
+                        // a malformed `@skip("x")` already gets its own diagnostic
+                        // from `validate_annotation`, so skipping it avoids a
+                        // confusing second error on the same annotation.
+                        let skip_ann = f
+                            .annotations
+                            .iter()
+                            .find(|a| a.name == "skip" && a.args.is_empty());
+                        if let Some(skip_ann) = skip_ann
+                            && !matches!(&ty, crate::types::Type::Generic(n, args)
+                                if n == "Option" && args.len() == 1)
+                            && !ty.is_error()
+                        {
+                            this.error(
+                                format!(
+                                    "`@skip` is only valid on `Option<T>` fields — field `{}` \
+                                     has type `{}`, so decode would have no value to supply",
+                                    f.name, ty
+                                ),
+                                skip_ann.span,
+                            );
+                        }
 
                         // Validate constraint expression if present: bind `self` to
                         // the field type, type-check the expression, verify it is Bool.

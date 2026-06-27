@@ -652,6 +652,22 @@ impl Interpreter {
                 variants: HashMap::from([("Ok".to_string(), 1), ("Err".to_string(), 1)]),
             },
         );
+        // Built-in `JsonError`: non-generic variants, each carrying
+        // a single `String` message (arity 1). Variant set is shared with sema
+        // via `JSON_ERROR_VARIANTS` so the two can't drift.
+        for variant in phoenix_sema::types::JSON_ERROR_VARIANTS {
+            self.variant_to_enum
+                .insert(variant.to_string(), "JsonError".to_string());
+        }
+        self.enums.insert(
+            "JsonError".to_string(),
+            EnumDef {
+                variants: phoenix_sema::types::JSON_ERROR_VARIANTS
+                    .iter()
+                    .map(|v| (v.to_string(), 1))
+                    .collect(),
+            },
+        );
     }
 
     /// Runs a complete Phoenix program by registering all declarations and then

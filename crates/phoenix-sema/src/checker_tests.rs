@@ -5193,10 +5193,106 @@ fn extern_js_unresolved_param_type_reports_one_error() {
 use phoenix_common::diagnostics::Severity;
 
 /// Valid built-in annotations on their correct targets produce no diagnostics.
+/// `@skip` is only valid on `Option<T>` (Phase 4.6), so the skipped field is
+/// optional here.
 #[test]
 fn valid_annotations_produce_no_diagnostics() {
     assert_no_errors(
-        "@jsonSerializable\nstruct User {\n  @jsonName(\"user_name\")\n  name: String\n  @skip\n  cached: String\n}",
+        "@jsonSerializable\nstruct User {\n  @jsonName(\"user_name\")\n  name: String\n  @skip\n  cached: Option<String>\n}",
+    );
+}
+
+/// `@skip` on a non-`Option` field is an error: decode has no value to
+/// supply for a skipped required field (the language has no field defaults).
+#[test]
+fn skip_on_non_option_field_is_error() {
+    assert_has_error(
+        "struct User {\n  @skip\n  cached: String\n}",
+        "`@skip` is only valid on `Option<T>` fields",
+    );
+}
+
+/// `@skip` on an `Option<T>` field is accepted (decode fills it with `None`).
+#[test]
+fn skip_on_option_field_is_ok() {
+    assert_no_errors("struct User {\n  name: String\n  @skip\n  cached: Option<Int>\n}");
+}
+
+/// `JsonError` is a reserved builtin enum name (Phase 4.6) and cannot be
+/// redeclared by user code.
+#[test]
+fn jsonerror_cannot_be_redeclared() {
+    assert_has_error(
+        "enum JsonError {\n  Boom\n}",
+        "`JsonError` is a reserved builtin name",
+    );
+}
+
+/// The `JsonError` reservation is name-based, not enum-specific: a user may
+/// not shadow it with a struct or a function either (the reservation flows
+/// through the shared `is_builtin_name` predicate).
+#[test]
+fn jsonerror_cannot_be_redeclared_as_struct_or_function() {
+    assert_has_error(
+        "struct JsonError {\n  msg: String\n}",
+        "`JsonError` is a reserved builtin name",
+    );
+    assert_has_error(
+        "function JsonError() {\n}",
+        "`JsonError` is a reserved builtin name",
+    );
+}
+
+/// Constructing a builtin `JsonError` variant with the wrong arity is rejected
+/// like any other variant: each variant carries exactly one `String` field.
+#[test]
+fn jsonerror_variant_wrong_arity_is_error() {
+    assert_has_error(
+        "function main() {\n  let x = MissingField()\n}",
+        "variant `MissingField` takes 1 field(s), got 0",
+    );
+    assert_has_error(
+        "function main() {\n  let x = ParseError(\"a\", \"b\")\n}",
+        "variant `ParseError` takes 1 field(s), got 2",
+    );
+}
+
+/// `JsonError` and its variants are usable with no import — as a parameter
+/// type, constructed by bare variant name, and matched on.
+#[test]
+fn jsonerror_is_usable_without_import() {
+    assert_no_errors(
+        "function describe(e: JsonError) -> String {\n  \
+           match e {\n    \
+             ParseError(m) -> m\n    \
+             TypeMismatch(m) -> m\n    \
+             MissingField(m) -> m\n  \
+           }\n\
+         }\n\
+         function main() {\n  print(describe(MissingField(\"x\")))\n}",
+    );
+}
+
+/// The builtin `JsonError` variants (`ParseError`/`TypeMismatch`/`MissingField`)
+/// are NOT reserved names — only the type name `JsonError` is. A user enum may
+/// reuse a variant name, but a bare-name *use* of the shared variant is then
+/// ambiguous between the user enum and the builtin and must be diagnosed.
+#[test]
+fn user_variant_colliding_with_jsonerror_variant_is_ambiguous() {
+    assert_has_error(
+        "enum Mine {\n  ParseError(Int)\n}\n\
+         function main() {\n  let x = ParseError(1)\n}",
+        "variant `ParseError` is ambiguous",
+    );
+}
+
+/// `@skip` validation looks through type aliases: `@skip` on a field whose
+/// alias resolves to `Option<T>` is accepted (resolved type drives the check).
+#[test]
+fn skip_on_aliased_option_field_is_ok() {
+    assert_no_errors(
+        "type MaybeInt = Option<Int>\n\
+         struct User {\n  name: String\n  @skip\n  cached: MaybeInt\n}",
     );
 }
 

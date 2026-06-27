@@ -161,6 +161,10 @@ backend_matrix_test!(matrix_builders, "builders.phx");
 // printed prefix (wasm32-gc lowering added 2026-06-15).
 backend_matrix_test!(matrix_list_query_methods, "list_query_methods.phx");
 backend_matrix_test!(matrix_option_result, "option_result.phx");
+// The pre-registered builtin `JsonError` enum: usable with no
+// import as a param type, constructed by bare variant name, matched on,
+// and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).
+backend_matrix_test!(matrix_json_error_enum, "json_error_enum.phx");
 // The Option/Result combinators the original `option_result.phx` slice
 // deferred on wasm32-gc — `mapErr` / `orElse` / `okOr` / `unwrapOrElse`
 // / `ok` / `err`, each on both variants (lowering added 2026-06-15).

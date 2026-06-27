@@ -528,14 +528,24 @@ impl<'a> LoweringContext<'a> {
         self.lower_function_bodies(program);
     }
 
-    /// Register enum layouts for built-in Option and Result types.
+    /// Register enum layouts for the built-in `Option`, `Result`, and
+    /// `JsonError` types — the single source of truth for builtin enum
+    /// layouts (`register_enum_layouts` skips all three).
     ///
-    /// Option has `Some(T)` and `None`; Result has `Ok(T)` and `Err(E)`.
-    /// Since these are generic, the field types use a placeholder
-    /// (`StructRef(GENERIC_PLACEHOLDER)`).  The concrete types are determined at
-    /// each use site via type inference.
+    /// `Option` has `Some(T)` and `None`; `Result` has `Ok(T)` and
+    /// `Err(E)`. Since these are generic, their type-parameter field
+    /// types are erased to the nameless `GENERIC_PLACEHOLDER`; the
+    /// concrete types are determined at each use site via type
+    /// inference. `JsonError` is non-generic (every variant carries a
+    /// concrete `String`), so the erase step below is a no-op for it —
+    /// it is registered here purely to keep all builtin enum layouts in
+    /// one place.
     fn register_builtin_enum_layouts(&mut self) {
-        for name in &[crate::types::OPTION_ENUM, crate::types::RESULT_ENUM] {
+        for name in &[
+            crate::types::OPTION_ENUM,
+            crate::types::RESULT_ENUM,
+            crate::types::JSON_ERROR_ENUM,
+        ] {
             if let Some(info) = self.check.enum_info_by_name(name) {
                 let variants: Vec<(String, Vec<IrType>)> = info
                     .variants
@@ -567,7 +577,7 @@ impl<'a> LoweringContext<'a> {
             } else {
                 unreachable!(
                     "builtin enum '{name}' not found in sema — \
-                     sema should always register Option and Result"
+                     sema should always register Option, Result, and JsonError"
                 );
             }
         }

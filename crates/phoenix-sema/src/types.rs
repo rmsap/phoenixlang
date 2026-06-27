@@ -1,5 +1,12 @@
 use phoenix_common::module_path::bare_name;
 
+/// The variant names of the built-in `JsonError` enum, in
+/// declaration order. Every variant carries a single `String` message.
+/// Shared so the sema registration ([`crate::checker::Checker`]'s
+/// `register_builtins`) and the interpreter's builtin-enum table cannot
+/// drift on the variant set.
+pub const JSON_ERROR_VARIANTS: [&str; 3] = ["ParseError", "TypeMismatch", "MissingField"];
+
 /// The types in the Phoenix type system.
 ///
 /// This enum represents every type the compiler currently understands.

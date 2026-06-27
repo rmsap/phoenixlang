@@ -15,6 +15,9 @@ pub const GENERIC_PLACEHOLDER: &str = "__generic";
 pub const OPTION_ENUM: &str = "Option";
 /// The name of the built-in `Result` enum in the IR.
 pub const RESULT_ENUM: &str = "Result";
+/// The name of the built-in `JsonError` enum in the IR.
+/// Non-generic, with three `String`-carrying variants.
+pub const JSON_ERROR_ENUM: &str = "JsonError";
 
 /// A type in the IR.
 ///

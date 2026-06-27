@@ -65,7 +65,8 @@ use crate::checker::{
 use crate::types::Type;
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::ids::{
-    EnumId, FIRST_USER_ENUM_ID, FuncId, OPTION_ENUM_ID, RESULT_ENUM_ID, StructId, TraitId,
+    EnumId, FIRST_USER_ENUM_ID, FuncId, JSON_ERROR_ENUM_ID, OPTION_ENUM_ID, RESULT_ENUM_ID,
+    StructId, TraitId,
 };
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{CaptureInfo, Declaration, Program};
@@ -113,8 +114,9 @@ pub type MethodIndex = HashMap<String, HashMap<String, FuncId>>;
 ///    occupy `FuncId(0..functions.len())`; user methods occupy
 ///    `FuncId(functions.len()..functions.len() + user_methods.len())`.
 /// 4. **Reserved enum ids are pinned.** `enum_by_name["Option"] ==
-///    `[`OPTION_ENUM_ID`] and `enum_by_name["Result"] ==
-///    `[`RESULT_ENUM_ID`]; the first user-declared enum, if any,
+///    `[`OPTION_ENUM_ID`], `enum_by_name["Result"] ==
+///    `[`RESULT_ENUM_ID`], and `enum_by_name["JsonError"] ==
+///    `[`JSON_ERROR_ENUM_ID`]; the first user-declared enum, if any,
 ///    receives [`FIRST_USER_ENUM_ID`].
 /// 5. **No `Type::Error` in `call_type_args`.** Checked in debug
 ///    only; a release-mode violation would surface as a panic in
@@ -872,14 +874,19 @@ fn build_user_and_builtin_methods(rm: &mut ResolvedModule, checker: &mut Checker
         .collect();
 }
 
-/// Built-in `Option` then `Result` first (pinned to
-/// [`OPTION_ENUM_ID`] / [`RESULT_ENUM_ID`]), then user enums in AST
-/// order. Entry-module enums are placed via the entry program's
-/// declaration walk (preserves the existing single-file id-allocation
-/// order); enums from non-entry modules are drained afterward in
-/// lexical order of their qualified key (deterministic across runs).
+/// Built-in `Option`, `Result`, then `JsonError` first (pinned to
+/// [`OPTION_ENUM_ID`] / [`RESULT_ENUM_ID`] / [`JSON_ERROR_ENUM_ID`]),
+/// then user enums in AST order. Entry-module enums are placed via the
+/// entry program's declaration walk (preserves the existing single-file
+/// id-allocation order); enums from non-entry modules are drained
+/// afterward in lexical order of their qualified key (deterministic
+/// across runs).
 fn build_enums(rm: &mut ResolvedModule, checker: &mut Checker, program: &Program) {
-    for (builtin, expected_id) in [("Option", OPTION_ENUM_ID), ("Result", RESULT_ENUM_ID)] {
+    for (builtin, expected_id) in [
+        ("Option", OPTION_ENUM_ID),
+        ("Result", RESULT_ENUM_ID),
+        ("JsonError", JSON_ERROR_ENUM_ID),
+    ] {
         if let Some(info) = checker.enums.remove(builtin) {
             let id = next_enum_id(rm.enums.len());
             assert_eq!(
