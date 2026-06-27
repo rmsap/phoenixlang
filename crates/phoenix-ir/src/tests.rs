@@ -1908,17 +1908,15 @@ fn lower_modules_qualifies_non_entry_function() {
     );
 }
 
-/// Namespace calls (`lib.func(...)`) type-check — sema records the target
-/// in `namespace_call_targets` — but the IR execution side ("I2") has not
-/// landed. Lowering one must fail with the intentional, named
-/// `unimplemented!` guard at the top of `lower_method_call`, not the
-/// misleading "unknown identifier `lib`" panic that lowering the namespace
-/// receiver would otherwise raise. Pin that staged boundary so I2 flips it
-/// deliberately (and so a regression doesn't silently re-route to the
-/// confusing panic). Remove/replace this test when I2 lands.
+/// Namespace calls (`lib.func(...)`) lower to an ordinary `Op::Call`
+/// targeting the resolved qualified function — the receiver is a
+/// namespace, not a value, so there is nothing to evaluate as an object.
+/// Pin that lowering succeeds and the resulting module verifies (rather
+/// than tripping `lower_ident`'s "unknown identifier `lib`" on the
+/// namespace receiver), and that the call site emits a `Call` op
+/// targeting `lib::shout`'s `FuncId` specifically.
 #[test]
-#[should_panic(expected = "not yet lowerable")]
-fn namespace_call_lowering_is_staged_until_i2() {
+fn namespace_call_lowers_to_a_direct_call() {
     let entry = make_module(
         ModulePath::entry(),
         "import lib\nfunction main() { lib.shout() }",
@@ -1938,8 +1936,37 @@ fn namespace_call_lowering_is_staged_until_i2() {
         "namespace call should type-check; sema errors: {:?}",
         analysis.diagnostics
     );
-    // Panics: namespace-call lowering is staged for I2.
-    let _ = lower_modules(&modules, &analysis.module);
+    let ir = lower_modules(&modules, &analysis.module);
+    let errs = crate::verify::verify(&ir);
+    assert!(
+        errs.is_empty(),
+        "namespace-call lowering must verify: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    // The entry's `main` must contain a `Call` op targeting `lib::shout`'s
+    // FuncId — not merely *some* call. A wrong-target lowering (or one that
+    // re-routed through the namespace receiver) would slip past a bare
+    // "any Op::Call" check.
+    let shout_id = *ir
+        .function_index
+        .get("lib::shout")
+        .expect("`lib::shout` must be registered in the IR function_index");
+    let main = ir
+        .functions
+        .iter()
+        .map(|f| f.func())
+        .find(|f| f.name == "main")
+        .expect("entry module must lower a `main`");
+    let calls_shout = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|instr| matches!(&instr.op, Op::Call(target, _, _) if *target == shout_id));
+    assert!(
+        calls_shout,
+        "namespace call `lib.shout()` should lower to an `Op::Call` targeting \
+         `lib::shout` (FuncId {shout_id:?})"
+    );
 }
 
 /// `qualify_resolved` must pass through any name that already contains

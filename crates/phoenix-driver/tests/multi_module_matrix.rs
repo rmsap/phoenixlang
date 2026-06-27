@@ -73,6 +73,13 @@ macro_rules! multi_matrix_test {
 
 multi_matrix_test!(matrix_basic_import, "basic_import");
 multi_matrix_test!(matrix_import_alias, "import_alias");
+// Namespace imports (`import helpers` → `helpers.add(...)`, plus an
+// aliased `import helpers as h`). Covers the namespace-call path on
+// every backend, including a *generic* function (`helpers.identity(42)`)
+// to exercise type-arg threading through monomorphization, and a call
+// that relies on a callee default argument (`helpers.scaled(5)`) to
+// exercise default-fill on that path.
+multi_matrix_test!(matrix_namespace_import, "namespace_import");
 multi_matrix_test!(matrix_import_wildcard, "import_wildcard");
 multi_matrix_test!(matrix_nested_modules, "nested_modules");
 // The §2.6 tripwire: a public function whose default arg references a

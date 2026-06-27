@@ -1,0 +1,15 @@
+public function add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+public function greet(name: String) -> String {
+  "hi {name}"
+}
+
+public function identity<T>(x: T) -> T {
+  x
+}
+
+public function scaled(x: Int, by: Int = 10) -> Int {
+  x * by
+}

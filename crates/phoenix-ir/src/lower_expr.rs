@@ -963,33 +963,29 @@ impl<'a> LoweringContext<'a> {
     /// defaults — at monomorphization time for the trait-bounded
     /// branch, since the concrete impl is not known here.
     fn lower_method_call(&mut self, mc: &MethodCallExpr) -> ValueId {
-        // Namespace call (`lib.func(...)`) resolved by sema: sema records
-        // the target's qualified key in `namespace_call_targets`, but the
-        // execution side (IR lowering of the call into an `Op::Call`, plus
-        // the interpreters) is the staged follow-up "I2". Until it lands,
-        // a namespace call type-checks but cannot be lowered.
-        //
-        // The CLI driver gates the IR-based backends on
-        // `namespace_call_targets` *before* calling `lower_modules`
-        // (`report_unlowerable_namespace_calls` in `phoenix-driver`), so a
-        // real user invocation surfaces a clean span-anchored diagnostic
-        // and never reaches here. This `unimplemented!` is the
-        // defense-in-depth backstop for callers that lower directly (the
-        // IR tests, future embedders): it fails with an intentional, named
-        // message rather than falling through to `lower_ident`'s
-        // `unreachable!("unknown identifier ...")` on the namespace
-        // receiver, which would misattribute the gap.
-        // See docs/known-issues.md and design-decisions.md (Decision 5).
-        if self.check.namespace_call_targets.contains_key(&mc.span) {
-            let receiver = match &mc.object {
-                Expr::Ident(id) => id.name.as_str(),
-                _ => "<namespace>",
+        // Namespace call (`lib.func(...)`): sema recorded the target's
+        // qualified key in `namespace_call_targets`. Resolve it to a
+        // `FuncId` and lower exactly like a direct free-function call — the
+        // receiver is a namespace, not a value, so there is nothing to
+        // evaluate as an object. Intrinsic-namespace calls (`json.encode`)
+        // are rejected by sema today and so never reach here.
+        if let Some(qualified) = self.check.namespace_call_targets.get(&mc.span).cloned() {
+            let Some(&func_id) = self.module.function_index.get(qualified.as_str()) else {
+                unreachable!(
+                    "namespace call target `{qualified}` was recorded by sema but is \
+                     absent from the IR `function_index` — sema/IR function tables are \
+                     out of sync"
+                );
             };
-            unimplemented!(
-                "namespace call `{}.{}(...)` type-checks but is not yet lowerable — \
-                 namespace-call execution lands in the I2 follow-up (see docs/known-issues.md)",
-                receiver,
-                mc.method,
+            let positional: Vec<ValueId> = mc.args.iter().map(|a| self.lower_expr(a)).collect();
+            let result_type = self.expr_type(&mc.span);
+            let args = self.merge_call_args(func_id, &positional, &[], mc.span);
+            let args = self.coerce_call_args(func_id, args, mc.span);
+            let type_args = self.resolve_call_type_args(mc.span);
+            return self.emit(
+                Op::Call(func_id, type_args, args),
+                result_type,
+                Some(mc.span),
             );
         }
         // Phase 2.7 decision F: recognize `List.builder()` /

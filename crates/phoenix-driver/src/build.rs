@@ -43,10 +43,7 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>, loc
         None => Target::default(),
     };
 
-    let (modules, check_result, sm) = super::parse_resolve_check(path, locked);
-    if super::report_unlowerable_namespace_calls(&check_result, &sm) {
-        process::exit(1);
-    }
+    let (modules, check_result, _sm) = super::parse_resolve_check(path, locked);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);

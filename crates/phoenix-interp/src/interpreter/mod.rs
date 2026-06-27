@@ -213,14 +213,13 @@ pub struct Interpreter {
     /// Keyed by the lambda's source span.
     pub(crate) lambda_captures: HashMap<Span, Vec<CaptureInfo>>,
 
-    /// Spans of namespace calls (`lib.func(...)`) that sema resolved,
-    /// drained from sema's `Analysis`. The tree-walk interpreter does not
-    /// yet execute namespace calls (the receiver is a namespace, not a
-    /// value) — that execution support is the staged "I2" follow-up. Until
-    /// then [`Interpreter::eval_method_call`] consults this set to fail
-    /// with a clear, named error rather than the misleading "undefined
-    /// variable" that lowering the namespace receiver would otherwise
-    /// produce. Empty for single-file inputs without sema metadata.
+    /// Namespace calls (`lib.func(...)`) keyed by call span to the
+    /// resolved callee's qualified key, drained from sema's `Analysis`.
+    /// The receiver is a namespace, not a value, so
+    /// [`Interpreter::eval_method_call`] consults this map to dispatch
+    /// straight to the target function in its owning module instead of
+    /// evaluating the receiver as an object. Empty for single-file inputs
+    /// without sema metadata.
     pub(crate) namespace_call_targets: HashMap<Span, String>,
 
     /// Per-module visibility scopes (drained from sema's `Analysis`).
@@ -1519,22 +1518,20 @@ impl Interpreter {
     /// Evaluates a method call, dispatching to built-in type methods or
     /// user-defined methods.
     fn eval_method_call(&mut self, mc: &MethodCallExpr) -> Result<Value> {
-        // Namespace call (`lib.func(...)`) resolved by sema but not yet
-        // executable: the receiver is a namespace, not a value, so the
-        // execution side is the staged "I2" follow-up. Fail with a named
-        // error rather than falling through to evaluate the namespace
-        // receiver, which would report a misleading "undefined variable".
-        // See docs/known-issues.md and design-decisions.md (Decision 5).
-        if self.namespace_call_targets.contains_key(&mc.span) {
-            let receiver = match &mc.object {
-                Expr::Ident(id) => id.name.as_str(),
-                _ => "<namespace>",
+        // Namespace call (`lib.func(...)`): sema recorded the resolved
+        // qualified target. The receiver is a namespace, not a value, so
+        // dispatch straight to that function in its owning module — the
+        // same path `eval_call` takes for a direct call, minus the callee
+        // resolution (already done by sema).
+        if let Some(qualified) = self.namespace_call_targets.get(&mc.span).cloned() {
+            let Some(entry) = self.functions.get(&qualified).cloned() else {
+                return error(format!(
+                    "namespace call target `{qualified}` was recorded by sema but is not \
+                     a registered function — sema/interpreter tables are out of sync"
+                ));
             };
-            return error(format!(
-                "namespace call `{}.{}(...)` type-checks but is not executable yet — \
-                 namespace-call execution lands in the I2 follow-up (see docs/known-issues.md)",
-                receiver, mc.method,
-            ));
+            let args = self.eval_args(&mc.args)?;
+            return self.call_function_in_module(&entry.decl, args, Vec::new(), entry.module);
         }
         // Recognize the builtin static constructors `List.builder()` and
         // `Map.builder()` before evaluating the object. The parser models
@@ -3375,8 +3372,8 @@ function main() {
         assert_eq!(output, vec!["42"]);
     }
 
-    /// Build a single-entry module slice from `source` and run it
-    /// through `run_modules`, capturing stdout.
+    /// Build a single-entry module slice from `source` and run it,
+    /// capturing stdout. Thin wrapper over [`run_resolved_modules_capturing`].
     fn run_modules_capturing(source: &str) -> Vec<String> {
         use phoenix_modules::{ModulePath, ResolvedSourceModule};
         use std::path::PathBuf;
@@ -3391,8 +3388,17 @@ function main() {
             file_path: PathBuf::from("<test>"),
             import_targets: Default::default(),
         };
-        let modules = [module];
-        let mut analysis = phoenix_sema::checker::check_modules(&modules);
+        run_resolved_modules_capturing(&[module])
+    }
+
+    /// Type-check an already-resolved multi-module slice, seed an
+    /// interpreter from the analysis, and drive `run_modules_inner` with a
+    /// capturing writer — returning stdout split into lines. Asserts the
+    /// slice type-checks cleanly and runs without a runtime error.
+    fn run_resolved_modules_capturing(
+        modules: &[phoenix_modules::ResolvedSourceModule],
+    ) -> Vec<String> {
+        let mut analysis = phoenix_sema::checker::check_modules(modules);
         assert!(
             analysis.diagnostics.is_empty(),
             "sema diagnostics: {:?}",
@@ -3404,7 +3410,7 @@ function main() {
         let mut interpreter = Interpreter::with_output(Box::new(writer));
         interpreter.seed_from_resolved(&mut analysis.module);
         interpreter
-            .run_modules_inner(&modules)
+            .run_modules_inner(modules)
             .expect("runtime error");
         let bytes = buffer.borrow();
         String::from_utf8_lossy(&bytes)
@@ -3413,17 +3419,15 @@ function main() {
             .collect()
     }
 
-    /// Namespace calls (`lib.func(...)`) type-check but the tree-walk
-    /// interpreter cannot execute them yet — the receiver is a namespace,
-    /// not a value, so execution is the staged "I2" follow-up. Pin that the
-    /// guard in `eval_method_call` (keyed on the drained
-    /// `namespace_call_targets`) fails with a clear, named error rather than
-    /// the misleading "undefined variable `lib`" that evaluating the
-    /// namespace receiver would otherwise produce. Goes through the public
-    /// `run_modules` entry so the drain is exercised end to end. Remove or
-    /// flip this test when I2 lands.
+    /// Namespace calls (`lib.func(...)`) execute by dispatching to the
+    /// resolved target function in its owning module. Drives
+    /// `run_modules_inner` (via [`run_resolved_modules_capturing`]) with a
+    /// capturing writer so the drained `namespace_call_targets` and the
+    /// `eval_method_call` dispatch are exercised end to end — including a
+    /// call that relies on a callee default argument (`scaled(5)`), which
+    /// the namespace path must fill just like a direct call.
     #[test]
-    fn namespace_call_execution_is_staged_until_i2() {
+    fn namespace_call_executes_across_modules() {
         use phoenix_modules::{ModulePath, ResolvedSourceModule};
         use std::path::PathBuf;
         let mk = |path: ModulePath, src: &str, id: SourceId, is_entry: bool| {
@@ -3436,34 +3440,24 @@ function main() {
                 program,
                 is_entry,
                 file_path: PathBuf::from("<test>"),
+                import_targets: Default::default(),
             }
         };
         let entry = mk(
             ModulePath::entry(),
-            "import lib\nfunction main() { lib.shout() }",
+            "import lib\nfunction main() { print(lib.greet(\"Ada\")) print(lib.scaled(5)) }",
             SourceId(0),
             true,
         );
         let lib = mk(
             ModulePath(vec!["lib".to_string()]),
-            "public function shout() -> String { \"hi\" }",
+            "public function greet(name: String) -> String { \"hi {name}\" }\n\
+             public function scaled(x: Int, by: Int = 10) -> Int { x * by }",
             SourceId(1),
             false,
         );
-        let modules = [entry, lib];
-        let mut analysis = phoenix_sema::checker::check_modules(&modules);
-        assert!(
-            analysis.diagnostics.is_empty(),
-            "namespace call should type-check; sema diagnostics: {:?}",
-            analysis.diagnostics
-        );
-        let err =
-            run_modules(&modules, &mut analysis).expect_err("namespace call must not execute yet");
-        assert!(
-            err.message.contains("not executable yet"),
-            "expected the staged I2 error, got: {}",
-            err.message
-        );
+        let out = run_resolved_modules_capturing(&[entry, lib]);
+        assert_eq!(out, vec!["hi Ada".to_string(), "50".to_string()]);
     }
 
     /// Like [`run_modules_capturing`], but registers host-FFI bindings (built

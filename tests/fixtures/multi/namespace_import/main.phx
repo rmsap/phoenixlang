@@ -1,0 +1,15 @@
+import helpers
+import helpers as h
+
+function main() {
+  // Plain namespace call.
+  print(helpers.add(1, 2))
+  // Aliased namespace call.
+  print(h.greet("Ada"))
+  // Generic function via a namespace call — exercises type-arg
+  // threading through monomorphization on the namespace path.
+  print(helpers.identity(42))
+  // Default argument filled on the namespace path (`by` defaults to 10),
+  // so the call site must thread defaults exactly like a direct call.
+  print(helpers.scaled(5))
+}
