@@ -75,6 +75,13 @@ impl Interpreter {
         self.lambda_captures = std::mem::take(&mut resolved.lambda_captures);
         self.module_scopes = std::mem::take(&mut resolved.module_scopes);
         self.namespace_call_targets = std::mem::take(&mut resolved.namespace_call_targets);
+        // The tree-walk interpreter only needs to know *which* spans are
+        // encode calls (it encodes the runtime `Value` directly), so drain
+        // the map and keep just its keys — same take-and-forget discipline
+        // as the siblings above.
+        self.json_encode_spans = std::mem::take(&mut resolved.json_encode_types)
+            .into_keys()
+            .collect();
     }
 
     /// Multi-module orchestration for [`run_modules`]. Registers every

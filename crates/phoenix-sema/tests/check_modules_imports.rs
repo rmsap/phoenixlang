@@ -856,17 +856,15 @@ fn local_binding_shadows_namespace() {
 }
 
 #[test]
-fn intrinsic_json_namespace_binds_but_methods_pending() {
-    // `import json` binds the intrinsic namespace (no source file needed);
-    // its methods are not implemented until Phase 4.6.
-    let entry = entry_only("import json\nfunction main() { json.encode(5) }");
+fn intrinsic_json_namespace_encode_typechecks() {
+    // `import json` binds the intrinsic namespace (no source file needed)
+    // and `json.encode(value)` type-checks to `String`.
+    let entry =
+        entry_only("import json\nfunction main() { let s: String = json.encode(5) print(s) }");
     let analysis = check_modules(&[entry]);
     assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("`json.encode` is not available yet")),
-        "expected the json-not-yet diagnostic (proving the namespace bound), got: {:?}",
+        analysis.diagnostics.is_empty(),
+        "json.encode should type-check via the bound namespace, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -875,15 +873,108 @@ fn intrinsic_json_namespace_binds_but_methods_pending() {
 fn intrinsic_json_namespace_aliased_binds() {
     // `import json as j` binds the intrinsic under the alias, exactly like
     // a user-module namespace; the alias dispatches to the same intrinsic.
-    let entry = entry_only("import json as j\nfunction main() { j.encode(5) }");
+    let entry =
+        entry_only("import json as j\nfunction main() { let s: String = j.encode(5) print(s) }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "json.encode via the alias should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn intrinsic_json_decode_is_pending() {
+    // `json.decode` is not implemented until a later Phase 4.6 slice; it
+    // reports a clean "not available yet" diagnostic.
+    let entry = entry_only("import json\nfunction main() { json.decode(\"x\") }");
     let analysis = check_modules(&[entry]);
     assert!(
         analysis
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("`json.encode` is not available yet")),
-        "expected the json-not-yet diagnostic via the alias, got: {:?}",
+            .any(|d| d.message.contains("`json.decode` is not available yet")),
+        "expected the json.decode-pending diagnostic, got: {:?}",
         analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_unsupported_type_is_a_clear_error() {
+    // This slice supports scalars + structs; a `List` argument is rejected
+    // with a "does not support" diagnostic naming the type.
+    let entry = entry_only("import json\nfunction main() { print(json.encode([1, 2, 3])) }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.encode` does not support")),
+        "expected an unsupported-type diagnostic for json.encode of a List, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_struct_with_unsupported_field_names_the_field_type() {
+    // `unsupported_json_encode_type` recurses into struct fields: a struct
+    // whose own shape is fine but that carries a `List` field must be
+    // rejected, and the diagnostic must name the *field's* type (`List<Int>`),
+    // not the struct — proving the walk descended into the field.
+    let entry = entry_only(concat!(
+        "import json\n",
+        "struct Bag { items: List<Int> }\n",
+        "function main() { print(json.encode(Bag([1, 2, 3]))) }",
+    ));
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| {
+            d.message.contains("`json.encode` does not support") && d.message.contains("List")
+        }),
+        "expected an unsupported-field diagnostic naming `List`, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_rejects_type_arguments() {
+    // `json.encode` is not generic: a turbofish must be rejected with a
+    // dedicated diagnostic (not silently accepted).
+    let entry = entry_only("import json\nfunction main() { print(json.encode<Int>(5)) }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`json.encode` does not take type arguments")),
+        "expected a type-argument-rejection diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_rejects_wrong_argument_count() {
+    // `json.encode` takes exactly one argument; zero or many must report
+    // the arity error.
+    let zero = entry_only("import json\nfunction main() { print(json.encode()) }");
+    let zero_analysis = check_modules(&[zero]);
+    assert!(
+        zero_analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("json.encode() takes 1 argument, got 0")),
+        "expected an arity diagnostic for zero args, got: {:?}",
+        zero_analysis.diagnostics
+    );
+
+    let many = entry_only("import json\nfunction main() { print(json.encode(1, 2)) }");
+    let many_analysis = check_modules(&[many]);
+    assert!(
+        many_analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("json.encode() takes 1 argument, got 2")),
+        "expected an arity diagnostic for two args, got: {:?}",
+        many_analysis.diagnostics
     );
 }
 
@@ -1119,10 +1210,12 @@ fn intrinsic_json_cannot_be_shadowed_by_source_module() {
     // `import json` reserves the intrinsic namespace: even when a source
     // module literally named `json` is present, the import binds the
     // compiler intrinsic (resolver skips file resolution for it), not the
-    // file. If the source module won, `json.encode(5)` would resolve to
-    // its public `encode` and type-check cleanly; instead we must see the
-    // intrinsic's "not available yet" diagnostic — proving the reservation.
-    let entry = entry_only("import json\nfunction main() { let x: Int = json.encode(5) print(x) }");
+    // file. The source module's `encode` returns `Int`; the intrinsic's
+    // returns `String`. Binding `let s: String = json.encode(5)` cleanly
+    // proves the intrinsic won — if the source module had won, this would
+    // be a `String`-vs-`Int` type error.
+    let entry =
+        entry_only("import json\nfunction main() { let s: String = json.encode(5) print(s) }");
     let json_module = non_entry(
         "json",
         "public function encode(x: Int) -> Int { x }",
@@ -1130,11 +1223,9 @@ fn intrinsic_json_cannot_be_shadowed_by_source_module() {
     );
     let analysis = check_modules(&[entry, json_module]);
     assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("`json.encode` is not available yet")),
-        "expected the intrinsic to win over a same-named source module, got: {:?}",
+        analysis.diagnostics.is_empty(),
+        "intrinsic `json.encode` (-> String) must win over a same-named source \
+         module's `encode` (-> Int), got: {:?}",
         analysis.diagnostics
     );
 }

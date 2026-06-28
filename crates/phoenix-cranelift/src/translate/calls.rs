@@ -170,6 +170,16 @@ fn translate_builtin(
     match name {
         "print" => translate_print(builder, ctx, args, state),
         "toString" => translate_to_string(builder, ctx, args, state),
+        // JSON string escaping for synthesized encoders.
+        "json.escapeString" => {
+            let recv = get_val(state, args[0])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_escape_str,
+                &[recv[0], recv[1]],
+            ))
+        }
         // String methods.
         _ if name.starts_with("String.") => translate_string_method(
             builder,

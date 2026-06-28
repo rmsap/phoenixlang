@@ -182,6 +182,14 @@ pub(super) fn translate_builtin_call(
     match name {
         "print" => translate_print_builtin(ctx, b, args),
         "toString" => translate_to_string_builtin(ctx, b, args, instr),
+        // JSON string escaping for synthesized encoders. Rides
+        // in the embedded `phoenix_runtime.wasm` — same shape as `toString`
+        // on a `String`: one fat-pointer arg, fat-pointer (sret) result.
+        "json.escapeString" => {
+            let vid = expect_result(instr, "BuiltinCall(\"json.escapeString\")")?;
+            let runtime_idx = b.require_phx_func("phx_json_escape_str")?;
+            emit_sret_string_call(ctx, b, runtime_idx, &[args[0]], vid)
+        }
         // `List.<method>` dispatcher. Covers the indexing/iteration
         // primitives (`length` / `get`), the functional methods
         // (`map` / `filter` / `reduce` / `flatMap` / `sortBy` / `any` /

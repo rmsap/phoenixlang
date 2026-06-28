@@ -2758,6 +2758,7 @@ dependencies = [
  "phoenix-lexer",
  "phoenix-modules",
  "phoenix-parser",
+ "phoenix-runtime",
  "phoenix-sema",
  "ryu",
 ]
@@ -2784,6 +2785,7 @@ dependencies = [
  "phoenix-ir",
  "phoenix-lexer",
  "phoenix-parser",
+ "phoenix-runtime",
  "phoenix-sema",
  "ryu",
 ]

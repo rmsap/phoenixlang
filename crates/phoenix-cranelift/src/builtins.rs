@@ -76,6 +76,8 @@ pub struct RuntimeFunctions {
     pub str_to_lower: FuncId,
     /// `phx_str_to_upper(ptr, len) -> (ptr, len)`.
     pub str_to_upper: FuncId,
+    /// `phx_json_escape_str(ptr, len) -> (ptr, len).
+    pub json_escape_str: FuncId,
     /// `phx_str_index_of(p1, l1, p2, l2) -> i64`.
     pub str_index_of: FuncId,
     /// `phx_str_replace(p1, l1, p2, l2, p3, l3) -> (ptr, len)`.
@@ -219,6 +221,7 @@ impl RuntimeFunctions {
             str_trim: declare_str_transform(module, "phx_str_trim", call_conv)?,
             str_to_lower: declare_str_transform(module, "phx_str_to_lower", call_conv)?,
             str_to_upper: declare_str_transform(module, "phx_str_to_upper", call_conv)?,
+            json_escape_str: declare_str_transform(module, "phx_json_escape_str", call_conv)?,
             str_index_of: declare_func(
                 module,
                 "phx_str_index_of",

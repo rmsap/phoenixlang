@@ -38,6 +38,7 @@ pub mod value_alloc;
 pub mod verify;
 
 mod default_wrappers;
+mod json_synth;
 /// AST-to-IR lowering pass.
 pub mod lower;
 mod lower_decl;

@@ -222,6 +222,12 @@ pub struct Interpreter {
     /// without sema metadata.
     pub(crate) namespace_call_targets: HashMap<Span, String>,
 
+    /// Spans of `json.encode(value)` calls, drained from sema.
+    /// The tree-walk interpreter encodes the runtime `Value` directly (it
+    /// has full type information), so it only needs to recognize which
+    /// `json.<method>` sites are encode calls.
+    pub(crate) json_encode_spans: std::collections::HashSet<Span>,
+
     /// Per-module visibility scopes (drained from sema's `Analysis`).
     /// Used by [`Interpreter::qualify`] to translate user-source bare
     /// names into qualified registry keys (mirrors what the IR layer
@@ -329,6 +335,7 @@ impl Interpreter {
             last_return_was_explicit: false,
             lambda_captures: HashMap::new(),
             namespace_call_targets: HashMap::new(),
+            json_encode_spans: std::collections::HashSet::new(),
             output,
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),
@@ -1531,6 +1538,41 @@ impl Interpreter {
         }
     }
 
+    /// Recursively encode a runtime value to a JSON string.
+    ///
+    /// Scalars route through `Value`'s `Display` (the same rendering as
+    /// `toString`), so they match the compiled backends' `toString`-based
+    /// encoders; strings use the shared `phoenix_runtime::json_escape`; a
+    /// struct emits an object with its fields in declaration order. This
+    /// slice covers scalars and structs; richer shapes arrive with later
+    /// slices and are gated in sema.
+    fn json_encode_value(&self, value: &Value) -> Result<String> {
+        match value {
+            Value::String(s) => Ok(phoenix_runtime::json_escape(s)),
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) => Ok(value.to_string()),
+            Value::Struct(name, fields) => {
+                let def = self.structs.get(name).ok_or_else(|| RuntimeError {
+                    message: format!("json.encode: unknown struct `{name}`"),
+                    try_return_value: None,
+                })?;
+                let mut parts = Vec::with_capacity(def.field_names.len());
+                for fname in &def.field_names {
+                    let fv = fields.get(fname).ok_or_else(|| RuntimeError {
+                        message: format!("json.encode: struct `{name}` is missing field `{fname}`"),
+                        try_return_value: None,
+                    })?;
+                    // Field-name keys are identifiers, so raw quoting is valid
+                    // JSON (matching the synthesized IR encoders).
+                    parts.push(format!("\"{}\":{}", fname, self.json_encode_value(fv)?));
+                }
+                Ok(format!("{{{}}}", parts.join(",")))
+            }
+            other => error(format!(
+                "json.encode does not support this value yet: {other}"
+            )),
+        }
+    }
+
     /// Evaluates a method call, dispatching to built-in type methods or
     /// user-defined methods.
     fn eval_method_call(&mut self, mc: &MethodCallExpr) -> Result<Value> {
@@ -1548,6 +1590,14 @@ impl Interpreter {
             };
             let args = self.eval_args(&mc.args)?;
             return self.call_function_in_module(&entry.decl, args, Vec::new(), entry.module);
+        }
+        // `json.encode(value)`: the receiver is the intrinsic
+        // `json` namespace, not a value. Evaluate the argument and encode
+        // the runtime value directly — the interpreter has full type info,
+        // so it needs no synthesized per-type encoder.
+        if self.json_encode_spans.contains(&mc.span) {
+            let value = self.eval_expr(&mc.args[0])?;
+            return Ok(Value::String(self.json_encode_value(&value)?));
         }
         // Recognize the builtin static constructors `List.builder()` and
         // `Map.builder()` before evaluating the object. The parser models

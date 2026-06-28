@@ -734,6 +734,12 @@ pub struct Checker {
     /// do not record here — they dispatch to synthesized builtins by method
     /// name. See [`ResolvedModule::namespace_call_targets`].
     pub(crate) namespace_call_targets: HashMap<Span, String>,
+    /// Static type of the argument at each `json.encode(value)` call, keyed
+    /// by the `MethodCallExpr`'s source span (Phase 4.6). The IR pass reads
+    /// this to (a) collect which types need a synthesized encoder and (b)
+    /// dispatch each call site to the encoder for its argument's type. See
+    /// [`ResolvedModule::json_encode_types`].
+    pub(crate) json_encode_types: HashMap<Span, Type>,
     /// Resolved annotation type for each `let`-with-annotation, keyed by
     /// the `VarDecl`'s source span. See
     /// [`ResolvedModule::var_annotation_types`].
@@ -840,6 +846,7 @@ impl Checker {
             symbol_references: HashMap::new(),
             call_type_args: HashMap::new(),
             namespace_call_targets: HashMap::new(),
+            json_encode_types: HashMap::new(),
             var_annotation_types: HashMap::new(),
             next_func_id: 0,
             user_method_offset: 0,

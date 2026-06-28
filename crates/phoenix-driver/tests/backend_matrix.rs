@@ -164,6 +164,15 @@ backend_matrix_test!(matrix_option_result, "option_result.phx");
 // Explicit turbofish type args on a generic method (`b.wrap<Int>(42)`),
 // threaded through monomorphization — two instantiations, both backends.
 backend_matrix_test!(matrix_method_turbofish, "method_turbofish.phx");
+// `json.encode` of scalars + a nested struct. The synthesized
+// per-type encoders are ordinary IR, so the four backends agree
+// byte-for-byte. wasm32-gc is skipped: its `phx_json_escape_str` port (a
+// hand-written byte-loop string transform) lands in a follow-up slice.
+backend_matrix_test!(
+    matrix_json_encode_struct,
+    "json_encode_struct.phx",
+    skip_wasm_gc: "json.encode string escaping not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

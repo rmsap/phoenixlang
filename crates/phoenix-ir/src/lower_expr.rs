@@ -988,6 +988,25 @@ impl<'a> LoweringContext<'a> {
                 Some(mc.span),
             );
         }
+        // `json.encode(value)`: sema recorded the argument's
+        // static type. Dispatch to the synthesized per-type encoder. Like
+        // the namespace case, the receiver `json` is not a value, so this
+        // must intercept before the object is lowered.
+        if let Some(arg_ty) = self.check.json_encode_types.get(&mc.span).cloned() {
+            let arg_val = self.lower_expr(&mc.args[0]);
+            let key = crate::json_synth::encode_type_key(&arg_ty);
+            let encoder_id = *self.module.json_encoders.get(&key).unwrap_or_else(|| {
+                unreachable!(
+                    "json.encode site has no synthesized encoder for `{key}` — \
+                     demand collection and dispatch are out of sync"
+                )
+            });
+            return self.emit(
+                Op::Call(encoder_id, Vec::new(), vec![arg_val]),
+                IrType::StringRef,
+                Some(mc.span),
+            );
+        }
         // Phase 2.7 decision F: recognize `List.builder()` /
         // `Map.builder()` *before* evaluating the receiver. Phoenix's
         // parser models `Type.method(...)` as a `MethodCallExpr`

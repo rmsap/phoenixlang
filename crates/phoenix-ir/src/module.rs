@@ -193,6 +193,13 @@ pub struct IrModule {
     pub function_index: HashMap<String, FuncId>,
     /// Method dispatch table: `(type_name, method_name)` → [`FuncId`].
     pub method_index: HashMap<(String, String), FuncId>,
+    /// Synthesized JSON encoder registry: a per-type encoder
+    /// function keyed by the type's encode-key (`"Int"`, `"String"`, a
+    /// struct's qualified name, …). Populated by
+    /// [`crate::json_synth::synthesize_json_encoders`] for every type
+    /// reachable from a `json.encode(value)` call; each `json.encode` site
+    /// lowers to an `Op::Call` of the encoder for its argument's type.
+    pub json_encoders: HashMap<String, FuncId>,
     /// Default-argument wrapper registry, keyed by (callee FuncId,
     /// param index). Populated by
     /// [`crate::default_wrappers::synthesize_default_wrappers`] for
@@ -484,6 +491,7 @@ impl IrModule {
             struct_type_params: HashMap::new(),
             function_index: HashMap::new(),
             method_index: HashMap::new(),
+            json_encoders: HashMap::new(),
             default_wrapper_index: HashMap::new(),
             dyn_vtables: HashMap::new(),
             traits: HashMap::new(),

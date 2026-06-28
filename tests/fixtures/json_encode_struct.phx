@@ -1,0 +1,37 @@
+// JSON encode of scalars and a (nested) struct. The synthesized per-type
+// encoders run as ordinary IR, so every backend produces identical output.
+
+import json
+
+struct Address {
+  city: String
+  zip: Int
+}
+
+// A field-less struct: pins that the `{`/`}` accumulator boundary agrees
+// across backends (encodes to `{}`).
+struct Empty {}
+
+struct User {
+  name: String
+  age: Int
+  active: Bool
+  balance: Float
+  home: Address
+  tags: Empty
+}
+
+function main() {
+  let u: User = User("Ada", 36, true, 3.14, Address("London", 12345), Empty())
+  print(json.encode(u))
+  print(json.encode(Empty()))
+  // Top-level scalars encode to bare JSON values. `Float` is included so
+  // the matrix verifies shortest-roundtrip formatting agrees across
+  // backends (the one scalar where `Display`/`toString` could diverge).
+  print(json.encode(42))
+  print(json.encode(3.14))
+  // Exercise the named two-char escapes (`\"`, `\n`, `\t`) so backend
+  // string-escaping agreement is pinned beyond the plain-ASCII path.
+  print(json.encode("he\"llo\tworld\n"))
+  print(json.encode(true))
+}

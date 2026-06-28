@@ -99,6 +99,10 @@ pub fn lower_modules(
     // `default_wrapper_index` instead of inlining AST defaults).
     crate::default_wrappers::synthesize_default_wrappers(&mut ctx);
 
+    // Pass 1.5 (JSON): synthesize per-type encoders before Pass 2
+    // dispatches each `json.encode` site to its encoder.
+    crate::json_synth::synthesize_json_encoders(&mut ctx);
+
     // Pass 2 — lower each module's function bodies with `current_module`
     // set to that module's path. This is what lets bare-name lookups
     // inside body-lowering (`function_index.get(&name)`,
@@ -523,6 +527,11 @@ impl<'a> LoweringContext<'a> {
         // stubs by `FuncId`) and before Pass 2 (so call sites consult
         // `default_wrapper_index` instead of inlining AST defaults).
         crate::default_wrappers::synthesize_default_wrappers(self);
+
+        // Pass 1.5 (JSON): synthesize a per-type encoder for every type
+        // reachable from a `json.encode` call, before Pass 2 dispatches
+        // each call site to its encoder. See [`crate::json_synth`].
+        crate::json_synth::synthesize_json_encoders(self);
 
         // Pass 2: Lower all function bodies.
         self.lower_function_bodies(program);

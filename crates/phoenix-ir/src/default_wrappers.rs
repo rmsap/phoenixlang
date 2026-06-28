@@ -349,7 +349,7 @@ fn lower_wrapper_body(ctx: &mut LoweringContext<'_>, job: &WrapperJob, wrapper_i
 /// created inside `body` simply consume counter values that the user-
 /// body pass then continues from. Resetting it would cause name
 /// collisions.
-fn with_synthetic_function<R>(
+pub(crate) fn with_synthetic_function<R>(
     ctx: &mut LoweringContext<'_>,
     func_id: FuncId,
     module: ModulePath,

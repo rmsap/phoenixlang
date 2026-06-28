@@ -698,16 +698,108 @@ impl Checker {
     /// members are synthesized by the JSON serialization work (Phase 4.6)
     /// and are not available yet.
     fn check_json_namespace_call(&mut self, mc: &MethodCallExpr) -> Type {
-        self.error(
-            format!(
-                "`json.{}` is not available yet — JSON serialization lands in Phase 4.6",
-                mc.method
-            ),
-            mc.span,
-        );
-        // Still type-check the arguments so errors inside them surface.
-        self.check_call_args(&mc.args);
-        Type::Error
+        match mc.method.as_str() {
+            "encode" => self.check_json_encode(mc),
+            // `json.decode<T>` lands in a later Phase 4.6 slice.
+            _ => {
+                self.error(
+                    format!(
+                        "`json.{}` is not available yet — JSON serialization lands in Phase 4.6",
+                        mc.method
+                    ),
+                    mc.span,
+                );
+                self.check_call_args(&mc.args);
+                Type::Error
+            }
+        }
+    }
+
+    /// Type-check `json.encode(value) -> String`. Records the argument's
+    /// static type for the IR encode-synthesis pass and validates that the
+    /// type is JSON-encodable with the currently-supported surface.
+    fn check_json_encode(&mut self, mc: &MethodCallExpr) -> Type {
+        if !mc.type_args.is_empty() {
+            self.error(
+                "`json.encode` does not take type arguments".to_string(),
+                mc.span,
+            );
+        }
+        if mc.args.len() != 1 {
+            self.error(
+                format!("json.encode() takes 1 argument, got {}", mc.args.len()),
+                mc.span,
+            );
+            self.check_call_args(&mc.args);
+            return Type::String;
+        }
+        let arg_type = self.check_expr(&mc.args[0]);
+        if arg_type.is_error() {
+            return Type::String;
+        }
+        if let Some(unsupported) = self.unsupported_json_encode_type(&arg_type, &mut Vec::new()) {
+            self.error(
+                format!(
+                    "`json.encode` does not support `{unsupported}` yet — \
+                     supported today: Int, Float, Bool, String, and structs of those \
+                     (more types land in later Phase 4.6 slices)"
+                ),
+                mc.args[0].span(),
+            );
+            return Type::String;
+        }
+        self.json_encode_types.insert(mc.span, arg_type);
+        Type::String
+    }
+
+    /// Returns the name of the first JSON-unencodable type reachable from
+    /// `ty` (itself or, for a struct, a field type), or `None` when `ty` is
+    /// fully encodable with today's surface. `visiting` guards against
+    /// cyclic struct graphs.
+    ///
+    /// Phase 4.6 grows this surface in slices: today it is the scalars plus
+    /// non-generic structs of supported field types; `Option`, enums,
+    /// `List`, and `Map` are added by later slices.
+    fn unsupported_json_encode_type(
+        &self,
+        ty: &Type,
+        visiting: &mut Vec<String>,
+    ) -> Option<String> {
+        match ty {
+            Type::Int | Type::Float | Type::Bool | Type::String => None,
+            Type::Named(name) => {
+                // A non-generic struct: every field must be encodable.
+                let Some(info) = self.lookup_struct(name) else {
+                    return Some(phoenix_common::module_path::bare_name(name).to_string());
+                };
+                if !info.type_params.is_empty() {
+                    return Some(phoenix_common::module_path::bare_name(name).to_string());
+                }
+                if visiting.iter().any(|n| n == name) {
+                    // Already on the stack — break the cycle. This guard is
+                    // purely defensive: a recursive struct is only
+                    // constructible (hence reachable by a live `json.encode`)
+                    // when its back-edge field is an `Option`/`List`/`Map`,
+                    // all of which this slice already gates as unsupported
+                    // above — so a cycle of only scalar/struct fields can
+                    // never actually be encoded. If a later slice adds
+                    // `Option`/`List`/`Map` encoding, this guard becomes load-
+                    // bearing: it keeps the walk terminating on the cyclic
+                    // type itself (downstream recursion limits still apply).
+                    return None;
+                }
+                visiting.push(name.clone());
+                // Clone only the field types (not the whole `Field`s) to drop
+                // the `&self` borrow of `info` before recursing.
+                let field_tys: Vec<Type> = info.fields.iter().map(|f| f.ty.clone()).collect();
+                let result = field_tys
+                    .iter()
+                    .find_map(|ty| self.unsupported_json_encode_type(ty, visiting));
+                visiting.pop();
+                result
+            }
+            other => Some(other.to_string()),
+        }
     }
 
     /// Type-check each argument expression for its side effects (surfacing

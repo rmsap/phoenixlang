@@ -142,33 +142,26 @@ machinery (Phase 2.5) is the seam it will extend.
 module yourself (the Phase 2.5 mechanism); there is no automatic npm dependency fetch.
 **Target phase:** 3.1-js follow-up. Carved out at Phase 3.1 close (2026-07-01).
 
-### Namespace calls type-check but are not executable yet (`lib.func(...)`)
+### `json.encode` string escaping is not yet ported to the wasm32-gc backend
 
-Namespace imports (`import a.b` / `import a.b as c`) bind the module as a
-namespace and `ns.func(...)` calls resolve through sema — visibility, arity,
-argument types, and generics are all checked, and the resolved callee key is
-recorded in `ResolvedModule::namespace_call_targets` for the downstream
-backends to consume. The **execution** half — IR lowering of a namespace call
-into an `Op::Call`, plus the tree-walk interpreter equivalent — is the staged
-"I2" follow-up and has **not** landed. Until it does, a program that calls a
-namespace function type-checks (`phoenix check` succeeds) but cannot be run or
-lowered: every command reports a clean, span-anchored diagnostic naming the
-limitation and pointing here. `phoenix run` (tree-walk interpreter) reports it
-as a runtime error; `phoenix ir`, `phoenix run-ir`, and `phoenix build`
-(IR-based backends) report it before lowering and exit non-zero. (Intrinsic
-`json.*` calls are a separate matter — they always produce a sema error today,
-since their members are synthesized by Phase 4.6, so they never reach a
-backend.)
+`json.encode` (Phase 4.6) is byte-identical across four backends — the AST
+interpreter, the IR interpreter, native, and wasm32-linear (which rides the
+embedded `phoenix_runtime.wasm`'s `phx_json_escape_str`). The **wasm32-gc**
+backend reimplements runtime string helpers in hand-written WASM-GC rather
+than embedding the runtime, so it needs its own `phx_json_escape_str` port —
+a byte-loop string transform in the style of `synthesize_str_concat`
+(`crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs`). Until that
+lands, building a program that calls `json.encode` with `--target wasm32-gc`
+fails with a clean diagnostic:
 
-The IR-based backends are gated in the driver
-(`report_unlowerable_namespace_calls` in `phoenix-driver`) so no valid user
-invocation panics. Backstop guards keyed on `namespace_call_targets` remain at
-the backend entry points (`lower_method_call` in `phoenix-ir`,
-`eval_method_call` in `phoenix-interp`) — the IR one is a defense-in-depth
-`unimplemented!` for callers that lower directly (e.g. tests) — so they all
-flip to real lowering in lockstep when I2 lands. **Target phase:** the
-namespace-import execution follow-up (I2). Surfaced 2026-06-25 reviewing the
-namespace-import binding PR.
+```
+wasm32-gc: builtin `json.escapeString` not yet supported. Covered: …
+```
+
+and the `json_encode_*` matrix fixtures carry a `skip_wasm_gc:`
+annotation. **Target:** a Phase 4.6 wasm32-gc follow-up slice (delete the
+skip annotations when it lands). Surfaced 2026-06-27 implementing
+`json.encode` (Phase 4.6 J3a).
 
 ### An absent optional field serializes as omitted (TS) vs `null` (Go/Python)
 

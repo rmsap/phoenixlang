@@ -46,12 +46,25 @@ pub(crate) fn dispatch(
                     "Result" => option_result::builtin_result(interp, method, args),
                     "ListBuilder" => collections::builtin_list_builder(method, args),
                     "MapBuilder" => collections::builtin_map_builder(method, args),
+                    "json" => builtin_json(method, args),
                     _ => error(format!("unknown builtin type: {type_name}")),
                 }
             } else {
                 error(format!("unknown builtin function: {name}"))
             }
         }
+    }
+}
+
+/// Dispatch the intrinsic `json.*` builtins emitted by the JSON encoder
+/// synthesis.
+fn builtin_json(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
+    match method {
+        "escapeString" => match args.as_slice() {
+            [IrValue::String(s)] => Ok(IrValue::String(phoenix_runtime::json_escape(s))),
+            _ => error("json.escapeString expects a single string argument".to_string()),
+        },
+        _ => error(format!("unknown json builtin: {method}")),
     }
 }
 

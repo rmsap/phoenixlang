@@ -282,6 +282,66 @@ pub extern "C" fn phx_bool_to_str(val: i8) -> PhxFatPtr {
     to_phx_string_from_str(if val != 0 { "true" } else { "false" })
 }
 
+/// JSON-escape `s` and wrap it in double quotes.
+///
+/// This is the single source of truth for JSON string escaping across all
+/// five backends: the compiled runtime calls it via
+/// [`phx_json_escape_str`], and both interpreters call it directly
+/// (`phoenix_runtime::json_escape`). Keeping one implementation guarantees
+/// byte-identical JSON output. The escape set matches `serde_json`'s
+/// default (used by the Phase 4.6 decode path), so encode output parses
+/// back losslessly: `"` `\` and the `\b \f \n \r \t` shortcuts are
+/// special-cased, other control characters below `0x20` become `\uXXXX`,
+/// and every other character (including non-ASCII) is emitted verbatim.
+///
+/// Note: this escapes only `String` values. Non-finite `Float`s
+/// (`NaN`/`Infinity`), which `toString` renders as bare tokens, are not
+/// valid JSON — that is a known limitation of the encoder, not of this
+/// function, and is consistent across every backend.
+pub fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str("\\u");
+                // Lowercase hex, zero-padded to 4 digits — matches serde_json.
+                for shift in [12, 8, 4, 0] {
+                    let nibble = ((c as u32) >> shift) & 0xf;
+                    out.push(char::from_digit(nibble, 16).unwrap());
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// JSON-escape a GC-managed string and return a new GC-managed string
+/// (the escaped form wrapped in double quotes). The synthesized per-type
+/// JSON encoders (Phase 4.6) call this for every `String` value.
+///
+/// # Safety
+///
+/// `(ptr, len)` must be a valid UTF-8 slice, rooted by the caller's
+/// shadow-stack frame for the duration of the call (the allocation below
+/// can trigger a GC collection — same contract as [`phx_str_concat`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_escape_str(ptr: *const u8, len: usize) -> PhxFatPtr {
+    // Phoenix strings are valid UTF-8 by construction (same assumption the
+    // string-comparison primitives make on `str_from`'s bytes).
+    let s = unsafe { std::str::from_utf8_unchecked(str_from(ptr, len)) };
+    to_phx_string_from_str(&json_escape(s))
+}
+
 // ── String comparison ───────────────────────────────────────────────
 
 /// Generate a string comparison function exported as `extern "C"`.
@@ -499,6 +559,42 @@ mod tests {
         let result = unsafe { phx_str_concat(a.as_ptr(), a.len(), b_str.as_ptr(), b_str.len()) };
         assert_eq!(result.len, 0);
         assert!(!result.ptr.is_null(), "empty concat should not return null");
+    }
+
+    // ── JSON string escaping ───────────────────────────────────────
+
+    #[test]
+    fn json_escape_plain_string_is_quoted() {
+        assert_eq!(json_escape("hello"), "\"hello\"");
+        assert_eq!(json_escape(""), "\"\"");
+    }
+
+    #[test]
+    fn json_escape_quote_and_backslash() {
+        assert_eq!(json_escape("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    /// The named shortcuts must use the two-char escapes, not `\uXXXX`.
+    #[test]
+    fn json_escape_named_control_shortcuts() {
+        assert_eq!(json_escape("\n\r\t\u{08}\u{0c}"), "\"\\n\\r\\t\\b\\f\"");
+    }
+
+    /// Other control characters below 0x20 fall back to lowercase,
+    /// zero-padded `\uXXXX` — matching `serde_json`.
+    #[test]
+    fn json_escape_other_controls_use_u_escape() {
+        assert_eq!(
+            json_escape("\u{00}\u{01}\u{1f}"),
+            "\"\\u0000\\u0001\\u001f\""
+        );
+    }
+
+    /// Non-ASCII is emitted verbatim (UTF-8), not `\u`-escaped — also
+    /// matching `serde_json`'s default.
+    #[test]
+    fn json_escape_non_ascii_is_verbatim() {
+        assert_eq!(json_escape("é日🦀"), "\"é日🦀\"");
     }
 
     // ── toString functions ─────────────────────────────────────────

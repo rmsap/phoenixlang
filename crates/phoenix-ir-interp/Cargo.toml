@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 phoenix-common = { path = "../phoenix-common" }
 phoenix-ir = { path = "../phoenix-ir" }
+# JSON string escaping — the synthesized encoders' `json.escapeString`
+# builtin routes through `phoenix_runtime::json_escape`, the single source
+# of truth shared with the compiled backends so JSON output is identical.
+phoenix-runtime = { path = "../phoenix-runtime" }
 # Float formatting — shared shortest-roundtrip d2s. The IR interpreter's
 # Float Display must match the tree-walk interpreter and
 # `phoenix-runtime::format_f64` byte-for-byte so the backend matrix stays

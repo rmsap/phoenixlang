@@ -10,6 +10,10 @@ repository.workspace = true
 phoenix-common = { path = "../phoenix-common" }
 phoenix-modules = { path = "../phoenix-modules" }
 phoenix-parser = { path = "../phoenix-parser" }
+# JSON string escaping — `json.encode` of a `String` routes through
+# `phoenix_runtime::json_escape`, the single source of truth shared with
+# the compiled backends so JSON output is byte-identical.
+phoenix-runtime = { path = "../phoenix-runtime" }
 phoenix-sema = { path = "../phoenix-sema" }
 # Float formatting — shared shortest-roundtrip d2s implementation. The
 # interpreter's `Display for Value::Float` routes through this so that
