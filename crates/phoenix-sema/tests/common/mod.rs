@@ -28,6 +28,7 @@ pub fn entry_only(source: &str) -> ResolvedSourceModule {
         program: parse(source, SourceId(0)),
         is_entry: true,
         file_path: PathBuf::from("<test>"),
+        import_targets: Default::default(),
     }
 }
 
@@ -38,5 +39,6 @@ pub fn non_entry(name: &str, source: &str, source_id: SourceId) -> ResolvedSourc
         program: parse(source, source_id),
         is_entry: false,
         file_path: PathBuf::from(format!("<test:{}>", name)),
+        import_targets: Default::default(),
     }
 }

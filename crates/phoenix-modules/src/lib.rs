@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use phoenix_common::diagnostics::Diagnostic;
 use phoenix_common::source::SourceMap;
@@ -22,7 +23,12 @@ pub use phoenix_common::module_path::ModulePath;
 /// One parsed `.phx` file with its module path and identity metadata.
 #[derive(Debug)]
 pub struct ResolvedSourceModule {
-    /// The dotted module path (`models.user`); empty for the entry file.
+    /// The dotted module path. Empty for the entry file. For a module that
+    /// belongs to a **dependency package**, this is package-qualified — a
+    /// module `helpers` inside a dependency named `greet` has path
+    /// `greet.helpers`, so its symbols never collide with a local `helpers`.
+    /// Entry-package modules keep their bare project-relative path (unchanged
+    /// from single-package behavior).
     pub module_path: ModulePath,
     /// The `SourceId` allocated when this file was added to the `SourceMap`.
     pub source_id: SourceId,
@@ -33,6 +39,36 @@ pub struct ResolvedSourceModule {
     pub is_entry: bool,
     /// The canonical absolute path to the source file.
     pub file_path: PathBuf,
+    /// Resolved target identity for each `import` in this module, keyed by the
+    /// import path **as written in source** (`imp.path`). Lets sema map a
+    /// dependency's verbatim `import helpers` to its package-qualified target
+    /// (`greet.helpers`) without rewriting the AST. The real resolver always
+    /// populates this with an entry per import (identity-mapped for a
+    /// single-package project — every import maps to its own literal path), so
+    /// sema's lookup succeeds and agrees with its `ModulePath(imp.path)`
+    /// fallback. Only test-constructed modules leave it empty, where the
+    /// fallback takes over — behavior is unchanged either way.
+    pub import_targets: HashMap<Vec<String>, ModulePath>,
+}
+
+/// Cross-package wiring handed to [`resolve_with_packages`]: where each declared
+/// dependency lives, and what each package itself depends on (so an `import`'s
+/// first path segment can dispatch to the right package's root).
+///
+/// Built by the driver from the resolved dependency graph. A package's identity
+/// is its **dependency name** (the key in `[dependencies]`); the flat namespace
+/// gives exactly one root per name. The default (empty) value reproduces
+/// single-package behavior exactly — every import resolves locally.
+#[derive(Debug, Clone, Default)]
+pub struct PackageResolution {
+    /// The entry project's declared dependency names.
+    pub entry_deps: Vec<String>,
+    /// Each dependency package name → its root directory (containing its
+    /// `phoenix.toml`; modules resolve under it).
+    pub roots: HashMap<String, PathBuf>,
+    /// Each dependency package name → the dependency names *it* declares, so a
+    /// dependency's own cross-package imports dispatch correctly.
+    pub deps: HashMap<String, Vec<String>>,
 }
 
 /// Errors produced by [`resolve`] when the import graph cannot be assembled.
@@ -88,6 +124,24 @@ pub enum ResolveError {
     /// permission bit on one sibling doesn't mask read failures elsewhere
     /// in the project. Mirrors `MalformedSourceFiles`.
     FileReadFailures { files: Vec<(PathBuf, String)> },
+    /// An import's first path segment names a declared dependency *and* a
+    /// local module in the same package — ambiguous, so it is rejected rather
+    /// than silently preferring one.
+    DependencyCollision {
+        /// The colliding name (dependency name == local module name).
+        name: String,
+        /// The local module file that collides with the dependency name.
+        local_path: PathBuf,
+        import_span: Span,
+    },
+    /// An import's first path segment names a declared dependency, but no root
+    /// was supplied for it in [`PackageResolution`]. Defensive: the driver is
+    /// expected to provide a root for every declared dependency.
+    UnresolvedDependency {
+        /// The dependency name.
+        name: String,
+        import_span: Span,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -153,6 +207,18 @@ impl std::fmt::Display for ResolveError {
                 }
                 Ok(())
             }
+            ResolveError::DependencyCollision {
+                name, local_path, ..
+            } => write!(
+                f,
+                "`{name}` is both a declared dependency and a local module/directory ({}); \
+                 rename the local one to disambiguate",
+                local_path.display()
+            ),
+            ResolveError::UnresolvedDependency { name, .. } => write!(
+                f,
+                "import refers to dependency `{name}`, which is declared but was not resolved"
+            ),
         }
     }
 }
@@ -175,7 +241,144 @@ pub fn resolve(
     entry_file: &Path,
     source_map: &mut SourceMap,
 ) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
-    resolve_with_overlay(entry_file, source_map, &HashMap::new())
+    resolve_core(
+        entry_file,
+        source_map,
+        &HashMap::new(),
+        &PackageResolution::default(),
+    )
+}
+
+/// Resolve the import graph rooted at `entry_file`, with cross-package
+/// dependencies wired in via `packages`.
+///
+/// An `import`'s first path segment is matched against the importing package's
+/// declared dependency names first: a match resolves under that dependency's
+/// root and the resulting module carries a package-qualified path
+/// (`greet.helpers`); otherwise it resolves locally as before. A local module
+/// whose name collides with a declared dependency is a
+/// [`ResolveError::DependencyCollision`]. `EscapesRoot` is enforced per package
+/// (each module stays under its own package's root).
+///
+/// With an empty [`PackageResolution`] this is identical to [`resolve`].
+pub fn resolve_with_packages(
+    entry_file: &Path,
+    source_map: &mut SourceMap,
+    packages: &PackageResolution,
+) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
+    resolve_core(entry_file, source_map, &HashMap::new(), packages)
+}
+
+/// The package context a module is resolved within: its prefix, root, and the
+/// dependency names it can dispatch its imports to.
+///
+/// Always held behind an [`Rc`] so the per-import dispatch shares a frame's
+/// context with a refcount bump rather than cloning the root paths on every
+/// edge; the struct itself is never cloned.
+#[derive(Debug)]
+struct PkgCtx {
+    /// Module-path prefix for this package: empty for the entry package, the
+    /// dependency name for a dependency package.
+    prefix: Vec<String>,
+    /// The package root (modules resolve under it).
+    root: PathBuf,
+    /// Pre-canonicalized root for per-import `ensure_under_root`.
+    root_canon: PathBuf,
+    /// Dependency names this package declares (for first-segment dispatch).
+    dep_names: Vec<String>,
+}
+
+/// The local module or directory that would collide with dependency `name`
+/// under `root`, if any. Both a `{name}.phx` file and a `{name}/` directory make
+/// a bare `import {name}...` ambiguous: a `{name}/` directory can hold local
+/// `{name}.sub` modules that the cross-package dispatch would otherwise silently
+/// shadow, so it counts as a collision even without a `{name}/mod.phx`.
+fn local_collision_path(root: &Path, name: &str) -> Option<PathBuf> {
+    let file = root.join(format!("{name}.phx"));
+    if file.is_file() {
+        return Some(file);
+    }
+    let dir = root.join(name);
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    None
+}
+
+/// Dispatch one `import` to its resolved `(identity, file, owning package)`.
+///
+/// First-segment-is-a-dependency → cross-package (resolve the remaining path
+/// under the dependency's root; identity is the import path verbatim, which is
+/// already package-qualified since the first segment is the dependency name).
+/// Otherwise → local (resolve under the current package's root; identity is the
+/// package prefix followed by the import path).
+fn dispatch_import(
+    ctx: &Rc<PkgCtx>,
+    path: &[String],
+    import_span: Span,
+    pkg_ctxs: &HashMap<String, Rc<PkgCtx>>,
+) -> Result<(ModulePath, PathBuf, Rc<PkgCtx>), ResolveError> {
+    // `parse_import_decl` always pushes at least one segment, so a parsed
+    // import path is never empty. The first-segment dispatch below relies on
+    // that, but rather than index-panic if the invariant ever breaks, peel the
+    // first segment off safely and surface an empty import path as an
+    // unresolvable module — loud in dev via the `debug_assert`, graceful in
+    // release.
+    debug_assert!(
+        !path.is_empty(),
+        "import path must have at least one segment"
+    );
+    let Some((first, rest)) = path.split_first() else {
+        return Err(ResolveError::MissingModule {
+            path: ModulePath(Vec::new()),
+            import_span,
+            probed: Vec::new(),
+        });
+    };
+    if ctx.dep_names.iter().any(|d| d == first) {
+        // A local module or directory of the same name is ambiguous against the
+        // dependency.
+        if let Some(local_path) = local_collision_path(&ctx.root, first) {
+            return Err(ResolveError::DependencyCollision {
+                name: first.clone(),
+                local_path,
+                import_span,
+            });
+        }
+        let dctx = pkg_ctxs
+            .get(first)
+            .ok_or_else(|| ResolveError::UnresolvedDependency {
+                name: first.clone(),
+                import_span,
+            })?;
+        let target_id = ModulePath(path.to_vec());
+        let remaining = ModulePath(rest.to_vec());
+        let file = if remaining.0.is_empty() {
+            // `import greet` (no sub-path) → the package's root module mod.phx.
+            let mod_file = dctx.root.join("mod.phx");
+            let canon = mod_file
+                .canonicalize()
+                .map_err(|_| ResolveError::MissingModule {
+                    path: target_id.clone(),
+                    import_span,
+                    probed: vec![mod_file],
+                })?;
+            ensure_under_root(&canon, &dctx.root_canon, import_span)?;
+            canon
+        } else {
+            resolve_module_path(&dctx.root, &dctx.root_canon, &remaining, import_span)?
+        };
+        Ok((target_id, file, dctx.clone()))
+    } else {
+        let target_id = ModulePath(ctx.prefix.iter().chain(path.iter()).cloned().collect());
+        let file = resolve_module_path(
+            &ctx.root,
+            &ctx.root_canon,
+            &ModulePath(path.to_vec()),
+            import_span,
+        )?;
+        Ok((target_id, file, ctx.clone()))
+    }
 }
 
 /// Resolve the import graph rooted at `entry_file`, consulting an in-memory
@@ -207,12 +410,43 @@ pub fn resolve_with_overlay(
     source_map: &mut SourceMap,
     overlay: &HashMap<PathBuf, &str>,
 ) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
+    resolve_core(
+        entry_file,
+        source_map,
+        overlay,
+        &PackageResolution::default(),
+    )
+}
+
+/// Resolve the import graph rooted at `entry_file` with **both** an in-memory
+/// overlay (for unsaved editor buffers) and cross-package dependencies wired in.
+///
+/// This is the combination [`resolve_with_overlay`] and [`resolve_with_packages`]
+/// each cover only half of: the language server needs both at once — open-buffer
+/// contents *and* a [`PackageResolution`] so a multi-package project's `import`s
+/// resolve in the editor the same way they do under `phoenix check`.
+pub fn resolve_with_overlay_and_packages(
+    entry_file: &Path,
+    source_map: &mut SourceMap,
+    overlay: &HashMap<PathBuf, &str>,
+    packages: &PackageResolution,
+) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
+    resolve_core(entry_file, source_map, overlay, packages)
+}
+
+/// Core resolver shared by [`resolve`], [`resolve_with_overlay`],
+/// [`resolve_with_packages`], and [`resolve_with_overlay_and_packages`]: a
+/// package-aware BFS over the import graph, selecting an overlay and/or
+/// [`PackageResolution`] per public entry point.
+fn resolve_core(
+    entry_file: &Path,
+    source_map: &mut SourceMap,
+    overlay: &HashMap<PathBuf, &str>,
+    packages: &PackageResolution,
+) -> Result<Vec<ResolvedSourceModule>, ResolveError> {
     // Canonicalize every overlay key once on entry so the BFS below can
-    // do a direct lookup against the canonical paths it discovers
-    // (`entry_canon` for the entry, paths returned by `discover_import_file`
-    // for siblings — both already canonical). Keys whose files don't
-    // exist on disk are dropped: the BFS only ever asks about canonical
-    // paths, so a literal-match fallback is unreachable in practice.
+    // do a direct lookup against the canonical paths it discovers. Keys whose
+    // files don't exist on disk are dropped.
     let canonical_overlay: HashMap<PathBuf, &str> = overlay
         .iter()
         .filter_map(|(k, v)| k.canonicalize().ok().map(|c| (c, *v)))
@@ -235,35 +469,69 @@ pub fn resolve_with_overlay(
     // O(1) instead of paying a syscall each.
     let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
 
-    // BFS over modules. Each queue entry is (module_path, file_path).
-    let mut queue: VecDeque<(ModulePath, PathBuf)> = VecDeque::new();
+    // The entry package's context, plus one per declared dependency package.
+    // Each `PkgCtx` is shared (`Rc`) so the per-import dispatch hands frames a
+    // cheap refcount bump rather than cloning the root paths on every edge.
+    let entry_ctx = Rc::new(PkgCtx {
+        prefix: Vec::new(),
+        root: root.clone(),
+        root_canon: root_canon.clone(),
+        dep_names: packages.entry_deps.clone(),
+    });
+    let pkg_ctxs: HashMap<String, Rc<PkgCtx>> = packages
+        .roots
+        .iter()
+        .map(|(name, dep_root)| {
+            let dr_canon = dep_root.canonicalize().unwrap_or_else(|_| dep_root.clone());
+            (
+                name.clone(),
+                Rc::new(PkgCtx {
+                    prefix: vec![name.clone()],
+                    root: dep_root.clone(),
+                    root_canon: dr_canon,
+                    dep_names: packages.deps.get(name).cloned().unwrap_or_default(),
+                }),
+            )
+        })
+        .collect();
+
+    // BFS over modules. Each frame carries the module's identity, its file, and
+    // the package context its own imports dispatch within.
+    struct Frame {
+        module_path: ModulePath,
+        file_path: PathBuf,
+        ctx: Rc<PkgCtx>,
+    }
+    let mut queue: VecDeque<Frame> = VecDeque::new();
     let mut seen: HashSet<ModulePath> = HashSet::new();
     let mut out: Vec<ResolvedSourceModule> = Vec::new();
     // Per-module list of imports observed (for the post-BFS cycle pass).
     let mut import_edges: HashMap<ModulePath, Vec<(ModulePath, Span)>> = HashMap::new();
-    // Accumulator for parse errors. Multiple broken files surface in a
-    // single run instead of bailing on the first — mirrors how the
-    // single-file path returns every parser diagnostic at once.
+    // Accumulator for parse errors — every broken file surfaces in one run.
     let mut malformed: Vec<(PathBuf, Vec<Diagnostic>)> = Vec::new();
-    // Accumulator for read failures on imported modules. A non-entry
-    // file that can't be read does not bail the BFS; sibling subtrees
-    // (and their own malformed/read failures) are still surfaced in the
-    // same run.
+    // Accumulator for read failures on imported modules (entry read failure is
+    // fatal; a sibling's is accumulated).
     let mut read_failures: Vec<(PathBuf, String)> = Vec::new();
 
-    queue.push_back((ModulePath::entry(), entry_canon.clone()));
+    queue.push_back(Frame {
+        module_path: ModulePath::entry(),
+        file_path: entry_canon.clone(),
+        ctx: entry_ctx,
+    });
 
-    while let Some((mp, file_path)) = queue.pop_front() {
+    while let Some(Frame {
+        module_path: mp,
+        file_path,
+        ctx,
+    }) = queue.pop_front()
+    {
         if seen.contains(&mp) {
             continue;
         }
         seen.insert(mp.clone());
 
-        // Read + parse.  The entry file gets a different error variant from
-        // imported files: an unreadable entry is fatal (we have no graph to
-        // explore without it), but an unreadable sibling is accumulated.
-        // Editor overlays short-circuit the disk read: an open buffer's
-        // contents take precedence over what is on disk.
+        // Read + parse.  An unreadable entry is fatal; an unreadable sibling is
+        // accumulated. Editor overlays short-circuit the disk read.
         let contents = if let Some(buf) = canonical_overlay.get(&file_path) {
             buf.to_string()
         } else {
@@ -281,37 +549,46 @@ pub fn resolve_with_overlay(
                 }
             }
         };
-        // Entry's display name reproduces the caller-supplied path so
-        // single-file invocations keep emitting diagnostics under the same
-        // prefix the user typed (`/abs/path/foo.phx:LINE` or
-        // `relative/foo.phx:LINE`). Imported modules use a root-relative
-        // form because their absolute paths are an artifact of the
-        // canonicalize step, not anything the user named.
+        // Display name: the entry reproduces the caller-supplied path; a local
+        // module is root-relative; a dependency module is prefixed with its
+        // package name so diagnostics make the package boundary clear.
         let display_name = if mp.is_entry() {
             entry_file.display().to_string()
+        } else if ctx.prefix.is_empty() {
+            display_name_for(&file_path, &ctx.root)
         } else {
-            display_name_for(&file_path, &root)
+            format!(
+                "{}/{}",
+                ctx.prefix.join("."),
+                display_name_for(&file_path, &ctx.root)
+            )
         };
         let source_id = source_map.add(display_name, contents);
         let tokens = tokenize(source_map.contents(source_id), source_id);
         let (program, parse_diags) = phoenix_parser::parser::parse(&tokens);
         if !parse_diags.is_empty() {
-            // Record the failure but keep going. A malformed file's import
-            // list cannot be trusted, so we don't queue its imports — but
-            // sibling modules from other branches of the BFS still get
-            // parsed and any of their own parse errors are captured too.
+            // A malformed file's import list cannot be trusted, so we don't
+            // queue its imports — but sibling modules are still parsed.
             malformed.push((file_path.clone(), parse_diags));
             continue;
         }
 
-        // Walk imports from this module's AST and resolve each to a file
-        // path (plus capture the per-import span for diagnostic carry).
+        // Walk imports: dispatch each to its resolved identity + file + owning
+        // package, recording the as-written → resolved-identity mapping sema
+        // consumes so a dependency's verbatim `import helpers` reaches the
+        // package-qualified `greet.helpers`.
         let mut my_edges: Vec<(ModulePath, Span)> = Vec::new();
+        let mut import_targets: HashMap<Vec<String>, ModulePath> = HashMap::new();
         for imp in iter_imports(&program) {
-            let target = ModulePath(imp.path.clone());
-            let resolved = resolve_module_path(&root, &root_canon, &target, imp.span)?;
-            my_edges.push((target.clone(), imp.span));
-            queue.push_back((target, resolved));
+            let (target_id, target_file, target_ctx) =
+                dispatch_import(&ctx, &imp.path, imp.span, &pkg_ctxs)?;
+            import_targets.insert(imp.path.clone(), target_id.clone());
+            my_edges.push((target_id.clone(), imp.span));
+            queue.push_back(Frame {
+                module_path: target_id,
+                file_path: target_file,
+                ctx: target_ctx,
+            });
         }
         // Sort edges lexically for deterministic cycle reports.
         my_edges.sort_by(|a, b| a.0.cmp(&b.0));
@@ -323,6 +600,7 @@ pub fn resolve_with_overlay(
             source_id,
             program,
             file_path,
+            import_targets,
         });
     }
 
@@ -1141,5 +1419,369 @@ mod tests {
         let out = resolve(&entry, &mut sm).unwrap();
         let entry_module = &out[0];
         assert_eq!(sm.name(entry_module.source_id), entry.display().to_string());
+    }
+
+    // ── Cross-package resolution ───────────────────────
+
+    fn mp(segments: &[&str]) -> ModulePath {
+        ModulePath(segments.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn cross_package_import_resolves_and_prefixes() {
+        // The entry imports `greet.greeting`; `greet` is a dependency whose
+        // root holds `greeting.phx`. The resulting module is package-qualified
+        // (`greet.greeting`) and not the entry.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.greeting { hello }\nfunction main() {}\n",
+        );
+        write_file(
+            td.path(),
+            "greet/greeting.phx",
+            "public function hello() {}\n",
+        );
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
+
+        let greeting = out
+            .iter()
+            .find(|m| m.module_path == mp(&["greet", "greeting"]))
+            .expect("greet.greeting module present");
+        assert!(!greeting.is_entry);
+        // The entry's import maps verbatim path → resolved (already-qualified)
+        // identity.
+        let entry_mod = out.iter().find(|m| m.is_entry).unwrap();
+        assert_eq!(
+            entry_mod
+                .import_targets
+                .get(&vec!["greet".to_string(), "greeting".to_string()]),
+            Some(&mp(&["greet", "greeting"]))
+        );
+    }
+
+    #[test]
+    fn dependency_internal_import_is_prefixed() {
+        // A dependency's *own* `import helpers` (bare in source) resolves to the
+        // package-qualified `greet.helpers`, so it can never collide with a
+        // local `helpers`. The AST is not rewritten — the mapping lives in
+        // `import_targets`.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.greeting { hello }\nfunction main() {}\n",
+        );
+        write_file(
+            td.path(),
+            "greet/greeting.phx",
+            "import helpers { help }\npublic function hello() {}\n",
+        );
+        write_file(
+            td.path(),
+            "greet/helpers.phx",
+            "public function help() {}\n",
+        );
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
+
+        assert!(
+            out.iter()
+                .any(|m| m.module_path == mp(&["greet", "helpers"])),
+            "greet.helpers should be resolved; got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+        let greeting = out
+            .iter()
+            .find(|m| m.module_path == mp(&["greet", "greeting"]))
+            .unwrap();
+        // greeting's verbatim `import helpers` maps to greet.helpers.
+        assert_eq!(
+            greeting.import_targets.get(&vec!["helpers".to_string()]),
+            Some(&mp(&["greet", "helpers"]))
+        );
+    }
+
+    #[test]
+    fn bare_dependency_import_resolves_mod_phx() {
+        // `import greet` (no sub-path) resolves to the package's `mod.phx`.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet { hello }\nfunction main() {}\n",
+        );
+        write_file(td.path(), "greet/mod.phx", "public function hello() {}\n");
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
+        assert!(out.iter().any(|m| m.module_path == mp(&["greet"])));
+    }
+
+    #[test]
+    fn nested_cross_package_subpath_resolves_under_dependency_root() {
+        // A multi-segment cross-package import (`greet.sub.deep`) resolves under
+        // the dependency's *nested* directory (`greet/sub/deep.phx`), exercising
+        // the multi-segment `remaining` path in the cross-package dispatch — not
+        // just the single-segment (`greet.greeting`) and bare (`greet`) forms.
+        // The resulting identity is the verbatim, already-qualified import path.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.sub.deep { deep }\nfunction main() {}\n",
+        );
+        write_file(
+            td.path(),
+            "greet/sub/deep.phx",
+            "public function deep() {}\n",
+        );
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
+        assert!(
+            out.iter()
+                .any(|m| m.module_path == mp(&["greet", "sub", "deep"])),
+            "greet.sub.deep should resolve under the dependency's nested dir; got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn local_module_colliding_with_dependency_name_errors() {
+        // A local `greet.phx` and a declared dependency `greet` are ambiguous.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet { hello }\nfunction main() {}\n",
+        );
+        write_file(td.path(), "proj/greet.phx", "public function hello() {}\n");
+        write_file(td.path(), "greet/mod.phx", "public function hello() {}\n");
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        match resolve_with_packages(&entry, &mut sm, &packages) {
+            Err(ResolveError::DependencyCollision { name, .. }) => assert_eq!(name, "greet"),
+            other => panic!("expected DependencyCollision, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_directory_colliding_with_dependency_name_errors() {
+        // A local `greet/` directory (holding `greet.greeting`) and a declared
+        // dependency `greet` are ambiguous even without a `greet/mod.phx`: the
+        // dependency must not silently shadow the local subtree.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.greeting { hello }\nfunction main() {}\n",
+        );
+        write_file(
+            td.path(),
+            "proj/greet/greeting.phx",
+            "public function hello() {}\n",
+        );
+        write_file(
+            td.path(),
+            "dep/greet/mod.phx",
+            "public function hello() {}\n",
+        );
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("dep/greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        match resolve_with_packages(&entry, &mut sm, &packages) {
+            Err(ResolveError::DependencyCollision { name, .. }) => assert_eq!(name, "greet"),
+            other => panic!("expected DependencyCollision, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn declared_dependency_without_root_errors() {
+        // `greet` is declared as an entry dependency but no root was supplied in
+        // `PackageResolution` — the defensive `UnresolvedDependency` path.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet { hello }\nfunction main() {}\n",
+        );
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::new(),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        match resolve_with_packages(&entry, &mut sm, &packages) {
+            Err(ResolveError::UnresolvedDependency { name, .. }) => assert_eq!(name, "greet"),
+            other => panic!("expected UnresolvedDependency, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transitive_dependency_resolves_through_package_deps() {
+        // greet depends on `core`; greet.greeting imports `core.util`. The
+        // `deps` map lets the dispatch reach core's root from within greet.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.greeting { hello }\nfunction main() {}\n",
+        );
+        write_file(
+            td.path(),
+            "greet/greeting.phx",
+            "import core.util { u }\npublic function hello() {}\n",
+        );
+        write_file(td.path(), "core/util.phx", "public function u() {}\n");
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([
+                ("greet".to_string(), td.path().join("greet")),
+                ("core".to_string(), td.path().join("core")),
+            ]),
+            deps: HashMap::from([("greet".to_string(), vec!["core".to_string()])]),
+        };
+        let mut sm = SourceMap::new();
+        let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
+        assert!(
+            out.iter().any(|m| m.module_path == mp(&["core", "util"])),
+            "core.util should resolve transitively; got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dependency_cannot_reach_undeclared_sibling() {
+        // `core` is a resolved package, but greet does NOT declare it (`deps` is
+        // empty for greet). greet's `import core.util` must therefore *not*
+        // dispatch cross-package to core's root — its first segment isn't one of
+        // greet's dep names, so it resolves locally under greet's own root and
+        // fails as `MissingModule` (probed under greet, not core). This is the
+        // isolation guard: a package reaches only the dependencies it declares,
+        // never an arbitrary sibling that merely happens to be in the graph.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.greeting { hello }\nfunction main() {}\n",
+        );
+        write_file(
+            td.path(),
+            "greet/greeting.phx",
+            "import core.util { u }\npublic function hello() {}\n",
+        );
+        write_file(td.path(), "core/util.phx", "public function u() {}\n");
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([
+                ("greet".to_string(), td.path().join("greet")),
+                ("core".to_string(), td.path().join("core")),
+            ]),
+            // greet declares no dependencies — `core` is undeclared from its view.
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        match resolve_with_packages(&entry, &mut sm, &packages) {
+            Err(ResolveError::MissingModule { probed, .. }) => {
+                // Looked for `core/util` under greet's root, never core's —
+                // proof the undeclared sibling was not reachable.
+                let greet_root = td.path().join("greet");
+                assert!(
+                    probed.iter().all(|p| p.starts_with(&greet_root)),
+                    "expected probes under greet's root {:?}; got {:?}",
+                    greet_root,
+                    probed
+                );
+            }
+            other => panic!("expected MissingModule, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn missing_module_under_dependency_root_errors() {
+        // The first segment names a valid dependency, but the requested submodule
+        // does not exist under its root — the cross-package dispatch must surface
+        // a `MissingModule` (probed under the *dependency's* root), not resolve it
+        // locally or silently drop it.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet.nope { x }\nfunction main() {}\n",
+        );
+        // `greet` exists but has no `nope` module.
+        write_file(
+            td.path(),
+            "greet/greeting.phx",
+            "public function hello() {}\n",
+        );
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([("greet".to_string(), td.path().join("greet"))]),
+            deps: HashMap::new(),
+        };
+        let mut sm = SourceMap::new();
+        match resolve_with_packages(&entry, &mut sm, &packages) {
+            Err(ResolveError::MissingModule { probed, .. }) => {
+                // The dispatch went cross-package: the probes live under the
+                // dependency's root, not the entry's — proof the missing module
+                // was looked for in the right place rather than resolved locally.
+                let greet_root = td.path().join("greet");
+                assert!(
+                    probed.iter().all(|p| p.starts_with(&greet_root)),
+                    "expected probes under the dependency root {:?}; got {:?}",
+                    greet_root,
+                    probed
+                );
+            }
+            other => panic!("expected MissingModule, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn empty_package_resolution_is_single_package_behavior() {
+        // With no packages, resolution is byte-identical to `resolve`.
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "helpers.phx", "public function h() {}\n");
+        let entry = write_file(
+            td.path(),
+            "main.phx",
+            "import helpers { h }\nfunction main() {}\n",
+        );
+        let mut sm1 = SourceMap::new();
+        let a = resolve(&entry, &mut sm1).unwrap();
+        let mut sm2 = SourceMap::new();
+        let b = resolve_with_packages(&entry, &mut sm2, &PackageResolution::default()).unwrap();
+        let pa: Vec<_> = a.iter().map(|m| m.module_path.clone()).collect();
+        let pb: Vec<_> = b.iter().map(|m| m.module_path.clone()).collect();
+        assert_eq!(pa, pb);
     }
 }

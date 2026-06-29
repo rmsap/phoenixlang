@@ -261,6 +261,14 @@ pub(crate) fn render_resolve_error(
                 requested_path.display()
             ),
         ),
+        // Cross-package variants: localize to the import span, but reuse the
+        // canonical `Display` text instead of duplicating the message here so
+        // the two cannot drift. (Currently unreachable from the LSP, which
+        // resolves without a `PackageResolution`; handled for exhaustiveness.)
+        ResolveError::DependencyCollision { import_span, .. }
+        | ResolveError::UnresolvedDependency { import_span, .. } => {
+            push_diag(Some(*import_span), err.to_string());
+        }
         ResolveError::EntryNotFound { .. } | ResolveError::FileReadFailures { .. } => {
             push_diag(None, err.to_string());
         }

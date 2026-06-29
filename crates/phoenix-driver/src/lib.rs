@@ -17,6 +17,7 @@ pub mod deps;
 pub mod manifest;
 
 use std::fs;
+use std::path::Path;
 use std::process;
 
 use config::PhoenixConfig;
@@ -295,8 +296,9 @@ pub fn cmd_parse(path: &str) {
 /// signature stays stable across that change.
 pub(crate) fn parse_and_check(
     path: &str,
+    locked: bool,
 ) -> (phoenix_parser::ast::Program, phoenix_sema::Analysis) {
-    let (modules, analysis, _source_map) = parse_resolve_check(path);
+    let (modules, analysis, _source_map) = parse_resolve_check(path, locked);
     // `phoenix_modules::resolve` always returns at least the entry module
     // and places it first; both invariants are load-bearing here.
     debug_assert!(
@@ -319,15 +321,10 @@ pub(crate) fn parse_and_check(
 /// extra clone.
 pub(crate) fn parse_resolve_check(
     path: &str,
+    locked: bool,
 ) -> (Vec<ResolvedSourceModule>, phoenix_sema::Analysis, SourceMap) {
     let mut source_map = SourceMap::new();
-    let modules = match phoenix_modules::resolve(std::path::Path::new(path), &mut source_map) {
-        Ok(modules) => modules,
-        Err(err) => {
-            report_resolve_error(&err, &source_map);
-            process::exit(1);
-        }
-    };
+    let modules = resolve_modules_with_deps(path, locked, &mut source_map);
 
     let analysis = checker::check_modules(&modules);
     if !analysis.diagnostics.is_empty() {
@@ -338,15 +335,58 @@ pub(crate) fn parse_resolve_check(
     (modules, analysis, source_map)
 }
 
-/// Type-checks a source file and reports diagnostics.
-pub fn cmd_check(path: &str) {
-    parse_and_check(path);
+/// Resolve the module graph for `path`, first fetching + wiring any declared
+/// package dependencies so cross-package `import`s resolve. On any error
+/// (manifest, dependency resolution, or module resolution) the diagnostic is
+/// printed and the process exits.
+fn resolve_modules_with_deps(
+    path: &str,
+    locked: bool,
+    source_map: &mut SourceMap,
+) -> Vec<ResolvedSourceModule> {
+    resolve_modules_reporting(path, locked, source_map).unwrap_or_else(|_| process::exit(1))
+}
+
+/// Shared core of dependency-aware module resolution: discover + fetch declared
+/// dependencies, then resolve the import graph with them wired in. All
+/// user-facing stderr — both errors and the "Updated phoenix.lock" notice — is
+/// emitted here; the `Err` payload is an opaque category tag the caller maps to
+/// its own policy — [`resolve_modules_with_deps`] exits the process, while the
+/// watch path ([`try_parse_and_check`]) keeps the loop alive. `locked` forbids
+/// updating `phoenix.lock`.
+fn resolve_modules_reporting(
+    path: &str,
+    locked: bool,
+    source_map: &mut SourceMap,
+) -> Result<Vec<ResolvedSourceModule>, String> {
+    let entry = Path::new(path);
+    let (packages, lock_changed) =
+        deps::project::build_package_resolution(entry, locked).map_err(|msg| {
+            eprintln!("error: {msg}");
+            "dependency resolution errors".to_string()
+        })?;
+    if lock_changed {
+        eprintln!("Updated phoenix.lock");
+    }
+    phoenix_modules::resolve_with_packages(entry, source_map, &packages).map_err(|err| {
+        report_resolve_error(&err, source_map);
+        "resolve / parse errors".to_string()
+    })
+}
+
+/// Type-checks a source file and reports diagnostics. Resolves and fetches any
+/// declared dependencies first; `locked` forbids updating `phoenix.lock`.
+pub fn cmd_check(path: &str, locked: bool) {
+    parse_and_check(path, locked);
     println!("No errors found.");
 }
 
 /// Lower a Phoenix source file to IR and print the textual representation.
+/// Declared dependencies (if any) still resolve, but — like `gen` and unlike
+/// `check`/`run`/`build` — this is a non-`--locked`-aware path: the lockfile may
+/// be updated but is never gated.
 pub fn cmd_ir(path: &str) {
-    let (modules, check_result, _sm) = parse_resolve_check(path);
+    let (modules, check_result, _sm) = parse_resolve_check(path, false);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     // Run the IR verifier to catch structural errors.
@@ -361,24 +401,28 @@ pub fn cmd_ir(path: &str) {
     print!("{}", ir_module);
 }
 
-/// Runs a Phoenix program via the tree-walk interpreter.
-pub fn cmd_run(path: &str) {
+/// Runs a Phoenix program via the tree-walk interpreter. Resolves and fetches
+/// any declared dependencies first; `locked` forbids updating `phoenix.lock`.
+pub fn cmd_run(path: &str, locked: bool) {
     // The AST interpreter goes through `interpreter::run_modules` so
     // multi-file programs work end-to-end (sema's `module_scopes`
     // translate cross-module name references). For single-file
     // inputs this reduces to the same behavior as the previous
     // single-program path — entry module qualifies to bare, every
     // name resolves identically.
-    let (modules, mut analysis, _sm) = parse_resolve_check(path);
+    let (modules, mut analysis, _sm) = parse_resolve_check(path, locked);
     if let Err(err) = interpreter::run_modules(&modules, &mut analysis) {
         eprintln!("runtime error: {}", err);
         process::exit(1);
     }
 }
 
-/// Run a Phoenix program via the IR interpreter.
+/// Run a Phoenix program via the IR interpreter. Declared dependencies (if any)
+/// still resolve, but — like `gen`/`ir` and unlike `check`/`run`/`build` — this
+/// is a non-`--locked`-aware path: the lockfile may be updated but is never
+/// gated.
 pub fn cmd_run_ir(path: &str) {
-    let (modules, check_result, _sm) = parse_resolve_check(path);
+    let (modules, check_result, _sm) = parse_resolve_check(path, false);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
@@ -407,7 +451,9 @@ pub fn cmd_run_ir(path: &str) {
 /// exit. The actual file emission is shared with the watch path via
 /// [`emit_target`] so the two cannot drift.
 fn cmd_gen(path: &str, target: &str, out_dir: &str, mode: GenMode, framework: Option<&str>) {
-    let (program, check_result) = parse_and_check(path);
+    // Code generation is schema-first and not `--locked`-aware; declared
+    // dependencies (if any) still resolve, but the lockfile is never gated.
+    let (program, check_result) = parse_and_check(path, false);
 
     if target == "openapi" && mode != GenMode::Both {
         eprintln!("warning: --client/--server flags have no effect on OpenAPI target");
@@ -724,13 +770,15 @@ fn try_parse_and_check(
     path: &str,
 ) -> Result<(phoenix_parser::ast::Program, phoenix_sema::Analysis), String> {
     let mut source_map = SourceMap::new();
-    let modules = match phoenix_modules::resolve(std::path::Path::new(path), &mut source_map) {
-        Ok(modules) => modules,
-        Err(err) => {
-            report_resolve_error(&err, &source_map);
-            return Err("resolve / parse errors".to_string());
-        }
-    };
+    // Watch mode never gates the lockfile (`locked = false`); a dependency- or
+    // manifest-resolution failure is reported and surfaced as an `Err` rather
+    // than exiting the watch loop.
+    //
+    // NOTE: this re-resolves dependencies on every rebuild. For path-only deps
+    // that is cheap; for git deps it re-runs `resolve_project` against the cache
+    // per file change. A future refinement could resolve once per watch session
+    // and re-resolve only when the manifest itself changes.
+    let modules = resolve_modules_reporting(path, false, &mut source_map)?;
 
     let analysis = checker::check_modules(&modules);
     if !analysis.diagnostics.is_empty() {

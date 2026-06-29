@@ -1,0 +1,6 @@
+// The `greet` package's root module (imported as `import greet { ... }`).
+// Its internal `import util` is bare in source — the resolver qualifies it to
+// `greet.util`, so it never collides with the app's own `util`.
+import util { libValue }
+
+public function greeting() -> String { libValue() }

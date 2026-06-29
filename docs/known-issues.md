@@ -51,6 +51,34 @@ locking work above.
 offline path already avoids it; this is a fetch-latency optimization for repeated
 unlocked builds. Surfaced 2026-06-25 during the Phase 3.3 fetch + lockfile review.
 
+### The LSP does not resolve cross-package dependencies
+
+The CLI (`build` / `run` / `check`) discovers a project's `[dependencies]`,
+fetches them, and threads their roots into the module resolver via
+`phoenix_modules::resolve_with_packages`, so cross-package `import`s resolve. The
+language server does **not**: `phoenix-lsp` resolves through
+`resolve_with_overlay`, which always passes an empty `PackageResolution`. In a
+multi-package project the editor therefore sees a dependency's `import` (e.g.
+`import greet { ... }`) as an unresolved module even though `phoenix check`
+succeeds on the same file — a diagnostics divergence between the CLI and the
+editor, not a miscompile. (The `render_resolve_error` arms for the new
+`DependencyCollision` / `UnresolvedDependency` variants are handled for match
+exhaustiveness but are consequently unreachable from the LSP today.)
+
+**Planned fix:** build a `PackageResolution` in `phoenix-lsp` the same way the
+driver's `build_package_resolution` does (discover the manifest, resolve deps
+against the cache) and call `phoenix_modules::resolve_with_overlay_and_packages`
+instead of `resolve_with_overlay` — it takes the overlay (for open buffers) and
+the `PackageResolution` together, which is exactly the combination the server
+needs. Still needs a decision on when the server (re)resolves dependencies (on
+open vs. on manifest change) so it doesn't fetch on every keystroke.
+
+**File:** `crates/phoenix-lsp/src/project.rs` (resolver call site);
+`crates/phoenix-driver/src/lib.rs` (`build_package_resolution`, the logic to
+mirror). **Priority: Medium** — cross-package projects get spurious editor
+diagnostics; single-package projects are unaffected. Surfaced 2026-06-27 during
+the Phase 3.1 PR4 cross-package resolution review.
+
 ### Release binaries don't bundle third-party dependency license notices
 
 Phoenix is MIT-licensed and links a large tree of permissively-licensed crates

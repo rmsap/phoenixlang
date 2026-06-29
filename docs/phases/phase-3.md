@@ -67,6 +67,14 @@ A `phoenix.toml`-driven package manager: declare a package and its dependencies,
 
 3.1 lives entirely in **`phoenix-driver`** (config, CLI, a new resolver/lockfile module or a `phoenix-package` crate) and **`phoenix-modules`** (the resolver seam), plus new workspace deps. It does **not** touch the lexer, parser, sema, IR, runtime, or codegen — so it is disjoint from [Phase 4.6](./phase-4.md#46-json-and-serialization) and any other stdlib work. The only files both tracks might touch are the workspace `Cargo.toml` `[workspace.dependencies]` table (each appends distinct entries), `tests/fixtures/` (additive new files), and the docs (different sections). Rebase those few touch-points frequently; everything else is in separate crates.
 
+### Dependency resolution across commands
+
+Any command that compiles a file — `check`, `run`, `build`, `ir`, `run-ir`, `gen` — first walks up from the entry file to discover the nearest `phoenix.toml` and, if it declares `[dependencies]`, resolves + fetches them before compiling. This is project-relative discovery (cargo-style): running a file that lives under a project with git dependencies will fetch those dependencies even if the file itself imports nothing from them.
+
+Two roots are in play and they are intentionally distinct: **manifest/dependency resolution** is rooted at the discovered `phoenix.toml`'s directory (path deps resolve relative to it, the lockfile is written there), while **local-module resolution** for the entry package is rooted at the *entry file's own directory* (a bare `import util` resolves to `util.phx` beside the entry file, not beside the manifest). For the common layout — entry file and `phoenix.toml` in the same directory — they coincide. They diverge only when the entry file sits in a subdirectory below its manifest; that case is unchanged from pre-PR4 single-package behavior and is not (yet) something the package manager re-roots.
+
+`--locked` (refuse to update `phoenix.lock`, error on drift) is accepted only on `check`, `run`, and `build` — the commands that produce a runnable/shippable artifact and therefore need reproducibility. `ir`, `run-ir`, and `gen` are diagnostic/codegen paths: they still resolve dependencies (so cross-package imports work) and may *write* `phoenix.lock` if it is out of date, but they are not `--locked`-gated. The asymmetry is deliberate — reproducibility gating belongs on the build/run surface, not on IR inspection or schema codegen.
+
 ## 3.2 Language Server Protocol (LSP)
 
 A multi-module foundation landed in Phase 2.6 — diagnostics, hover, completion, goto-def, find-references, and rename all work cross-file for functions / structs / enums / methods / fields / enum variants, with the rich diagnostic shape (notes routed to the right file URI). 3.2 closes the remaining symbol-coverage gaps and adds the standard LSP features the editor experience expects.

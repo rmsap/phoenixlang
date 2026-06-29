@@ -1804,6 +1804,7 @@ fn make_module(
         program,
         is_entry,
         file_path: PathBuf::from(format!("<test:{source_id:?}>")),
+        import_targets: Default::default(),
     }
 }
 

@@ -48,11 +48,17 @@ enum Commands {
     Check {
         /// Path to the source file
         file: String,
+        /// Require phoenix.lock to be up to date; error on drift instead of updating it
+        #[arg(long)]
+        locked: bool,
     },
     /// Run a Phoenix program
     Run {
         /// Path to the source file
         file: String,
+        /// Require phoenix.lock to be up to date; error on drift instead of updating it
+        #[arg(long)]
+        locked: bool,
     },
     /// Dump the SSA-style intermediate representation
     Ir {
@@ -77,6 +83,9 @@ enum Commands {
         /// WebAssembly compilation for the per-target PR sequence.
         #[arg(long)]
         target: Option<String>,
+        /// Require phoenix.lock to be up to date; error on drift instead of updating it
+        #[arg(long)]
+        locked: bool,
     },
     /// Generate typed code from a Phoenix schema file
     Gen {
@@ -122,15 +131,16 @@ fn run() {
     match cli.command {
         Commands::Lex { file } => cmd_lex(&file),
         Commands::Parse { file } => cmd_parse(&file),
-        Commands::Check { file } => cmd_check(&file),
+        Commands::Check { file, locked } => cmd_check(&file, locked),
         Commands::Ir { file } => cmd_ir(&file),
-        Commands::Run { file } => cmd_run(&file),
+        Commands::Run { file, locked } => cmd_run(&file, locked),
         Commands::RunIr { file } => cmd_run_ir(&file),
         Commands::Build {
             file,
             output,
             target,
-        } => build::cmd_build(&file, output.as_deref(), target.as_deref()),
+            locked,
+        } => build::cmd_build(&file, output.as_deref(), target.as_deref(), locked),
         Commands::Gen {
             file,
             target,

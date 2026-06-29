@@ -61,7 +61,17 @@ impl Checker {
             let importer_path = module.module_path.clone();
             for decl in &module.program.declarations {
                 if let Declaration::Import(imp) = decl {
-                    let target_path = ModulePath(imp.path.clone());
+                    // Use the resolver-provided cross-package target identity
+                    // (e.g. a dependency's verbatim `import helpers` → the
+                    // package-qualified `greet.helpers`). For a single-package
+                    // project `import_targets` is identity-mapped (every import
+                    // maps to its own literal path), so the lookup and the
+                    // `unwrap_or_else` fallback agree — unchanged behavior.
+                    let target_path = module
+                        .import_targets
+                        .get(&imp.path)
+                        .cloned()
+                        .unwrap_or_else(|| ModulePath(imp.path.clone()));
                     let Some(target_program) = by_path.get(&target_path) else {
                         // Resolver should have caught this — defense in depth.
                         self.diagnostics.push(Diagnostic::error(

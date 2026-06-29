@@ -14,13 +14,18 @@
 //!   `path` sources.
 //! - [`lock`] — `phoenix.lock` generation, reading, and drift detection.
 //! - [`resolve`] — the project-level entry point that ties manifest, lockfile,
-//!   and fetcher together (to be wired into `build` / `run` / `check` in a
-//!   later PR; currently driven by the integration tests).
+//!   and fetcher together; consumed by the driver's `parse_resolve_check` path
+//!   so `build` / `run` / `check` resolve dependencies before compiling.
+//! - [`project`] — projects a resolved graph into the
+//!   [`phoenix_modules::PackageResolution`] the module resolver consumes, and
+//!   owns the manifest-discovery + dependency-resolution glue the compile path
+//!   calls before lowering.
 
 pub mod cache;
 pub mod fetch;
 pub mod graph;
 pub mod lock;
+pub mod project;
 pub mod resolve;
 
 pub use graph::{

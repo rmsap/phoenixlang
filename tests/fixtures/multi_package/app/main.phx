@@ -1,0 +1,11 @@
+// Imports across a package boundary (`greet`, a path dependency) and from a
+// local module (`util`). `greet`'s public `greeting` itself depends on greet's
+// internal `util.libValue`, so a successful run proves transitive cross-package
+// resolution end to end.
+import greet { greeting }
+import util { localValue }
+
+function main() {
+  print(greeting())
+  print(localValue())
+}

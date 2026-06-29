@@ -3361,6 +3361,7 @@ function main() {
             program,
             is_entry: true,
             file_path: PathBuf::from("<test>"),
+            import_targets: Default::default(),
         };
         let modules = [module];
         let mut analysis = phoenix_sema::checker::check_modules(&modules);
@@ -3405,6 +3406,7 @@ function main() {
             program,
             is_entry: true,
             file_path: PathBuf::from("<test>"),
+            import_targets: Default::default(),
         };
         let modules = [module];
         let mut analysis = phoenix_sema::checker::check_modules(&modules);
@@ -3482,6 +3484,7 @@ function main() {
             program,
             is_entry: true,
             file_path: PathBuf::from("<test>"),
+            import_targets: Default::default(),
         };
         let modules = [module];
         let mut analysis = phoenix_sema::checker::check_modules(&modules);

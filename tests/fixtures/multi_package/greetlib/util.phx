@@ -1,0 +1,3 @@
+// `greet`'s OWN `util` module. Its name deliberately collides with the app's
+// local `util` module to prove package-qualified identity keeps them separate.
+public function libValue() -> String { "42" }
