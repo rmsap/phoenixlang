@@ -16,7 +16,9 @@ use crate::config::PhoenixConfig;
 use crate::manifest::{Dependency, GitRef};
 
 use super::cache::{git_checkout_dir, git_db_dir};
-use super::graph::{FetchedPackage, ManifestProvider, PackageManifest, ResolveError};
+use super::graph::{
+    FetchedPackage, ManifestProvider, PackageManifest, PackageSource, ResolveError,
+};
 use super::lock::LockedPackage;
 
 /// Filename extension for the per-checkout completion marker. The marker lives
@@ -78,14 +80,12 @@ impl CacheFetcher {
             ),
         })?;
         let manifest = read_package_manifest(name, &root)?;
-        // Canonical path is the unification identity for path sources.
-        let source_id = root.to_string_lossy().into_owned();
         Ok(FetchedPackage {
             manifest,
+            // The canonical root is both the package root and (for a path
+            // source) the unification identity.
+            source: PackageSource::Path { path: root.clone() },
             root,
-            source_id,
-            rev: None,
-            git_ref: None,
         })
     }
 
@@ -103,8 +103,8 @@ impl CacheFetcher {
         let locked_sha = self
             .locked
             .get(name)
-            .filter(|lp| lp.git == url && lp.matches_ref(reference))
-            .map(|lp| lp.rev.clone());
+            .filter(|lp| lp.git() == Some(url) && lp.matches_ref(reference))
+            .map(|lp| lp.rev().to_string());
 
         // `cache_root` and `refreshed` are distinct fields, so the simultaneous
         // shared/mutable borrows below are disjoint and accepted.
@@ -123,9 +123,11 @@ impl CacheFetcher {
         Ok(FetchedPackage {
             manifest,
             root,
-            source_id: url.to_string(),
-            rev: Some(sha),
-            git_ref: Some(reference.clone()),
+            source: PackageSource::Git {
+                url: url.to_string(),
+                git_ref: reference.clone(),
+                rev: sha,
+            },
         })
     }
 }
@@ -608,7 +610,10 @@ mod tests {
         let fetched = fetcher.fetch_path("util", "util", tmp.path()).unwrap();
         assert_eq!(fetched.manifest.version.to_string(), "0.3.0");
         assert_eq!(fetched.manifest.name, "util");
-        assert!(fetched.rev.is_none());
+        assert!(
+            matches!(fetched.source, PackageSource::Path { .. }),
+            "a path dependency must carry an explicit Path source"
+        );
         assert_eq!(fetched.root, dep_dir.canonicalize().unwrap());
     }
 }

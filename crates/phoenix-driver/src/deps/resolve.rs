@@ -180,7 +180,7 @@ fn cache_root_or_error(dir: Option<PathBuf>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deps::graph::{ResolvedGraph, ResolvedPackage};
+    use crate::deps::graph::{PackageSource, ResolvedGraph, ResolvedPackage};
     use crate::deps::lock::Lockfile;
 
     fn git_graph(name: &str, version: &str, url: &str, rev: &str) -> ResolvedGraph {
@@ -189,9 +189,11 @@ mod tests {
             version: semver::Version::parse(version).unwrap(),
             root: PathBuf::from("/cache/x"),
             dependencies: BTreeMap::new(),
-            source_id: url.to_string(),
-            rev: Some(rev.to_string()),
-            git_ref: Some(crate::manifest::GitRef::Tag(format!("v{version}"))),
+            source: PackageSource::Git {
+                url: url.to_string(),
+                git_ref: crate::manifest::GitRef::Tag(format!("v{version}")),
+                rev: rev.to_string(),
+            },
         };
         ResolvedGraph {
             packages: [(name.to_string(), pkg)].into_iter().collect(),

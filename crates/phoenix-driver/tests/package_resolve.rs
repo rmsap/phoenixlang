@@ -124,7 +124,7 @@ fn git_dependency_fetches_and_writes_lockfile() {
     // The package resolved to the tagged commit, with its files on disk.
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.version.to_string(), "1.0.0");
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
 
     // A lockfile was written beside the manifest, pinning the commit.
@@ -161,7 +161,7 @@ fn git_dependency_on_branch_resolves_to_branch_head() {
 
     let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve branch");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
 
     // A branch dep records the requested branch as the lock's ref key.
@@ -193,7 +193,7 @@ fn git_dependency_default_branch_resolves_to_head() {
     let res =
         resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve default branch");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
 
     // A default-branch dep records no tag/branch ref key — the commit pins it.
@@ -295,7 +295,7 @@ fn reproducible_from_clean_cache_under_locked() {
     // Under --locked, resolution rematerializes the pinned commit and succeeds.
     let res = resolve_project(proj.path(), &deps, cache.path(), true).expect("locked rebuild");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
     assert!(
         !res.lock_changed,
@@ -337,7 +337,7 @@ fn locked_rebuild_is_offline_when_checkout_survives() {
     // Under --locked the pinned commit's surviving checkout is reused offline.
     let res = resolve_project(proj.path(), &deps, cache.path(), true).expect("offline rebuild");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
     assert!(
         !res.lock_changed,
@@ -366,7 +366,7 @@ fn git_dependency_pinned_by_rev_resolves_and_records_rev_req() {
 
     let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve rev");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
 
     let lock_text = std::fs::read_to_string(proj.path().join("phoenix.lock")).unwrap();
     assert!(!lock_text.contains("tag = "), "{lock_text}");
@@ -410,10 +410,7 @@ fn locked_rebuild_with_abbreviated_rev_reuses_checkout_offline() {
     // Initial resolve clones, checks out the abbreviated rev's commit, writes the
     // lock (pinning the full resolved SHA).
     let first = resolve_project(proj.path(), &deps, cache.path(), false).expect("first resolve");
-    assert_eq!(
-        first.graph.packages["greet"].rev.as_deref(),
-        Some(sha.as_str())
-    );
+    assert_eq!(first.graph.packages["greet"].rev(), Some(sha.as_str()));
 
     // Drop the bare clone but keep the materialized checkout, then make the clone
     // unreachable by deleting the upstream repo entirely.
@@ -424,7 +421,7 @@ fn locked_rebuild_with_abbreviated_rev_reuses_checkout_offline() {
     // surviving checkout is reused offline (no clone needed).
     let res = resolve_project(proj.path(), &deps, cache.path(), true).expect("offline rebuild");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(greet.rev.as_deref(), Some(sha.as_str()));
+    assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
     assert!(
         !res.lock_changed,
@@ -525,11 +522,7 @@ fn changed_url_re_resolves_instead_of_reusing_locked_commit() {
     let deps_b = git_dep(repo_b.path(), "v1.0.0");
     let res = resolve_project(proj.path(), &deps_b, cache.path(), false).expect("re-resolve B");
     let greet = &res.graph.packages["greet"];
-    assert_eq!(
-        greet.rev.as_deref(),
-        Some(sha_b.as_str()),
-        "must resolve B's commit"
-    );
+    assert_eq!(greet.rev(), Some(sha_b.as_str()), "must resolve B's commit");
     assert!(
         res.lock_changed,
         "the lock must be rewritten for the new source"
@@ -643,10 +636,7 @@ fn locked_branch_dep_reuses_pinned_commit_until_ref_unchanged() {
 
     // Lock against the branch HEAD (sha1).
     let first = resolve_project(proj.path(), &deps, cache.path(), false).expect("lock branch");
-    assert_eq!(
-        first.graph.packages["greet"].rev.as_deref(),
-        Some(sha1.as_str())
-    );
+    assert_eq!(first.graph.packages["greet"].rev(), Some(sha1.as_str()));
 
     // Advance the branch HEAD to a new commit.
     let sha2 = commit_files(
@@ -662,7 +652,7 @@ fn locked_branch_dep_reuses_pinned_commit_until_ref_unchanged() {
     // An unlocked re-resolve with the same branch ref reuses the pinned commit.
     let again = resolve_project(proj.path(), &deps, cache.path(), false).expect("reuse pinned");
     assert_eq!(
-        again.graph.packages["greet"].rev.as_deref(),
+        again.graph.packages["greet"].rev(),
         Some(sha1.as_str()),
         "must reuse the pinned commit, not advance to the new branch HEAD"
     );
@@ -748,7 +738,7 @@ fn transitive_git_diamond_resolves_shared_dep_once() {
     // tagged commit with its files materialized.
     let core = &res.graph.packages["core"];
     assert_eq!(core.version.to_string(), "1.0.0");
-    assert_eq!(core.rev.as_deref(), Some(core_sha.as_str()));
+    assert_eq!(core.rev(), Some(core_sha.as_str()));
     assert!(core.root.join("greet.phx").is_file());
     assert!(res.graph.packages.contains_key("a"));
     assert!(res.graph.packages.contains_key("b"));
@@ -791,7 +781,7 @@ fn path_dependency_resolves_without_lockfile() {
     let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve path dep");
     let util = &res.graph.packages["util"];
     assert_eq!(util.version.to_string(), "0.2.0");
-    assert!(util.rev.is_none());
+    assert!(util.rev().is_none());
     // No git deps → no lockfile.
     assert!(!res.lock_changed);
     assert!(!proj.path().join("phoenix.lock").exists());
@@ -849,9 +839,9 @@ fn path_dep_with_transitive_git_dep_fetches_and_locks_only_the_git_dep() {
 
     // `mid` resolved in place (no rev); `core` was fetched from git and pinned.
     let mid = &res.graph.packages["mid"];
-    assert!(mid.rev.is_none(), "path dep is never SHA-pinned");
+    assert!(mid.rev().is_none(), "path dep is never SHA-pinned");
     let core = &res.graph.packages["core"];
-    assert_eq!(core.rev.as_deref(), Some(core_sha.as_str()));
+    assert_eq!(core.rev(), Some(core_sha.as_str()));
     assert!(core.root.join("greet.phx").is_file());
 
     // The lockfile pins the transitively-reached git `core` but not the path

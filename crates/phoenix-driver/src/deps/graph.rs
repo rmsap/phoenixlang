@@ -56,6 +56,7 @@
 //! - A cycle reachable *only* through a superseded version is still reported,
 //!   because cycle detection runs eagerly during the walk, before pruning.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -74,6 +75,48 @@ pub struct PackageManifest {
     pub dependencies: BTreeMap<String, Dependency>,
 }
 
+/// The kind and origin of a resolved package — an **explicit** source-kind
+/// discriminant carried on [`FetchedPackage`] / [`ResolvedPackage`] so the rest
+/// of the package manager never has to infer "is this git?" from the presence
+/// of a commit SHA. A registry source is a future additive variant; making the
+/// kind explicit now is the registry-readiness seam (see
+/// `docs/design-decisions.md` §Phase 3.1 A).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageSource {
+    /// A git source: clone URL, the manifest-requested ref, and the resolved
+    /// commit SHA (what gets pinned in the lockfile).
+    Git {
+        /// The clone URL.
+        url: String,
+        /// The ref the manifest requested (tag/branch/rev/default).
+        git_ref: GitRef,
+        /// The resolved commit SHA.
+        rev: String,
+    },
+    /// A local `path` source — resolved in place, never SHA-pinned, never
+    /// recorded in the lockfile. `path` is the canonical package root.
+    Path {
+        /// The canonical package root directory.
+        path: PathBuf,
+    },
+}
+
+impl PackageSource {
+    /// A stable identifier for the package's *upstream*, used for unification:
+    /// the git URL (without the ref, so distinct refs of one repo share it) for
+    /// a git source, or the canonical root path for a `path` source.
+    ///
+    /// Borrows the git URL and only allocates for a `path` source (the lossy
+    /// path render), so the hot conflict-check scan in [`resolve_graph`] doesn't
+    /// allocate per candidate.
+    pub fn unification_id(&self) -> Cow<'_, str> {
+        match self {
+            PackageSource::Git { url, .. } => Cow::Borrowed(url),
+            PackageSource::Path { path } => path.to_string_lossy(),
+        }
+    }
+}
+
 /// A package located on disk together with the data the resolver needs to
 /// unify and (later) lock it.
 #[derive(Debug, Clone)]
@@ -83,17 +126,8 @@ pub struct FetchedPackage {
     /// The directory containing the package's `phoenix.toml` — the package
     /// root that modules resolve under.
     pub root: PathBuf,
-    /// A stable identifier for the package's *upstream* used for unification:
-    /// the git URL for a git source, or the canonical root path for a `path`
-    /// source. Distinct refs of the same git repo share a `source_id`.
-    pub source_id: String,
-    /// For a git source, the resolved commit SHA (what gets pinned in the
-    /// lockfile); `None` for a `path` source, which is never SHA-pinned.
-    pub rev: Option<String>,
-    /// For a git source, the ref the manifest *requested* (tag/branch/rev/
-    /// default). Recorded in the lockfile so a manifest ref change is detected
-    /// as drift; `None` for a `path` source.
-    pub git_ref: Option<GitRef>,
+    /// The explicit source-kind (git / path) and its origin data.
+    pub source: PackageSource,
 }
 
 /// Locates a dependency and parses its manifest.
@@ -112,6 +146,25 @@ pub trait ManifestProvider {
         dep: &Dependency,
         parent_dir: &std::path::Path,
     ) -> Result<FetchedPackage, ResolveError>;
+
+    /// Enumerate the versions available for `name` from source `dep`.
+    ///
+    /// A git or `path` source resolves to exactly **one** version — the ref (or
+    /// the path's `[package].version`) *is* the choice — so the default returns
+    /// a one-element set via [`fetch`]. This is the registry-readiness seam for
+    /// resolution (see `docs/design-decisions.md` §Phase 3.1 A): a future
+    /// registry provider, where each requirement is a *range* over many
+    /// published versions, overrides this to drive a backtracking solver —
+    /// without that addition breaking the trait. The current resolver does not
+    /// call this yet (git/path need no solver); shaping it now is the point.
+    fn available_versions(
+        &mut self,
+        name: &str,
+        dep: &Dependency,
+        parent_dir: &std::path::Path,
+    ) -> Result<Vec<semver::Version>, ResolveError> {
+        Ok(vec![self.fetch(name, dep, parent_dir)?.manifest.version])
+    }
 }
 
 /// One node of the resolved dependency graph.
@@ -127,14 +180,20 @@ pub struct ResolvedPackage {
     /// the per-package dependency map that cross-package import resolution
     /// threads through.
     pub dependencies: BTreeMap<String, Dependency>,
-    /// The upstream source identity (see [`FetchedPackage::source_id`]).
-    pub source_id: String,
+    /// The explicit source-kind (git / path) and its origin data. Source of
+    /// truth for lockfile generation — git-vs-path is read from this, never
+    /// inferred from "has a commit SHA".
+    pub source: PackageSource,
+}
+
+impl ResolvedPackage {
     /// The resolved commit SHA for a git source; `None` for a `path` source.
-    /// Drives lockfile generation ([`super::lock::Lockfile::from_graph`]).
-    pub rev: Option<String>,
-    /// The manifest-requested ref for a git source; `None` for a `path` source.
-    /// Recorded in the lockfile so a ref change surfaces as drift.
-    pub git_ref: Option<GitRef>,
+    pub fn rev(&self) -> Option<&str> {
+        match &self.source {
+            PackageSource::Git { rev, .. } => Some(rev),
+            PackageSource::Path { .. } => None,
+        }
+    }
 }
 
 /// The fully resolved dependency graph: one [`ResolvedPackage`] per name.
@@ -322,7 +381,7 @@ pub fn resolve_graph(
         let fetched = provider.fetch(&frame.name, &frame.dep, &frame.parent_dir)?;
         let key = (
             frame.name.clone(),
-            fetched.source_id.clone(),
+            fetched.source.unification_id().into_owned(),
             fetched.manifest.version.clone(),
         );
         // Same name+source+version already walked: its candidate is recorded
@@ -382,12 +441,15 @@ pub fn resolve_graph(
         // Source identity must agree across all requirements. `cands[0]` is the
         // first candidate discovered in the DFS walk, so the reported
         // `first`/`second` ordering is stable across runs.
-        let first_source = cands[0].source_id.clone();
-        if let Some(diff) = cands.iter().find(|c| c.source_id != first_source) {
+        let first_source = cands[0].source.unification_id();
+        if let Some(diff) = cands
+            .iter()
+            .find(|c| c.source.unification_id() != first_source)
+        {
             return Err(ResolveError::SourceConflict {
                 name,
-                first: first_source,
-                second: diff.source_id.clone(),
+                first: first_source.into_owned(),
+                second: diff.source.unification_id().into_owned(),
             });
         }
         // Versions must be pairwise caret-compatible.
@@ -411,9 +473,7 @@ pub fn resolve_graph(
                 version: chosen.manifest.version,
                 root: chosen.root,
                 dependencies: chosen.manifest.dependencies,
-                source_id: chosen.source_id,
-                rev: chosen.rev,
-                git_ref: chosen.git_ref,
+                source: chosen.source,
             },
         );
     }
@@ -488,9 +548,9 @@ mod tests {
                     dependencies: deps,
                 },
                 root: PathBuf::from(format!("/virtual/{sid}")),
-                source_id: sid,
-                rev: None,
-                git_ref: None,
+                source: PackageSource::Path {
+                    path: std::path::PathBuf::from(sid),
+                },
             })
         }
     }
@@ -565,9 +625,9 @@ mod tests {
                                     .collect(),
                             },
                             root: PathBuf::from("/proj/util"),
-                            source_id: "/proj/util".to_string(),
-                            rev: None,
-                            git_ref: None,
+                            source: PackageSource::Path {
+                                path: std::path::PathBuf::from("/proj/util".to_string()),
+                            },
                         })
                     }
                     "core" => {
@@ -580,9 +640,9 @@ mod tests {
                                 dependencies: BTreeMap::new(),
                             },
                             root: PathBuf::from("/proj/core"),
-                            source_id: "/proj/core".to_string(),
-                            rev: None,
-                            git_ref: None,
+                            source: PackageSource::Path {
+                                path: std::path::PathBuf::from("/proj/core".to_string()),
+                            },
                         })
                     }
                     other => panic!("unexpected fetch for `{other}`"),
@@ -662,9 +722,9 @@ mod tests {
                             dependencies: BTreeMap::new(),
                         },
                         root: PathBuf::from("/virtual/core"),
-                        source_id: "u/core".to_string(),
-                        rev: None,
-                        git_ref: None,
+                        source: PackageSource::Path {
+                            path: std::path::PathBuf::from("u/core".to_string()),
+                        },
                     });
                 }
                 // `a` wants core v1.2; `b` wants core v1.5.
@@ -678,9 +738,9 @@ mod tests {
                             .collect(),
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
-                    source_id: format!("u/{name}"),
-                    rev: None,
-                    git_ref: None,
+                    source: PackageSource::Path {
+                        path: std::path::PathBuf::from(format!("u/{name}")),
+                    },
                 })
             }
         }
@@ -738,9 +798,9 @@ mod tests {
                             dependencies: BTreeMap::new(),
                         },
                         root: PathBuf::from("/virtual/core"),
-                        source_id: "u/core".to_string(),
-                        rev: None,
-                        git_ref: None,
+                        source: PackageSource::Path {
+                            path: std::path::PathBuf::from("u/core".to_string()),
+                        },
                     });
                 }
                 // `a` depends on core v2.
@@ -753,9 +813,9 @@ mod tests {
                             .collect(),
                     },
                     root: PathBuf::from("/virtual/a"),
-                    source_id: "u/a".to_string(),
-                    rev: None,
-                    git_ref: None,
+                    source: PackageSource::Path {
+                        path: std::path::PathBuf::from("u/a".to_string()),
+                    },
                 })
             }
         }
@@ -880,9 +940,9 @@ mod tests {
                         dependencies: deps,
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
-                    source_id,
-                    rev: None,
-                    git_ref: None,
+                    source: PackageSource::Path {
+                        path: PathBuf::from(source_id),
+                    },
                 })
             }
         }
@@ -1102,9 +1162,9 @@ mod tests {
                         dependencies: deps,
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
-                    source_id,
-                    rev: None,
-                    git_ref: None,
+                    source: PackageSource::Path {
+                        path: PathBuf::from(source_id),
+                    },
                 })
             }
         }
@@ -1205,9 +1265,9 @@ mod tests {
                         dependencies: deps,
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
-                    source_id,
-                    rev: None,
-                    git_ref: None,
+                    source: PackageSource::Path {
+                        path: PathBuf::from(source_id),
+                    },
                 })
             }
         }
@@ -1269,12 +1329,12 @@ mod tests {
                 let (rev, git_ref) = if name == "core" {
                     self.core_fetches += 1;
                     if self.core_fetches == 1 {
-                        (Some("a".repeat(40)), GitRef::Branch("main".into()))
+                        ("a".repeat(40), GitRef::Branch("main".into()))
                     } else {
-                        (Some("b".repeat(40)), GitRef::Branch("main".into()))
+                        ("b".repeat(40), GitRef::Branch("main".into()))
                     }
                 } else {
-                    (Some(format!("{name}rev")), GitRef::Tag("v1".into()))
+                    (format!("{name}rev"), GitRef::Tag("v1".into()))
                 };
                 Ok(FetchedPackage {
                     manifest: PackageManifest {
@@ -1283,9 +1343,11 @@ mod tests {
                         dependencies: deps,
                     },
                     root: PathBuf::from(format!("/virtual/{name}")),
-                    source_id,
-                    rev,
-                    git_ref: Some(git_ref),
+                    source: PackageSource::Git {
+                        url: source_id,
+                        git_ref,
+                        rev,
+                    },
                 })
             }
         }
@@ -1301,9 +1363,45 @@ mod tests {
         // `core` keeps the first-fetched commit, not the second.
         assert_eq!(p.core_fetches, 2, "both in-edges fetch core before dedup");
         assert_eq!(
-            graph.packages["core"].rev.as_deref(),
+            graph.packages["core"].rev(),
             Some("a".repeat(40).as_str()),
             "the first-fetched commit must win the same-version tie-break"
         );
+    }
+
+    #[test]
+    fn available_versions_default_returns_single_version_from_fetch() {
+        // The registry-readiness seam: the default `available_versions`
+        // delegates to `fetch` and returns exactly one version — the git/path
+        // contract (the ref/path *is* the choice). A future registry provider
+        // overrides it to enumerate, without breaking the trait.
+        struct OneVersion;
+        impl ManifestProvider for OneVersion {
+            fn fetch(
+                &mut self,
+                name: &str,
+                _dep: &Dependency,
+                _parent_dir: &std::path::Path,
+            ) -> Result<FetchedPackage, ResolveError> {
+                Ok(FetchedPackage {
+                    manifest: PackageManifest {
+                        name: name.to_string(),
+                        version: semver::Version::parse("3.1.4").unwrap(),
+                        dependencies: BTreeMap::new(),
+                    },
+                    root: PathBuf::from("/virtual"),
+                    source: PackageSource::Git {
+                        url: "u/x".to_string(),
+                        git_ref: GitRef::Tag("v1".into()),
+                        rev: "a".repeat(40),
+                    },
+                })
+            }
+        }
+        let mut p = OneVersion;
+        let versions = p
+            .available_versions("x", &git("u/x", "v1"), std::path::Path::new("/proj"))
+            .unwrap();
+        assert_eq!(versions, vec![semver::Version::parse("3.1.4").unwrap()]);
     }
 }

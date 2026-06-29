@@ -27,7 +27,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::graph::ResolvedGraph;
+use super::graph::{PackageSource, ResolvedGraph};
 use crate::manifest::GitRef;
 
 /// The current lockfile schema version. Bumped only on a breaking format change.
@@ -47,43 +47,93 @@ pub struct Lockfile {
     pub packages: BTreeMap<String, LockedPackage>,
 }
 
-/// One locked git dependency.
+/// One locked dependency, tagged by **source kind** so the lockfile entry's
+/// origin is explicit rather than inferred. Today only [`LockedPackage::Git`]
+/// exists; a future `Registry { name, version, checksum }` variant is purely
+/// additive (the registry-readiness seam — see `docs/design-decisions.md`
+/// §Phase 3.1 A). The enum is `#[serde(untagged)]`, so the `Git` variant
+/// serializes to exactly the established format (no discriminator field) and a
+/// registry entry will be told apart by its own fields.
 ///
-/// `rev` is the resolved commit. `tag`/`branch`/`rev_req` record the *requested*
-/// ref so a manifest ref change is detected as drift: a tag request sets `tag`,
-/// a branch request sets `branch`, an explicit `rev` request sets `rev_req`, and
-/// a default-branch request sets none of the three. Recording `rev_req`
-/// distinguishes an explicit commit pin from a default-branch pin — both
-/// otherwise carry no tag/branch — so a switch between them re-resolves rather
-/// than silently reusing the stale commit.
+/// Two consequences of `untagged` to keep in mind. First, deserialization
+/// matches purely by field *shape*, first variant that fits wins — so any future
+/// variant (e.g. `Registry`) MUST be structurally disjoint from `Git` (a
+/// `git` + `rev` table is unambiguously git), or an entry could deserialize as
+/// the wrong source. Second, a malformed entry yields the generic serde error "data
+/// did not match any variant of untagged enum LockedPackage" rather than a
+/// precise "missing field `rev`"; that diagnostic precision is deliberately
+/// traded for the discriminator-free on-disk format.
 ///
-/// `rev_req` is stored lowercased: git object ids are case-insensitive hex, and
-/// [`LockedPackage::matches_ref`] compares them that way, so canonicalizing on
-/// storage keeps a pure-case change in the manifest's `rev` from reading as
-/// drift in [`Lockfile::diff`] (which compares entries by value).
+/// For the git variant: `rev` is the resolved commit; `tag`/`branch`/`rev_req`
+/// record the *requested* ref so a manifest ref change is detected as drift (a
+/// tag request sets `tag`, a branch request `branch`, an explicit `rev` request
+/// `rev_req`, a default-branch request none). Recording `rev_req` distinguishes
+/// an explicit commit pin from a default-branch pin — both otherwise carry no
+/// tag/branch — so a switch between them re-resolves rather than reusing the
+/// stale commit. `rev_req` is stored lowercased: git object ids are
+/// case-insensitive hex, so canonicalizing keeps a pure-case manifest change
+/// from reading as drift in [`Lockfile::diff`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LockedPackage {
-    /// The resolved `[package].version`.
-    pub version: String,
-    /// The git clone URL.
-    pub git: String,
-    /// The requested tag, if the manifest pinned one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
-    /// The requested branch, if the manifest pinned one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// The requested commit, if the manifest pinned an explicit `rev` (which may
-    /// be abbreviated). Distinguishes a commit pin from a default-branch pin.
-    /// Stored lowercased so a pure case change in the manifest isn't spurious
-    /// drift (see the type-level note).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev_req: Option<String>,
-    /// The resolved commit SHA.
-    pub rev: String,
+#[serde(untagged)]
+pub enum LockedPackage {
+    /// A git-sourced dependency pinned to a resolved commit.
+    Git {
+        /// The resolved `[package].version`.
+        version: String,
+        /// The git clone URL.
+        git: String,
+        /// The requested tag, if the manifest pinned one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        /// The requested branch, if the manifest pinned one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        /// The requested commit (lowercased, possibly abbreviated), if the
+        /// manifest pinned an explicit `rev`. Distinguishes a commit pin from a
+        /// default-branch pin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rev_req: Option<String>,
+        /// The resolved commit SHA.
+        rev: String,
+    },
 }
 
 impl LockedPackage {
+    /// The resolved `[package].version`.
+    pub fn version(&self) -> &str {
+        match self {
+            LockedPackage::Git { version, .. } => version,
+        }
+    }
+
+    /// The git clone URL, for a git-sourced entry.
+    pub fn git(&self) -> Option<&str> {
+        match self {
+            LockedPackage::Git { git, .. } => Some(git),
+        }
+    }
+
+    /// The resolved commit SHA, for a git-sourced entry.
+    pub fn rev(&self) -> &str {
+        match self {
+            LockedPackage::Git { rev, .. } => rev,
+        }
+    }
+
+    /// The requested tag, if a git entry pinned one.
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            LockedPackage::Git { tag, .. } => tag.as_deref(),
+        }
+    }
+
+    /// The requested commit (`rev`-pinned entries only), if any.
+    pub fn rev_req(&self) -> Option<&str> {
+        match self {
+            LockedPackage::Git { rev_req, .. } => rev_req.as_deref(),
+        }
+    }
+
     /// Whether `reference` (the manifest's current request) still matches what
     /// this lock entry recorded — the condition for reusing the pinned commit
     /// without re-resolving.
@@ -97,22 +147,27 @@ impl LockedPackage {
     /// `rev` pin and the default branch re-resolves instead of reusing the
     /// stale commit.
     pub fn matches_ref(&self, reference: &GitRef) -> bool {
+        let LockedPackage::Git {
+            tag,
+            branch,
+            rev_req,
+            rev,
+            ..
+        } = self;
         match reference {
-            GitRef::Tag(t) => self.tag.as_deref() == Some(t.as_str()),
-            GitRef::Branch(b) => self.branch.as_deref() == Some(b.as_str()),
+            GitRef::Tag(t) => tag.as_deref() == Some(t.as_str()),
+            GitRef::Branch(b) => branch.as_deref() == Some(b.as_str()),
             GitRef::Rev(r) => {
-                self.tag.is_none()
-                    && self.branch.is_none()
-                    && self.rev_req.is_some()
+                tag.is_none()
+                    && branch.is_none()
+                    && rev_req.is_some()
                     // Resolved SHAs are lowercase hex; a manifest may pin an
                     // upper/mixed-case (possibly abbreviated) rev, so compare
                     // the prefix case-insensitively rather than re-resolving on
                     // a mere case difference.
-                    && starts_with_ignore_ascii_case(&self.rev, r)
+                    && starts_with_ignore_ascii_case(rev, r)
             }
-            GitRef::DefaultBranch => {
-                self.tag.is_none() && self.branch.is_none() && self.rev_req.is_none()
-            }
+            GitRef::DefaultBranch => tag.is_none() && branch.is_none() && rev_req.is_none(),
         }
     }
 }
@@ -169,31 +224,32 @@ impl Lockfile {
     pub fn from_graph(graph: &ResolvedGraph) -> Self {
         let mut packages = BTreeMap::new();
         for (name, pkg) in &graph.packages {
-            // A git package carries a resolved `rev`; a path package does not,
-            // which is exactly how the two are told apart here.
-            if let Some(rev) = &pkg.rev {
-                let (tag, branch, rev_req) = match &pkg.git_ref {
-                    Some(GitRef::Tag(t)) => (Some(t.clone()), None, None),
-                    Some(GitRef::Branch(b)) => (None, Some(b.clone()), None),
-                    // Lowercase the rev: object ids are case-insensitive hex, so
-                    // the canonical form keeps a pure-case re-pin out of `diff`.
-                    Some(GitRef::Rev(r)) => (None, None, Some(r.to_ascii_lowercase())),
-                    // Default-branch / absent record no requested ref key;
-                    // `rev` itself pins them.
-                    _ => (None, None, None),
-                };
-                packages.insert(
-                    name.clone(),
-                    LockedPackage {
-                        version: pkg.version.to_string(),
-                        git: pkg.source_id.clone(),
-                        tag,
-                        branch,
-                        rev_req,
-                        rev: rev.clone(),
-                    },
-                );
-            }
+            // Source-kind is read from the explicit `source` discriminant, not
+            // inferred from "has a rev": a git source is locked, a path source
+            // is never recorded. (A future registry source would add an arm.)
+            let PackageSource::Git { url, git_ref, rev } = &pkg.source else {
+                continue;
+            };
+            let (tag, branch, rev_req) = match git_ref {
+                GitRef::Tag(t) => (Some(t.clone()), None, None),
+                GitRef::Branch(b) => (None, Some(b.clone()), None),
+                // Lowercase the rev: object ids are case-insensitive hex, so
+                // the canonical form keeps a pure-case re-pin out of `diff`.
+                GitRef::Rev(r) => (None, None, Some(r.to_ascii_lowercase())),
+                // Default-branch records no requested ref key; `rev` pins it.
+                GitRef::DefaultBranch => (None, None, None),
+            };
+            packages.insert(
+                name.clone(),
+                LockedPackage::Git {
+                    version: pkg.version.to_string(),
+                    git: url.clone(),
+                    tag,
+                    branch,
+                    rev_req,
+                    rev: rev.clone(),
+                },
+            );
         }
         Lockfile {
             version: LOCKFILE_VERSION,
@@ -265,18 +321,23 @@ impl Lockfile {
 /// commit is unchanged but the source URL or *requested* ref differs, show that
 /// change so the drift doesn't read as a confusing no-op.
 fn describe_change(name: &str, old: &LockedPackage, fresh: &LockedPackage) -> String {
-    if old.rev != fresh.rev {
+    // Both entries are git today; destructuring (rather than `git()` + an
+    // empty-string fallback) keeps the URLs as plain `&str` and turns a future
+    // non-git variant into a compile error that forces explicit handling here.
+    let (LockedPackage::Git { git: old_git, .. }, LockedPackage::Git { git: fresh_git, .. }) =
+        (old, fresh);
+    if old.rev() != fresh.rev() {
         format!(
             "`{name}` changed: {} @ {} → {} @ {}",
-            old.version,
-            short(&old.rev),
-            fresh.version,
-            short(&fresh.rev)
+            old.version(),
+            short(old.rev()),
+            fresh.version(),
+            short(fresh.rev())
         )
-    } else if old.git != fresh.git {
+    } else if old_git != fresh_git {
         // Same commit, different source: a pure ref-key diff would print an
         // identical-looking "ref changed: tag v1 → tag v1", so report the URL.
-        format!("`{name}` source changed: {} → {}", old.git, fresh.git)
+        format!("`{name}` source changed: {old_git} → {fresh_git}")
     } else {
         let old_ref = describe_locked_ref(old);
         let new_ref = describe_locked_ref(fresh);
@@ -292,11 +353,17 @@ fn describe_change(name: &str, old: &LockedPackage, fresh: &LockedPackage) -> St
 
 /// Describe the *requested* ref a lock entry recorded.
 fn describe_locked_ref(pkg: &LockedPackage) -> String {
-    if let Some(t) = &pkg.tag {
+    let LockedPackage::Git {
+        tag,
+        branch,
+        rev_req,
+        ..
+    } = pkg;
+    if let Some(t) = tag {
         format!("tag {t}")
-    } else if let Some(b) = &pkg.branch {
+    } else if let Some(b) = branch {
         format!("branch {b}")
-    } else if let Some(r) = &pkg.rev_req {
+    } else if let Some(r) = rev_req {
         format!("rev {r}")
     } else {
         "default branch".to_string()
@@ -319,7 +386,7 @@ fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deps::graph::ResolvedPackage;
+    use crate::deps::graph::{PackageSource, ResolvedPackage};
 
     fn git_pkg(name: &str, version: &str, url: &str, rev: &str) -> ResolvedPackage {
         ResolvedPackage {
@@ -327,9 +394,11 @@ mod tests {
             version: semver::Version::parse(version).unwrap(),
             root: std::path::PathBuf::from("/cache/x"),
             dependencies: BTreeMap::new(),
-            source_id: url.to_string(),
-            rev: Some(rev.to_string()),
-            git_ref: Some(GitRef::Tag(format!("v{version}"))),
+            source: PackageSource::Git {
+                url: url.to_string(),
+                git_ref: GitRef::Tag(format!("v{version}")),
+                rev: rev.to_string(),
+            },
         }
     }
 
@@ -339,9 +408,9 @@ mod tests {
             version: semver::Version::parse(version).unwrap(),
             root: std::path::PathBuf::from("/proj/util"),
             dependencies: BTreeMap::new(),
-            source_id: "/proj/util".to_string(),
-            rev: None,
-            git_ref: None,
+            source: PackageSource::Path {
+                path: std::path::PathBuf::from("/proj/util"),
+            },
         }
     }
 
@@ -360,9 +429,9 @@ mod tests {
         let lock = Lockfile::from_graph(&graph);
         assert_eq!(lock.packages.len(), 1, "path dep must be omitted");
         let http = &lock.packages["http"];
-        assert_eq!(http.version, "1.2.3");
-        assert_eq!(http.git, "u/http.git");
-        assert_eq!(http.rev, "abc123def456");
+        assert_eq!(http.version(), "1.2.3");
+        assert_eq!(http.git(), Some("u/http.git"));
+        assert_eq!(http.rev(), "abc123def456");
     }
 
     #[test]
@@ -372,6 +441,13 @@ mod tests {
         let text = lock.to_toml_string();
         assert!(text.starts_with("# Auto-generated by Phoenix"));
         assert!(text.contains("[packages.http]"));
+        // The source-kind enum is `#[serde(untagged)]`, so the git entry must
+        // serialize with NO discriminator field — byte-identical to the
+        // pre-seam format. Pins the format-preservation guarantee.
+        assert!(
+            !text.contains("source ="),
+            "untagged git entry must not emit a `source` discriminator: {text}"
+        );
         // Parse the body back (skip the comment header — the TOML parser
         // tolerates leading comments, so the whole text parses).
         let parsed: Lockfile = toml::from_str(&text).unwrap();
@@ -434,7 +510,7 @@ mod tests {
         // A tag-pinned git dep records the `tag` ref alongside the resolved rev.
         let graph = graph_of(vec![git_pkg("http", "1.2.3", "u/http.git", "abc123def456")]);
         let lock = Lockfile::from_graph(&graph);
-        assert_eq!(lock.packages["http"].tag.as_deref(), Some("v1.2.3"));
+        assert_eq!(lock.packages["http"].tag(), Some("v1.2.3"));
         let text = lock.to_toml_string();
         assert!(text.contains("tag = \"v1.2.3\""), "{text}");
         let parsed: Lockfile = toml::from_str(&text).unwrap();
@@ -443,7 +519,7 @@ mod tests {
 
     #[test]
     fn matches_ref_distinguishes_ref_changes() {
-        let locked = LockedPackage {
+        let locked = LockedPackage::Git {
             version: "1.0.0".into(),
             git: "u/http.git".into(),
             tag: Some("v1.0.0".into()),
@@ -458,7 +534,7 @@ mod tests {
         assert!(!locked.matches_ref(&GitRef::Branch("v1.0.0".into())));
 
         // A commit-pinned entry records `rev_req`.
-        let by_rev = LockedPackage {
+        let by_rev = LockedPackage::Git {
             version: "1.0.0".into(),
             git: "u/http.git".into(),
             tag: None,
@@ -475,7 +551,7 @@ mod tests {
 
         // A default-branch entry records no requested ref: it reuses the pinned
         // commit on a default-branch request, but a switch to a rev pin re-resolves.
-        let by_default = LockedPackage {
+        let by_default = LockedPackage::Git {
             version: "1.0.0".into(),
             git: "u/http.git".into(),
             tag: None,
@@ -492,7 +568,7 @@ mod tests {
         // Resolved SHAs are lowercase hex; a manifest pinning an uppercase or
         // mixed-case abbreviated rev must still match the lock entry (a pure
         // case difference is not drift).
-        let locked = LockedPackage {
+        let locked = LockedPackage::Git {
             version: "1.0.0".into(),
             git: "u/http.git".into(),
             tag: None,
@@ -518,12 +594,14 @@ mod tests {
             version: semver::Version::parse("1.0.0").unwrap(),
             root: std::path::PathBuf::from("/cache/x"),
             dependencies: BTreeMap::new(),
-            source_id: "u/http.git".into(),
-            rev: Some("abc123def456".into()),
-            git_ref: Some(GitRef::Rev("abc123".into())),
+            source: PackageSource::Git {
+                url: "u/http.git".into(),
+                git_ref: GitRef::Rev("abc123".into()),
+                rev: "abc123def456".into(),
+            },
         };
         let lock = Lockfile::from_graph(&graph_of(vec![pkg]));
-        assert_eq!(lock.packages["http"].rev_req.as_deref(), Some("abc123"));
+        assert_eq!(lock.packages["http"].rev_req(), Some("abc123"));
         let parsed: Lockfile = toml::from_str(&lock.to_toml_string()).unwrap();
         assert_eq!(parsed, lock);
     }
@@ -540,7 +618,7 @@ mod tests {
             let mut packages = BTreeMap::new();
             packages.insert(
                 "http".to_string(),
-                LockedPackage {
+                LockedPackage::Git {
                     version: "1.0.0".into(),
                     git: "u/http.git".into(),
                     tag: None,
@@ -576,16 +654,18 @@ mod tests {
                 version: semver::Version::parse("1.0.0").unwrap(),
                 root: std::path::PathBuf::from("/cache/x"),
                 dependencies: BTreeMap::new(),
-                source_id: "u/http.git".into(),
-                rev: Some("abc123def456".into()),
-                git_ref: Some(GitRef::Rev(rev_req.into())),
+                source: PackageSource::Git {
+                    url: "u/http.git".into(),
+                    git_ref: GitRef::Rev(rev_req.into()),
+                    rev: "abc123def456".into(),
+                },
             };
             Lockfile::from_graph(&graph_of(vec![pkg]))
         };
         let committed = mk("ABC123");
         let fresh = mk("abc123");
         assert_eq!(
-            committed.packages["http"].rev_req.as_deref(),
+            committed.packages["http"].rev_req(),
             Some("abc123"),
             "rev_req must be stored lowercased"
         );
