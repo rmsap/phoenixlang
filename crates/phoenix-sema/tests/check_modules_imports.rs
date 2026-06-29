@@ -901,8 +901,8 @@ fn intrinsic_json_decode_is_pending() {
 
 #[test]
 fn json_encode_of_unsupported_type_is_a_clear_error() {
-    // This slice supports scalars + structs; a `List` argument is rejected
-    // with a "does not support" diagnostic naming the type.
+    // A `List` argument is not yet supported and is rejected with a "does
+    // not support" diagnostic naming the type.
     let entry = entry_only("import json\nfunction main() { print(json.encode([1, 2, 3])) }");
     let analysis = check_modules(&[entry]);
     assert!(
@@ -911,6 +911,114 @@ fn json_encode_of_unsupported_type_is_a_clear_error() {
             .iter()
             .any(|d| d.message.contains("`json.encode` does not support")),
         "expected an unsupported-type diagnostic for json.encode of a List, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_option_and_enum_typechecks() {
+    // `Option<T>` and non-generic enums (unit + payload variants) are
+    // encodable.
+    let entry = entry_only(
+        "import json\n\
+         enum Status {\n  Active\n  Pending(Int)\n}\n\
+         function main() {\n  \
+           print(json.encode(Pending(3)))\n  \
+           let o: Option<Int> = None\n  \
+           print(json.encode(o))\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "Option and non-generic enum encode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_generic_enum_is_unsupported() {
+    // Generic enums other than `Option` (here `Result`) are not yet
+    // encodable and are rejected with a clear diagnostic.
+    let entry = entry_only(
+        "import json\n\
+         function main() {\n  \
+           let r: Result<Int, String> = Ok(1)\n  \
+           print(json.encode(r))\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.encode` does not support")),
+        "expected an unsupported-type diagnostic for json.encode of a Result, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_enum_with_unsupported_variant_field_names_the_field_type() {
+    // `unsupported_json_encode_type` recurses into enum *variant* field types:
+    // an enum whose own shape is fine but that carries a `List` payload must
+    // be rejected, and the diagnostic must name the variant field's type
+    // (`List<Int>`), not the enum — proving the walk descended into the
+    // variant.
+    let entry = entry_only(concat!(
+        "import json\n",
+        "enum Tagged { Plain Boxed(List<Int>) }\n",
+        "function main() { print(json.encode(Boxed([1, 2, 3]))) }",
+    ));
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| {
+            d.message.contains("`json.encode` does not support") && d.message.contains("List")
+        }),
+        "expected an unsupported-variant-field diagnostic naming `List`, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_empty_enum_is_supported_and_does_not_crash() {
+    // An uninhabited enum (zero variants) is vacuously encodable: every
+    // variant's fields must be encodable, and there are none. Sema must accept
+    // it (no diagnostic) rather than reject it as unsupported. (The IR-side
+    // regression guard — that encoder synthesis doesn't underflow on the empty
+    // variant ladder — lives in phoenix-ir's
+    // `json_encode_of_empty_enum_synthesizes_without_panicking`.)
+    let entry = entry_only(concat!(
+        "import json\n",
+        "enum Empty {}\n",
+        "function unused(v: Empty) { print(json.encode(v)) }\n",
+        "function main() { print(\"ok\") }",
+    ));
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "empty enum should be vacuously encodable, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_recursive_option_self_type_typechecks() {
+    // A struct closed through `Option<Self>` is encodable: the encodability
+    // walk must terminate on the back-edge (the `visiting` guard returns
+    // `None`) rather than recurse forever, and accept the type. This locks in
+    // the back-edge guard's reasoning — such a type IS constructible and
+    // reaches a live `json.encode` (the synthesized encoder is itself
+    // recursive and terminates on the finite runtime value).
+    let entry = entry_only(concat!(
+        "import json\n",
+        "struct Node { value: Int  next: Option<Node> }\n",
+        "function main() { print(json.encode(Node(1, None))) }",
+    ));
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "recursive Option<Self> struct should be encodable, got: {:?}",
         analysis.diagnostics
     );
 }

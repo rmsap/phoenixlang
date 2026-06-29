@@ -1543,9 +1543,11 @@ impl Interpreter {
     /// Scalars route through `Value`'s `Display` (the same rendering as
     /// `toString`), so they match the compiled backends' `toString`-based
     /// encoders; strings use the shared `phoenix_runtime::json_escape`; a
-    /// struct emits an object with its fields in declaration order. This
-    /// slice covers scalars and structs; richer shapes arrive with later
-    /// slices and are gated in sema.
+    /// struct emits an object with its fields in declaration order;
+    /// `Option<T>` encodes as `null`/passthrough and other enums are
+    /// adjacently tagged (`{"type":"V","value":[…]}`). This covers scalars,
+    /// structs, `Option`, and non-generic enums; richer shapes (`List`,
+    /// `Map`, generic enums) arrive with later slices and are gated in sema.
     fn json_encode_value(&self, value: &Value) -> Result<String> {
         match value {
             Value::String(s) => Ok(phoenix_runtime::json_escape(s)),
@@ -1566,6 +1568,30 @@ impl Interpreter {
                     parts.push(format!("\"{}\":{}", fname, self.json_encode_value(fv)?));
                 }
                 Ok(format!("{{{}}}", parts.join(",")))
+            }
+            // `Option<T>`: None → null, Some(x) → encode(x). Other enums are
+            // adjacently tagged.
+            Value::EnumVariant(enum_name, variant, fields) if enum_name == "Option" => {
+                match variant.as_str() {
+                    "None" => Ok("null".to_string()),
+                    "Some" => self.json_encode_value(&fields[0]),
+                    other => error(format!("json.encode: unexpected Option variant `{other}`")),
+                }
+            }
+            Value::EnumVariant(_, variant, fields) => {
+                // Variant names are identifiers, so raw quoting is valid JSON.
+                if fields.is_empty() {
+                    Ok(format!("{{\"type\":\"{variant}\"}}"))
+                } else {
+                    let mut parts = Vec::with_capacity(fields.len());
+                    for fv in fields {
+                        parts.push(self.json_encode_value(fv)?);
+                    }
+                    Ok(format!(
+                        "{{\"type\":\"{variant}\",\"value\":[{}]}}",
+                        parts.join(",")
+                    ))
+                }
             }
             other => error(format!(
                 "json.encode does not support this value yet: {other}"

@@ -885,6 +885,96 @@ function main() {
     assert_eq!(result_layout[1].0, "Err");
 }
 
+/// `json.encode` of an uninhabited enum (zero variants) must synthesize a
+/// valid encoder rather than underflow on the empty variant ladder. The
+/// encode site is in an uncalled function, so no value is constructed — only
+/// the static type drives encoder demand. Regression guard for the
+/// `variants.len() - 1` underflow in `emit_enum_encode`.
+#[test]
+fn json_encode_of_empty_enum_synthesizes_without_panicking() {
+    // `import json` requires the multi-module path (single-file checking
+    // rejects `import`), so build the program through `lower_modules`.
+    let entry = make_module(
+        ModulePath::entry(),
+        "import json\n\
+         enum Empty {}\n\
+         function unused(v: Empty) { print(json.encode(v)) }\n\
+         function main() { print(\"ok\") }",
+        SourceId(0),
+        true,
+    );
+    let modules = vec![entry];
+    let analysis = checker::check_modules(&modules);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "sema errors: {:?}",
+        analysis
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+    let module = lower_modules(&modules, &analysis.module);
+    // An encoder was synthesized for the empty enum, and the module verifies
+    // (the lowered body returns a valid `StringRef`).
+    assert!(
+        module.json_encoders.contains_key("Empty"),
+        "expected a synthesized encoder for the empty enum `Empty`"
+    );
+    let errors = verify::verify(&module);
+    assert!(
+        errors.is_empty(),
+        "empty-enum encoder should produce valid IR, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+/// `json.encode` of a struct closed through `Option<Self>` must synthesize a
+/// finite set of mutually-recursive encoders (one for `Node`, one for
+/// `Option<Node>`) and produce valid IR — demand collection terminates on the
+/// already-seen key rather than looping, and the recursive call resolves
+/// through `IrModule::json_encoders`. Regression guard for the recursive
+/// encoder-demand walk in `collect_demanded_types`.
+#[test]
+fn json_encode_of_recursive_option_self_type_synthesizes_valid_ir() {
+    let entry = make_module(
+        ModulePath::entry(),
+        "import json\n\
+         struct Node { value: Int  next: Option<Node> }\n\
+         function main() { print(json.encode(Node(1, None))) }",
+        SourceId(0),
+        true,
+    );
+    let modules = vec![entry];
+    let analysis = checker::check_modules(&modules);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "sema errors: {:?}",
+        analysis
+            .diagnostics
+            .iter()
+            .map(|d| &d.message)
+            .collect::<Vec<_>>()
+    );
+    let module = lower_modules(&modules, &analysis.module);
+    // Both the struct and its `Option<Self>` field type got encoders, and the
+    // module verifies (the mutually-recursive bodies are valid IR).
+    assert!(
+        module.json_encoders.contains_key("Node"),
+        "expected a synthesized encoder for `Node`"
+    );
+    assert!(
+        module.json_encoders.contains_key("Option<Node>"),
+        "expected a synthesized encoder for the `Option<Node>` field type"
+    );
+    let errors = verify::verify(&module);
+    assert!(
+        errors.is_empty(),
+        "recursive Option<Self> encoders should produce valid IR, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
 /// Option and Result use EnumAlloc (not StructAlloc) in IR output.
 #[test]
 fn option_result_use_enum_alloc_in_ir() {

@@ -1,0 +1,48 @@
+// JSON encode of `Option` (None → null, Some(x) → encode(x)) and enums
+// (adjacently tagged: unit → {"type":"V"}, with-fields → {"type":"V",
+// "value":[…]}), including `Some` of a struct (the Option-of-aggregate
+// dispatch), a struct with enum + Option fields, and an enum variant carrying
+// non-scalar payloads — a nested struct and an `Option<Int>` — which exercises
+// the per-field encoder dispatch (including a generic field) inside the variant
+// body.
+//
+// Only *generic* enums are deferred: json.encode of a generic enum other than
+// `Option` (e.g. `Result<T, E>` or a user `enum Wrapper<T> { … }`) is gated as
+// unsupported in sema. A non-generic enum with a concrete generic field, as
+// `Located` shows, is fully supported. (The separate K.12 phantom /
+// nested-generic-variant resolution limit — §docs/design-decisions.md K.4/K.12
+// — concerns generic enums and is independent of json.encode.)
+
+import json
+
+struct Point {
+  x: Int
+  y: Int
+}
+
+enum Status {
+  Active
+  Pending(Int)
+  Closed(String, Int)
+  Located(Point, Option<Int>)
+}
+
+struct Account {
+  id: Int
+  status: Status
+  nickname: Option<String>
+  balance: Option<Int>
+}
+
+function main() {
+  print(json.encode(Active))
+  print(json.encode(Pending(3)))
+  print(json.encode(Closed("done", 7)))
+  print(json.encode(Located(Point(1, 2), Some(7))))
+  print(json.encode(Some(5)))
+  print(json.encode(Some(Point(8, 9))))
+  let missing: Option<Int> = None
+  print(json.encode(missing))
+  let acct: Account = Account(1, Pending(99), Some("vip"), None)
+  print(json.encode(acct))
+}

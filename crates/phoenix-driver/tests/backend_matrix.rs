@@ -173,6 +173,14 @@ backend_matrix_test!(
     "json_encode_struct.phx",
     skip_wasm_gc: "json.encode string escaping not yet ported to wasm32-gc (Phase 4.6 follow-up)"
 );
+// `json.encode` of `Option` (null / passthrough) and enums (adjacently
+// tagged), plus a struct mixing both — exercises the discriminant-branch
+// synthesis. wasm32-gc skipped (shares the escape-port deferral).
+backend_matrix_test!(
+    matrix_json_encode_enum,
+    "json_encode_enum.phx",
+    skip_wasm_gc: "json.encode string escaping not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

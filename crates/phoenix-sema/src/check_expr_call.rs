@@ -757,49 +757,80 @@ impl Checker {
     /// fully encodable with today's surface. `visiting` guards against
     /// cyclic struct graphs.
     ///
-    /// Phase 4.6 grows this surface in slices: today it is the scalars plus
-    /// non-generic structs of supported field types; `Option`, enums,
+    /// Phase 4.6 grows this surface in slices: today it is the scalars,
+    /// `Option<T>`, non-generic structs, and non-generic enums (each of
+    /// supported component types); generic enums other than `Option`,
     /// `List`, and `Map` are added by later slices.
     fn unsupported_json_encode_type(
         &self,
         ty: &Type,
         visiting: &mut Vec<String>,
     ) -> Option<String> {
+        let bare = |name: &str| phoenix_common::module_path::bare_name(name).to_string();
         match ty {
             Type::Int | Type::Float | Type::Bool | Type::String => None,
+            // `Option<T>` is encodable when `T` is (None → null, Some(x) →
+            // encode(x)). Other generic instantiations (`Result<…>`, generic
+            // user enums, `List`, `Map`) are deferred to later slices.
+            Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
+                self.unsupported_json_encode_type(&args[0], visiting)
+            }
             Type::Named(name) => {
-                // A non-generic struct: every field must be encodable.
-                let Some(info) = self.lookup_struct(name) else {
-                    return Some(phoenix_common::module_path::bare_name(name).to_string());
-                };
-                if !info.type_params.is_empty() {
-                    return Some(phoenix_common::module_path::bare_name(name).to_string());
-                }
+                // Back-edge guard for cyclic struct/enum graphs: returning
+                // `None` (encodable) terminates the walk on the cyclic type
+                // itself. This is sound and load-bearing: a recursive type
+                // closed through `Option<Self>` (e.g. `struct Node { next:
+                // Option<Node> }`) IS encodable — the synthesized encoder is
+                // itself recursive and terminates on the finite runtime value
+                // (`Some(child)` / `None`). `List`/`Map` back-edges remain
+                // gated as unsupported below.
                 if visiting.iter().any(|n| n == name) {
-                    // Already on the stack — break the cycle. This guard is
-                    // purely defensive: a recursive struct is only
-                    // constructible (hence reachable by a live `json.encode`)
-                    // when its back-edge field is an `Option`/`List`/`Map`,
-                    // all of which this slice already gates as unsupported
-                    // above — so a cycle of only scalar/struct fields can
-                    // never actually be encoded. If a later slice adds
-                    // `Option`/`List`/`Map` encoding, this guard becomes load-
-                    // bearing: it keeps the walk terminating on the cyclic
-                    // type itself (downstream recursion limits still apply).
                     return None;
                 }
-                visiting.push(name.clone());
-                // Clone only the field types (not the whole `Field`s) to drop
-                // the `&self` borrow of `info` before recursing.
-                let field_tys: Vec<Type> = info.fields.iter().map(|f| f.ty.clone()).collect();
-                let result = field_tys
-                    .iter()
-                    .find_map(|ty| self.unsupported_json_encode_type(ty, visiting));
-                visiting.pop();
-                result
+                // A non-generic struct: every field must be encodable.
+                if let Some(info) = self.lookup_struct(name) {
+                    if !info.type_params.is_empty() {
+                        return Some(bare(name));
+                    }
+                    let field_tys: Vec<Type> = info.fields.iter().map(|f| f.ty.clone()).collect();
+                    return self.first_unsupported_component(name, &field_tys, visiting);
+                }
+                // A non-generic enum: every variant's field types must be
+                // encodable. (Generic enums — including `Result` — are gated
+                // by their `Type::Generic` shape above / below.)
+                if let Some(info) = self.lookup_enum(name) {
+                    if !info.type_params.is_empty() {
+                        return Some(bare(name));
+                    }
+                    let variant_tys: Vec<Type> = info
+                        .variants
+                        .iter()
+                        .flat_map(|(_, fts)| fts.iter().cloned())
+                        .collect();
+                    return self.first_unsupported_component(name, &variant_tys, visiting);
+                }
+                Some(bare(name))
             }
             other => Some(other.to_string()),
         }
+    }
+
+    /// Return the first JSON-unencodable type among `components` (a struct's
+    /// field types or an enum's variant field types), with `name` pushed onto
+    /// `visiting` for the duration of the walk so a cyclic back-edge through
+    /// `components` terminates on `name` itself rather than recursing forever.
+    fn first_unsupported_component(
+        &self,
+        name: &str,
+        components: &[Type],
+        visiting: &mut Vec<String>,
+    ) -> Option<String> {
+        visiting.push(name.to_string());
+        let result = components
+            .iter()
+            .find_map(|ty| self.unsupported_json_encode_type(ty, visiting));
+        visiting.pop();
+        result
     }
 
     /// Type-check each argument expression for its side effects (surfacing
