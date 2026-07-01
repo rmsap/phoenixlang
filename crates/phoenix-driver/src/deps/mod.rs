@@ -22,6 +22,7 @@
 //!   calls before lowering.
 
 pub mod cache;
+pub mod edit;
 pub mod fetch;
 pub mod graph;
 pub mod lock;

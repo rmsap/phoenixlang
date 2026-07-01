@@ -20,7 +20,7 @@
 
 use clap::{Parser, Subcommand};
 
-use phoenix_driver::build;
+use phoenix_driver::{build, pkg_cli};
 use phoenix_driver::{cmd_check, cmd_ir, cmd_lex, cmd_parse, cmd_run, cmd_run_ir, run_gen};
 
 #[derive(Parser)]
@@ -34,6 +34,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Scaffold a new project (phoenix.toml + main.phx) in the current directory
+    Init {
+        /// Package name (default: the current directory's name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Add a dependency to phoenix.toml and refresh phoenix.lock
+    Add {
+        /// Dependency name (the import prefix; the key under [dependencies])
+        name: String,
+        /// Git source URL
+        #[arg(long)]
+        git: Option<String>,
+        /// Git tag to pin (use with --git)
+        #[arg(long)]
+        tag: Option<String>,
+        /// Git commit to pin (use with --git)
+        #[arg(long)]
+        rev: Option<String>,
+        /// Git branch to track (use with --git)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Local path source (relative to phoenix.toml)
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Tokenize a source file and print the token stream
     Lex {
         /// Path to the source file
@@ -129,6 +155,15 @@ fn run() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init { name } => pkg_cli::cmd_init(name.as_deref()),
+        Commands::Add {
+            name,
+            git,
+            tag,
+            rev,
+            branch,
+            path,
+        } => pkg_cli::cmd_add(&name, git, tag, rev, branch, path),
         Commands::Lex { file } => cmd_lex(&file),
         Commands::Parse { file } => cmd_parse(&file),
         Commands::Check { file, locked } => cmd_check(&file, locked),

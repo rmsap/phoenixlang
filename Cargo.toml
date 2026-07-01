@@ -73,9 +73,10 @@ toml = "0.8"
 # cross target in the release matrix (which installs a cross C toolchain for
 # exactly this). reqwest 0.13's rustls transport exposes no `ring` alternative,
 # so the C-free `ring` provider isn't reachable through this stack today.
-# `toml_edit` (format-preserving `phoenix.toml` edits for `phoenix add`) is
-# added alongside the `add` code that uses it.
+# `toml_edit` performs format-preserving `phoenix.toml` edits for `phoenix add`
+# (preserving comments/layout a parse-and-reserialize would discard).
 semver = "1"
+toml_edit = "0.22"
 # Keep gix's (pure-Rust) defaults — sha1, zlib, parallel, revision/index — and
 # add only the blocking rustls HTTPS transport and worktree checkout we need.
 gix = { version = "0.85", features = [

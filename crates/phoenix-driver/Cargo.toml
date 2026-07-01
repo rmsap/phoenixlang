@@ -39,6 +39,8 @@ semver = { workspace = true }
 # Clones git-sourced dependencies into the cache (package manager). Also used by
 # the package-manager integration tests to build throwaway local git repos.
 gix = { workspace = true }
+# Format-preserving `phoenix.toml` edits for `phoenix add`.
+toml_edit = { workspace = true }
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
