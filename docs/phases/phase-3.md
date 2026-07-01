@@ -1,6 +1,6 @@
 # Phase 3: Tooling
 
-**Status: Not started**
+**Status: In progress — 3.1 (package manager) complete (2026-07-01); 3.2 / 3.3 / 3.5 not started.**
 
 Developers will not adopt a language without good tooling. Phase 3 (tooling) and [Phase 4](./phase-4.md) (the standard library) are **independent tracks that run in parallel** — nothing in Phase 3 depends on Phase 4. Every Phase 3 item rests only on foundations that already shipped in Phase 2: the package manager (3.1) on the module system (2.6), the LSP gap-closing (3.2) on the 2.6 LSP pipeline, the formatter (3.3) on the parser, and error-message quality (3.5) on the 2.6 diagnostic builder.
 
@@ -14,7 +14,7 @@ Annotations ([4.5](./phase-4.md#45-annotation-system)) are the keystone for the 
 
 ## 3.1 Package Manager
 
-**Status: scoped, not started.** This is the active item on the tooling track. **Depends on:** Module system and visibility (2.6, complete) — cross-package imports build on intra-project modules. Independent of all Phase 4 work (see [Parallel-track note](#31-parallel-track-note) below).
+**Status: ✅ complete (2026-07-01).** A `phoenix.toml`-driven, git-first package manager: manifest schema, transitive semver resolution, git-into-cache fetching with a reproducible `phoenix.lock`, cross-package imports, dependency-aware `build`/`run`/`check`, and `phoenix init`/`add`. See the [closeout](#-phase-31-closed-2026-07-01) below. **Depends on:** Module system and visibility (2.6, complete) — cross-package imports build on intra-project modules. Independent of all Phase 4 work (see [Parallel-track note](#31-parallel-track-note) below).
 
 ### Goal
 
@@ -27,7 +27,7 @@ A `phoenix.toml`-driven package manager: declare a package and its dependencies,
 - `crates/phoenix-driver/src/main.rs` — clap `Commands` enum dispatches to `lib.rs` handlers (`run_gen` pattern). **`phoenix build` already exists** (`src/build.rs`); `init`, `add`, and `test` do not.
 - Workspace `Cargo.toml` already has `serde` / `serde_json` / `toml` / `clap` / `tempfile`. **Newly added deps:** `semver` and `gix` (the pure-Rust git client; see the git-client decision below).
 
-### Design decisions to lock (record in design-decisions.md when implemented)
+### Design decisions to lock (recorded in [design-decisions.md §Phase 3.1](../design-decisions.md#phase-31-package-manager))
 
 - **Manifest schema.** `[package]` = `name`, `version` (semver), optional `description` / `authors` / `license`. `[dependencies]` accepts **git** (`dep = { git = "url", tag|rev|branch = "…" }`) and **local path** (`dep = { path = "../foo" }`) sources. Path deps are invaluable for local dev, monorepos, and testing the resolver itself. A bare-string semver value (`dep = "^1.2"`) is **reserved for the future registry** and, until then, is a clear "no registry configured" error rather than a silent failure.
 - **Resolution + lockfile.** Resolve transitively, solve semver with the `semver` crate, and write `phoenix.lock` pinning each dependency to a resolved commit SHA. A present lockfile is authoritative (reproducible builds); `--locked` fails if the manifest and lock disagree.
@@ -54,14 +54,14 @@ A `phoenix.toml`-driven package manager: declare a package and its dependencies,
 
 ### Exit criteria for declaring Phase 3.1 complete
 
-- [ ] `[package]` + `[dependencies]` parse from `phoenix.toml`; `[gen]` still parses; malformed manifests give clear diagnostics. Unit tests cover the schema.
-- [ ] Semver resolution solves a transitive graph and reports conflicts legibly; covered by tests over injected manifests.
-- [ ] Git dependencies fetch into the cache and local `path` dependencies resolve in place; `phoenix.lock` is generated, respected, and makes git-backed builds reproducible from a clean checkout; `--locked` detects drift.
-- [ ] Registry-readiness seams are in place: resolved/locked packages carry an explicit source-kind (not inferred from "has a git rev"), and `ManifestProvider` is shaped so a future version solver can be added without a trait break. (No registry behavior is implemented — only the seams.)
-- [ ] `import dep.module { ... }` resolves to the fetched package (public-only), with per-package `EscapesRoot` preserved and collision/missing-dep diagnostics. Multi-package integration fixture builds and runs.
-- [ ] `phoenix build` / `run` / `check` resolve + fetch dependencies first; `phoenix init` and `phoenix add` work, with tempdir + local-git-repo integration tests.
-- [ ] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
-- [ ] `phoenix.toml.example` updated; design-decisions.md records the locked decisions; known-issues opened for the registry and npm/js carve-outs.
+- [x] `[package]` + `[dependencies]` parse from `phoenix.toml`; `[gen]` still parses; malformed manifests give clear diagnostics. Unit tests cover the schema. *(PR1)*
+- [x] Semver resolution solves a transitive graph and reports conflicts legibly; covered by tests over injected manifests. *(PR2)*
+- [x] Git dependencies fetch into the cache and local `path` dependencies resolve in place; `phoenix.lock` is generated, respected, and makes git-backed builds reproducible from a clean checkout; `--locked` detects drift. *(PR3)*
+- [x] Registry-readiness seams are in place: resolved/locked packages carry an explicit source-kind (not inferred from "has a git rev"), and `ManifestProvider` is shaped so a future version solver can be added without a trait break. (No registry behavior is implemented — only the seams.) *(PR4.5)*
+- [x] `import dep.module { ... }` resolves to the fetched package (public-only), with per-package `EscapesRoot` preserved and collision/missing-dep diagnostics. Multi-package integration fixture builds and runs. *(PR4)*
+- [x] `phoenix build` / `run` / `check` resolve + fetch dependencies first; `phoenix init` and `phoenix add` work, with tempdir + local-git-repo integration tests. *(PR4, PR5)*
+- [x] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
+- [x] `phoenix.toml.example` updated; design-decisions.md records the locked decisions; known-issues opened for the registry and npm/js carve-outs. *(PR6)*
 
 ### 3.1 Parallel-track note
 
@@ -74,6 +74,19 @@ Any command that compiles a file — `check`, `run`, `build`, `ir`, `run-ir`, `g
 Two roots are in play and they are intentionally distinct: **manifest/dependency resolution** is rooted at the discovered `phoenix.toml`'s directory (path deps resolve relative to it, the lockfile is written there), while **local-module resolution** for the entry package is rooted at the *entry file's own directory* (a bare `import util` resolves to `util.phx` beside the entry file, not beside the manifest). For the common layout — entry file and `phoenix.toml` in the same directory — they coincide. They diverge only when the entry file sits in a subdirectory below its manifest; that case is unchanged from pre-PR4 single-package behavior and is not (yet) something the package manager re-roots.
 
 `--locked` (refuse to update `phoenix.lock`, error on drift) is accepted only on `check`, `run`, and `build` — the commands that produce a runnable/shippable artifact and therefore need reproducibility. `ir`, `run-ir`, and `gen` are diagnostic/codegen paths: they still resolve dependencies (so cross-package imports work) and may *write* `phoenix.lock` if it is out of date, but they are not `--locked`-gated. The asymmetry is deliberate — reproducibility gating belongs on the build/run surface, not on IR inspection or schema codegen.
+
+### ✅ Phase 3.1 closed (2026-07-01)
+
+Shipped a git-first, `phoenix.toml`-driven package manager end-to-end, in six reviewed PRs:
+
+- **PR1 — Manifest.** `[package]` (name, version, optional description/authors/license) + `[dependencies]` (git `{ git, tag|rev|branch }` and local `{ path }`); a bare-string semver value is reserved for the registry with a clear "no registry configured" error; `[gen]` still parses; `deny_unknown_fields` preserved.
+- **PR2 — Resolver core.** Transitive dependency graph + semver reconciliation (one source per name, caret-compatible, highest wins) + legible source/version/cyclic conflict diagnostics, over an injectable `ManifestProvider` (no fetching).
+- **PR3 — Fetch + lockfile.** `gix` clones git sources into `$PHOENIX_HOME/cache` (default `~/.phoenix/cache`, keyed by URL + SHA); path sources resolve in place; `phoenix.lock` (name-keyed tables, git-only, requested-ref recorded) is generated, respected, and reproducible from a clean checkout; `--locked` detects drift (including a manifest ref bump).
+- **PR4 — Cross-package imports.** First-segment dispatch against declared dependency names; package-qualified module identity so a dependency's internal module never collides with a local one; per-package `EscapesRoot`; collision + missing-dependency diagnostics; `build`/`run`/`check` resolve+fetch before compiling. The multi-package fixture (`tests/fixtures/multi_package/`, with a deliberately colliding `util` module) checks, runs, and native-compiles.
+- **PR4.5 — Registry-readiness seams.** Explicit source-kind on `ResolvedPackage`/`LockedPackage` (a `PackageSource` enum and an untagged `LockedPackage` enum — no rev-inference, lockfile format unchanged) + an `available_versions` capability on `ManifestProvider` (default one-element set), so a registry + version solver is additive.
+- **PR5 — CLI.** `phoenix init [--name]` scaffolds a `[package]` manifest + a runnable root `main.phx`; `phoenix add <name> (--git … | --path …)` validates the source via the manifest schema, format-preservingly edits `phoenix.toml`, and atomically refreshes the lockfile (rolling the edit back on any resolution failure).
+
+**Design decisions** are recorded in [design-decisions.md §Phase 3.1](../design-decisions.md#phase-31-package-manager) (A–F). **Carve-outs** — a central registry, and the npm / `import js "pkg"` / `[js-dependencies]` slice (now a dedicated **3.1-js** follow-up) — are open in [known-issues.md](../known-issues.md). Verified by `cargo test --workspace` / `clippy --all-targets` / `fmt --check` clean.
 
 ## 3.2 Language Server Protocol (LSP)
 

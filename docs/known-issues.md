@@ -114,6 +114,34 @@ dependency attribution until this lands; it should precede the next release tag.
 **Target phase:** before the next release (Phase 3.1 or sooner). Surfaced 2026-06-25
 during the Phase 3.1 git-client (`gix`) migration review.
 
+### No package registry — only git and local `path` sources
+
+`[dependencies]` accepts a **git** source (`{ git, tag|rev|branch }`) and a local **path**
+source (`{ path }`). A bare version string (`dep = "^1.2"`) is *reserved* for a future
+central registry and, until then, errors with a clear "requires a package registry — none
+is configured yet" message (`ManifestError::RegistryUnsupported`) rather than being silently
+accepted. A registry — with a real version-*requirement* solver (backtracking over many
+published versions), search, and `phoenix publish` — is deferred to a later phase (see
+[phase-6.md §6.2](phases/phase-6.md)). The resolver, fetcher, and lockfile already carry the
+registry-readiness seams ([design-decisions §Phase 3.1 A](design-decisions.md#phase-31-package-manager))
+so adding it is additive, not a rewrite.
+
+**Workaround:** depend on published packages by git tag/rev/branch, or by local path.
+**Target phase:** registry lands in Phase 6.2. Carved out at Phase 3.1 close (2026-07-01).
+
+### npm / JavaScript package dependencies (`import js "pkg"`) are not supported
+
+Phase 2.5 [decision J](design-decisions.md#j-npm-package-slice-deferred-to-phase-31) reserved
+string-source JS imports (`import js "pkg"`) plus a `[js-dependencies]` manifest section for
+"Phase 3.1", but that slice (npm fetch, `@types` typings, bundling) is orthogonal to the
+Phoenix-package core and considerably larger. It is carved out to a dedicated **3.1-js**
+follow-up rather than gating the core package manager. The `extern js` import-section
+machinery (Phase 2.5) is the seam it will extend.
+
+**Workaround:** declare JS interop with `extern js` signature blocks and supply the host
+module yourself (the Phase 2.5 mechanism); there is no automatic npm dependency fetch.
+**Target phase:** 3.1-js follow-up. Carved out at Phase 3.1 close (2026-07-01).
+
 ### An absent optional field serializes as omitted (TS) vs `null` (Go/Python)
 
 For an `Option<T>` field with no value, the TypeScript target omits the key entirely

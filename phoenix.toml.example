@@ -2,10 +2,9 @@
 #
 # Copy this file to phoenix.toml in your project root. The [gen] section
 # configures `phoenix gen` defaults. The [package] and [dependencies]
-# sections declare the package-manager manifest: they are
-# parsed and validated today, but resolving and building against
-# dependencies is wired into `phoenix build`/`run`/`check` in a later
-# step.
+# sections declare the package-manager manifest: `phoenix build`/`run`/`check`
+# resolve and fetch declared dependencies (pinning git sources in phoenix.lock)
+# before compiling, and `phoenix init`/`add` scaffold and edit this file.
 
 # ── Package metadata ───────────────────────────────────────────
 # Identifies this package so it can be depended upon (and, eventually,

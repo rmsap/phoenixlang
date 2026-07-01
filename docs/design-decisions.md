@@ -1384,6 +1384,35 @@ Subordinate decisions for the Phase 3.1 package manager. Phase-level scope and e
 
 **Why fix the seams now and not at registry time:** both are cheap while the git code is in flight and expensive afterward — (1) is a serialized lockfile format, so changing it post-hoc means a format migration on every user's `phoenix.lock`; (2) is the public shape of the provider trait, so changing it post-hoc breaks every provider. Neither requires implementing any registry behavior in 3.1; they only stop the git-shaped code from hardening assumptions a registry would have to undo. The accurate framing recorded here so it isn't forgotten: **adding a registry later is "add a provider *and* add a version solver," not "add a provider"** — git got to skip the solver only because a ref already pins the version.
 
+#### B. Dependency identity is the dependency *key*, not the package's own name
+
+**Decided:** 2026-07-01
+A dependency's identity across a project — what an `import`'s first path segment matches, and what the resolver unifies a diamond on — is the **key** on the left of `=` in `[dependencies]`, *not* the `[package].name` the dependency declares for itself. `[package].name` is metadata (diagnostics, eventual publishing).
+**Why:** git-first has no registry to enforce globally-unique names, so two unrelated repos can legitimately share a `[package].name`. Keying identity on the *consumer-chosen* key lets them coexist and lets a consumer rename a dependency (Cargo's model: `foo = { package = "real-name" }`). Name-identity was rejected — it would force unrelated same-named packages into a false conflict and dictate the import name to every consumer.
+**Trade-off:** two manifests must use the *same* key to share one package in a diamond; different keys for the same repo fetch two copies (correct, if not minimal).
+
+#### C. Version reconciliation: one source per name, caret-compatible, highest wins
+
+**Decided:** 2026-07-01
+When one key is required more than once (a diamond), all requirements must share a single upstream **source** — the git URL (without the ref) or the canonical path; differing upstreams are a hard `SourceConflict`. Among same-upstream requirements that pin different refs (and thus possibly different `[package].version`s), the versions must be semver-compatible under caret (`^`) semantics and the **highest** is chosen; incompatible majors are a `VersionConflict`. This is where the `semver` crate does real work.
+**Why not exact-match-only:** it would force a hand-resolved conflict for every trivially-compatible minor bump. **Why no solver:** a backtracking version-requirement solver rides the registry (decision A), because a git ref already pins one concrete version. The two documented "known residual" tests in `deps/graph.rs` (a dependency *shared* with a superseded version can still be conflict-checked, or selected higher-than-minimal) are symptoms of having no solver — sound, but not minimal-version selection.
+
+#### D. Lockfile format: name-keyed tables, git-only, requested ref recorded
+
+**Decided:** 2026-07-01
+`phoenix.lock` is TOML with one **name-keyed** `[packages.<name>]` table per resolved package — not a Cargo-style `[[package]]` array, because Phoenix's flat namespace admits exactly one version per name, so a keyed table is the honest, directly-indexable shape. Only **git** dependencies are recorded; **path** dependencies resolve in place each build and are never locked. Each git entry records the resolved commit (`rev`) **and** the requested ref (`tag` / `branch` / `rev_req`): recording the requested ref is what lets a manifest ref bump (e.g. `tag = "v1"` → `"v2"`) surface as `--locked` drift while a clean checkout still rebuilds the pinned commit fully offline. `LockedPackage` is an untagged source-kind enum, so the git entry serializes byte-identically to the pre-seam format today and a registry entry stays representable later (decision A).
+
+#### E. Cross-package identity: sema is package-aware; dependency ASTs stay verbatim
+
+**Decided:** 2026-07-01
+A module's identity is `(package, module path)`. A dependency's modules are **package-qualified** (a module `helpers` inside a dependency `greet` is `greet.helpers`), so a dependency's internal module name can never silently collide with the project's, or another dependency's, module of the same name. The dependency's **source is left verbatim** — its own `import helpers` stays bare; the resolver hands sema the resolved package-qualified target for each import (a per-module `import_targets` map), and that identity flows through `module_qualify`, so registration, the interpreter, and IR all inherit it with no per-consumer change. Visibility comes for free: the 2.6 public-only rule is per-*module*, so it already governs the package edge.
+**Why:** the original brief forbade touching sema (parallel-track hygiene); that constraint was **deliberately lifted** to enable this. Rejected alternatives: (a) the resolver rewriting a dependency's `import` ASTs to be package-qualified — rejected because the parsed AST would then differ from the on-disk source (bad for the LSP/tooling); (b) leaving module paths literal with no qualification — rejected because a dependency's internal module would silently collide with a local one. Entry-package modules keep their bare paths, so single-package behavior is unchanged.
+
+#### F. `init` scaffolds a flat project; `add` is atomic
+
+**Decided:** 2026-07-01
+`phoenix init` writes `phoenix.toml` (a `[package]`) and a **root** `main.phx` carrying a runnable stub. The entry file's directory is both its module root and the project root — matching Phoenix's "the entry file's directory is the root" model (Go-like: source beside the manifest) rather than imposing a `src/` layout Phoenix does not otherwise enforce. `phoenix add` validates the requested source through the *same* `parse_dependency` a hand-written manifest uses (so the CLI and the manifest accept identical inputs), edits `phoenix.toml` format-preservingly (`toml_edit`, so comments/layout survive), then resolves to refresh the lockfile; on **any** resolution failure the manifest edit is rolled back, so `add` is atomic — the project is never left holding a manifest entry that doesn't resolve.
+
 
 ---
 
