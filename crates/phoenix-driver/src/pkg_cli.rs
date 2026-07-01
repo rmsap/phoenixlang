@@ -153,8 +153,11 @@ pub fn cmd_add(
 fn refresh_lock(manifest_dir: &Path, manifest_path: &Path) -> Result<bool, String> {
     let config = PhoenixConfig::load_file(manifest_path).map_err(|e| e.to_string())?;
     let dependencies = config.dependencies().map_err(|e| e.to_string())?;
-    let cache_root = deps::resolve::default_cache_root()?;
-    let resolution = deps::resolve_project(manifest_dir, &dependencies, &cache_root, false)
+    // Resolve the cache root lazily (`None`): a path-only `add` fetches nothing,
+    // so it must not require a resolvable `$PHOENIX_HOME`. The lockfile write is
+    // atomic, so a failed refresh leaves any existing `phoenix.lock` intact —
+    // the manifest rollback below then restores a fully consistent pair.
+    let resolution = deps::resolve_project(manifest_dir, &dependencies, None, false)
         .map_err(|e| e.to_string())?;
     Ok(resolution.lock_changed)
 }

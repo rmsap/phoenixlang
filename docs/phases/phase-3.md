@@ -88,6 +88,14 @@ Shipped a git-first, `phoenix.toml`-driven package manager end-to-end, in six re
 
 **Design decisions** are recorded in [design-decisions.md §Phase 3.1](../design-decisions.md#phase-31-package-manager) (A–F). **Carve-outs** — a central registry, and the npm / `import js "pkg"` / `[js-dependencies]` slice (now a dedicated **3.1-js** follow-up) — are open in [known-issues.md](../known-issues.md). Verified by `cargo test --workspace` / `clippy --all-targets` / `fmt --check` clean.
 
+### Bugs closed in this phase (post-close review)
+
+A review of the merged implementation surfaced three defects, all now fixed with regression tests:
+
+- **Module identity could silently collide (miscompile).** Cross-package identity was a flat module path whose first segment was the bare dependency alias, so a dependency's root module (`import greet` → path `greet`) was indistinguishable from an entry-package top-level module `greet.phx`, and a **transitive** dependency aliased the same as an entry top-level module (e.g. both `util`) collapsed to one identity — the BFS dedup silently dropped one, and a dependency's `import util` could bind to the *entry's* `util`. Fixed by giving the package dimension a reserved, un-forgeable marker (`ModulePath::in_package`), realizing genuine `(package, module path)` identity ([design-decisions §Phase 3.1 E](../design-decisions.md#e-cross-package-identity-sema-is-package-aware-dependency-asts-stay-verbatim)); the marker is stripped for display so diagnostics are unchanged.
+- **A transitive git dependency behind a `path` dep fetched into the project tree.** The cache-vs-project-dir decision was made from the project's *direct* dependencies only, so an all-`path` project whose path dep transitively declared a git source cloned it under `<project>/git/…` instead of `$PHOENIX_HOME/cache`, violating the "never inside the project tree" invariant. Fixed by resolving the cache root **lazily** — only when a git source is actually reached, at any depth — which also stops a genuinely git-free project from needing `$PHOENIX_HOME`.
+- **`phoenix.lock` was written non-atomically.** A truncate-then-write could leave a corrupt lockfile on an interrupted write (and undermined `phoenix add`'s rollback guarantee). Fixed with an atomic temp-file + rename, so a failed write always leaves the previous lockfile intact.
+
 ## 3.2 Language Server Protocol (LSP)
 
 A multi-module foundation landed in Phase 2.6 — diagnostics, hover, completion, goto-def, find-references, and rename all work cross-file for functions / structs / enums / methods / fields / enum variants, with the rich diagnostic shape (notes routed to the right file URI). 3.2 closes the remaining symbol-coverage gaps and adds the standard LSP features the editor experience expects.

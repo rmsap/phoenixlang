@@ -29,6 +29,20 @@ pub struct ModulePath(pub Vec<String>);
 /// segment (Phoenix identifiers are alphanumeric + `_`).
 const BUILTIN_SEGMENT: &str = "<builtin>";
 
+/// Build the reserved leading segment that marks a module as belonging to
+/// dependency package `alias`. Like [`BUILTIN_SEGMENT`], the angle brackets
+/// (illegal in a Phoenix identifier) make the marker un-forgeable by any
+/// user-declared module segment — so a dependency's module identity can never
+/// silently collide with an entry-package module of the same path.
+fn package_segment(alias: &str) -> String {
+    format!("<pkg:{alias}>")
+}
+
+/// If `segment` is a package marker, its inner alias.
+fn package_alias(segment: &str) -> Option<&str> {
+    segment.strip_prefix("<pkg:")?.strip_suffix('>')
+}
+
 impl ModulePath {
     /// The entry module's path (empty).
     pub fn entry() -> Self {
@@ -38,6 +52,27 @@ impl ModulePath {
     /// The sentinel path for compiler-synthesized declarations.
     pub fn builtin() -> Self {
         ModulePath(vec![BUILTIN_SEGMENT.to_string()])
+    }
+
+    /// A module inside dependency package `alias`, at relative module path
+    /// `rel` (an empty `rel` is the package's root module). The package is
+    /// encoded as a reserved, un-forgeable leading segment, so the identity is
+    /// distinct from any entry-package module — realizing the `(package, module
+    /// path)` identity (see `docs/design-decisions.md` §Phase 3.1 E). The
+    /// marker is invisible in the human display form ([`dotted`](Self::dotted) /
+    /// `Display`) but preserved in the symbol-table key ([`module_qualify`]).
+    pub fn in_package(alias: &str, rel: &[String]) -> Self {
+        let mut segments = Vec::with_capacity(rel.len() + 1);
+        segments.push(package_segment(alias));
+        segments.extend(rel.iter().cloned());
+        ModulePath(segments)
+    }
+
+    /// Split a package-qualified path into `(alias, relative segments)`, or
+    /// `None` for an entry / local / builtin path.
+    fn package_split(&self) -> Option<(&str, &[String])> {
+        let alias = package_alias(self.0.first()?)?;
+        Some((alias, &self.0[1..]))
     }
 
     /// True if this path is the entry module's path (empty).
@@ -52,13 +87,29 @@ impl ModulePath {
 
     /// Join the segments with `.` for use in user-facing display
     /// (`["a", "b"]` → `"a.b"`).  The entry path returns `""` and the
-    /// builtin sentinel returns the literal `"<builtin>"` segment.
+    /// builtin sentinel returns the literal `"<builtin>"` segment. A
+    /// package-qualified path renders with the dependency *alias* in place of
+    /// its internal marker (`greet` / `greet.util`), so diagnostics never leak
+    /// the `<pkg:…>` sentinel.
     ///
     /// This is the *display* form; for symbol-table keys use
     /// [`module_qualify`], which guarantees a bare-name result for entry
-    /// and builtin paths and never collides with an identifier in non-
-    /// trivial cases (the `::` separator is illegal in identifiers).
+    /// and builtin paths, keeps the package marker so a dependency module's key
+    /// stays distinct, and never collides with an identifier in non-trivial
+    /// cases (the `::` separator is illegal in identifiers).
     pub fn dotted(&self) -> String {
+        match self.package_split() {
+            Some((alias, [])) => alias.to_string(),
+            Some((alias, rest)) => format!("{alias}.{}", rest.join(".")),
+            None => self.0.join("."),
+        }
+    }
+
+    /// The raw segment join used as the symbol-table key prefix. Unlike
+    /// [`dotted`](Self::dotted), this preserves the `<pkg:…>` marker verbatim,
+    /// so a dependency module's mangled key can never coincide with an
+    /// entry-package module's — the identity distinction the marker exists for.
+    fn key_prefix(&self) -> String {
         self.0.join(".")
     }
 }
@@ -92,7 +143,7 @@ pub fn module_qualify(module: &ModulePath, name: &str) -> String {
     if module.is_entry() || module.is_builtin() {
         name.to_string()
     } else {
-        format!("{}::{}", module.dotted(), name)
+        format!("{}::{}", module.key_prefix(), name)
     }
 }
 
@@ -189,5 +240,59 @@ mod tests {
     #[test]
     fn builtin_displays_as_builtin_marker() {
         assert_eq!(ModulePath::builtin().to_string(), "<builtin>");
+    }
+
+    #[test]
+    fn package_module_is_distinct_from_entry_module_of_same_path() {
+        // The core guarantee: a dependency `util`'s root and an entry-package
+        // top-level `util` must be different identities (different keys), even
+        // though they display the same.
+        let dep_root = ModulePath::in_package("util", &[]);
+        let entry_mod = ModulePath(vec!["util".into()]);
+        assert_ne!(dep_root, entry_mod);
+        assert_ne!(
+            module_qualify(&dep_root, "f"),
+            module_qualify(&entry_mod, "f"),
+            "package and entry modules must mangle to distinct keys"
+        );
+        // Two different packages with the same relative path are also distinct.
+        assert_ne!(
+            ModulePath::in_package("a", &["m".into()]),
+            ModulePath::in_package("b", &["m".into()])
+        );
+    }
+
+    #[test]
+    fn package_module_displays_with_alias_not_marker() {
+        // Display/dotted never leak the internal `<pkg:…>` marker.
+        assert_eq!(ModulePath::in_package("greet", &[]).dotted(), "greet");
+        assert_eq!(
+            ModulePath::in_package("greet", &["util".into()]).dotted(),
+            "greet.util"
+        );
+        assert_eq!(
+            ModulePath::in_package("greet", &["a".into(), "b".into()]).to_string(),
+            "greet.a.b"
+        );
+    }
+
+    #[test]
+    fn package_module_key_preserves_marker_and_round_trips_bare_name() {
+        // The mangled key keeps the package distinction (so it can't collide),
+        // and `bare_name` still recovers the plain identifier from it.
+        let key = module_qualify(&ModulePath::in_package("greet", &["util".into()]), "foo");
+        assert!(key.ends_with("::foo"));
+        assert!(
+            key.contains("<pkg:greet>"),
+            "key must retain the marker: {key}"
+        );
+        assert_eq!(bare_name(&key), "foo");
+    }
+
+    #[test]
+    fn package_module_is_not_entry_or_builtin() {
+        let p = ModulePath::in_package("greet", &[]);
+        assert!(!p.is_entry());
+        assert!(!p.is_builtin());
     }
 }

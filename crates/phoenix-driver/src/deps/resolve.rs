@@ -72,13 +72,18 @@ impl From<LockError> for ProjectResolveError {
 /// - `manifest_dir` is the directory containing the project's `phoenix.toml`
 ///   (relative `path` deps resolve against it, and the lockfile lives there).
 /// - `deps` is the project's validated `[dependencies]`.
+/// - `cache_root`: where git sources are fetched. `None` resolves the default
+///   `$PHOENIX_HOME/cache` lazily — only if a git source is actually reached
+///   (directly *or* transitively through a `path` dependency), so a git-free
+///   project never requires a cache location. `Some(root)` forces an explicit
+///   root (tests, or a caller that already resolved one).
 /// - `locked`: when `true`, a present lockfile is authoritative and any drift
 ///   between it and the freshly-resolved graph is an error (the lockfile is
 ///   never rewritten). When `false`, the lockfile is (re)written if it changed.
 pub fn resolve_project(
     manifest_dir: &Path,
     deps: &BTreeMap<String, Dependency>,
-    cache_root: &Path,
+    cache_root: Option<&Path>,
     locked: bool,
 ) -> Result<ProjectResolution, ProjectResolveError> {
     let lock_path = manifest_dir.join("phoenix.lock");
@@ -92,7 +97,10 @@ pub fn resolve_project(
         .as_ref()
         .map(|l| l.packages.clone())
         .unwrap_or_default();
-    let mut fetcher = CacheFetcher::new(cache_root.to_path_buf(), locked_packages);
+    let mut fetcher = match cache_root {
+        Some(root) => CacheFetcher::new(root.to_path_buf(), locked_packages),
+        None => CacheFetcher::with_default_cache(locked_packages),
+    };
 
     let graph = resolve_graph(deps, manifest_dir, &mut fetcher)?;
     let fresh = Lockfile::from_graph(&graph);

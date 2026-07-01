@@ -23,7 +23,7 @@
 //! into an error instead of silently rewriting it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -172,6 +172,37 @@ impl LockedPackage {
     }
 }
 
+/// Write `contents` to `path` atomically via a sibling temp file + rename.
+///
+/// The temp name carries the process id so two *different* processes writing
+/// the same lockfile don't clobber each other's in-progress temp file (the
+/// rename itself is still the single atomic commit point); the file is removed
+/// on a failed rename so a botched write leaves no stray temp behind.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_sibling(path);
+    std::fs::write(&tmp, contents)?;
+    // `rename` replaces the destination on both POSIX and Windows (Rust's
+    // `fs::rename` uses replace-existing semantics), so the swap is atomic.
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// A sibling temp path for `path` (same directory, so the rename stays on one
+/// filesystem), disambiguated by process id.
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("phoenix.lock"));
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
 /// Errors reading or interpreting a `phoenix.lock`.
 #[derive(Debug)]
 pub enum LockError {
@@ -282,9 +313,17 @@ impl Lockfile {
         format!("{LOCKFILE_HEADER}{body}")
     }
 
-    /// Write the lockfile to `path` (overwriting any existing file).
+    /// Write the lockfile to `path` (overwriting any existing file), atomically.
+    ///
+    /// The contents are written to a sibling temp file and then renamed over
+    /// `path`. A rename is atomic on the same filesystem (and the temp file is
+    /// always a sibling, so it is), so an interrupted or failed write can never
+    /// leave a half-written / truncated `phoenix.lock` behind — a later
+    /// `--locked` read then always sees either the old lockfile or the complete
+    /// new one, never a corrupt partial. (Inter-process races on the cache /
+    /// lockfile are a separate, documented limitation.)
     pub fn write(&self, path: &Path) -> Result<(), LockError> {
-        std::fs::write(path, self.to_toml_string()).map_err(LockError::Write)
+        write_atomic(path, self.to_toml_string().as_bytes()).map_err(LockError::Write)
     }
 
     /// Compare this (freshly-resolved) lockfile against a committed one,
@@ -452,6 +491,49 @@ mod tests {
         // tolerates leading comments, so the whole text parses).
         let parsed: Lockfile = toml::from_str(&text).unwrap();
         assert_eq!(parsed, lock);
+    }
+
+    #[test]
+    fn write_is_atomic_and_leaves_no_temp_file() {
+        // The atomic write overwrites an existing lockfile in place and leaves
+        // no `.tmp` sibling behind — an interrupted write can never surface a
+        // truncated `phoenix.lock` to a later `--locked` read.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("phoenix.lock");
+
+        let first = Lockfile::from_graph(&graph_of(vec![git_pkg(
+            "http",
+            "1.0.0",
+            "u/http.git",
+            "aaaa1111",
+        )]));
+        first.write(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            first.to_toml_string()
+        );
+
+        // Overwriting works, and the result round-trips.
+        let second = Lockfile::from_graph(&graph_of(vec![git_pkg(
+            "http",
+            "2.0.0",
+            "u/http.git",
+            "bbbb2222",
+        )]));
+        second.write(&path).unwrap();
+        assert_eq!(
+            Lockfile::read(&path).unwrap(),
+            second,
+            "overwrite must leave a complete, parseable lockfile"
+        );
+
+        // No stray temp file lingers in the directory.
+        let strays: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
     }
 
     #[test]

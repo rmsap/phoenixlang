@@ -33,11 +33,29 @@ use super::lock::LockedPackage;
 /// likewise invisible to the Phoenix module loader.
 const CHECKOUT_OK_EXT: &str = "ok";
 
+/// How the fetcher obtains the dependency cache root.
+///
+/// Resolved *lazily* — only when a git source is actually reached — so a
+/// resolve that touches no git source never requires `$PHOENIX_HOME`/a home
+/// directory. This matters because a git source can be reached transitively
+/// through a `path` dependency, which the project's *direct* `[dependencies]`
+/// don't reveal: eagerly deciding "no git deps ⇒ no cache needed" from the
+/// direct set would both miss that case (fetching into the project tree) and
+/// needlessly demand a cache location from a genuinely git-free project.
+enum CacheRoot {
+    /// An explicit root supplied by the caller (tests, or a caller that has
+    /// already resolved one).
+    Explicit(PathBuf),
+    /// `$PHOENIX_HOME/cache`, resolved on first git fetch and erroring with an
+    /// actionable message only if a git source is reached.
+    Default,
+}
+
 /// A [`ManifestProvider`] that fetches git dependencies into the on-disk cache
 /// and resolves `path` dependencies relative to their declaring manifest.
 pub struct CacheFetcher {
-    /// The dependency cache root (`$PHOENIX_HOME/cache`).
-    cache_root: PathBuf,
+    /// The dependency cache root (`$PHOENIX_HOME/cache`), resolved lazily.
+    cache_root: CacheRoot,
     /// Locked packages from an existing `phoenix.lock`, keyed by dependency
     /// name. A git dependency whose name is locked *and* whose URL still
     /// matches reuses the pinned commit — no ref resolution, and no network if
@@ -53,14 +71,38 @@ pub struct CacheFetcher {
 }
 
 impl CacheFetcher {
-    /// Create a fetcher writing into `cache_root`, honoring the `locked`
-    /// revisions from an existing lockfile (pass an empty map for a fresh
-    /// resolve).
+    /// Create a fetcher writing into an explicit `cache_root`, honoring the
+    /// `locked` revisions from an existing lockfile (pass an empty map for a
+    /// fresh resolve).
     pub fn new(cache_root: PathBuf, locked: BTreeMap<String, LockedPackage>) -> Self {
         CacheFetcher {
-            cache_root,
+            cache_root: CacheRoot::Explicit(cache_root),
             locked,
             refreshed: HashSet::new(),
+        }
+    }
+
+    /// Create a fetcher that resolves the default cache root
+    /// (`$PHOENIX_HOME/cache`) lazily — only if a git source is actually
+    /// reached. A resolve over path-only sources never demands a cache
+    /// location, even when a `path` dependency transitively pulls a git source
+    /// (in which case the cache is resolved at that point, not silently
+    /// redirected into the project tree).
+    pub fn with_default_cache(locked: BTreeMap<String, LockedPackage>) -> Self {
+        CacheFetcher {
+            cache_root: CacheRoot::Default,
+            locked,
+            refreshed: HashSet::new(),
+        }
+    }
+
+    /// Resolve the cache root, materializing the default location on demand.
+    /// Returns the actionable "set `$PHOENIX_HOME`" error only when a git
+    /// source forced the question.
+    fn cache_root(&self) -> Result<PathBuf, String> {
+        match &self.cache_root {
+            CacheRoot::Explicit(root) => Ok(root.clone()),
+            CacheRoot::Default => super::resolve::default_cache_root(),
         }
     }
 
@@ -106,10 +148,16 @@ impl CacheFetcher {
             .filter(|lp| lp.git() == Some(url) && lp.matches_ref(reference))
             .map(|lp| lp.rev().to_string());
 
-        // `cache_root` and `refreshed` are distinct fields, so the simultaneous
-        // shared/mutable borrows below are disjoint and accepted.
+        // Resolve the cache root now that a git source has actually been
+        // reached; a git-free resolve never gets here, so it never needs one.
+        // The owned `PathBuf` releases the `&self` borrow before `&mut
+        // self.refreshed` below, so the borrows don't overlap.
+        let cache_root = self.cache_root().map_err(|message| ResolveError::Fetch {
+            name: name.to_string(),
+            message,
+        })?;
         let (root, sha) = materialize_git(
-            &self.cache_root,
+            &cache_root,
             url,
             reference,
             locked_sha.as_deref(),

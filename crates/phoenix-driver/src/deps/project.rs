@@ -12,7 +12,6 @@ use std::path::Path;
 use phoenix_modules::PackageResolution;
 
 use crate::config::PhoenixConfig;
-use crate::manifest;
 
 use super::ResolvedGraph;
 
@@ -50,19 +49,12 @@ pub(crate) fn build_package_resolution(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    // The cache root is only consulted to fetch git sources. A path-only project
-    // fetches nothing, so don't make it require a resolvable `$PHOENIX_HOME` /
-    // home directory — fall back to the (unused) manifest dir when no dependency
-    // is a git source.
-    let needs_cache = dependencies
-        .values()
-        .any(|d| matches!(d, manifest::Dependency::Git { .. }));
-    let cache_root = if needs_cache {
-        super::resolve::default_cache_root()?
-    } else {
-        manifest_dir.clone()
-    };
-    let resolution = super::resolve_project(&manifest_dir, &dependencies, &cache_root, locked)
+    // Resolve the cache root lazily (`None`): it is consulted only to fetch git
+    // sources, so a project that reaches no git source — even one whose git
+    // source hides behind a `path` dependency's own dependencies — never
+    // requires a resolvable `$PHOENIX_HOME`, and a git source is always fetched
+    // into the real cache rather than the project tree.
+    let resolution = super::resolve_project(&manifest_dir, &dependencies, None, locked)
         .map_err(|e| e.to_string())?;
     let entry_deps = dependencies.keys().cloned().collect();
     Ok((

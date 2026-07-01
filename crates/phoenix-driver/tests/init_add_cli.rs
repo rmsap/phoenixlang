@@ -364,6 +364,78 @@ fn add_bad_git_ref_rolls_back_manifest() {
 }
 
 #[test]
+fn transitive_git_via_path_dep_fetches_into_cache_not_project_tree() {
+    // A git source reached *only* transitively — through a `path` dependency's
+    // own `[dependencies]` — must still fetch into `$PHOENIX_HOME/cache`, never
+    // into the project tree. Regression guard: deciding "needs a cache?" from
+    // the project's *direct* deps alone (all `path` here) once mislocated the
+    // cache to the project directory, cloning the transitive git dep under
+    // `<project>/git/…` and violating the "never inside the project tree" rule.
+    let leaf = make_git_package("leaf", "v1.0.0");
+
+    // `mid`: a local path package that itself declares the git dep on `leaf`.
+    let mid = tempfile::tempdir().unwrap();
+    std::fs::write(
+        mid.path().join("phoenix.toml"),
+        // Single-quoted (literal) TOML string so a Windows path's backslashes
+        // aren't interpreted as escapes.
+        format!(
+            "[package]\nname = \"mid\"\nversion = \"1.0.0\"\n\n\
+             [dependencies]\nleaf = {{ git = '{}', tag = \"v1.0.0\" }}\n",
+            leaf.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        mid.path().join("mod.phx"),
+        "public function midValue() -> String { \"mid\" }\n",
+    )
+    .unwrap();
+
+    // `app`: depends on `mid` only by local path (no direct git dep).
+    let app = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        app.path().join("phoenix.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nmid = {{ path = '{}' }}\n",
+            mid.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        app.path().join("main.phx"),
+        "import mid { midValue }\nfunction main() { print(midValue()) }\n",
+    )
+    .unwrap();
+
+    let out = phoenix(app.path(), home.path())
+        .args(["check", "main.phx"])
+        .output()
+        .expect("run phoenix check");
+    assert!(
+        out.status.success(),
+        "check with a transitive git dep should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The transitive git clone landed in the cache, not the project tree.
+    assert!(
+        home.path().join("cache").join("git").is_dir(),
+        "transitive git dep should have been fetched into $PHOENIX_HOME/cache"
+    );
+    assert!(
+        !app.path().join("git").exists(),
+        "no git cache may be written inside the project tree"
+    );
+    assert!(
+        !mid.path().join("git").exists(),
+        "no git cache may be written inside a path dependency's tree either"
+    );
+}
+
+#[test]
 fn add_without_manifest_errors() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

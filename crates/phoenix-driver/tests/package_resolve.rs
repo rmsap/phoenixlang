@@ -119,7 +119,7 @@ fn git_dependency_fetches_and_writes_lockfile() {
     let cache = tempfile::tempdir().unwrap();
     let deps = git_dep(repo_dir.path(), "v1.0.0");
 
-    let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve");
+    let res = resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("resolve");
 
     // The package resolved to the tagged commit, with its files on disk.
     let greet = &res.graph.packages["greet"];
@@ -159,7 +159,8 @@ fn git_dependency_on_branch_resolves_to_branch_head() {
         GitRef::Branch(current_branch(repo_dir.path())),
     );
 
-    let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve branch");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("resolve branch");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
@@ -190,8 +191,8 @@ fn git_dependency_default_branch_resolves_to_head() {
     let cache = tempfile::tempdir().unwrap();
     let deps = git_dep_ref(repo_dir.path(), GitRef::DefaultBranch);
 
-    let res =
-        resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve default branch");
+    let res = resolve_project(proj.path(), &deps, Some(cache.path()), false)
+        .expect("resolve default branch");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
@@ -229,7 +230,7 @@ fn nonexistent_ref_errors_with_resolution_diagnostic() {
     let cache = tempfile::tempdir().unwrap();
     let deps = git_dep(repo_dir.path(), "v9.9.9");
 
-    let err = resolve_project(proj.path(), &deps, cache.path(), false)
+    let err = resolve_project(proj.path(), &deps, Some(cache.path()), false)
         .expect_err("a nonexistent ref must error");
     let msg = err.to_string();
     assert!(msg.contains("could not resolve"), "got: {msg}");
@@ -256,9 +257,10 @@ fn second_resolve_is_in_sync_and_does_not_rewrite() {
     let cache = tempfile::tempdir().unwrap();
     let deps = git_dep(repo_dir.path(), "v1.0.0");
 
-    resolve_project(proj.path(), &deps, cache.path(), false).expect("first resolve");
+    resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("first resolve");
     // A second resolve (even with --locked) must see no drift and not rewrite.
-    let res2 = resolve_project(proj.path(), &deps, cache.path(), true).expect("locked resolve");
+    let res2 =
+        resolve_project(proj.path(), &deps, Some(cache.path()), true).expect("locked resolve");
     assert!(
         !res2.lock_changed,
         "in-sync --locked resolve must not write"
@@ -286,14 +288,15 @@ fn reproducible_from_clean_cache_under_locked() {
     let deps = git_dep(repo_dir.path(), "v1.0.0");
 
     // Initial resolve writes the lock.
-    resolve_project(proj.path(), &deps, cache.path(), false).expect("first resolve");
+    resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("first resolve");
 
     // Wipe the cache entirely — simulating a clean checkout on another machine.
     std::fs::remove_dir_all(cache.path()).unwrap();
     std::fs::create_dir_all(cache.path()).unwrap();
 
     // Under --locked, resolution rematerializes the pinned commit and succeeds.
-    let res = resolve_project(proj.path(), &deps, cache.path(), true).expect("locked rebuild");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), true).expect("locked rebuild");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
@@ -327,7 +330,7 @@ fn locked_rebuild_is_offline_when_checkout_survives() {
     let deps = git_dep(repo_dir.path(), "v1.0.0");
 
     // Initial resolve clones, checks out, and writes the lock.
-    resolve_project(proj.path(), &deps, cache.path(), false).expect("first resolve");
+    resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("first resolve");
 
     // Drop the bare clone but keep the materialized checkout, then make the clone
     // unreachable by deleting the upstream repo entirely.
@@ -335,7 +338,8 @@ fn locked_rebuild_is_offline_when_checkout_survives() {
     drop(repo_dir);
 
     // Under --locked the pinned commit's surviving checkout is reused offline.
-    let res = resolve_project(proj.path(), &deps, cache.path(), true).expect("offline rebuild");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), true).expect("offline rebuild");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
@@ -364,7 +368,7 @@ fn git_dependency_pinned_by_rev_resolves_and_records_rev_req() {
     let cache = tempfile::tempdir().unwrap();
     let deps = git_dep_ref(repo_dir.path(), GitRef::Rev(sha.clone()));
 
-    let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve rev");
+    let res = resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("resolve rev");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha.as_str()));
 
@@ -409,7 +413,8 @@ fn locked_rebuild_with_abbreviated_rev_reuses_checkout_offline() {
 
     // Initial resolve clones, checks out the abbreviated rev's commit, writes the
     // lock (pinning the full resolved SHA).
-    let first = resolve_project(proj.path(), &deps, cache.path(), false).expect("first resolve");
+    let first =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("first resolve");
     assert_eq!(first.graph.packages["greet"].rev(), Some(sha.as_str()));
 
     // Drop the bare clone but keep the materialized checkout, then make the clone
@@ -419,7 +424,8 @@ fn locked_rebuild_with_abbreviated_rev_reuses_checkout_offline() {
 
     // Under --locked the abbreviated rev still matches the pinned commit, so its
     // surviving checkout is reused offline (no clone needed).
-    let res = resolve_project(proj.path(), &deps, cache.path(), true).expect("offline rebuild");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), true).expect("offline rebuild");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha.as_str()));
     assert!(greet.root.join("greet.phx").is_file());
@@ -452,7 +458,7 @@ fn locked_rev_pointing_at_missing_commit_errors_cleanly() {
     let deps = git_dep(repo_dir.path(), "v1.0.0");
 
     // Initial resolve writes the lock pinning the real commit.
-    resolve_project(proj.path(), &deps, cache.path(), false).expect("first resolve");
+    resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("first resolve");
 
     // Repoint the lock's `rev` at a bare-hex SHA that doesn't exist, and wipe the
     // cache so the offline fast path can't reuse the real checkout.
@@ -466,7 +472,7 @@ fn locked_rev_pointing_at_missing_commit_errors_cleanly() {
     std::fs::create_dir_all(cache.path()).unwrap();
 
     // Rebuilding the checkout for the missing commit fails with a clear message.
-    let err = resolve_project(proj.path(), &deps, cache.path(), false)
+    let err = resolve_project(proj.path(), &deps, Some(cache.path()), false)
         .expect_err("missing commit must error");
     assert!(
         err.to_string().contains("could not check out"),
@@ -497,7 +503,7 @@ fn changed_url_re_resolves_instead_of_reusing_locked_commit() {
 
     // Lock against repo A.
     let deps_a = git_dep(repo_a.path(), "v1.0.0");
-    resolve_project(proj.path(), &deps_a, cache.path(), false).expect("lock against A");
+    resolve_project(proj.path(), &deps_a, Some(cache.path()), false).expect("lock against A");
 
     // A distinct repo B at the same name/version but a different commit.
     let repo_b = tempfile::tempdir().unwrap();
@@ -520,7 +526,8 @@ fn changed_url_re_resolves_instead_of_reusing_locked_commit() {
     // Re-point at repo B and re-resolve (unlocked): the URL no longer matches the
     // lock, so the pinned commit from A is not reused.
     let deps_b = git_dep(repo_b.path(), "v1.0.0");
-    let res = resolve_project(proj.path(), &deps_b, cache.path(), false).expect("re-resolve B");
+    let res =
+        resolve_project(proj.path(), &deps_b, Some(cache.path()), false).expect("re-resolve B");
     let greet = &res.graph.packages["greet"];
     assert_eq!(greet.rev(), Some(sha_b.as_str()), "must resolve B's commit");
     assert!(
@@ -551,7 +558,7 @@ fn locked_detects_drift_when_manifest_changes() {
 
     // Lock against v1.0.0.
     let deps_v1 = git_dep(repo_dir.path(), "v1.0.0");
-    resolve_project(proj.path(), &deps_v1, cache.path(), false).expect("lock v1");
+    resolve_project(proj.path(), &deps_v1, Some(cache.path()), false).expect("lock v1");
 
     // A new compatible release, tagged v1.1.0.
     let v11 = package_files("greet", "1.1.0");
@@ -566,7 +573,7 @@ fn locked_detects_drift_when_manifest_changes() {
 
     // Manifest now wants v1.1.0 but the lock still pins v1.0.0 → drift error.
     let deps_v11 = git_dep(repo_dir.path(), "v1.1.0");
-    let err = resolve_project(proj.path(), &deps_v11, cache.path(), true)
+    let err = resolve_project(proj.path(), &deps_v11, Some(cache.path()), true)
         .expect_err("expected --locked drift");
     assert!(
         err.to_string().contains("out of date"),
@@ -599,11 +606,11 @@ fn locked_detects_drift_on_ref_key_change_same_commit() {
 
     // Lock against the tag.
     let deps_tag = git_dep(repo_dir.path(), "v1.0.0");
-    resolve_project(proj.path(), &deps_tag, cache.path(), false).expect("lock against tag");
+    resolve_project(proj.path(), &deps_tag, Some(cache.path()), false).expect("lock against tag");
 
     // Re-point at the branch (same commit) under --locked → ref-key drift.
     let deps_branch = git_dep_ref(repo_dir.path(), GitRef::Branch(branch));
-    let err = resolve_project(proj.path(), &deps_branch, cache.path(), true)
+    let err = resolve_project(proj.path(), &deps_branch, Some(cache.path()), true)
         .expect_err("expected --locked ref-change drift");
     assert!(
         err.to_string().contains("out of date"),
@@ -635,7 +642,8 @@ fn locked_branch_dep_reuses_pinned_commit_until_ref_unchanged() {
     let deps = git_dep_ref(repo_dir.path(), GitRef::Branch(branch));
 
     // Lock against the branch HEAD (sha1).
-    let first = resolve_project(proj.path(), &deps, cache.path(), false).expect("lock branch");
+    let first =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("lock branch");
     assert_eq!(first.graph.packages["greet"].rev(), Some(sha1.as_str()));
 
     // Advance the branch HEAD to a new commit.
@@ -650,7 +658,8 @@ fn locked_branch_dep_reuses_pinned_commit_until_ref_unchanged() {
     assert_ne!(sha1, sha2, "branch must have moved");
 
     // An unlocked re-resolve with the same branch ref reuses the pinned commit.
-    let again = resolve_project(proj.path(), &deps, cache.path(), false).expect("reuse pinned");
+    let again =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("reuse pinned");
     assert_eq!(
         again.graph.packages["greet"].rev(),
         Some(sha1.as_str()),
@@ -732,7 +741,8 @@ fn transitive_git_diamond_resolves_shared_dep_once() {
         },
     );
 
-    let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve diamond");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("resolve diamond");
 
     // All three git packages resolved; `core` unified to one entry at the
     // tagged commit with its files materialized.
@@ -778,7 +788,8 @@ fn path_dependency_resolves_without_lockfile() {
         },
     );
 
-    let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve path dep");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("resolve path dep");
     let util = &res.graph.packages["util"];
     assert_eq!(util.version.to_string(), "0.2.0");
     assert!(util.rev().is_none());
@@ -835,7 +846,8 @@ fn path_dep_with_transitive_git_dep_fetches_and_locks_only_the_git_dep() {
         },
     );
 
-    let res = resolve_project(proj.path(), &deps, cache.path(), false).expect("resolve mixed");
+    let res =
+        resolve_project(proj.path(), &deps, Some(cache.path()), false).expect("resolve mixed");
 
     // `mid` resolved in place (no rev); `core` was fetched from git and pinned.
     let mid = &res.graph.packages["mid"];

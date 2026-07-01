@@ -277,9 +277,16 @@ pub fn resolve_with_packages(
 /// edge; the struct itself is never cloned.
 #[derive(Debug)]
 struct PkgCtx {
-    /// Module-path prefix for this package: empty for the entry package, the
-    /// dependency name for a dependency package.
+    /// Module-path *identity* prefix for this package: empty for the entry
+    /// package; the reserved, un-forgeable package marker segment
+    /// (`ModulePath::in_package`) for a dependency, so a dependency module's
+    /// identity can never collide with an entry-package module of the same
+    /// path (see `docs/design-decisions.md` §Phase 3.1 E).
     prefix: Vec<String>,
+    /// The dependency's human alias, for diagnostics — `None` for the entry
+    /// package. Kept separate from `prefix` so display never leaks the internal
+    /// `<pkg:…>` marker.
+    alias: Option<String>,
     /// The package root (modules resolve under it).
     root: PathBuf,
     /// Pre-canonicalized root for per-import `ensure_under_root`.
@@ -351,7 +358,11 @@ fn dispatch_import(
                 name: first.clone(),
                 import_span,
             })?;
-        let target_id = ModulePath(path.to_vec());
+        // Identity is package-qualified via the un-forgeable marker (not the
+        // bare alias), so a dependency's root/submodule can never collide with
+        // an entry-package module — or a transitive package alias with an entry
+        // top-level module — of the same name.
+        let target_id = ModulePath::in_package(first, rest);
         let remaining = ModulePath(rest.to_vec());
         let file = if remaining.0.is_empty() {
             // `import greet` (no sub-path) → the package's root module mod.phx.
@@ -474,6 +485,7 @@ fn resolve_core(
     // cheap refcount bump rather than cloning the root paths on every edge.
     let entry_ctx = Rc::new(PkgCtx {
         prefix: Vec::new(),
+        alias: None,
         root: root.clone(),
         root_canon: root_canon.clone(),
         dep_names: packages.entry_deps.clone(),
@@ -486,7 +498,11 @@ fn resolve_core(
             (
                 name.clone(),
                 Rc::new(PkgCtx {
-                    prefix: vec![name.clone()],
+                    // The package-marker prefix (identity), so this dependency's
+                    // local imports register under the same package-qualified
+                    // identity that an external `import <name>.…` resolves to.
+                    prefix: ModulePath::in_package(name, &[]).0,
+                    alias: Some(name.clone()),
                     root: dep_root.clone(),
                     root_canon: dr_canon,
                     dep_names: packages.deps.get(name).cloned().unwrap_or_default(),
@@ -554,14 +570,12 @@ fn resolve_core(
         // package name so diagnostics make the package boundary clear.
         let display_name = if mp.is_entry() {
             entry_file.display().to_string()
-        } else if ctx.prefix.is_empty() {
-            display_name_for(&file_path, &ctx.root)
+        } else if let Some(alias) = &ctx.alias {
+            // A dependency module: label with the human alias (never the
+            // internal `<pkg:…>` identity marker).
+            format!("{}/{}", alias, display_name_for(&file_path, &ctx.root))
         } else {
-            format!(
-                "{}/{}",
-                ctx.prefix.join("."),
-                display_name_for(&file_path, &ctx.root)
-            )
+            display_name_for(&file_path, &ctx.root)
         };
         let source_id = source_map.add(display_name, contents);
         let tokens = tokenize(source_map.contents(source_id), source_id);
@@ -1427,6 +1441,17 @@ mod tests {
         ModulePath(segments.iter().map(|s| s.to_string()).collect())
     }
 
+    /// A package-qualified expected identity — dependency `alias`, relative path
+    /// `rest` — mirroring the `ModulePath::in_package` the resolver assigns a
+    /// dependency's modules. Its display form is the human `alias`/`alias.rest`,
+    /// but its identity carries the un-forgeable package marker.
+    fn pkg_mp(alias: &str, rest: &[&str]) -> ModulePath {
+        ModulePath::in_package(
+            alias,
+            &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
     #[test]
     fn cross_package_import_resolves_and_prefixes() {
         // The entry imports `greet.greeting`; `greet` is a dependency whose
@@ -1453,7 +1478,7 @@ mod tests {
 
         let greeting = out
             .iter()
-            .find(|m| m.module_path == mp(&["greet", "greeting"]))
+            .find(|m| m.module_path == pkg_mp("greet", &["greeting"]))
             .expect("greet.greeting module present");
         assert!(!greeting.is_entry);
         // The entry's import maps verbatim path → resolved (already-qualified)
@@ -1463,7 +1488,7 @@ mod tests {
             entry_mod
                 .import_targets
                 .get(&vec!["greet".to_string(), "greeting".to_string()]),
-            Some(&mp(&["greet", "greeting"]))
+            Some(&pkg_mp("greet", &["greeting"]))
         );
     }
 
@@ -1499,18 +1524,18 @@ mod tests {
 
         assert!(
             out.iter()
-                .any(|m| m.module_path == mp(&["greet", "helpers"])),
+                .any(|m| m.module_path == pkg_mp("greet", &["helpers"])),
             "greet.helpers should be resolved; got {:?}",
             out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
         );
         let greeting = out
             .iter()
-            .find(|m| m.module_path == mp(&["greet", "greeting"]))
+            .find(|m| m.module_path == pkg_mp("greet", &["greeting"]))
             .unwrap();
         // greeting's verbatim `import helpers` maps to greet.helpers.
         assert_eq!(
             greeting.import_targets.get(&vec!["helpers".to_string()]),
-            Some(&mp(&["greet", "helpers"]))
+            Some(&pkg_mp("greet", &["helpers"]))
         );
     }
 
@@ -1531,7 +1556,7 @@ mod tests {
         };
         let mut sm = SourceMap::new();
         let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
-        assert!(out.iter().any(|m| m.module_path == mp(&["greet"])));
+        assert!(out.iter().any(|m| m.module_path == pkg_mp("greet", &[])));
     }
 
     #[test]
@@ -1561,7 +1586,7 @@ mod tests {
         let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
         assert!(
             out.iter()
-                .any(|m| m.module_path == mp(&["greet", "sub", "deep"])),
+                .any(|m| m.module_path == pkg_mp("greet", &["sub", "deep"])),
             "greet.sub.deep should resolve under the dependency's nested dir; got {:?}",
             out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
         );
@@ -1672,9 +1697,75 @@ mod tests {
         let mut sm = SourceMap::new();
         let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
         assert!(
-            out.iter().any(|m| m.module_path == mp(&["core", "util"])),
+            out.iter()
+                .any(|m| m.module_path == pkg_mp("core", &["util"])),
             "core.util should resolve transitively; got {:?}",
             out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn transitive_package_alias_does_not_collide_with_entry_top_level_module() {
+        // Regression: a *transitive* dependency aliased `util` and an entry
+        // top-level module `util.phx` must stay distinct. The direct-collision
+        // guard only checks the importing package's own root, so it can't catch
+        // this pairing; the flat-identity scheme once folded both to `["util"]`,
+        // so the BFS `seen` set silently dropped one — and a dependency's
+        // `import util` could then bind to the *entry's* `util`. Package-marked
+        // identity (`ModulePath::in_package`) keeps them apart.
+        let td = TempDir::new().unwrap();
+        let entry = write_file(
+            td.path(),
+            "proj/main.phx",
+            "import greet { hello }\nimport util { localValue }\nfunction main() {}\n",
+        );
+        // The entry's OWN top-level `util` module.
+        write_file(
+            td.path(),
+            "proj/util.phx",
+            "public function localValue() {}\n",
+        );
+        // `greet` depends on a *different* package that also happens to be
+        // aliased `util`, and imports it internally.
+        write_file(
+            td.path(),
+            "greet/mod.phx",
+            "import util { u }\npublic function hello() {}\n",
+        );
+        write_file(td.path(), "util/mod.phx", "public function u() {}\n");
+        let packages = PackageResolution {
+            entry_deps: vec!["greet".into()],
+            roots: HashMap::from([
+                ("greet".to_string(), td.path().join("greet")),
+                ("util".to_string(), td.path().join("util")),
+            ]),
+            // greet declares the `util` *package* as its dependency.
+            deps: HashMap::from([("greet".to_string(), vec!["util".to_string()])]),
+        };
+        let mut sm = SourceMap::new();
+        let out = resolve_with_packages(&entry, &mut sm, &packages).unwrap();
+
+        // Both survive with distinct identities: the entry's local `util`…
+        assert!(
+            out.iter().any(|m| m.module_path == mp(&["util"])),
+            "entry's local `util` must survive; got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+        // …and the transitive `util` *package* (package-marked identity).
+        assert!(
+            out.iter().any(|m| m.module_path == pkg_mp("util", &[])),
+            "the transitive `util` package must survive distinctly; got {:?}",
+            out.iter().map(|m| &m.module_path).collect::<Vec<_>>()
+        );
+        // greet's `import util` binds to the util *package*, never the entry's
+        // local `util` — the silent-miscompile guard.
+        let greet_mod = out
+            .iter()
+            .find(|m| m.module_path == pkg_mp("greet", &[]))
+            .expect("greet package root present");
+        assert_eq!(
+            greet_mod.import_targets.get(&vec!["util".to_string()]),
+            Some(&pkg_mp("util", &[])),
         );
     }
 

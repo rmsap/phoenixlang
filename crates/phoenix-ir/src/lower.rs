@@ -15,7 +15,7 @@ use crate::instruction::{FuncId, Op, ValueId};
 use crate::module::{IrFunction, IrModule};
 use crate::terminator::Terminator;
 use crate::types::IrType;
-use phoenix_common::module_path::ModulePath;
+use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::Program;
 use phoenix_sema::ResolvedModule;
@@ -461,7 +461,11 @@ impl<'a> LoweringContext<'a> {
         if self.current_module.is_entry() || self.current_module.is_builtin() {
             Cow::Borrowed(name)
         } else {
-            Cow::Owned(format!("{}::{}", self.current_module.dotted(), name))
+            // Route through `module_qualify` (the single mangling source of
+            // truth) rather than re-deriving the prefix, so a package-qualified
+            // module keeps its `<pkg:…>` marker in the key — matching sema's
+            // registration and keeping a dependency module's key distinct.
+            Cow::Owned(module_qualify(&self.current_module, name))
         }
     }
 
