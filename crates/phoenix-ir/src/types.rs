@@ -19,6 +19,11 @@ pub const RESULT_ENUM: &str = "Result";
 /// Non-generic, with three `String`-carrying variants.
 pub const JSON_ERROR_ENUM: &str = "JsonError";
 
+/// The name of the built-in `List` generic in the IR.
+pub const LIST_TYPE: &str = "List";
+/// The name of the built-in `Map` generic in the IR.
+pub const MAP_TYPE: &str = "Map";
+
 /// A type in the IR.
 ///
 /// Value types (`I64`, `F64`, `Bool`) are passed by copy and live in

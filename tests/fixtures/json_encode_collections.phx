@@ -1,0 +1,30 @@
+// JSON encode of List<T> (array) and Map<String, V> (object), including
+// empty collections, nesting, and collections of aggregates.
+
+import json
+
+struct Point {
+  x: Int
+  y: Int
+}
+
+function main() {
+  print(json.encode([1, 2, 3]))
+  print(json.encode(["a", "b\"c"]))
+  let empty: List<Int> = []
+  print(json.encode(empty))
+  // List of structs.
+  print(json.encode([Point(1, 2), Point(3, 4)]))
+  // Nested list.
+  print(json.encode([[1, 2], [3]]))
+  // Map<String, V> → object (insertion order preserved).
+  let m: Map<String, Int> = {"x": 1, "y": 2}
+  print(json.encode(m))
+  let em: Map<String, Int> = {}
+  print(json.encode(em))
+  // Map with a struct value, and a List value.
+  let pts: Map<String, Point> = {"origin": Point(0, 0)}
+  print(json.encode(pts))
+  let lists: Map<String, List<Int>> = {"evens": [2, 4], "odds": [1, 3]}
+  print(json.encode(lists))
+}

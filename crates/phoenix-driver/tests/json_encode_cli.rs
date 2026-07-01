@@ -69,6 +69,30 @@ const EXPECTED_ENUM: &str = concat!(
     "\n",
 );
 
+/// The exact stdout of `tests/fixtures/json_encode_collections.phx`. Mirrors
+/// the fixture's `print(json.encode(...))` lines in order: a scalar list, a
+/// list of escaped strings, an empty list (`[]`), a list of structs, a nested
+/// list, a `Map<String, Int>` object (insertion order preserved), an empty map
+/// (`{}`), a map with a struct value, and a map with `List` values. Pins the
+/// array/object wire form so a shared bug in both encoders — which the
+/// cross-backend matrix would not catch — is caught.
+const EXPECTED_COLLECTIONS: &str = concat!(
+    "[1,2,3]\n",
+    r#"["a","b\"c"]"#,
+    "\n",
+    "[]\n",
+    r#"[{"x":1,"y":2},{"x":3,"y":4}]"#,
+    "\n",
+    "[[1,2],[3]]\n",
+    r#"{"x":1,"y":2}"#,
+    "\n",
+    "{}\n",
+    r#"{"origin":{"x":0,"y":0}}"#,
+    "\n",
+    r#"{"evens":[2,4],"odds":[1,3]}"#,
+    "\n",
+);
+
 fn assert_fixture_stdout(subcommand: &str, fixture: &str, expected: &str) {
     let output = phoenix_bin()
         .args([subcommand, fixture])
@@ -115,5 +139,23 @@ fn json_encode_enum_golden_ir() {
         "run-ir",
         "tests/fixtures/json_encode_enum.phx",
         EXPECTED_ENUM,
+    );
+}
+
+#[test]
+fn json_encode_collections_golden_ast() {
+    assert_fixture_stdout(
+        "run",
+        "tests/fixtures/json_encode_collections.phx",
+        EXPECTED_COLLECTIONS,
+    );
+}
+
+#[test]
+fn json_encode_collections_golden_ir() {
+    assert_fixture_stdout(
+        "run-ir",
+        "tests/fixtures/json_encode_collections.phx",
+        EXPECTED_COLLECTIONS,
     );
 }

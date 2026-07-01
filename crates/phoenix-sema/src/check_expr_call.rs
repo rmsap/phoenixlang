@@ -758,9 +758,9 @@ impl Checker {
     /// cyclic struct graphs.
     ///
     /// Phase 4.6 grows this surface in slices: today it is the scalars,
-    /// `Option<T>`, non-generic structs, and non-generic enums (each of
-    /// supported component types); generic enums other than `Option`,
-    /// `List`, and `Map` are added by later slices.
+    /// `Option<T>`, `List<T>`, `Map<String, V>`, non-generic structs, and
+    /// non-generic enums (each of supported component types); non-`String`-key
+    /// maps and generic enums other than `Option` are added by later slices.
     fn unsupported_json_encode_type(
         &self,
         ty: &Type,
@@ -771,9 +771,21 @@ impl Checker {
             Type::Int | Type::Float | Type::Bool | Type::String => None,
             // `Option<T>` is encodable when `T` is (None → null, Some(x) →
             // encode(x)). Other generic instantiations (`Result<…>`, generic
-            // user enums, `List`, `Map`) are deferred to later slices.
+            // user enums) are deferred.
             Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
                 self.unsupported_json_encode_type(&args[0], visiting)
+            }
+            // `List<T>` → array; encodable when `T` is.
+            Type::Generic(name, args) if name == "List" && args.len() == 1 => {
+                self.unsupported_json_encode_type(&args[0], visiting)
+            }
+            // `Map<String, V>` → JSON object, encodable when `V` is. Maps with
+            // non-`String` keys (which serialize as `[k, v]` pairs) are
+            // deferred to a follow-up slice.
+            Type::Generic(name, args)
+                if name == "Map" && args.len() == 2 && args[0] == Type::String =>
+            {
+                self.unsupported_json_encode_type(&args[1], visiting)
             }
             Type::Named(name) => {
                 // Back-edge guard for cyclic struct/enum graphs: returning

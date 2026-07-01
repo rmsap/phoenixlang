@@ -1545,9 +1545,11 @@ impl Interpreter {
     /// encoders; strings use the shared `phoenix_runtime::json_escape`; a
     /// struct emits an object with its fields in declaration order;
     /// `Option<T>` encodes as `null`/passthrough and other enums are
-    /// adjacently tagged (`{"type":"V","value":[…]}`). This covers scalars,
-    /// structs, `Option`, and non-generic enums; richer shapes (`List`,
-    /// `Map`, generic enums) arrive with later slices and are gated in sema.
+    /// adjacently tagged (`{"type":"V","value":[…]}`); a `List<T>` becomes an
+    /// array and a `Map<String, V>` an object (insertion order). This covers
+    /// scalars, structs, `Option`, non-generic enums, `List`, and
+    /// `Map<String, _>`; richer shapes (non-`String`-key maps, generic enums)
+    /// arrive with later slices and are gated in sema.
     fn json_encode_value(&self, value: &Value) -> Result<String> {
         match value {
             Value::String(s) => Ok(phoenix_runtime::json_escape(s)),
@@ -1592,6 +1594,33 @@ impl Interpreter {
                         parts.join(",")
                     ))
                 }
+            }
+            // `List<T>` → array.
+            Value::List(elems) => {
+                let mut parts = Vec::with_capacity(elems.len());
+                for e in elems {
+                    parts.push(self.json_encode_value(e)?);
+                }
+                Ok(format!("[{}]", parts.join(",")))
+            }
+            // `Map<String, V>` → object. Sema guarantees String keys for this
+            // slice, so the empty case is unambiguously `{}`.
+            Value::Map(entries) => {
+                let mut parts = Vec::with_capacity(entries.len());
+                for (k, v) in entries {
+                    let Value::String(ks) = k else {
+                        return error(
+                            "json.encode: Map with non-String keys is not supported yet"
+                                .to_string(),
+                        );
+                    };
+                    parts.push(format!(
+                        "{}:{}",
+                        phoenix_runtime::json_escape(ks),
+                        self.json_encode_value(v)?
+                    ));
+                }
+                Ok(format!("{{{}}}", parts.join(",")))
             }
             other => error(format!(
                 "json.encode does not support this value yet: {other}"

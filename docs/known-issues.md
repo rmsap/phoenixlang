@@ -141,6 +141,20 @@ machinery (Phase 2.5) is the seam it will extend.
 **Workaround:** declare JS interop with `extern js` signature blocks and supply the host
 module yourself (the Phase 2.5 mechanism); there is no automatic npm dependency fetch.
 **Target phase:** 3.1-js follow-up. Carved out at Phase 3.1 close (2026-07-01).
+### `json.encode` of a `Map` with non-`String` keys is not yet supported
+
+`json.encode` supports `Map<String, V>` (→ JSON object). Maps with other
+key types (`Map<Int, V>`, struct keys, …) are intended to serialize as an
+array of `[key, value]` pairs (the locked wire format), but that
+form is not implemented yet: `json.encode` of such a map is a clean sema
+error ("`json.encode` does not support `Map<Int, …>`"). The deferral is
+because the tree-walk interpreter encodes runtime `Value`s, which carry no
+key-type tag — so an *empty* non-`String`-key map can't be distinguished
+from an empty `String`-key map without threading the static type through
+the value-driven encoder. `String`-key maps have no such ambiguity (always
+an object, empty → `{}`). **Target:** a Phase 4.6 follow-up that adds the
+pairs form (likely alongside the wasm32-gc port). Surfaced 2026-06-28
+implementing `List`/`Map` encode (Phase 4.6 J3c).
 
 ### `json.encode` string escaping is not yet ported to the wasm32-gc backend
 

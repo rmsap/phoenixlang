@@ -900,17 +900,42 @@ fn intrinsic_json_decode_is_pending() {
 }
 
 #[test]
-fn json_encode_of_unsupported_type_is_a_clear_error() {
-    // A `List` argument is not yet supported and is rejected with a "does
-    // not support" diagnostic naming the type.
-    let entry = entry_only("import json\nfunction main() { print(json.encode([1, 2, 3])) }");
+fn json_encode_of_list_and_string_map_typechecks() {
+    // `List<T>` and `Map<String, V>` are encodable.
+    let entry = entry_only(
+        "import json\n\
+         function main() {\n  \
+           print(json.encode([1, 2, 3]))\n  \
+           let m: Map<String, Int> = {\"x\": 1}\n  \
+           print(json.encode(m))\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "List and Map<String,_> encode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_nonstring_key_map_is_unsupported() {
+    // Non-`String`-key maps (which serialize as `[k, v]` pairs) are deferred,
+    // so they are rejected with a "does not support" diagnostic.
+    let entry = entry_only(
+        "import json\n\
+         function main() {\n  \
+           let m: Map<Int, Int> = {1: 2}\n  \
+           print(json.encode(m))\n\
+         }",
+    );
     let analysis = check_modules(&[entry]);
     assert!(
         analysis
             .diagnostics
             .iter()
             .any(|d| d.message.contains("`json.encode` does not support")),
-        "expected an unsupported-type diagnostic for json.encode of a List, got: {:?}",
+        "expected an unsupported-type diagnostic for a non-String-key Map, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -961,21 +986,21 @@ fn json_encode_of_generic_enum_is_unsupported() {
 #[test]
 fn json_encode_of_enum_with_unsupported_variant_field_names_the_field_type() {
     // `unsupported_json_encode_type` recurses into enum *variant* field types:
-    // an enum whose own shape is fine but that carries a `List` payload must
-    // be rejected, and the diagnostic must name the variant field's type
-    // (`List<Int>`), not the enum — proving the walk descended into the
-    // variant.
+    // an enum whose own shape is fine but that carries an unsupported payload
+    // (a non-`String`-key `Map`) must be rejected, and the diagnostic must
+    // name the variant field's type (`Map`), not the enum — proving the walk
+    // descended into the variant.
     let entry = entry_only(concat!(
         "import json\n",
-        "enum Tagged { Plain Boxed(List<Int>) }\n",
-        "function main() { print(json.encode(Boxed([1, 2, 3]))) }",
+        "enum Tagged { Plain Boxed(Map<Int, Int>) }\n",
+        "function main() { print(json.encode(Boxed({1: 2}))) }",
     ));
     let analysis = check_modules(&[entry]);
     assert!(
         analysis.diagnostics.iter().any(|d| {
-            d.message.contains("`json.encode` does not support") && d.message.contains("List")
+            d.message.contains("`json.encode` does not support") && d.message.contains("Map")
         }),
-        "expected an unsupported-variant-field diagnostic naming `List`, got: {:?}",
+        "expected an unsupported-variant-field diagnostic naming `Map`, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -1026,20 +1051,21 @@ fn json_encode_of_recursive_option_self_type_typechecks() {
 #[test]
 fn json_encode_of_struct_with_unsupported_field_names_the_field_type() {
     // `unsupported_json_encode_type` recurses into struct fields: a struct
-    // whose own shape is fine but that carries a `List` field must be
-    // rejected, and the diagnostic must name the *field's* type (`List<Int>`),
-    // not the struct — proving the walk descended into the field.
+    // whose own shape is fine but that carries an unsupported field (a
+    // non-`String`-key `Map`) must be rejected, and the diagnostic must name
+    // the *field's* type (`Map`), not the struct — proving the walk descended
+    // into the field.
     let entry = entry_only(concat!(
         "import json\n",
-        "struct Bag { items: List<Int> }\n",
-        "function main() { print(json.encode(Bag([1, 2, 3]))) }",
+        "struct Bag { items: Map<Int, Int> }\n",
+        "function main() { print(json.encode(Bag({1: 2}))) }",
     ));
     let analysis = check_modules(&[entry]);
     assert!(
         analysis.diagnostics.iter().any(|d| {
-            d.message.contains("`json.encode` does not support") && d.message.contains("List")
+            d.message.contains("`json.encode` does not support") && d.message.contains("Map")
         }),
-        "expected an unsupported-field diagnostic naming `List`, got: {:?}",
+        "expected an unsupported-field diagnostic naming `Map`, got: {:?}",
         analysis.diagnostics
     );
 }
