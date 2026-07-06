@@ -9,6 +9,7 @@ Annotations ([4.5](./phase-4.md#45-annotation-system)) are the keystone for the 
 ## Recommended order
 
 - **In parallel from the start:** 3.1 Package Manager, 3.2 LSP gap-closing, 3.3 Formatter — all independent of each other and of Phase 4. The shared constraint is intra-Phase-3, not cross-phase: the formatter and LSP both consume whatever grammar the parser produces, so any new language surface (e.g. 4.5 annotations) lands before, or is followed up in, those tools.
+- **After 3.1:** [3.1.2 npm / JavaScript dependencies](#312-npm--javascript-package-dependencies) — the carved-out follow-up. Unlike the items above it is **not** independent of Phase 4: it touches compiler crates (sema, the WASM glue, the interpreters), so the [Phase 4.6 parallel-track hygiene](./phase-4.md#46-parallel-track-note) applies.
 - **Continuous:** 3.5 Error Message quality — the diagnostic-builder foundation already landed in 2.6, so this is an ongoing investment that improves with every release rather than a discrete milestone.
 - **On the stdlib track (Phase 4):** 4.5 Annotations goes first; see [Phase 4](./phase-4.md#recommended-order).
 
@@ -41,7 +42,7 @@ A `phoenix.toml`-driven package manager: declare a package and its dependencies,
 
 - **`phoenix test` is NOT in 3.1.** It belongs to the test framework ([Phase 4.9](./phase-4.md#49-test-framework)), which depends on annotations/async/HTTP/db. 3.1 ships `init` and `add`; `build`/`run`/`check` become dependency-aware. (The earlier `phoenix.toml (name, version, dependencies)` bullet listing `phoenix test` was aspirational; this supersedes it.)
 - **Registry + `phoenix publish` are deferred.** 3.1 is git-first; a central registry, search, and publishing ride a later phase (see [Phase 6.2](./phase-6.md)).
-- **The npm / `js-dependencies` slice is a carved-out follow-up, not a 3.1 close gate.** Phase 2.5 decision J deferred `import js "pkg"` string-source imports + `[js-dependencies]` to "Phase 3.1," but that slice (npm fetch, typings, bundling) is orthogonal to the Phoenix-package core and far larger. It rides a dedicated **3.1-js** follow-up once the core package manager works; the core close criteria below do not depend on it. The `extern js` import-section machinery (Phase 2.5) is the seam it will extend.
+- **The npm / `js-dependencies` slice is a carved-out follow-up, not a 3.1 close gate.** Phase 2.5 decision J deferred `import js "pkg"` string-source imports + `[js-dependencies]` to "Phase 3.1," but that slice (npm fetch, typings, bundling) is orthogonal to the Phoenix-package core and far larger. It rides the dedicated [§3.1.2](#312-npm--javascript-package-dependencies) follow-up once the core package manager works; the core close criteria below do not depend on it. The `extern js` import-section machinery (Phase 2.5) is the seam it will extend.
 
 ### PR sequence
 
@@ -86,7 +87,7 @@ Shipped a git-first, `phoenix.toml`-driven package manager end-to-end, in six re
 - **PR4.5 — Registry-readiness seams.** Explicit source-kind on `ResolvedPackage`/`LockedPackage` (a `PackageSource` enum and an untagged `LockedPackage` enum — no rev-inference, lockfile format unchanged) + an `available_versions` capability on `ManifestProvider` (default one-element set), so a registry + version solver is additive.
 - **PR5 — CLI.** `phoenix init [--name]` scaffolds a `[package]` manifest + a runnable root `main.phx`; `phoenix add <name> (--git … | --path …)` validates the source via the manifest schema, format-preservingly edits `phoenix.toml`, and atomically refreshes the lockfile (rolling the edit back on any resolution failure).
 
-**Design decisions** are recorded in [design-decisions.md §Phase 3.1](../design-decisions.md#phase-31-package-manager) (A–F). **Carve-outs** — a central registry, and the npm / `import js "pkg"` / `[js-dependencies]` slice (now a dedicated **3.1-js** follow-up) — are open in [known-issues.md](../known-issues.md). Verified by `cargo test --workspace` / `clippy --all-targets` / `fmt --check` clean.
+**Design decisions** are recorded in [design-decisions.md §Phase 3.1](../design-decisions.md#phase-31-package-manager) (A–F). **Carve-outs** — a central registry, and the npm / `import js "pkg"` / `[js-dependencies]` slice (now [§3.1.2](#312-npm--javascript-package-dependencies) below) — are open in [known-issues.md](../known-issues.md). Verified by `cargo test --workspace` / `clippy --all-targets` / `fmt --check` clean.
 
 ### Bugs closed in this phase (post-close review)
 
@@ -95,6 +96,51 @@ A review of the merged implementation surfaced three defects, all now fixed with
 - **Module identity could silently collide (miscompile).** Cross-package identity was a flat module path whose first segment was the bare dependency alias, so a dependency's root module (`import greet` → path `greet`) was indistinguishable from an entry-package top-level module `greet.phx`, and a **transitive** dependency aliased the same as an entry top-level module (e.g. both `util`) collapsed to one identity — the BFS dedup silently dropped one, and a dependency's `import util` could bind to the *entry's* `util`. Fixed by giving the package dimension a reserved, un-forgeable marker (`ModulePath::in_package`), realizing genuine `(package, module path)` identity ([design-decisions §Phase 3.1 E](../design-decisions.md#e-cross-package-identity-sema-is-package-aware-dependency-asts-stay-verbatim)); the marker is stripped for display so diagnostics are unchanged.
 - **A transitive git dependency behind a `path` dep fetched into the project tree.** The cache-vs-project-dir decision was made from the project's *direct* dependencies only, so an all-`path` project whose path dep transitively declared a git source cloned it under `<project>/git/…` instead of `$PHOENIX_HOME/cache`, violating the "never inside the project tree" invariant. Fixed by resolving the cache root **lazily** — only when a git source is actually reached, at any depth — which also stops a genuinely git-free project from needing `$PHOENIX_HOME`.
 - **`phoenix.lock` was written non-atomically.** A truncate-then-write could leave a corrupt lockfile on an interrupted write (and undermined `phoenix add`'s rollback guarantee). Fixed with an atomic temp-file + rename, so a failed write always leaves the previous lockfile intact.
+
+## 3.1.2 npm / JavaScript Package Dependencies
+
+**Status: scoped, not started.** The carved-out follow-up to [§3.1](#31-package-manager) (Phase 2.5 [decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)): let a Phoenix program depend on npm packages. **Depends on:** the §3.1 package manager (complete) and the Phase 2.5 `extern js` interop (complete). This item **does** touch the compiler backends (sema, cranelift glue, the interpreters), unlike §3.1 — so the [Phase 4.6 parallel-track hygiene](./phase-4.md#46-parallel-track-note) applies again to those crates.
+
+### Goal
+
+Let a `.phx` program bind to an npm package's exports — `extern js "left-pad" { function leftPad(s: String, n: Int) -> String }` — with the package declared in a `[js-dependencies]` manifest section. Phoenix wires the WASM glue to that module and emits a `package.json`; the developer's existing JS toolchain (`npm install` + Node/bundler) supplies the actual code. **Phoenix fetches and bundles nothing** (the BYO model — see the toolchain decision below).
+
+### The seam it extends (what exists today)
+
+The Phase 2.5 `extern js` machinery is already module-agnostic at the IR level, so this is *extending a prepared seam*, not new machinery:
+
+- `Op::ExternCall(module, name, args)` already carries the module; IR lowering and the native C-ABI symbol (`phx_extern_<module>__<name>`) already namespace by it.
+- The only hardcoding is (a) sema registers every extern under the ambient module `"js"` (`FunctionInfo.extern_js = Some(("js", name))` in `check_register.rs`), and (b) the WASM glue binds hosts *flatly* as `host.<name>` (`crates/phoenix-cranelift/src/wasm/glue.rs`).
+- Two code comments already anticipate this work: `wasm/glue.rs` ("if npm-package modules land (Phase 3.1), … this must become `host.<module>.<name>`") and the interpreter's `interpreter/mod.rs` ("npm-package modules arrive with the import-js grammar later").
+- `[dependencies]` parsing (`manifest.rs`) and the `deny_unknown_fields` `PhoenixConfig` (`config.rs`) are where `[js-dependencies]` hooks in. The Gen carve-out already rejects `extern js` / `JsValue` in schemas.
+
+### Design decisions (locked; full writeup lands in design-decisions.md §3.1.2 at close)
+
+- **Toolchain: BYO host modules — Phoenix fetches/bundles nothing.** `[js-dependencies]` records the intended packages/versions; the glue emits namespaced `host.<pkg>.<name>` bindings that `import` the package specifier; the *embedder's* `node_modules` + bundler/Node runtime resolves it. Phoenix emits a `package.json` from `[js-dependencies]` so `npm install` is one command. **Why:** preserves the self-contained, no-external-toolchain posture the [gix decision](#31-package-manager) protects (no required Node/npm/esbuild), and matches Phase 2.5 [decision K](../design-decisions.md#k-extern-declarations-are-signature-only-the-host-is-supplied-separately-no-inline-js-bodies) (host supplied by the embedder). Rejected: shelling out to npm+esbuild (hard Node toolchain dependency); a pure-Rust npm resolver + JS bundler (a multi-phase subsystem disproportionate to this slice). A future **opt-in** `phoenix build --bundle` (shell out to a bundler *if present*, never required) can layer on top later — out of scope here.
+- **Syntax: `extern js "specifier" { … }`.** Extend the existing `extern js` block with an optional module-specifier string; `extern js { … }` (no string) stays the ambient `js` host. It is the same construct (host-external signatures), just naming the module — the smallest, most localized grammar change. (Supersedes decision J's `import js "pkg"` sketch, which would require the `import` grammar to carry a string source *and* a signature block.) **Signature-only** per decision K — no inline JS bodies; generating signatures from a package's `@types` is a future follow-up, not v1.
+- **Backend scope: uniform mechanism-parity (A0).** `extern js "pkg"` compiles on all five backends; a *call* where no host is registered raises the existing [A0](../design-decisions.md#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary) "unbound host `(module.name)`" runtime error — identical to `extern js` today. npm-using programs stay portable source that only *does* something under a WASM+JS host; a stubbable extern rejoins the five-backend byte-identical matrix. (Rejected a compile-time gate on non-JS targets — it would break the "same source compiles everywhere" property `extern js` has.)
+
+### Scope boundaries (carved out, with forward pointers)
+
+- **Automatic npm fetch + bundling is out of scope** (the BYO decision). A future opt-in `--bundle` convenience layer, and/or a pure-Rust fetcher, ride a later follow-up.
+- **`@types` → Phoenix-signature generation is out of scope.** Signatures are hand-declared (decision K). A `.d.ts`-to-`extern js` generator is a separate future tool.
+- **No Phoenix-owned JS lockfile.** The developer's `package-lock.json` owns JS-dependency reproducibility; Phoenix does not duplicate it.
+
+### PR sequence
+
+1. **Grammar + AST + sema.** Extend the `extern js` block to carry an optional module-specifier string (absent ⇒ ambient `"js"`, unchanged); sema registers externs under `(specifier, name)` so the module flows to `Op::ExternCall`. Marshallability rules unchanged. Unit tests.
+2. **Backend namespacing.** Make the wasm-linear + wasm-gc glue and the required-host guard namespace host bindings as `host.<module>.<name>` (the already-TODO'd change); route the interpreters' extern dispatch by module; native already namespaces. A backend-matrix fixture with a named non-`js`, stubbable module (rejoins the byte-identical matrix).
+3. **`[js-dependencies]` + `package.json` emission.** Add the `[js-dependencies]` section to `PhoenixConfig` (npm name → version spec); on a wasm `phoenix build`, emit a `package.json` from it beside the glue; diagnose an `extern js "pkg"` whose module is not a declared js-dependency. Integration tests.
+4. **Close.** design-decisions.md §3.1.2 writeup; flip the [known-issues](../known-issues.md) npm entry from "carved out" to "implemented (BYO); auto-fetch/bundle deferred"; exit criteria + closeout.
+
+### Exit criteria for declaring Phase 3.1.2 complete
+
+- [ ] `extern js "specifier" { … }` parses (ambient `extern js { … }` unchanged); sema registers externs under the named module; marshallability diagnostics unchanged. Unit tests.
+- [ ] WASM glue (both sub-targets) binds hosts as `host.<module>.<name>` and the required-host guard is per-module; the interpreters dispatch externs by module; a named-module interop fixture runs on the backend matrix (stubbed hosts rejoin byte-identical parity).
+- [ ] `[js-dependencies]` parses and validates; a wasm build emits a `package.json` from it; an `extern js "pkg"` naming an undeclared js-dependency is diagnosed. Integration tests (tempdir).
+- [ ] Calling an npm extern with no host registered gives the A0 "unbound host" runtime error on native / the interpreters (no silent no-op); no compile-time gate.
+- [ ] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
+- [ ] design-decisions.md §3.1.2 records the locked decisions; the known-issues npm entry is updated; `phoenix.toml.example` documents `[js-dependencies]`.
 
 ## 3.2 Language Server Protocol (LSP)
 
