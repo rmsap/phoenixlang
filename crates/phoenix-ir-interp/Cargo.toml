@@ -13,6 +13,10 @@ phoenix-ir = { path = "../phoenix-ir" }
 # builtin routes through `phoenix_runtime::json_escape`, the single source
 # of truth shared with the compiled backends so JSON output is identical.
 phoenix-runtime = { path = "../phoenix-runtime" }
+# JSON DOM parsing for `json.decode`: the interpreter's `json.*` builtins
+# parse + navigate a `serde_json::Value` the same way the compiled runtime
+# does, so decode is byte-identical.
+serde_json.workspace = true
 # Float formatting — shared shortest-roundtrip d2s. The IR interpreter's
 # Float Display must match the tree-walk interpreter and
 # `phoenix-runtime::format_f64` byte-for-byte so the backend matrix stays

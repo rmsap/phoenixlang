@@ -200,6 +200,11 @@ pub struct IrModule {
     /// reachable from a `json.encode(value)` call; each `json.encode` site
     /// lowers to an `Op::Call` of the encoder for its argument's type.
     pub json_encoders: HashMap<String, FuncId>,
+    /// Synthesized JSON decoder *entry* registry, keyed by the
+    /// decoded type's encode-key. The entry takes the input `String`, parses
+    /// it, and dispatches to the per-type node decoder; each `json.decode<T>`
+    /// site lowers to an `Op::Call` of `json_decoders[key(T)]`.
+    pub json_decoders: HashMap<String, FuncId>,
     /// Default-argument wrapper registry, keyed by (callee FuncId,
     /// param index). Populated by
     /// [`crate::default_wrappers::synthesize_default_wrappers`] for
@@ -492,6 +497,7 @@ impl IrModule {
             function_index: HashMap::new(),
             method_index: HashMap::new(),
             json_encoders: HashMap::new(),
+            json_decoders: HashMap::new(),
             default_wrapper_index: HashMap::new(),
             dyn_vtables: HashMap::new(),
             traits: HashMap::new(),

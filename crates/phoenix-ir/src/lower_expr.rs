@@ -1007,6 +1007,24 @@ impl<'a> LoweringContext<'a> {
                 Some(mc.span),
             );
         }
+        // `json.decode<T>(text)`: sema recorded the target type `T`. Dispatch
+        // to the synthesized decoder *entry* (which parses + decodes).
+        if let Some(target) = self.check.json_decode_types.get(&mc.span).cloned() {
+            let arg_val = self.lower_expr(&mc.args[0]);
+            let key = crate::json_synth::encode_type_key(&target);
+            let decoder_id = *self.module.json_decoders.get(&key).unwrap_or_else(|| {
+                unreachable!(
+                    "json.decode site has no synthesized decoder for `{key}` — \
+                     demand collection and dispatch are out of sync"
+                )
+            });
+            let result_type = self.expr_type(&mc.span);
+            return self.emit(
+                Op::Call(decoder_id, Vec::new(), vec![arg_val]),
+                result_type,
+                Some(mc.span),
+            );
+        }
         // Phase 2.7 decision F: recognize `List.builder()` /
         // `Map.builder()` *before* evaluating the receiver. Phoenix's
         // parser models `Type.method(...)` as a `MethodCallExpr`

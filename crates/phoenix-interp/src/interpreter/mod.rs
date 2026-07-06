@@ -77,6 +77,15 @@ pub(crate) fn err_val(val: Value) -> Value {
     Value::EnumVariant("Result".to_string(), "Err".to_string(), vec![val])
 }
 
+/// Constructs a `JsonError::<variant>(message)` value.
+fn json_error_value(variant: &str, msg: &str) -> Value {
+    Value::EnumVariant(
+        "JsonError".to_string(),
+        variant.to_string(),
+        vec![Value::String(msg.to_string())],
+    )
+}
+
 /// Creates a `RuntimeError` for wrong argument count on a method call.
 pub(crate) fn arg_count_error(method: &str, expected: usize, got: usize) -> RuntimeError {
     let noun = if expected == 1 {
@@ -228,6 +237,11 @@ pub struct Interpreter {
     /// `json.<method>` sites are encode calls.
     pub(crate) json_encode_spans: std::collections::HashSet<Span>,
 
+    /// Target type `T` at each `json.decode<T>(text)` call, drained from
+    /// sema. The tree-walk interpreter decodes a `serde_json`
+    /// DOM into a typed `Value` guided by this type.
+    pub(crate) json_decode_types: HashMap<Span, phoenix_sema::types::Type>,
+
     /// Per-module visibility scopes (drained from sema's `Analysis`).
     /// Used by [`Interpreter::qualify`] to translate user-source bare
     /// names into qualified registry keys (mirrors what the IR layer
@@ -336,6 +350,7 @@ impl Interpreter {
             lambda_captures: HashMap::new(),
             namespace_call_targets: HashMap::new(),
             json_encode_spans: std::collections::HashSet::new(),
+            json_decode_types: HashMap::new(),
             output,
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),
@@ -1628,6 +1643,47 @@ impl Interpreter {
         }
     }
 
+    /// Decode `text` into a `Result<T, JsonError>` runtime value guided by
+    /// the target type `ty`. Parse errors become
+    /// `Err(ParseError(msg))`; a shape mismatch becomes `Err(TypeMismatch)`.
+    /// Never panics — malformed input is always a returned `Err`.
+    fn json_decode(&self, text: &str, ty: &phoenix_sema::types::Type) -> Value {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Err(e) => err_val(json_error_value("ParseError", &e.to_string())),
+            Ok(dom) => self.json_decode_value(&dom, ty),
+        }
+    }
+
+    /// Build a `Result<T, JsonError>` from a parsed DOM node and target type.
+    /// This slice handles the scalar types.
+    fn json_decode_value(&self, dom: &serde_json::Value, ty: &phoenix_sema::types::Type) -> Value {
+        use phoenix_sema::types::Type;
+        let mismatch = |name: &str| err_val(json_error_value("TypeMismatch", name));
+        match ty {
+            Type::Int => match dom.as_i64() {
+                Some(i) => ok_val(Value::Int(i)),
+                None => mismatch("expected Int"),
+            },
+            // A JSON integer is a valid Float too.
+            Type::Float => match dom.as_f64() {
+                Some(f) => ok_val(Value::Float(f)),
+                None => mismatch("expected Float"),
+            },
+            Type::Bool => match dom.as_bool() {
+                Some(b) => ok_val(Value::Bool(b)),
+                None => mismatch("expected Bool"),
+            },
+            Type::String => match dom.as_str() {
+                Some(s) => ok_val(Value::String(s.to_string())),
+                None => mismatch("expected String"),
+            },
+            other => err_val(json_error_value(
+                "TypeMismatch",
+                &format!("json.decode does not support {other} yet"),
+            )),
+        }
+    }
+
     /// Evaluates a method call, dispatching to built-in type methods or
     /// user-defined methods.
     fn eval_method_call(&mut self, mc: &MethodCallExpr) -> Result<Value> {
@@ -1653,6 +1709,17 @@ impl Interpreter {
         if self.json_encode_spans.contains(&mc.span) {
             let value = self.eval_expr(&mc.args[0])?;
             return Ok(Value::String(self.json_encode_value(&value)?));
+        }
+        // `json.decode<T>(text)`: parse the string and build a
+        // `Result<T, JsonError>` value guided by the target type `T`.
+        if let Some(ty) = self.json_decode_types.get(&mc.span).cloned() {
+            let text = match self.eval_expr(&mc.args[0])? {
+                Value::String(s) => s,
+                other => {
+                    return error(format!("json.decode expects a String, got {other}"));
+                }
+            };
+            return Ok(self.json_decode(&text, &ty));
         }
         // Recognize the builtin static constructors `List.builder()` and
         // `Map.builder()` before evaluating the object. The parser models

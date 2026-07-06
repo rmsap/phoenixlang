@@ -24,3 +24,7 @@ crate-type = ["staticlib", "rlib", "cdylib"]
 
 [dependencies]
 ryu.workspace = true
+# JSON DOM parsing for `json.decode`. The synthesized per-type
+# decoders navigate a `serde_json::Value` DOM via the C-ABI primitives in
+# `json.rs`; per-type logic stays in IR, only generic parsing is native.
+serde_json.workspace = true

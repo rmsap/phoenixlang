@@ -2761,6 +2761,7 @@ dependencies = [
  "phoenix-runtime",
  "phoenix-sema",
  "ryu",
+ "serde_json",
 ]
 
 [[package]]
@@ -2772,6 +2773,7 @@ dependencies = [
  "phoenix-lexer",
  "phoenix-modules",
  "phoenix-parser",
+ "phoenix-runtime",
  "phoenix-sema",
 ]
 
@@ -2788,6 +2790,7 @@ dependencies = [
  "phoenix-runtime",
  "phoenix-sema",
  "ryu",
+ "serde_json",
 ]
 
 [[package]]
@@ -2842,6 +2845,7 @@ name = "phoenix-runtime"
 version = "0.2.0"
 dependencies = [
  "ryu",
+ "serde_json",
 ]
 
 [[package]]

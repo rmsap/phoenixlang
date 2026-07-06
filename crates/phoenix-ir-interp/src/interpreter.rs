@@ -89,14 +89,20 @@ pub struct IrInterpreter<'m> {
     /// call — a host callback that re-enters Phoenix and calls another extern
     /// must still find the registry. See [`IrInterpreter::call_extern_host`].
     host_registry: Rc<phoenix_common::host::HostRegistry>,
-    /// Phoenix closures handed to the host as callbacks (Phase 2.5), indexed by
+    /// Phoenix closures handed to the host as callbacks, indexed by
     /// [`phoenix_common::host::CallbackHandle`]; invoked back through the
     /// [`phoenix_common::host::HostContext`] bridge. Retained for the
     /// interpreter's lifetime (no event loop releases them).
     host_callbacks: Vec<IrValue>,
+    /// JSON DOM arena for `json.decode`. The `json.*` builtins
+    /// return `i64` indices into this vector — mirroring the compiled
+    /// runtime's opaque pointer handles. Grows for the interpreter's
+    /// lifetime (`json.free` is a no-op); a `phoenix run-ir` process is
+    /// short-lived, so no reclamation is needed.
+    pub(crate) json_arena: Vec<crate::builtins::JsonRoot>,
 }
 
-/// Lets a host function call back into Phoenix (Phase 2.5) via the IR
+/// Lets a host function call back into Phoenix via the IR
 /// interpreter's normal closure-call path. Synchronous — the interpreter has no
 /// event loop (the callbacks-only async model).
 impl HostContext for IrInterpreter<'_> {
@@ -130,6 +136,7 @@ impl<'m> IrInterpreter<'m> {
             depth: 0,
             host_registry: Rc::new(phoenix_common::host::HostRegistry::new()),
             host_callbacks: Vec::new(),
+            json_arena: Vec::new(),
         }
     }
 

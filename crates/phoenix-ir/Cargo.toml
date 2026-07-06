@@ -14,4 +14,8 @@ phoenix-sema = { path = "../phoenix-sema" }
 
 [dev-dependencies]
 phoenix-lexer = { path = "../phoenix-lexer" }
+# Test-only: `json_synth.rs` mirrors the runtime's node-kind ABI constants
+# (`JSON_KIND_*`) and a lockstep test asserts the mirror can't drift — the
+# same scheme as the list-header layout check.
+phoenix-runtime = { path = "../phoenix-runtime" }
 insta = { workspace = true }

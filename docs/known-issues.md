@@ -156,26 +156,28 @@ an object, empty → `{}`). **Target:** a Phase 4.6 follow-up that adds the
 pairs form (likely alongside the wasm32-gc port). Surfaced 2026-06-28
 implementing `List`/`Map` encode (Phase 4.6 J3c).
 
-### `json.encode` string escaping is not yet ported to the wasm32-gc backend
+### JSON serialization is not yet ported to the wasm32-gc backend
 
-`json.encode` (Phase 4.6) is byte-identical across four backends — the AST
-interpreter, the IR interpreter, native, and wasm32-linear (which rides the
-embedded `phoenix_runtime.wasm`'s `phx_json_escape_str`). The **wasm32-gc**
-backend reimplements runtime string helpers in hand-written WASM-GC rather
-than embedding the runtime, so it needs its own `phx_json_escape_str` port —
-a byte-loop string transform in the style of `synthesize_str_concat`
-(`crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs`). Until that
-lands, building a program that calls `json.encode` with `--target wasm32-gc`
-fails with a clean diagnostic:
+`json.encode` and `json.decode` (Phase 4.6) are byte-identical across four
+backends — the AST interpreter, the IR interpreter, native, and
+wasm32-linear (which rides the embedded `phoenix_runtime.wasm`). The
+**wasm32-gc** backend reimplements runtime helpers in hand-written WASM-GC
+rather than embedding the runtime, so it needs its own ports of the two
+runtime seams JSON relies on:
 
-```
-wasm32-gc: builtin `json.escapeString` not yet supported. Covered: …
-```
+- **Encode:** `phx_json_escape_str` — a byte-loop string transform in the
+  style of `synthesize_str_concat`
+  (`crates/phoenix-cranelift/src/wasm/wasm_gc/string_helpers.rs`).
+- **Decode:** the `serde_json` DOM primitives (`phx_json_parse` / `kind` /
+  `as_*` / …). Since wasm32-gc doesn't embed the runtime cdylib, this most
+  likely means a small companion wasip1 module satisfying those imports.
 
-and the `json_encode_*` matrix fixtures carry a `skip_wasm_gc:`
+Until they land, building a program that calls `json.encode` / `json.decode`
+with `--target wasm32-gc` fails with a clean "builtin not yet supported"
+diagnostic, and the `json_*` matrix fixtures carry a `skip_wasm_gc:`
 annotation. **Target:** a Phase 4.6 wasm32-gc follow-up slice (delete the
-skip annotations when it lands). Surfaced 2026-06-27 implementing
-`json.encode` (Phase 4.6 J3a).
+skip annotations when it lands). Surfaced 2026-06-27 (encode) / 2026-07-01
+(decode) implementing Phase 4.6 (J3a / J4a).
 
 ### An absent optional field serializes as omitted (TS) vs `null` (Go/Python)
 

@@ -180,6 +180,62 @@ fn translate_builtin(
                 &[recv[0], recv[1]],
             ))
         }
+        // JSON decode DOM primitives for synthesized decoders.
+        "json.parse" => {
+            let s = get_val(state, args[0])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_parse,
+                &[s[0], s[1]],
+            ))
+        }
+        "json.free" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_free, &[h]))
+        }
+        "json.parseFailed" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_parse_failed,
+                &[h],
+            ))
+        }
+        "json.parseError" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_parse_error,
+                &[h],
+            ))
+        }
+        "json.root" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_root, &[h]))
+        }
+        "json.kind" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_kind, &[h]))
+        }
+        "json.asInt" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_as_int, &[h]))
+        }
+        "json.asFloat" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_as_float, &[h]))
+        }
+        "json.asBool" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_as_bool, &[h]))
+        }
+        "json.asStr" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(builder, ctx, ctx.runtime.json_as_str, &[h]))
+        }
         // String methods.
         _ if name.starts_with("String.") => translate_string_method(
             builder,

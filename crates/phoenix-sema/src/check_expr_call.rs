@@ -700,7 +700,7 @@ impl Checker {
     fn check_json_namespace_call(&mut self, mc: &MethodCallExpr) -> Type {
         match mc.method.as_str() {
             "encode" => self.check_json_encode(mc),
-            // `json.decode<T>` lands in a later Phase 4.6 slice.
+            "decode" => self.check_json_decode(mc),
             _ => {
                 self.error(
                     format!(
@@ -712,6 +712,89 @@ impl Checker {
                 self.check_call_args(&mc.args);
                 Type::Error
             }
+        }
+    }
+
+    /// Type-check `json.decode<T>(text) -> Result<T, JsonError>`. `T` comes
+    /// from an explicit turbofish (`json.decode<Int>(s)`); contextual
+    /// inference (`let x: Int = json.decode(s)?`) lands in a later slice.
+    /// Records `T` for the IR decoder-synthesis pass.
+    fn check_json_decode(&mut self, mc: &MethodCallExpr) -> Type {
+        let json_error = Type::Named("JsonError".to_string());
+        // Argument: exactly one `String`. Track well-formedness so we only
+        // record the decode type (which downstream IR lowering and the
+        // interpreters key off, unconditionally indexing `args[0]`) when the
+        // call is actually decodable.
+        let mut args_ok = true;
+        if mc.args.len() != 1 {
+            self.error(
+                format!("json.decode() takes 1 argument, got {}", mc.args.len()),
+                mc.span,
+            );
+            self.check_call_args(&mc.args);
+            args_ok = false;
+        } else {
+            let arg_ty = self.check_expr(&mc.args[0]);
+            if !arg_ty.is_error() && arg_ty != Type::String {
+                self.error(
+                    format!("json.decode() expects a `String` argument, got `{arg_ty}`"),
+                    mc.args[0].span(),
+                );
+                args_ok = false;
+            }
+        }
+        // Target type `T` from the turbofish.
+        let Some(target) = mc.type_args.first() else {
+            self.error(
+                "json.decode requires an explicit type argument, e.g. `json.decode<Int>(s)`"
+                    .to_string(),
+                mc.span,
+            );
+            return Type::Error;
+        };
+        if mc.type_args.len() > 1 {
+            self.error(
+                "json.decode takes a single type argument".to_string(),
+                mc.span,
+            );
+        }
+        let t = self.resolve_type_expr(target);
+        if t.is_error() {
+            return Type::Error;
+        }
+        if let Some(unsupported) = self.unsupported_json_decode_type(&t) {
+            self.error(
+                format!(
+                    "`json.decode` does not support `{unsupported}` yet — \
+                     supported today: Int, Float, Bool, String \
+                     (more types land in later Phase 4.6 slices)"
+                ),
+                mc.span,
+            );
+        } else if args_ok {
+            // Only a fully well-formed call (one `String` arg, supported `T`)
+            // is handed to synthesis/lowering. A malformed call still returns
+            // the `Result<T, JsonError>` type for error recovery, but records
+            // no decode site — so the `args[0]`-indexing lowering path is
+            // unreachable without an accompanying sema error.
+            self.json_decode_types.insert(mc.span, t.clone());
+        }
+        Type::Generic("Result".to_string(), vec![t, json_error])
+    }
+
+    /// Returns the name of the first JSON-undecodable type reachable from
+    /// `ty`, or `None` when `ty` is decodable with today's surface. This
+    /// slice supports the scalars only; structs, `Option`, enums, `List`,
+    /// and `Map` are added by later slices.
+    //
+    // TODO(Phase 4.6): when composite targets land, this walk turns
+    // recursive — thread a cycle-tracking accumulator (a `&mut
+    // HashSet<String>` of struct/enum names in progress) through it so a
+    // self-referential struct can't loop, mirroring the encode-side gate.
+    fn unsupported_json_decode_type(&self, ty: &Type) -> Option<String> {
+        match ty {
+            Type::Int | Type::Float | Type::Bool | Type::String => None,
+            other => Some(other.to_string()),
         }
     }
 

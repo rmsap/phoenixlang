@@ -1,0 +1,74 @@
+// json.decode<T> for scalar T: Ok on a matching JSON value, Err(TypeMismatch)
+// on a wrong kind, Err(ParseError) on malformed input. Never panics.
+
+import json
+
+// Surfaces the error *message*, not just the variant: the ParseError text
+// comes straight from serde_json, so printing it pins that every backend's
+// parse failure is byte-identical (native/wasm parse via `from_slice`, the
+// interpreters via `from_str` — serde reports both the same).
+function describeErr(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function main() {
+  let a: Result<Int, JsonError> = json.decode<Int>("42")
+  match a { Ok(v) -> print(toString(v)) Err(e) -> print(describeErr(e)) }
+
+  let b: Result<Int, JsonError> = json.decode<Int>("\"hi\"")
+  match b { Ok(v) -> print(toString(v)) Err(e) -> print(describeErr(e)) }
+
+  let c: Result<Int, JsonError> = json.decode<Int>("nope")
+  match c { Ok(v) -> print(toString(v)) Err(e) -> print(describeErr(e)) }
+
+  let d: Result<String, JsonError> = json.decode<String>("\"he\\\"llo\"")
+  match d { Ok(v) -> print(v) Err(e) -> print(describeErr(e)) }
+
+  let e: Result<Bool, JsonError> = json.decode<Bool>("true")
+  match e { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  let f: Result<Float, JsonError> = json.decode<Float>("3.5")
+  match f { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  let g: Result<Float, JsonError> = json.decode<Float>("7")
+  match g { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  // `null` and container kinds against a scalar target: distinct kind tags,
+  // both must land on TypeMismatch identically across backends.
+  let h: Result<Int, JsonError> = json.decode<Int>("null")
+  match h { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  let i: Result<Int, JsonError> = json.decode<Int>("[1]")
+  match i { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  // Each scalar target has its own `expected <T>` error branch in the
+  // synthesized decoder — exercise the wrong-kind path per type so a
+  // mismatched message can't slip through on any one of them.
+  let j: Result<Bool, JsonError> = json.decode<Bool>("1")
+  match j { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  let k: Result<Float, JsonError> = json.decode<Float>("\"x\"")
+  match k { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  let l: Result<String, JsonError> = json.decode<String>("5")
+  match l { Ok(v) -> print(v) Err(x) -> print(describeErr(x)) }
+
+  // Number-kind boundary: a fractional number and an Int-overflowing number
+  // are both KIND_FLOAT, not KIND_INT — the synthesized decoders reject an
+  // Int target via the kind tag while the tree-walk interpreter rejects via
+  // as_i64(); these pin that the two paths agree.
+  let m: Result<Int, JsonError> = json.decode<Int>("1.5")
+  match m { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  let n: Result<Int, JsonError> = json.decode<Int>("99999999999999999999")
+  match n { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+
+  // The remaining container kind (object) against a scalar target
+  // (`{{`/`}}` are the string-interpolation escapes for literal braces).
+  let o: Result<Int, JsonError> = json.decode<Int>("{{}}")
+  match o { Ok(v) -> print(toString(v)) Err(x) -> print(describeErr(x)) }
+}

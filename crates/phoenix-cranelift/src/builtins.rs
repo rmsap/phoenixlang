@@ -78,6 +78,26 @@ pub struct RuntimeFunctions {
     pub str_to_upper: FuncId,
     /// `phx_json_escape_str(ptr, len) -> (ptr, len).
     pub json_escape_str: FuncId,
+    /// `phx_json_parse(ptr, len) -> i64` (root handle) — Phase 4.6.
+    pub json_parse: FuncId,
+    /// `phx_json_free(i64)`.
+    pub json_free: FuncId,
+    /// `phx_json_parse_failed(i64) -> i8`.
+    pub json_parse_failed: FuncId,
+    /// `phx_json_parse_error(i64) -> (ptr, len)`.
+    pub json_parse_error: FuncId,
+    /// `phx_json_root(i64) -> i64`.
+    pub json_root: FuncId,
+    /// `phx_json_kind(i64) -> i64`.
+    pub json_kind: FuncId,
+    /// `phx_json_as_int(i64) -> i64`.
+    pub json_as_int: FuncId,
+    /// `phx_json_as_float(i64) -> f64`.
+    pub json_as_float: FuncId,
+    /// `phx_json_as_bool(i64) -> i8`.
+    pub json_as_bool: FuncId,
+    /// `phx_json_as_str(i64) -> (ptr, len)`.
+    pub json_as_str: FuncId,
     /// `phx_str_index_of(p1, l1, p2, l2) -> i64`.
     pub str_index_of: FuncId,
     /// `phx_str_replace(p1, l1, p2, l2, p3, l3) -> (ptr, len)`.
@@ -222,6 +242,28 @@ impl RuntimeFunctions {
             str_to_lower: declare_str_transform(module, "phx_str_to_lower", call_conv)?,
             str_to_upper: declare_str_transform(module, "phx_str_to_upper", call_conv)?,
             json_escape_str: declare_str_transform(module, "phx_json_escape_str", call_conv)?,
+            json_parse: declare_func(module, "phx_json_parse", &[I64, I64], &[I64], call_conv)?,
+            json_free: declare_func(module, "phx_json_free", &[I64], &[], call_conv)?,
+            json_parse_failed: declare_func(
+                module,
+                "phx_json_parse_failed",
+                &[I64],
+                &[I8],
+                call_conv,
+            )?,
+            json_parse_error: declare_func(
+                module,
+                "phx_json_parse_error",
+                &[I64],
+                &[I64, I64],
+                call_conv,
+            )?,
+            json_root: declare_func(module, "phx_json_root", &[I64], &[I64], call_conv)?,
+            json_kind: declare_func(module, "phx_json_kind", &[I64], &[I64], call_conv)?,
+            json_as_int: declare_func(module, "phx_json_as_int", &[I64], &[I64], call_conv)?,
+            json_as_float: declare_func(module, "phx_json_as_float", &[I64], &[F64], call_conv)?,
+            json_as_bool: declare_func(module, "phx_json_as_bool", &[I64], &[I8], call_conv)?,
+            json_as_str: declare_func(module, "phx_json_as_str", &[I64], &[I64, I64], call_conv)?,
             str_index_of: declare_func(
                 module,
                 "phx_str_index_of",

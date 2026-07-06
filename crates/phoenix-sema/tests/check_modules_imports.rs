@@ -884,17 +884,149 @@ fn intrinsic_json_namespace_aliased_binds() {
 }
 
 #[test]
-fn intrinsic_json_decode_is_pending() {
-    // `json.decode` is not implemented until a later Phase 4.6 slice; it
-    // reports a clean "not available yet" diagnostic.
+fn json_decode_scalar_typechecks_to_result() {
+    // `json.decode<Int>(s)` type-checks to `Result<Int, JsonError>`.
+    let entry = entry_only(
+        "import json\n\
+         function main() {\n  \
+           let r: Result<Int, JsonError> = json.decode<Int>(\"5\")\n  \
+           match r { Ok(v) -> print(toString(v)) Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "json.decode<Int> should type-check to Result<Int, JsonError>, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_via_aliased_namespace_binds_and_records() {
+    // `import json as j`: the alias dispatches to the same intrinsic (like
+    // the encode aliasing test above), and the decode site is recorded for
+    // IR decoder synthesis exactly as with the bare name.
+    let entry = entry_only(
+        "import json as j\n\
+         function main() {\n  \
+           let r: Result<Int, JsonError> = j.decode<Int>(\"5\")\n  \
+           match r { Ok(v) -> print(toString(v)) Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "j.decode<Int> via the alias should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+    assert_eq!(
+        analysis.module.json_decode_types.len(),
+        1,
+        "the aliased decode call must be recorded as a decode site"
+    );
+}
+
+#[test]
+fn json_decode_without_type_argument_is_an_error() {
+    // Without an explicit turbofish, `json.decode` cannot resolve `T`.
     let entry = entry_only("import json\nfunction main() { json.decode(\"x\") }");
     let analysis = check_modules(&[entry]);
     assert!(
         analysis
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("`json.decode` is not available yet")),
-        "expected the json.decode-pending diagnostic, got: {:?}",
+            .any(|d| d.message.contains("requires an explicit type argument")),
+        "expected the missing-type-argument diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_with_wrong_argument_count_is_an_error() {
+    // `json.decode` takes exactly one argument; zero (or two) is rejected
+    // even though the turbofish resolves `T`.
+    let entry = entry_only("import json\nfunction main() { json.decode<Int>() }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("json.decode() takes 1 argument")),
+        "expected the argument-count diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_with_two_arguments_is_an_error() {
+    // The other side of the argument-count check: too many arguments,
+    // with recovery type-checking still applied to each of them.
+    let entry = entry_only("import json\nfunction main() { json.decode<Int>(\"a\", \"b\") }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("json.decode() takes 1 argument, got 2")),
+        "expected the argument-count diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_with_non_string_argument_is_an_error() {
+    // A non-`String` argument is rejected — and, crucially, the call must
+    // NOT be recorded as a decode site: IR lowering and the interpreters
+    // index `args[0]` unconditionally for recorded sites, so a malformed
+    // call slipping through would be a downstream panic, not a diagnostic.
+    let entry = entry_only("import json\nfunction main() { json.decode<Int>(5) }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("expects a `String` argument")),
+        "expected the argument-type diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+    assert!(
+        analysis.module.json_decode_types.is_empty(),
+        "a malformed json.decode call must not be recorded as a decode site"
+    );
+}
+
+#[test]
+fn json_decode_with_multiple_type_arguments_is_an_error() {
+    // A single turbofish type argument names `T`; more is rejected.
+    let entry = entry_only("import json\nfunction main() { json.decode<Int, Bool>(\"5\") }");
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("json.decode takes a single type argument")),
+        "expected the too-many-type-arguments diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_unsupported_type_is_a_clear_error() {
+    // This slice decodes scalars only; a struct target is rejected.
+    let entry = entry_only(
+        "import json\n\
+         struct P { x: Int }\n\
+         function main() {\n  \
+           let r: Result<P, JsonError> = json.decode<P>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.decode` does not support")),
+        "expected an unsupported-type diagnostic for json.decode of a struct, got: {:?}",
         analysis.diagnostics
     );
 }

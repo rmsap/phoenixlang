@@ -247,6 +247,12 @@ pub struct ResolvedModule {
     ///
     /// Shares the [`Span`]-keying caveat noted on [`Self::call_type_args`].
     pub json_encode_types: HashMap<Span, Type>,
+    /// Target type `T` at each `json.decode<T>(text)` call site, keyed by the
+    /// `MethodCallExpr`'s source span. The IR JSON-decode
+    /// synthesis pass reads this to synthesize a per-`T` decoder and dispatch
+    /// each call site. Shares the [`Span`]-keying caveat on
+    /// [`Self::call_type_args`].
+    pub json_decode_types: HashMap<Span, Type>,
     /// Resolved type annotation for each `let` binding that carried
     /// one, keyed by the `VarDecl`'s source span. Absent entries mean
     /// the binding was unannotated.
@@ -704,6 +710,7 @@ pub(crate) fn build_from_checker(program: &Program, mut checker: Checker) -> Ana
     rm.call_type_args = std::mem::take(&mut checker.call_type_args);
     rm.namespace_call_targets = std::mem::take(&mut checker.namespace_call_targets);
     rm.json_encode_types = std::mem::take(&mut checker.json_encode_types);
+    rm.json_decode_types = std::mem::take(&mut checker.json_decode_types);
     rm.var_annotation_types = std::mem::take(&mut checker.var_annotation_types);
     rm.lambda_captures = std::mem::take(&mut checker.lambda_captures);
     // ── Module-scope handoff: flatten ModuleScope into a plain
@@ -750,6 +757,7 @@ fn empty_resolved_module() -> ResolvedModule {
         call_type_args: HashMap::new(),
         namespace_call_targets: HashMap::new(),
         json_encode_types: HashMap::new(),
+        json_decode_types: HashMap::new(),
         var_annotation_types: HashMap::new(),
         lambda_captures: HashMap::new(),
         module_scopes: HashMap::new(),

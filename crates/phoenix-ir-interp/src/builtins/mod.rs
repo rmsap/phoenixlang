@@ -46,7 +46,7 @@ pub(crate) fn dispatch(
                     "Result" => option_result::builtin_result(interp, method, args),
                     "ListBuilder" => collections::builtin_list_builder(method, args),
                     "MapBuilder" => collections::builtin_map_builder(method, args),
-                    "json" => builtin_json(method, args),
+                    "json" => builtin_json(interp, method, args),
                     _ => error(format!("unknown builtin type: {type_name}")),
                 }
             } else {
@@ -56,15 +56,135 @@ pub(crate) fn dispatch(
     }
 }
 
-/// Dispatch the intrinsic `json.*` builtins emitted by the JSON encoder
-/// synthesis.
-fn builtin_json(method: &str, args: Vec<IrValue>) -> Result<IrValue> {
+/// A parsed JSON DOM root in the interpreter's `json_arena`: the tree, or
+/// the captured parse-error message. Mirrors the compiled runtime's opaque
+/// pointer handles; handles are the arena index, passed through IR as
+/// `i64`. A root doubles as its own top-level node — `json.root` returns
+/// the handle unchanged rather than cloning the tree; distinct child-node
+/// handles arrive with the composite-decode slices.
+pub(crate) struct JsonRoot(std::result::Result<serde_json::Value, String>);
+
+/// Dispatch the intrinsic `json.*` builtins emitted by the JSON encode /
+/// decode synthesis. Encode's `escapeString` is pure; the decode builtins
+/// operate over the interpreter's DOM arena.
+fn builtin_json(
+    interp: &mut IrInterpreter<'_>,
+    method: &str,
+    args: Vec<IrValue>,
+) -> Result<IrValue> {
+    use phoenix_runtime::json as rt;
     match method {
         "escapeString" => match args.as_slice() {
             [IrValue::String(s)] => Ok(IrValue::String(phoenix_runtime::json_escape(s))),
             _ => error("json.escapeString expects a single string argument".to_string()),
         },
+        "parse" => {
+            let s = json_str_arg(&args, "json.parse")?;
+            let parsed = serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string());
+            interp.json_arena.push(JsonRoot(parsed));
+            Ok(IrValue::Int((interp.json_arena.len() - 1) as i64))
+        }
+        "free" => Ok(IrValue::Void), // arena grows for the interpreter's lifetime
+        "parseFailed" => {
+            let failed = json_handle(interp, &args, "json.parseFailed")?.0.is_err();
+            Ok(IrValue::Bool(failed))
+        }
+        "parseError" => {
+            let msg = match &json_handle(interp, &args, "json.parseError")?.0 {
+                Err(m) => m.clone(),
+                Ok(_) => String::new(),
+            };
+            Ok(IrValue::String(msg))
+        }
+        "root" => {
+            // A root doubles as its own top-level node (`json_node` resolves
+            // the parsed tree directly), so hand the handle back unchanged —
+            // no tree clone. Still bounds-checked like every other use.
+            let h = json_handle_arg(&args, "json.root")?;
+            if interp.json_arena.get(h).is_none() {
+                return error("json.root: invalid JSON handle".to_string());
+            }
+            Ok(IrValue::Int(h as i64))
+        }
+        "kind" => {
+            let v = json_node(interp, &args, "json.kind")?;
+            let kind = match v {
+                serde_json::Value::Null => rt::JSON_KIND_NULL,
+                serde_json::Value::Bool(_) => rt::JSON_KIND_BOOL,
+                serde_json::Value::Number(n) if n.is_i64() => rt::JSON_KIND_INT,
+                serde_json::Value::Number(_) => rt::JSON_KIND_FLOAT,
+                serde_json::Value::String(_) => rt::JSON_KIND_STRING,
+                serde_json::Value::Array(_) => rt::JSON_KIND_ARRAY,
+                serde_json::Value::Object(_) => rt::JSON_KIND_OBJECT,
+            };
+            Ok(IrValue::Int(kind))
+        }
+        "asInt" => Ok(IrValue::Int(
+            json_node(interp, &args, "json.asInt")?
+                .as_i64()
+                .unwrap_or(0),
+        )),
+        "asFloat" => Ok(IrValue::Float(
+            json_node(interp, &args, "json.asFloat")?
+                .as_f64()
+                .unwrap_or(0.0),
+        )),
+        "asBool" => Ok(IrValue::Bool(
+            json_node(interp, &args, "json.asBool")?
+                .as_bool()
+                .unwrap_or(false),
+        )),
+        "asStr" => Ok(IrValue::String(
+            json_node(interp, &args, "json.asStr")?
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )),
         _ => error(format!("unknown json builtin: {method}")),
+    }
+}
+
+/// Extract the single `String` argument of a `json.*` builtin.
+fn json_str_arg(args: &[IrValue], method: &str) -> Result<String> {
+    match args {
+        [IrValue::String(s)] => Ok(s.clone()),
+        _ => error(format!("{method} expects a single string argument")),
+    }
+}
+
+/// Extract the single `i64` handle argument of a `json.*` builtin.
+fn json_handle_arg(args: &[IrValue], method: &str) -> Result<usize> {
+    match args {
+        [IrValue::Int(i)] => Ok(*i as usize),
+        _ => error(format!("{method} expects a single handle argument")),
+    }
+}
+
+/// Resolve a `json.*` builtin's handle arg to its arena entry (bounds-checked;
+/// an out-of-range handle is a clean error, never a panic).
+fn json_handle<'a>(
+    interp: &'a IrInterpreter<'_>,
+    args: &[IrValue],
+    method: &str,
+) -> Result<&'a JsonRoot> {
+    let h = json_handle_arg(args, method)?;
+    match interp.json_arena.get(h) {
+        Some(handle) => Ok(handle),
+        None => error(format!("{method}: invalid JSON handle")),
+    }
+}
+
+/// Resolve the node value referenced by a `json.*` builtin's handle arg.
+/// A failed-parse root has no node — the decoders branch on `parseFailed`
+/// before navigating, so hitting one here is a clean interpreter error.
+fn json_node<'a>(
+    interp: &'a IrInterpreter<'_>,
+    args: &[IrValue],
+    method: &str,
+) -> Result<&'a serde_json::Value> {
+    match &json_handle(interp, args, method)?.0 {
+        Ok(v) => Ok(v),
+        Err(_) => error(format!("{method}: invalid JSON node handle")),
     }
 }
 

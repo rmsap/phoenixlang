@@ -740,6 +740,11 @@ pub struct Checker {
     /// dispatch each call site to the encoder for its argument's type. See
     /// [`ResolvedModule::json_encode_types`].
     pub(crate) json_encode_types: HashMap<Span, Type>,
+    /// Target type `T` at each `json.decode<T>(text)` call, keyed by the
+    /// `MethodCallExpr`'s source span (Phase 4.6). The IR pass reads this to
+    /// synthesize a per-`T` decoder and dispatch each call site to it. See
+    /// [`ResolvedModule::json_decode_types`].
+    pub(crate) json_decode_types: HashMap<Span, Type>,
     /// Resolved annotation type for each `let`-with-annotation, keyed by
     /// the `VarDecl`'s source span. See
     /// [`ResolvedModule::var_annotation_types`].
@@ -847,6 +852,7 @@ impl Checker {
             call_type_args: HashMap::new(),
             namespace_call_targets: HashMap::new(),
             json_encode_types: HashMap::new(),
+            json_decode_types: HashMap::new(),
             var_annotation_types: HashMap::new(),
             next_func_id: 0,
             user_method_offset: 0,

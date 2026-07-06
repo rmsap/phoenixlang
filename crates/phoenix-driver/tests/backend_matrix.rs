@@ -189,6 +189,14 @@ backend_matrix_test!(
     "json_encode_collections.phx",
     skip_wasm_gc: "json.encode string escaping not yet ported to wasm32-gc (Phase 4.6 follow-up)"
 );
+// `json.decode<T>` for scalar T: Ok, Err(TypeMismatch), Err(ParseError),
+// int→float — the parse-to-DOM + per-type decoder pipeline. wasm32-gc
+// skipped (serde_json DOM not ported there; shares the encode deferral).
+backend_matrix_test!(
+    matrix_json_decode_scalars,
+    "json_decode_scalars.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

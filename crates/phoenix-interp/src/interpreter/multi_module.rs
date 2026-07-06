@@ -82,6 +82,8 @@ impl Interpreter {
         self.json_encode_spans = std::mem::take(&mut resolved.json_encode_types)
             .into_keys()
             .collect();
+        // Decode needs the target type per call site, not just the span.
+        self.json_decode_types = std::mem::take(&mut resolved.json_decode_types);
     }
 
     /// Multi-module orchestration for [`run_modules`]. Registers every

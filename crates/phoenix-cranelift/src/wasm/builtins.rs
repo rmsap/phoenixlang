@@ -190,6 +190,10 @@ pub(super) fn translate_builtin_call(
             let runtime_idx = b.require_phx_func("phx_json_escape_str")?;
             emit_sret_string_call(ctx, b, runtime_idx, &[args[0]], vid)
         }
+        // JSON decode DOM primitives, all riding the embedded runtime.
+        m if m.starts_with("json.") => {
+            translate_json_decode_builtin(ctx, b, m.strip_prefix("json.").unwrap(), args, instr)
+        }
         // `List.<method>` dispatcher. Covers the indexing/iteration
         // primitives (`length` / `get`), the functional methods
         // (`map` / `filter` / `reduce` / `flatMap` / `sortBy` / `any` /
@@ -270,6 +274,60 @@ pub(super) fn translate_builtin_call(
         other => Err(CompileError::new(format!(
             "wasm32-linear: builtin `{other}` not yet supported \
              (Phase 2.4 PR 3c — see docs/design-decisions.md §Phase 2.4)"
+        ))),
+    }
+}
+
+/// Translate a JSON decode DOM builtin (`json.parse`, `json.kind`, …) to a
+/// call into the embedded `phoenix_runtime.wasm`. Handles are `i64`; string
+/// results come back via the sret helper.
+fn translate_json_decode_builtin(
+    ctx: &mut FuncTranslateCtx,
+    b: &mut ModuleBuilder,
+    method: &str,
+    args: &[ValueId],
+    instr: &phoenix_ir::instruction::Instruction,
+) -> Result<(), CompileError> {
+    // A `(arg) -> scalar` runtime call: push the arg's slots, call, store.
+    let scalar = |ctx: &mut FuncTranslateCtx,
+                  b: &mut ModuleBuilder,
+                  fname: &str,
+                  ret: IrType|
+     -> Result<(), CompileError> {
+        let vid = expect_result(instr, "json decode scalar")?;
+        ctx.emit_load_all(args[0])?;
+        let idx = b.require_phx_func(fname)?;
+        ctx.emit(Instruction::Call(idx));
+        ctx.emit_store_result(vid, ret)?;
+        Ok(())
+    };
+    match method {
+        "parse" => scalar(ctx, b, "phx_json_parse", IrType::I64),
+        "free" => {
+            // Void: push the handle, call, no result to store.
+            ctx.emit_load_all(args[0])?;
+            let idx = b.require_phx_func("phx_json_free")?;
+            ctx.emit(Instruction::Call(idx));
+            Ok(())
+        }
+        "parseFailed" => scalar(ctx, b, "phx_json_parse_failed", IrType::Bool),
+        "root" => scalar(ctx, b, "phx_json_root", IrType::I64),
+        "kind" => scalar(ctx, b, "phx_json_kind", IrType::I64),
+        "asInt" => scalar(ctx, b, "phx_json_as_int", IrType::I64),
+        "asFloat" => scalar(ctx, b, "phx_json_as_float", IrType::F64),
+        "asBool" => scalar(ctx, b, "phx_json_as_bool", IrType::Bool),
+        "parseError" => {
+            let vid = expect_result(instr, "json.parseError")?;
+            let idx = b.require_phx_func("phx_json_parse_error")?;
+            emit_sret_string_call(ctx, b, idx, &[args[0]], vid)
+        }
+        "asStr" => {
+            let vid = expect_result(instr, "json.asStr")?;
+            let idx = b.require_phx_func("phx_json_as_str")?;
+            emit_sret_string_call(ctx, b, idx, &[args[0]], vid)
+        }
+        other => Err(CompileError::new(format!(
+            "wasm32-linear: `BuiltinCall(\"json.{other}\")` not supported"
         ))),
     }
 }

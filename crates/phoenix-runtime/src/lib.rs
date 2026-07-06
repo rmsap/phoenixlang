@@ -17,6 +17,7 @@
 /// Garbage collector: mark-and-sweep heap, shadow stack, and the C-ABI
 /// hooks (`phx_gc_alloc`, `phx_gc_push_frame`, ...) called by compiled code.
 pub mod gc;
+pub mod json;
 
 mod list_builder_methods;
 mod list_methods;

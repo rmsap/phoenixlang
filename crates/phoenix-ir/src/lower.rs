@@ -102,6 +102,7 @@ pub fn lower_modules(
     // Pass 1.5 (JSON): synthesize per-type encoders before Pass 2
     // dispatches each `json.encode` site to its encoder.
     crate::json_synth::synthesize_json_encoders(&mut ctx);
+    crate::json_synth::synthesize_json_decoders(&mut ctx);
 
     // Pass 2 — lower each module's function bodies with `current_module`
     // set to that module's path. This is what lets bare-name lookups
@@ -532,6 +533,7 @@ impl<'a> LoweringContext<'a> {
         // reachable from a `json.encode` call, before Pass 2 dispatches
         // each call site to its encoder. See [`crate::json_synth`].
         crate::json_synth::synthesize_json_encoders(self);
+        crate::json_synth::synthesize_json_decoders(self);
 
         // Pass 2: Lower all function bodies.
         self.lower_function_bodies(program);

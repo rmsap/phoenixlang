@@ -15,6 +15,9 @@ phoenix-parser = { path = "../phoenix-parser" }
 # the compiled backends so JSON output is byte-identical.
 phoenix-runtime = { path = "../phoenix-runtime" }
 phoenix-sema = { path = "../phoenix-sema" }
+# JSON DOM parsing for `json.decode` — the tree-walk interpreter decodes a
+# `serde_json::Value` into a typed `Value`, matching the compiled backends.
+serde_json.workspace = true
 # Float formatting — shared shortest-roundtrip d2s implementation. The
 # interpreter's `Display for Value::Float` routes through this so that
 # `phoenix run` (interpreted) and `phoenix build` (native, via
