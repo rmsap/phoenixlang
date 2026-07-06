@@ -374,7 +374,9 @@ struct Case {
     fixture: &'static str,
     /// Registers the Rust host stubs on either interpreter.
     register: fn(&mut dyn HostRegister),
-    /// The C host shim for the native column.
+    /// The C host shim for the native column. Read only by the non-Windows
+    /// `native_column`; the Windows stub never compiles the C shim.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     c_shim: &'static str,
 }
 
