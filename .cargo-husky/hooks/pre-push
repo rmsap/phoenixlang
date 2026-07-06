@@ -8,6 +8,11 @@ set -e
 echo "[pre-push] cargo build -p phoenix-runtime"
 cargo build -p phoenix-runtime
 
+# The wasm32-linear backend-matrix tests require phoenix_runtime.wasm, which
+# only a target-specific build produces.
+echo "[pre-push] cargo build -p phoenix-runtime --target wasm32-wasip1 --release"
+cargo build -p phoenix-runtime --target wasm32-wasip1 --release
+
 # Build and test one crate at a time to keep memory usage low.
 echo "[pre-push] cargo test --workspace (sequential)"
 cargo test --workspace --jobs 1 -- --test-threads=1
