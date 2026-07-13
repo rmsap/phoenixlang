@@ -362,9 +362,11 @@ impl ModuleBuilder {
     /// Append an imported function (a runtime WASI import, or a custom
     /// `extern js` import via [`Self::declare_extern_import`]). This does not
     /// dedupe against existing imports: the only imports declared before the
-    /// merge are `extern js` functions, which live in the `js` (custom)
-    /// namespace, so a runtime WASI import in `wasi_snapshot_preview1` can
-    /// never collide with one. Returns the merged function index.
+    /// merge are `extern js` functions, whose namespaces — the ambient `js` or
+    /// an npm package specifier — can never collide with a
+    /// runtime WASI import, because the parser rejects
+    /// `"wasi_snapshot_preview1"` as a module specifier. Returns the merged
+    /// function index.
     pub(super) fn merge_func_import(
         &mut self,
         module: &str,

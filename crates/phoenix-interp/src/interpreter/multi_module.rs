@@ -223,12 +223,23 @@ impl Interpreter {
                 self.register_methods(&qualified_type, &imp.methods, Some(module_path));
             }
             Declaration::ExternJs(block) => {
-                // Record each extern's name and parameter order: the name drives
-                // call precedence and a clean unbound-host error, the order lets
+                // Record each extern's host module and parameter order: the name
+                // drives call precedence and a clean unbound-host error, the
+                // module routes dispatch to the right host-registry binding (the
+                // ambient `js` or an npm package specifier), the order lets
                 // named args be reordered into positional form (see `check_call`).
+                // Keyed module-qualified, like every other registry this method
+                // fills: sema scopes externs per module, so two modules may each
+                // declare an extern `f` — against *different* host modules —
+                // and a bare-keyed map would let whichever registered last
+                // silently hijack the other's call sites.
+                let host_module = block.module.as_deref().unwrap_or("js");
                 for item in &block.items {
+                    let qualified =
+                        phoenix_common::module_path::module_qualify(module_path, &item.name);
                     let params = item.params.iter().map(|p| p.name.clone()).collect();
-                    self.extern_params.insert(item.name.clone(), params);
+                    self.extern_params
+                        .insert(qualified, Rc::new((host_module.to_string(), params)));
                 }
             }
             Declaration::Trait(_)

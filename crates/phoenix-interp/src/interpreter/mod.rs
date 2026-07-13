@@ -196,14 +196,22 @@ const MAX_CALL_DEPTH: usize = 50;
 pub struct Interpreter {
     pub(crate) env: Environment,
     pub(crate) functions: HashMap<String, FunctionEntry>,
-    /// `extern js` host functions declared in the program, mapped to their
-    /// declared parameter names in source order. Membership drives call
-    /// precedence (an extern shadows a same-named local closure, matching
-    /// sema's `check_call`); the parameter order lets a call's named arguments
-    /// be reordered into positional form before marshalling, exactly as the IR
-    /// backend does. Tracked by bare name; cross-module extern resolution is out
-    /// of scope until the import-js grammar lands.
-    pub(crate) extern_params: HashMap<String, Vec<String>>,
+    /// `extern js` host functions declared in the program, mapped to their host
+    /// module (`"js"` for an ambient `extern js { ... }` block, the npm package
+    /// specifier for `extern js "pkg" { ... }`) and their declared
+    /// parameter names in source order. Membership drives call precedence (an
+    /// extern shadows a same-named local closure, matching sema's `check_call`);
+    /// the module keys the [`host_registry`](Self::host_registry) lookup at
+    /// dispatch; the parameter order lets a call's named arguments be reordered
+    /// into positional form before marshalling, exactly as the IR backend does.
+    /// Keyed exactly like [`functions`](Self::functions): bare name on the
+    /// single-file path, module-qualified (`module_qualify`) on the multi-module
+    /// path — mirroring sema's per-module extern scoping, so same-named externs
+    /// in different modules can't clobber each other's host module. The entry is
+    /// behind an `Rc` because dispatch must clone it out of the map (to release
+    /// the borrow before evaluating arguments), and an `Rc` bump keeps that
+    /// per-call clone free.
+    pub(crate) extern_params: HashMap<String, Rc<(String, Vec<String>)>>,
     pub(crate) structs: HashMap<String, StructDef>,
     pub(crate) enums: HashMap<String, EnumDef>, // enum name -> def
     pub(crate) variant_to_enum: HashMap<String, String>, // variant name -> enum name
@@ -738,14 +746,20 @@ impl Interpreter {
                     self.register_methods(&imp.type_name, &imp.methods, None);
                 }
                 Declaration::ExternJs(block) => {
-                    // No Phoenix body to register, but record each extern's name
-                    // and parameter order. The name drives call precedence and a
-                    // clean unbound-host error (vs. "undefined function"); the
+                    // No Phoenix body to register, but record each extern's host
+                    // module and parameter order. The name drives call precedence
+                    // and a clean unbound-host error (vs. "undefined function");
+                    // the module routes dispatch to the right host-registry
+                    // binding (the ambient `js` or an npm package specifier); the
                     // parameter order lets a call's named args be reordered into
                     // positional form before marshalling (see `check_call`).
+                    let host_module = block.module.as_deref().unwrap_or("js");
                     for item in &block.items {
                         let params = item.params.iter().map(|p| p.name.clone()).collect();
-                        self.extern_params.insert(item.name.clone(), params);
+                        self.extern_params.insert(
+                            item.name.clone(),
+                            Rc::new((host_module.to_string(), params)),
+                        );
                     }
                 }
                 Declaration::Trait(_)
@@ -2001,17 +2015,21 @@ impl Interpreter {
             }
 
             // `extern js` host call. Dispatch to the registered host
-            // binding; an unregistered extern is a clean error (the bare CLI
-            // registers none). Checked *before* the closure-variable arm to match
-            // sema's `check_call` precedence (function -> extern -> variable), so
-            // a name bound to both an extern and a local closure resolves to the
-            // extern in both sema and the interpreter. The host module is `js`
-            // today — npm-package modules arrive with the import-js grammar later.
-            if let Some(param_names) = self.extern_params.get(&ident.name).cloned() {
+            // binding for the extern's declared module — the ambient `js` or an
+            // npm package specifier; an unregistered extern is a
+            // clean error (the bare CLI registers none). Checked *before* the
+            // closure-variable arm to match sema's `check_call` precedence
+            // (function -> extern -> variable), so a name bound to both an extern
+            // and a local closure resolves to the extern in both sema and the
+            // interpreter. Looked up by the qualified name (like `functions`
+            // above) so a same-named extern in another module — possibly bound
+            // to a different host module — can never satisfy this call site.
+            if let Some(entry) = self.extern_params.get(&qname).cloned() {
+                let (host_module, param_names) = &*entry;
                 let positional = self.eval_args(&call.args)?;
                 let args =
-                    self.assemble_extern_args(&ident.name, &param_names, positional, named_args)?;
-                return self.call_extern_host("js", &ident.name, args);
+                    self.assemble_extern_args(&ident.name, param_names, positional, named_args)?;
+                return self.call_extern_host(host_module, &ident.name, args);
             }
 
             // Variable holding a closure
@@ -3670,8 +3688,17 @@ function main() {
             file_path: PathBuf::from("<test>"),
             import_targets: Default::default(),
         };
-        let modules = [module];
-        let mut analysis = phoenix_sema::checker::check_modules(&modules);
+        run_resolved_modules_with_host_capturing(&[module], register)
+    }
+
+    /// Slice-taking core of [`run_modules_with_host_capturing`]: type-check an
+    /// already-resolved multi-module slice, seed an interpreter, register the
+    /// host bindings, and drive `run_modules_inner` with a capturing writer.
+    fn run_resolved_modules_with_host_capturing(
+        modules: &[phoenix_modules::ResolvedSourceModule],
+        register: impl FnOnce(&mut Interpreter),
+    ) -> std::result::Result<Vec<String>, RuntimeError> {
+        let mut analysis = phoenix_sema::checker::check_modules(modules);
         assert!(
             analysis.diagnostics.is_empty(),
             "sema diagnostics: {:?}",
@@ -3683,7 +3710,7 @@ function main() {
         let mut interpreter = Interpreter::with_output(Box::new(writer));
         interpreter.seed_from_resolved(&mut analysis.module);
         register(&mut interpreter);
-        interpreter.run_modules_inner(&modules)?;
+        interpreter.run_modules_inner(modules)?;
         let bytes = buffer.borrow();
         Ok(String::from_utf8_lossy(&bytes)
             .lines()
@@ -3721,6 +3748,63 @@ function main() {
         .expect("program should run with the host binding registered");
         assert_eq!(out, Vec::<String>::new());
         assert_eq!(*seen.borrow(), vec!["hi".to_string()]);
+    }
+
+    /// Two modules may each declare a same-named extern bound to *different*
+    /// host modules — sema scopes externs per module, so this is a legal
+    /// program. Each call site must dispatch to its own declaration's host
+    /// module: `extern_params` is keyed module-qualified (like `functions`),
+    /// so a bare-keyed map regression — where whichever module registers last
+    /// hijacks the other's call sites, routing the entry's ambient `tag()` to
+    /// the npm-package host — surfaces here as swapped output.
+    #[test]
+    fn run_modules_routes_same_named_externs_to_their_own_host_modules() {
+        use phoenix_modules::{ModulePath, ResolvedSourceModule};
+        use std::path::PathBuf;
+        let mk = |path: ModulePath, src: &str, id: SourceId, is_entry: bool| {
+            let tokens = tokenize(src, id);
+            let (program, errs) = parser::parse(&tokens);
+            assert!(errs.is_empty(), "parse errors: {:?}", errs);
+            ResolvedSourceModule {
+                module_path: path,
+                source_id: id,
+                program,
+                is_entry,
+                file_path: PathBuf::from("<test>"),
+                import_targets: Default::default(),
+            }
+        };
+        let entry = mk(
+            ModulePath::entry(),
+            "import lib\n\
+             extern js { function tag() -> String }\n\
+             function main() { print(tag()) print(lib.libTag()) }",
+            SourceId(0),
+            true,
+        );
+        // `lib` registers *after* the entry, so a bare-keyed `extern_params`
+        // would overwrite the entry's `tag` with the npm-package binding.
+        let lib = mk(
+            ModulePath(vec!["lib".to_string()]),
+            "extern js \"pkg\" { function tag() -> String }\n\
+             public function libTag() -> String { tag() }",
+            SourceId(1),
+            false,
+        );
+        let out = run_resolved_modules_with_host_capturing(&[entry, lib], |interp| {
+            interp.register_host(
+                "js",
+                "tag",
+                Box::new(|_ctx, _args| Ok(HostValue::Str("ambient".to_string()))),
+            );
+            interp.register_host(
+                "pkg",
+                "tag",
+                Box::new(|_ctx, _args| Ok(HostValue::Str("package".to_string()))),
+            );
+        })
+        .expect("both externs should dispatch to their own host bindings");
+        assert_eq!(out, vec!["ambient".to_string(), "package".to_string()]);
     }
 
     /// The public [`run_modules_with_host`] entry point threads a *pre-built*
@@ -4182,6 +4266,60 @@ function main() {
         assert!(
             err.message.contains("no host binding registered") && err.message.contains("js.alert"),
             "expected a clean unbound-host error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn extern_js_npm_module_dispatches_by_module() {
+        // An `extern js "pkg" { ... }` extern (Phase 3.1.2) dispatches to the
+        // binding registered under the *package* module, not the ambient `js`.
+        let out = run_with_host(
+            "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+             function main() { print(leftPad(\"4\", 3)) }",
+            |interp| {
+                interp.register_host(
+                    "left-pad",
+                    "leftPad",
+                    Box::new(|_ctx, args| {
+                        let mut it = args.into_iter();
+                        match (it.next(), it.next()) {
+                            (Some(HostValue::Str(s)), Some(HostValue::Int(w))) => {
+                                Ok(HostValue::Str(format!("{s:>width$}", width = w as usize)))
+                            }
+                            other => Err(format!("unexpected args: {other:?}")),
+                        }
+                    }),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(out.trim_end(), "  4");
+    }
+
+    #[test]
+    fn extern_js_npm_module_does_not_fall_back_to_the_ambient_host() {
+        // A binding registered under the ambient `js` module must NOT satisfy a
+        // same-named extern declared against an npm package — that would
+        // silently mis-route the call. The unbound error names the package.
+        let err = run_with_host(
+            "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+             function main() { print(leftPad(\"4\", 3)) }",
+            |interp| {
+                interp.register_host(
+                    "js",
+                    "leftPad",
+                    Box::new(|_ctx, _args| {
+                        Err("the ambient binding must not be reached".to_string())
+                    }),
+                );
+            },
+        )
+        .expect_err("an npm extern with only an ambient binding should error");
+        assert!(
+            err.message.contains("no host binding registered")
+                && err.message.contains("left-pad.leftPad"),
+            "expected an unbound-host error naming the package, got: {}",
             err.message
         );
     }

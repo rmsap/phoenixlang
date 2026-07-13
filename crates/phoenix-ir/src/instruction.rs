@@ -221,8 +221,10 @@ pub enum Op {
     /// Call an `extern js` host function.
     ///
     /// Fields: `(module, name, args)` — the `(module, name)` host-call linkage
-    /// (`("js", "alert")` today) carried over from sema's
-    /// `FunctionInfo::extern_js`, plus the marshalled argument values. The
+    /// carried over from sema's `FunctionInfo::extern_js`: `("js", "alert")`
+    /// for an ambient `extern js { ... }` extern, or the npm package specifier
+    /// as the module half (`("left-pad", "leftPad")`) for an
+    /// `extern js "pkg" { ... }` extern — plus the marshalled argument values. The
     /// instruction's `result_type` is the extern's return type
     /// (possibly [`crate::types::IrType::JsValue`] or `Void`).
     ///

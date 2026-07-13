@@ -276,6 +276,83 @@ try {
     );
 }
 
+/// An npm-package namespace whose function lives on its *prototype chain* (a
+/// class instance passed as the namespace) is rejected at instantiate time with
+/// an error saying the function is inherited — not the generic "missing"
+/// message, which would misdirect debugging when the function is visibly there.
+/// (Namespaced bindings require own properties; the module-namespace/object-
+/// literal shapes the BYO model expects always satisfy that.)
+#[test]
+fn instantiate_rejects_an_inherited_namespace_binding_naming_the_cause() {
+    if skip_if_no_runtime_wasm(
+        "instantiate_rejects_an_inherited_namespace_binding_naming_the_cause",
+    ) {
+        return;
+    }
+    if skip_if_no_node("instantiate_rejects_an_inherited_namespace_binding_naming_the_cause") {
+        return;
+    }
+
+    let dir = TempDir::new("inheritedhost");
+    let src = dir.join("app.phx");
+    std::fs::write(
+        &src,
+        "extern js \"left-pad\" {\n  \
+           function leftPad(s: String, width: Int) -> String\n\
+         }\n\
+         function main() {\n  \
+           print(leftPad(\"4\", 3))\n\
+         }\n",
+    )
+    .unwrap();
+    let wasm = dir.join("app.wasm");
+
+    let status = phoenix_bin()
+        .args(["build", "--target", "wasm32-linear"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("failed to run phoenix build");
+    assert!(status.success(), "wasm32-linear build failed");
+
+    // The namespace is a class instance: `leftPad` exists and is callable, but
+    // only via the prototype — the guard must name that, not claim it missing.
+    let driver = dir.join("driver.mjs");
+    std::fs::write(
+        &driver,
+        r#"
+import { readFile } from "node:fs/promises";
+import { instantiate } from "./app.js";
+const wasm = await readFile(new URL("./app.wasm", import.meta.url));
+class Pad { leftPad(s, w) { return s.padStart(w); } }
+try {
+  await instantiate({ wasm, host: { "left-pad": new Pad() } });
+  process.stdout.write("NO_THROW");
+} catch (e) {
+  process.stdout.write("THREW:" + e.message);
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new("node")
+        .arg(&driver)
+        .output()
+        .expect("failed to run node");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(output.status.success(), "node run failed: {stderr}");
+    assert!(
+        stdout.starts_with("THREW:")
+            && stdout.contains("left-pad.leftPad")
+            && stdout.contains("only inherited"),
+        "instantiate should throw naming the inherited (not missing) `left-pad.leftPad` \
+         binding, got: {stdout}"
+    );
+}
+
 /// A host function *returning* a `String` builds a GC-managed Phoenix string via
 /// the exported `phx_string_alloc`. This pins the full
 /// round-trip across three shapes: a *multi-byte* host string is printed (so a

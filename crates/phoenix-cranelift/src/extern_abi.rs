@@ -13,7 +13,7 @@
 //! `super::wasm::translate` re-exports these for its existing call sites; the
 //! native backend imports them directly.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use phoenix_ir::instruction::Op;
 use phoenix_ir::types::IrType;
@@ -25,7 +25,11 @@ use crate::error::CompileError;
 /// generators flatten it to a WASM signature, the native binding flattens it to
 /// a C-ABI signature — so the call and its host binding can never drift.
 pub(crate) struct ExternSig {
-    /// The host module (`"js"` today).
+    /// The host module: `"js"` for an ambient `extern js { ... }` block, or
+    /// the npm package specifier from `extern js "pkg" { ... }` (Phase 3.1.2).
+    /// Every backend routes the call by this `(module, name)` pair (decision
+    /// A0): the WASM glue's import namespace + `host` lookup shape, the native
+    /// binding's escaped shim symbol.
     pub(crate) module: String,
     /// The host function name.
     pub(crate) name: String,
@@ -40,24 +44,27 @@ pub(crate) struct ExternSig {
 ///
 /// Only externs actually *called* appear: a declared-but-uncalled extern emits
 /// no `Op::ExternCall`. The signature is taken from the first call site; sema
-/// coerces every argument to the declared parameter type and rejects
-/// non-marshallable types, so every site of a given extern agrees and matches
-/// the declaration. The IR carries no extern declaration table — only
-/// `Op::ExternCall` sites — so call-site derivation is the only signal here.
+/// coerces every argument to the declared parameter type, rejects
+/// non-marshallable types, and rejects conflicting declarations of the same
+/// `(module, name)` pair across modules
+/// (`check_extern_host_signature_coherence`), so every site of a given extern
+/// agrees — *asserted* below rather than assumed, because a disagreeing site
+/// slipping through would bind mis-marshalling thunks/imports. The IR carries
+/// no extern declaration table — only `Op::ExternCall` sites — so call-site
+/// derivation is the only signal here.
 pub(crate) fn collect_externs(
     ir_module: &phoenix_ir::module::IrModule,
 ) -> Result<Vec<ExternSig>, CompileError> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut out = Vec::new();
+    // Index into `out` by `(module, name)`: dedupes the pair and lets a later
+    // call site be checked against the signature already collected.
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    let mut out: Vec<ExternSig> = Vec::new();
     for func in ir_module.concrete_functions() {
         for block in &func.blocks {
             for instr in &block.instructions {
                 let Op::ExternCall(module, name, args) = &instr.op else {
                     continue;
                 };
-                if !seen.insert((module.clone(), name.clone())) {
-                    continue;
-                }
                 let mut params = Vec::with_capacity(args.len());
                 for arg in args {
                     let ty = func.instruction_result_type(*arg).ok_or_else(|| {
@@ -68,6 +75,19 @@ pub(crate) fn collect_externs(
                     })?;
                     params.push(ty.clone());
                 }
+                let key = (module.clone(), name.clone());
+                if let Some(&idx) = seen.get(&key) {
+                    let prior = &out[idx];
+                    if prior.params != params || prior.return_type != instr.result_type {
+                        return Err(CompileError::new(format!(
+                            "`extern js` call `{module}.{name}` disagrees with an earlier \
+                             call site's signature (internal compiler bug — sema enforces \
+                             one signature per host function)"
+                        )));
+                    }
+                    continue;
+                }
+                seen.insert(key, out.len());
                 out.push(ExternSig {
                     module: module.clone(),
                     name: name.clone(),
@@ -200,4 +220,46 @@ pub(crate) fn collect_callback_signatures(
     ir_module: &phoenix_ir::module::IrModule,
 ) -> Result<Vec<CallbackSig>, CompileError> {
     Ok(callback_sigs_in_externs(&collect_externs(ir_module)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoenix_common::span::SourceId;
+    use phoenix_lexer::lexer::tokenize;
+    use phoenix_parser::parser;
+    use phoenix_sema::checker;
+
+    fn lower(source: &str) -> phoenix_ir::module::IrModule {
+        let tokens = tokenize(source, SourceId(0));
+        let (program, parse_errors) = parser::parse(&tokens);
+        assert!(parse_errors.is_empty(), "parse errors: {parse_errors:?}");
+        let result = checker::check(&program);
+        assert!(
+            result.diagnostics.is_empty(),
+            "type errors: {:?}",
+            result.diagnostics
+        );
+        phoenix_ir::lower(&program, &result.module)
+    }
+
+    #[test]
+    fn agreeing_call_sites_dedupe_to_one_extern() {
+        // Two call sites of the same `(module, name)` pair collapse to ONE
+        // `ExternSig` — one wasm import / one shim symbol / one glue thunk
+        // downstream — after the later site's signature is checked against the
+        // collected one (the backstop to sema's coherence check). This pins the
+        // happy path of that keying: the multi-declaration BYO fixture relies
+        // on it, but only end-to-end.
+        let module = lower(
+            "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+             function main() { print(leftPad(\"a\", 3)) print(leftPad(\"b\", 4)) }",
+        );
+        let externs = collect_externs(&module).expect("collection should succeed");
+        assert_eq!(externs.len(), 1, "the pair must dedupe to one ExternSig");
+        assert_eq!(externs[0].module, "left-pad");
+        assert_eq!(externs[0].name, "leftPad");
+        assert_eq!(externs[0].params, vec![IrType::StringRef, IrType::I64]);
+        assert_eq!(externs[0].return_type, IrType::StringRef);
+    }
 }

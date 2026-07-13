@@ -1,0 +1,12 @@
+extern js "left-pad" {
+  function leftPad(s: String, width: Int) -> String
+}
+
+extern js {
+  function shout(s: String) -> String
+}
+
+function main() {
+  print(leftPad("4", 3))
+  print(shout(leftPad("hi", 4)))
+}

@@ -323,13 +323,71 @@ mod tests {
         assert!(glue.contains("getLength(p0, p1)"));
         assert!(glue.contains("const __r = Number(host.getLength(readString(p0, p1)));"));
         assert!(glue.contains("return BigInt(Math.trunc(__r));"));
-        assert!(glue.contains(r#"for (const __name of ["alert", "getLength"])"#));
+        assert!(
+            glue.contains(
+                r#"for (const [__mod, __name] of [[null, "alert"], [null, "getLength"]])"#
+            )
+        );
+    }
+
+    #[test]
+    fn npm_package_module_binds_namespaced() {
+        // `extern js "pkg"` externs (Phase 3.1.2) get their own import namespace
+        // and a `host["pkg"].<name>` lookup — the ambient flat `host.<name>`
+        // shape is reserved for `extern js { ... }`, so two packages exporting
+        // the same name cannot collide. The required-host guard checks the
+        // namespaced binding.
+        let externs = vec![ExternSig {
+            module: "left-pad".to_string(),
+            name: "leftPad".to_string(),
+            params: vec![IrType::StringRef, IrType::I64],
+            return_type: IrType::StringRef,
+        }];
+        let glue = generate(&externs).unwrap();
+        assert!(glue.contains("\"left-pad\": {"));
+        assert!(glue.contains(r#"host["left-pad"].leftPad(readString(p0, p1), Number(p2))"#));
+        assert!(glue.contains(r#"for (const [__mod, __name] of [["left-pad", "leftPad"]])"#));
+        // The guard reads the namespace as an *own* property, so a specifier
+        // spelling an `Object.prototype` member can't satisfy it by inheritance
+        // — and the function on that namespace likewise, so an extern named
+        // `toString` can't be silently satisfied by the inherited member.
+        assert!(glue.contains("Object.prototype.hasOwnProperty.call(host, __mod)"));
+        assert!(glue.contains("Object.prototype.hasOwnProperty.call(__ns, __name)"));
+        // A function that exists but only via the prototype chain gets an error
+        // saying so — distinct from the plain missing-binding message, so the
+        // embedder isn't told a visibly-present function is "missing".
+        assert!(glue.contains("is only inherited from the namespace's prototype chain"));
+        assert!(!glue.contains("host.leftPad"));
+    }
+
+    #[test]
+    fn two_packages_with_the_same_exported_name_do_not_collide() {
+        // The collision the namespaced binding exists to prevent (Phase 3.1.2):
+        // two npm packages exporting the same function name. Each pair gets its
+        // own import namespace, its own `host.<module>.<name>` thunk, and its
+        // own required-host entry — nothing merges on the shared bare name.
+        let mk = |module: &str| ExternSig {
+            module: module.to_string(),
+            name: "f".to_string(),
+            params: vec![IrType::I64],
+            return_type: IrType::I64,
+        };
+        let glue = generate(&[mk("pkg-a"), mk("pkg-b")]).unwrap();
+        assert!(glue.contains("\"pkg-a\": {"));
+        assert!(glue.contains("\"pkg-b\": {"));
+        assert!(glue.contains(r#"host["pkg-a"].f("#));
+        assert!(glue.contains(r#"host["pkg-b"].f("#));
+        assert!(
+            glue.contains(r#"for (const [__mod, __name] of [["pkg-a", "f"], ["pkg-b", "f"]])"#)
+        );
+        // Neither thunk falls back to a flat ambient lookup.
+        assert!(!glue.contains("host.f("));
     }
 
     #[test]
     fn no_externs_yields_an_empty_required_host_list() {
         let glue = generate(&[]).unwrap();
-        assert!(glue.contains("for (const __name of [])"));
+        assert!(glue.contains("for (const [__mod, __name] of [])"));
         assert!(!glue.contains("__REQUIRED_HOST__"));
     }
 
@@ -378,7 +436,7 @@ mod tests {
         );
         assert!(glue.contains("returned no value (null or undefined)"));
         assert!(glue.contains("stringAlloc(bytes.length)"));
-        assert!(glue.contains(r#"for (const __name of ["greet"])"#));
+        assert!(glue.contains(r#"for (const [__mod, __name] of [[null, "greet"]])"#));
     }
 
     #[test]
@@ -411,7 +469,11 @@ mod tests {
         );
         assert!(glue.contains(r#"exports["__phoenix_invoke_closure__to_v"](ptr)"#));
         assert!(glue.contains("__retainCallback(ptr, (args) =>"));
-        assert!(glue.contains(r#"for (const __name of ["onTick", "withValue"])"#));
+        assert!(
+            glue.contains(
+                r#"for (const [__mod, __name] of [[null, "onTick"], [null, "withValue"]])"#
+            )
+        );
     }
 
     #[test]
@@ -489,7 +551,7 @@ mod tests {
         let glue = generate(&externs).unwrap();
         assert!(glue.contains("weird(/* ...args */) { throw new Error("));
         assert!(glue.contains("nested closures are not supported yet"));
-        assert!(glue.contains(r#"for (const __name of ["alert"])"#));
+        assert!(glue.contains(r#"for (const [__mod, __name] of [[null, "alert"]])"#));
         assert!(!glue.contains("__cb_"));
     }
 }

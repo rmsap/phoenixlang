@@ -110,14 +110,34 @@ pub struct ImportItem {
 ///   function alert(message: String)
 ///   function setTimeout(callback: (Void) -> Void, ms: Int)
 /// }
+///
+/// extern js "left-pad" {
+///   function leftPad(s: String, width: Int) -> String
+/// }
 /// ```
 ///
 /// The `js` language tag is matched contextually by the parser (it stays a
 /// plain identifier so it remains usable as a variable name). Each signature
 /// is typed so calls can be type-checked and marshalled across the WASM
 /// boundary, but carries no `body` — the implementation lives in the JS host.
+///
+/// An optional string after `js` names the host **module** the signatures bind
+/// to — an npm package specifier. Absent, the block binds to the
+/// ambient `js` host (the browser/Node globals, Phase 2.5 behavior). The module
+/// is per-block and applies to every signature it contains; it sets the module
+/// half of the `(module, name)` linkage a call lowers to at the backend, not
+/// how the function is named or resolved within Phoenix. Every backend routes
+/// by that pair (decision A0): the WASM glue namespaces named modules as
+/// `host.<module>.<name>`, the native binding escapes the module into its
+/// C-ABI shim symbol, and the interpreters key their host registries by it.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternJsBlock {
+    /// The host module the signatures bind to: an npm package specifier from
+    /// `extern js "pkg" { ... }`, or `None` for the ambient `js` host
+    /// (`extern js { ... }`). Never the literal `"js"` — the ambient host's
+    /// module name is reserved and the parser rejects it as a specifier, so
+    /// `Some` unambiguously means an npm package.
+    pub module: Option<String>,
     /// The declared external function signatures, in source order.
     pub items: Vec<ExternFnSig>,
     /// Source span covering the entire `extern js { ... }` block.

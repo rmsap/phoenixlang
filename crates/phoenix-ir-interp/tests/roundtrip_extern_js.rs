@@ -96,6 +96,59 @@ fn extern_js_unbound_host_errors_cleanly() {
 }
 
 #[test]
+fn extern_js_npm_module_dispatches_by_module() {
+    // An `extern js "pkg" { ... }` extern dispatches to the
+    // binding registered under the *package* module — the `(module, name)`
+    // registry keying, parity with the AST interpreter.
+    let module = lower_to_ir(
+        "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+         function main() { print(leftPad(\"4\", 3)) }",
+    );
+    let lines = run_with_host_capture(&module, |interp| {
+        interp.register_host(
+            "left-pad",
+            "leftPad",
+            Box::new(|_ctx, args| {
+                let mut it = args.into_iter();
+                match (it.next(), it.next()) {
+                    (Some(HostValue::Str(s)), Some(HostValue::Int(w))) => {
+                        Ok(HostValue::Str(format!("{s:>width$}", width = w as usize)))
+                    }
+                    other => Err(format!("unexpected args: {other:?}")),
+                }
+            }),
+        );
+    })
+    .unwrap();
+    assert_eq!(lines, vec!["  4".to_string()]);
+}
+
+#[test]
+fn extern_js_npm_module_does_not_fall_back_to_the_ambient_host() {
+    // A binding registered under the ambient `js` module must NOT satisfy a
+    // same-named extern declared against an npm package — that would silently
+    // mis-route the call. The unbound error names the package.
+    let module = lower_to_ir(
+        "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+         function main() { print(leftPad(\"4\", 3)) }",
+    );
+    let err = run_with_host_capture(&module, |interp| {
+        interp.register_host(
+            "js",
+            "leftPad",
+            Box::new(|_ctx, _args| Err("the ambient binding must not be reached".to_string())),
+        );
+    })
+    .expect_err("an npm extern with only an ambient binding should error");
+    assert!(
+        err.message.contains("no host binding registered")
+            && err.message.contains("left-pad.leftPad"),
+        "expected an unbound-host error naming the package, got: {}",
+        err.message
+    );
+}
+
+#[test]
 fn extern_js_callback_can_call_another_extern() {
     // Re-entrancy: the host `run` invokes the Phoenix callback, which itself
     // calls a *second* extern (`shout`). The registry must stay populated for the

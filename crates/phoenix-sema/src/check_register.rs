@@ -320,7 +320,10 @@ impl Checker {
         );
     }
 
-    /// Register an `extern js { ... }` block (Phase 2.5 JavaScript interop).
+    /// Register an `extern js { ... }` block,
+    /// binding every signature to the block's host module — an npm package
+    /// specifier (`extern js "pkg" { ... }`, or the ambient `js`
+    /// host when no specifier is given.
     ///
     /// Each bodyless signature becomes a [`FunctionInfo`] flagged
     /// [`extern_js`](FunctionInfo::extern_js) and stored in the dedicated
@@ -330,6 +333,12 @@ impl Checker {
     /// ([`Type::is_js_marshallable`]) and that no parameter carries a default
     /// value (the JavaScript host cannot evaluate a Phoenix default).
     pub(crate) fn register_extern_js(&mut self, block: &ExternJsBlock) {
+        // The host module the whole block binds to. It becomes the module half
+        // of the `(module, name)` linkage calls lower to — how every backend
+        // routes the call (the WASM glue's `host.<module>.<name>` lookup, the
+        // native shim symbol, the interpreters' host registries) — independent
+        // of how the function is named/resolved within Phoenix.
+        let host_module = block.module.as_deref().unwrap_or("js").to_string();
         for item in &block.items {
             // Builtin names (`Option`, `Result`, …) are reserved in every module.
             // `build_one_module_scope_phase_a` skips inserting a builtin-shadowing
@@ -451,9 +460,78 @@ impl Checker {
                     // declaring module, calls resolve regardless of visibility.
                     visibility: Visibility::Private,
                     def_module: self.current_module.clone(),
-                    extern_js: Some(("js".to_string(), item.name.clone())),
+                    extern_js: Some((host_module.clone(), item.name.clone())),
                 },
             );
+        }
+    }
+
+    /// Cross-module coherence for `extern js` declarations:
+    /// every declaration binding the same `(host module, name)` pair must
+    /// agree on parameter and return types.
+    ///
+    /// Sema scopes externs per Phoenix module, so several modules may each
+    /// declare the host functions they use — including the same one (the
+    /// expected BYO pattern). But the `(module, name)` pair is the *linkage*
+    /// key every backend routes by (decision A0): the compiled backends emit
+    /// one wasm import / one C-ABI shim symbol / one glue thunk per pair, so
+    /// declarations that disagree on types would marshal some modules' call
+    /// sites with another module's shapes — loudly at best, *silently* when
+    /// the flattened ABIs happen to coincide (e.g. `Int` vs `JsValue`, both
+    /// one `i64` slot on wasm32-linear). Rejected here, at the source;
+    /// `collect_externs` in phoenix-cranelift backstops the same invariant
+    /// as an internal error.
+    ///
+    /// Only `check_modules` runs this: within one module the qualified-name
+    /// key already rejects a duplicate extern, so a single-module program
+    /// cannot conflict.
+    pub(crate) fn check_extern_host_signature_coherence(&mut self) {
+        // Group declarations by their host linkage pair.
+        let mut by_pair: HashMap<&(String, String), Vec<(&String, &FunctionInfo)>> = HashMap::new();
+        for (qualified, info) in &self.extern_functions {
+            if let Some(pair) = &info.extern_js {
+                by_pair.entry(pair).or_default().push((qualified, info));
+            }
+        }
+        // Collected then sorted (rather than pushed while iterating) both to
+        // release the `extern_functions` borrow before `self.error` and to
+        // make the diagnostic order deterministic — HashMap iteration isn't.
+        // The sort key is `(pair, qualified name)` so all errors about one
+        // host function stay adjacent in the output.
+        let mut errors: Vec<((String, String), String, String, Span)> = Vec::new();
+        for (pair, mut decls) in by_pair {
+            if decls.len() < 2 {
+                continue;
+            }
+            // Sorting by qualified name makes "which declaration the others
+            // are compared against" (and thus the diagnostic text) stable.
+            decls.sort_by(|a, b| a.0.cmp(b.0));
+            let (_, first) = decls[0];
+            for (qualified, info) in &decls[1..] {
+                if info.params == first.params && info.return_type == first.return_type {
+                    continue;
+                }
+                errors.push((
+                    pair.clone(),
+                    (*qualified).clone(),
+                    format!(
+                        "conflicting `extern js` signatures for host function `{}.{}`: \
+                         `{}` here vs `{}` in module `{}` — every declaration binding \
+                         the same host function must have identical parameter and \
+                         return types, because all of them link to one host binding",
+                        pair.0,
+                        pair.1,
+                        signature_display(&info.params, &info.return_type),
+                        signature_display(&first.params, &first.return_type),
+                        first.def_module,
+                    ),
+                    info.definition_span,
+                ));
+            }
+        }
+        errors.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, _, message, span) in errors {
+            self.error(message, span);
         }
     }
 
@@ -1320,4 +1398,16 @@ impl Checker {
             self.register_impl(&synthetic_impl);
         }
     }
+}
+
+/// Render an extern signature as `(String, Int) -> String` for the
+/// cross-module coherence diagnostic
+/// ([`Checker::check_extern_host_signature_coherence`]).
+fn signature_display(params: &[Type], return_type: &Type) -> String {
+    let params = params
+        .iter()
+        .map(Type::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({params}) -> {return_type}")
 }

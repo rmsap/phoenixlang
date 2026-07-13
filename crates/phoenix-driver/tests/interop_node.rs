@@ -100,3 +100,20 @@ interop_node_test!(
     interop_host_side_effect_ordering_gc,
     "host_effect"
 );
+interop_node_test!(
+    interop_npm_module_namespaced_binding,
+    interop_npm_module_namespaced_binding_gc,
+    "npm_module"
+);
+// Two Phoenix modules each binding the same `("left-pad", "leftPad")` pair —
+// the expected BYO pattern. The pair dedupes into one import + one thunk
+// (`collect_externs`), which only a compiled multi-file build exercises; this
+// tier runs it through the real driver's module resolution on both wasm
+// targets. (Its interpreter coverage lives in phoenix-interp's multi-module
+// unit tests; the five-backend matrix front-end is single-file, so the fixture
+// is exempted there — see `carve_outs_are_glue_tier_only`.)
+interop_node_test!(
+    interop_npm_module_multi_module,
+    interop_npm_module_multi_module_gc,
+    "npm_module_multi"
+);

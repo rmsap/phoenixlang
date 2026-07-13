@@ -1,7 +1,9 @@
 //! Native (Cranelift) `extern js` host-FFI binding (Phase 2.5 decision A0/E/G).
 //!
 //! The native backend lowers each `Op::ExternCall` to a call of the C-ABI symbol
-//! `phx_extern_<module>__<name>` and emits a **weak** default body that aborts
+//! `phx_extern_<module>__<name>` (the module half escaped to a C identifier for
+//! npm package specifiers — `left-pad` → `left_2dpad`) and emits a **weak**
+//! default body that aborts
 //! via `phx_extern_unbound`. A linked **host shim** provides strong definitions
 //! that override the defaults (strong-beats-weak, independent of link order). A
 //! Phoenix closure handed to a host crosses as its env pointer and is invoked
@@ -242,4 +244,73 @@ fn native_declared_but_uncalled_extern_runs_normally() {
         &[],
     );
     assert_eq!(out, vec!["ran".to_string()]);
+}
+
+const NPM_PROGRAM: &str = "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+     function main() { print(leftPad(\"4\", 3)) }\n";
+
+/// An npm-package extern (`extern js "pkg" { ... }`, Phase 3.1.2) is the same
+/// weak-shim/strong-override mechanism as the ambient host (decision A0) — the
+/// module half of the symbol is escaped into C-identifier form
+/// (`("left-pad", "leftPad")` → `phx_extern_left_2dpad__leftPad`), so a plain C
+/// host shim can define and override it.
+#[test]
+fn native_npm_extern_round_trips_through_an_escaped_shim_symbol() {
+    let shim = compile_c_shim(
+        r#"
+#include <stdint.h>
+#include <stddef.h>
+
+extern char *phx_string_alloc(size_t n);
+
+// The escaped symbol for ("left-pad", "leftPad"): left-pad the string with
+// spaces to `width` characters (byte-wise — ASCII input in this test).
+struct PhxStr { const char *ptr; int64_t len; };
+struct PhxStr phx_extern_left_2dpad__leftPad(const char *ptr, int64_t len, int64_t width) {
+  int64_t out_len = len < width ? width : len;
+  char *out = phx_string_alloc((size_t)out_len);
+  int64_t pad = out_len - len;
+  for (int64_t i = 0; i < pad; i++) out[i] = ' ';
+  for (int64_t i = 0; i < len; i++) out[pad + i] = ptr[i];
+  struct PhxStr r = { out, out_len };
+  return r;
+}
+"#,
+        "npm_shim",
+    );
+    let out = run_with_shim(NPM_PROGRAM, std::slice::from_ref(&shim));
+    assert_eq!(out, vec!["  4".to_string()]);
+}
+
+/// With no host shim, an npm-package extern links (via its weak default) and
+/// aborts on first call naming the `(module, name)` *and* the escaped symbol a
+/// shim must define — the A0 "clear runtime error, never a silent no-op",
+/// identical in mechanism to the ambient-host case above.
+#[test]
+fn native_unbound_npm_extern_aborts_naming_package_and_symbol() {
+    let obj_bytes = common::compile_to_obj(NPM_PROGRAM);
+    let obj_path = unique("npm_unbound", "o");
+    let exe_path = unique("npm_unbound", "exe");
+    std::fs::write(&obj_path, &obj_bytes).unwrap();
+    link_executable_with_objects(&obj_path, &exe_path, &[])
+        .expect("a program with only weak extern defaults should still link");
+
+    let output = Command::new(&exe_path)
+        .output()
+        .expect("could not run the unbound npm interop binary");
+
+    // Clean up before asserting, so a failing assertion doesn't leak scratch.
+    let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&exe_path);
+
+    assert!(
+        !output.status.success(),
+        "an unbound npm extern must abort, but the binary exited cleanly"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no host binding for `extern left-pad` function `leftPad`")
+            && stderr.contains("phx_extern_left_2dpad__leftPad"),
+        "the abort must name the package and the escaped symbol, got: {stderr}"
+    );
 }

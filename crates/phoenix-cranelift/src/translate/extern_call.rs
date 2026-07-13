@@ -3,7 +3,8 @@
 //! `extern js` is a uniform host-FFI boundary (design-decisions §Phase 2.5
 //! decision A0): the generic `Op::ExternCall` is bound per backend. The native
 //! binding (decision E) lowers each distinct extern `(module, name)` to a call of
-//! a C-ABI symbol `phx_extern_<module>__<name>` carrying the native value ABI
+//! a C-ABI symbol `phx_extern_<module>__<name>` (the module half escaped to a C
+//! identifier — see [`extern_symbol`]) carrying the native value ABI
 //! (`i64`/`f64`/`i8`/string-fat-pointer; `JsValue` → an opaque `i64` host handle).
 //! The compiler emits the call and the symbol reference; a linked **host shim**
 //! provides the body.
@@ -49,8 +50,36 @@ use super::{FuncState, get_val};
 /// host shim defines this; the compiler emits a weak default. The `__` separator
 /// matches the function-name mangling (`TypeName.method` → `TypeName__method`),
 /// so `extern js`'s `alert` is `phx_extern_js__alert`.
+///
+/// The module half is escaped ([`mangle_module`]) so an npm package specifier
+/// (`extern js "pkg" { ... }`) — whose `-`/`@`/`/` are not valid in
+/// a C identifier — still yields a symbol a host shim can define from plain C:
+/// `("left-pad", "leftPad")` → `phx_extern_left_2dpad__leftPad`. The ambient
+/// `js` module contains no escapable characters, so Phase 2.5 ambient symbols
+/// are byte-identical to before.
 pub(crate) fn extern_symbol(module: &str, name: &str) -> String {
-    format!("phx_extern_{module}__{name}")
+    format!("phx_extern_{}__{name}", mangle_module(module))
+}
+
+/// Escape a host-module name into C-identifier-safe form: ASCII alphanumerics
+/// pass through; every other byte (including `_`) becomes `_xx` (two lowercase
+/// hex digits). The encoding is injective, and because an `_` in the output is
+/// always followed by two hex digits, the escaped module can never contain `__`
+/// or end in `_` — so the `__` separator in [`extern_symbol`] stays unambiguous
+/// even against an extern *name* that itself contains `__`.
+fn mangle_module(module: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(module.len());
+    for b in module.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            out.push('_');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
 }
 
 /// Declare every called `extern js` function as a weak C-ABI symbol with a
@@ -70,20 +99,23 @@ pub(crate) fn declare_extern_shims(
     }
 
     // The runtime abort helper, shared by every default shim body:
-    // `phx_extern_unbound(module_ptr, module_len, name_ptr, name_len) -> !`. All
-    // four args are pointer-width (`usize` lengths lower to `i64` on 64-bit).
+    // `phx_extern_unbound(module_ptr, module_len, name_ptr, name_len,
+    // symbol_ptr, symbol_len) -> !`. All six args are pointer-width (`usize`
+    // lengths lower to `i64` on 64-bit). The symbol travels alongside the raw
+    // `(module, name)` because only the compiler knows the escaped mangling
+    // ([`extern_symbol`]) — the runtime must not re-derive it.
     let mut unbound_sig = Signature::new(ctx.call_conv);
-    for _ in 0..4 {
+    for _ in 0..6 {
         unbound_sig.params.push(AbiParam::new(POINTER_TYPE));
     }
     let unbound_id =
         ctx.module
             .declare_function("phx_extern_unbound", Linkage::Import, &unbound_sig)?;
 
-    // The `(module, name)` strings the shim bodies pass to `phx_extern_unbound`
-    // are emitted as rodata. Module names repeat across externs (every `extern
-    // js` function shares `"js"`), so cache the `DataId` by content to emit each
-    // distinct string once.
+    // The `(module, name, symbol)` strings the shim bodies pass to
+    // `phx_extern_unbound` are emitted as rodata. Module names repeat across
+    // externs (every ambient `extern js` function shares `"js"`), so cache the
+    // `DataId` by content to emit each distinct string once.
     let mut rodata_cache: HashMap<String, DataId> = HashMap::new();
 
     for sig in externs {
@@ -100,6 +132,7 @@ pub(crate) fn declare_extern_shims(
             &cl_sig,
             &sig.module,
             &sig.name,
+            &symbol,
             unbound_id,
             &mut rodata_cache,
         )?;
@@ -112,16 +145,18 @@ pub(crate) fn declare_extern_shims(
 }
 
 /// Define the weak default body of one extern symbol: call `phx_extern_unbound`
-/// with the `(module, name)` strings (from rodata), then terminate. The helper
-/// never returns (it aborts the process), so the trailing `return` of zeroed
-/// values is unreachable — it exists only to give Cranelift a well-typed
+/// with the `(module, name, symbol)` strings (from rodata), then terminate. The
+/// helper never returns (it aborts the process), so the trailing `return` of
+/// zeroed values is unreachable — it exists only to give Cranelift a well-typed
 /// terminator without depending on a specific trap-code API.
+#[allow(clippy::too_many_arguments)]
 fn define_unbound_shim(
     ctx: &mut CompileContext,
     func_id: cranelift_module::FuncId,
     cl_sig: &Signature,
     module: &str,
     name: &str,
+    symbol: &str,
     unbound_id: cranelift_module::FuncId,
     rodata_cache: &mut HashMap<String, DataId>,
 ) -> Result<(), CompileError> {
@@ -138,10 +173,11 @@ fn define_unbound_shim(
 
     let (m_ptr, m_len) = emit_rodata_str(&mut ctx.module, &mut builder, module, rodata_cache)?;
     let (n_ptr, n_len) = emit_rodata_str(&mut ctx.module, &mut builder, name, rodata_cache)?;
+    let (s_ptr, s_len) = emit_rodata_str(&mut ctx.module, &mut builder, symbol, rodata_cache)?;
     let unbound_ref = ctx.module.declare_func_in_func(unbound_id, builder.func);
     builder
         .ins()
-        .call(unbound_ref, &[m_ptr, m_len, n_ptr, n_len]);
+        .call(unbound_ref, &[m_ptr, m_len, n_ptr, n_len, s_ptr, s_len]);
 
     // Unreachable (the call above diverges), but the block needs a terminator
     // matching the signature's returns. Zeroed values of each return type.
@@ -344,4 +380,45 @@ pub(super) fn translate_extern_call(
     }
     let call = builder.ins().call(func_ref, &cl_args);
     Ok(builder.inst_results(call).to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extern_symbol;
+
+    #[test]
+    fn ambient_symbols_are_unchanged() {
+        // The Phase 2.5 host-shim contract: hosts already define these exact
+        // symbols, so the npm-module escaping must leave them byte-identical.
+        assert_eq!(extern_symbol("js", "alert"), "phx_extern_js__alert");
+        assert_eq!(
+            extern_symbol("js", "get_length"),
+            "phx_extern_js__get_length"
+        );
+    }
+
+    #[test]
+    fn npm_specifiers_escape_to_c_identifiers() {
+        assert_eq!(
+            extern_symbol("left-pad", "leftPad"),
+            "phx_extern_left_2dpad__leftPad"
+        );
+        assert_eq!(
+            extern_symbol("@scope/pkg", "f"),
+            "phx_extern__40scope_2fpkg__f"
+        );
+    }
+
+    #[test]
+    fn escaping_keeps_distinct_pairs_distinct() {
+        // The classic `__`-separator ambiguity: without escaping, ("a__b", "c")
+        // and ("a", "b__c") would mangle identically. Escaping `_` in the module
+        // keeps the first `__` an unambiguous separator.
+        assert_ne!(extern_symbol("a__b", "c"), extern_symbol("a", "b__c"));
+        // And a raw module that happens to spell an escaped form stays distinct.
+        assert_ne!(
+            extern_symbol("left-pad", "f"),
+            extern_symbol("left_2dpad", "f")
+        );
+    }
 }

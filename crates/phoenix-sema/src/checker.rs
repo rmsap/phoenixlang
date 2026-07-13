@@ -1006,6 +1006,14 @@ impl Checker {
         // Registration pass.
         self.for_each_module(modules, |this, prog| this.register_decls(prog));
 
+        // Cross-module `extern js` coherence: every declaration binding the
+        // same `(host module, name)` pair must agree on its signature — the
+        // pair is one linkage everywhere downstream (wasm import, C shim
+        // symbol, glue thunk). Runs after registration so it sees every
+        // module's externs; a single-module program cannot conflict (the
+        // qualified-name key rejects duplicates), so `check_program` skips it.
+        self.check_extern_host_signature_coherence();
+
         // Body-check pass.
         self.for_each_module(modules, |this, prog| this.check_decl_bodies(prog));
 

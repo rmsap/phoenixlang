@@ -142,6 +142,34 @@ fn register_strings(r: &mut dyn HostRegister) {
     );
 }
 
+/// `npm_module`: an `extern js "left-pad" { ... }` extern
+/// registered under the *package* module, next to an ambient binding — dispatch
+/// must route by `(module, name)`, never flatten the package into the ambient
+/// host. `leftPad` pads with spaces to `width`, matching JS `padStart`.
+fn register_npm_module(r: &mut dyn HostRegister) {
+    r.reg(
+        "left-pad",
+        "leftPad",
+        Box::new(|_c, a| {
+            let mut it = a.into_iter();
+            match (it.next(), it.next()) {
+                (Some(HostValue::Str(s)), Some(HostValue::Int(w))) => {
+                    Ok(HostValue::Str(format!("{s:>width$}", width = w as usize)))
+                }
+                _ => Err("leftPad expects (String, Int)".into()),
+            }
+        }),
+    );
+    r.reg(
+        "js",
+        "shout",
+        Box::new(|_c, a| match a.into_iter().next() {
+            Some(HostValue::Str(s)) => Ok(HostValue::Str(s.to_uppercase())),
+            _ => Err("shout expects a String".into()),
+        }),
+    );
+}
+
 /// `strings_unicode`: a multi-byte UTF-8 `String` round-trips intact. `echo`
 /// hands back the exact same bytes (in + out fidelity); `byteLen` reports the
 /// UTF-8 byte length — the one length measure all three host languages compute
@@ -348,6 +376,35 @@ struct PhxStr phx_extern_js__tagOf(int64_t handle) {
 int8_t phx_extern_js__sameNode(int64_t a, int64_t b) { return a == b ? 1 : 0; }
 "#;
 
+const NPM_MODULE_SHIM: &str = r#"
+#include <stdint.h>
+#include <stddef.h>
+extern char *phx_string_alloc(size_t n);
+struct PhxStr { const char *ptr; int64_t len; };
+// The escaped symbol for ("left-pad", "leftPad"): the native mangling
+// hex-escapes non-alphanumerics in the module half (`-` -> `_2d`), so an npm
+// package specifier still yields a symbol definable from plain C.
+struct PhxStr phx_extern_left_2dpad__leftPad(const char *ptr, int64_t len, int64_t width) {
+  int64_t out_len = len < width ? width : len;
+  char *out = phx_string_alloc((size_t)out_len);
+  int64_t pad = out_len - len;
+  for (int64_t i = 0; i < pad; i++) out[i] = ' ';
+  for (int64_t i = 0; i < len; i++) out[pad + i] = ptr[i];
+  struct PhxStr r = { out, out_len };
+  return r;
+}
+struct PhxStr phx_extern_js__shout(const char *ptr, int64_t len) {
+  char *out = phx_string_alloc((size_t)len);
+  for (int64_t i = 0; i < len; i++) {
+    char c = ptr[i];
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    out[i] = c;
+  }
+  struct PhxStr r = { out, len };
+  return r;
+}
+"#;
+
 const CALLBACKS_SHIM: &str = r#"
 #include <stdint.h>
 // Exported trampolines: () -> Void, (Int) -> Void, (Int) -> Int.
@@ -404,6 +461,11 @@ const CALLBACKS: Case = Case {
     fixture: "callbacks",
     register: register_callbacks,
     c_shim: CALLBACKS_SHIM,
+};
+const NPM_MODULE: Case = Case {
+    fixture: "npm_module",
+    register: register_npm_module,
+    c_shim: NPM_MODULE_SHIM,
 };
 
 fn lines(s: &str) -> Vec<String> {
@@ -612,18 +674,24 @@ matrix! {
     interop_matrix_strings_unicode => STRINGS_UNICODE,
     interop_matrix_jsvalue => JSVALUE,
     interop_matrix_callbacks => CALLBACKS,
+    interop_matrix_npm_module => NPM_MODULE,
 }
 
-/// Assert the two glue-tier carve-outs stay out of the five-backend matrix and
-/// can't silently grow: `dom/*` (browser/jsdom tier) and `host_effect` (the glue's
-/// `ctx.emit` channel, which the interpreters' `HostContext` doesn't expose). Every
-/// *other* `tests/fixtures/interop/` entry must be a matrix case above — so adding
-/// a stubbable fixture without wiring it into all five columns fails here.
+/// Assert the matrix carve-outs stay explicit and can't silently grow: every
+/// `tests/fixtures/interop/` entry must be a matrix case above unless it is on
+/// the documented exemption list — so adding a stubbable fixture without wiring
+/// it into all five columns fails here. Current exemptions: `dom/*`
+/// (browser/jsdom tier) and `host_effect` (the glue's `ctx.emit` channel, which
+/// the interpreters' `HostContext` doesn't expose) exist only in the glue tier;
+/// `npm_module_multi` is a multi-file project — this matrix's front-end is
+/// single-file — so it runs on the Node tier (`interop_node.rs`, both wasm
+/// targets, through the real driver's module resolution), with its interpreter
+/// coverage in phoenix-interp's multi-module unit tests.
 #[test]
 fn carve_outs_are_glue_tier_only() {
     // Derived from the cases that actually run, not a parallel hand-kept list.
     let matrixed: Vec<&str> = CASES.iter().map(|c| c.fixture).collect();
-    let glue_tier_only = ["host_effect", "dom"];
+    let matrix_exempt = ["host_effect", "dom", "npm_module_multi"];
 
     let mut unaccounted = Vec::new();
     for entry in std::fs::read_dir(interop_fixtures_dir()).expect("reading interop fixtures dir") {
@@ -632,15 +700,15 @@ fn carve_outs_are_glue_tier_only() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !matrixed.contains(&name.as_str()) && !glue_tier_only.contains(&name.as_str()) {
+        if !matrixed.contains(&name.as_str()) && !matrix_exempt.contains(&name.as_str()) {
             unaccounted.push(name);
         }
     }
     assert!(
         unaccounted.is_empty(),
-        "interop fixtures neither in the five-backend matrix nor declared glue-tier-only: \
-         {unaccounted:?} — add them as a matrix case in interop_matrix.rs or, if their effect \
-         only exists in the glue tier, to the `glue_tier_only` carve-out list (and document why)"
+        "interop fixtures neither in the five-backend matrix nor on the exemption list: \
+         {unaccounted:?} — add them as a matrix case in interop_matrix.rs or, if another \
+         tier legitimately owns them, to the `matrix_exempt` list (and document why)"
     );
     // The matrix cases must actually exist on disk (guards against a typo'd name).
     for f in &matrixed {
@@ -663,5 +731,12 @@ fn carve_outs_are_glue_tier_only() {
     assert!(
         interop_fixtures_dir().join("dom").is_dir(),
         "carve-out family `dom` is missing its directory"
+    );
+    assert!(
+        interop_fixtures_dir()
+            .join("npm_module_multi")
+            .join("main.phx")
+            .exists(),
+        "Node-tier fixture `npm_module_multi` is missing its main.phx"
     );
 }

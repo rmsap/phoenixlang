@@ -99,13 +99,13 @@ A review of the merged implementation surfaced three defects, all now fixed with
 
 ## 3.1.2 npm / JavaScript Package Dependencies
 
-**Status: scoped, not started.** The carved-out follow-up to [§3.1](#31-package-manager) (Phase 2.5 [decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)): let a Phoenix program depend on npm packages. **Depends on:** the §3.1 package manager (complete) and the Phase 2.5 `extern js` interop (complete). This item **does** touch the compiler backends (sema, cranelift glue, the interpreters), unlike §3.1 — so the [Phase 4.6 parallel-track hygiene](./phase-4.md#46-parallel-track-note) applies again to those crates.
+**Status: in progress — PRs 1–2 (grammar/AST/sema + backend namespacing) implemented; `[js-dependencies]` + close remain.** The carved-out follow-up to [§3.1](#31-package-manager) (Phase 2.5 [decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)): let a Phoenix program depend on npm packages. **Depends on:** the §3.1 package manager (complete) and the Phase 2.5 `extern js` interop (complete). This item **does** touch the compiler backends (sema, cranelift glue, the interpreters), unlike §3.1 — so the [Phase 4.6 parallel-track hygiene](./phase-4.md#46-parallel-track-note) applies again to those crates.
 
 ### Goal
 
 Let a `.phx` program bind to an npm package's exports — `extern js "left-pad" { function leftPad(s: String, n: Int) -> String }` — with the package declared in a `[js-dependencies]` manifest section. Phoenix wires the WASM glue to that module and emits a `package.json`; the developer's existing JS toolchain (`npm install` + Node/bundler) supplies the actual code. **Phoenix fetches and bundles nothing** (the BYO model — see the toolchain decision below).
 
-### The seam it extends (what exists today)
+### The seam it extends (what existed before this slice)
 
 The Phase 2.5 `extern js` machinery is already module-agnostic at the IR level, so this is *extending a prepared seam*, not new machinery:
 
@@ -135,10 +135,10 @@ The Phase 2.5 `extern js` machinery is already module-agnostic at the IR level, 
 
 ### Exit criteria for declaring Phase 3.1.2 complete
 
-- [ ] `extern js "specifier" { … }` parses (ambient `extern js { … }` unchanged); sema registers externs under the named module; marshallability diagnostics unchanged. Unit tests.
-- [ ] WASM glue (both sub-targets) binds hosts as `host.<module>.<name>` and the required-host guard is per-module; the interpreters dispatch externs by module; a named-module interop fixture runs on the backend matrix (stubbed hosts rejoin byte-identical parity).
+- [x] `extern js "specifier" { … }` parses (ambient `extern js { … }` unchanged); sema registers externs under the named module; marshallability diagnostics unchanged. Unit tests. (Plus cross-module coherence: declarations binding the same `(host module, name)` pair must agree on parameter/return types — the pair is one linkage downstream (one wasm import, one shim symbol, one glue thunk), so a mismatch would mis-marshal, silently where the flattened ABIs coincide. Identical re-declarations across modules stay legal and dedupe — the expected BYO pattern, pinned by the `npm_module_multi` Node-tier fixture.)
+- [x] WASM glue (both sub-targets) binds hosts as `host.<module>.<name>` and the required-host guard is per-module; the interpreters dispatch externs by module; a named-module interop fixture runs on the backend matrix (stubbed hosts rejoin byte-identical parity). (Native routes via its shim symbol, the module half escaped to a C identifier — `left-pad` → `left_2dpad` — so npm specifiers stay definable from plain C and the `__` separator stays unambiguous.)
 - [ ] `[js-dependencies]` parses and validates; a wasm build emits a `package.json` from it; an `extern js "pkg"` naming an undeclared js-dependency is diagnosed. Integration tests (tempdir).
-- [ ] Calling an npm extern with no host registered gives the A0 "unbound host" runtime error on native / the interpreters (no silent no-op); no compile-time gate.
+- [x] Calling an npm extern with no host registered gives the A0 "unbound host" runtime error on native / the interpreters (no silent no-op); no compile-time gate.
 - [ ] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
 - [ ] design-decisions.md §3.1.2 records the locked decisions; the known-issues npm entry is updated; `phoenix.toml.example` documents `[js-dependencies]`.
 

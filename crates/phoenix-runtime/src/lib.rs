@@ -143,18 +143,23 @@ pub unsafe extern "C" fn phx_panic(msg_ptr: *const u8, msg_len: usize) {
 /// Abort because an `extern js` host function was called with no host binding
 /// linked (Phase 2.5 decision A0 / G — the native binding).
 ///
-/// The native backend emits a **weak** default definition of each
-/// `phx_extern_<module>__<name>` symbol whose body calls this with the extern's
-/// `(module, name)` as two string fat pointers; a host that links a *strong*
+/// The native backend emits a **weak** default definition of each extern's
+/// C-ABI symbol whose body calls this with the extern's `(module, name)` and
+/// the symbol itself as three string fat pointers; a host that links a *strong*
 /// definition of that symbol overrides the weak default, so this only runs when
 /// the program reaches an extern call whose host shim was never linked. Aborts
 /// loudly naming the missing `(module, name)` rather than failing silently or as
 /// an opaque link error.
 ///
+/// The symbol is passed in (rather than re-derived here) because the compiler
+/// escapes the module half into C-identifier form (`extern js "left-pad"` →
+/// `phx_extern_left_2dpad__leftPad`); passing the exact symbol keeps this
+/// message correct without duplicating the escaping in the runtime.
+///
 /// # Safety
 ///
-/// `module_ptr`/`name_ptr` must each point to `*_len` valid UTF-8 bytes (the
-/// compiler emits them from rodata, so they always do).
+/// `module_ptr`/`name_ptr`/`symbol_ptr` must each point to `*_len` valid UTF-8
+/// bytes (the compiler emits them from rodata, so they always do).
 #[cold]
 #[inline(never)]
 #[unsafe(no_mangle)]
@@ -163,15 +168,18 @@ pub unsafe extern "C" fn phx_extern_unbound(
     module_len: usize,
     name_ptr: *const u8,
     name_len: usize,
+    symbol_ptr: *const u8,
+    symbol_len: usize,
 ) -> ! {
     let module = std::str::from_utf8(unsafe { slice::from_raw_parts(module_ptr, module_len) })
         .unwrap_or("<invalid UTF-8>");
     let name = std::str::from_utf8(unsafe { slice::from_raw_parts(name_ptr, name_len) })
         .unwrap_or("<invalid UTF-8>");
+    let symbol = std::str::from_utf8(unsafe { slice::from_raw_parts(symbol_ptr, symbol_len) })
+        .unwrap_or("<invalid UTF-8>");
     runtime_abort(&format!(
         "no host binding for `extern {module}` function `{name}` — link a host \
-         shim defining `phx_extern_{module}__{name}` (the program called it but \
-         none was provided)"
+         shim defining `{symbol}` (the program called it but none was provided)"
     ));
 }
 

@@ -829,3 +829,81 @@ fn impl_on_type_declared_in_multiple_foreign_modules_lists_all_candidates() {
         diag.message
     );
 }
+
+#[test]
+fn extern_js_same_host_function_identical_signatures_across_modules_is_ok() {
+    // The expected BYO pattern: each module declares the npm
+    // exports it uses, so the same `("left-pad", "leftPad")` binding may
+    // appear in several modules — with identical signatures the backends
+    // dedupe the pair into one import/shim/thunk, and there is nothing to
+    // diagnose.
+    let entry = entry_only(
+        "import lib\n\
+         extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+         function main() { print(leftPad(\"4\", 3)) print(lib.padded(\"hi\")) }",
+    );
+    let lib = non_entry(
+        "lib",
+        "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+         public function padded(s: String) -> String { leftPad(s, 4) }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, lib]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "identical cross-module extern declarations must not conflict: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn extern_js_conflicting_signatures_for_one_host_function_are_rejected() {
+    // Sema scopes externs per module, so both declarations register — but
+    // `("left-pad", "leftPad")` is ONE linkage pair downstream (one wasm
+    // import, one C shim symbol, one glue thunk), so the signatures must
+    // agree: when the flattened ABIs coincide, a mismatch would otherwise
+    // mis-marshal one module's call sites silently.
+    let entry = entry_only(
+        "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }\n\
+         function main() { print(leftPad(\"4\", 3)) }",
+    );
+    let lib = non_entry(
+        "lib",
+        "extern js \"left-pad\" { function leftPad(s: String) -> String }\n\
+         public function padded(s: String) -> String { leftPad(s) }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, lib]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("conflicting `extern js` signatures for host function `left-pad.leftPad`")),
+        "expected a cross-module signature-conflict diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn extern_js_same_name_under_different_host_modules_does_not_conflict() {
+    // Same Phoenix-level name, different host modules — distinct linkage
+    // pairs, so the coherence check has nothing to say even though the
+    // signatures differ. (Dispatch routing for this shape is pinned by the
+    // interpreters' multi-module tests.)
+    let entry = entry_only(
+        "import lib\n\
+         extern js { function tag() -> String }\n\
+         function main() { print(tag()) print(lib.libTag()) }",
+    );
+    let lib = non_entry(
+        "lib",
+        "extern js \"pkg\" { function tag(n: Int) -> String }\n\
+         public function libTag() -> String { tag(1) }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, lib]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "distinct (host module, name) pairs must not conflict: {:?}",
+        analysis.diagnostics
+    );
+}

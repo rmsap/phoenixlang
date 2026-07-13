@@ -1,0 +1,7 @@
+extern js "left-pad" {
+  function leftPad(s: String, width: Int) -> String
+}
+
+public function padded(s: String) -> String {
+  leftPad(s, 4)
+}

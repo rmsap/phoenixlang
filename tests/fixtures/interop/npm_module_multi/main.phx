@@ -1,0 +1,10 @@
+import lib
+
+extern js "left-pad" {
+  function leftPad(s: String, width: Int) -> String
+}
+
+function main() {
+  print(leftPad("4", 3))
+  print(lib.padded("hi"))
+}

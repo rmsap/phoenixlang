@@ -263,6 +263,24 @@ mod tests {
     }
 
     #[test]
+    fn npm_package_module_binds_namespaced() {
+        // `extern js "pkg"` externs bind namespaced
+        // (`host["pkg"].<name>`) with a per-module required-host entry — the gc
+        // side of the shared glue core's routing (mirrors the linear test).
+        let externs = vec![ExternSig {
+            module: "left-pad".to_string(),
+            name: "leftPad".to_string(),
+            params: vec![IrType::StringRef, IrType::I64],
+            return_type: IrType::StringRef,
+        }];
+        let glue = generate(&externs).unwrap();
+        assert!(glue.contains("\"left-pad\": {"));
+        assert!(glue.contains(r#"host["left-pad"].leftPad(__readGcString(p0), Number(p1))"#));
+        assert!(glue.contains(r#"for (const [__mod, __name] of [["left-pad", "leftPad"]])"#));
+        assert!(!glue.contains("host.leftPad"));
+    }
+
+    #[test]
     fn string_marshals_via_the_scratch_helpers_one_slot() {
         // A gc `String` is one slot (a managed ref), read/built via the scratch
         // helpers — not linear's 2-slot `(ptr, len)` + `phx_string_alloc`.
@@ -381,7 +399,7 @@ mod tests {
             glue.contains(r#"exports["__phoenix_invoke_closure_i_to_v"](ptr, __intArg(args[0]))"#)
         );
         // The callback-taking extern is a required host binding.
-        assert!(glue.contains(r#"for (const __name of ["eachUpTo"])"#));
+        assert!(glue.contains(r#"for (const [__mod, __name] of [[null, "eachUpTo"]])"#));
     }
 
     #[test]
@@ -480,7 +498,7 @@ mod tests {
         let glue = generate(&externs).unwrap();
         assert!(glue.contains("weird(/* ...args */) { throw new Error("));
         assert!(glue.contains("nested closures are not supported yet"));
-        assert!(glue.contains(r#"for (const __name of ["alert"])"#));
+        assert!(glue.contains(r#"for (const [__mod, __name] of [[null, "alert"]])"#));
         // No factory emitted for the unsupported signature.
         assert!(!glue.contains("__cb_"));
     }

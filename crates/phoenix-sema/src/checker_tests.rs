@@ -5169,6 +5169,62 @@ fn extern_js_function_registered_in_extern_table_only() {
 }
 
 #[test]
+fn extern_js_module_specifier_recorded_as_host_module() {
+    // `extern js "left-pad" { ... }` registers the extern under the *named* host
+    // module (the npm package specifier), not the ambient `js` — this is the
+    // `(module, name)` linkage calls lower to and every backend routes by.
+    // The Phoenix-level name (`leftPad`) is unchanged.
+    let tokens = tokenize(
+        "extern js \"left-pad\" { function leftPad(s: String, width: Int) -> String }",
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let analysis = check(&program);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "unexpected errors: {:?}",
+        analysis.diagnostics
+    );
+    let info = analysis
+        .module
+        .extern_functions
+        .get("leftPad")
+        .expect("`leftPad` should be registered as an extern function");
+    assert_eq!(
+        info.extern_js,
+        Some(("left-pad".to_string(), "leftPad".to_string()))
+    );
+    assert_eq!(info.params, vec![Type::String, Type::Int]);
+    assert_eq!(info.return_type, Type::String);
+}
+
+#[test]
+fn extern_js_same_name_across_host_modules_collides() {
+    // The same function name bound to two different host modules in one Phoenix
+    // module is rejected: externs are keyed by their Phoenix-qualified name, not
+    // by `(host module, name)` — a bare call `f()` could not say which host
+    // module it means, so the name stays the resolution key even though the
+    // backends route by `(module, name)`.
+    let tokens = tokenize(
+        "extern js { function f() -> Int }\n\
+         extern js \"pkg\" { function f() -> Int }",
+        SourceId(0),
+    );
+    let (program, parse_errors) = parser::parse(&tokens);
+    assert!(parse_errors.is_empty(), "parse errors: {:?}", parse_errors);
+    let analysis = check(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`f` is already defined")),
+        "expected a duplicate-definition error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn extern_js_return_type_flows_to_caller() {
     // An extern returning Int is usable in arithmetic — the return type flows.
     assert_no_errors(

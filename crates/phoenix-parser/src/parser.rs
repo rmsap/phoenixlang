@@ -24,6 +24,63 @@ fn strip_string_literal_quotes(text: &str) -> String {
         .to_string()
 }
 
+/// Why an `extern js` module specifier is rejected, if it is —
+/// `None` means the specifier is usable. Best-effort syntax hygiene, not npm
+/// validation (that lands with `[js-dependencies]`): each arm rejects a string
+/// that would otherwise flow downstream verbatim and misbehave far from the
+/// mistake.
+fn extern_module_specifier_error(specifier: &str) -> Option<&'static str> {
+    if specifier.is_empty() {
+        // Names no module.
+        Some(
+            "`extern js` module specifier must not be empty — omit the string for the \
+             ambient `js` host, or name an npm package",
+        )
+    } else if specifier == "js" {
+        // The ambient host's module name: accepting it would be a silent alias
+        // for the no-specifier form that reads as an npm package named `js`
+        // downstream.
+        Some(
+            "`\"js\"` is not a module specifier — it names the ambient `js` host; omit \
+             the string (`extern js { ... }`) to bind browser/Node globals",
+        )
+    } else if specifier == "wasi_snapshot_preview1" {
+        // The WASM import namespace the runtime's WASI shim owns. An extern
+        // namespace would clobber it in the generated glue's imports object (a
+        // duplicate object key, later wins), breaking instantiation far from
+        // the mistake.
+        Some(
+            "`\"wasi_snapshot_preview1\"` is not a module specifier — that import \
+             namespace is reserved for the Phoenix runtime's WASI shim; name an npm \
+             package",
+        )
+    } else if specifier.contains('\\') || specifier.contains(char::is_whitespace) {
+        // No npm specifier has whitespace or a backslash, and the raw text
+        // keeps escape sequences intact (`strip_string_literal_quotes` strips
+        // only the quotes) — so an escaped spelling like `"left\u002Dpad"`
+        // would never match the package it means. Rejecting backslashes also
+        // keeps an escaped spelling of a reserved specifier from sneaking past
+        // the arms above.
+        Some(
+            "`extern js` module specifier must not contain whitespace or escape \
+             sequences — write the npm package specifier literally (e.g. \"left-pad\", \
+             \"@scope/pkg\")",
+        )
+    } else if specifier.contains(['{', '}']) {
+        // `{name}` is string interpolation in expression position, but the
+        // specifier is taken raw, so `extern js "{pkg}"` would silently bind a
+        // literal `{pkg}` namespace no package can ever match (braces are
+        // invalid in npm specifiers anyway).
+        Some(
+            "`extern js` module specifier must not contain `{` or `}` — string \
+             interpolation is not supported here; write the npm package specifier \
+             literally (e.g. \"left-pad\", \"@scope/pkg\")",
+        )
+    } else {
+        None
+    }
+}
+
 /// Returns a human-readable name for a [`TokenKind`], suitable for use in
 /// user-facing error messages.
 fn token_kind_display(kind: &TokenKind) -> &'static str {
@@ -650,6 +707,10 @@ impl<'src> Parser<'src> {
     /// }
     /// ```
     ///
+    /// An optional string literal after `js` names a host module — an npm
+    /// package specifier (`extern js "left-pad" { ... }`;
+    /// omitting it binds the block to the ambient `js` host.
+    ///
     /// The `js` language tag is matched as a contextual identifier (not a
     /// reserved keyword) so `js` stays usable as a variable name; only
     /// `extern js` is recognized today. A signature that fails to parse is
@@ -689,6 +750,26 @@ impl<'src> Parser<'src> {
             // follows), so a missing tag doesn't cascade into further errors.
         }
 
+        // Optional module specifier: `extern js "left-pad" { ... }` binds the
+        // block's signatures to an npm package host module;
+        // absent, the block binds to the ambient `js` host. A malformed
+        // specifier ([`extern_module_specifier_error`] explains each rejection)
+        // is diagnosed best-effort: the block still parses, with no module, so
+        // one bad specifier doesn't cascade.
+        let module = if self.peek().kind == TokenKind::StringLiteral {
+            let tok = self.advance();
+            let specifier = strip_string_literal_quotes(&tok.text);
+            match extern_module_specifier_error(&specifier) {
+                Some(message) => {
+                    self.diagnostics.push(Diagnostic::error(message, tok.span));
+                    None
+                }
+                None => Some(specifier),
+            }
+        } else {
+            None
+        };
+
         self.expect(TokenKind::LBrace)?;
         self.skip_newlines();
 
@@ -712,6 +793,7 @@ impl<'src> Parser<'src> {
 
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(ExternJsBlock {
+            module,
             items,
             span: start.merge(end),
         })
@@ -7278,6 +7360,169 @@ public type UserId = Int";
                 assert_eq!(sig.params[0].name, "message");
                 assert!(sig.return_type.is_none());
             }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_ambient_has_no_module() {
+        // `extern js { ... }` (no specifier) binds the ambient host — module None.
+        let (program, diagnostics) =
+            parse_source("extern js {\n  function alert(message: String)\n}");
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => assert!(block.module.is_none()),
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_with_module_specifier() {
+        // `extern js "left-pad" { ... }` names an npm package host module.
+        let src = "extern js \"left-pad\" {\n  \
+                   function leftPad(s: String, width: Int) -> String\n}";
+        let (program, diagnostics) = parse_source(src);
+        assert!(diagnostics.is_empty(), "errors: {:?}", diagnostics);
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => {
+                assert_eq!(block.module.as_deref(), Some("left-pad"));
+                assert_eq!(block.items.len(), 1);
+                assert_eq!(block.items[0].name, "leftPad");
+            }
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_scoped_and_subpath_specifiers() {
+        // Scoped (`@scope/pkg`) and subpath (`pkg/sub`) specifiers are accepted
+        // verbatim — validation against `[js-dependencies]` is a later PR.
+        for spec in ["@scope/pkg", "pkg/sub/mod"] {
+            let src = format!("extern js \"{spec}\" {{\n  function f() -> Int\n}}");
+            let (program, diagnostics) = parse_source(&src);
+            assert!(
+                diagnostics.is_empty(),
+                "errors for `{spec}`: {:?}",
+                diagnostics
+            );
+            match &program.declarations[0] {
+                Declaration::ExternJs(block) => assert_eq!(block.module.as_deref(), Some(spec)),
+                other => panic!("expected ExternJs decl, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_empty_specifier_errors() {
+        // `extern js ""` names no module — a diagnostic, and the block falls back
+        // to no module (parsed best-effort).
+        let (program, diagnostics) = parse_source("extern js \"\" {\n  function f() -> Int\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("must not be empty")),
+            "expected an empty-specifier error; got {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => assert!(block.module.is_none()),
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_specifier_with_escapes_or_whitespace_errors() {
+        // The lexer keeps escape sequences raw (`strip_string_literal_quotes`
+        // strips only the quotes), so a specifier with a backslash — e.g. the
+        // escaped spelling `"left\u002Dpad"` — would flow downstream verbatim
+        // and never match the npm package it means; whitespace likewise names
+        // no npm package. Both are rejected best-effort (block parses, no
+        // module). Rejecting backslashes also keeps an escaped spelling of a
+        // reserved specifier (`"js"`, `"wasi_snapshot_preview1"`) from
+        // bypassing its dedicated check.
+        for src in [
+            "extern js \"left\\u002Dpad\" {\n  function f() -> Int\n}",
+            "extern js \" \" {\n  function f() -> Int\n}",
+            "extern js \"left pad\" {\n  function f() -> Int\n}",
+        ] {
+            let (program, diagnostics) = parse_source(src);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("whitespace or escape sequences")),
+                "expected a malformed-specifier error for `{src}`; got {:?}",
+                diagnostics
+            );
+            match &program.declarations[0] {
+                Declaration::ExternJs(block) => assert!(block.module.is_none()),
+                other => panic!("expected ExternJs decl, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_specifier_with_interpolation_braces_errors() {
+        // `{name}` is string interpolation in expression position, but the
+        // specifier is taken raw (the lexer keeps braces inside the literal
+        // token), so `extern js "{pkg}"` would silently bind a literal `{pkg}`
+        // namespace no package can ever match. Rejected best-effort like the
+        // whitespace/backslash cases (block parses, no module).
+        for src in [
+            "extern js \"{pkg}\" {\n  function f() -> Int\n}",
+            "extern js \"left-{sep}pad\" {\n  function f() -> Int\n}",
+        ] {
+            let (program, diagnostics) = parse_source(src);
+            assert!(
+                diagnostics.iter().any(|d| d
+                    .message
+                    .contains("string interpolation is not supported here")),
+                "expected a brace-specifier error for `{src}`; got {:?}",
+                diagnostics
+            );
+            match &program.declarations[0] {
+                Declaration::ExternJs(block) => assert!(block.module.is_none()),
+                other => panic!("expected ExternJs decl, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_reserved_js_specifier_errors() {
+        // `extern js "js"` spells out the ambient host's module name — rejected
+        // (it would silently alias `extern js { ... }` and read as an npm
+        // package named `js`); the block falls back to no module, best-effort.
+        let (program, diagnostics) = parse_source("extern js \"js\" {\n  function f() -> Int\n}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("not a module specifier")),
+            "expected a reserved-specifier error; got {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => assert!(block.module.is_none()),
+            other => panic!("expected ExternJs decl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extern_js_reserved_wasi_specifier_errors() {
+        // `extern js "wasi_snapshot_preview1"` claims the import namespace the
+        // runtime's WASI shim owns — in the generated glue's imports object the
+        // extern namespace would be a duplicate key (later wins), clobbering the
+        // shim and failing instantiation far from the mistake. Rejected like the
+        // reserved `"js"`; the block falls back to no module, best-effort.
+        let (program, diagnostics) =
+            parse_source("extern js \"wasi_snapshot_preview1\" {\n  function f() -> Int\n}");
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("reserved for the Phoenix runtime's WASI shim")),
+            "expected a reserved-specifier error; got {:?}",
+            diagnostics
+        );
+        match &program.declarations[0] {
+            Declaration::ExternJs(block) => assert!(block.module.is_none()),
             other => panic!("expected ExternJs decl, got {:?}", other),
         }
     }
