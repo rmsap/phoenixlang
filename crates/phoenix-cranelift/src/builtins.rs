@@ -98,6 +98,14 @@ pub struct RuntimeFunctions {
     pub json_as_bool: FuncId,
     /// `phx_json_as_str(i64) -> (ptr, len)`.
     pub json_as_str: FuncId,
+    /// `phx_json_get_field(i64, ptr, len) -> i64` — child handle, or the
+    /// missing-field sentinel (`0` in this runtime). The sentinel value is
+    /// backend-private (the IR interpreter uses `-1`, since its arena index
+    /// `0` is a valid handle): synthesized IR must only test a handle via
+    /// `json.isMissing`, never against a literal.
+    pub json_get_field: FuncId,
+    /// `phx_json_is_missing(i64) -> i8`.
+    pub json_is_missing: FuncId,
     /// `phx_str_index_of(p1, l1, p2, l2) -> i64`.
     pub str_index_of: FuncId,
     /// `phx_str_replace(p1, l1, p2, l2, p3, l3) -> (ptr, len)`.
@@ -264,6 +272,14 @@ impl RuntimeFunctions {
             json_as_float: declare_func(module, "phx_json_as_float", &[I64], &[F64], call_conv)?,
             json_as_bool: declare_func(module, "phx_json_as_bool", &[I64], &[I8], call_conv)?,
             json_as_str: declare_func(module, "phx_json_as_str", &[I64], &[I64, I64], call_conv)?,
+            json_get_field: declare_func(
+                module,
+                "phx_json_get_field",
+                &[I64, I64, I64],
+                &[I64],
+                call_conv,
+            )?,
+            json_is_missing: declare_func(module, "phx_json_is_missing", &[I64], &[I8], call_conv)?,
             str_index_of: declare_func(
                 module,
                 "phx_str_index_of",

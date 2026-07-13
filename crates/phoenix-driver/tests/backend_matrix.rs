@@ -197,6 +197,25 @@ backend_matrix_test!(
     "json_decode_scalars.phx",
     skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
 );
+// `json.decode<Struct>`: (nested) object → struct, missing→MissingField,
+// wrong-kind (incl. `null`) field error propagation, extra keys ignored,
+// non-object / malformed → Err, field-less struct. wasm32-gc skipped
+// (serde_json DOM deferral).
+backend_matrix_test!(
+    matrix_json_decode_struct,
+    "json_decode_struct.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
+// Struct-cycle decode (A → B → A): exercises IR decoder-cycle synthesis
+// (pre-registered node-decoder stubs let A's decoder call B's call A's)
+// at runtime, not just sema's cycle guard. Finite input always errs — on
+// whichever missing/wrong-kind field the input steers to. wasm32-gc
+// skipped (serde_json DOM deferral).
+backend_matrix_test!(
+    matrix_json_decode_recursive,
+    "json_decode_recursive.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

@@ -1,0 +1,41 @@
+// json.decode<A> where `A` and `B` form a struct cycle (A → B → A) — pins
+// the decoder-cycle machinery in IR synthesis: the node-decoder stubs are
+// pre-registered so A's decoder can call B's, which calls A's. A finite
+// JSON input can never satisfy the cycle (Option fields land in a later
+// slice), so every case errs — the point is that synthesis terminates and
+// the recursive decoders actually run. `{{`/`}}` are the
+// string-interpolation escapes for the literal JSON braces.
+
+import json
+
+struct A {
+  b: B
+  x: Int
+}
+
+struct B {
+  a: A
+}
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function main() {
+  // No fields at all → the outer decoder's first field is missing.
+  let r: Result<A, JsonError> = json.decode<A>("{{}}")
+  match r { Ok(v) -> print("ok") Err(e) -> print(describe(e)) }
+
+  // Two full laps of the cycle (A → B → A) before the innermost A is
+  // missing its `b`.
+  let s: Result<A, JsonError> = json.decode<A>("{{\"b\":{{\"a\":{{}}}},\"x\":1}}")
+  match s { Ok(v) -> print("ok") Err(e) -> print(describe(e)) }
+
+  // A wrong-kind node mid-cycle: the inner A decoder rejects `3`.
+  let t: Result<A, JsonError> = json.decode<A>("{{\"b\":{{\"a\":3}},\"x\":1}}")
+  match t { Ok(v) -> print("ok") Err(e) -> print(describe(e)) }
+}

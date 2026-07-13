@@ -1,3 +1,4 @@
+mod json;
 mod multi_module;
 
 pub use multi_module::{run_modules, run_modules_with_host};
@@ -75,15 +76,6 @@ pub(crate) fn ok_val(val: Value) -> Value {
 /// Constructs a `Result::Err` variant value.
 pub(crate) fn err_val(val: Value) -> Value {
     Value::EnumVariant("Result".to_string(), "Err".to_string(), vec![val])
-}
-
-/// Constructs a `JsonError::<variant>(message)` value.
-fn json_error_value(variant: &str, msg: &str) -> Value {
-    Value::EnumVariant(
-        "JsonError".to_string(),
-        variant.to_string(),
-        vec![Value::String(msg.to_string())],
-    )
 }
 
 /// Creates a `RuntimeError` for wrong argument count on a method call.
@@ -250,6 +242,12 @@ pub struct Interpreter {
     /// DOM into a typed `Value` guided by this type.
     pub(crate) json_decode_types: HashMap<Span, phoenix_sema::types::Type>,
 
+    /// Struct field `(name, type)` lists keyed by qualified struct name,
+    /// seeded from sema (Phase 4.6). `json.decode` of a struct target needs
+    /// each field's type to recurse; the interpreter's own `StructDef` only
+    /// tracks field names.
+    pub(crate) json_struct_fields: HashMap<String, Vec<(String, phoenix_sema::types::Type)>>,
+
     /// Per-module visibility scopes (drained from sema's `Analysis`).
     /// Used by [`Interpreter::qualify`] to translate user-source bare
     /// names into qualified registry keys (mirrors what the IR layer
@@ -359,6 +357,7 @@ impl Interpreter {
             namespace_call_targets: HashMap::new(),
             json_encode_spans: std::collections::HashSet::new(),
             json_decode_types: HashMap::new(),
+            json_struct_fields: HashMap::new(),
             output,
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),
@@ -1567,137 +1566,6 @@ impl Interpreter {
         }
     }
 
-    /// Recursively encode a runtime value to a JSON string.
-    ///
-    /// Scalars route through `Value`'s `Display` (the same rendering as
-    /// `toString`), so they match the compiled backends' `toString`-based
-    /// encoders; strings use the shared `phoenix_runtime::json_escape`; a
-    /// struct emits an object with its fields in declaration order;
-    /// `Option<T>` encodes as `null`/passthrough and other enums are
-    /// adjacently tagged (`{"type":"V","value":[…]}`); a `List<T>` becomes an
-    /// array and a `Map<String, V>` an object (insertion order). This covers
-    /// scalars, structs, `Option`, non-generic enums, `List`, and
-    /// `Map<String, _>`; richer shapes (non-`String`-key maps, generic enums)
-    /// arrive with later slices and are gated in sema.
-    fn json_encode_value(&self, value: &Value) -> Result<String> {
-        match value {
-            Value::String(s) => Ok(phoenix_runtime::json_escape(s)),
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) => Ok(value.to_string()),
-            Value::Struct(name, fields) => {
-                let def = self.structs.get(name).ok_or_else(|| RuntimeError {
-                    message: format!("json.encode: unknown struct `{name}`"),
-                    try_return_value: None,
-                })?;
-                let mut parts = Vec::with_capacity(def.field_names.len());
-                for fname in &def.field_names {
-                    let fv = fields.get(fname).ok_or_else(|| RuntimeError {
-                        message: format!("json.encode: struct `{name}` is missing field `{fname}`"),
-                        try_return_value: None,
-                    })?;
-                    // Field-name keys are identifiers, so raw quoting is valid
-                    // JSON (matching the synthesized IR encoders).
-                    parts.push(format!("\"{}\":{}", fname, self.json_encode_value(fv)?));
-                }
-                Ok(format!("{{{}}}", parts.join(",")))
-            }
-            // `Option<T>`: None → null, Some(x) → encode(x). Other enums are
-            // adjacently tagged.
-            Value::EnumVariant(enum_name, variant, fields) if enum_name == "Option" => {
-                match variant.as_str() {
-                    "None" => Ok("null".to_string()),
-                    "Some" => self.json_encode_value(&fields[0]),
-                    other => error(format!("json.encode: unexpected Option variant `{other}`")),
-                }
-            }
-            Value::EnumVariant(_, variant, fields) => {
-                // Variant names are identifiers, so raw quoting is valid JSON.
-                if fields.is_empty() {
-                    Ok(format!("{{\"type\":\"{variant}\"}}"))
-                } else {
-                    let mut parts = Vec::with_capacity(fields.len());
-                    for fv in fields {
-                        parts.push(self.json_encode_value(fv)?);
-                    }
-                    Ok(format!(
-                        "{{\"type\":\"{variant}\",\"value\":[{}]}}",
-                        parts.join(",")
-                    ))
-                }
-            }
-            // `List<T>` → array.
-            Value::List(elems) => {
-                let mut parts = Vec::with_capacity(elems.len());
-                for e in elems {
-                    parts.push(self.json_encode_value(e)?);
-                }
-                Ok(format!("[{}]", parts.join(",")))
-            }
-            // `Map<String, V>` → object. Sema guarantees String keys for this
-            // slice, so the empty case is unambiguously `{}`.
-            Value::Map(entries) => {
-                let mut parts = Vec::with_capacity(entries.len());
-                for (k, v) in entries {
-                    let Value::String(ks) = k else {
-                        return error(
-                            "json.encode: Map with non-String keys is not supported yet"
-                                .to_string(),
-                        );
-                    };
-                    parts.push(format!(
-                        "{}:{}",
-                        phoenix_runtime::json_escape(ks),
-                        self.json_encode_value(v)?
-                    ));
-                }
-                Ok(format!("{{{}}}", parts.join(",")))
-            }
-            other => error(format!(
-                "json.encode does not support this value yet: {other}"
-            )),
-        }
-    }
-
-    /// Decode `text` into a `Result<T, JsonError>` runtime value guided by
-    /// the target type `ty`. Parse errors become
-    /// `Err(ParseError(msg))`; a shape mismatch becomes `Err(TypeMismatch)`.
-    /// Never panics — malformed input is always a returned `Err`.
-    fn json_decode(&self, text: &str, ty: &phoenix_sema::types::Type) -> Value {
-        match serde_json::from_str::<serde_json::Value>(text) {
-            Err(e) => err_val(json_error_value("ParseError", &e.to_string())),
-            Ok(dom) => self.json_decode_value(&dom, ty),
-        }
-    }
-
-    /// Build a `Result<T, JsonError>` from a parsed DOM node and target type.
-    /// This slice handles the scalar types.
-    fn json_decode_value(&self, dom: &serde_json::Value, ty: &phoenix_sema::types::Type) -> Value {
-        use phoenix_sema::types::Type;
-        let mismatch = |name: &str| err_val(json_error_value("TypeMismatch", name));
-        match ty {
-            Type::Int => match dom.as_i64() {
-                Some(i) => ok_val(Value::Int(i)),
-                None => mismatch("expected Int"),
-            },
-            // A JSON integer is a valid Float too.
-            Type::Float => match dom.as_f64() {
-                Some(f) => ok_val(Value::Float(f)),
-                None => mismatch("expected Float"),
-            },
-            Type::Bool => match dom.as_bool() {
-                Some(b) => ok_val(Value::Bool(b)),
-                None => mismatch("expected Bool"),
-            },
-            Type::String => match dom.as_str() {
-                Some(s) => ok_val(Value::String(s.to_string())),
-                None => mismatch("expected String"),
-            },
-            other => err_val(json_error_value(
-                "TypeMismatch",
-                &format!("json.decode does not support {other} yet"),
-            )),
-        }
-    }
-
     /// Evaluates a method call, dispatching to built-in type methods or
     /// user-defined methods.
     fn eval_method_call(&mut self, mc: &MethodCallExpr) -> Result<Value> {
@@ -1733,7 +1601,7 @@ impl Interpreter {
                     return error(format!("json.decode expects a String, got {other}"));
                 }
             };
-            return Ok(self.json_decode(&text, &ty));
+            return self.json_decode(&text, &ty);
         }
         // Recognize the builtin static constructors `List.builder()` and
         // `Map.builder()` before evaluating the object. The parser models

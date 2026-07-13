@@ -1,0 +1,13 @@
+public struct Point {
+  public x: Int
+  public y: Int
+}
+
+public struct User {
+  public name: String
+  public home: Point
+
+  public function summary(self) -> String {
+    self.name + " lives at " + toString(self.home.x) + "," + toString(self.home.y)
+  }
+}

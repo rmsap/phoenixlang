@@ -1,17 +1,6 @@
-//! JSON encoder synthesis.
-//!
-//! For every type reachable from a `json.encode(value)` call, this pass
-//! synthesizes a per-type encoder function `__json_encode_<key>(v: T) ->
-//! String` and records it in [`crate::module::IrModule::json_encoders`].
-//! Because the synthesized routines are ordinary IR, all five backends
-//! execute them uniformly — there is no per-backend serialization logic.
-//! Each `json.encode` call site then lowers to an `Op::Call` of the
-//! encoder for its argument's static type (see `lower_method_call`).
-//!
-//! Runs as a Pass 1.5 step (after declaration registration, before user
-//! bodies are lowered) so encoder stubs exist before any call site — or
-//! any sibling encoder — needs to reference them. Mirrors the two-pass
-//! shape of [`crate::default_wrappers`].
+//! `json.encode` synthesis: for every type reachable from a
+//! `json.encode(value)` call, a per-type encoder function
+//! `__json_encode_<key>(v: T) -> String`.
 //!
 //! Covered so far: scalars (`Int`/`Float`/`Bool`/`String`), non-generic
 //! structs, `Option<T>` (None → null, Some(x) → encode(x)), non-generic
@@ -25,12 +14,13 @@ use std::collections::BTreeMap;
 use phoenix_common::module_path::ModulePath;
 use phoenix_sema::types::Type;
 
+use super::{encode_type_key, enum_variant_index, sanitize};
 use crate::default_wrappers::with_synthetic_function;
 use crate::instruction::{FuncId, Op, ValueId};
 use crate::lower::LoweringContext;
 use crate::module::IrFunction;
 use crate::terminator::Terminator;
-use crate::types::{IrType, JSON_ERROR_ENUM, LIST_TYPE, MAP_TYPE, OPTION_ENUM, RESULT_ENUM};
+use crate::types::{IrType, LIST_TYPE, MAP_TYPE, OPTION_ENUM};
 
 /// Synthesize an encoder for every type demanded by a `json.encode` call
 /// (transitively through struct fields). No-op when the program has no
@@ -97,60 +87,12 @@ fn collect_demanded_types(ctx: &LoweringContext<'_>) -> BTreeMap<String, Type> {
     demanded
 }
 
-/// A stable, collision-free key per encodable type: a scalar's name, a
-/// struct's or non-generic enum's qualified name (`"models.user::User"`), or
-/// an `Option<T>` parameterized by its element key (`"Option<Int>"`). Shared
-/// with the `json.encode` dispatch in `lower_method_call`.
-pub(crate) fn encode_type_key(ty: &Type) -> String {
-    match ty {
-        Type::Int => "Int".to_string(),
-        Type::Float => "Float".to_string(),
-        Type::Bool => "Bool".to_string(),
-        Type::String => "String".to_string(),
-        // Generic collections need a distinct encoder per instantiation.
-        Type::Generic(name, args) if name == OPTION_ENUM && args.len() == 1 => {
-            format!("Option<{}>", encode_type_key(&args[0]))
-        }
-        Type::Generic(name, args) if name == LIST_TYPE && args.len() == 1 => {
-            format!("List<{}>", encode_type_key(&args[0]))
-        }
-        Type::Generic(name, args) if name == MAP_TYPE && args.len() == 2 => format!(
-            "Map<{},{}>",
-            encode_type_key(&args[0]),
-            encode_type_key(&args[1])
-        ),
-        // Both structs and non-generic enums key on their qualified name.
-        Type::Named(name) => name.clone(),
-        other => unreachable!(
-            "json encode: unsupported type reached synthesis ({other:?}) — \
-             sema's `unsupported_json_encode_type` gate should reject it"
-        ),
-    }
-}
-
-/// Readable name prefix for a type's encoder. Not guaranteed unique on its
-/// own — the `::`→`__` mangling can alias distinct keys (e.g. `a::b` and a
-/// struct literally named `a__b`) — so `register_encoder_stub` appends the
-/// assigned `FuncId` to make the final IR function name collision-free.
-/// (Dispatch never relies on the name: `IrModule::json_encoders` is keyed by
-/// the unmangled `key`.)
-fn encoder_fn_name(key: &str) -> String {
-    // Map every non-alphanumeric character (`::`, `<`, `>`, …) to `_` so the
-    // name is a valid object symbol; the FuncId suffix added by
-    // `register_encoder_stub` carries uniqueness.
-    let safe: String = key
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("__json_encode_{safe}")
-}
-
 /// Pass A: append the encoder's stub (one param `v: T`, returns a string).
 fn register_encoder_stub(ctx: &mut LoweringContext<'_>, key: &str, ty: &Type) -> FuncId {
     let param_ir = ctx.lower_type(ty);
     let stub = IrFunction::new(
         FuncId(u32::MAX), // filled in by `push_concrete`
-        encoder_fn_name(key),
+        format!("__json_encode_{}", sanitize(key)),
         vec![param_ir],
         vec!["v".to_string()],
         IrType::StringRef,
@@ -158,7 +100,7 @@ fn register_encoder_stub(ctx: &mut LoweringContext<'_>, key: &str, ty: &Type) ->
     );
     let fid = ctx.module.push_concrete(stub);
     // Suffix with the (globally unique) FuncId so the IR symbol name is
-    // unique even when `encoder_fn_name` mangling aliases two keys.
+    // unique even when the `sanitize` mangling aliases two keys.
     let func = ctx.module.functions[fid.index()].func_mut();
     func.name = format!("{}_{}", func.name, fid.0);
     fid
@@ -262,19 +204,6 @@ fn emit_struct_encode(ctx: &mut LoweringContext<'_>, struct_name: &str, param: V
     }
     let close = ctx.emit(Op::ConstString("}".to_string()), IrType::StringRef, None);
     ctx.emit(Op::StringConcat(acc, close), IrType::StringRef, None)
-}
-
-/// The discriminant index of `variant` in `enum_name`'s IR layout, looked up
-/// rather than assuming sema's variant order matches the layout order. The two
-/// agree today (the layout is built from sema's variant list), but resolving
-/// the index keeps every enum encoder correct if that ever changes.
-fn enum_variant_index(ctx: &LoweringContext<'_>, enum_name: &str, variant: &str) -> u32 {
-    ctx.module
-        .enum_layouts
-        .get(enum_name)
-        .and_then(|vs| vs.iter().position(|(n, _)| n == variant))
-        .unwrap_or_else(|| unreachable!("{enum_name} layout missing variant `{variant}`"))
-        as u32
 }
 
 /// Emit an `Option<T>` encoder: `None` → `null`, `Some(x)` → `encode(x)`.
@@ -653,318 +582,4 @@ fn emit_map_encode(
 /// `Map.keys` / `Map.values` results.
 fn list_of(elem: &Type) -> Type {
     Type::Generic(LIST_TYPE.to_string(), vec![elem.clone()])
-}
-
-// ── JSON decode ─────────────────────────────────────────────
-//
-// Node-kind tags mirror `phoenix_runtime::json::JSON_KIND_*` — the runtime
-// is the ABI source of truth. Mirroring (rather than importing) keeps this
-// compiler crate free of a production dependency on the runtime; the
-// `kind_tags_match_runtime_abi` test pins the two in lockstep, the same
-// scheme the list-header layout check uses. Decoders compare the result of
-// the `json.kind` builtin against these.
-const KIND_BOOL: i64 = 1;
-const KIND_INT: i64 = 2;
-const KIND_FLOAT: i64 = 3;
-const KIND_STRING: i64 = 4;
-
-/// Synthesize a decoder for every type demanded by a `json.decode<T>` call.
-/// No-op when the program has no `json.decode` sites. This slice covers the
-/// scalar types (sema's `unsupported_json_decode_type` gate rejects the
-/// rest before they reach here).
-pub(crate) fn synthesize_json_decoders(ctx: &mut LoweringContext<'_>) {
-    let demanded: BTreeMap<String, Type> = ctx
-        .check
-        .json_decode_types
-        .values()
-        .map(|t| (encode_type_key(t), t.clone()))
-        .collect();
-    if demanded.is_empty() {
-        return;
-    }
-    // Pass A: register the node-decoder + entry stubs for every type.
-    let mut node_ids: BTreeMap<String, FuncId> = BTreeMap::new();
-    for (key, ty) in &demanded {
-        let node =
-            register_decoder_stub(ctx, &format!("__json_decode_{}", sanitize(key)), ty, false);
-        node_ids.insert(key.clone(), node);
-        let entry = register_decoder_stub(
-            ctx,
-            &format!("__json_decode_entry_{}", sanitize(key)),
-            ty,
-            true,
-        );
-        ctx.module.json_decoders.insert(key.clone(), entry);
-    }
-    // Pass B: build the node-decoder + entry bodies.
-    for (key, ty) in &demanded {
-        let node = node_ids[key];
-        let entry = ctx.module.json_decoders[key];
-        build_node_decoder(ctx, ty, node);
-        build_decode_entry(ctx, ty, entry, node);
-    }
-}
-
-/// Map a type key to a symbol-safe suffix (shares the `encoder_fn_name`
-/// scheme so the two families read alike in IR dumps).
-fn sanitize(key: &str) -> String {
-    key.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-/// Register a decoder stub. An entry (`is_entry`) takes the input `String`;
-/// a node decoder takes a DOM node handle (`I64`). Both return
-/// `Result<T, JsonError>`.
-fn register_decoder_stub(
-    ctx: &mut LoweringContext<'_>,
-    name: &str,
-    ty: &Type,
-    is_entry: bool,
-) -> FuncId {
-    let param = if is_entry {
-        IrType::StringRef
-    } else {
-        IrType::I64
-    };
-    let ret = result_ir(ctx, ty);
-    let stub = IrFunction::new(
-        FuncId(u32::MAX),
-        name.to_string(),
-        vec![param],
-        vec![if is_entry { "s" } else { "node" }.to_string()],
-        ret,
-        None,
-    );
-    let fid = ctx.module.push_concrete(stub);
-    let func = ctx.module.functions[fid.index()].func_mut();
-    func.name = format!("{}_{}", func.name, fid.0);
-    fid
-}
-
-/// `Result<T, JsonError>` as an IR type.
-fn result_ir(ctx: &LoweringContext<'_>, ty: &Type) -> IrType {
-    let t = ctx.lower_type(ty);
-    IrType::EnumRef(
-        RESULT_ENUM.to_string(),
-        vec![t, IrType::EnumRef(JSON_ERROR_ENUM.to_string(), Vec::new())],
-    )
-}
-
-/// Build the entry body: parse the input string, propagate a parse error,
-/// otherwise decode the root node — freeing the DOM on both paths.
-fn build_decode_entry(ctx: &mut LoweringContext<'_>, ty: &Type, entry: FuncId, node_dec: FuncId) {
-    let result_ty = result_ir(ctx, ty);
-    with_synthetic_function(ctx, entry, ModulePath::entry(), |ctx| {
-        let start = ctx.create_block();
-        ctx.switch_to_block(start);
-        let s = ctx.add_block_param(start, IrType::StringRef);
-
-        let dom = ctx.emit(
-            Op::BuiltinCall("json.parse".to_string(), vec![s]),
-            IrType::I64,
-            None,
-        );
-        let failed = ctx.emit(
-            Op::BuiltinCall("json.parseFailed".to_string(), vec![dom]),
-            IrType::Bool,
-            None,
-        );
-        let perr = ctx.create_block();
-        let ok = ctx.create_block();
-        let done = ctx.create_block();
-        let result = ctx.add_block_param(done, result_ty.clone());
-        ctx.terminate(Terminator::Branch {
-            condition: failed,
-            true_block: perr,
-            true_args: Vec::new(),
-            false_block: ok,
-            false_args: Vec::new(),
-        });
-
-        // Parse failed → Err(ParseError(message)).
-        ctx.switch_to_block(perr);
-        let msg = ctx.emit(
-            Op::BuiltinCall("json.parseError".to_string(), vec![dom]),
-            IrType::StringRef,
-            None,
-        );
-        let je = emit_json_error(ctx, "ParseError", msg);
-        let err_res = emit_result_err(ctx, &result_ty, je);
-        ctx.emit_void(Op::BuiltinCall("json.free".to_string(), vec![dom]), None);
-        ctx.terminate(Terminator::Jump {
-            target: done,
-            args: vec![err_res],
-        });
-
-        // Parsed → decode the root node, then free.
-        ctx.switch_to_block(ok);
-        let root = ctx.emit(
-            Op::BuiltinCall("json.root".to_string(), vec![dom]),
-            IrType::I64,
-            None,
-        );
-        let decoded = ctx.emit(
-            Op::Call(node_dec, Vec::new(), vec![root]),
-            result_ty.clone(),
-            None,
-        );
-        ctx.emit_void(Op::BuiltinCall("json.free".to_string(), vec![dom]), None);
-        ctx.terminate(Terminator::Jump {
-            target: done,
-            args: vec![decoded],
-        });
-
-        ctx.switch_to_block(done);
-        ctx.terminate(Terminator::Return(Some(result)));
-    });
-}
-
-/// Build a per-type node decoder body. This slice handles the scalars.
-fn build_node_decoder(ctx: &mut LoweringContext<'_>, ty: &Type, fid: FuncId) {
-    let result_ty = result_ir(ctx, ty);
-    with_synthetic_function(ctx, fid, ModulePath::entry(), |ctx| {
-        let start = ctx.create_block();
-        ctx.switch_to_block(start);
-        let node = ctx.add_block_param(start, IrType::I64);
-        let result = emit_scalar_decode(ctx, ty, node, &result_ty);
-        ctx.terminate(Terminator::Return(Some(result)));
-    });
-}
-
-/// Emit a scalar decoder: check the node's kind, extract on match, else
-/// `Err(TypeMismatch)`. Leaves the context in the merge block and returns
-/// its parameter.
-fn emit_scalar_decode(
-    ctx: &mut LoweringContext<'_>,
-    ty: &Type,
-    node: ValueId,
-    result_ty: &IrType,
-) -> ValueId {
-    let (kinds, extract, value_ir, name): (&[i64], &str, IrType, &str) = match ty {
-        Type::Int => (&[KIND_INT], "json.asInt", IrType::I64, "Int"),
-        // A JSON integer is also a valid Float.
-        Type::Float => (
-            &[KIND_INT, KIND_FLOAT],
-            "json.asFloat",
-            IrType::F64,
-            "Float",
-        ),
-        Type::Bool => (&[KIND_BOOL], "json.asBool", IrType::Bool, "Bool"),
-        Type::String => (&[KIND_STRING], "json.asStr", IrType::StringRef, "String"),
-        other => unreachable!("scalar decode: unsupported type {other:?}"),
-    };
-
-    let kind = ctx.emit(
-        Op::BuiltinCall("json.kind".to_string(), vec![node]),
-        IrType::I64,
-        None,
-    );
-    let ok_blk = ctx.create_block();
-    let err_blk = ctx.create_block();
-    let merge = ctx.create_block();
-    let result = ctx.add_block_param(merge, result_ty.clone());
-
-    // Chain of kind tests: any match jumps to `ok_blk`; the final miss falls
-    // through to `err_blk`.
-    for (i, &k) in kinds.iter().enumerate() {
-        let kv = ctx.emit(Op::ConstI64(k), IrType::I64, None);
-        let eq = ctx.emit(Op::IEq(kind, kv), IrType::Bool, None);
-        let next = if i + 1 < kinds.len() {
-            ctx.create_block()
-        } else {
-            err_blk
-        };
-        ctx.terminate(Terminator::Branch {
-            condition: eq,
-            true_block: ok_blk,
-            true_args: Vec::new(),
-            false_block: next,
-            false_args: Vec::new(),
-        });
-        if next != err_blk {
-            ctx.switch_to_block(next);
-        }
-    }
-
-    // Match → Ok(extract(node)).
-    ctx.switch_to_block(ok_blk);
-    let v = ctx.emit(
-        Op::BuiltinCall(extract.to_string(), vec![node]),
-        value_ir,
-        None,
-    );
-    let ok = emit_result_ok(ctx, result_ty, v);
-    ctx.terminate(Terminator::Jump {
-        target: merge,
-        args: vec![ok],
-    });
-
-    // Miss → Err(TypeMismatch("expected <T>")).
-    ctx.switch_to_block(err_blk);
-    let msg = ctx.emit(
-        Op::ConstString(format!("expected {name}")),
-        IrType::StringRef,
-        None,
-    );
-    let je = emit_json_error(ctx, "TypeMismatch", msg);
-    let err = emit_result_err(ctx, result_ty, je);
-    ctx.terminate(Terminator::Jump {
-        target: merge,
-        args: vec![err],
-    });
-
-    ctx.switch_to_block(merge);
-    result
-}
-
-/// `Ok(value)` as a `Result<T, JsonError>` (`result_ty`).
-fn emit_result_ok(ctx: &mut LoweringContext<'_>, result_ty: &IrType, value: ValueId) -> ValueId {
-    let ok_idx = enum_variant_index(ctx, RESULT_ENUM, "Ok");
-    ctx.emit(
-        Op::EnumAlloc(RESULT_ENUM.to_string(), ok_idx, vec![value]),
-        result_ty.clone(),
-        None,
-    )
-}
-
-/// `Err(json_error)` as a `Result<T, JsonError>` (`result_ty`).
-fn emit_result_err(ctx: &mut LoweringContext<'_>, result_ty: &IrType, je: ValueId) -> ValueId {
-    let err_idx = enum_variant_index(ctx, RESULT_ENUM, "Err");
-    ctx.emit(
-        Op::EnumAlloc(RESULT_ENUM.to_string(), err_idx, vec![je]),
-        result_ty.clone(),
-        None,
-    )
-}
-
-/// A `JsonError::<variant>(message)` value.
-fn emit_json_error(ctx: &mut LoweringContext<'_>, variant: &str, msg: ValueId) -> ValueId {
-    let idx = enum_variant_index(ctx, JSON_ERROR_ENUM, variant);
-    ctx.emit(
-        Op::EnumAlloc(JSON_ERROR_ENUM.to_string(), idx, vec![msg]),
-        IrType::EnumRef(JSON_ERROR_ENUM.to_string(), Vec::new()),
-        None,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use phoenix_runtime::json as rt;
-
-    /// The `KIND_*` mirror must match the runtime's `JSON_KIND_*` ABI (see
-    /// the module comment on the constants).
-    #[test]
-    fn kind_tags_match_runtime_abi() {
-        assert_eq!(super::KIND_BOOL, rt::JSON_KIND_BOOL);
-        assert_eq!(super::KIND_INT, rt::JSON_KIND_INT);
-        assert_eq!(super::KIND_FLOAT, rt::JSON_KIND_FLOAT);
-        assert_eq!(super::KIND_STRING, rt::JSON_KIND_STRING);
-        // Tags the scalar decoders don't consume yet, pinned by value so a
-        // runtime renumbering is caught now, not when the composite-decode
-        // slices mirror them here (replace these with mirror asserts then).
-        assert_eq!(rt::JSON_KIND_NULL, 0);
-        assert_eq!(rt::JSON_KIND_ARRAY, 5);
-        assert_eq!(rt::JSON_KIND_OBJECT, 6);
-    }
 }

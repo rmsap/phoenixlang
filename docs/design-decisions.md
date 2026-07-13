@@ -1460,6 +1460,17 @@ A wasm build writes `package.json` beside the glue from `[js-dependencies]` **on
 **Why warn and not error:** a host can legitimately be supplied by something other than an npm package — a local ES module, an import map, a bundler alias, a globally-provided host — so an undeclared module is a *likely* mistake (a typo, or a forgotten entry that will leave the glue's `import` unresolvable at run time), not a certain one. Erroring would make BYO hosts unusable in exactly the cases decision A exists to support. The diagnostic scopes to the **entry package's own** externs: a dependency package's `extern js` is that package's concern, and pointing the consumer at *their* `phoenix.toml` for a module they never wrote would be misdirection.
 **No Phoenix-owned JS lockfile:** the developer's `package-lock.json` owns JS-dependency reproducibility. Duplicating it would create two sources of truth that drift.
 
+### Phase 4.6 JSON serialization
+
+Subordinate decisions for the Phase 4.6 JSON work. Phase-level scope, wire encodings, and the synthesis architecture live in [phase-4.md §4.6](phases/phase-4.md#46-json-and-serialization).
+
+#### A. `json.encode` / `json.decode` respect cross-module field privacy
+
+**Decided:** 2026-07-13
+A synthesized encoder *reads* every field of every struct reachable from the target type, and a synthesized decoder *constructs* those structs outright — so either operation on a foreign struct with private fields would bypass the field-privacy gates that already reject direct reads (`v.secret`), writes, and positional construction (`Vault(…)`) from outside the defining module. Sema therefore rejects `json.encode`/`json.decode` when any struct transitively reachable from the target type (through struct fields, enum variant payloads, or generic arguments) is declared in a different module and has a private field. Builtin structs are exempt, as everywhere in the privacy rules; inside the defining module both operations remain allowed, matching the read/write/construction rules.
+
+**Why not treat JSON round-tripping as privileged** (like a serialization derive generated inside the defining module): that stance silently voids constructor invariants — any module could fabricate a value with arbitrary private-field contents from a string, and `json.encode` would expose field values the caller cannot legally read. Enforcing now and relaxing later (e.g. an opt-in annotation on the struct) is backward-compatible; shipping the exemption and restricting later would be a breaking change.
+
 ---
 
 ## Phoenix Gen

@@ -656,7 +656,7 @@ Database-hint annotations (`@primary`, `@unique`, `@index`) may also be recogniz
 
 ## 4.6 JSON and Serialization
 
-**Status: scoped, not started.** First consumer of the [Annotation system (4.5)](#45-annotation-system), which has landed. **Depends on:** Annotations (4.5, complete) for `@jsonName`/`@skip`; generic monomorphization (2.2, complete). Independent of all Phase 3 work (see [Parallel-track note](#46-parallel-track-note) below).
+**Status: in progress.** Landed so far: explicit `json.decode<T>` type arguments; `json.encode` for scalars, non-generic structs, `Option`, non-generic enums, `List<T>`, and `Map<String, V>`; `json.decode` for scalars and non-generic structs (nested, imported, and cyclic), with cross-module field privacy enforced on both operations. Remaining: decode of `Option`/enums/`List`/`Map`, contextual inference of `T` (see known-issues), `@jsonName`/`@skip`, and the wasm32-gc DOM port. First consumer of the [Annotation system (4.5)](#45-annotation-system), which has landed. **Depends on:** Annotations (4.5, complete) for `@jsonName`/`@skip`; generic monomorphization (2.2, complete). Independent of all Phase 3 work (see [Parallel-track note](#46-parallel-track-note) below).
 
 ### Goal
 

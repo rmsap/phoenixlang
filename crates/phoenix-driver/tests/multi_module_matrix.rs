@@ -121,6 +121,24 @@ multi_matrix_test!(matrix_enum_with_fields, "enum_with_fields");
 // `check_modules_callable.rs::imported_dyn_trait_in_function_signature_is_a_known_limitation`),
 // so this test deliberately uses the generic-bound form.
 multi_matrix_test!(matrix_trait_bound, "trait_bound");
+// `json.decode<User>` where `User` (and its nested `Point` field) are
+// imported from another module. Struct decode resolves the struct's
+// identity in three separate places — sema's decodability gate
+// (`lookup_struct` canonicalization), IR decoder synthesis
+// (`struct_info_by_name`), and the AST interpreter's field-type seeding
+// (`json_struct_fields`, keyed by qualified name) — and only a
+// cross-module target makes the qualified spellings diverge from the
+// bare ones. Doubles as the golden for the decode error taxonomy
+// (missing vs wrong-kind vs non-object vs `null` field): the
+// single-file matrix checks cross-backend agreement only, so a
+// misunderstanding shared by every backend would pass there but fail
+// this fixture's `expected.txt`. wasm32-gc skipped (json.decode DOM
+// deferral, same as the single-file json_decode fixtures).
+multi_matrix_test!(
+    matrix_json_decode_import,
+    "json_decode_import",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 
 // TODO(2.7): once imported `dyn Trait` is supported (see
 // `check_modules_callable.rs::imported_dyn_trait_in_function_signature_is_a_known_limitation`),

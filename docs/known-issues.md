@@ -6,6 +6,18 @@ Tracked bugs, limitations, and code-quality items. For unresolved design questio
 
 ## Known Limitations
 
+### `json.decode` requires an explicit type argument (no contextual inference yet)
+
+`json.decode<T>(text)` resolves the target `T` from the explicit turbofish
+(`json.decode<User>(s)`). The Phase 4.6 design also envisioned *contextual*
+inference — recovering `T` from the binding through `?`/`Result`, e.g.
+`let u: User = json.decode(s)?` — as the default form. That path is not yet
+implemented: it needs bidirectional type-flow from a `let`/return annotation,
+through the `?` operator, into the call's return type. Until it lands,
+`json.decode` without a turbofish is a clean sema error ("json.decode
+requires an explicit type argument"). **Target:** a Phase 4.6 follow-up.
+Surfaced 2026-07-13 implementing struct decode (Phase 4.6 J4b).
+
 ### The dependency cache has no inter-process locking
 
 The git dependency cache (`$PHOENIX_HOME/cache`) is mutated without an OS file

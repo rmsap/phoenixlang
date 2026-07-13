@@ -236,6 +236,25 @@ fn translate_builtin(
             let h = get_val1(state, args[0])?;
             Ok(call_runtime(builder, ctx, ctx.runtime.json_as_str, &[h]))
         }
+        "json.getField" => {
+            let h = get_val1(state, args[0])?;
+            let key = get_val(state, args[1])?; // StringRef → (ptr, len)
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_get_field,
+                &[h, key[0], key[1]],
+            ))
+        }
+        "json.isMissing" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_is_missing,
+                &[h],
+            ))
+        }
         // String methods.
         _ if name.starts_with("String.") => translate_string_method(
             builder,

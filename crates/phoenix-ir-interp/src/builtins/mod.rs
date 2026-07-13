@@ -60,8 +60,9 @@ pub(crate) fn dispatch(
 /// the captured parse-error message. Mirrors the compiled runtime's opaque
 /// pointer handles; handles are the arena index, passed through IR as
 /// `i64`. A root doubles as its own top-level node — `json.root` returns
-/// the handle unchanged rather than cloning the tree; distinct child-node
-/// handles arrive with the composite-decode slices.
+/// the handle unchanged rather than cloning the tree; `json.getField`
+/// pushes each child it returns as its own arena entry (a subtree clone),
+/// so child handles resolve exactly like roots.
 pub(crate) struct JsonRoot(std::result::Result<serde_json::Value, String>);
 
 /// Dispatch the intrinsic `json.*` builtins emitted by the JSON encode /
@@ -106,6 +107,41 @@ fn builtin_json(
             }
             Ok(IrValue::Int(h as i64))
         }
+        "getField" => match args.as_slice() {
+            [IrValue::Int(h), IrValue::String(key)] => {
+                // Clone the child subtree (releasing the arena borrow) before
+                // pushing it as its own arena entry (a child is always a
+                // parsed node). Nested decoding re-clones grandchildren from
+                // the clone and the arena only grows (`free` is a no-op) —
+                // O(subtree × depth) work, accepted for a reference
+                // interpreter; the compiled runtime borrows into the root
+                // tree instead.
+                // A failed-parse root or out-of-range handle here is an
+                // IR-synthesis bug (decoders check `parseFailed` before
+                // navigating) — surface it as an interpreter error rather
+                // than masking it as a plausible `Err(MissingField)`.
+                let child = match interp.json_arena.get(*h as usize) {
+                    Some(JsonRoot(Ok(v))) => v.get(key).cloned(),
+                    Some(JsonRoot(Err(_))) => {
+                        return error("json.getField: handle is a failed-parse root".to_string());
+                    }
+                    None => return error("json.getField: invalid JSON handle".to_string()),
+                };
+                match child {
+                    Some(c) => {
+                        interp.json_arena.push(JsonRoot(Ok(c)));
+                        Ok(IrValue::Int((interp.json_arena.len() - 1) as i64))
+                    }
+                    // Key absent → the missing-field sentinel (see `isMissing`).
+                    None => Ok(IrValue::Int(-1)),
+                }
+            }
+            _ => error("json.getField expects (handle, key)".to_string()),
+        },
+        "isMissing" => match args.as_slice() {
+            [IrValue::Int(h)] => Ok(IrValue::Bool(*h == -1)),
+            _ => error("json.isMissing expects a single handle argument".to_string()),
+        },
         "kind" => {
             let v = json_node(interp, &args, "json.kind")?;
             let kind = match v {

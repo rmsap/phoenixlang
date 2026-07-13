@@ -762,15 +762,22 @@ impl Checker {
         if t.is_error() {
             return Type::Error;
         }
-        if let Some(unsupported) = self.unsupported_json_decode_type(&t) {
+        if let Some(unsupported) = self.unsupported_json_decode_type(&t, &mut Vec::new()) {
             self.error(
                 format!(
                     "`json.decode` does not support `{unsupported}` yet — \
-                     supported today: Int, Float, Bool, String \
-                     (more types land in later Phase 4.6 slices)"
+                     supported today: Int, Float, Bool, String, and non-generic \
+                     structs of supported types (more land in later Phase 4.6 slices)"
                 ),
                 mc.span,
             );
+        } else if self.json_field_privacy_violation("json.decode", &t, mc.span) {
+            // Decoding constructs every reachable struct; a foreign struct
+            // with private fields is rejected (diagnostic already emitted)
+            // and, like the unsupported case, records no decode site.
+            // Anchored on the call span (not `args[0]` as on the encode
+            // side): the violation travels with the type argument, while
+            // encode's travels with the value argument.
         } else if args_ok {
             // Only a fully well-formed call (one `String` arg, supported `T`)
             // is handed to synthesis/lowering. A malformed call still returns
@@ -783,17 +790,44 @@ impl Checker {
     }
 
     /// Returns the name of the first JSON-undecodable type reachable from
-    /// `ty`, or `None` when `ty` is decodable with today's surface. This
-    /// slice supports the scalars only; structs, `Option`, enums, `List`,
-    /// and `Map` are added by later slices.
-    //
-    // TODO(Phase 4.6): when composite targets land, this walk turns
-    // recursive — thread a cycle-tracking accumulator (a `&mut
-    // HashSet<String>` of struct/enum names in progress) through it so a
-    // self-referential struct can't loop, mirroring the encode-side gate.
-    fn unsupported_json_decode_type(&self, ty: &Type) -> Option<String> {
+    /// `ty` (recursing through struct fields), or `None` when `ty` is
+    /// decodable with today's surface: the scalars plus non-generic structs
+    /// of decodable field types. `Option`, enums, `List`, and `Map` are
+    /// added by later slices. `visiting` holds the names of the structs
+    /// currently being walked so a self-referential struct can't recurse
+    /// forever, mirroring the encode-side gate.
+    fn unsupported_json_decode_type(
+        &self,
+        ty: &Type,
+        visiting: &mut Vec<String>,
+    ) -> Option<String> {
         match ty {
             Type::Int | Type::Float | Type::Bool | Type::String => None,
+            Type::Named(name) => {
+                // Resolved `Type::Named` names are already canonical — bare
+                // for an entry-module type, module-qualified for an imported
+                // one (see `resolve_type_expr`) — so the spelling here is
+                // both the cycle-guard identity and the diagnostic spelling,
+                // exactly as in the encode-side gate. The qualifier keeps
+                // same-named types from different modules distinguishable.
+                if visiting.iter().any(|n| n == name) {
+                    return None; // break struct cycles
+                }
+                // A non-generic struct: every field must be decodable.
+                let Some(info) = self.lookup_struct(name) else {
+                    return Some(name.clone());
+                };
+                if !info.type_params.is_empty() {
+                    return Some(name.clone());
+                }
+                visiting.push(name.clone());
+                let result = info
+                    .fields
+                    .iter()
+                    .find_map(|f| self.unsupported_json_decode_type(&f.ty, visiting));
+                visiting.pop();
+                result
+            }
             other => Some(other.to_string()),
         }
     }
@@ -831,6 +865,12 @@ impl Checker {
             );
             return Type::String;
         }
+        // Encoding reads every reachable field; a foreign struct with
+        // private fields is rejected (diagnostic already emitted) and
+        // records no encode site.
+        if self.json_field_privacy_violation("json.encode", &arg_type, mc.args[0].span()) {
+            return Type::String;
+        }
         self.json_encode_types.insert(mc.span, arg_type);
         Type::String
     }
@@ -849,7 +889,6 @@ impl Checker {
         ty: &Type,
         visiting: &mut Vec<String>,
     ) -> Option<String> {
-        let bare = |name: &str| phoenix_common::module_path::bare_name(name).to_string();
         match ty {
             Type::Int | Type::Float | Type::Bool | Type::String => None,
             // `Option<T>` is encodable when `T` is (None → null, Some(x) →
@@ -878,14 +917,21 @@ impl Checker {
                 // Option<Node> }`) IS encodable — the synthesized encoder is
                 // itself recursive and terminates on the finite runtime value
                 // (`Some(child)` / `None`). `List`/`Map` back-edges remain
-                // gated as unsupported below.
+                // gated as unsupported below. Comparing raw spellings is the
+                // right identity: resolved `Type::Named` names are already
+                // canonical (see `resolve_type_expr`), matching the
+                // decode-side gate.
                 if visiting.iter().any(|n| n == name) {
                     return None;
                 }
                 // A non-generic struct: every field must be encodable.
+                // Diagnostics print the name as spelled in the resolved type
+                // (the canonical name — bare for an entry-module type,
+                // module-qualified for an imported one, so same-named types
+                // from different modules stay distinguishable).
                 if let Some(info) = self.lookup_struct(name) {
                     if !info.type_params.is_empty() {
-                        return Some(bare(name));
+                        return Some(name.clone());
                     }
                     let field_tys: Vec<Type> = info.fields.iter().map(|f| f.ty.clone()).collect();
                     return self.first_unsupported_component(name, &field_tys, visiting);
@@ -895,7 +941,7 @@ impl Checker {
                 // by their `Type::Generic` shape above / below.)
                 if let Some(info) = self.lookup_enum(name) {
                     if !info.type_params.is_empty() {
-                        return Some(bare(name));
+                        return Some(name.clone());
                     }
                     let variant_tys: Vec<Type> = info
                         .variants
@@ -904,7 +950,7 @@ impl Checker {
                         .collect();
                     return self.first_unsupported_component(name, &variant_tys, visiting);
                 }
-                Some(bare(name))
+                Some(name.clone())
             }
             other => Some(other.to_string()),
         }

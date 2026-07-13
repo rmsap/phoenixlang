@@ -82,8 +82,36 @@ impl Interpreter {
         self.json_encode_spans = std::mem::take(&mut resolved.json_encode_types)
             .into_keys()
             .collect();
-        // Decode needs the target type per call site, not just the span.
+        // Decode needs the target type per call site, not just the span —
+        // and, to recurse into a struct target, each struct's field types.
+        // Seed only the structs transitively reachable from a decode target
+        // (the same set the IR demand walk in `json_synth.rs` computes), so
+        // the common no-decode program clones nothing and a decode-using
+        // program clones only what its targets can reach.
         self.json_decode_types = std::mem::take(&mut resolved.json_decode_types);
+        fn named(ty: &phoenix_sema::types::Type) -> Option<String> {
+            match ty {
+                phoenix_sema::types::Type::Named(n) => Some(n.clone()),
+                _ => None,
+            }
+        }
+        let mut queue: Vec<String> = self.json_decode_types.values().filter_map(named).collect();
+        while let Some(name) = queue.pop() {
+            // Already seeded — also breaks struct cycles (A → B → A).
+            if self.json_struct_fields.contains_key(&name) {
+                continue;
+            }
+            let Some(id) = resolved.struct_by_name.get(&name) else {
+                continue;
+            };
+            let fields: Vec<(String, phoenix_sema::types::Type)> = resolved.structs[id.index()]
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.ty.clone()))
+                .collect();
+            queue.extend(fields.iter().filter_map(|(_, ty)| named(ty)));
+            self.json_struct_fields.insert(name, fields);
+        }
     }
 
     /// Multi-module orchestration for [`run_modules`]. Registers every

@@ -1010,13 +1010,33 @@ fn json_decode_with_multiple_type_arguments_is_an_error() {
 }
 
 #[test]
-fn json_decode_of_unsupported_type_is_a_clear_error() {
-    // This slice decodes scalars only; a struct target is rejected.
+fn json_decode_of_struct_typechecks() {
+    // A non-generic struct (with a nested struct field) is a decodable target.
     let entry = entry_only(
         "import json\n\
          struct P { x: Int }\n\
+         struct Q { p: P name: String }\n\
          function main() {\n  \
-           let r: Result<P, JsonError> = json.decode<P>(\"x\")\n  \
+           let r: Result<Q, JsonError> = json.decode<Q>(\"x\")\n  \
+           match r { Ok(v) -> print(v.name) Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "struct decode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_generic_struct_is_an_error() {
+    // A generic struct instantiation is not a decodable target yet.
+    let entry = entry_only(
+        "import json\n\
+         struct Box<T> { value: T }\n\
+         function main() {\n  \
+           let r: Result<Box<Int>, JsonError> = json.decode<Box<Int>>(\"x\")\n  \
            match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
          }",
     );
@@ -1026,7 +1046,347 @@ fn json_decode_of_unsupported_type_is_a_clear_error() {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("`json.decode` does not support")),
-        "expected an unsupported-type diagnostic for json.decode of a struct, got: {:?}",
+        "expected an unsupported-type diagnostic for json.decode of a generic struct, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_struct_with_undecodable_field_is_an_error() {
+    // The gate recurses into fields: a struct wrapping a `List<Int>` is
+    // rejected, and the diagnostic names the offending field type, not the
+    // struct.
+    let entry = entry_only(
+        "import json\n\
+         struct S { xs: List<Int> }\n\
+         function main() {\n  \
+           let r: Result<S, JsonError> = json.decode<S>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not support `List<Int>`")),
+        "expected the diagnostic to name the undecodable field type `List<Int>`, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_struct_with_enum_field_is_an_error() {
+    // The gate's `Named` arm requires a struct: a field whose type resolves
+    // to an enum is rejected (enum decode lands in a later slice), and the
+    // diagnostic names the enum, not the struct.
+    let entry = entry_only(
+        "import json\n\
+         enum Color { Red  Green }\n\
+         struct S { c: Color }\n\
+         function main() {\n  \
+           let r: Result<S, JsonError> = json.decode<S>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not support `Color`")),
+        "expected the diagnostic to name the enum field type `Color`, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_diagnostic_names_an_imported_type_with_its_qualifier() {
+    // The gate prints *canonical* names: for an imported type that means the
+    // module qualifier stays in the diagnostic, so same-named types from
+    // different modules remain distinguishable. (An entry-module type's
+    // canonical spelling is bare — see
+    // `json_decode_of_struct_with_enum_field_is_an_error`.)
+    let entry = entry_only(
+        "import json\n\
+         import models { Color }\n\
+         struct S { c: Color }\n\
+         function main() {\n  \
+           let r: Result<S, JsonError> = json.decode<S>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let models = non_entry("models", "public enum Color { Red  Green }", SourceId(1));
+    let analysis = check_modules(&[entry, models]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not support `models::Color`")),
+        "expected the diagnostic to keep the imported enum's qualifier, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_imported_generic_struct_is_rejected_as_spelled() {
+    // Encode-side sibling of the test above, pinning the one *reachable*
+    // imported-and-unsupported encode shape: a generic struct instantiation.
+    // Unlike `Type::Named` payloads (always canonical, qualifier included),
+    // a `Type::Generic` payload keeps the source spelling — so the
+    // diagnostic says `Box<Int>`, as written at the call site. If generic
+    // payloads are ever canonicalized too, update the expected spelling to
+    // `models::Box<Int>`. (The gate's other qualified-name arms — a bare
+    // `Type::Named` naming a generic struct or enum — are defensive:
+    // resolution errors out before producing such a type.)
+    let entry = entry_only(
+        "import json\n\
+         import models { Box }\n\
+         function main() {\n  \
+           let b: Box<Int> = Box(1)\n  \
+           print(json.encode(b))\n\
+         }",
+    );
+    let models = non_entry(
+        "models",
+        "public struct Box<T> { public value: T }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, models]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`json.encode` does not support `Box<Int>`")),
+        "expected an unsupported-type diagnostic for the imported generic \
+         struct instantiation, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_imported_struct_with_private_field_is_rejected() {
+    // `json.decode` constructs the struct, so decoding a foreign struct
+    // with a private field would bypass the construction-privacy gate
+    // (see design-decisions.md §Phase 4.6 JSON serialization).
+    let entry = entry_only(
+        "import json\n\
+         import models { Vault }\n\
+         function main() {\n  \
+           let r: Result<Vault, JsonError> = json.decode<Vault>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let models = non_entry(
+        "models",
+        "public struct Vault { secret: String }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, models]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| {
+            d.message
+                .contains("`json.decode` cannot construct struct `models::Vault`")
+                && d.message.contains("`secret`")
+                && d.message.contains("private to module `models`")
+        }),
+        "expected a batched privacy diagnostic naming the struct, field, and \
+         module, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_reaching_a_private_field_struct_through_a_field_is_rejected() {
+    // The privacy walk is transitive: the offending struct sits behind a
+    // field of an entry-module struct, and the diagnostic names the nested
+    // struct (where the private field lives), not the decode target.
+    let entry = entry_only(
+        "import json\n\
+         import models { Vault }\n\
+         struct Wrapper { v: Vault  tag: String }\n\
+         function main() {\n  \
+           let r: Result<Wrapper, JsonError> = json.decode<Wrapper>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let models = non_entry(
+        "models",
+        "public struct Vault { secret: String }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, models]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`json.decode` cannot construct struct `models::Vault`")),
+        "expected the privacy diagnostic to name the nested foreign struct, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_own_module_struct_with_private_field_typechecks() {
+    // Privacy is a cross-module boundary, exactly as for reads/writes/
+    // construction: the defining module may decode its own private fields.
+    let entry = entry_only(
+        "import json\n\
+         struct Vault { secret: String }\n\
+         function main() {\n  \
+           let r: Result<Vault, JsonError> = json.decode<Vault>(\"x\")\n  \
+           match r { Ok(v) -> print(v.secret) Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "same-module decode of a private-field struct should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_imported_struct_with_private_field_is_rejected() {
+    // Encode-side sibling: serializing a foreign struct would expose field
+    // values the caller cannot read directly.
+    let entry = entry_only(
+        "import json\n\
+         import models { Vault }\n\
+         function show(v: Vault) -> String { json.encode(v) }\n\
+         function main() { print(\"x\") }",
+    );
+    let models = non_entry(
+        "models",
+        "public struct Vault { secret: String }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, models]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| {
+            d.message
+                .contains("`json.encode` cannot serialize struct `models::Vault`")
+                && d.message.contains("private to module `models`")
+        }),
+        "expected an encode-privacy diagnostic, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_reaching_a_private_field_struct_through_an_enum_is_rejected() {
+    // The walk recurses through enum variant payloads too (enums are
+    // encodable), so a private-field struct can't hide inside one.
+    let entry = entry_only(
+        "import json\n\
+         import models { Holder }\n\
+         function show(h: Holder) -> String { json.encode(h) }\n\
+         function main() { print(\"x\") }",
+    );
+    let models = non_entry(
+        "models",
+        "public struct Vault { secret: String }\n\
+         public enum Holder { Empty  Full(Vault) }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, models]);
+    assert!(
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("`json.encode` cannot serialize struct `models::Vault`")),
+        "expected the enum payload's foreign struct to be rejected, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_generic_container_of_private_field_struct_is_rejected() {
+    // The walk recurses through generic *arguments* (`List<T>` / `Option<T>`
+    // / `Map<K, V>` are encodable containers), so a private-field struct
+    // can't hide inside one. Pins the `Type::Generic` arm of the privacy
+    // walk, which the direct / struct-field / enum-payload tests don't reach.
+    let entry = entry_only(
+        "import json\n\
+         import models { Vault }\n\
+         function showAll(vs: List<Vault>) -> String { json.encode(vs) }\n\
+         function showMaybe(v: Option<Vault>) -> String { json.encode(v) }\n\
+         function main() { print(\"x\") }",
+    );
+    let models = non_entry(
+        "models",
+        "public struct Vault { secret: String }",
+        SourceId(1),
+    );
+    let analysis = check_modules(&[entry, models]);
+    let privacy_errors = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("`json.encode` cannot serialize struct `models::Vault`")
+        })
+        .count();
+    assert_eq!(
+        privacy_errors, 2,
+        "expected both container call sites (List and Option) to be rejected, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_encode_of_own_module_struct_with_private_field_typechecks() {
+    // Same-module encode of private fields is fine, matching field reads.
+    let entry = entry_only(
+        "import json\n\
+         struct Vault { secret: String }\n\
+         function main() { print(json.encode(Vault(\"s\"))) }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "same-module encode of a private-field struct should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_mutually_recursive_structs_terminates() {
+    // The gate's cycle guard: a struct cycle (A → B → A) must terminate
+    // rather than recurse forever, and — mirroring the encode-side gate —
+    // the back-edge itself is treated as decodable, so the walk's verdict
+    // comes from the remaining (scalar) fields.
+    let entry = entry_only(
+        "import json\n\
+         struct A { b: B x: Int }\n\
+         struct B { a: A }\n\
+         function main() {\n  \
+           let r: Result<A, JsonError> = json.decode<A>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "the cycle guard should accept a struct cycle, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_unsupported_type_is_a_clear_error() {
+    // This slice decodes scalars + structs; a `List` target is rejected.
+    let entry = entry_only(
+        "import json\n\
+         function main() {\n  \
+           let r: Result<List<Int>, JsonError> = json.decode<List<Int>>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`json.decode` does not support")),
+        "expected an unsupported-type diagnostic for json.decode of a List, got: {:?}",
         analysis.diagnostics
     );
 }

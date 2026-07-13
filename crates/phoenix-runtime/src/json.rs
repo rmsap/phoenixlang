@@ -130,6 +130,35 @@ pub unsafe extern "C" fn phx_json_kind(handle: i64) -> i64 {
     }
 }
 
+/// Look up an object field by key, returning the child node handle (or `0`
+/// when `handle` is not an object or has no such key — the "missing" handle,
+/// tested by [`phx_json_is_missing`]).
+///
+/// # Safety
+/// `handle` must be a live node handle and `(key_ptr, key_len)` a valid UTF-8
+/// slice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_get_field(
+    handle: i64,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> i64 {
+    let key = unsafe { std::str::from_utf8_unchecked(str_from(key_ptr, key_len)) };
+    match unsafe { node(handle) }.get(key) {
+        Some(child) => child as *const Value as i64,
+        None => 0,
+    }
+}
+
+/// `1` if `handle` is the missing-field sentinel (`0`), else `0`.
+///
+/// # Safety
+/// Pure integer comparison — always safe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_is_missing(handle: i64) -> i8 {
+    (handle == 0) as i8
+}
+
 /// Extract a node as an `i64` (caller has confirmed kind `INT`).
 ///
 /// # Safety

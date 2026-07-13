@@ -1,0 +1,86 @@
+// json.decode<Struct>: decode a JSON object into a (nested) struct. A
+// missing required field → Err(MissingField); a field whose value has the
+// wrong kind (including `null`) → the field decoder's Err(TypeMismatch)
+// propagates; a non-object → Err(TypeMismatch); a field-less struct decodes
+// from any object. `{{`/`}}` are the string-interpolation escapes for the
+// literal JSON braces. (String building uses `+` rather than interpolation to
+// steer clear of the known interpolation-span issue for nested field access.)
+
+import json
+
+struct Point {
+  x: Int
+  y: Int
+}
+
+// A field-less struct: the decoder is just the object-kind check.
+struct Empty {}
+
+struct User {
+  name: String
+  age: Int
+  home: Point
+  active: Bool
+}
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function showUser(u: User) -> String {
+  u.name + " " + toString(u.age) + " at " +
+    toString(u.home.x) + "," + toString(u.home.y) + " " + toString(u.active)
+}
+
+function main() {
+  // Fully-populated, with a nested struct.
+  let a: Result<User, JsonError> =
+    json.decode<User>("{{\"name\":\"Ada\",\"age\":36,\"home\":{{\"x\":1,\"y\":2}},\"active\":true}}")
+  match a { Ok(u) -> print(showUser(u)) Err(e) -> print(describe(e)) }
+
+  // Unknown extra keys are ignored (lenient).
+  let b: Result<Point, JsonError> = json.decode<Point>("{{\"x\":9,\"y\":8,\"z\":7}}")
+  match b { Ok(p) -> print(toString(p.x) + "," + toString(p.y)) Err(e) -> print(describe(e)) }
+
+  // Missing required field.
+  let c: Result<User, JsonError> = json.decode<User>("{{\"name\":\"Bo\",\"age\":5}}")
+  match c { Ok(u) -> print(u.name) Err(e) -> print(describe(e)) }
+
+  // Field of the wrong kind — the nested field decoder's error propagates.
+  let d: Result<User, JsonError> =
+    json.decode<User>("{{\"name\":\"Cy\",\"age\":\"old\",\"home\":{{\"x\":1,\"y\":2}},\"active\":true}}")
+  match d { Ok(u) -> print(u.name) Err(e) -> print(describe(e)) }
+
+  // A nested-object field that is the wrong kind.
+  let e: Result<User, JsonError> =
+    json.decode<User>("{{\"name\":\"Di\",\"age\":1,\"home\":5,\"active\":true}}")
+  match e { Ok(u) -> print(u.name) Err(x) -> print(describe(x)) }
+
+  // Not an object at all.
+  let f: Result<Point, JsonError> = json.decode<Point>("[1, 2]")
+  match f { Ok(p) -> print("ok") Err(e) -> print(describe(e)) }
+
+  // Malformed JSON → ParseError.
+  let g: Result<Point, JsonError> = json.decode<Point>("not json")
+  match g { Ok(p) -> print("ok") Err(e) -> print(describe(e)) }
+
+  // A `null` field value is a wrong kind, not a missing field.
+  let h: Result<Point, JsonError> = json.decode<Point>("{{\"x\":null,\"y\":2}}")
+  match h { Ok(p) -> print("ok") Err(e) -> print(describe(e)) }
+
+  // A field-less struct decodes from `{}` (and its shape is object-only).
+  let i: Result<Empty, JsonError> = json.decode<Empty>("{{}}")
+  match i { Ok(v) -> print("empty ok") Err(e) -> print(describe(e)) }
+  let j: Result<Empty, JsonError> = json.decode<Empty>("3")
+  match j { Ok(v) -> print("ok") Err(e) -> print(describe(e)) }
+
+  // Round-trip: decode(encode(u)) reproduces the struct — pins the
+  // synthesized encoder and decoder against each other on every backend.
+  let k: Result<User, JsonError> =
+    json.decode<User>(json.encode(User("Eve", 7, Point(3, 4), false)))
+  match k { Ok(u) -> print(showUser(u)) Err(e) -> print(describe(e)) }
+}

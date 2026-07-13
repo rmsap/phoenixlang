@@ -1,0 +1,57 @@
+// json.decode<Struct> where the struct (and its nested struct field) are
+// imported from another module — pins the qualified-name identity across
+// sema's decodability gate, IR decoder synthesis, and the AST interpreter's
+// struct-field seeding. `{{`/`}}` escape the literal JSON braces.
+//
+// This is also the only decode fixture with a golden (`expected.txt`) — the
+// single-file backend matrix asserts cross-backend *agreement* only — so the
+// error taxonomy is pinned against expected text here: missing field vs
+// wrong-kind field, nested-field error propagation, non-object input, and
+// `null` ≠ missing.
+
+import json
+import models { User }
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function main() {
+  let a: Result<User, JsonError> =
+    json.decode<User>("{{\"name\":\"Ada\",\"home\":{{\"x\":3,\"y\":4}}}}")
+  match a {
+    Ok(u) -> print(u.name + " " + toString(u.home.x) + "," + toString(u.home.y))
+    Err(e) -> print(describe(e))
+  }
+
+  // Method dispatch on a decoded value: the struct identity `json.decode`
+  // stamps on the value must be the one method lookup resolves — a
+  // qualified-vs-bare mismatch would fail here, not on field access.
+  match a {
+    Ok(u) -> print(u.summary())
+    Err(e) -> print(describe(e))
+  }
+
+  // Missing required field on the imported struct.
+  let b: Result<User, JsonError> = json.decode<User>("{{\"name\":\"Bo\"}}")
+  match b { Ok(u) -> print(u.name) Err(e) -> print(describe(e)) }
+
+  // A field of the wrong kind — the field decoder's TypeMismatch propagates.
+  let c: Result<User, JsonError> =
+    json.decode<User>("{{\"name\":5,\"home\":{{\"x\":1,\"y\":2}}}}")
+  match c { Ok(u) -> print(u.name) Err(e) -> print(describe(e)) }
+
+  // Not an object at all.
+  let d: Result<User, JsonError> = json.decode<User>("[1, 2]")
+  match d { Ok(u) -> print(u.name) Err(e) -> print(describe(e)) }
+
+  // A `null` field is a wrong kind (the nested Point decoder rejects it),
+  // not a missing field.
+  let e: Result<User, JsonError> =
+    json.decode<User>("{{\"name\":\"Cy\",\"home\":null}}")
+  match e { Ok(u) -> print(u.name) Err(x) -> print(describe(x)) }
+}

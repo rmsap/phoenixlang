@@ -326,6 +326,17 @@ fn translate_json_decode_builtin(
             let idx = b.require_phx_func("phx_json_as_str")?;
             emit_sret_string_call(ctx, b, idx, &[args[0]], vid)
         }
+        "getField" => {
+            // (handle: i64, key: StringRef) -> i64.
+            let vid = expect_result(instr, "json.getField")?;
+            ctx.emit_load_all(args[0])?; // handle (1 slot)
+            ctx.emit_load_all(args[1])?; // key (ptr, len)
+            let idx = b.require_phx_func("phx_json_get_field")?;
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, IrType::I64)?;
+            Ok(())
+        }
+        "isMissing" => scalar(ctx, b, "phx_json_is_missing", IrType::Bool),
         other => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"json.{other}\")` not supported"
         ))),
