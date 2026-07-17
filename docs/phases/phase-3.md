@@ -99,7 +99,7 @@ A review of the merged implementation surfaced three defects, all now fixed with
 
 ## 3.1.2 npm / JavaScript Package Dependencies
 
-**Status: in progress — PRs 1–2 (grammar/AST/sema + backend namespacing) implemented; `[js-dependencies]` + close remain.** The carved-out follow-up to [§3.1](#31-package-manager) (Phase 2.5 [decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)): let a Phoenix program depend on npm packages. **Depends on:** the §3.1 package manager (complete) and the Phase 2.5 `extern js` interop (complete). This item **does** touch the compiler backends (sema, cranelift glue, the interpreters), unlike §3.1 — so the [Phase 4.6 parallel-track hygiene](./phase-4.md#46-parallel-track-note) applies again to those crates.
+**Status: COMPLETE (2026-07-17).** The carved-out follow-up to [§3.1](#31-package-manager) (Phase 2.5 [decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)): let a Phoenix program depend on npm packages. **Depends on:** the §3.1 package manager (complete) and the Phase 2.5 `extern js` interop (complete). This item **does** touch the compiler backends (sema, cranelift glue, the interpreters), unlike §3.1 — so the [Phase 4.6 parallel-track hygiene](./phase-4.md#46-parallel-track-note) applies again to those crates.
 
 ### Goal
 
@@ -114,11 +114,12 @@ The Phase 2.5 `extern js` machinery is already module-agnostic at the IR level, 
 - Two code comments already anticipate this work: `wasm/glue.rs` ("if npm-package modules land (Phase 3.1), … this must become `host.<module>.<name>`") and the interpreter's `interpreter/mod.rs` ("npm-package modules arrive with the import-js grammar later").
 - `[dependencies]` parsing (`manifest.rs`) and the `deny_unknown_fields` `PhoenixConfig` (`config.rs`) are where `[js-dependencies]` hooks in. The Gen carve-out already rejects `extern js` / `JsValue` in schemas.
 
-### Design decisions (locked; full writeup lands in design-decisions.md §3.1.2 at close)
+### Design decisions (recorded in [design-decisions.md §Phase 3.1.2](../design-decisions.md#phase-312-npm--javascript-dependencies), A–D)
 
 - **Toolchain: BYO host modules — Phoenix fetches/bundles nothing.** `[js-dependencies]` records the intended packages/versions; the glue emits namespaced `host.<pkg>.<name>` bindings that `import` the package specifier; the *embedder's* `node_modules` + bundler/Node runtime resolves it. Phoenix emits a `package.json` from `[js-dependencies]` so `npm install` is one command. **Why:** preserves the self-contained, no-external-toolchain posture the [gix decision](#31-package-manager) protects (no required Node/npm/esbuild), and matches Phase 2.5 [decision K](../design-decisions.md#k-extern-declarations-are-signature-only-the-host-is-supplied-separately-no-inline-js-bodies) (host supplied by the embedder). Rejected: shelling out to npm+esbuild (hard Node toolchain dependency); a pure-Rust npm resolver + JS bundler (a multi-phase subsystem disproportionate to this slice). A future **opt-in** `phoenix build --bundle` (shell out to a bundler *if present*, never required) can layer on top later — out of scope here.
 - **Syntax: `extern js "specifier" { … }`.** Extend the existing `extern js` block with an optional module-specifier string; `extern js { … }` (no string) stays the ambient `js` host. It is the same construct (host-external signatures), just naming the module — the smallest, most localized grammar change. (Supersedes decision J's `import js "pkg"` sketch, which would require the `import` grammar to carry a string source *and* a signature block.) **Signature-only** per decision K — no inline JS bodies; generating signatures from a package's `@types` is a future follow-up, not v1.
 - **Backend scope: uniform mechanism-parity (A0).** `extern js "pkg"` compiles on all five backends; a *call* where no host is registered raises the existing [A0](../design-decisions.md#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary) "unbound host `(module.name)`" runtime error — identical to `extern js` today. npm-using programs stay portable source that only *does* something under a WASM+JS host; a stubbable extern rejoins the five-backend byte-identical matrix. (Rejected a compile-time gate on non-JS targets — it would break the "same source compiles everywhere" property `extern js` has.)
+- **`package.json` write-if-absent; an undeclared module warns (decided 2026-07-15, during implementation).** A wasm build writes `package.json` beside the glue only when none is already there — a developer-owned file is never clobbered — and an entry-package `extern js "pkg"` naming a module absent from `[js-dependencies]` warns rather than errors, on wasm builds only. Full rationale in [design-decisions §Phase 3.1.2 D](../design-decisions.md#d-packagejson-is-generated-only-when-absent-an-undeclared-module-warns).
 
 ### Scope boundaries (carved out, with forward pointers)
 
@@ -137,10 +138,21 @@ The Phase 2.5 `extern js` machinery is already module-agnostic at the IR level, 
 
 - [x] `extern js "specifier" { … }` parses (ambient `extern js { … }` unchanged); sema registers externs under the named module; marshallability diagnostics unchanged. Unit tests. (Plus cross-module coherence: declarations binding the same `(host module, name)` pair must agree on parameter/return types — the pair is one linkage downstream (one wasm import, one shim symbol, one glue thunk), so a mismatch would mis-marshal, silently where the flattened ABIs coincide. Identical re-declarations across modules stay legal and dedupe — the expected BYO pattern, pinned by the `npm_module_multi` Node-tier fixture.)
 - [x] WASM glue (both sub-targets) binds hosts as `host.<module>.<name>` and the required-host guard is per-module; the interpreters dispatch externs by module; a named-module interop fixture runs on the backend matrix (stubbed hosts rejoin byte-identical parity). (Native routes via its shim symbol, the module half escaped to a C identifier — `left-pad` → `left_2dpad` — so npm specifiers stay definable from plain C and the `__` separator stays unambiguous.)
-- [ ] `[js-dependencies]` parses and validates; a wasm build emits a `package.json` from it; an `extern js "pkg"` naming an undeclared js-dependency is diagnosed. Integration tests (tempdir).
+- [x] `[js-dependencies]` parses and validates; a wasm build emits a `package.json` from it; an `extern js "pkg"` naming an undeclared js-dependency is diagnosed. Integration tests (tempdir). (Emission is **write-if-absent** and the undeclared diagnostic is a **warning**, emitted on wasm builds only — the sole target where the npm binding matters — and scoped to the entry package's own externs — see [design-decisions §Phase 3.1.2 D](../design-decisions.md#d-packagejson-is-generated-only-when-absent-an-undeclared-module-warns).)
 - [x] Calling an npm extern with no host registered gives the A0 "unbound host" runtime error on native / the interpreters (no silent no-op); no compile-time gate.
-- [ ] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
-- [ ] design-decisions.md §3.1.2 records the locked decisions; the known-issues npm entry is updated; `phoenix.toml.example` documents `[js-dependencies]`.
+- [x] Workspace `cargo test` / `clippy --all-targets` / `fmt --check` clean; CI green.
+- [x] design-decisions.md §3.1.2 records the locked decisions; the known-issues npm entry is updated; `phoenix.toml.example` documents `[js-dependencies]`.
+
+### Closeout (2026-07-17)
+
+Shipped npm dependencies on the BYO model, in four reviewed PRs:
+
+- **PR1 — Grammar + AST + sema.** `extern js "specifier" { … }` carries an optional module specifier (absent ⇒ the ambient `"js"` host, unchanged; an empty string is a parse error); sema registers each extern under `(specifier, name)` so the module flows to `Op::ExternCall`. Marshallability rules untouched.
+- **PR2 — Backend namespacing.** Both wasm sub-targets bind hosts as `host.<module>.<name>` with a per-module required-host guard; the interpreters dispatch externs by module; native routes through its shim symbol with the module half escaped to a C identifier (`left-pad` → `left_2dpad`), keeping the `__` separator unambiguous. Named-module fixtures (`npm_module`, `npm_module_multi`) run on the backend matrix — stubbed hosts rejoin byte-identical parity.
+- **PR3 — `[js-dependencies]` + `package.json`.** The manifest section (npm name → verbatim version spec) parses and validates; a wasm build emits a `package.json` (`"type": "module"` + sorted dependencies) beside the glue when none is present; on a wasm build, an entry-package `extern js "pkg"` naming an undeclared module warns and the build proceeds (other targets bind extern hosts directly, not via npm, so they skip the check).
+- **PR4 — Close.** This writeup.
+
+**Design decisions** are recorded in [design-decisions.md §Phase 3.1.2](../design-decisions.md#phase-312-npm--javascript-dependencies) (A–D); B supersedes Phase 2.5 [decision J](../design-decisions.md#j-npm-package-slice-deferred-to-phase-31)'s `import js "pkg"` sketch. **Carve-outs** — automatic npm fetch/bundling (an opt-in `--bundle` is the future shape) and `@types` → signature generation — are open in [known-issues.md](../known-issues.md). Verified by `cargo test --workspace` / `clippy --all-targets` / `fmt --check` clean.
 
 ## 3.2 Language Server Protocol (LSP)
 

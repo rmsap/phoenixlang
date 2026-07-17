@@ -1349,6 +1349,7 @@ The browser tier verifies DOM interop against a **curated, hand-declared** `exte
 #### J. npm package slice deferred to Phase 3.1
 
 **Decided:** 2026-06-17
+**Superseded:** delivered as [§Phase 3.1.2](#phase-312-npm--javascript-dependencies) (closed 2026-07-17); the `import js "pkg"` sketch below was replaced by `extern js "pkg"` ([decision B](#b-syntax-an-optional-module-specifier-on-the-existing-extern-js-block)).
 
 **Rationale:** `import js "pkg" { ... }` string-source imports, `[js-dependencies]` in `phoenix.toml`, and bundler/npm resolution all depend on a package manager that does not exist yet (today `phoenix.toml` carries only `[gen]`, and `phoenix-modules` resolves filesystem-relative imports with no registry). Building a package system inside 2.5 would balloon the phase; 2.5 ships hand-declared `extern js` host/browser APIs only, and the npm slice rides with / after Phase 3.1. The existing dotted-identifier `import a.b.c { ... }` grammar is untouched — the JS string-source form is not landed in 2.5.
 
@@ -1426,6 +1427,38 @@ A module's identity is `(package, module path)`. A dependency's modules are **pa
 **Decided:** 2026-07-01
 `phoenix init` writes `phoenix.toml` (a `[package]`) and a **root** `main.phx` carrying a runnable stub. The entry file's directory is both its module root and the project root — matching Phoenix's "the entry file's directory is the root" model (Go-like: source beside the manifest) rather than imposing a `src/` layout Phoenix does not otherwise enforce. `phoenix add` validates the requested source through the *same* `parse_dependency` a hand-written manifest uses (so the CLI and the manifest accept identical inputs), edits `phoenix.toml` format-preservingly (`toml_edit`, so comments/layout survive), then resolves to refresh the lockfile; on **any** resolution failure the manifest edit is rolled back, so `add` is atomic — the project is never left holding a manifest entry that doesn't resolve.
 
+### Phase 3.1.2 npm / JavaScript dependencies
+
+Subordinate decisions for the npm slice — the carved-out follow-up to §3.1 that supersedes Phase 2.5 [decision J](#j-npm-package-slice-deferred-to-phase-31). Phase-level scope and exit criteria live in [phase-3.md §3.1.2](phases/phase-3.md#312-npm--javascript-package-dependencies).
+
+#### A. Toolchain: BYO host modules — Phoenix fetches and bundles nothing
+
+**Decided:** 2026-07-10
+`[js-dependencies]` **records** the intended npm packages and version specs; it does not install them. The WASM glue emits namespaced `host.<module>.<name>` bindings that `import` the package specifier, and the *embedder's* `node_modules` + bundler/Node runtime resolves it. Phoenix's only convenience is generating a `package.json` from `[js-dependencies]` so `npm install` is one command.
+**Why:** it preserves the self-contained, no-external-toolchain posture the [gix decision](phases/phase-3.md#31-package-manager) protects — a Phoenix build never requires Node, npm, or a bundler on the machine — and it matches [decision K](#k-extern-declarations-are-signature-only-the-host-is-supplied-separately-no-inline-js-bodies): the signature is Phoenix's, the host is the embedder's. Version specs are stored **verbatim**; Phoenix does not interpret npm semver, because doing so would mean owning a resolution model that `npm`/`package-lock.json` already own better.
+**Alternatives considered:** *shell out to npm + esbuild* — rejected, it makes a Node toolchain a hard build dependency for every wasm target. *A pure-Rust npm resolver + JS bundler* — rejected, a multi-phase subsystem wildly disproportionate to this slice, duplicating a mature ecosystem tool.
+**Not foreclosed:** an **opt-in** `phoenix build --bundle` that shells out to a bundler *if present* (never required) can layer on top later without disturbing this default.
+
+#### B. Syntax: an optional module specifier on the existing `extern js` block
+
+**Decided:** 2026-07-10
+An npm module is named by a string on the existing block — `extern js "left-pad" { ... }`. `extern js { ... }` (no string) remains the ambient `js` host, unchanged.
+**Why:** it is the same construct — host-external signatures — merely naming which host module supplies them, so it is the smallest and most localized grammar change, and existing code keeps its meaning. This **supersedes** decision J's `import js "pkg"` sketch, which would have required the `import` grammar to carry both a string source *and* a signature block, forking `import` into two shapes for no semantic gain. Signatures stay hand-declared per decision K; generating them from a package's `@types` is a separate future tool, not v1.
+
+#### C. Backend scope: uniform mechanism parity, no compile-time gate
+
+**Decided:** 2026-07-10
+`extern js "pkg"` compiles on **all five** backends. A *call* whose host is not registered raises the existing [A0](#a0-parity-model-extern-functions-are-a-uniform-host-ffi-boundary) "unbound host `(module.name)`" runtime error — identical to what ambient `extern js` does today.
+**Why:** it keeps the "same source compiles everywhere" property `extern js` already has, and it means an npm-using program with stubbed hosts rejoins the five-backend byte-identical matrix instead of being untestable off wasm. A compile-time gate on non-JS targets was rejected precisely because it would break that property.
+**Consequence — cross-module signature coherence:** declarations binding the same `(host module, name)` pair must agree on parameter/return types. The pair is a *single* linkage downstream (one wasm import, one native shim symbol, one glue thunk), so a mismatch would mis-marshal — silently, wherever the flattened ABIs happen to coincide. Identical re-declarations across modules stay legal and dedupe, which is the expected BYO pattern (each module declares what it uses).
+
+#### D. `package.json` is generated only when absent; an undeclared module warns
+
+**Decided:** 2026-07-15
+A wasm build writes `package.json` beside the glue from `[js-dependencies]` **only if one is not already there** — a developer-owned `package.json` (scripts, devDependencies, a bundler config) is never clobbered, and a project with no `[js-dependencies]` gets no file at all. On a **wasm build** — the only target where the npm binding matters; native and the interpreters bind extern hosts directly, not via npm — an `extern js "pkg"` whose module is absent from `[js-dependencies]` is a **warning**, not an error: the build proceeds.
+**Why write-if-absent:** the generated file is a convenience for the empty-directory case; the moment a developer has made it theirs, silently overwriting it would destroy work Phoenix has no way to reconstruct. Regenerate-on-every-build was rejected for exactly that; a `--force` flag is deferrable until someone wants it.
+**Why warn and not error:** a host can legitimately be supplied by something other than an npm package — a local ES module, an import map, a bundler alias, a globally-provided host — so an undeclared module is a *likely* mistake (a typo, or a forgotten entry that will leave the glue's `import` unresolvable at run time), not a certain one. Erroring would make BYO hosts unusable in exactly the cases decision A exists to support. The diagnostic scopes to the **entry package's own** externs: a dependency package's `extern js` is that package's concern, and pointing the consumer at *their* `phoenix.toml` for a module they never wrote would be misdirection.
+**No Phoenix-owned JS lockfile:** the developer's `package-lock.json` owns JS-dependency reproducibility. Duplicating it would create two sources of truth that drift.
 
 ---
 

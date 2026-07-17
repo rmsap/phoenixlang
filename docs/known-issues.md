@@ -129,18 +129,28 @@ so adding it is additive, not a rewrite.
 **Workaround:** depend on published packages by git tag/rev/branch, or by local path.
 **Target phase:** registry lands in Phase 6.2. Carved out at Phase 3.1 close (2026-07-01).
 
-### npm / JavaScript package dependencies (`import js "pkg"`) are not supported
+### npm packages are declared and bound, but Phoenix does not fetch or bundle them
 
-Phase 2.5 [decision J](design-decisions.md#j-npm-package-slice-deferred-to-phase-31) reserved
-string-source JS imports (`import js "pkg"`) plus a `[js-dependencies]` manifest section for
-"Phase 3.1", but that slice (npm fetch, `@types` typings, bundling) is orthogonal to the
-Phoenix-package core and considerably larger. It is carved out to a dedicated **3.1-js**
-follow-up rather than gating the core package manager. The `extern js` import-section
-machinery (Phase 2.5) is the seam it will extend.
+npm dependencies work as of [Phase 3.1.2](phases/phase-3.md#312-npm--javascript-package-dependencies):
+`extern js "left-pad" { ... }` binds an npm module's exports, `[js-dependencies]` declares the
+package and version spec, and a wasm build emits a `package.json` beside the glue. What Phoenix
+deliberately does **not** do is install or bundle the JavaScript — the **BYO** model
+([design-decisions §Phase 3.1.2 A](design-decisions.md#a-toolchain-byo-host-modules--phoenix-fetches-and-bundles-nothing)):
+running `npm install` and choosing a bundler/Node runtime stays the developer's job, so a
+Phoenix build never requires a Node toolchain on the machine. Two consequences follow. A
+build cannot tell you a declared package is missing, misversioned, or missing the export you
+bound — an unresolvable `import` surfaces from the JS runtime/bundler, not from Phoenix. And
+`@types` → Phoenix-signature generation does not exist: signatures are hand-declared
+([decision K](design-decisions.md#k-extern-declarations-are-signature-only-the-host-is-supplied-separately-no-inline-js-bodies)),
+so a signature that misdescribes a package's real shape is a run-time surprise.
 
-**Workaround:** declare JS interop with `extern js` signature blocks and supply the host
-module yourself (the Phase 2.5 mechanism); there is no automatic npm dependency fetch.
-**Target phase:** 3.1-js follow-up. Carved out at Phase 3.1 close (2026-07-01).
+**Workaround:** not applicable — the intended flow is `npm install` in the build output
+directory (the generated `package.json` is ready to use), then run the glue under Node or
+your bundler.
+**Target phase:** an **opt-in** `phoenix build --bundle` (shell out to a bundler if present,
+never required) and/or a `.d.ts`-to-`extern js` generator are unscheduled follow-ups. Deferred
+at Phase 3.1.2 close (2026-07-17).
+
 ### `json.encode` of a `Map` with non-`String` keys is not yet supported
 
 `json.encode` supports `Map<String, V>` (→ JSON object). Maps with other

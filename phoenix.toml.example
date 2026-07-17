@@ -5,6 +5,7 @@
 # sections declare the package-manager manifest: `phoenix build`/`run`/`check`
 # resolve and fetch declared dependencies (pinning git sources in phoenix.lock)
 # before compiling, and `phoenix init`/`add` scaffold and edit this file.
+# [js-dependencies] declares the npm packages an `extern js "pkg"` block binds.
 
 # ── Package metadata ───────────────────────────────────────────
 # Identifies this package so it can be depended upon (and, eventually,
@@ -35,6 +36,24 @@
 # # Local path source — relative to this file's directory. Resolves in
 # # place and is never SHA-pinned; ideal for monorepos and local dev.
 # util = { path = "../util" }
+
+# ── JavaScript dependencies ────────────────────────────────────
+# npm packages an `extern js "pkg" { ... }` block binds. Each entry is
+# an npm package name → a version spec, passed through verbatim (npm
+# owns the version grammar; Phoenix does not interpret it).
+#
+# Phoenix records these; it does not install them. A wasm build writes a
+# package.json from this section beside the generated JS glue — only if
+# one is not already there, so your own package.json is never clobbered —
+# and `npm install` in that directory supplies the actual code. On a wasm
+# build, binding a module that isn't declared here is a warning, not an
+# error: the host may legitimately come from a local module, an import
+# map, or a bundler alias. (Other targets bind extern hosts directly, not
+# via npm, so they skip the check.)
+#
+# [js-dependencies]
+# left-pad = "^1.3.0"
+# chalk = "^5"
 
 [gen]
 # Path to your .phx schema file.

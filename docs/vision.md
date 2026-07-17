@@ -142,7 +142,7 @@ Phoenix aims to be a **single-language full-stack** web language where compile-t
 
 ### Stage 1: JavaScript Interop (Phase 2.5)
 
-Phoenix compiles to WebAssembly and calls into the JavaScript ecosystem via `extern js` declarations and npm imports. The `extern js` host-FFI boundary **shipped in Phase 2.5** (uniform across all five backends); the `import js "pkg"` npm-resolution slice shown below is deferred to Phase 3.1 (the package manager). Developers use **existing frameworks** (React, Svelte, Vue) for the UI layer and write business logic, state management, and backend code in Phoenix. This delivers immediate value: Phoenix's type safety for data and API calls, the JS ecosystem for UI.
+Phoenix compiles to WebAssembly and calls into the JavaScript ecosystem via `extern js` declarations and npm packages. The `extern js` host-FFI boundary **shipped in Phase 2.5** (uniform across all five backends); the `extern js "pkg"` npm-dependency slice **shipped in Phase 3.1.2** on the BYO model — `[js-dependencies]` in `phoenix.toml` declares the packages and the developer's own npm toolchain installs them ([design-decisions §Phase 3.1.2](design-decisions.md#phase-312-npm--javascript-dependencies)). Developers use **existing frameworks** (React, Svelte, Vue) for the UI layer and write business logic, state management, and backend code in Phoenix. This delivers immediate value: Phoenix's type safety for data and API calls, the JS ecosystem for UI. The sketch below shows the intended shape of React interop; some of its signatures use surface that has not landed yet — tuple returns, marshalling aggregates like `Map`, and `async`/`await` (Phase 4.3). Today's marshallable set is the scalars, `String`, `JsValue`, and closures.
 
 ```phoenix
 // Use React from Phoenix via JS interop
@@ -151,7 +151,7 @@ extern js {
   function render(element: JsValue, root: JsValue)
 }
 
-import js "react" { function useState(init: Int) -> (Int, (Int) -> Void) }
+extern js "react" { function useState(init: Int) -> (Int, (Int) -> Void) }
 
 // Phoenix logic, rendered by React
 async function loadUser(id: Int) -> Result<User, ApiError> {
