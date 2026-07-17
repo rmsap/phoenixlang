@@ -14,6 +14,7 @@
 pub mod build;
 pub mod config;
 pub mod deps;
+pub mod js_deps;
 pub mod manifest;
 pub mod pkg_cli;
 
@@ -299,7 +300,7 @@ pub(crate) fn parse_and_check(
     path: &str,
     locked: bool,
 ) -> (phoenix_parser::ast::Program, phoenix_sema::Analysis) {
-    let (modules, analysis, _source_map) = parse_resolve_check(path, locked);
+    let (modules, analysis, _source_map, _config) = parse_resolve_check(path, locked);
     // `phoenix_modules::resolve` always returns at least the entry module
     // and places it first; both invariants are load-bearing here.
     debug_assert!(
@@ -313,9 +314,13 @@ pub(crate) fn parse_and_check(
 /// Multi-module parse + resolve + type-check entry point.
 ///
 /// Returns the full resolver output (in deterministic topological order,
-/// entry first), the project-wide semantic analysis, and the shared
-/// [`SourceMap`] so cross-module diagnostics resolve their own
-/// `SourceId`s. Exits the process on parse, resolve, or type errors.
+/// entry first), the project-wide semantic analysis, the shared
+/// [`SourceMap`] so cross-module diagnostics resolve their own `SourceId`s,
+/// and the project's [`PhoenixConfig`] (`None` if it has no manifest) —
+/// already discovered and validated while resolving dependencies, so a
+/// caller that needs another manifest section (e.g. `[js-dependencies]`)
+/// reads it off this value instead of re-discovering `phoenix.toml`. Exits
+/// the process on parse, resolve, or type errors.
 ///
 /// Callers that need the entry [`Program`] standalone use
 /// [`parse_and_check`], which extracts it from `modules[0]` without an
@@ -323,9 +328,14 @@ pub(crate) fn parse_and_check(
 pub(crate) fn parse_resolve_check(
     path: &str,
     locked: bool,
-) -> (Vec<ResolvedSourceModule>, phoenix_sema::Analysis, SourceMap) {
+) -> (
+    Vec<ResolvedSourceModule>,
+    phoenix_sema::Analysis,
+    SourceMap,
+    Option<PhoenixConfig>,
+) {
     let mut source_map = SourceMap::new();
-    let modules = resolve_modules_with_deps(path, locked, &mut source_map);
+    let (modules, config) = resolve_modules_with_deps(path, locked, &mut source_map);
 
     let analysis = checker::check_modules(&modules);
     if !analysis.diagnostics.is_empty() {
@@ -333,7 +343,7 @@ pub(crate) fn parse_resolve_check(
         process::exit(1);
     }
 
-    (modules, analysis, source_map)
+    (modules, analysis, source_map, config)
 }
 
 /// Resolve the module graph for `path`, first fetching + wiring any declared
@@ -344,7 +354,7 @@ fn resolve_modules_with_deps(
     path: &str,
     locked: bool,
     source_map: &mut SourceMap,
-) -> Vec<ResolvedSourceModule> {
+) -> (Vec<ResolvedSourceModule>, Option<PhoenixConfig>) {
     resolve_modules_reporting(path, locked, source_map).unwrap_or_else(|_| process::exit(1))
 }
 
@@ -359,20 +369,22 @@ fn resolve_modules_reporting(
     path: &str,
     locked: bool,
     source_map: &mut SourceMap,
-) -> Result<Vec<ResolvedSourceModule>, String> {
+) -> Result<(Vec<ResolvedSourceModule>, Option<PhoenixConfig>), String> {
     let entry = Path::new(path);
-    let (packages, lock_changed) =
-        deps::project::build_package_resolution(entry, locked).map_err(|msg| {
-            eprintln!("error: {msg}");
-            "dependency resolution errors".to_string()
-        })?;
+    let (packages, lock_changed, config) = deps::project::build_package_resolution(entry, locked)
+        .map_err(|msg| {
+        eprintln!("error: {msg}");
+        "dependency resolution errors".to_string()
+    })?;
     if lock_changed {
         eprintln!("Updated phoenix.lock");
     }
-    phoenix_modules::resolve_with_packages(entry, source_map, &packages).map_err(|err| {
-        report_resolve_error(&err, source_map);
-        "resolve / parse errors".to_string()
-    })
+    let modules =
+        phoenix_modules::resolve_with_packages(entry, source_map, &packages).map_err(|err| {
+            report_resolve_error(&err, source_map);
+            "resolve / parse errors".to_string()
+        })?;
+    Ok((modules, config))
 }
 
 /// Type-checks a source file and reports diagnostics. Resolves and fetches any
@@ -387,7 +399,7 @@ pub fn cmd_check(path: &str, locked: bool) {
 /// `check`/`run`/`build` — this is a non-`--locked`-aware path: the lockfile may
 /// be updated but is never gated.
 pub fn cmd_ir(path: &str) {
-    let (modules, check_result, _sm) = parse_resolve_check(path, false);
+    let (modules, check_result, _sm, _config) = parse_resolve_check(path, false);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     // Run the IR verifier to catch structural errors.
@@ -411,7 +423,7 @@ pub fn cmd_run(path: &str, locked: bool) {
     // inputs this reduces to the same behavior as the previous
     // single-program path — entry module qualifies to bare, every
     // name resolves identically.
-    let (modules, mut analysis, _sm) = parse_resolve_check(path, locked);
+    let (modules, mut analysis, _sm, _config) = parse_resolve_check(path, locked);
     if let Err(err) = interpreter::run_modules(&modules, &mut analysis) {
         eprintln!("runtime error: {}", err);
         process::exit(1);
@@ -423,7 +435,7 @@ pub fn cmd_run(path: &str, locked: bool) {
 /// is a non-`--locked`-aware path: the lockfile may be updated but is never
 /// gated.
 pub fn cmd_run_ir(path: &str) {
-    let (modules, check_result, _sm) = parse_resolve_check(path, false);
+    let (modules, check_result, _sm, _config) = parse_resolve_check(path, false);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
@@ -779,7 +791,7 @@ fn try_parse_and_check(
     // that is cheap; for git deps it re-runs `resolve_project` against the cache
     // per file change. A future refinement could resolve once per watch session
     // and re-resolve only when the manifest itself changes.
-    let modules = resolve_modules_reporting(path, false, &mut source_map)?;
+    let (modules, _config) = resolve_modules_reporting(path, false, &mut source_map)?;
 
     let analysis = checker::check_modules(&modules);
     if !analysis.diagnostics.is_empty() {

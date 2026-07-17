@@ -26,6 +26,12 @@ pub struct PhoenixConfig {
     /// it.
     #[serde(default, rename = "dependencies")]
     pub(crate) raw_dependencies: BTreeMap<String, toml::Value>,
+    /// Declared npm/JavaScript dependencies (`[js-dependencies]` section):
+    /// package name → version spec, verbatim as written into a generated
+    /// `package.json` (the BYO model). Read through the validating
+    /// [`PhoenixConfig::js_dependencies`] accessor.
+    #[serde(default, rename = "js-dependencies")]
+    pub(crate) raw_js_dependencies: BTreeMap<String, String>,
     /// Code generation configuration (`[gen]` section).
     #[serde(default, rename = "gen")]
     pub codegen: GenConfig,
@@ -264,6 +270,7 @@ impl PhoenixConfig {
             pkg.validate().map_err(to_config_err)?;
         }
         self.dependencies().map_err(to_config_err)?;
+        self.js_dependencies().map_err(to_config_err)?;
         Ok(())
     }
 
@@ -277,6 +284,23 @@ impl PhoenixConfig {
         }
         Ok(out)
     }
+
+    /// Validates and returns the declared npm/JavaScript dependencies
+    /// (`[js-dependencies]`): package name → version spec. Each name and spec
+    /// must be non-empty; the spec is otherwise taken verbatim (it flows into a
+    /// generated `package.json` for the developer's own `npm install` — the BYO
+    /// model, so Phoenix does not interpret npm semver here).
+    pub fn js_dependencies(&self) -> Result<BTreeMap<String, String>, ManifestError> {
+        for (name, version) in &self.raw_js_dependencies {
+            if name.trim().is_empty() {
+                return Err(ManifestError::EmptyJsDependencyName);
+            }
+            if version.trim().is_empty() {
+                return Err(ManifestError::EmptyJsDependencyVersion { name: name.clone() });
+            }
+        }
+        Ok(self.raw_js_dependencies.clone())
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +312,44 @@ mod tests {
         let config: PhoenixConfig = toml::from_str("").unwrap();
         assert!(config.codegen.target.is_none());
         assert!(config.codegen.schema.is_none());
+    }
+
+    #[test]
+    fn parse_js_dependencies_section() {
+        let config: PhoenixConfig =
+            toml::from_str("[js-dependencies]\nleft-pad = \"^1.3.0\"\nchalk = \"5\"\n").unwrap();
+        let js = config.js_dependencies().unwrap();
+        assert_eq!(js.get("left-pad").map(String::as_str), Some("^1.3.0"));
+        assert_eq!(js.get("chalk").map(String::as_str), Some("5"));
+    }
+
+    #[test]
+    fn js_dependencies_coexist_with_package_and_gen() {
+        let config: PhoenixConfig = toml::from_str(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [js-dependencies]\nleft-pad = \"^1\"\n\n[gen]\ntarget = \"go\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.package.as_ref().unwrap().name, "app");
+        assert_eq!(config.codegen.target.as_deref(), Some("go"));
+        assert!(config.js_dependencies().unwrap().contains_key("left-pad"));
+    }
+
+    #[test]
+    fn js_dependencies_empty_version_rejected() {
+        let config: PhoenixConfig = toml::from_str("[js-dependencies]\nleft-pad = \"\"\n").unwrap();
+        assert!(matches!(
+            config.js_dependencies().unwrap_err(),
+            crate::manifest::ManifestError::EmptyJsDependencyVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn js_dependencies_non_string_version_rejected() {
+        // A non-string value (e.g. a table) is a serde parse error.
+        let result: Result<PhoenixConfig, _> =
+            toml::from_str("[js-dependencies]\nleft-pad = { version = \"1\" }\n");
+        assert!(result.is_err());
     }
 
     #[test]

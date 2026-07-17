@@ -155,6 +155,13 @@ pub enum ManifestError {
         /// The offending key (`git` or `path`).
         key: String,
     },
+    /// A `[js-dependencies]` entry had an empty or whitespace-only name.
+    EmptyJsDependencyName,
+    /// A `[js-dependencies]` entry had an empty or whitespace-only version spec.
+    EmptyJsDependencyVersion {
+        /// The npm package name.
+        name: String,
+    },
 }
 
 impl std::fmt::Display for ManifestError {
@@ -207,6 +214,17 @@ impl std::fmt::Display for ManifestError {
             ManifestError::EmptySource { name, key } => write!(
                 f,
                 "dependency `{name}` has an empty `{key}` value; provide a non-empty source"
+            ),
+            ManifestError::EmptyJsDependencyName => {
+                write!(
+                    f,
+                    "`[js-dependencies]` contains an entry with an empty name"
+                )
+            }
+            ManifestError::EmptyJsDependencyVersion { name } => write!(
+                f,
+                "js dependency `{name}` has an empty version spec; provide a version range \
+                 (e.g. `\"^1.2.0\"`) or `\"*\"`"
             ),
         }
     }

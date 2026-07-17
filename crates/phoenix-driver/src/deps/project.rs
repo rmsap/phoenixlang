@@ -22,11 +22,15 @@ use super::ResolvedGraph;
 ///
 /// `locked` forbids updating `phoenix.lock`. The returned `bool` is whether this
 /// resolution changed the on-disk lockfile; the caller owns the user-facing
-/// notice so all stderr reporting stays at the driver layer.
+/// notice so all stderr reporting stays at the driver layer. The returned
+/// [`PhoenixConfig`] (`None` if no manifest exists) is the one this function
+/// already loaded and validated to discover `[dependencies]` — callers that
+/// need other manifest sections (e.g. `[js-dependencies]`) read them off this
+/// value instead of re-discovering and re-parsing `phoenix.toml` themselves.
 pub(crate) fn build_package_resolution(
     entry: &Path,
     locked: bool,
-) -> Result<(PackageResolution, bool), String> {
+) -> Result<(PackageResolution, bool, Option<PhoenixConfig>), String> {
     // `Path::parent()` yields `Some("")` for a bare filename (`main.phx`), not
     // `None`, and `find_with_path("")` would then probe only `./phoenix.toml`
     // and refuse to walk up (an empty path can't `pop()`). Treat that empty
@@ -39,11 +43,11 @@ pub(crate) fn build_package_resolution(
     let Some((config, manifest_path)) =
         PhoenixConfig::find_with_path(entry_dir).map_err(|e| e.to_string())?
     else {
-        return Ok((PackageResolution::default(), false));
+        return Ok((PackageResolution::default(), false, None));
     };
     let dependencies = config.dependencies().map_err(|e| e.to_string())?;
     if dependencies.is_empty() {
-        return Ok((PackageResolution::default(), false));
+        return Ok((PackageResolution::default(), false, Some(config)));
     }
     let manifest_dir = manifest_path
         .parent()
@@ -60,6 +64,7 @@ pub(crate) fn build_package_resolution(
     Ok((
         package_resolution_from_graph(entry_deps, &resolution.graph),
         resolution.lock_changed,
+        Some(config),
     ))
 }
 

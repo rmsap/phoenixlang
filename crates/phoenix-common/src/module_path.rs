@@ -85,6 +85,18 @@ impl ModulePath {
         self.0.len() == 1 && self.0[0] == BUILTIN_SEGMENT
     }
 
+    /// True if this path names a module inside a dependency package (i.e. was
+    /// built with [`in_package`](Self::in_package)), as opposed to a module of
+    /// the entry package itself (entry or local). Lets a caller that merges
+    /// declarations across the whole resolved module graph (entry package +
+    /// every dependency) scope back down to "declared by *this* package" when
+    /// that distinction matters — e.g. a dependency's own `extern js` bindings
+    /// are that package's concern, not something the entry package's manifest
+    /// should have to declare.
+    pub fn in_dependency_package(&self) -> bool {
+        self.package_split().is_some()
+    }
+
     /// Join the segments with `.` for use in user-facing display
     /// (`["a", "b"]` → `"a.b"`).  The entry path returns `""` and the
     /// builtin sentinel returns the literal `"<builtin>"` segment. A
@@ -313,5 +325,14 @@ mod tests {
         let p = ModulePath::in_package("greet", &[]);
         assert!(!p.is_entry());
         assert!(!p.is_builtin());
+    }
+
+    #[test]
+    fn in_dependency_package_distinguishes_package_from_local_modules() {
+        assert!(ModulePath::in_package("greet", &[]).in_dependency_package());
+        assert!(ModulePath::in_package("greet", &["util".into()]).in_dependency_package());
+        assert!(!ModulePath::entry().in_dependency_package());
+        assert!(!ModulePath::builtin().in_dependency_package());
+        assert!(!ModulePath(vec!["util".into()]).in_dependency_package());
     }
 }

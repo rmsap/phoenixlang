@@ -43,7 +43,7 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>, loc
         None => Target::default(),
     };
 
-    let (modules, check_result, _sm) = super::parse_resolve_check(path, locked);
+    let (modules, check_result, _sm, config) = super::parse_resolve_check(path, locked);
     let ir_module = phoenix_ir::lower_modules(&modules, &check_result.module);
 
     let errors = phoenix_ir::verify::verify(&ir_module);
@@ -212,8 +212,61 @@ pub fn cmd_build(path: &str, output: Option<&str>, target_str: Option<&str>, loc
             }
             eprintln!("Compiled to {}", out_path.display());
         }
+
+        // BYO npm: from the project's `[js-dependencies]`, warn
+        // about any `extern js "pkg"` module that isn't declared, and write a
+        // `package.json` beside the glue (write-if-absent). WASM-only — the
+        // native and interpreter paths bind extern hosts directly, not via npm.
+        emit_js_deps(config.as_ref(), &check_result, out_path.parent());
     } else {
         link_object(&artifact_bytes, &out_path);
+    }
+}
+
+/// BYO-npm handshake for a WASM build: from the project's
+/// `[js-dependencies]`, warn about any `extern js "pkg"` module that isn't
+/// declared there, then write a `package.json` beside the glue — but only if
+/// one isn't already present, so a developer-owned `package.json` is never
+/// clobbered.
+///
+/// `config` is the manifest [`parse_resolve_check`](super::parse_resolve_check)
+/// already discovered and validated while resolving dependencies for this same
+/// build — `None` means the project has no `phoenix.toml` at all, which is
+/// equivalent to declaring no js-dependencies.
+fn emit_js_deps(
+    config: Option<&crate::config::PhoenixConfig>,
+    analysis: &phoenix_sema::Analysis,
+    glue_dir: Option<&Path>,
+) {
+    let js_deps = match config {
+        // `config` was already loaded through `PhoenixConfig::load_file`,
+        // which runs `validate_manifest` (including `js_dependencies`) before
+        // handing back a `PhoenixConfig` — so this can't fail here.
+        Some(config) => config
+            .js_dependencies()
+            .expect("js-dependencies already validated when the manifest was loaded"),
+        None => std::collections::BTreeMap::new(),
+    };
+
+    let used = crate::js_deps::used_js_modules(analysis);
+    for module in crate::js_deps::undeclared_js_modules(&used, &js_deps) {
+        eprintln!(
+            "warning: `extern js \"{module}\"` names a package not in [js-dependencies]; \
+             add it to phoenix.toml (or fix the specifier)"
+        );
+    }
+
+    if let Some(dir) = glue_dir {
+        match crate::js_deps::write_package_json_if_absent(dir, &js_deps) {
+            Ok(true) => {
+                eprintln!(
+                    "Wrote package.json to {}",
+                    dir.join("package.json").display()
+                )
+            }
+            Ok(false) => {}
+            Err(err) => eprintln!("warning: could not write package.json: {err}"),
+        }
     }
 }
 
