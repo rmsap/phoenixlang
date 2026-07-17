@@ -1076,13 +1076,12 @@ fn json_decode_of_struct_with_undecodable_field_is_an_error() {
 }
 
 #[test]
-fn json_decode_of_struct_with_enum_field_is_an_error() {
-    // The gate's `Named` arm requires a struct: a field whose type resolves
-    // to an enum is rejected (enum decode lands in a later slice), and the
-    // diagnostic names the enum, not the struct.
+fn json_decode_of_struct_with_enum_field_typechecks() {
+    // The gate recurses into a non-generic enum field (with a with-field
+    // variant), so a struct carrying one is a decodable target.
     let entry = entry_only(
         "import json\n\
-         enum Color { Red  Green }\n\
+         enum Color { Red  Green  Custom(Int) }\n\
          struct S { c: Color }\n\
          function main() {\n  \
            let r: Result<S, JsonError> = json.decode<S>(\"x\")\n  \
@@ -1091,39 +1090,130 @@ fn json_decode_of_struct_with_enum_field_is_an_error() {
     );
     let analysis = check_modules(&[entry]);
     assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("does not support `Color`")),
-        "expected the diagnostic to name the enum field type `Color`, got: {:?}",
+        analysis.diagnostics.is_empty(),
+        "struct-with-enum-field decode should type-check, got: {:?}",
         analysis.diagnostics
     );
 }
 
 #[test]
-fn json_decode_diagnostic_names_an_imported_type_with_its_qualifier() {
-    // The gate prints *canonical* names: for an imported type that means the
-    // module qualifier stays in the diagnostic, so same-named types from
-    // different modules remain distinguishable. (An entry-module type's
-    // canonical spelling is bare — see
-    // `json_decode_of_struct_with_enum_field_is_an_error`.)
+fn json_decode_of_enum_typechecks() {
+    // A non-generic enum is a decodable target directly: unit, single-field,
+    // multi-field, and non-scalar-payload (nested struct + Option) variants.
     let entry = entry_only(
         "import json\n\
-         import models { Color }\n\
-         struct S { c: Color }\n\
+         struct P { x: Int }\n\
+         enum Status { Active  Pending(Int)  Located(P, Option<Int>) }\n\
+         function main() {\n  \
+           let r: Result<Status, JsonError> = json.decode<Status>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "enum decode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_option_typechecks() {
+    // `Option<T>` is a decodable target when `T` is (here a struct).
+    let entry = entry_only(
+        "import json\n\
+         struct P { x: Int }\n\
+         function main() {\n  \
+           let r: Result<Option<P>, JsonError> = json.decode<Option<P>>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "Option decode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_option_of_undecodable_inner_is_an_error() {
+    // The gate recurses through `Option`'s inner type: `Option<T>` is only
+    // as decodable as `T`, so `Option<List<Int>>` is rejected and the
+    // diagnostic names the undecodable inner type, not the `Option`.
+    let entry = entry_only(
+        "import json\n\
+         function main() {\n  \
+           let r: Result<Option<List<Int>>, JsonError> = json.decode<Option<List<Int>>>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not support `List<Int>`")),
+        "expected the diagnostic to name the undecodable Option inner type \
+         `List<Int>`, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_enum_with_undecodable_variant_field_is_an_error() {
+    // The gate recurses into variant field types: an enum with a variant
+    // carrying a `List<Int>` is rejected, naming the offending payload type.
+    let entry = entry_only(
+        "import json\n\
+         enum E { A  B(List<Int>) }\n\
+         function main() {\n  \
+           let r: Result<E, JsonError> = json.decode<E>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("does not support `List<Int>`")),
+        "expected the diagnostic to name the undecodable variant payload `List<Int>`, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn json_decode_of_imported_generic_enum_is_rejected_with_qualifier() {
+    // Only *non-generic* enums decode; a generic enum instantiation stays
+    // unsupported. The diagnostic keeps the *canonical* (module-qualified)
+    // spelling — `models::Wrapper<Int>`, not `Wrapper<Int>` — so same-named
+    // types from different modules stay distinguishable. (This replaced an
+    // earlier qualifier test that relied on a *non-generic* imported enum
+    // being rejected, which now decodes; generic instantiations are the
+    // remaining imported-and-unsupported shape, so they carry the qualifier
+    // coverage.)
+    let entry = entry_only(
+        "import json\n\
+         import models { Wrapper }\n\
+         struct S { w: Wrapper<Int> }\n\
          function main() {\n  \
            let r: Result<S, JsonError> = json.decode<S>(\"x\")\n  \
            match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
          }",
     );
-    let models = non_entry("models", "public enum Color { Red  Green }", SourceId(1));
+    let models = non_entry(
+        "models",
+        "public enum Wrapper<T> { Empty  Full(T) }",
+        SourceId(1),
+    );
     let analysis = check_modules(&[entry, models]);
     assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("does not support `models::Color`")),
-        "expected the diagnostic to keep the imported enum's qualifier, got: {:?}",
+        analysis.diagnostics.iter().any(|d| d
+            .message
+            .contains("does not support `models::Wrapper<Int>`")),
+        "expected the imported generic enum to be rejected with its module \
+         qualifier, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -1132,13 +1222,10 @@ fn json_decode_diagnostic_names_an_imported_type_with_its_qualifier() {
 fn json_encode_of_imported_generic_struct_is_rejected_as_spelled() {
     // Encode-side sibling of the test above, pinning the one *reachable*
     // imported-and-unsupported encode shape: a generic struct instantiation.
-    // Unlike `Type::Named` payloads (always canonical, qualifier included),
-    // a `Type::Generic` payload keeps the source spelling — so the
-    // diagnostic says `Box<Int>`, as written at the call site. If generic
-    // payloads are ever canonicalized too, update the expected spelling to
-    // `models::Box<Int>`. (The gate's other qualified-name arms — a bare
-    // `Type::Named` naming a generic struct or enum — are defensive:
-    // resolution errors out before producing such a type.)
+    // `Type::Generic` payloads are spelled canonically like `Type::Named`
+    // ones — qualifier included, `models::Box<Int>` — via
+    // `canonical_type_spelling`, keeping same-named types from different
+    // modules distinguishable.
     let entry = entry_only(
         "import json\n\
          import models { Box }\n\
@@ -1156,9 +1243,9 @@ fn json_encode_of_imported_generic_struct_is_rejected_as_spelled() {
     assert!(
         analysis.diagnostics.iter().any(|d| d
             .message
-            .contains("`json.encode` does not support `Box<Int>`")),
-        "expected an unsupported-type diagnostic for the imported generic \
-         struct instantiation, got: {:?}",
+            .contains("`json.encode` does not support `models::Box<Int>`")),
+        "expected an unsupported-type diagnostic naming the imported generic \
+         struct instantiation with its module qualifier, got: {:?}",
         analysis.diagnostics
     );
 }

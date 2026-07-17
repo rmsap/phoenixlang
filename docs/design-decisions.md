@@ -1471,6 +1471,15 @@ A synthesized encoder *reads* every field of every struct reachable from the tar
 
 **Why not treat JSON round-tripping as privileged** (like a serialization derive generated inside the defining module): that stance silently voids constructor invariants — any module could fabricate a value with arbitrary private-field contents from a string, and `json.encode` would expose field values the caller cannot legally read. Enforcing now and relaxing later (e.g. an opt-in annotation on the struct) is backward-compatible; shipping the exemption and restricting later would be a breaking change.
 
+#### B. An absent `Option` struct field decodes to `None` (absent ≡ null)
+
+**Decided:** 2026-07-13
+`json.decode` treats a struct field of type `Option<T>` whose key is absent from the JSON object exactly like an explicit `null`: both decode to `None`. Any other missing field remains `Err(MissingField)`. Encoding is unchanged — `None` always emits an explicit `"field": null` — so Phoenix round-trips are exact either way.
+
+**Why lenient:** real-world JSON producers routinely omit optional fields rather than emitting `null` — JavaScript/TypeScript serializers drop `undefined` properties entirely, and mainstream decoders (serde, Jackson, `encoding/json`) default an absent optional to its empty value. Rejecting the omitted form would make Phoenix unable to decode the most common wire shape for "no value" while adding no safety: the field's type already declares absence a legal state. Tightening from lenient to strict per-field remains expressible later (e.g. a future annotation) without breaking programs; the reverse direction would be a breaking change.
+
+This applies to *named object fields* only. Positional payloads — the elements of an adjacently-tagged enum variant's `"value"` array — have no per-element "absent" notion; a too-short array is always `Err(TypeMismatch)`, even when the trailing element's type is `Option<T>`.
+
 ---
 
 ## Phoenix Gen

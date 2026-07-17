@@ -89,28 +89,50 @@ impl Interpreter {
         // the common no-decode program clones nothing and a decode-using
         // program clones only what its targets can reach.
         self.json_decode_types = std::mem::take(&mut resolved.json_decode_types);
-        fn named(ty: &phoenix_sema::types::Type) -> Option<String> {
+        // Collect the named types reachable one level from `ty`, unwrapping
+        // generic wrappers (`Option<T>`/`List<T>`/`Map<K,V>`) to their leaves.
+        fn collect_named(ty: &phoenix_sema::types::Type, out: &mut Vec<String>) {
             match ty {
-                phoenix_sema::types::Type::Named(n) => Some(n.clone()),
-                _ => None,
+                phoenix_sema::types::Type::Named(n) => out.push(n.clone()),
+                phoenix_sema::types::Type::Generic(_, args) => {
+                    for a in args {
+                        collect_named(a, out);
+                    }
+                }
+                _ => {}
             }
         }
-        let mut queue: Vec<String> = self.json_decode_types.values().filter_map(named).collect();
+        let mut queue: Vec<String> = Vec::new();
+        for ty in self.json_decode_types.values() {
+            collect_named(ty, &mut queue);
+        }
         while let Some(name) = queue.pop() {
-            // Already seeded — also breaks struct cycles (A → B → A).
-            if self.json_struct_fields.contains_key(&name) {
+            // Already seeded — also breaks cycles (A → B → A).
+            if self.json_struct_fields.contains_key(&name)
+                || self.json_enum_variants.contains_key(&name)
+            {
                 continue;
             }
-            let Some(id) = resolved.struct_by_name.get(&name) else {
-                continue;
-            };
-            let fields: Vec<(String, phoenix_sema::types::Type)> = resolved.structs[id.index()]
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.ty.clone()))
-                .collect();
-            queue.extend(fields.iter().filter_map(|(_, ty)| named(ty)));
-            self.json_struct_fields.insert(name, fields);
+            if let Some(id) = resolved.struct_by_name.get(&name) {
+                let fields: Vec<(String, phoenix_sema::types::Type)> = resolved.structs[id.index()]
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect();
+                for (_, ty) in &fields {
+                    collect_named(ty, &mut queue);
+                }
+                self.json_struct_fields.insert(name, fields);
+            } else if let Some(id) = resolved.enum_by_name.get(&name) {
+                let variants: Vec<(String, Vec<phoenix_sema::types::Type>)> =
+                    resolved.enums[id.index()].variants.clone();
+                for (_, ftys) in &variants {
+                    for ty in ftys {
+                        collect_named(ty, &mut queue);
+                    }
+                }
+                self.json_enum_variants.insert(name, variants);
+            }
         }
     }
 

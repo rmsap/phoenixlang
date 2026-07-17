@@ -248,6 +248,12 @@ pub struct Interpreter {
     /// tracks field names.
     pub(crate) json_struct_fields: HashMap<String, Vec<(String, phoenix_sema::types::Type)>>,
 
+    /// Enum variant `(name, field-types)` lists keyed by qualified enum name,
+    /// seeded from sema alongside [`Self::json_struct_fields`]. `json.decode`
+    /// of an enum target needs each variant's field types to recurse; the
+    /// interpreter's own `EnumDef` only tracks variant field *counts*.
+    pub(crate) json_enum_variants: HashMap<String, Vec<(String, Vec<phoenix_sema::types::Type>)>>,
+
     /// Per-module visibility scopes (drained from sema's `Analysis`).
     /// Used by [`Interpreter::qualify`] to translate user-source bare
     /// names into qualified registry keys (mirrors what the IR layer
@@ -358,6 +364,7 @@ impl Interpreter {
             json_encode_spans: std::collections::HashSet::new(),
             json_decode_types: HashMap::new(),
             json_struct_fields: HashMap::new(),
+            json_enum_variants: HashMap::new(),
             output,
             module_scopes: HashMap::new(),
             module_stack: Vec::new(),

@@ -3709,13 +3709,13 @@ fn rejects_float_comparison_op() {
 }
 
 /// Companion to [`rejects_unsupported_ir_op`] for the *string
-/// comparison* family. String construction/concatenation *is* a
-/// supported linear-backend op, so the only deferred op the fixture
-/// exercises is the `==` (which lowers to `Op::StringEq`).
+/// comparison* family. `==` (`Op::StringEq`) *is* lowered now — it backs
+/// adjacently-tagged enum decode — so this exercises `!=` (`Op::StringNe`),
+/// which stays deferred alongside the ordering comparisons.
 #[test]
 fn rejects_string_comparison_op() {
-    let src = "function main() {\n  let a: String = \"x\"\n  let b: String = \"y\"\n  let c: Bool = a == b\n  print(c)\n}\n";
-    assert_unsupported_op_rejection(src, "StringEq");
+    let src = "function main() {\n  let a: String = \"x\"\n  let b: String = \"y\"\n  let c: Bool = a != b\n  print(c)\n}\n";
+    assert_unsupported_op_rejection(src, "StringNe");
 }
 
 /// Shared "compile from source and expect Ok" helper used by the

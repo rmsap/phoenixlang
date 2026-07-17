@@ -7,9 +7,11 @@
 //! seeded in `multi_module.rs`). The two implementations are pinned against
 //! each other by the cross-backend fixture matrix.
 
+use phoenix_sema::types::OPTION_ENUM;
+
 use crate::value::Value;
 
-use super::{Interpreter, Result, RuntimeError, err_val, error, ok_val};
+use super::{Interpreter, Result, RuntimeError, err_val, error, none_val, ok_val, some_val};
 
 /// Constructs a `JsonError::<variant>(message)` value.
 fn json_error_value(variant: &str, msg: &str) -> Value {
@@ -56,7 +58,7 @@ impl Interpreter {
             }
             // `Option<T>`: None → null, Some(x) → encode(x). Other enums are
             // adjacently tagged.
-            Value::EnumVariant(enum_name, variant, fields) if enum_name == "Option" => {
+            Value::EnumVariant(enum_name, variant, fields) if enum_name == OPTION_ENUM => {
                 match variant.as_str() {
                     "None" => Ok("null".to_string()),
                     "Some" => self.json_encode_value(&fields[0]),
@@ -124,8 +126,9 @@ impl Interpreter {
         }
     }
 
-    /// Build a `Result<T, JsonError>` from a parsed DOM node and target type.
-    /// This slice handles scalars and non-generic structs.
+    /// Build a `Result<T, JsonError>` from a parsed DOM node and target type:
+    /// scalars, `Option<T>`, and non-generic structs and enums (the composite
+    /// shapes each dispatch to their own helper).
     fn json_decode_value(
         &self,
         dom: &serde_json::Value,
@@ -151,47 +154,133 @@ impl Interpreter {
                 Some(s) => Ok(ok_val(Value::String(s.to_string()))),
                 None => mismatch("expected String"),
             },
-            // A non-generic struct: require an object, decode each field
-            // (missing → MissingField, a field error propagates), then build.
+            // `Option<T>`: `null` → `None`, else decode `T` and wrap `Some`.
+            Type::Generic(name, args) if name == OPTION_ENUM && args.len() == 1 => {
+                if dom.is_null() {
+                    return Ok(ok_val(none_val()));
+                }
+                match self.json_decode_value(dom, &args[0])? {
+                    Value::EnumVariant(_, ref v, inner) if v == "Ok" => Ok(ok_val(some_val(
+                        inner.into_iter().next().unwrap_or(Value::Void),
+                    ))),
+                    other => Ok(other), // Err(JsonError) propagates.
+                }
+            }
+            // A non-generic struct or enum: require an object and build it.
             Type::Named(name) => {
-                // A miss here is an internal bug, not bad input: sema's gate
-                // admitted the struct, so `seed_from_resolved` must know it.
-                // Surface it as an interpreter error rather than masking it
-                // as a plausible `Err(TypeMismatch)` (mirrors the IR
-                // interpreter's stance on `json.getField` misuse).
-                let Some(fields) = self.json_struct_fields.get(name) else {
-                    return error(format!(
+                if let Some(fields) = self.json_struct_fields.get(name) {
+                    self.json_decode_struct(dom, name, fields)
+                } else if let Some(variants) = self.json_enum_variants.get(name) {
+                    self.json_decode_enum(dom, name, variants)
+                } else {
+                    // A miss here is an internal bug, not bad input: sema's
+                    // gate admitted the type, so `seed_from_resolved` must know
+                    // it. Surface it as an interpreter error rather than
+                    // masking it as a plausible `Err(TypeMismatch)`.
+                    error(format!(
                         "json.decode target `{name}` passed sema's gate but has no \
-                         struct-field entry — sema/interpreter tables are out of sync"
-                    ));
-                };
-                if !dom.is_object() {
-                    return mismatch("expected object");
+                         struct/enum entry — sema/interpreter tables are out of sync"
+                    ))
                 }
-                let mut field_values = std::collections::BTreeMap::new();
-                for (fname, fty) in fields {
-                    let Some(child) = dom.get(fname) else {
-                        return Ok(err_val(json_error_value("MissingField", fname)));
-                    };
-                    match self.json_decode_value(child, fty)? {
-                        // Ok(v) → keep the field value.
-                        Value::EnumVariant(_, ref v, inner) if v == "Ok" => {
-                            field_values.insert(
-                                fname.clone(),
-                                inner.into_iter().next().unwrap_or(Value::Void),
-                            );
-                        }
-                        // Err(JsonError) → propagate unchanged (the payload is a
-                        // JsonError regardless of the Ok type).
-                        other => return Ok(other),
-                    }
-                }
-                Ok(ok_val(Value::Struct(name.clone(), field_values)))
             }
             other => Ok(err_val(json_error_value(
                 "TypeMismatch",
                 &format!("json.decode does not support {other} yet"),
             ))),
         }
+    }
+
+    /// Decode a non-generic struct: require an object, decode each field (an
+    /// absent `Option` field → `None` — absent ≡ null, see design-decisions
+    /// §Phase 4.6 B; any other missing field → MissingField; a field error
+    /// propagates), then build. Mirrors the synthesized IR struct decoder.
+    fn json_decode_struct(
+        &self,
+        dom: &serde_json::Value,
+        struct_name: &str,
+        fields: &[(String, phoenix_sema::types::Type)],
+    ) -> Result<Value> {
+        use phoenix_sema::types::Type;
+        if !dom.is_object() {
+            return Ok(err_val(json_error_value("TypeMismatch", "expected object")));
+        }
+        let mut field_values = std::collections::BTreeMap::new();
+        for (fname, fty) in fields {
+            let Some(child) = dom.get(fname) else {
+                let is_option = matches!(
+                    fty,
+                    Type::Generic(n, args) if n == OPTION_ENUM && args.len() == 1
+                );
+                if is_option {
+                    field_values.insert(fname.clone(), none_val());
+                    continue;
+                }
+                return Ok(err_val(json_error_value("MissingField", fname)));
+            };
+            match self.json_decode_value(child, fty)? {
+                Value::EnumVariant(_, ref v, inner) if v == "Ok" => {
+                    field_values.insert(
+                        fname.clone(),
+                        inner.into_iter().next().unwrap_or(Value::Void),
+                    );
+                }
+                other => return Ok(other), // Err(JsonError) propagates.
+            }
+        }
+        Ok(ok_val(Value::Struct(struct_name.to_string(), field_values)))
+    }
+
+    /// Decode an adjacently-tagged enum: require an object, read the `"type"`
+    /// string discriminator, and — for a variant with fields — decode its
+    /// `"value"` array positionally. Mirrors the synthesized IR enum decoder.
+    fn json_decode_enum(
+        &self,
+        dom: &serde_json::Value,
+        enum_name: &str,
+        variants: &[(String, Vec<phoenix_sema::types::Type>)],
+    ) -> Result<Value> {
+        let mismatch = |name: &str| Ok(err_val(json_error_value("TypeMismatch", name)));
+        if !dom.is_object() {
+            return mismatch("expected object");
+        }
+        let Some(tag_node) = dom.get("type") else {
+            return Ok(err_val(json_error_value("MissingField", "type")));
+        };
+        let Some(tag) = tag_node.as_str() else {
+            return mismatch("expected a string \"type\" discriminator");
+        };
+        let Some((vname, ftys)) = variants.iter().find(|(n, _)| n == tag) else {
+            return mismatch(&format!("unknown enum variant: {tag}"));
+        };
+        if ftys.is_empty() {
+            return Ok(ok_val(Value::EnumVariant(
+                enum_name.to_string(),
+                vname.clone(),
+                vec![],
+            )));
+        }
+        let Some(value_node) = dom.get("value") else {
+            return Ok(err_val(json_error_value("MissingField", "value")));
+        };
+        let Some(arr) = value_node.as_array() else {
+            return mismatch("expected a \"value\" array");
+        };
+        let mut field_vals = Vec::with_capacity(ftys.len());
+        for (i, fty) in ftys.iter().enumerate() {
+            let Some(elem) = arr.get(i) else {
+                return mismatch("too few elements in \"value\" array");
+            };
+            match self.json_decode_value(elem, fty)? {
+                Value::EnumVariant(_, ref v, inner) if v == "Ok" => {
+                    field_vals.push(inner.into_iter().next().unwrap_or(Value::Void));
+                }
+                other => return Ok(other), // Err(JsonError) propagates.
+            }
+        }
+        Ok(ok_val(Value::EnumVariant(
+            enum_name.to_string(),
+            vname.clone(),
+            field_vals,
+        )))
     }
 }

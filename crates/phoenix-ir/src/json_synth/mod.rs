@@ -14,12 +14,14 @@
 //! sibling encoder/decoder — needs to reference them. Mirrors the two-pass
 //! shape of [`crate::default_wrappers`].
 //!
-//! [`encode`] and [`decode`] hold the per-direction synthesis; this module
-//! owns what the two share: the type-key scheme ([`encode_type_key`]),
-//! symbol mangling ([`sanitize`]), and enum-layout lookups
-//! ([`enum_variant_index`]).
+//! [`encode`] and [`decode`] hold the per-direction synthesis
+//! ([`decode_emit`] carries the decoder side's shape-agnostic emit
+//! toolkit); this module owns what the directions share: the type-key
+//! scheme ([`encode_type_key`]), symbol mangling ([`sanitize`]), and
+//! enum-layout lookups ([`enum_variant_index`]).
 
 mod decode;
+mod decode_emit;
 mod encode;
 
 pub(crate) use decode::synthesize_json_decoders;

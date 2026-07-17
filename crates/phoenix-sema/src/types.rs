@@ -7,6 +7,13 @@ use phoenix_common::module_path::bare_name;
 /// drift on the variant set.
 pub const JSON_ERROR_VARIANTS: [&str; 3] = ["ParseError", "TypeMismatch", "MissingField"];
 
+/// The canonical name of the built-in `Option` enum — the spelling a
+/// resolved `Type::Generic` carries. Shared by sema's JSON gates, the
+/// tree-walking interpreter's JSON decoding, and the IR layer's
+/// `OPTION_ENUM` (assigned from this constant), so the name those sites
+/// match on cannot drift from the registered builtin.
+pub const OPTION_ENUM: &str = "Option";
+
 /// The types in the Phoenix type system.
 ///
 /// This enum represents every type the compiler currently understands.

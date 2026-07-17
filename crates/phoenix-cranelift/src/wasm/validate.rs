@@ -121,8 +121,9 @@ pub(super) fn validate(ir_module: &IrModule) -> Result<(), CompileError> {
                     | Op::FGt(..)
                     | Op::FLe(..)
                     | Op::FGe(..)
-                    // String comparison:
-                    | Op::StringEq(..)
+                    // String comparison (`StringEq` *is* lowered — it
+                    // backs adjacently-tagged enum decode — so it is
+                    // absent here; the rest stay deferred):
                     | Op::StringNe(..)
                     | Op::StringLt(..)
                     | Op::StringGt(..)

@@ -18,6 +18,21 @@ through the `?` operator, into the call's return type. Until it lands,
 requires an explicit type argument"). **Target:** a Phase 4.6 follow-up.
 Surfaced 2026-07-13 implementing struct decode (Phase 4.6 J4b).
 
+### Nested `Option` JSON round-trips are lossy: `Some(None)` → `None`
+
+`json.encode` maps both `None` and `Some(None)` of an `Option<Option<T>>` to
+the same JSON `null` (the inner `None` encodes as `null`, and `Some(x)`
+encodes as `encode(x)` with no wrapper), so `json.decode` cannot distinguish
+them and always returns the outer `None`. Every other shape round-trips
+exactly. This matches what `serde_json` does for `Option<Option<T>>` without
+a custom representation, and nested Options are rare in wire types — but it
+is silent data loss for that one value. A fix needs a wrapper representation
+for `Some` (e.g. one-element array or a tagged object), which is a wire-format
+design decision; rejecting `Option<Option<T>>` in the sema gate remains a
+fallback if a representation is never chosen. **Target:** revisit when the
+Phase 4.6 decode surface is complete. Surfaced 2026-07-13 implementing
+`Option`/enum decode.
+
 ### The dependency cache has no inter-process locking
 
 The git dependency cache (`$PHOENIX_HOME/cache`) is mutated without an OS file

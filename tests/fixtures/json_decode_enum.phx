@@ -1,0 +1,272 @@
+// json.decode<Enum> and json.decode<Option<T>>: decode adjacently-tagged
+// enums ({"type":"V"} / {"type":"V","value":[…]}) and Options (null → None,
+// else decode T → Some). Covers unit + with-field variants, a variant with
+// non-scalar payloads (nested struct + Option), a variant carrying *another
+// enum* (enum-in-enum), a *self-recursive* enum (the `Tree` cycle — sema's
+// cycle guard, the interpreter's seeding walk, and the IR demand walk's
+// stub pre-registration, with recursion that actually terminates at a
+// `Leaf`), the reverse composition (a struct with enum and Option fields —
+// including an *absent* Option field decoding to None, absent ≡ null), a
+// top-level Option of a composite (Option<Point>), nested Option — pinning
+// the documented lossy Some(None) round-trip (see known-issues.md) —
+// leniency toward extra "value" elements and a stray "value" on a unit
+// variant, and the error paths: unknown variant / missing "type" /
+// non-string "type" / missing "value" / wrong-kind "value" / too-few
+// elements / non-object → the right JsonError. `{{`/`}}` are the string-interpolation escapes for literal
+// JSON braces; string building uses `+` to avoid the known
+// interpolation-span issue for field access.
+
+import json
+
+struct Point {
+  x: Int
+  y: Int
+}
+
+// A second enum, carried as a `Status` variant payload: the `Status`
+// decoder dispatches to the `Priority` enum decoder (enum-in-enum).
+enum Priority {
+  Low
+  High(Int)
+}
+
+enum Status {
+  Active
+  Pending(Int)
+  Closed(String, Int)
+  Located(Point, Option<Int>)
+  Escalated(Priority)
+}
+
+// A self-recursive enum: `Node` carries the enum itself, so its decoder
+// calls itself through the pre-registered stub. Unlike the struct-cycle
+// fixture (`json_decode_recursive.phx`), the `Leaf` variant terminates the
+// recursion, so a decode can *succeed*, not just err.
+enum Tree {
+  Leaf(Int)
+  Node(Int, Tree)
+}
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function showOpt(o: Option<Int>) -> String {
+  match o {
+    Some(n) -> toString(n)
+    None -> "none"
+  }
+}
+
+function showOptPoint(o: Option<Point>) -> String {
+  match o {
+    Some(p) -> "Point(" + toString(p.x) + "," + toString(p.y) + ")"
+    None -> "none"
+  }
+}
+
+function showOptOpt(o: Option<Option<Int>>) -> String {
+  match o {
+    Some(i) -> "some(" + showOpt(i) + ")"
+    None -> "none"
+  }
+}
+
+function showPriority(p: Priority) -> String {
+  match p {
+    Low -> "Low"
+    High(n) -> "High(" + toString(n) + ")"
+  }
+}
+
+function showStatus(s: Status) -> String {
+  match s {
+    Active -> "Active"
+    Pending(n) -> "Pending(" + toString(n) + ")"
+    Closed(m, n) -> "Closed(" + m + "," + toString(n) + ")"
+    Located(p, o) ->
+      "Located(" + toString(p.x) + "," + toString(p.y) + "," + showOpt(o) + ")"
+    Escalated(p) -> "Escalated(" + showPriority(p) + ")"
+  }
+}
+
+function showStatusResult(r: Result<Status, JsonError>) -> String {
+  match r {
+    Ok(s) -> showStatus(s)
+    Err(e) -> describe(e)
+  }
+}
+
+function showTree(t: Tree) -> String {
+  match t {
+    Leaf(n) -> "Leaf(" + toString(n) + ")"
+    Node(n, rest) -> "Node(" + toString(n) + "," + showTree(rest) + ")"
+  }
+}
+
+function showTreeResult(r: Result<Tree, JsonError>) -> String {
+  match r {
+    Ok(t) -> showTree(t)
+    Err(e) -> describe(e)
+  }
+}
+
+// The reverse composition of `Located`: a struct whose fields are an enum
+// and an Option — exercises the struct decoder dispatching to the enum and
+// Option node decoders, and the absent-Option-field → None path.
+struct Task {
+  status: Status
+  note: Option<Int>
+}
+
+function showTaskResult(r: Result<Task, JsonError>) -> String {
+  match r {
+    Ok(t) -> "Task(" + showStatus(t.status) + "," + showOpt(t.note) + ")"
+    Err(e) -> describe(e)
+  }
+}
+
+function main() {
+  // Unit variant.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Active\"}}")))
+
+  // Single-field variant.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Pending\",\"value\":[3]}}")))
+
+  // Two-field variant.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Closed\",\"value\":[\"done\",7]}}")))
+
+  // Variant with a nested struct + Some(Option) payload.
+  print(showStatusResult(
+    json.decode<Status>("{{\"type\":\"Located\",\"value\":[{{\"x\":1,\"y\":2}},7]}}")))
+
+  // Same variant with a null Option payload → None.
+  print(showStatusResult(
+    json.decode<Status>("{{\"type\":\"Located\",\"value\":[{{\"x\":4,\"y\":5}},null]}}")))
+
+  // Enum-in-enum: the payload is itself an adjacently-tagged enum, so the
+  // Status decoder dispatches to the Priority enum decoder.
+  print(showStatusResult(
+    json.decode<Status>("{{\"type\":\"Escalated\",\"value\":[{{\"type\":\"High\",\"value\":[2]}}]}}")))
+  print(showStatusResult(
+    json.decode<Status>("{{\"type\":\"Escalated\",\"value\":[{{\"type\":\"Low\"}}]}}")))
+
+  // The nested enum's decode error propagates as the outer enum's error.
+  print(showStatusResult(
+    json.decode<Status>("{{\"type\":\"Escalated\",\"value\":[{{\"type\":\"Rush\"}}]}}")))
+
+  // Unknown extra keys are ignored (lenient).
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Pending\",\"value\":[8],\"z\":0}}")))
+
+  // A stray "value" on a *unit* variant is ignored too (the decoder never
+  // reads "value" for a field-less variant).
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Active\",\"value\":[9]}}")))
+
+  // Self-recursive enum: two laps of recursion, terminated by a Leaf.
+  print(showTreeResult(json.decode<Tree>(
+    "{{\"type\":\"Node\",\"value\":[1,{{\"type\":\"Node\",\"value\":[2,{{\"type\":\"Leaf\",\"value\":[3]}}]}}]}}")))
+
+  // An error deep in the recursion propagates out unchanged.
+  print(showTreeResult(json.decode<Tree>(
+    "{{\"type\":\"Node\",\"value\":[1,{{\"type\":\"Twig\"}}]}}")))
+
+  // Round-trip over the recursive shape.
+  print(showTreeResult(json.decode<Tree>(json.encode(Node(4, Leaf(5))))))
+
+  // Unknown variant name.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Bogus\"}}")))
+
+  // Missing "type" discriminator.
+  print(showStatusResult(json.decode<Status>("{{\"value\":[1]}}")))
+
+  // "type" is not a string.
+  print(showStatusResult(json.decode<Status>("{{\"type\":5}}")))
+
+  // A with-field variant missing its "value" array.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Pending\"}}")))
+
+  // "value" is not an array.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Pending\",\"value\":5}}")))
+
+  // Too few elements in "value".
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Closed\",\"value\":[\"x\"]}}")))
+
+  // Extra elements in "value" are ignored (lenient, like unknown keys).
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Pending\",\"value\":[8,9]}}")))
+
+  // An element of the wrong kind — the field decoder's error propagates.
+  print(showStatusResult(json.decode<Status>("{{\"type\":\"Pending\",\"value\":[\"no\"]}}")))
+
+  // Not an object at all.
+  print(showStatusResult(json.decode<Status>("[1, 2]")))
+
+  // Malformed JSON → ParseError.
+  print(showStatusResult(json.decode<Status>("nope")))
+
+  // Direct Option<T> decode: null → None, a value → Some.
+  let a: Result<Option<Int>, JsonError> = json.decode<Option<Int>>("null")
+  match a { Ok(o) -> print(showOpt(o)) Err(e) -> print(describe(e)) }
+  let b: Result<Option<Int>, JsonError> = json.decode<Option<Int>>("42")
+  match b { Ok(o) -> print(showOpt(o)) Err(e) -> print(describe(e)) }
+  let c: Result<Option<Int>, JsonError> = json.decode<Option<Int>>("\"no\"")
+  match c { Ok(o) -> print(showOpt(o)) Err(e) -> print(describe(e)) }
+
+  // Direct Option of a *composite*: the Option node decoder dispatches to
+  // the struct decoder at the root (Some / None / inner-error propagation).
+  let d: Result<Option<Point>, JsonError> = json.decode<Option<Point>>("{{\"x\":1,\"y\":2}}")
+  match d { Ok(o) -> print(showOptPoint(o)) Err(e) -> print(describe(e)) }
+  let g: Result<Option<Point>, JsonError> = json.decode<Option<Point>>("null")
+  match g { Ok(o) -> print(showOptPoint(o)) Err(e) -> print(describe(e)) }
+  let h: Result<Option<Point>, JsonError> = json.decode<Option<Point>>("5")
+  match h { Ok(o) -> print(showOptPoint(o)) Err(e) -> print(describe(e)) }
+
+  // Nested Option: null → the *outer* None; a value → Some(Some(v)).
+  let i: Result<Option<Option<Int>>, JsonError> = json.decode<Option<Option<Int>>>("null")
+  match i { Ok(o) -> print(showOptOpt(o)) Err(e) -> print(describe(e)) }
+  let j: Result<Option<Option<Int>>, JsonError> = json.decode<Option<Option<Int>>>("7")
+  match j { Ok(o) -> print(showOptOpt(o)) Err(e) -> print(describe(e)) }
+
+  // KNOWN-ISSUE pin (known-issues.md, "Nested `Option` JSON round-trips are
+  // lossy"): Some(None) encodes as null, so it round-trips to the outer
+  // None — not back to Some(None). Update this expectation when a wrapper
+  // representation for `Some` lands.
+  let innerNone: Option<Int> = None
+  let someNone: Option<Option<Int>> = Some(innerNone)
+  let k: Result<Option<Option<Int>>, JsonError> =
+    json.decode<Option<Option<Int>>>(json.encode(someNone))
+  match k { Ok(o) -> print(showOptOpt(o)) Err(e) -> print(describe(e)) }
+
+  // A struct with an enum field and an Option field, both present.
+  print(showTaskResult(json.decode<Task>(
+    "{{\"status\":{{\"type\":\"Pending\",\"value\":[1]}},\"note\":9}}")))
+
+  // The Option field explicitly null → None.
+  print(showTaskResult(json.decode<Task>(
+    "{{\"status\":{{\"type\":\"Active\"}},\"note\":null}}")))
+
+  // The Option field *absent* → None too (absent ≡ null).
+  print(showTaskResult(json.decode<Task>("{{\"status\":{{\"type\":\"Active\"}}}}")))
+
+  // An absent non-Option field is still an error.
+  print(showTaskResult(json.decode<Task>("{{\"note\":3}}")))
+
+  // An enum field's decode error propagates as the struct's error.
+  print(showTaskResult(json.decode<Task>("{{\"status\":{{\"type\":\"Nope\"}},\"note\":3}}")))
+
+  // Struct round-trips, including None (encoded as null) and Some.
+  print(showTaskResult(json.decode<Task>(json.encode(Task(Closed("c", 3), None)))))
+  print(showTaskResult(json.decode<Task>(json.encode(Task(Active, Some(4))))))
+
+  // Round-trip: decode(encode(s)) reproduces every variant shape — pins the
+  // synthesized encoder and decoder against each other on every backend.
+  print(showStatusResult(json.decode<Status>(json.encode(Active))))
+  print(showStatusResult(json.decode<Status>(json.encode(Pending(11)))))
+  print(showStatusResult(json.decode<Status>(json.encode(Closed("z", 2)))))
+  print(showStatusResult(json.decode<Status>(json.encode(Located(Point(6, 7), Some(9))))))
+  print(showStatusResult(json.decode<Status>(json.encode(Escalated(High(3))))))
+  print(showStatusResult(json.decode<Status>(json.encode(Escalated(Low)))))
+}

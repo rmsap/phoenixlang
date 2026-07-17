@@ -255,6 +255,16 @@ fn translate_builtin(
                 &[h],
             ))
         }
+        "json.arrayGet" => {
+            let h = get_val1(state, args[0])?;
+            let idx = get_val1(state, args[1])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_array_get,
+                &[h, idx],
+            ))
+        }
         // String methods.
         _ if name.starts_with("String.") => translate_string_method(
             builder,

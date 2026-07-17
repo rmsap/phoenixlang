@@ -1,7 +1,7 @@
 use crate::check_types::UnifyError;
 use crate::checker::{Checker, FunctionInfo};
 use crate::module_scope::{IntrinsicNs, NamespaceTarget};
-use crate::types::Type;
+use crate::types::{OPTION_ENUM, Type};
 use phoenix_common::module_path::{ModulePath, module_qualify};
 use phoenix_common::span::Span;
 use phoenix_parser::ast::{CallExpr, Expr, MethodCallExpr, StructLiteralExpr, Visibility};
@@ -766,8 +766,9 @@ impl Checker {
             self.error(
                 format!(
                     "`json.decode` does not support `{unsupported}` yet — \
-                     supported today: Int, Float, Bool, String, and non-generic \
-                     structs of supported types (more land in later Phase 4.6 slices)"
+                     supported today: Int, Float, Bool, String, `Option<T>`, and \
+                     non-generic structs and enums of supported types (List and Map \
+                     land in later Phase 4.6 slices)"
                 ),
                 mc.span,
             );
@@ -790,12 +791,13 @@ impl Checker {
     }
 
     /// Returns the name of the first JSON-undecodable type reachable from
-    /// `ty` (recursing through struct fields), or `None` when `ty` is
-    /// decodable with today's surface: the scalars plus non-generic structs
-    /// of decodable field types. `Option`, enums, `List`, and `Map` are
-    /// added by later slices. `visiting` holds the names of the structs
-    /// currently being walked so a self-referential struct can't recurse
-    /// forever, mirroring the encode-side gate.
+    /// `ty` (recursing through struct fields, enum variant fields, and
+    /// `Option`'s inner type), or `None` when `ty` is decodable with today's
+    /// surface: the scalars, `Option<T>`, and non-generic structs and enums
+    /// of decodable field types. `List` and `Map` are added by later slices.
+    /// `visiting` holds the names of the structs/enums currently being walked
+    /// so a self-referential type can't recurse forever, mirroring the
+    /// encode-side gate.
     fn unsupported_json_decode_type(
         &self,
         ty: &Type,
@@ -803,32 +805,48 @@ impl Checker {
     ) -> Option<String> {
         match ty {
             Type::Int | Type::Float | Type::Bool | Type::String => None,
+            // `Option<T>` decodes when `T` does (null → None, else Some(x)).
+            Type::Generic(name, args) if name == OPTION_ENUM && args.len() == 1 => {
+                self.unsupported_json_decode_type(&args[0], visiting)
+            }
             Type::Named(name) => {
                 // Resolved `Type::Named` names are already canonical — bare
                 // for an entry-module type, module-qualified for an imported
                 // one (see `resolve_type_expr`) — so the spelling here is
-                // both the cycle-guard identity and the diagnostic spelling,
-                // exactly as in the encode-side gate. The qualifier keeps
-                // same-named types from different modules distinguishable.
+                // both the cycle-guard identity and the diagnostic spelling.
                 if visiting.iter().any(|n| n == name) {
-                    return None; // break struct cycles
+                    return None; // break cycles
                 }
                 // A non-generic struct: every field must be decodable.
-                let Some(info) = self.lookup_struct(name) else {
-                    return Some(name.clone());
-                };
-                if !info.type_params.is_empty() {
-                    return Some(name.clone());
+                if let Some(info) = self.lookup_struct(name) {
+                    if !info.type_params.is_empty() {
+                        return Some(name.clone());
+                    }
+                    visiting.push(name.clone());
+                    let r = info
+                        .fields
+                        .iter()
+                        .find_map(|f| self.unsupported_json_decode_type(&f.ty, visiting));
+                    visiting.pop();
+                    return r;
                 }
-                visiting.push(name.clone());
-                let result = info
-                    .fields
-                    .iter()
-                    .find_map(|f| self.unsupported_json_decode_type(&f.ty, visiting));
-                visiting.pop();
-                result
+                // A non-generic enum: every variant's field types must decode.
+                if let Some(info) = self.lookup_enum(name) {
+                    if !info.type_params.is_empty() {
+                        return Some(name.clone());
+                    }
+                    visiting.push(name.clone());
+                    let r = info
+                        .variants
+                        .iter()
+                        .flat_map(|(_, fts)| fts.iter())
+                        .find_map(|t| self.unsupported_json_decode_type(t, visiting));
+                    visiting.pop();
+                    return r;
+                }
+                Some(name.clone())
             }
-            other => Some(other.to_string()),
+            other => Some(canonical_type_spelling(other)),
         }
     }
 
@@ -894,7 +912,7 @@ impl Checker {
             // `Option<T>` is encodable when `T` is (None → null, Some(x) →
             // encode(x)). Other generic instantiations (`Result<…>`, generic
             // user enums) are deferred.
-            Type::Generic(name, args) if name == "Option" && args.len() == 1 => {
+            Type::Generic(name, args) if name == OPTION_ENUM && args.len() == 1 => {
                 self.unsupported_json_encode_type(&args[0], visiting)
             }
             // `List<T>` → array; encodable when `T` is.
@@ -952,7 +970,7 @@ impl Checker {
                 }
                 Some(name.clone())
             }
-            other => Some(other.to_string()),
+            other => Some(canonical_type_spelling(other)),
         }
     }
 
@@ -1658,5 +1676,24 @@ impl Checker {
             );
         }
         Type::Error
+    }
+}
+
+/// Spell `ty` for a JSON-gate diagnostic with *canonical* names throughout:
+/// unlike `Display` (which strips module qualifiers for readability in
+/// ordinary type errors), a rejected generic keeps its possibly-qualified
+/// base name — `models::Wrapper<Int>`, not `Wrapper<Int>` — so same-named
+/// types from different modules stay distinguishable, matching the gates'
+/// `Type::Named` arms (which return the canonical name directly). Builtin
+/// generics (`List`, `Map`, `Result`) are unaffected: their canonical names
+/// are already bare.
+fn canonical_type_spelling(ty: &Type) -> String {
+    match ty {
+        Type::Named(name) => name.clone(),
+        Type::Generic(name, args) => {
+            let args: Vec<String> = args.iter().map(canonical_type_spelling).collect();
+            format!("{name}<{}>", args.join(", "))
+        }
+        other => other.to_string(),
     }
 }

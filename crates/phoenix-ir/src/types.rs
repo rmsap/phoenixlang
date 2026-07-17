@@ -11,8 +11,9 @@ use std::fmt;
 /// via type inference or monomorphization.
 pub const GENERIC_PLACEHOLDER: &str = "__generic";
 
-/// The name of the built-in `Option` enum in the IR.
-pub const OPTION_ENUM: &str = "Option";
+/// The name of the built-in `Option` enum in the IR — assigned from sema's
+/// canonical spelling so the two layers cannot drift.
+pub const OPTION_ENUM: &str = phoenix_sema::types::OPTION_ENUM;
 /// The name of the built-in `Result` enum in the IR.
 pub const RESULT_ENUM: &str = "Result";
 /// The name of the built-in `JsonError` enum in the IR.

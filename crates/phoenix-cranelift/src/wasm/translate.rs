@@ -1598,6 +1598,20 @@ fn translate_instruction(
             emit_sret_string_call(ctx, b, runtime_idx, &[*lhs, *rhs], vid)?;
         }
 
+        // `Op::StringEq(a, b)` lowers to `phx_str_eq(a_ptr, a_len, b_ptr,
+        // b_len) -> i32` (0/1) — a plain scalar-returning runtime call (no
+        // sret), same shape as `json.getField`. This is the one string
+        // comparison the linear backend lowers: the synthesized enum decoder
+        // dispatches on the `"type"` tag by comparing it to each variant name.
+        Op::StringEq(lhs, rhs) => {
+            let vid = expect_result(instr, "Op::StringEq")?;
+            ctx.emit_load_all(*lhs)?; // (ptr, len)
+            ctx.emit_load_all(*rhs)?; // (ptr, len)
+            let idx = b.require_phx_func("phx_str_eq")?;
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, IrType::Bool)?;
+        }
+
         // --- Struct alloc + field access --------------------------------
         //
         // User struct values lower to GC-heap allocations via

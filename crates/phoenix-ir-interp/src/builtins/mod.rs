@@ -138,6 +138,29 @@ fn builtin_json(
             }
             _ => error("json.getField expects (handle, key)".to_string()),
         },
+        "arrayGet" => match args.as_slice() {
+            // Index an array node, cloning the element into its own arena entry
+            // (same borrow-release pattern as `getField`). Out of range or a
+            // non-array node → the missing sentinel (`-1`), tested by
+            // `isMissing`; a failed-parse root is an IR-synthesis bug.
+            [IrValue::Int(h), IrValue::Int(idx)] => {
+                let elem = match interp.json_arena.get(*h as usize) {
+                    Some(JsonRoot(Ok(v))) => v.get(*idx as usize).cloned(),
+                    Some(JsonRoot(Err(_))) => {
+                        return error("json.arrayGet: handle is a failed-parse root".to_string());
+                    }
+                    None => return error("json.arrayGet: invalid JSON handle".to_string()),
+                };
+                match elem {
+                    Some(c) => {
+                        interp.json_arena.push(JsonRoot(Ok(c)));
+                        Ok(IrValue::Int((interp.json_arena.len() - 1) as i64))
+                    }
+                    None => Ok(IrValue::Int(-1)),
+                }
+            }
+            _ => error("json.arrayGet expects (handle, index)".to_string()),
+        },
         "isMissing" => match args.as_slice() {
             [IrValue::Int(h)] => Ok(IrValue::Bool(*h == -1)),
             _ => error("json.isMissing expects a single handle argument".to_string()),

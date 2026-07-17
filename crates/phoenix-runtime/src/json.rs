@@ -159,6 +159,20 @@ pub unsafe extern "C" fn phx_json_is_missing(handle: i64) -> i8 {
     (handle == 0) as i8
 }
 
+/// Index an array node, returning the element handle (or `0`/"missing" when
+/// `handle` is not an array or `index` is out of bounds — tested by
+/// [`phx_json_is_missing`]).
+///
+/// # Safety
+/// `handle` must be a live node handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_array_get(handle: i64, index: i64) -> i64 {
+    match unsafe { node(handle) }.get(index as usize) {
+        Some(elem) => elem as *const Value as i64,
+        None => 0,
+    }
+}
+
 /// Extract a node as an `i64` (caller has confirmed kind `INT`).
 ///
 /// # Safety

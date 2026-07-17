@@ -216,6 +216,16 @@ backend_matrix_test!(
     "json_decode_recursive.phx",
     skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
 );
+// Adjacently-tagged enum decode + `Option<T>` decode: unit and
+// with-field variants, a variant carrying a nested struct + Option, a
+// self-recursive enum (terminating recursion, unlike the struct-cycle
+// fixture), the discriminator/`value` error paths, and encode∘decode
+// round-trips. wasm32-gc skipped (serde_json DOM deferral).
+backend_matrix_test!(
+    matrix_json_decode_enum,
+    "json_decode_enum.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

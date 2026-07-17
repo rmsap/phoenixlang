@@ -337,6 +337,16 @@ fn translate_json_decode_builtin(
             Ok(())
         }
         "isMissing" => scalar(ctx, b, "phx_json_is_missing", IrType::Bool),
+        "arrayGet" => {
+            // (handle: i64, index: i64) -> i64.
+            let vid = expect_result(instr, "json.arrayGet")?;
+            ctx.emit_load_all(args[0])?; // handle
+            ctx.emit_load_all(args[1])?; // index
+            let idx = b.require_phx_func("phx_json_array_get")?;
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, IrType::I64)?;
+            Ok(())
+        }
         other => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"json.{other}\")` not supported"
         ))),
