@@ -347,6 +347,7 @@ fn translate_json_decode_builtin(
             ctx.emit_store_result(vid, IrType::I64)?;
             Ok(())
         }
+        "arrayLen" => scalar(ctx, b, "phx_json_array_len", IrType::I64),
         other => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"json.{other}\")` not supported"
         ))),

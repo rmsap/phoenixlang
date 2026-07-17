@@ -22,6 +22,18 @@ fn json_error_value(variant: &str, msg: &str) -> Value {
     )
 }
 
+/// Unwrap a decoded `Result<T, JsonError>` runtime value: `Ok(v)` yields the
+/// payload; anything else (an `Err(JsonError)`) comes back as `Err` for the
+/// caller to propagate unchanged.
+fn unwrap_decoded(decoded: Value) -> std::result::Result<Value, Value> {
+    match decoded {
+        Value::EnumVariant(_, ref v, inner) if v == "Ok" => {
+            Ok(inner.into_iter().next().unwrap_or(Value::Void))
+        }
+        other => Err(other),
+    }
+}
+
 impl Interpreter {
     /// Recursively encode a runtime value to a JSON string.
     ///
@@ -127,8 +139,8 @@ impl Interpreter {
     }
 
     /// Build a `Result<T, JsonError>` from a parsed DOM node and target type:
-    /// scalars, `Option<T>`, and non-generic structs and enums (the composite
-    /// shapes each dispatch to their own helper).
+    /// scalars, `Option<T>`, `List<T>`, and non-generic structs and enums (the
+    /// composite shapes each dispatch to their own helper).
     fn json_decode_value(
         &self,
         dom: &serde_json::Value,
@@ -159,12 +171,25 @@ impl Interpreter {
                 if dom.is_null() {
                     return Ok(ok_val(none_val()));
                 }
-                match self.json_decode_value(dom, &args[0])? {
-                    Value::EnumVariant(_, ref v, inner) if v == "Ok" => Ok(ok_val(some_val(
-                        inner.into_iter().next().unwrap_or(Value::Void),
-                    ))),
-                    other => Ok(other), // Err(JsonError) propagates.
+                match unwrap_decoded(self.json_decode_value(dom, &args[0])?) {
+                    Ok(v) => Ok(ok_val(some_val(v))),
+                    Err(other) => Ok(other), // Err(JsonError) propagates.
                 }
+            }
+            // `List<T>`: require a JSON array, decode each element (a decode
+            // error propagates), then build the list.
+            Type::Generic(name, args) if name == "List" && args.len() == 1 => {
+                let Some(arr) = dom.as_array() else {
+                    return mismatch("expected array");
+                };
+                let mut elems = Vec::with_capacity(arr.len());
+                for elem in arr {
+                    match unwrap_decoded(self.json_decode_value(elem, &args[0])?) {
+                        Ok(v) => elems.push(v),
+                        Err(other) => return Ok(other), // Err(JsonError) propagates.
+                    }
+                }
+                Ok(ok_val(Value::List(elems)))
             }
             // A non-generic struct or enum: require an object and build it.
             Type::Named(name) => {
@@ -217,14 +242,11 @@ impl Interpreter {
                 }
                 return Ok(err_val(json_error_value("MissingField", fname)));
             };
-            match self.json_decode_value(child, fty)? {
-                Value::EnumVariant(_, ref v, inner) if v == "Ok" => {
-                    field_values.insert(
-                        fname.clone(),
-                        inner.into_iter().next().unwrap_or(Value::Void),
-                    );
+            match unwrap_decoded(self.json_decode_value(child, fty)?) {
+                Ok(v) => {
+                    field_values.insert(fname.clone(), v);
                 }
-                other => return Ok(other), // Err(JsonError) propagates.
+                Err(other) => return Ok(other), // Err(JsonError) propagates.
             }
         }
         Ok(ok_val(Value::Struct(struct_name.to_string(), field_values)))
@@ -270,11 +292,9 @@ impl Interpreter {
             let Some(elem) = arr.get(i) else {
                 return mismatch("too few elements in \"value\" array");
             };
-            match self.json_decode_value(elem, fty)? {
-                Value::EnumVariant(_, ref v, inner) if v == "Ok" => {
-                    field_vals.push(inner.into_iter().next().unwrap_or(Value::Void));
-                }
-                other => return Ok(other), // Err(JsonError) propagates.
+            match unwrap_decoded(self.json_decode_value(elem, fty)?) {
+                Ok(v) => field_vals.push(v),
+                Err(other) => return Ok(other), // Err(JsonError) propagates.
             }
         }
         Ok(ok_val(Value::EnumVariant(

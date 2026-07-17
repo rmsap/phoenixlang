@@ -766,9 +766,9 @@ impl Checker {
             self.error(
                 format!(
                     "`json.decode` does not support `{unsupported}` yet — \
-                     supported today: Int, Float, Bool, String, `Option<T>`, and \
-                     non-generic structs and enums of supported types (List and Map \
-                     land in later Phase 4.6 slices)"
+                     supported today: Int, Float, Bool, String, `Option<T>`, `List<T>`, \
+                     and non-generic structs and enums of supported types (Map lands in \
+                     a later Phase 4.6 slice)"
                 ),
                 mc.span,
             );
@@ -791,13 +791,13 @@ impl Checker {
     }
 
     /// Returns the name of the first JSON-undecodable type reachable from
-    /// `ty` (recursing through struct fields, enum variant fields, and
-    /// `Option`'s inner type), or `None` when `ty` is decodable with today's
-    /// surface: the scalars, `Option<T>`, and non-generic structs and enums
-    /// of decodable field types. `List` and `Map` are added by later slices.
-    /// `visiting` holds the names of the structs/enums currently being walked
-    /// so a self-referential type can't recurse forever, mirroring the
-    /// encode-side gate.
+    /// `ty` (recursing through struct fields, enum variant fields, and the
+    /// inner type of `Option`/`List`), or `None` when `ty` is decodable with
+    /// today's surface: the scalars, `Option<T>`, `List<T>`, and non-generic
+    /// structs and enums of decodable component types. `Map` is added by a
+    /// later slice. `visiting` holds the names of the structs/enums currently
+    /// being walked so a self-referential type can't recurse forever,
+    /// mirroring the encode-side gate.
     fn unsupported_json_decode_type(
         &self,
         ty: &Type,
@@ -807,6 +807,10 @@ impl Checker {
             Type::Int | Type::Float | Type::Bool | Type::String => None,
             // `Option<T>` decodes when `T` does (null → None, else Some(x)).
             Type::Generic(name, args) if name == OPTION_ENUM && args.len() == 1 => {
+                self.unsupported_json_decode_type(&args[0], visiting)
+            }
+            // `List<T>` decodes from a JSON array when `T` does.
+            Type::Generic(name, args) if name == "List" && args.len() == 1 => {
                 self.unsupported_json_decode_type(&args[0], visiting)
             }
             Type::Named(name) => {

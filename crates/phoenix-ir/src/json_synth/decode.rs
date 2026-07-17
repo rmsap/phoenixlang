@@ -4,10 +4,10 @@
 //! and — for the call-site types only — a parse-wrapper *entry*
 //! `__json_decode_entry_<key>(s: String) -> Result<T, JsonError>`.
 //!
-//! Covered so far: scalars (`Int`/`Float`/`Bool`/`String`), `Option<T>`, and
-//! non-generic structs and enums (adjacently tagged: `{"type":"V"}` /
-//! `{"type":"V","value":[…]}`); sema's `unsupported_json_decode_type` gate
-//! rejects the rest before it reaches here.
+//! Covered so far: scalars (`Int`/`Float`/`Bool`/`String`), `Option<T>`,
+//! `List<T>`, and non-generic structs and enums (adjacently tagged:
+//! `{"type":"V"}` / `{"type":"V","value":[…]}`); sema's
+//! `unsupported_json_decode_type` gate rejects the rest before it reaches here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,7 +24,7 @@ use crate::instruction::{FuncId, Op, ValueId};
 use crate::lower::LoweringContext;
 use crate::module::IrFunction;
 use crate::terminator::Terminator;
-use crate::types::{IrType, OPTION_ENUM};
+use crate::types::{IrType, LIST_TYPE, OPTION_ENUM};
 
 // Node-kind tags mirror `phoenix_runtime::json::JSON_KIND_*` — the runtime
 // is the ABI source of truth. Mirroring (rather than importing) keeps this
@@ -66,8 +66,10 @@ pub(crate) fn synthesize_json_decoders(ctx: &mut LoweringContext<'_>) {
             continue;
         }
         match &ty {
-            // `Option<T>` → decode `T`.
-            Type::Generic(name, args) if name == OPTION_ENUM && args.len() == 1 => {
+            // `Option<T>` / `List<T>` → decode `T`.
+            Type::Generic(name, args)
+                if (name == OPTION_ENUM || name == LIST_TYPE) && args.len() == 1 =>
+            {
                 queue.push(args[0].clone());
             }
             Type::Named(name) => {
@@ -227,14 +229,14 @@ fn build_decode_entry(ctx: &mut LoweringContext<'_>, ty: &Type, entry: FuncId, n
     });
 }
 
-/// Build a per-type node decoder body: scalars, `Option<T>`, and non-generic
-/// structs and enums. `node_ids` maps a type key to its node decoder, so an
-/// aggregate decoder can call its field/variant/element decoders;
-/// `struct_fields` is the demand walk's field snapshot for a struct target
-/// (`None` for a non-struct). Both borrow caller-local maps, so the emit
-/// closure captures them as-is; only an enum target's variants need an owned
-/// snapshot up front (the lookup borrows `ctx.check`, and the closure needs
-/// `ctx` mutably).
+/// Build a per-type node decoder body: scalars, `Option<T>`, `List<T>`, and
+/// non-generic structs and enums. `node_ids` maps a type key to its node
+/// decoder, so an aggregate decoder can call its field/variant/element
+/// decoders; `struct_fields` is the demand walk's field snapshot for a
+/// struct target (`None` for a non-struct). Both borrow caller-local maps,
+/// so the emit closure captures them as-is; only an enum target's variants
+/// need an owned snapshot up front (the lookup borrows `ctx.check`, and the
+/// closure needs `ctx` mutably).
 fn build_node_decoder(
     ctx: &mut LoweringContext<'_>,
     ty: &Type,
@@ -265,6 +267,11 @@ fn build_node_decoder(
             && args.len() == 1
         {
             emit_option_decode(ctx, &args[0], node, &result_ty, node_ids)
+        } else if let Type::Generic(name, args) = ty
+            && name == LIST_TYPE
+            && args.len() == 1
+        {
+            emit_list_decode(ctx, &args[0], node, &result_ty, node_ids)
         } else {
             emit_scalar_decode(ctx, ty, node, &result_ty)
         };
@@ -334,6 +341,137 @@ fn emit_option_decode(
     ctx.terminate(Terminator::Jump {
         target: merge,
         args: vec![ok_some],
+    });
+
+    ctx.switch_to_block(merge);
+    result
+}
+
+/// Emit a `List<T>` decoder: require a JSON array, decode each element into a
+/// `ListBuilder<T>` (a `T` decode error propagates), then freeze it into the
+/// list. The builder is threaded through the loop as a block param so it stays
+/// GC-rooted across iterations (the same discipline the encode accumulator
+/// uses). Leaves the context in the merge block; returns its parameter.
+fn emit_list_decode(
+    ctx: &mut LoweringContext<'_>,
+    elem: &Type,
+    node: ValueId,
+    result_ty: &IrType,
+    node_ids: &BTreeMap<String, FuncId>,
+) -> ValueId {
+    let elem_ir = ctx.lower_type(elem);
+    // The list type is the `Ok` payload of `Result<List<T>, JsonError>`.
+    let list_ir = match result_ty {
+        IrType::EnumRef(_, args) => args[0].clone(),
+        other => unreachable!("List decode: unexpected result type {other:?}"),
+    };
+    let builder_ir = IrType::ListBuilderRef(Box::new(elem_ir));
+
+    let merge = ctx.create_block();
+    let result = ctx.add_block_param(merge, result_ty.clone());
+
+    // Require a JSON array.
+    let kind = ctx.emit(
+        Op::BuiltinCall("json.kind".to_string(), vec![node]),
+        IrType::I64,
+        None,
+    );
+    let arr_kind = ctx.emit(Op::ConstI64(KIND_ARRAY), IrType::I64, None);
+    let is_arr = ctx.emit(Op::IEq(kind, arr_kind), IrType::Bool, None);
+    let arr_blk = ctx.create_block();
+    let not_arr = ctx.create_block();
+    ctx.terminate(Terminator::Branch {
+        condition: is_arr,
+        true_block: arr_blk,
+        true_args: Vec::new(),
+        false_block: not_arr,
+        false_args: Vec::new(),
+    });
+    ctx.switch_to_block(not_arr);
+    let m = ctx.emit(
+        Op::ConstString("expected array".to_string()),
+        IrType::StringRef,
+        None,
+    );
+    let je = emit_json_error(ctx, "TypeMismatch", m);
+    let err = emit_result_err(ctx, result_ty, je);
+    ctx.terminate(Terminator::Jump {
+        target: merge,
+        args: vec![err],
+    });
+
+    // Iterate `0..len`, decoding each element into a fresh `ListBuilder`.
+    ctx.switch_to_block(arr_blk);
+    let len = ctx.emit(
+        Op::BuiltinCall("json.arrayLen".to_string(), vec![node]),
+        IrType::I64,
+        None,
+    );
+    let builder = ctx.emit(
+        Op::BuiltinCall("ListBuilder.alloc".to_string(), Vec::new()),
+        builder_ir.clone(),
+        None,
+    );
+    let zero = ctx.emit(Op::ConstI64(0), IrType::I64, None);
+    let one = ctx.emit(Op::ConstI64(1), IrType::I64, None);
+
+    let header = ctx.create_block();
+    let body = ctx.create_block();
+    let freeze_blk = ctx.create_block();
+    let h_i = ctx.add_block_param(header, IrType::I64);
+    let h_b = ctx.add_block_param(header, builder_ir.clone());
+    let b_i = ctx.add_block_param(body, IrType::I64);
+    let b_b = ctx.add_block_param(body, builder_ir.clone());
+    let f_b = ctx.add_block_param(freeze_blk, builder_ir);
+    ctx.terminate(Terminator::Jump {
+        target: header,
+        args: vec![zero, builder],
+    });
+
+    // Header: while i < len.
+    ctx.switch_to_block(header);
+    let cond = ctx.emit(Op::ILt(h_i, len), IrType::Bool, None);
+    ctx.terminate(Terminator::Branch {
+        condition: cond,
+        true_block: body,
+        true_args: vec![h_i, h_b],
+        false_block: freeze_blk,
+        false_args: vec![h_b],
+    });
+
+    // Body: decode element `i` (in-bounds, so never the missing sentinel) and
+    // push it; on a decode error `emit_decode_field` jumps to `merge`. The
+    // array handle `node` dominates every block here, so it is read directly;
+    // only the builder needs threading through block params.
+    ctx.switch_to_block(body);
+    let elem_node = ctx.emit(
+        Op::BuiltinCall("json.arrayGet".to_string(), vec![node, b_i]),
+        IrType::I64,
+        None,
+    );
+    let v = emit_decode_field(ctx, elem_node, elem, result_ty, merge, node_ids);
+    ctx.emit(
+        Op::BuiltinCall("ListBuilder.push".to_string(), vec![b_b, v]),
+        IrType::Void,
+        None,
+    );
+    let i_next = ctx.emit(Op::IAdd(b_i, one), IrType::I64, None);
+    ctx.terminate(Terminator::Jump {
+        target: header,
+        args: vec![i_next, b_b],
+    });
+
+    // Freeze: builder → List, wrap Ok.
+    ctx.switch_to_block(freeze_blk);
+    let list = ctx.emit(
+        Op::BuiltinCall("ListBuilder.freeze".to_string(), vec![f_b]),
+        list_ir,
+        None,
+    );
+    let ok = emit_result_ok(ctx, result_ty, list);
+    ctx.terminate(Terminator::Jump {
+        target: merge,
+        args: vec![ok],
     });
 
     ctx.switch_to_block(merge);

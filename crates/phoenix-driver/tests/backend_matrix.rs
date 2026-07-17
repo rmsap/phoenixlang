@@ -226,6 +226,24 @@ backend_matrix_test!(
     "json_decode_enum.phx",
     skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
 );
+// `List<T>` decode: arrays of scalars, structs, enums, Options, and nested
+// lists; a `List` inside a struct field, an enum variant payload, and an
+// `Option` target; the non-array / bad-element / empty paths; and an
+// encode∘decode round-trip. wasm32-gc skipped (serde_json DOM deferral).
+backend_matrix_test!(
+    matrix_json_decode_list,
+    "json_decode_list.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
+// Large-list decode: 65537 elements, so collections fire *inside* the
+// synthesized decode loop while its ListBuilder is live only as a
+// loop-header block param — the rooting discipline the small-array fixture
+// above never stresses. wasm32-gc skipped (serde_json DOM deferral).
+backend_matrix_test!(
+    matrix_json_decode_gc_stress,
+    "json_decode_gc_stress.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
 // The pre-registered builtin `JsonError` enum: usable with no
 // import as a param type, constructed by bare variant name, matched on,
 // and as the `Err` arm of `Result<T, JsonError>` (the `json.decode` shape).

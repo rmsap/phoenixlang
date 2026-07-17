@@ -161,6 +161,13 @@ fn builtin_json(
             }
             _ => error("json.arrayGet expects (handle, index)".to_string()),
         },
+        "arrayLen" => {
+            let v = json_node(interp, &args, "json.arrayLen")?;
+            Ok(IrValue::Int(match v {
+                serde_json::Value::Array(a) => a.len() as i64,
+                _ => 0,
+            }))
+        }
         "isMissing" => match args.as_slice() {
             [IrValue::Int(h)] => Ok(IrValue::Bool(*h == -1)),
             _ => error("json.isMissing expects a single handle argument".to_string()),

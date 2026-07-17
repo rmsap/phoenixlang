@@ -1,0 +1,212 @@
+// json.decode<List<T>>: decode a JSON array into a `List<T>`, for scalar,
+// struct, enum, Option, and nested-list element types. A non-array →
+// Err(TypeMismatch); an element whose decode fails → that element's error
+// propagates (both at the top level and from inside a nested list or a
+// struct element); an empty array → an empty list. Also covers a List
+// nested inside a struct field, inside an enum variant payload, and inside
+// an `Option` target, plus a round-trip. `{{`/`}}` are the
+// string-interpolation escapes for literal JSON braces; string building uses
+// `+` to avoid the known interpolation-span issue for field access.
+
+import json
+
+struct Point {
+  x: Int
+  y: Int
+}
+
+enum Tag {
+  Off
+  On(Int)
+}
+
+enum Batch {
+  Empty
+  Items(List<Int>)
+}
+
+struct Poly {
+  name: String
+  verts: List<Point>
+}
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function showInts(xs: List<Int>) -> String {
+  let mut s: String = "["
+  let mut first: Bool = true
+  for x in xs {
+    if first { s = s + toString(x) } else { s = s + "," + toString(x) }
+    first = false
+  }
+  s + "]"
+}
+
+function showIntsResult(r: Result<List<Int>, JsonError>) -> String {
+  match r {
+    Ok(xs) -> showInts(xs)
+    Err(e) -> describe(e)
+  }
+}
+
+function showPoints(ps: List<Point>) -> String {
+  let mut s: String = "["
+  let mut first: Bool = true
+  for p in ps {
+    let one: String = "(" + toString(p.x) + "," + toString(p.y) + ")"
+    if first { s = s + one } else { s = s + "," + one }
+    first = false
+  }
+  s + "]"
+}
+
+function showTag(t: Tag) -> String {
+  match t {
+    Off -> "Off"
+    On(n) -> "On(" + toString(n) + ")"
+  }
+}
+
+function showOpt(o: Option<Int>) -> String {
+  match o {
+    Some(n) -> toString(n)
+    None -> "none"
+  }
+}
+
+function showBatch(bt: Batch) -> String {
+  match bt {
+    Empty -> "empty"
+    Items(xs) -> "items " + showInts(xs)
+  }
+}
+
+function showOptList(ol: Option<List<Int>>) -> String {
+  match ol {
+    Some(xs) -> "some " + showInts(xs)
+    None -> "none"
+  }
+}
+
+function main() {
+  // List<Int>.
+  let a: Result<List<Int>, JsonError> = json.decode<List<Int>>("[1, 2, 3]")
+  print(showIntsResult(a))
+
+  // Empty array → empty list.
+  let b: Result<List<Int>, JsonError> = json.decode<List<Int>>("[]")
+  print(showIntsResult(b))
+
+  // Not an array.
+  let c: Result<List<Int>, JsonError> = json.decode<List<Int>>("{{\"x\":1}}")
+  print(showIntsResult(c))
+
+  // An element of the wrong kind — the element decoder's error propagates.
+  let d: Result<List<Int>, JsonError> = json.decode<List<Int>>("[1, \"no\", 3]")
+  print(showIntsResult(d))
+
+  // Malformed JSON → ParseError.
+  let e: Result<List<Int>, JsonError> = json.decode<List<Int>>("nope")
+  print(showIntsResult(e))
+
+  // List<String>.
+  let f: Result<List<String>, JsonError> = json.decode<List<String>>("[\"a\", \"b\"]")
+  match f {
+    Ok(xs) -> {
+      let mut s: String = ""
+      for x in xs { s = s + x + "." }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // List<Point> (list of structs).
+  let g: Result<List<Point>, JsonError> =
+    json.decode<List<Point>>("[{{\"x\":1,\"y\":2}}, {{\"x\":3,\"y\":4}}]")
+  match g { Ok(ps) -> print(showPoints(ps)) Err(x) -> print(describe(x)) }
+
+  // List<Tag> (list of adjacently-tagged enums).
+  let h: Result<List<Tag>, JsonError> =
+    json.decode<List<Tag>>("[{{\"type\":\"Off\"}}, {{\"type\":\"On\",\"value\":[7]}}]")
+  match h {
+    Ok(ts) -> {
+      let mut s: String = ""
+      for t in ts { s = s + showTag(t) + " " }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // List<Option<Int>> (list of Options; null → None).
+  let i: Result<List<Option<Int>>, JsonError> =
+    json.decode<List<Option<Int>>>("[1, null, 3]")
+  match i {
+    Ok(os) -> {
+      let mut s: String = ""
+      for o in os { s = s + showOpt(o) + " " }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // List<List<Int>> (nested lists).
+  let j: Result<List<List<Int>>, JsonError> =
+    json.decode<List<List<Int>>>("[[1, 2], [], [3]]")
+  match j {
+    Ok(rows) -> {
+      let mut s: String = ""
+      for row in rows { s = s + showInts(row) }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // An element error one level down: the inner list decoder's error
+  // propagates out through both loops.
+  let m: Result<List<List<Int>>, JsonError> =
+    json.decode<List<List<Int>>>("[[1, 2], [3, \"x\"]]")
+  match m {
+    Ok(rows) -> {
+      let mut s: String = ""
+      for row in rows { s = s + showInts(row) }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // An element error inside a struct element: the Point field decoder's
+  // error propagates out of the list decoder.
+  let n: Result<List<Point>, JsonError> =
+    json.decode<List<Point>>("[{{\"x\":1,\"y\":2}}, {{\"x\":\"no\",\"y\":4}}]")
+  match n { Ok(ps) -> print(showPoints(ps)) Err(x) -> print(describe(x)) }
+
+  // A struct whose field is a List<Point>.
+  let k: Result<Poly, JsonError> =
+    json.decode<Poly>("{{\"name\":\"tri\",\"verts\":[{{\"x\":0,\"y\":0}}, {{\"x\":1,\"y\":1}}]}}")
+  match k { Ok(p) -> print(p.name + " " + showPoints(p.verts)) Err(x) -> print(describe(x)) }
+
+  // A List as an enum variant payload: the variant's "value" array holds the
+  // fields positionally, so the list itself is the nested `[[…]]`.
+  let o: Result<Batch, JsonError> =
+    json.decode<Batch>("{{\"type\":\"Items\",\"value\":[[4, 5, 6]]}}")
+  match o { Ok(bt) -> print(showBatch(bt)) Err(x) -> print(describe(x)) }
+
+  // Option<List<Int>>: null → None, an array → Some(list).
+  let p: Result<Option<List<Int>>, JsonError> =
+    json.decode<Option<List<Int>>>("null")
+  match p { Ok(ol) -> print(showOptList(ol)) Err(x) -> print(describe(x)) }
+  let q: Result<Option<List<Int>>, JsonError> =
+    json.decode<Option<List<Int>>>("[9, 10]")
+  match q { Ok(ol) -> print(showOptList(ol)) Err(x) -> print(describe(x)) }
+
+  // Round-trip: decode(encode(xs)) reproduces the list.
+  let l: Result<List<Point>, JsonError> =
+    json.decode<List<Point>>(json.encode([Point(5, 6), Point(7, 8)]))
+  match l { Ok(ps) -> print(showPoints(ps)) Err(x) -> print(describe(x)) }
+}

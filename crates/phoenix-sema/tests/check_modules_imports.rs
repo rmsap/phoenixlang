@@ -1053,12 +1053,12 @@ fn json_decode_of_generic_struct_is_an_error() {
 
 #[test]
 fn json_decode_of_struct_with_undecodable_field_is_an_error() {
-    // The gate recurses into fields: a struct wrapping a `List<Int>` is
-    // rejected, and the diagnostic names the offending field type, not the
-    // struct.
+    // The gate recurses into fields: a struct wrapping a non-`String`-key map
+    // (still unsupported) is rejected, and the diagnostic names the offending
+    // field type, not the struct.
     let entry = entry_only(
         "import json\n\
-         struct S { xs: List<Int> }\n\
+         struct S { m: Map<Int, Int> }\n\
          function main() {\n  \
            let r: Result<S, JsonError> = json.decode<S>(\"x\")\n  \
            match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
@@ -1069,8 +1069,8 @@ fn json_decode_of_struct_with_undecodable_field_is_an_error() {
         analysis
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("does not support `List<Int>`")),
-        "expected the diagnostic to name the undecodable field type `List<Int>`, got: {:?}",
+            .any(|d| d.message.contains("does not support `Map<Int, Int>`")),
+        "expected the diagnostic to name the undecodable field type `Map<Int, Int>`, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -1137,14 +1137,36 @@ fn json_decode_of_option_typechecks() {
 }
 
 #[test]
+fn json_decode_of_list_typechecks() {
+    // `List<T>` is a decodable target when `T` is — here a list of structs,
+    // and a nested `List<List<Int>>`, exercising the recursive element gate.
+    let entry = entry_only(
+        "import json\n\
+         struct P { x: Int }\n\
+         function main() {\n  \
+           let r: Result<List<P>, JsonError> = json.decode<List<P>>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n  \
+           let n: Result<List<List<Int>>, JsonError> = json.decode<List<List<Int>>>(\"y\")\n  \
+           match n { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "List decode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn json_decode_of_option_of_undecodable_inner_is_an_error() {
     // The gate recurses through `Option`'s inner type: `Option<T>` is only
-    // as decodable as `T`, so `Option<List<Int>>` is rejected and the
+    // as decodable as `T`, so `Option<Map<Int, Int>>` is rejected and the
     // diagnostic names the undecodable inner type, not the `Option`.
     let entry = entry_only(
         "import json\n\
          function main() {\n  \
-           let r: Result<Option<List<Int>>, JsonError> = json.decode<Option<List<Int>>>(\"x\")\n  \
+           let r: Result<Option<Map<Int, Int>>, JsonError> = json.decode<Option<Map<Int, Int>>>(\"x\")\n  \
            match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
          }",
     );
@@ -1153,9 +1175,9 @@ fn json_decode_of_option_of_undecodable_inner_is_an_error() {
         analysis
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("does not support `List<Int>`")),
+            .any(|d| d.message.contains("does not support `Map<Int, Int>`")),
         "expected the diagnostic to name the undecodable Option inner type \
-         `List<Int>`, got: {:?}",
+         `Map<Int, Int>`, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -1163,10 +1185,11 @@ fn json_decode_of_option_of_undecodable_inner_is_an_error() {
 #[test]
 fn json_decode_of_enum_with_undecodable_variant_field_is_an_error() {
     // The gate recurses into variant field types: an enum with a variant
-    // carrying a `List<Int>` is rejected, naming the offending payload type.
+    // carrying a non-`String`-key map (still unsupported) is rejected, naming
+    // the offending payload type.
     let entry = entry_only(
         "import json\n\
-         enum E { A  B(List<Int>) }\n\
+         enum E { A  B(Map<Int, Int>) }\n\
          function main() {\n  \
            let r: Result<E, JsonError> = json.decode<E>(\"x\")\n  \
            match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
@@ -1177,8 +1200,8 @@ fn json_decode_of_enum_with_undecodable_variant_field_is_an_error() {
         analysis
             .diagnostics
             .iter()
-            .any(|d| d.message.contains("does not support `List<Int>`")),
-        "expected the diagnostic to name the undecodable variant payload `List<Int>`, got: {:?}",
+            .any(|d| d.message.contains("does not support `Map<Int, Int>`")),
+        "expected the diagnostic to name the undecodable variant payload `Map<Int, Int>`, got: {:?}",
         analysis.diagnostics
     );
 }
@@ -1459,23 +1482,29 @@ fn json_decode_of_mutually_recursive_structs_terminates() {
 
 #[test]
 fn json_decode_of_unsupported_type_is_a_clear_error() {
-    // This slice decodes scalars + structs; a `List` target is rejected.
-    let entry = entry_only(
-        "import json\n\
-         function main() {\n  \
-           let r: Result<List<Int>, JsonError> = json.decode<List<Int>>(\"x\")\n  \
-           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
-         }",
-    );
-    let analysis = check_modules(&[entry]);
-    assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("`json.decode` does not support")),
-        "expected an unsupported-type diagnostic for json.decode of a List, got: {:?}",
-        analysis.diagnostics
-    );
+    // This slice decodes scalars, `Option`, `List`, structs, and enums; a
+    // `Map` target (string-keyed or not) is still rejected until a later
+    // slice. `Map<String, Int>` is the riskier case: encode already supports
+    // it, so a decode gate naively mirroring the encode gate would silently
+    // admit it.
+    for map_ty in ["Map<Int, Int>", "Map<String, Int>"] {
+        let entry = entry_only(&format!(
+            "import json\n\
+             function main() {{\n  \
+               let r: Result<{map_ty}, JsonError> = json.decode<{map_ty}>(\"x\")\n  \
+               match r {{ Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }}\n\
+             }}"
+        ));
+        let analysis = check_modules(&[entry]);
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("`json.decode` does not support")),
+            "expected an unsupported-type diagnostic for json.decode of `{map_ty}`, got: {:?}",
+            analysis.diagnostics
+        );
+    }
 }
 
 #[test]

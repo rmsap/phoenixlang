@@ -109,6 +109,8 @@ pub struct RuntimeFunctions {
     /// `phx_json_array_get(i64, i64) -> i64` — element handle, or the
     /// missing-field sentinel when out of range / not an array.
     pub json_array_get: FuncId,
+    /// `phx_json_array_len(i64) -> i64` — array length (`0` if not an array).
+    pub json_array_len: FuncId,
     /// `phx_str_index_of(p1, l1, p2, l2) -> i64`.
     pub str_index_of: FuncId,
     /// `phx_str_replace(p1, l1, p2, l2, p3, l3) -> (ptr, len)`.
@@ -290,6 +292,7 @@ impl RuntimeFunctions {
                 &[I64],
                 call_conv,
             )?,
+            json_array_len: declare_func(module, "phx_json_array_len", &[I64], &[I64], call_conv)?,
             str_index_of: declare_func(
                 module,
                 "phx_str_index_of",

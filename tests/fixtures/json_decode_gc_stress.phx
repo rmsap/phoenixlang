@@ -1,0 +1,44 @@
+// GC-stress companion to json_decode_list.phx, whose arrays are all tiny —
+// small enough that a collection never fires while a decode loop is running.
+// The synthesized `List<T>` decoder keeps its ListBuilder live only as a
+// loop-header block parameter (the same rooting discipline
+// gc_loop_carried_ref.phx pins for user loops), and each element decode
+// allocates a fresh `Result` enum. Decoding 65537 elements therefore
+// allocates well past the 1-MB auto-collect threshold, so the GC fires
+// repeatedly *inside* the decode loop while the builder is reachable only
+// through block params. A rooting regression would crash or corrupt the
+// decoded list; the printed length and sum pin correctness.
+//
+// The input string is built by self-doubling ("7," doubled 16 times →
+// 65536 elements), so construction is O(n) rather than the deliberately
+// quadratic concat loop of gc_loop_carried_ref.phx.
+
+import json
+
+function fail(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function main() {
+  // `body` is a schema keyword, hence `digits`.
+  let mut digits: String = "7,"
+  let mut i: Int = 0
+  while (i < 16) {
+    digits = digits + digits
+    i = i + 1
+  }
+  let text: String = "[" + digits + "8]"
+  let r: Result<List<Int>, JsonError> = json.decode<List<Int>>(text)
+  match r {
+    Ok(xs) -> {
+      let mut sum: Int = 0
+      for x in xs { sum = sum + x }
+      print(toString(xs.length()) + " " + toString(sum))
+    }
+    Err(e) -> print(fail(e))
+  }
+}

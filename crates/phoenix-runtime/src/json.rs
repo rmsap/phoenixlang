@@ -173,6 +173,19 @@ pub unsafe extern "C" fn phx_json_array_get(handle: i64, index: i64) -> i64 {
     }
 }
 
+/// The length of an array node (`0` when `handle` is not an array). The
+/// caller confirms kind `ARRAY` before iterating with [`phx_json_array_get`].
+///
+/// # Safety
+/// `handle` must be a live node handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_array_len(handle: i64) -> i64 {
+    match unsafe { node(handle) } {
+        Value::Array(a) => a.len() as i64,
+        _ => 0,
+    }
+}
+
 /// Extract a node as an `i64` (caller has confirmed kind `INT`).
 ///
 /// # Safety
