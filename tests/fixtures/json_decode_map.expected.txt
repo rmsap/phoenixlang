@@ -1,0 +1,14 @@
+a=1 b=2 c=3 
+[]
+type: expected object
+type: expected Int
+parse: expected ident at line 1 column 2
+a=1 z=26 
+a=2 
+=0 a=1 é=9 
+o:(0,0) p:(1,2) 
+evens:24 odds:13 
+outer{a=1 b=2 }
+a=none b=1 
+svc cpu=4 mem=8 
+a=1 b=2 

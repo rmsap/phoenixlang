@@ -68,6 +68,26 @@ static CFG: MatrixCfg = MatrixCfg {
     expected_rel: None,
 };
 
+fn expected_rel(fixture: &str) -> String {
+    format!(
+        "tests/fixtures/{}.expected.txt",
+        fixture.trim_end_matches(".phx")
+    )
+}
+
+/// Like [`CFG`] but additionally pins stdout against
+/// `tests/fixtures/<stem>.expected.txt`. For fixtures whose asserted
+/// behavior is inherited identically by every backend from a shared
+/// dependency (e.g. serde_json's object key order): a dependency change
+/// would move all five columns in unison, so cross-backend agreement
+/// alone can't guard it — same rationale as the multi-file suite's pin.
+static PINNED_CFG: MatrixCfg = MatrixCfg {
+    source_rel,
+    label,
+    bin_stem,
+    expected_rel: Some(expected_rel),
+};
+
 macro_rules! backend_matrix_test {
     // All five columns.
     ($name:ident, $fixture:literal) => {
@@ -85,6 +105,15 @@ macro_rules! backend_matrix_test {
         #[test]
         fn $name() {
             common::matrix_harness::assert_backend_agreement(&CFG, $fixture, Some($reason));
+        }
+    };
+    // Additionally pin stdout against `<stem>.expected.txt` (see
+    // [`PINNED_CFG`]). Other pinned combinations (no skip, …) can gain
+    // arms when a fixture needs them.
+    ($name:ident, $fixture:literal, pinned, skip_wasm_gc: $reason:literal) => {
+        #[test]
+        fn $name() {
+            common::matrix_harness::assert_backend_agreement(&PINNED_CFG, $fixture, Some($reason));
         }
     };
 }
@@ -242,6 +271,19 @@ backend_matrix_test!(
 backend_matrix_test!(
     matrix_json_decode_gc_stress,
     "json_decode_gc_stress.phx",
+    skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
+);
+// `Map<String, V>` decode: objects of scalars, structs, lists, options
+// (null value → `None`), and nested maps; a struct with a `Map` field;
+// the non-object / bad-value / empty paths; edge-case keys (`""`,
+// non-ASCII); duplicate keys; and an encode∘decode round-trip. Pinned:
+// key order and last-duplicate-wins come from serde_json identically on
+// every backend, so agreement alone can't guard them. wasm32-gc skipped
+// (serde_json DOM deferral).
+backend_matrix_test!(
+    matrix_json_decode_map,
+    "json_decode_map.phx",
+    pinned,
     skip_wasm_gc: "json.decode DOM (serde_json) not yet ported to wasm32-gc (Phase 4.6 follow-up)"
 );
 // The pre-registered builtin `JsonError` enum: usable with no

@@ -111,6 +111,14 @@ pub struct RuntimeFunctions {
     pub json_array_get: FuncId,
     /// `phx_json_array_len(i64) -> i64` — array length (`0` if not an array).
     pub json_array_len: FuncId,
+    /// `phx_json_object_len(i64) -> i64` — object entry count (`0` if not an
+    /// object).
+    pub json_object_len: FuncId,
+    /// `phx_json_object_key_at(i64, i64) -> (ptr, len)` — the i-th object key.
+    pub json_object_key_at: FuncId,
+    /// `phx_json_object_value_at(i64, i64) -> i64` — the i-th object value
+    /// node handle (or the missing sentinel when out of range).
+    pub json_object_value_at: FuncId,
     /// `phx_str_index_of(p1, l1, p2, l2) -> i64`.
     pub str_index_of: FuncId,
     /// `phx_str_replace(p1, l1, p2, l2, p3, l3) -> (ptr, len)`.
@@ -293,6 +301,27 @@ impl RuntimeFunctions {
                 call_conv,
             )?,
             json_array_len: declare_func(module, "phx_json_array_len", &[I64], &[I64], call_conv)?,
+            json_object_len: declare_func(
+                module,
+                "phx_json_object_len",
+                &[I64],
+                &[I64],
+                call_conv,
+            )?,
+            json_object_key_at: declare_func(
+                module,
+                "phx_json_object_key_at",
+                &[I64, I64],
+                &[I64, I64],
+                call_conv,
+            )?,
+            json_object_value_at: declare_func(
+                module,
+                "phx_json_object_value_at",
+                &[I64, I64],
+                &[I64],
+                call_conv,
+            )?,
             str_index_of: declare_func(
                 module,
                 "phx_str_index_of",

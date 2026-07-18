@@ -5,8 +5,8 @@
 //! `__json_decode_entry_<key>(s: String) -> Result<T, JsonError>`.
 //!
 //! Covered so far: scalars (`Int`/`Float`/`Bool`/`String`), `Option<T>`,
-//! `List<T>`, and non-generic structs and enums (adjacently tagged:
-//! `{"type":"V"}` / `{"type":"V","value":[…]}`); sema's
+//! `List<T>`, `Map<String, V>`, and non-generic structs and enums (adjacently
+//! tagged: `{"type":"V"}` / `{"type":"V","value":[…]}`); sema's
 //! `unsupported_json_decode_type` gate rejects the rest before it reaches here.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,7 +24,7 @@ use crate::instruction::{FuncId, Op, ValueId};
 use crate::lower::LoweringContext;
 use crate::module::IrFunction;
 use crate::terminator::Terminator;
-use crate::types::{IrType, LIST_TYPE, OPTION_ENUM};
+use crate::types::{IrType, LIST_TYPE, MAP_TYPE, OPTION_ENUM};
 
 // Node-kind tags mirror `phoenix_runtime::json::JSON_KIND_*` — the runtime
 // is the ABI source of truth. Mirroring (rather than importing) keeps this
@@ -71,6 +71,14 @@ pub(crate) fn synthesize_json_decoders(ctx: &mut LoweringContext<'_>) {
                 if (name == OPTION_ENUM || name == LIST_TYPE) && args.len() == 1 =>
             {
                 queue.push(args[0].clone());
+            }
+            // `Map<String, V>` → decode `V`. Matching the key type (not just
+            // arity) keeps the planned non-`String`-key pairs form from
+            // silently taking the object path if only sema's gate is relaxed.
+            Type::Generic(name, args)
+                if name == MAP_TYPE && args.len() == 2 && args[0] == Type::String =>
+            {
+                queue.push(args[1].clone());
             }
             Type::Named(name) => {
                 if let Some(info) = ctx.check.struct_info_by_name(name) {
@@ -229,9 +237,9 @@ fn build_decode_entry(ctx: &mut LoweringContext<'_>, ty: &Type, entry: FuncId, n
     });
 }
 
-/// Build a per-type node decoder body: scalars, `Option<T>`, `List<T>`, and
-/// non-generic structs and enums. `node_ids` maps a type key to its node
-/// decoder, so an aggregate decoder can call its field/variant/element
+/// Build a per-type node decoder body: scalars, `Option<T>`, `List<T>`,
+/// `Map<String, V>`, and non-generic structs and enums. `node_ids` maps a
+/// type key to its node decoder, so an aggregate decoder can call its field/variant/element
 /// decoders; `struct_fields` is the demand walk's field snapshot for a
 /// struct target (`None` for a non-struct). Both borrow caller-local maps,
 /// so the emit closure captures them as-is; only an enum target's variants
@@ -272,6 +280,12 @@ fn build_node_decoder(
             && args.len() == 1
         {
             emit_list_decode(ctx, &args[0], node, &result_ty, node_ids)
+        } else if let Type::Generic(name, args) = ty
+            && name == MAP_TYPE
+            && args.len() == 2
+            && args[0] == Type::String
+        {
+            emit_map_decode(ctx, &args[1], node, &result_ty, node_ids)
         } else {
             emit_scalar_decode(ctx, ty, node, &result_ty)
         };
@@ -469,6 +483,148 @@ fn emit_list_decode(
         None,
     );
     let ok = emit_result_ok(ctx, result_ty, list);
+    ctx.terminate(Terminator::Jump {
+        target: merge,
+        args: vec![ok],
+    });
+
+    ctx.switch_to_block(merge);
+    result
+}
+
+/// Emit a `Map<String, V>` decoder: require a JSON object, decode each entry's
+/// value into a `MapBuilder<String, V>` (a `V` decode error propagates), then
+/// freeze it into the map. Entries iterate in the DOM's key order (see
+/// `phx_json_object_len`), so the built map's order is identical across
+/// backends. Positional `_at` access is O(index) on the DOM's `BTreeMap`, so
+/// this loop is quadratic in the entry count — an accepted tradeoff for the
+/// simple index-based ABI (see `phx_json_object_len` and known-issues). The
+/// builder is threaded through the loop as a block param to stay GC-rooted.
+/// Leaves the context in the merge block; returns its parameter.
+fn emit_map_decode(
+    ctx: &mut LoweringContext<'_>,
+    val_ty: &Type,
+    node: ValueId,
+    result_ty: &IrType,
+    node_ids: &BTreeMap<String, FuncId>,
+) -> ValueId {
+    let val_ir = ctx.lower_type(val_ty);
+    let str_ir = ctx.lower_type(&Type::String);
+    // The map type is the `Ok` payload of `Result<Map<String, V>, JsonError>`.
+    let map_ir = match result_ty {
+        IrType::EnumRef(_, args) => args[0].clone(),
+        other => unreachable!("Map decode: unexpected result type {other:?}"),
+    };
+    let builder_ir = IrType::MapBuilderRef(Box::new(str_ir.clone()), Box::new(val_ir));
+
+    let merge = ctx.create_block();
+    let result = ctx.add_block_param(merge, result_ty.clone());
+
+    // Require a JSON object.
+    let kind = ctx.emit(
+        Op::BuiltinCall("json.kind".to_string(), vec![node]),
+        IrType::I64,
+        None,
+    );
+    let obj_kind = ctx.emit(Op::ConstI64(KIND_OBJECT), IrType::I64, None);
+    let is_obj = ctx.emit(Op::IEq(kind, obj_kind), IrType::Bool, None);
+    let obj_blk = ctx.create_block();
+    let not_obj = ctx.create_block();
+    ctx.terminate(Terminator::Branch {
+        condition: is_obj,
+        true_block: obj_blk,
+        true_args: Vec::new(),
+        false_block: not_obj,
+        false_args: Vec::new(),
+    });
+    ctx.switch_to_block(not_obj);
+    let m = ctx.emit(
+        Op::ConstString("expected object".to_string()),
+        IrType::StringRef,
+        None,
+    );
+    let je = emit_json_error(ctx, "TypeMismatch", m);
+    let err = emit_result_err(ctx, result_ty, je);
+    ctx.terminate(Terminator::Jump {
+        target: merge,
+        args: vec![err],
+    });
+
+    // Iterate `0..len`, decoding each entry value into a fresh `MapBuilder`.
+    ctx.switch_to_block(obj_blk);
+    let len = ctx.emit(
+        Op::BuiltinCall("json.objectLen".to_string(), vec![node]),
+        IrType::I64,
+        None,
+    );
+    let builder = ctx.emit(
+        Op::BuiltinCall("MapBuilder.alloc".to_string(), Vec::new()),
+        builder_ir.clone(),
+        None,
+    );
+    let zero = ctx.emit(Op::ConstI64(0), IrType::I64, None);
+    let one = ctx.emit(Op::ConstI64(1), IrType::I64, None);
+
+    let header = ctx.create_block();
+    let body = ctx.create_block();
+    let freeze_blk = ctx.create_block();
+    let h_i = ctx.add_block_param(header, IrType::I64);
+    let h_b = ctx.add_block_param(header, builder_ir.clone());
+    let b_i = ctx.add_block_param(body, IrType::I64);
+    let b_b = ctx.add_block_param(body, builder_ir.clone());
+    let f_b = ctx.add_block_param(freeze_blk, builder_ir);
+    ctx.terminate(Terminator::Jump {
+        target: header,
+        args: vec![zero, builder],
+    });
+
+    // Header: while i < len.
+    ctx.switch_to_block(header);
+    let cond = ctx.emit(Op::ILt(h_i, len), IrType::Bool, None);
+    ctx.terminate(Terminator::Branch {
+        condition: cond,
+        true_block: body,
+        true_args: vec![h_i, h_b],
+        false_block: freeze_blk,
+        false_args: vec![h_b],
+    });
+
+    // Body: decode entry `i`'s value and set it under the entry key; on a
+    // decode error `emit_decode_field` jumps to `merge`. Both the key string
+    // and the decoded value are ref-typed SSA results, so the backend's
+    // blanket shadow-stack rooting keeps them live across the intervening
+    // allocations up to `MapBuilder.set`.
+    ctx.switch_to_block(body);
+    let key = ctx.emit(
+        Op::BuiltinCall("json.objectKeyAt".to_string(), vec![node, b_i]),
+        str_ir.clone(),
+        None,
+    );
+    let val_node = ctx.emit(
+        Op::BuiltinCall("json.objectValueAt".to_string(), vec![node, b_i]),
+        IrType::I64,
+        None,
+    );
+    let v = emit_decode_field(ctx, val_node, val_ty, result_ty, merge, node_ids);
+    ctx.emit(
+        Op::BuiltinCall("MapBuilder.set".to_string(), vec![b_b, key, v]),
+        IrType::Void,
+        None,
+    );
+    let i_next = ctx.emit(Op::IAdd(b_i, one), IrType::I64, None);
+    ctx.terminate(Terminator::Jump {
+        target: header,
+        args: vec![i_next, b_b],
+    });
+
+    // Freeze: builder → Map, wrap Ok.
+    ctx.switch_to_block(freeze_blk);
+    let map = ctx.emit(
+        Op::BuiltinCall("MapBuilder.freeze".to_string(), vec![f_b]),
+        map_ir,
+        None,
+    );
+    let ok = emit_result_ok(ctx, result_ty, map);
     ctx.terminate(Terminator::Jump {
         target: merge,
         args: vec![ok],

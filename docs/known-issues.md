@@ -180,18 +180,34 @@ at Phase 3.1.2 close (2026-07-17).
 
 ### `json.encode` of a `Map` with non-`String` keys is not yet supported
 
-`json.encode` supports `Map<String, V>` (→ JSON object). Maps with other
+Both directions support `Map<String, V>` (↔ JSON object). Maps with other
 key types (`Map<Int, V>`, struct keys, …) are intended to serialize as an
 array of `[key, value]` pairs (the locked wire format), but that
-form is not implemented yet: `json.encode` of such a map is a clean sema
-error ("`json.encode` does not support `Map<Int, …>`"). The deferral is
+form is not implemented yet: `json.encode`/`json.decode` of such a map is a
+clean sema error ("`json.encode` does not support `Map<Int, …>`" /
+"`json.decode` does not support `Map<Int, …>`"). The encode deferral is
 because the tree-walk interpreter encodes runtime `Value`s, which carry no
 key-type tag — so an *empty* non-`String`-key map can't be distinguished
 from an empty `String`-key map without threading the static type through
 the value-driven encoder. `String`-key maps have no such ambiguity (always
-an object, empty → `{}`). **Target:** a Phase 4.6 follow-up that adds the
-pairs form (likely alongside the wasm32-gc port). Surfaced 2026-06-28
-implementing `List`/`Map` encode (Phase 4.6 J3c).
+an object, empty → `{}`); decode always knows `K`/`V` statically but is
+gated in lockstep with encode so the two stay symmetric. **Target:** a
+Phase 4.6 follow-up that adds the pairs form (likely alongside the wasm32-gc
+port). Surfaced 2026-06-28 implementing `List`/`Map` encode (Phase 4.6 J3c);
+decode side confirmed 2026-07-17 (J4e).
+
+### `json.decode` of a large JSON object into a `Map` is quadratic
+
+The `Map<String, V>` decoder iterates object entries positionally
+(`phx_json_object_key_at` / `phx_json_object_value_at`), and each call walks
+the DOM's `BTreeMap` iterator from the start — `serde_json::Map` exposes no
+cursor or range API — so decoding an n-entry object costs O(n²) iterator
+steps. Negligible at typical sizes (~1k keys ≈ 10⁶ cheap steps, well under a
+millisecond); pathological only for very large objects (100k+ keys). JSON
+*arrays* are unaffected (`Vec`-indexed, O(1) per element). **Target:** a
+cursor-style object-iterator primitive if large-object decode becomes a real
+workload; not scheduled. Surfaced 2026-07-17 in review of `Map<String, V>`
+decode (Phase 4.6 J4e).
 
 ### JSON serialization is not yet ported to the wasm32-gc backend
 

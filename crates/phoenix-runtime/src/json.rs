@@ -186,6 +186,70 @@ pub unsafe extern "C" fn phx_json_array_len(handle: i64) -> i64 {
     }
 }
 
+/// The number of entries in an object node (`0` when `handle` is not an
+/// object). The caller confirms kind `OBJECT`, then iterates the entries by
+/// position with [`phx_json_object_key_at`] / [`phx_json_object_value_at`].
+///
+/// Object entries iterate in `serde_json`'s key order (its default `Map` is a
+/// `BTreeMap`, so lexicographic-by-key), identically across every backend —
+/// the decoded `Map` is built in that order.
+///
+/// Positional access is O(index) per call: `serde_json::Map` exposes no
+/// cursor or range API, so each `_at` call walks the `BTreeMap` iterator from
+/// the start, making a full `0..len` decode walk quadratic in the entry
+/// count. Negligible at typical object sizes (~1k keys ≈ 10⁶ cheap iterator
+/// steps); if large-object decode ever matters, the fix is a cursor-style
+/// iterator primitive, not a tweak here (see known-issues).
+///
+/// # Safety
+/// `handle` must be a live node handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_object_len(handle: i64) -> i64 {
+    match unsafe { node(handle) } {
+        Value::Object(o) => o.len() as i64,
+        _ => 0,
+    }
+}
+
+/// The key of the `index`-th object entry, as a GC-managed string (empty when
+/// `handle` is not an object or `index` is out of range). Pairs positionally
+/// with [`phx_json_object_value_at`] — both walk the same key order.
+///
+/// The empty string is NOT a detectable sentinel: `{"":1}` is legal JSON, so
+/// a genuine `""` key is indistinguishable from the out-of-range return.
+/// Callers must bounds-check via [`phx_json_object_len`] (as the synthesized
+/// decoders do), never probe by testing for `""`.
+///
+/// # Safety
+/// `handle` must be a live node handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_object_key_at(handle: i64, index: i64) -> PhxFatPtr {
+    match unsafe { node(handle) } {
+        Value::Object(o) => match o.keys().nth(index as usize) {
+            Some(k) => to_phx_string_from_str(k),
+            None => to_phx_string_from_str(""),
+        },
+        _ => to_phx_string_from_str(""),
+    }
+}
+
+/// The value node handle of the `index`-th object entry (or `0`/"missing"
+/// when `handle` is not an object or `index` is out of range). Pairs
+/// positionally with [`phx_json_object_key_at`].
+///
+/// # Safety
+/// `handle` must be a live node handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phx_json_object_value_at(handle: i64, index: i64) -> i64 {
+    match unsafe { node(handle) } {
+        Value::Object(o) => match o.values().nth(index as usize) {
+            Some(v) => v as *const Value as i64,
+            None => 0,
+        },
+        _ => 0,
+    }
+}
+
 /// Extract a node as an `i64` (caller has confirmed kind `INT`).
 ///
 /// # Safety

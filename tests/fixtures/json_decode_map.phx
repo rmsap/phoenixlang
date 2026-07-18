@@ -1,0 +1,174 @@
+// json.decode<Map<String, V>>: decode a JSON object into a `Map<String, V>`,
+// for scalar, struct, list, option, and nested-map value types. A non-object →
+// Err(TypeMismatch); a value whose decode fails → that value's error
+// propagates; an empty object → an empty map. Object entries iterate in the
+// DOM's key order (serde's `Map` is a BTreeMap → lexicographic by UTF-8
+// bytes), identically on every backend, so printing keys in `m.keys()` order
+// is deterministic. Also covers a Map nested in a struct field and a
+// round-trip. This fixture is PINNED against `json_decode_map.expected.txt`:
+// key order and duplicate-key semantics come from the shared serde_json
+// dependency, so cross-backend agreement alone can't guard them — a
+// dependency-behavior change would move all five columns in unison.
+// `{{`/`}}` are the string-interpolation escapes for literal JSON braces;
+// string building uses `+` to avoid the known interpolation-span issue for
+// field access.
+
+import json
+
+struct Point {
+  x: Int
+  y: Int
+}
+
+struct Config {
+  name: String
+  limits: Map<String, Int>
+}
+
+function describe(e: JsonError) -> String {
+  match e {
+    ParseError(m) -> "parse: " + m
+    TypeMismatch(m) -> "type: " + m
+    MissingField(m) -> "missing: " + m
+  }
+}
+
+function showStrIntMap(m: Map<String, Int>) -> String {
+  let mut s: String = ""
+  for k in m.keys() {
+    s = s + k + "=" + toString(m.get(k).unwrapOr(-1)) + " "
+  }
+  s
+}
+
+function showStrIntMapResult(r: Result<Map<String, Int>, JsonError>) -> String {
+  match r {
+    Ok(m) -> showStrIntMap(m)
+    Err(e) -> describe(e)
+  }
+}
+
+function main() {
+  // Map<String, Int>. Keys come back in sorted order regardless of input order.
+  let a: Result<Map<String, Int>, JsonError> =
+    json.decode<Map<String, Int>>("{{\"b\":2,\"a\":1,\"c\":3}}")
+  print(showStrIntMapResult(a))
+
+  // Empty object → empty map.
+  let b: Result<Map<String, Int>, JsonError> = json.decode<Map<String, Int>>("{{}}")
+  print("[" + showStrIntMapResult(b) + "]")
+
+  // Not an object.
+  let c: Result<Map<String, Int>, JsonError> = json.decode<Map<String, Int>>("[1, 2]")
+  print(showStrIntMapResult(c))
+
+  // A value of the wrong kind — the value decoder's error propagates.
+  let d: Result<Map<String, Int>, JsonError> =
+    json.decode<Map<String, Int>>("{{\"a\":1,\"b\":\"no\"}}")
+  print(showStrIntMapResult(d))
+
+  // Malformed JSON → ParseError.
+  let e: Result<Map<String, Int>, JsonError> = json.decode<Map<String, Int>>("nope")
+  print(showStrIntMapResult(e))
+
+  // Unknown keys are simply retained (a map keeps every entry; there is no
+  // "unknown key" for a map, unlike a struct).
+  let f: Result<Map<String, Int>, JsonError> =
+    json.decode<Map<String, Int>>("{{\"z\":26,\"a\":1}}")
+  print(showStrIntMapResult(f))
+
+  // Duplicate keys: the last value wins (every backend parses through
+  // serde_json, whose object parse inserts each entry in turn — a repeated
+  // key overwrites). The expected.txt pin makes this a stated semantic, not
+  // an accident of the dependency.
+  let dup: Result<Map<String, Int>, JsonError> =
+    json.decode<Map<String, Int>>("{{\"a\":1,\"a\":2}}")
+  print(showStrIntMapResult(dup))
+
+  // Edge-case keys: the empty string is a legal JSON key — and also what
+  // `phx_json_object_key_at` returns out of range, so this pins that the
+  // bounds-checked walk keeps a genuine "" key distinguishable (it is
+  // decoded as a real entry, never dropped). A non-ASCII key rides along;
+  // BTreeMap order is byte-wise, so "" < "a" < "é" (0xC3…).
+  let edge: Result<Map<String, Int>, JsonError> =
+    json.decode<Map<String, Int>>("{{\"é\":9,\"\":0,\"a\":1}}")
+  print(showStrIntMapResult(edge))
+
+  // Map<String, Point> (struct values).
+  let g: Result<Map<String, Point>, JsonError> =
+    json.decode<Map<String, Point>>("{{\"o\":{{\"x\":0,\"y\":0}},\"p\":{{\"x\":1,\"y\":2}}}}")
+  match g {
+    Ok(m) -> {
+      let mut s: String = ""
+      for k in m.keys() {
+        let p: Point = m.get(k).unwrapOr(Point(-1, -1))
+        s = s + k + ":(" + toString(p.x) + "," + toString(p.y) + ") "
+      }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // Map<String, List<Int>> (list values).
+  let h: Result<Map<String, List<Int>>, JsonError> =
+    json.decode<Map<String, List<Int>>>("{{\"evens\":[2,4],\"odds\":[1,3]}}")
+  match h {
+    Ok(m) -> {
+      let mut s: String = ""
+      for k in m.keys() {
+        let mut row: String = ""
+        for n in m.get(k).unwrapOr([]) { row = row + toString(n) }
+        s = s + k + ":" + row + " "
+      }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // Map<String, Map<String, Int>> (nested maps).
+  let i: Result<Map<String, Map<String, Int>>, JsonError> =
+    json.decode<Map<String, Map<String, Int>>>("{{\"outer\":{{\"a\":1,\"b\":2}}}}")
+  match i {
+    Ok(m) -> {
+      let mut s: String = ""
+      for k in m.keys() {
+        let inner: Map<String, Int> = m.get(k).unwrapOr({})
+        s = s + k + "{{" + showStrIntMap(inner) + "}}"
+      }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // Map<String, Option<Int>> (option values): null is a VALID value here
+  // (→ None), not a type error — the one value type where the entry
+  // decoder accepts JSON null, exercising the Option decoder's null path
+  // from inside the map loop.
+  let opt: Result<Map<String, Option<Int>>, JsonError> =
+    json.decode<Map<String, Option<Int>>>("{{\"a\":null,\"b\":1}}")
+  match opt {
+    Ok(m) -> {
+      let mut s: String = ""
+      for k in m.keys() {
+        match m.get(k).unwrapOr(None) {
+          Some(n) -> { s = s + k + "=" + toString(n) + " " }
+          None -> { s = s + k + "=none " }
+        }
+      }
+      print(s)
+    }
+    Err(x) -> print(describe(x))
+  }
+
+  // A struct whose field is a Map<String, Int>.
+  let j: Result<Config, JsonError> =
+    json.decode<Config>("{{\"name\":\"svc\",\"limits\":{{\"cpu\":4,\"mem\":8}}}}")
+  match j { Ok(cfg) -> print(cfg.name + " " + showStrIntMap(cfg.limits)) Err(x) -> print(describe(x)) }
+
+  // Round-trip: decode(encode(m)) reproduces the map (keys already sorted, so
+  // the re-encoded bytes match too).
+  let base: Map<String, Int> = {"a": 1, "b": 2}
+  let k: Result<Map<String, Int>, JsonError> =
+    json.decode<Map<String, Int>>(json.encode(base))
+  print(showStrIntMapResult(k))
+}

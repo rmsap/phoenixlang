@@ -767,8 +767,8 @@ impl Checker {
                 format!(
                     "`json.decode` does not support `{unsupported}` yet — \
                      supported today: Int, Float, Bool, String, `Option<T>`, `List<T>`, \
-                     and non-generic structs and enums of supported types (Map lands in \
-                     a later Phase 4.6 slice)"
+                     `Map<String, V>`, and non-generic structs and enums of supported \
+                     types (non-`String`-key maps are a deferred follow-up)"
                 ),
                 mc.span,
             );
@@ -791,13 +791,14 @@ impl Checker {
     }
 
     /// Returns the name of the first JSON-undecodable type reachable from
-    /// `ty` (recursing through struct fields, enum variant fields, and the
-    /// inner type of `Option`/`List`), or `None` when `ty` is decodable with
-    /// today's surface: the scalars, `Option<T>`, `List<T>`, and non-generic
-    /// structs and enums of decodable component types. `Map` is added by a
-    /// later slice. `visiting` holds the names of the structs/enums currently
-    /// being walked so a self-referential type can't recurse forever,
-    /// mirroring the encode-side gate.
+    /// `ty` (recursing through struct fields, enum variant fields, the inner
+    /// type of `Option`/`List`, and a `Map`'s value type), or `None` when `ty`
+    /// is decodable with today's surface: the scalars, `Option<T>`, `List<T>`,
+    /// `Map<String, V>`, and non-generic structs and enums of decodable
+    /// component types. Non-`String`-key maps and generic enums other than
+    /// `Option` remain unsupported. `visiting` holds the names of the
+    /// structs/enums currently being walked so a self-referential type can't
+    /// recurse forever, mirroring the encode-side gate.
     fn unsupported_json_decode_type(
         &self,
         ty: &Type,
@@ -812,6 +813,14 @@ impl Checker {
             // `List<T>` decodes from a JSON array when `T` does.
             Type::Generic(name, args) if name == "List" && args.len() == 1 => {
                 self.unsupported_json_decode_type(&args[0], visiting)
+            }
+            // `Map<String, V>` decodes from a JSON object when `V` does. Maps
+            // with non-`String` keys (which encode as `[k, v]` pairs) are a
+            // deferred follow-up, matching the encode-side gate.
+            Type::Generic(name, args)
+                if name == "Map" && args.len() == 2 && args[0] == Type::String =>
+            {
+                self.unsupported_json_decode_type(&args[1], visiting)
             }
             Type::Named(name) => {
                 // Resolved `Type::Named` names are already canonical — bare

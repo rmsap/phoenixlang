@@ -269,6 +269,36 @@ fn translate_builtin(
             let h = get_val1(state, args[0])?;
             Ok(call_runtime(builder, ctx, ctx.runtime.json_array_len, &[h]))
         }
+        "json.objectLen" => {
+            let h = get_val1(state, args[0])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_object_len,
+                &[h],
+            ))
+        }
+        "json.objectKeyAt" => {
+            let h = get_val1(state, args[0])?;
+            let idx = get_val1(state, args[1])?;
+            // Returns (ptr, len) — a fresh GC string.
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_object_key_at,
+                &[h, idx],
+            ))
+        }
+        "json.objectValueAt" => {
+            let h = get_val1(state, args[0])?;
+            let idx = get_val1(state, args[1])?;
+            Ok(call_runtime(
+                builder,
+                ctx,
+                ctx.runtime.json_object_value_at,
+                &[h, idx],
+            ))
+        }
         // String methods.
         _ if name.starts_with("String.") => translate_string_method(
             builder,

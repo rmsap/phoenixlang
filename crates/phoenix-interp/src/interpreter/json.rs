@@ -191,6 +191,27 @@ impl Interpreter {
                 }
                 Ok(ok_val(Value::List(elems)))
             }
+            // `Map<String, V>`: require a JSON object, decode each entry's
+            // value (a decode error propagates), then build the map. Entries
+            // iterate in serde's key order — identical to the compiled
+            // backends' DOM iteration. The `String`-key guard keeps the
+            // planned non-`String`-key pairs form from silently routing
+            // through the object decoder if only sema's gate is relaxed.
+            Type::Generic(name, args)
+                if name == "Map" && args.len() == 2 && args[0] == Type::String =>
+            {
+                let Some(obj) = dom.as_object() else {
+                    return mismatch("expected object");
+                };
+                let mut pairs = Vec::with_capacity(obj.len());
+                for (k, child) in obj {
+                    match unwrap_decoded(self.json_decode_value(child, &args[1])?) {
+                        Ok(v) => pairs.push((Value::String(k.clone()), v)),
+                        Err(other) => return Ok(other), // Err(JsonError) propagates.
+                    }
+                }
+                Ok(ok_val(Value::Map(pairs)))
+            }
             // A non-generic struct or enum: require an object and build it.
             Type::Named(name) => {
                 if let Some(fields) = self.json_struct_fields.get(name) {

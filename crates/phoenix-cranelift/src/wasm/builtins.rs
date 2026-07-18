@@ -348,6 +348,23 @@ fn translate_json_decode_builtin(
             Ok(())
         }
         "arrayLen" => scalar(ctx, b, "phx_json_array_len", IrType::I64),
+        "objectLen" => scalar(ctx, b, "phx_json_object_len", IrType::I64),
+        "objectKeyAt" => {
+            // (handle: i64, index: i64) -> String via the sret helper.
+            let vid = expect_result(instr, "json.objectKeyAt")?;
+            let idx = b.require_phx_func("phx_json_object_key_at")?;
+            emit_sret_string_call(ctx, b, idx, &[args[0], args[1]], vid)
+        }
+        "objectValueAt" => {
+            // (handle: i64, index: i64) -> i64.
+            let vid = expect_result(instr, "json.objectValueAt")?;
+            ctx.emit_load_all(args[0])?; // handle
+            ctx.emit_load_all(args[1])?; // index
+            let idx = b.require_phx_func("phx_json_object_value_at")?;
+            ctx.emit(Instruction::Call(idx));
+            ctx.emit_store_result(vid, IrType::I64)?;
+            Ok(())
+        }
         other => Err(CompileError::new(format!(
             "wasm32-linear: `BuiltinCall(\"json.{other}\")` not supported"
         ))),

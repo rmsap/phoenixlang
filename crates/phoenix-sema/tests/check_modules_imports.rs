@@ -1159,6 +1159,29 @@ fn json_decode_of_list_typechecks() {
 }
 
 #[test]
+fn json_decode_of_string_keyed_map_typechecks() {
+    // `Map<String, V>` is a decodable target when `V` is — here a map of
+    // structs, and a nested `Map<String, Map<String, Int>>`.
+    let entry = entry_only(
+        "import json\n\
+         struct P { x: Int }\n\
+         function main() {\n  \
+           let r: Result<Map<String, P>, JsonError> = json.decode<Map<String, P>>(\"x\")\n  \
+           match r { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n  \
+           let n: Result<Map<String, Map<String, Int>>, JsonError> =\n    \
+             json.decode<Map<String, Map<String, Int>>>(\"y\")\n  \
+           match n { Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }\n\
+         }",
+    );
+    let analysis = check_modules(&[entry]);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "Map<String, V> decode should type-check, got: {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn json_decode_of_option_of_undecodable_inner_is_an_error() {
     // The gate recurses through `Option`'s inner type: `Option<T>` is only
     // as decodable as `T`, so `Option<Map<Int, Int>>` is rejected and the
@@ -1482,16 +1505,24 @@ fn json_decode_of_mutually_recursive_structs_terminates() {
 
 #[test]
 fn json_decode_of_unsupported_type_is_a_clear_error() {
-    // This slice decodes scalars, `Option`, `List`, structs, and enums; a
-    // `Map` target (string-keyed or not) is still rejected until a later
-    // slice. `Map<String, Int>` is the riskier case: encode already supports
-    // it, so a decode gate naively mirroring the encode gate would silently
-    // admit it.
-    for map_ty in ["Map<Int, Int>", "Map<String, Int>"] {
+    // Decode covers scalars, `Option`, `List`, `Map<String, V>`, structs, and
+    // enums. A non-`String`-key `Map` is still rejected (deferred follow-up),
+    // as is a generic user struct instantiation — two distinct unsupported
+    // shapes that must each produce a clear diagnostic. The last two pin the
+    // `Map<String, V>` arm's recursion into `V`: a gate that admitted any
+    // `String`-keyed map without checking its value type would pass the
+    // positive tests but silently admit these.
+    for ty in [
+        "Map<Int, Int>",
+        "Box<Int>",
+        "Map<String, Box<Int>>",
+        "Map<String, Map<Int, Int>>",
+    ] {
         let entry = entry_only(&format!(
             "import json\n\
+             struct Box<T> {{ value: T }}\n\
              function main() {{\n  \
-               let r: Result<{map_ty}, JsonError> = json.decode<{map_ty}>(\"x\")\n  \
+               let r: Result<{ty}, JsonError> = json.decode<{ty}>(\"x\")\n  \
                match r {{ Ok(v) -> print(\"ok\") Err(e) -> print(\"err\") }}\n\
              }}"
         ));
@@ -1501,7 +1532,7 @@ fn json_decode_of_unsupported_type_is_a_clear_error() {
                 .diagnostics
                 .iter()
                 .any(|d| d.message.contains("`json.decode` does not support")),
-            "expected an unsupported-type diagnostic for json.decode of `{map_ty}`, got: {:?}",
+            "expected an unsupported-type diagnostic for json.decode of `{ty}`, got: {:?}",
             analysis.diagnostics
         );
     }

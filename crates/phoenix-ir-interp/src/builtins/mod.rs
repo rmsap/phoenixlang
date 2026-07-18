@@ -168,6 +168,62 @@ fn builtin_json(
                 _ => 0,
             }))
         }
+        "objectLen" => {
+            let v = json_node(interp, &args, "json.objectLen")?;
+            Ok(IrValue::Int(match v {
+                serde_json::Value::Object(o) => o.len() as i64,
+                _ => 0,
+            }))
+        }
+        "objectKeyAt" => match args.as_slice() {
+            // The i-th object key (serde's `Map` iterates in key order); empty
+            // string when not an object / out of range. `nth` is O(index) —
+            // a full decode walk is quadratic, matching the native runtime
+            // (see the note on `phx_json_object_len`).
+            [IrValue::Int(h), IrValue::Int(idx)] => {
+                let key = match interp.json_arena.get(*h as usize) {
+                    Some(JsonRoot(Ok(serde_json::Value::Object(o)))) => {
+                        o.keys().nth(*idx as usize).cloned().unwrap_or_default()
+                    }
+                    Some(JsonRoot(Ok(_))) => String::new(),
+                    Some(JsonRoot(Err(_))) => {
+                        return error(
+                            "json.objectKeyAt: handle is a failed-parse root".to_string(),
+                        );
+                    }
+                    None => return error("json.objectKeyAt: invalid JSON handle".to_string()),
+                };
+                Ok(IrValue::String(key))
+            }
+            _ => error("json.objectKeyAt expects (handle, index)".to_string()),
+        },
+        "objectValueAt" => match args.as_slice() {
+            // The i-th object value node, cloned into its own arena entry (same
+            // borrow-release pattern as `getField`); missing sentinel when not
+            // an object / out of range.
+            [IrValue::Int(h), IrValue::Int(idx)] => {
+                let val = match interp.json_arena.get(*h as usize) {
+                    Some(JsonRoot(Ok(serde_json::Value::Object(o)))) => {
+                        o.values().nth(*idx as usize).cloned()
+                    }
+                    Some(JsonRoot(Ok(_))) => None,
+                    Some(JsonRoot(Err(_))) => {
+                        return error(
+                            "json.objectValueAt: handle is a failed-parse root".to_string(),
+                        );
+                    }
+                    None => return error("json.objectValueAt: invalid JSON handle".to_string()),
+                };
+                match val {
+                    Some(c) => {
+                        interp.json_arena.push(JsonRoot(Ok(c)));
+                        Ok(IrValue::Int((interp.json_arena.len() - 1) as i64))
+                    }
+                    None => Ok(IrValue::Int(-1)),
+                }
+            }
+            _ => error("json.objectValueAt expects (handle, index)".to_string()),
+        },
         "isMissing" => match args.as_slice() {
             [IrValue::Int(h)] => Ok(IrValue::Bool(*h == -1)),
             _ => error("json.isMissing expects a single handle argument".to_string()),
