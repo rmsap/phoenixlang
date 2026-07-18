@@ -3,11 +3,17 @@
 //! A `phoenix build --target wasm32-linear` emits the `.wasm` + JS glue and,
 //! from the project's `[js-dependencies]`, a `package.json` beside the glue for
 //! the developer's own `npm install` (the BYO model). These drive the compiled
-//! binary in tempdirs; a WASM build emits bytes + glue + package.json with no
-//! external toolchain (no wasmtime / runtime lib needed), so they are hermetic.
+//! binary in tempdirs. No wasmtime / node / native runtime lib is needed — the
+//! output is never executed — but the wasm32-linear link step does need
+//! `phoenix_runtime.wasm`, so each test soft-skips when that artifact isn't
+//! built (hard failure under `PHOENIX_REQUIRE_RUNTIME_WASM=1`, which the debug
+//! `check` job sets).
 
 use std::path::Path;
 use std::process::Command;
+
+mod common;
+use common::skip_if_no_runtime_wasm;
 
 fn phoenix(cwd: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_phoenix"));
@@ -44,6 +50,9 @@ fn build_wasm(proj: &Path, home: &Path, out_wasm: &Path) -> std::process::Output
 
 #[test]
 fn wasm_build_emits_package_json_from_js_dependencies() {
+    if skip_if_no_runtime_wasm("wasm_build_emits_package_json_from_js_dependencies") {
+        return;
+    }
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     write_project(
@@ -72,6 +81,9 @@ fn wasm_build_emits_package_json_from_js_dependencies() {
 
 #[test]
 fn existing_package_json_is_not_clobbered() {
+    if skip_if_no_runtime_wasm("existing_package_json_is_not_clobbered") {
+        return;
+    }
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     write_project(
@@ -100,6 +112,9 @@ fn existing_package_json_is_not_clobbered() {
 
 #[test]
 fn undeclared_named_module_warns_but_build_succeeds() {
+    if skip_if_no_runtime_wasm("undeclared_named_module_warns_but_build_succeeds") {
+        return;
+    }
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     // Declares left-pad, but the program ALSO binds `chalk`, which is undeclared.
@@ -133,6 +148,9 @@ fn undeclared_named_module_warns_but_build_succeeds() {
 fn no_js_dependencies_writes_no_package_json() {
     // A wasm build with no `[js-dependencies]` (only the ambient/named externs
     // it happens to use) writes no package.json — nothing to install.
+    if skip_if_no_runtime_wasm("no_js_dependencies_writes_no_package_json") {
+        return;
+    }
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     // No [js-dependencies] section at all; the program uses the ambient host only.
@@ -172,6 +190,10 @@ fn dependency_packages_own_extern_js_is_not_the_root_projects_concern() {
     // (`analysis.module.extern_functions` spans every resolved module,
     // dependency packages included) leaking into the undeclared-js-dependency
     // diagnostic.
+    if skip_if_no_runtime_wasm("dependency_packages_own_extern_js_is_not_the_root_projects_concern")
+    {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
 
